@@ -1,0 +1,2962 @@
+# -*- coding: utf-8 -*-
+"""
+gui_auto_trade_setting_window.py
+
+자동매매설정창 전용 모듈.
+- AutoTradeSettingWindow
+- 자동매매설정창에서 직접 쓰는 상태/청산/등록해제 헬퍼
+- 자동매매설정창 전용 소형 다이얼로그
+
+주의:
+- MainWindow 본체와 StockRegisterWindow 본체는 포함하지 않는다.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect
+from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QStyle,
+    QStyleOptionButton,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QTimeEdit,
+    QVBoxLayout,
+    QWidget,
+    QHeaderView,
+)
+
+from gui_styles import (
+    apply_plain_table_header,
+    apply_selected_routine_label_style,
+)
+from gui_common_utils import safe_int_value, sanitize_path_part
+from gui_stock_data import active_routine_for_stock, stock_runtime_dir_for_routine
+from gui_order_utils import (
+    pending_order_side_quantities,
+    order_value,
+    order_status_display,
+    order_side_display,
+    format_number_value,
+    build_order_rows,
+    build_order_timeline_text,
+    filter_orders_by_range,
+    build_grouped_order_timeline_text,
+    settlement_summary_text,
+    date_range_for_mode,
+    filter_orders_by_dates,
+    today_orders,
+    build_current_status_rows,
+    build_full_trade_export_text,
+    order_sort_key,
+)
+from gui_order_status_window import OrderStatusWindow
+from gui_log_view_window import LogViewWindow
+from gui_integrity_check_window import IntegrityCheckWindow
+from gui_blocked_report_window import (
+    BlockedActionReportViewDialog,
+    blocked_items_preview,
+    latest_blocked_action_report_path,
+    write_blocked_action_report,
+)
+from gui_schedule_utils import (
+    schedule_config_updates,
+    schedule_change_log_text,
+    schedule_status_suffix,
+)
+from gui_schedule_window import (
+    ScheduleOperationDialog,
+    ScheduleTradeManagementDialog,
+)
+from gui_config_utils import (
+    default_config,
+    default_state,
+    default_orders,
+    ensure_stock_runtime_files,
+)
+from gui_config_window import show_deferred_config_message
+from gui_force_unregister_dialog import ForceUnregisterConfirmDialog
+from gui_search_stock_register_dialog import SearchStockRegisterDialog
+from gui_auto_trade_utils import auto_trade_unregister_category
+from gui_review_utils import (
+    build_review_required_item,
+    compact_time_text,
+    pending_order_summary,
+    review_required_for_start,
+    review_reason_summary,
+    safe_float_value,
+)
+from gui_routine_assign_utils import (
+    build_routine_assign_result_lines,
+    build_routine_assign_status_text,
+    build_routine_unassign_result_lines,
+    build_routine_unassign_status_text,
+)
+from gui_routine_guard import routine_action_guard_info
+from gui_routine_policy import (
+    routine_action_reasons_for_stock,
+    classify_routine_assign_targets,
+    can_unassign_active_routine_from_stock,
+)
+from runtime_io import (
+    read_json_dict,
+    read_orders_data,
+    write_json_if_missing,
+)
+from gui_auto_trade_runtime import (
+    now_text,
+    parse_stock_folder_name,
+    get_stock_dirs_in_routine,
+    write_state_json,
+)
+from gui_base_stock_service import (
+    ensure_single_real_trade_routine_for_all_stocks,
+    find_library_stock_by_code,
+    is_valid_stock_code,
+    load_stock_library,
+    normalize_base_stock_single_routine_file,
+    normalize_stock_code,
+    read_base_stocks,
+    single_routine_list,
+    update_base_stock_routines,
+    validate_base_stock_record,
+)
+from state_policy import (
+    auto_trade_status_color,
+    auto_trade_status_display,
+    auto_trade_status_dot,
+    effective_schedule_times,
+    minutes_from_hhmm,
+    normalize_after_trade_end_status,
+    normalize_operation_mode,
+    normalized_hhmm_or_empty,
+    normalized_hhmmss_or_empty,
+    operation_mode_check_text,
+    operation_mode_display,
+    real_trade_enabled,
+    trade_permission_display,
+    operation_mode_recalculation_target_status,
+    operation_text_and_color,
+    read_global_schedule,
+    schedule_override_enabled,
+    scheduled_status_for_now,
+    seconds_from_hhmmss,
+    start_status_by_operation_mode,
+    status_after_operation_mode_change,
+    validate_buy_time_range,
+    write_global_schedule,
+)
+from gui_ats_utils import (
+    ManualAtsSettingsDialog,
+    auto_trade_setting_regular_market_active_now,
+    manual_ats_active_now,
+    manual_ats_enabled_labels,
+    manual_ats_session_labels,
+    manual_ats_source,
+)
+from gui_auto_trade_display import (
+    apply_auto_trade_setting_activity_style,
+    apply_auto_trade_setting_liquidation_style,
+    auto_trade_setting_display_status,
+    auto_trade_setting_status_color,
+    create_auto_trade_setting_status_item,
+    create_auto_trade_status_item,
+    yes_no_display,
+    display_status_text_for_gui,
+    routine_status_display_text,
+    SORT_ROLE,
+    SortableTableWidgetItem,
+)
+from gui_auto_trade_situation import create_auto_trade_situation_item
+from gui_auto_trade_policy import (
+    auto_trade_setting_ats_after_regular_blocked,
+    auto_trade_setting_trade_started,
+    auto_trade_setting_should_preserve_raw_status,
+    auto_trade_setting_no_next_step_notice,
+    short_close_method_text,
+    compact_operation_time_range,
+    operation_policy_section,
+    auto_trade_setting_close_timestamp_later,
+    auto_trade_setting_early_close_metadata_is_stale,
+    clear_early_close_runtime_metadata_only,
+    auto_trade_setting_early_close_requested,
+    clear_auto_close_runtime_metadata,
+    close_method_from_state_or_policy,
+    auto_trade_setting_method_text,
+    individual_liquidation_policy_from_config,
+    effective_liquidation_policy_for_config,
+    auto_trade_setting_liquidation_text,
+    auto_trade_setting_regular_end_seconds,
+    auto_trade_setting_is_after_regular_end,
+    auto_trade_setting_has_unresolved_quantity,
+    auto_trade_setting_has_buy_pending_problem,
+    auto_trade_setting_has_close_progress_quantity,
+    auto_trade_setting_today_date_text,
+    auto_trade_setting_liquidation_completed_today,
+    auto_trade_setting_effective_liquidation_method,
+    auto_trade_setting_liquidation_result_policy,
+    auto_trade_setting_mark_liquidation_result_for_display,
+    auto_trade_setting_liquidation_active,
+    auto_trade_setting_liquidation_phase_active,
+)
+from gui_auto_trade_integrity import (
+    unique_review_reasons,
+    is_review_required_state,
+    is_review_required_stock_dir,
+    auto_trade_setting_data_inconsistency_reasons,
+    restart_initial_review_reason_for_stock,
+    auto_trade_setting_server_mismatch_detected,
+)
+from gui_auto_trade_order_log import (
+    open_auto_trade_log_view_window,
+    open_auto_trade_order_status_window,
+)
+from gui_auto_trade_unregister import (
+    AutoTradeUnregisterConfirmDialog,
+    reset_runtime_orders_for_force_unregister,
+    reset_runtime_state_for_force_unregister,
+    unregister_selected_auto_trade_stocks,
+)
+from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+from gui_auto_trade_selection import (
+    clear_current_routine_stock_selection,
+    ensure_context_row_selected,
+    has_selected_stock,
+    has_single_selected_stock,
+    select_all_current_routine_stocks,
+    selected_stock_dir,
+    selected_stock_info,
+    selected_stock_infos,
+    selected_stock_rows,
+)
+from gui_auto_trade_close import (
+    IndividualLiquidationSettingsDialog,
+    ProfitLossEarlyCloseDialog,
+    auto_trade_apply_selected_early_close,
+    auto_trade_apply_selected_early_close_default,
+    auto_trade_apply_selected_early_close_profit_loss,
+    auto_trade_open_selected_individual_liquidation_settings,
+    auto_trade_save_selected_individual_liquidation_settings,
+)
+from gui_auto_trade_ats_ops import (
+    auto_trade_open_selected_manual_ats_settings_dialog,
+    auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_state,
+    auto_trade_set_selected_manual_ats_flag,
+    auto_trade_show_selected_ats_immediate_sell_placeholder,
+)
+from gui_auto_trade_timer import (
+    auto_trade_current_runtime_file_signature,
+    auto_trade_current_time_policy_minute_key,
+    auto_trade_on_runtime_file_timer_tick,
+    auto_trade_on_time_policy_timer_tick,
+)
+from gui_auto_trade_status_ops import (
+    auto_trade_operation_policy_protected_status,
+    auto_trade_recalculate_all_status_by_operation_policy,
+    auto_trade_recalculate_stock_status_by_operation_policy,
+    auto_trade_resume_status_after_pause,
+    auto_trade_set_selected_operation_mode,
+    auto_trade_set_selected_schedule_operation_mode,
+    auto_trade_set_selected_stocks_buy_end,
+    auto_trade_update_stock_operation_mode,
+    auto_trade_update_stock_status,
+)
+from gui_auto_trade_run_control import (
+    auto_trade_start_selected_auto_trades,
+    auto_trade_stop_selected_auto_trades,
+)
+from gui_auto_trade_review_ops import (
+    auto_trade_open_review_required_window,
+    auto_trade_run_current_routine_stability_check,
+)
+from gui_auto_trade_table_loader import (
+    auto_trade_load_selected_routine_stocks,
+)
+from gui_operation_environment import (
+    OperationEnvironmentSettingsDialog,
+    TimeComboWidget,
+    default_operation_policy,
+    read_operation_policy,
+    write_operation_policy,
+)
+from gui_review_required_window import (
+    GlobalReviewRequiredWindow,
+)
+from gui_routine_registry import (
+    get_routine_dirs as registry_get_routine_dirs,
+    routine_display_name as registry_routine_display_name,
+    read_routine_budget,
+)
+from execution_enable_service import commit_execution_enable, preview_execution_enable
+from execution_queue_commit_service import commit_execution_queue_manually
+from execution_preview_order_service import preview_execution_for_real_ready_order
+from execution_preview_reporter import build_execution_preview_report
+from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
+from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
+INVALID_ITEMS_LOG_PATH = PROJECT_ROOT / "invalid_items.log"
+GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
+BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
+OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
+REAL_TRADE_GUARD_PATH = PROJECT_ROOT / "runtime" / "real_trade_guard.json"
+ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+PROGRAM_START_RESET_APPLIED = False
+
+
+def get_routine_dirs() -> list[Path]:
+    """루틴 원본 경로를 조회한다.
+
+    신규 기준:
+    - routines/<루틴명>/routine.json 패키지를 우선 인식한다.
+    - 신규 패키지가 없을 때만 기존 _루틴폴더/budget.json을 fallback으로 사용한다.
+    """
+    return registry_get_routine_dirs()
+
+
+def routine_display_name(routine_dir: Path) -> str:
+    """루틴 원본 경로에서 GUI 표시 루틴명을 반환한다."""
+    return registry_routine_display_name(routine_dir)
+
+
+
+
+
+
+
+
+
+def append_changelog(change_type: str, filename: str, message: str) -> None:
+    """
+    GUI 조작으로 발생한 변경사항을 PROJECT_CHANGELOG.txt 에 기록한다.
+    """
+    block = (
+        f"\n[{now_text()}]\n"
+        f"버전: v1.1\n"
+        f"구분: {change_type}\n"
+        f"파일: {filename}\n"
+        f"내용: {message}\n"
+        f"작성자: admin\n"
+    )
+
+    with CHANGELOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(block)
+
+
+def append_stock_log(stock_dir: Path, event_type: str, message: str) -> Path | None:
+    """
+    종목별 logs/YYYYMMDD.log 에 GUI 조작 및 상태 변경 내역을 기록한다.
+
+    주의:
+    - 실제 키움 주문/체결 로그가 아니라 관리자 GUI 조작 로그이다.
+    - logs 폴더가 없으면 생성한다.
+    - 기록 실패는 GUI 흐름을 막지 않도록 조용히 무시한다.
+    """
+    try:
+        logs_dir = stock_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = logs_dir / f"{datetime.now().strftime('%Y%m%d')}.log"
+        line = f"[{now_text()}] [{event_type}] {message}"
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+        return log_path
+    except Exception:
+        return None
+
+
+def reset_runtime_statuses_for_program_start(context_label: str = "프로그램재시작") -> tuple[int, int]:
+    """프로그램 시작/재시작 시 전체 runtime 종목을 안전 초기화한다.
+
+    - 정상 종목: 종료상태 + 시작 OFF
+    - 이상 종목: 검토관리 이동
+    - 운영 중 발생한 서버/형식 불일치의 적색 표시는 이 함수가 아니라 런타임 표시 로직에서 처리한다.
+    - 같은 프로세스에서 창을 다시 열 때마다 운영상태를 날리지 않도록 1회만 수행한다.
+    """
+    global PROGRAM_START_RESET_APPLIED
+    if PROGRAM_START_RESET_APPLIED:
+        return 0, 0
+    PROGRAM_START_RESET_APPLIED = True
+
+    protected_statuses = {
+        "REVIEW_REQUIRED",
+        "REVIEW",
+        "EMERGENCY_STOP",
+        "EMERGENCY_STOPPED",
+        "EMERGENCY",
+    }
+
+    stopped_count = 0
+    review_count = 0
+    checked_at = now_text()
+
+    for routine_dir in get_routine_dirs():
+        routine_name = routine_display_name(routine_dir)
+        for stock_dir in get_stock_dirs_in_routine(routine_dir):
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            if not isinstance(state, dict) or not state:
+                continue
+
+            code, name = parse_stock_folder_name(stock_dir.name)
+            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+            if status in protected_statuses:
+                continue
+
+            has_problem, reason, details = restart_initial_review_reason_for_stock(stock_dir, state)
+            holding_qty = details.get("holding_qty", 0)
+            avg_price = details.get("avg_price", 0.0)
+            holding_amount = details.get("holding_amount", 0.0)
+            buy_pending_qty = details.get("buy_pending_qty", 0)
+            sell_pending_qty = details.get("sell_pending_qty", 0)
+
+            if has_problem:
+                state["status"] = "REVIEW_REQUIRED"
+                state["review_required"] = True
+                state["review_status"] = "PENDING"
+                state["review_location"] = context_label
+                state["review_reason"] = reason
+                state["review_detail"] = (
+                    f"{reason}: 보유 {holding_qty}주 / 평단 {format_number_value(avg_price)} / "
+                    f"보유금액 {format_number_value(holding_amount)} / 미수 {buy_pending_qty} / 미도 {sell_pending_qty}"
+                )
+                state["review_routine"] = routine_name
+                state["review_entered_at"] = checked_at
+                state["review_checked_at"] = checked_at
+                review_count += 1
+            else:
+                state["status"] = "STOPPED"
+                state["review_required"] = False
+                state["review_status"] = ""
+                state["review_location"] = ""
+                state["review_reason"] = ""
+                state["review_detail"] = ""
+                stopped_count += 1
+
+            state["trade_enabled"] = False
+            state["buy_enabled"] = False
+            state["sell_enabled"] = False
+            state["real_trade_enabled"] = False
+            state["trade_started_at"] = ""
+            state["start_policy_status"] = ""
+            state["start_policy_checked_at"] = ""
+            state["resumed_at"] = ""
+            state["ignore_signals_before"] = ""
+            state["liquidation_policy_forced"] = False
+            state["liquidation_policy_reason"] = ""
+            state["early_close_requested_at"] = ""
+            state["early_close_source"] = ""
+            state["early_close_method"] = ""
+            state["early_close_policy"] = {}
+            state["operation_notice"] = ""
+            state["operation_notice_reason"] = ""
+            state["operation_notice_at"] = ""
+            state["auto_close_requested_at"] = ""
+            state["auto_close_source"] = ""
+            state["auto_close_method"] = ""
+            state["auto_close_policy"] = {}
+            state["updated_at"] = checked_at
+            state["startup_reset_at"] = checked_at
+            state["startup_reset_reason"] = "PROGRAM_RESTART_FORCE_STOP"
+            state["trade_stopped_at"] = checked_at
+
+            if not write_state_json(stock_dir, state):
+                continue
+
+    if stopped_count or review_count:
+        append_changelog(
+            "UPDATE",
+            "state.json",
+            f"{context_label} 안전초기화: 중지 {stopped_count}개 / 검토관리 {review_count}개",
+        )
+
+    return stopped_count, review_count
+
+
+
+
+def default_operation_policy() -> dict[str, object]:
+    """운영환경설정 기본값.
+
+    현재 단계에서는 UI/저장 구조를 먼저 확정한다.
+    실제 자동판정 엔진 연결은 후속 패치에서 단계적으로 반영한다.
+    """
+    return {
+        "regular_market": {
+            "start_time": "09:00:00",
+            "end_time": "15:20:00",
+        },
+        "extra_sessions": [
+            {"enabled": False, "name": "추가시간1", "start_time": "08:00:00", "end_time": "08:50:00"},
+            {"enabled": False, "name": "추가시간2", "start_time": "15:40:00", "end_time": "19:50:00"},
+            {"enabled": False, "name": "추가시간3", "start_time": "", "end_time": ""},
+        ],
+        "scheduled_operation": {
+            "default_start_time": "09:00:00",
+            "default_end_buy_time": "13:30:00",
+            "after_buy_end_status": "감시/매도",
+        },
+        "manual_operation": {
+            "use_regular_market": True,
+            "use_extra_session_1": False,
+            "use_extra_session_2": False,
+            "use_extra_session_3": False,
+            "enabled_status": "매수/매도",
+            "disabled_status": "감시/대기",
+            "use_liquidation_policy": False,
+        },
+        "auto_close": {
+            "method": "루틴매도신호",
+            "profit_percent": "",
+            "loss_percent": "",
+        },
+        "early_close": {
+            "method": "시장가",
+            "profit_percent": "",
+            "loss_percent": "",
+        },
+        "liquidation": {
+            "minutes_before_regular_close": "5",
+            "method": "이월",
+        },
+        "updated_at": "",
+    }
+
+
+def read_operation_policy() -> dict[str, object]:
+    default = default_operation_policy()
+    if not OPERATION_POLICY_PATH.exists():
+        return default
+    try:
+        data = json.loads(OPERATION_POLICY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if not isinstance(data, dict):
+        return default
+
+    # 얕은 병합: 누락된 상위 항목은 기본값으로 보완한다.
+    merged = default_operation_policy()
+    for key, value in data.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)  # type: ignore[index]
+        else:
+            merged[key] = value
+    return merged
+
+
+class StockPolicyOverrideDialog(QDialog):
+    """개별종목 예외설정 1차 UI.
+
+    환경설정이 디폴트이고, 이 창은 해당 종목만 예외로 둘 때 사용한다.
+    전체 리셋은 종목별 예외 설정값을 제거한다.
+    """
+
+    OVERRIDE_KEYS = (
+        "policy_override_enabled",
+        "operation_policy_override",
+        "manual_operation_override",
+        "scheduled_operation_override",
+        "auto_close_override",
+        "early_close_override",
+        "liquidation_override",
+    )
+
+    def __init__(self, stock_dir: Path, code: str, name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.stock_dir = stock_dir
+        self.code = code
+        self.name = name
+        self.config_path = stock_dir / "config.json"
+        self.config = read_json_dict(self.config_path) or default_config()
+        self.setWindowTitle(f"개별종목 설정 - {code} {name}")
+        self.resize(520, 360)
+
+        self.use_override = QCheckBox("이 종목만 개별설정 사용")
+        self.memo = QTextEdit()
+        self.memo.setPlaceholderText("개별 예외 사유 또는 메모")
+        self.memo.setMinimumHeight(90)
+        self.btn_reset_all = QPushButton("환경설정값으로 전체 리셋")
+        self.btn_save = QPushButton("저장")
+        self.btn_cancel = QPushButton("취소")
+
+        self._setup_ui()
+        self.load_config_to_widgets()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout()
+        info = QLabel(
+            "환경설정은 기본값입니다.\n"
+            "선택 종목만 예외로 적용합니다.\n"
+            "현재 1차 구현은 예외 사용 여부와 메모, 전체 리셋 흐름을 먼저 제공합니다."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        layout.addWidget(self.use_override)
+        layout.addWidget(QLabel("개별설정 메모"))
+        layout.addWidget(self.memo)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.btn_reset_all)
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.btn_save)
+        button_layout.addWidget(self.btn_cancel)
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+        self.btn_reset_all.clicked.connect(self.reset_all_to_global)
+        self.btn_save.clicked.connect(self.save_override)
+        self.btn_cancel.clicked.connect(self.reject)
+
+    def load_config_to_widgets(self) -> None:
+        self.use_override.setChecked(bool(self.config.get("policy_override_enabled", False)))
+        self.memo.setPlainText(str(self.config.get("policy_override_memo", "")))
+
+    def write_config(self) -> None:
+        self.config["updated_at"] = now_text()
+        self.config_path.write_text(
+            json.dumps(self.config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def save_override(self) -> None:
+        self.config["policy_override_enabled"] = self.use_override.isChecked()
+        self.config["policy_override_memo"] = self.memo.toPlainText().strip()
+        self.config["policy_override_updated_at"] = now_text()
+        try:
+            self.write_config()
+            append_stock_log(self.stock_dir, "GUI", "개별종목 설정 저장")
+            append_changelog("UPDATE", "config.json", f"개별종목 설정 저장: {self.code} {self.name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "저장 오류", f"개별종목 설정 저장 중 오류가 발생했습니다.\n\n{exc}")
+            return
+        QMessageBox.information(self, "저장 완료", "개별종목 설정을 저장했습니다.")
+        self.accept()
+
+    def reset_all_to_global(self) -> None:
+        for key in self.OVERRIDE_KEYS:
+            self.config.pop(key, None)
+        self.config.pop("policy_override_memo", None)
+        self.config["policy_override_enabled"] = False
+        self.config["policy_override_reset_at"] = now_text()
+        try:
+            self.write_config()
+            append_stock_log(self.stock_dir, "GUI", "개별종목 설정 전체 리셋")
+            append_changelog("UPDATE", "config.json", f"개별종목 설정 전체 리셋: {self.code} {self.name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "리셋 오류", f"개별종목 설정 리셋 중 오류가 발생했습니다.\n\n{exc}")
+            return
+        QMessageBox.information(self, "리셋 완료", "해당 종목의 개별설정을 환경설정값으로 전체 리셋했습니다.")
+        self.accept()
+
+
+class AutoTradeSettingWindow(QDialog):
+    """
+    자동매매설정 창.
+
+    1차 구현 범위:
+    - 자동매매 루틴 목록 표시
+    - 선택 루틴의 종목별 저장 폴더 표시
+    - state.json 기준 상태 요약 표시
+    - 실제 자동매매 시작/정지/삭제/환경설정/주문상태/로그 기능은 다음 단계에서 구현
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self.setWindowTitle("자동매매설정")
+        self.resize(1180, 680)
+        self.setMinimumWidth(1180)
+
+        self.routine_table = QTableWidget()
+        self.stock_table = QTableWidget()
+
+        self.btn_start = QPushButton("매매시작")
+        self.btn_stop = QPushButton("강제종료")
+        self.btn_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
+        self.btn_early_close = QPushButton("조기 마감")
+        self.btn_early_close.setStyleSheet("color: #2563eb; font-weight: bold;")
+        self.btn_preview_order_candidates = QPushButton("주문후보검증")
+        self.btn_execution_enable = QPushButton("수동 실주문 후보 활성화")
+        self.btn_real_ready_preflight = QPushButton("REAL_READY 수동 점검")
+        self.btn_execution_preview = QPushButton("Execution Preview")
+        self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
+        self.btn_fetch_minute_candles = QPushButton("분봉조회")
+        self.btn_early_close.setMinimumHeight(28)
+        self.btn_stop.setMinimumHeight(28)
+        self.btn_preview_order_candidates.setMinimumHeight(28)
+        self.btn_execution_enable.setMinimumHeight(28)
+        self.btn_real_ready_preflight.setMinimumHeight(28)
+        self.btn_execution_preview.setMinimumHeight(28)
+        self.btn_manual_queue_commit.setMinimumHeight(28)
+        self.btn_manual_queue_commit.setEnabled(False)
+        self.btn_fetch_minute_candles.setMinimumHeight(28)
+        self.btn_set_schedule = QPushButton("환경설정")
+        self.btn_delete = QPushButton("등록 해제")
+        self.btn_config = QPushButton("환경설정")
+        self.btn_order_view = QPushButton("주문상태 보기")
+        self.btn_log_view = QPushButton("로그 보기")
+        self.btn_review_view = QPushButton("검토관리")
+        self.btn_refresh = QPushButton("안정성검사")
+        self.btn_close = QPushButton("닫기")
+
+        self._routine_sort_column = -1
+        self._routine_sort_order = Qt.AscendingOrder
+        self._stock_sort_column = -1
+        self._stock_sort_order = Qt.AscendingOrder
+        # 헤더 정렬 후에는 정렬 규칙이 아니라 "그 순간의 화면 순서"를 보존한다.
+        # 설정 변경/조기마감/개별청산 저장 중 종목 위치가 튀는 것을 막기 위한 고정 순서다.
+        self._stock_visual_order: list[str] = []
+        self._last_time_policy_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._time_policy_timer = QTimer(self)
+        self._time_policy_timer.setInterval(10_000)
+        self._time_policy_timer.timeout.connect(self.on_time_policy_timer_tick)
+
+        # 외부에서 state/config/orders 파일을 직접 수정한 경우 화면에 자동 반영한다.
+        # 예: VSCode에서 보유수량/평단을 임시 입력하면 별도 버튼 없이 종목표가 갱신된다.
+        self._runtime_file_snapshot: dict[str, int] = {}
+        self._runtime_file_timer = QTimer(self)
+        self._runtime_file_timer.setInterval(2_000)
+        self._runtime_file_timer.timeout.connect(self.on_runtime_file_timer_tick)
+        self._last_execution_preview_result: dict[str, object] | None = None
+        self._last_execution_preview_queue_snapshot: dict[str, object] | None = None
+        self._last_execution_enable_preview_result: dict[str, object] | None = None
+        self._last_execution_enable_queue_snapshot: dict[str, object] | None = None
+        self._last_real_preflight_preview_result: dict[str, object] | None = None
+        self._last_real_preflight_queue_snapshot: dict[str, object] | None = None
+
+        self._setup_ui()
+        self._connect_events()
+
+        # 자동매매설정 창 시작 시 직전 실행 상태를 이어받지 않는다.
+        # 매매시작 버튼을 눌렀을 때만 현재 시간/운영방식 기준으로 재판정한다.
+        self.reset_runtime_statuses_on_window_start()
+
+        self.refresh_all()
+        self._runtime_file_snapshot = self.current_runtime_file_signature()
+        self._time_policy_timer.start()
+        self._runtime_file_timer.start()
+
+    def _setup_ui(self) -> None:
+        main_layout = QVBoxLayout()
+        button_layout = QHBoxLayout()
+
+        routine_box = QGroupBox("자동매매 루틴")
+        routine_layout = QVBoxLayout()
+        self._setup_routine_table()
+        routine_layout.addWidget(self.routine_table)
+        routine_box.setLayout(routine_layout)
+        routine_box.setMaximumHeight(175)
+
+        self.stock_box = QGroupBox()
+        stock_layout = QVBoxLayout()
+        self.selected_routine_label = QLabel("선택 루틴: -")
+        apply_selected_routine_label_style(self.selected_routine_label)
+        self.selected_routine_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.selected_routine_label.setMinimumHeight(28)
+        self._setup_stock_table()
+
+        selected_routine_header_layout = QHBoxLayout()
+        selected_routine_header_layout.setContentsMargins(0, 0, 0, 0)
+        selected_routine_header_layout.addWidget(self.selected_routine_label)
+        selected_routine_header_layout.addStretch(1)
+        selected_routine_header_layout.addWidget(self.btn_fetch_minute_candles)
+        selected_routine_header_layout.addWidget(self.btn_preview_order_candidates)
+        selected_routine_header_layout.addWidget(self.btn_execution_enable)
+        selected_routine_header_layout.addWidget(self.btn_real_ready_preflight)
+        selected_routine_header_layout.addWidget(self.btn_execution_preview)
+        selected_routine_header_layout.addSpacing(16)
+        selected_routine_header_layout.addWidget(self.btn_manual_queue_commit)
+        selected_routine_header_layout.addWidget(self.btn_early_close)
+        selected_routine_header_layout.addWidget(self.btn_stop)
+
+        stock_layout.addLayout(selected_routine_header_layout)
+        stock_layout.addWidget(self.stock_table)
+        self.stock_box.setLayout(stock_layout)
+
+        buttons = [
+            self.btn_start,
+            self.btn_set_schedule,
+            self.btn_delete,
+            self.btn_order_view,
+            self.btn_log_view,
+            self.btn_review_view,
+            self.btn_refresh,
+            self.btn_close,
+        ]
+
+        for button in buttons:
+            button.setMinimumHeight(34)
+            button_layout.addWidget(button)
+
+        # v20.9.1g: 좌우 분할 구조를 상하 구조로 변경한다.
+        # 루틴 목록은 상단 요약 영역으로 압축하고, 종목표는 하단 전체 폭을 사용한다.
+        main_layout.addWidget(routine_box, 0)
+        main_layout.addWidget(self.stock_box, 1)
+        main_layout.addLayout(button_layout)
+        self.setLayout(main_layout)
+
+    def _setup_routine_table(self) -> None:
+        headers = [
+            "루틴명",
+            "종목수",
+            "총예산",
+            "사용예산",
+            "가용예산",
+        ]
+
+        self.routine_table.setColumnCount(len(headers))
+        self.routine_table.setHorizontalHeaderLabels(headers)
+        apply_plain_table_header(self.routine_table)
+        self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.routine_table.horizontalHeader().setStretchLastSection(True)
+        self.routine_table.setColumnWidth(0, 220)
+        self.routine_table.setColumnWidth(1, 90)
+        self.routine_table.setColumnWidth(2, 140)
+        self.routine_table.setColumnWidth(3, 140)
+        self.routine_table.setColumnWidth(4, 140)
+        self.routine_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.routine_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.routine_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.routine_table.setSortingEnabled(False)
+        self.routine_table.horizontalHeader().setSectionsClickable(True)
+
+    def _setup_stock_table(self) -> None:
+        headers = [
+            "코드",
+            "종목",
+            "운영",
+            "현황",
+            "상태",
+            "방식",
+            "청산",
+            "보유",
+            "평단",
+            "매매",
+            "미수",
+            "미도",
+        ]
+
+        self.stock_table.setColumnCount(len(headers))
+        self.stock_table.setHorizontalHeaderLabels(headers)
+        apply_plain_table_header(self.stock_table)
+        header = self.stock_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        for col in range(len(headers)):
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
+        self.stock_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        header.setMinimumSectionSize(30)
+        self.stock_table.verticalHeader().setSectionsMovable(False)
+        self.stock_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.stock_table.verticalHeader().setMinimumWidth(40)
+        self.stock_table.verticalHeader().setMaximumWidth(40)
+        self.stock_table.verticalHeader().setFixedWidth(40)
+
+        # 자동매매설정창 하단 종목표 고정폭 배분
+        # 합계 920px: 전체 컬럼을 소폭 확대해 말줄임을 줄인다.
+        self._apply_stock_table_column_widths()
+        self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.stock_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.stock_table.setSortingEnabled(False)
+        self.stock_table.horizontalHeader().setSectionsClickable(True)
+        QTimer.singleShot(0, self._apply_stock_table_column_widths)
+
+    def _apply_stock_table_column_widths(self) -> None:
+        """자동매매설정창 하단 종목표 컬럼 폭을 강제로 재적용한다."""
+        widths = {
+            0: 80,    # 코드: 6자리 여유
+            1: 205,   # 종목: 13자 기준
+            2: 120,   # 운영: 09:30~13:30 표시
+            3: 50,    # 현황: 종목 운영 건강도 표시등
+            4: 90,   # 상태: 감시/대기, 매수/매도
+            5: 80,    # 방식: 루틴, 시장가, 현재가
+            6: 120,   # 청산: 10분/시장가, 10분/현재가
+            7: 75,    # 보유: 십만 단위
+            8: 90,    # 평단: 천만 단위
+            9: 47,    # 매매: 건수 백단위
+            10: 47,   # 미수: 건수 백단위
+            11: 47,   # 미도: 건수 백단위
+        }
+        self.stock_table.verticalHeader().setMinimumWidth(40)
+        self.stock_table.verticalHeader().setMaximumWidth(40)
+        self.stock_table.verticalHeader().setFixedWidth(40)
+        header = self.stock_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        for col, width in widths.items():
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
+            header.resizeSection(col, width)
+            self.stock_table.setColumnWidth(col, width)
+
+    def _connect_events(self) -> None:
+        self.routine_table.itemSelectionChanged.connect(self.on_routine_selection_changed)
+        self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_routine_table_by_column)
+        self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
+        self.stock_table.horizontalHeader().sectionClicked.connect(self.sort_stock_table_by_column)
+        self.stock_table.itemDoubleClicked.connect(self.on_stock_table_item_double_clicked)
+        self.stock_table.customContextMenuRequested.connect(self.on_stock_table_context_menu)
+        self.btn_refresh.clicked.connect(self.run_current_routine_stability_check)
+        self.btn_close.clicked.connect(self.close)
+        self.btn_start.clicked.connect(self.start_selected_auto_trades)
+        self.btn_stop.clicked.connect(self.stop_selected_auto_trades)
+        self.btn_fetch_minute_candles.clicked.connect(self.fetch_minute_candles_for_selected_stock)
+        self.btn_preview_order_candidates.clicked.connect(self.preview_order_candidates_for_pending_signals)
+        self.btn_execution_enable.clicked.connect(self.enable_execution_candidate_manually)
+        self.btn_real_ready_preflight.clicked.connect(self.run_real_ready_preflight_manually)
+        self.btn_execution_preview.clicked.connect(self.preview_execution_for_real_ready_order_manual)
+        self.btn_manual_queue_commit.clicked.connect(self.commit_last_execution_preview_queue_manually)
+        self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
+        self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
+        self.btn_delete.clicked.connect(self.unregister_selected_auto_trade_stocks)
+        self.btn_order_view.clicked.connect(self.open_order_status_window)
+        self.btn_log_view.clicked.connect(self.open_log_view_window)
+        self.btn_review_view.clicked.connect(self.open_review_required_window)
+
+    def sort_routine_table_by_column(self, column: int) -> None:
+        """상단 루틴표 헤더 클릭 정렬."""
+        if column < 0 or column >= self.routine_table.columnCount():
+            return
+
+        if self._routine_sort_column == column:
+            self._routine_sort_order = (
+                Qt.DescendingOrder
+                if self._routine_sort_order == Qt.AscendingOrder
+                else Qt.AscendingOrder
+            )
+        else:
+            self._routine_sort_column = column
+            self._routine_sort_order = Qt.AscendingOrder
+
+        selected_routine_name = self.current_selected_routine_name()
+        self.routine_table.sortItems(column, self._routine_sort_order)
+        if selected_routine_name:
+            self.restore_routine_selection(selected_routine_name)
+
+    def capture_stock_visual_order(self) -> list[str]:
+        """현재 하단 종목표에 보이는 행 순서를 종목 runtime 경로 기준으로 저장한다."""
+        order: list[str] = []
+        seen: set[str] = set()
+        for row in range(self.stock_table.rowCount()):
+            path_text = ""
+            for col in range(self.stock_table.columnCount()):
+                item = self.stock_table.item(row, col)
+                if item is None:
+                    continue
+                value = item.data(Qt.UserRole)
+                if value:
+                    path_text = str(value)
+                    break
+            if path_text and path_text not in seen:
+                order.append(path_text)
+                seen.add(path_text)
+        return order
+
+    def sort_stock_table_by_column(self, column: int) -> None:
+        """하단 종목표 헤더 클릭 정렬.
+
+        헤더 클릭 순간에만 정렬 규칙을 적용하고, 그 결과 화면 순서를 고정한다.
+        이후 설정 변경/조기마감/개별청산 저장으로 표가 다시 로딩되어도
+        정렬 규칙을 재적용하지 않고 이 화면 순서를 유지한다.
+        """
+        if column < 0 or column >= self.stock_table.columnCount():
+            return
+
+        if self._stock_sort_column == column:
+            self._stock_sort_order = (
+                Qt.DescendingOrder
+                if self._stock_sort_order == Qt.AscendingOrder
+                else Qt.AscendingOrder
+            )
+        else:
+            self._stock_sort_column = column
+            self._stock_sort_order = Qt.AscendingOrder
+
+        selected_paths = set()
+        for row in self.selected_stock_rows():
+            item = self.stock_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole):
+                selected_paths.add(str(item.data(Qt.UserRole)))
+
+        self.stock_table.sortItems(column, self._stock_sort_order)
+        self._stock_visual_order = self.capture_stock_visual_order()
+
+        if selected_paths:
+            self.stock_table.clearSelection()
+            for row in range(self.stock_table.rowCount()):
+                item = self.stock_table.item(row, 0)
+                if item is not None and str(item.data(Qt.UserRole)) in selected_paths:
+                    self.stock_table.selectRow(row)
+        self.update_action_buttons()
+
+    def apply_auto_trade_table_sorts(self) -> None:
+        """목록 갱신 후 상단 루틴표 정렬만 재적용한다.
+
+        하단 종목표는 헤더 클릭 시점의 화면 순서를 고정 보존한다.
+        refresh/load 중 stock_table.sortItems()를 재실행하면 작업 중인 종목이
+        정렬 규칙에 따라 이동하므로 여기서는 재정렬하지 않는다.
+        """
+        if self._routine_sort_column >= 0:
+            self.routine_table.sortItems(self._routine_sort_column, self._routine_sort_order)
+
+    def refresh_all(self) -> None:
+        # 자동매매설정 창 전체 갱신 전 하단 종목표 위치를 보존한다.
+        # 시간변경/매매시작/강제종료 후 종목표가 맨 위로 튀는 문제를 막는다.
+        selected_stock_paths, stock_scroll_value = self.capture_stock_table_view_state()
+
+        normalize_base_stock_single_routine_file()
+        ensure_single_real_trade_routine_for_all_stocks()
+        selected_routine_name = self.current_selected_routine_name()
+        self.load_routine_table()
+
+        if selected_routine_name:
+            self.restore_routine_selection(selected_routine_name)
+
+        if self.current_selected_routine_dir() is None and self.routine_table.rowCount() > 0:
+            self.routine_table.selectRow(0)
+
+        self.load_selected_routine_stocks()
+        self.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
+        self._runtime_file_snapshot = self.current_runtime_file_signature()
+        self.update_action_buttons()
+
+    def current_time_policy_minute_key(self) -> str:
+        return auto_trade_current_time_policy_minute_key(self)
+
+    def current_runtime_file_signature(self) -> tuple[tuple[str, int, int], ...]:
+        return auto_trade_current_runtime_file_signature(self)
+
+    def on_runtime_file_timer_tick(self) -> None:
+        auto_trade_on_runtime_file_timer_tick(self)
+
+    def on_time_policy_timer_tick(self) -> None:
+        auto_trade_on_time_policy_timer_tick(self)
+
+    def closeEvent(self, event) -> None:
+        """창을 닫을 때 시간정책 타이머를 정리한다."""
+        try:
+            self._time_policy_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._runtime_file_timer.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def capture_stock_table_view_state(self) -> tuple[set[str], int]:
+        """하단 종목표의 선택 종목 경로와 세로 스크롤 위치를 저장한다."""
+        selected_paths: set[str] = set()
+        try:
+            for row in self.selected_stock_rows():
+                item = self.stock_table.item(row, 0)
+                if item is not None and item.data(Qt.UserRole):
+                    selected_paths.add(str(item.data(Qt.UserRole)))
+        except Exception:
+            selected_paths = set()
+
+        try:
+            scroll_value = self.stock_table.verticalScrollBar().value()
+        except Exception:
+            scroll_value = 0
+
+        return selected_paths, scroll_value
+
+    def restore_stock_table_view_state(self, selected_paths: set[str], scroll_value: int) -> None:
+        """하단 종목표의 선택 종목과 세로 스크롤 위치를 복원한다.
+
+        selectRow()는 선택 복원 중 현재 행으로 자동 스크롤을 이동시킬 수 있다.
+        설정 저장/갱신 직후 종목이 튀는 현상을 막기 위해 selectionModel().select()로
+        선택 상태만 복원하고, 마지막에 기존 스크롤 위치를 다시 적용한다.
+        """
+        try:
+            if selected_paths:
+                self.stock_table.clearSelection()
+                selection_model = self.stock_table.selectionModel()
+                if selection_model is not None:
+                    flags = QItemSelectionModel.Select | QItemSelectionModel.Rows
+                    for row in range(self.stock_table.rowCount()):
+                        item = self.stock_table.item(row, 0)
+                        if item is not None and str(item.data(Qt.UserRole)) in selected_paths:
+                            index = self.stock_table.model().index(row, 0)
+                            selection_model.select(index, flags)
+        except Exception:
+            pass
+
+        try:
+            scroll_bar = self.stock_table.verticalScrollBar()
+            scroll_bar.setValue(min(max(0, scroll_value), scroll_bar.maximum()))
+        except Exception:
+            pass
+
+    def reset_runtime_statuses_on_window_start(self) -> None:
+        """자동매매설정 창 시작 시 프로그램 재시작 안전초기화를 재적용한다."""
+        reset_runtime_statuses_for_program_start("프로그램재시작")
+
+    def selected_stock_rows(self) -> list[int]:
+        return selected_stock_rows(self)
+
+    def has_selected_stock(self) -> bool:
+        return has_selected_stock(self)
+
+    def has_single_selected_stock(self) -> bool:
+        return has_single_selected_stock(self)
+
+    def update_action_buttons(self) -> None:
+        has_stock = self.has_selected_stock()
+        single_stock = self.has_single_selected_stock()
+
+        self.btn_start.setEnabled(has_stock)
+        self.btn_stop.setEnabled(has_stock)
+        self.btn_early_close.setEnabled(has_stock)
+        self.btn_set_schedule.setEnabled(True)
+        self.btn_delete.setEnabled(has_stock)
+        self.btn_order_view.setEnabled(single_stock)
+        self.btn_log_view.setEnabled(single_stock)
+        self.btn_review_view.setEnabled(True)
+
+    def on_stock_selection_changed(self) -> None:
+        self.update_action_buttons()
+
+    def operation_stock_dir_from_row(self, row: int) -> Path | None:
+        code_item = self.stock_table.item(row, 0)
+        if code_item is None:
+            return None
+        stock_dir_text = code_item.data(Qt.UserRole)
+        if not stock_dir_text:
+            return None
+        stock_dir = Path(str(stock_dir_text))
+        if not stock_dir.exists():
+            return None
+        return stock_dir
+
+    def on_stock_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        """운영 칸 더블클릭 시 시간/수동을 빠르게 전환한다."""
+        if item.column() != 2:
+            return
+
+        stock_dir = self.operation_stock_dir_from_row(item.row())
+        if stock_dir is None:
+            return
+
+        self.stock_table.selectRow(item.row())
+        config = read_json_dict(stock_dir / "config.json") or default_config()
+        current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+
+        if current_mode == "CONTINUOUS":
+            global_schedule = read_global_schedule()
+            self.set_selected_operation_mode(
+                "SCHEDULED",
+                schedule_config_updates(
+                    global_schedule["start_time"],
+                    global_schedule["end_buy_time"],
+                ),
+            )
+        else:
+            self.set_selected_operation_mode("CONTINUOUS")
+
+    def ensure_context_row_selected(self, row: int) -> None:
+        ensure_context_row_selected(self, row)
+
+    def select_all_current_routine_stocks(self) -> None:
+        select_all_current_routine_stocks(self)
+
+    def clear_current_routine_stock_selection(self) -> None:
+        clear_current_routine_stock_selection(self)
+
+    def on_stock_table_context_menu(self, pos) -> None:
+        show_auto_trade_stock_context_menu(self, pos)
+
+    def open_selected_individual_liquidation_settings(self) -> None:
+        auto_trade_open_selected_individual_liquidation_settings(self)
+
+    def individual_liquidation_status_text(self, policy_values: dict[str, object]) -> str:
+        if not bool(policy_values.get("enabled", False)):
+            return "환경설정 사용"
+        method = short_close_method_text(policy_values.get("method", "이월"))
+        if method == "이월":
+            return "청산 안함(이월)"
+        minutes = str(policy_values.get("minutes_before_regular_close", "5")).strip() or "5"
+        return f"개별 {minutes}분/{method}"
+
+    def save_selected_individual_liquidation_settings(self, policy_values: dict[str, object]) -> int:
+        return auto_trade_save_selected_individual_liquidation_settings(self, policy_values)
+
+    def selected_manual_ats_state(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, bool]:
+        return auto_trade_selected_manual_ats_state(self, selected)
+
+    def save_selected_manual_ats_state(self, ats_state: dict[str, bool]) -> int:
+        return auto_trade_save_selected_manual_ats_state(self, ats_state)
+
+    def open_selected_manual_ats_settings_dialog(self) -> None:
+        auto_trade_open_selected_manual_ats_settings_dialog(self)
+
+    def set_selected_manual_ats_flag(self, flag_key: str, enabled: bool, label: str) -> None:
+        auto_trade_set_selected_manual_ats_flag(self, flag_key, enabled, label)
+
+    def show_selected_ats_immediate_sell_placeholder(self, method: str) -> None:
+        auto_trade_show_selected_ats_immediate_sell_placeholder(self, method)
+
+    def selected_operation_mode_set(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> set[str]:
+        """선택 종목들의 운영방식 집합을 반환한다."""
+        selected = selected if selected is not None else self.selected_stock_infos()
+        modes: set[str] = set()
+        for stock_dir, _, _ in selected:
+            config = read_json_dict(stock_dir / "config.json")
+            if not config:
+                config = default_config()
+            modes.add(normalize_operation_mode(config.get("operation_mode", "SCHEDULED")))
+        return modes
+
+    def toggle_selected_manual_override_flag(self, flag_key: str, label: str) -> None:
+        """수동운영 종목의 개별 수동시간 사용 여부를 즉시 전환한다.
+
+        저장 위치:
+        - config.json / manual_operation_override
+        - 아직 실제 주문 연동 전 단계이므로, 우클릭 즉시 설정값을 먼저 보존한다.
+        """
+        selected = self.selected_stock_infos()
+        if not selected:
+            QMessageBox.warning(self, "선택 오류", "설정할 종목을 1개 이상 선택하세요.")
+            return
+
+        changed: list[str] = []
+        for stock_dir, code, name in selected:
+            config_path = stock_dir / "config.json"
+            config = read_json_dict(config_path)
+            if not config:
+                config = default_config()
+
+            if normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) != "CONTINUOUS":
+                continue
+
+            manual_override = config.get("manual_operation_override", {})
+            if not isinstance(manual_override, dict):
+                manual_override = {}
+
+            current_value = bool(manual_override.get(flag_key, False))
+            manual_override[flag_key] = not current_value
+            config["manual_operation_override"] = manual_override
+            config["policy_override_enabled"] = True
+            config["policy_override_updated_at"] = now_text()
+            config["updated_at"] = now_text()
+
+            try:
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "저장 오류", f"{code} {name} 설정 저장 중 오류가 발생했습니다.\n\n{exc}")
+                continue
+
+            changed.append(f"{code} {name}({label}: {'ON' if manual_override[flag_key] else 'OFF'})")
+            append_stock_log(stock_dir, "GUI", f"우클릭 수동운영 설정 변경: {label} -> {'ON' if manual_override[flag_key] else 'OFF'}")
+
+        if changed:
+            append_changelog("UPDATE", "config.json", f"수동운영 개별설정 변경: {' / '.join(changed)}")
+            self.statusBarMessage(f"{label} 전환 완료: {len(changed)}개")
+            self.refresh_all()
+        else:
+            QMessageBox.information(self, "처리 없음", "수동운영 종목만 이 메뉴를 사용할 수 있습니다.")
+
+    def reset_selected_manual_override(self) -> None:
+        """선택 수동운영 종목의 수동운영 개별설정을 제거한다."""
+        selected = self.selected_stock_infos()
+        if not selected:
+            QMessageBox.warning(self, "선택 오류", "리셋할 종목을 1개 이상 선택하세요.")
+            return
+
+        changed: list[str] = []
+        for stock_dir, code, name in selected:
+            config_path = stock_dir / "config.json"
+            config = read_json_dict(config_path)
+            if not config:
+                config = default_config()
+
+            if normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) != "CONTINUOUS":
+                continue
+
+            if "manual_operation_override" not in config:
+                continue
+
+            config.pop("manual_operation_override", None)
+            config["policy_override_updated_at"] = now_text()
+            config["updated_at"] = now_text()
+
+            try:
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "리셋 오류", f"{code} {name} 설정 리셋 중 오류가 발생했습니다.\n\n{exc}")
+                continue
+
+            changed.append(f"{code} {name}")
+            append_stock_log(stock_dir, "GUI", "우클릭 수동운영 개별설정 리셋")
+
+        if changed:
+            append_changelog("UPDATE", "config.json", f"수동운영 개별설정 리셋: {' / '.join(changed)}")
+            self.statusBarMessage(f"수동운영 기본 리셋 완료: {len(changed)}개")
+            self.refresh_all()
+        else:
+            QMessageBox.information(self, "처리 없음", "리셋할 수동운영 개별설정이 없습니다.")
+
+    def load_routine_table(self) -> None:
+        routine_dirs = get_routine_dirs()
+        self.routine_table.setSortingEnabled(False)
+        self.routine_table.setRowCount(len(routine_dirs))
+
+        for row, routine_dir in enumerate(routine_dirs):
+            routine_name = routine_display_name(routine_dir)
+            budget = read_routine_budget(routine_dir)
+            stock_count = len(assigned_stock_dirs_in_routine(routine_dir))
+
+            total_budget = int(budget.get('total_budget', 0))
+            used_budget = int(budget.get('used_budget', 0))
+            available_budget = int(budget.get('available_budget', 0))
+            values = [
+                routine_name,
+                str(stock_count),
+                f"{total_budget:,}",
+                f"{used_budget:,}",
+                f"{available_budget:,}",
+            ]
+            sort_values = [routine_name, stock_count, total_budget, used_budget, available_budget]
+
+            for col, value in enumerate(values):
+                item = SortableTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setData(Qt.UserRole, str(routine_dir))
+                item.setData(SORT_ROLE, sort_values[col])
+                self.routine_table.setItem(row, col, item)
+
+        self.routine_table.clearSelection()
+        if self._routine_sort_column >= 0:
+            self.routine_table.sortItems(self._routine_sort_column, self._routine_sort_order)
+
+    def current_selected_routine_name(self) -> str:
+        selected_rows = self.routine_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return ""
+
+        row = selected_rows[0].row()
+        item = self.routine_table.item(row, 0)
+        if item is None:
+            return ""
+
+        return item.text().strip()
+
+    def current_selected_routine_dir(self) -> Path | None:
+        selected_rows = self.routine_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return None
+
+        row = selected_rows[0].row()
+        item = self.routine_table.item(row, 0)
+        if item is None:
+            return None
+
+        path_text = item.data(Qt.UserRole)
+        if not path_text:
+            return None
+
+        path = Path(str(path_text))
+        if not path.exists():
+            return None
+
+        return path
+
+    def restore_routine_selection(self, routine_name: str) -> None:
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            if item and item.text().strip() == routine_name:
+                self.routine_table.selectRow(row)
+                return
+
+    def on_routine_selection_changed(self) -> None:
+        self.load_selected_routine_stocks()
+
+    def load_selected_routine_stocks(self) -> None:
+        auto_trade_load_selected_routine_stocks(self)
+
+    def selected_stock_dir(self) -> Path | None:
+        return selected_stock_dir(self)
+
+    def selected_stock_info(self) -> tuple[Path, str, str] | None:
+        return selected_stock_info(self)
+
+    def selected_stock_infos(self) -> list[tuple[Path, str, str]]:
+        return selected_stock_infos(self)
+
+    def fetch_minute_candles_for_selected_stock(self) -> None:
+        selected = self.selected_stock_info()
+        if selected is None:
+            self.statusBarMessage("분봉조회할 종목 1개를 선택하세요.")
+            return
+
+        _stock_dir, code, name = selected
+        parent = self.parent()
+        api = getattr(parent, "kiwoom_api", None)
+        if api is None:
+            self.statusBarMessage("키움 API가 초기화되지 않았습니다.")
+            return
+
+        if not api.is_available():
+            reason = api.unavailable_reason() or "unknown reason"
+            self.statusBarMessage(f"키움 API 사용불가: {reason}")
+            return
+
+        if not api.is_connected():
+            self.statusBarMessage("키움 로그인 후 분봉조회가 가능합니다.")
+            return
+
+        def handle_result(result: dict[str, object]) -> None:
+            if result.get("ok"):
+                saved_count = result.get("saved_count", 0)
+                message = f"{code} {name} candles.json 저장 완료: {saved_count}개"
+                warning = result.get("warning") or ""
+                if result.get("has_more") or warning:
+                    message = f"{message} ({warning or 'additional pages available'})"
+                self.statusBarMessage(message)
+                return
+
+            message = result.get("error") or result.get("message") or result.get("result") or "unknown error"
+            self.statusBarMessage(f"{code} {name} 분봉조회 실패: {message}")
+
+        try:
+            result = api.request_minute_candles(
+                code,
+                name,
+                interval=1,
+                count=300,
+                callback=handle_result,
+            )
+        except Exception as exc:
+            self.statusBarMessage(f"{code} {name} 분봉조회 실패: {exc}")
+            return
+
+        if result.get("ok"):
+            self.statusBarMessage(f"{code} {name} 분봉조회 요청됨")
+        else:
+            message = result.get("error") or result.get("message") or result.get("result") or "unknown error"
+            self.statusBarMessage(f"{code} {name} 분봉조회 실패: {message}")
+
+    def preview_order_candidates_for_pending_signals(self) -> None:
+        try:
+            from routine_signal_consumer import consume_pending_routine_signals_dry_run
+
+            result = consume_pending_routine_signals_dry_run(limit=5)
+            summary = result.get("summary", {}) if isinstance(result, dict) else {}
+            signals_checked = int(summary.get("signals_checked", 0) or 0)
+            blocked = int(summary.get("blocked", 0) or 0)
+            allowed = int(summary.get("allowed", 0) or 0)
+            errors = int(summary.get("errors", 0) or 0)
+            self.statusBarMessage(
+                f"주문후보검증: 확인 {signals_checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
+            )
+        except Exception as exc:
+            self.statusBarMessage(f"주문후보검증 실패: {exc}")
+
+    def read_order_from_queue_by_id(self, order_id: str, queue_path: Path) -> dict[str, object]:
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stage": "EXECUTION_ENABLE_ORDER_READ",
+                "order": None,
+                "blocked_reasons": [f"failed to read order_queue json: {exc}"],
+            }
+
+        if not isinstance(data, dict):
+            return {
+                "ok": False,
+                "stage": "EXECUTION_ENABLE_ORDER_READ",
+                "order": None,
+                "blocked_reasons": ["order_queue root must be an object"],
+            }
+
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            return {
+                "ok": False,
+                "stage": "EXECUTION_ENABLE_ORDER_READ",
+                "order": None,
+                "blocked_reasons": ["order_queue orders must be a list"],
+            }
+
+        for item in orders:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id", "") or "").strip() == order_id:
+                return {
+                    "ok": True,
+                    "stage": "EXECUTION_ENABLE_ORDER_READ",
+                    "order": dict(item),
+                    "blocked_reasons": [],
+                }
+
+        return {
+            "ok": False,
+            "stage": "EXECUTION_ENABLE_ORDER_READ",
+            "order": None,
+            "blocked_reasons": ["order_id not found"],
+        }
+
+    def execution_enable_confirmation_text(
+        self,
+        order: dict[str, object],
+        enable_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> str:
+        return "\n".join(
+            [
+                "execution_enabled 수동 활성화 확인",
+                "",
+                "이 작업은 order.execution_enabled 값을 True로 변경합니다.",
+                "SendOrder 호출이 아닙니다.",
+                "주문 전송이 아닙니다.",
+                "REAL_READY 생성이 아닙니다.",
+                "real_order_preflight는 자동 실행되지 않습니다.",
+                "status는 EXECUTABLE로 유지됩니다.",
+                "",
+                f"order_id: {enable_preview_result.get('order_id', order.get('id', '-'))}",
+                f"code: {enable_preview_result.get('code', order.get('code', '-'))}",
+                f"side: {enable_preview_result.get('side', order.get('side', '-'))}",
+                f"quantity: {enable_preview_result.get('quantity', order.get('quantity', '-'))}",
+                f"order_type: {enable_preview_result.get('order_type', order.get('order_type', '-'))}",
+                f"source_signal_id: {enable_preview_result.get('source_signal_id', order.get('source_signal_id', '-'))}",
+                f"approval_status: {order.get('approval_status', '-')}",
+                f"policy_status: {order.get('policy_status', '-')}",
+                "",
+                f"queue_path: {queue_path}",
+                f"before_sha256: {queue_snapshot.get('sha256', '-')}",
+                f"file_size: {queue_snapshot.get('size', '-')}",
+                f"mtime: {queue_snapshot.get('mtime', '-')}",
+                f"orders_count: {queue_snapshot.get('orders_count', '-')}",
+                "",
+                "계속하려면 수동 실주문 후보 활성화를 선택하세요.",
+            ]
+        )
+
+    def confirm_execution_enable_commit(
+        self,
+        order: dict[str, object],
+        enable_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("execution_enabled 수동 활성화 확인")
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(
+            self.execution_enable_confirmation_text(
+                order,
+                enable_preview_result,
+                queue_path,
+                queue_snapshot,
+            )
+        )
+        body.setMinimumHeight(380)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("수동 실주문 후보 활성화")
+        cancel_button = QPushButton("취소")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def show_execution_enable_result(self, result: dict[str, object]) -> None:
+        lines = [
+            "Execution Enable Result",
+            "",
+            f"enabled: {result.get('enabled', result.get('enable_preview', False))}",
+            f"enable_stage: {result.get('enable_stage', '-')}",
+            f"next_stage: {result.get('next_stage', '-')}",
+            f"changed: {result.get('changed', False)}",
+            f"order_id: {result.get('order_id', '-')}",
+            f"before_status: {result.get('before_status', '-')}",
+            f"after_status: {result.get('after_status', '-')}",
+            f"before_execution_enabled: {result.get('before_execution_enabled', '-')}",
+            f"after_execution_enabled: {result.get('after_execution_enabled', '-')}",
+            f"before_sha256: {result.get('before_sha256', '-')}",
+            f"after_sha256: {result.get('after_sha256', '-')}",
+            f"backup_path: {result.get('backup_path', '-')}",
+            "SendOrder called: False",
+            "real_order_preflight auto-called: False",
+            "",
+            "blocked_reasons:",
+        ]
+        blocked_reasons = result.get("blocked_reasons")
+        if isinstance(blocked_reasons, list) and blocked_reasons:
+            lines.extend(f"- {reason}" for reason in blocked_reasons)
+        else:
+            lines.append("-")
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Execution Enable Result")
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText("\n".join(str(line) for line in lines))
+        body.setMinimumHeight(380)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("확인")
+        ok_button.setMinimumWidth(80)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def enable_execution_candidate_manually(self) -> None:
+        order_id, accepted = QInputDialog.getText(
+            self,
+            "수동 실주문 후보 활성화",
+            "EXECUTABLE order_id:",
+        )
+        if not accepted:
+            return
+
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            self.statusBarMessage("수동 실주문 후보 활성화: order_id를 입력하세요.")
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        read_result = self.read_order_from_queue_by_id(order_id, queue_path)
+        if read_result.get("ok") is not True:
+            result = {
+                "enabled": False,
+                "enable_stage": "read_order",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": read_result.get("blocked_reasons", []),
+            }
+            self.show_execution_enable_result(result)
+            self.statusBarMessage("수동 실주문 후보 활성화 차단")
+            return
+
+        order = read_result.get("order")
+        order_dict = order if isinstance(order, dict) else {}
+        enable_preview = preview_execution_enable(
+            order_dict,
+            {"operator_confirmed_for_execution_enable": True},
+        )
+        self._last_execution_enable_preview_result = enable_preview
+        self._last_execution_enable_queue_snapshot = snapshot
+
+        if enable_preview.get("enable_preview") is not True:
+            result = {
+                "enabled": False,
+                "enable_stage": enable_preview.get("enable_stage"),
+                "next_stage": enable_preview.get("next_stage"),
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": enable_preview.get("blocked_reasons", []),
+            }
+            self.show_execution_enable_result(result)
+            self.statusBarMessage("수동 실주문 후보 활성화 차단")
+            return
+
+        if not self.confirm_execution_enable_commit(order_dict, enable_preview, queue_path, snapshot):
+            self.statusBarMessage("수동 실주문 후보 활성화 취소")
+            return
+
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            result = {
+                "enabled": False,
+                "enable_stage": "stale_preview",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "blocked_reasons": ["queue file changed after execution enable preview; rerun preview"],
+            }
+            self.show_execution_enable_result(result)
+            self.statusBarMessage("수동 실주문 후보 활성화 차단")
+            return
+
+        result = commit_execution_enable(
+            enable_preview,
+            queue_path,
+            preview_queue_snapshot=snapshot,
+            context={"manual_execution_enable_commit_confirmed": True},
+        )
+        self.show_execution_enable_result(result)
+        status_text = "완료" if result.get("enabled") else "차단"
+        self.statusBarMessage(f"수동 실주문 후보 활성화 {status_text}")
+
+    def real_preflight_confirmation_text(
+        self,
+        order: dict[str, object],
+        guard: dict[str, object],
+        preflight_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> str:
+        return "\n".join(
+            [
+                "REAL_READY 수동 점검 확인",
+                "",
+                "이 작업은 대상 order를 REAL_READY로 전환합니다.",
+                "",
+                "SendOrder 호출이 아닙니다.",
+                "",
+                "주문 전송이 아닙니다.",
+                "",
+                "Execution Preview는 자동 실행되지 않습니다.",
+                "",
+                "Queue 저장이 아닙니다.",
+                "",
+                "자동 실행 루프에 연결되지 않습니다.",
+                "",
+                "status",
+                "EXECUTABLE",
+                "↓",
+                "REAL_READY",
+                "",
+                "execution_enabled",
+                "True 유지",
+                "",
+                f"order_id: {preflight_preview_result.get('order_id', order.get('id', '-'))}",
+                f"code: {preflight_preview_result.get('code', order.get('code', '-'))}",
+                f"side: {preflight_preview_result.get('side', order.get('side', '-'))}",
+                f"quantity: {preflight_preview_result.get('quantity', order.get('quantity', '-'))}",
+                f"order_type: {preflight_preview_result.get('order_type', order.get('order_type', '-'))}",
+                f"source_signal_id: {preflight_preview_result.get('source_signal_id', order.get('source_signal_id', '-'))}",
+                f"approval_status: {order.get('approval_status', '-')}",
+                f"policy_status: {order.get('policy_status', '-')}",
+                "",
+                f"guard.real_trade_enabled: {guard.get('real_trade_enabled', '-')}",
+                f"guard.kiwoom_logged_in: {guard.get('kiwoom_logged_in', '-')}",
+                f"guard.account_selected: {guard.get('account_selected', '-')}",
+                f"guard.account_no: {guard.get('account_no', '-')}",
+                f"guard.operator_confirmed: {guard.get('operator_confirmed', '-')}",
+                "",
+                f"queue_path: {queue_path}",
+                f"before_sha256: {queue_snapshot.get('sha256', '-')}",
+                f"file_size: {queue_snapshot.get('size', '-')}",
+                f"mtime: {queue_snapshot.get('mtime', '-')}",
+                f"orders_count: {queue_snapshot.get('orders_count', '-')}",
+            ]
+        )
+
+    def confirm_real_preflight_commit(
+        self,
+        order: dict[str, object],
+        guard: dict[str, object],
+        preflight_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("REAL_READY 수동 점검 확인")
+        dialog.resize(760, 560)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(
+            self.real_preflight_confirmation_text(
+                order,
+                guard,
+                preflight_preview_result,
+                queue_path,
+                queue_snapshot,
+            )
+        )
+        body.setMinimumHeight(420)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("REAL_READY 수동 점검 실행")
+        cancel_button = QPushButton("취소")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def show_real_preflight_result(self, result: dict[str, object]) -> None:
+        lines = [
+            "REAL_READY Manual Preflight Result",
+            "",
+            f"real_preflight_committed: {result.get('real_preflight_committed', result.get('real_preflight_preview', False))}",
+            f"preflight_stage: {result.get('preflight_stage', '-')}",
+            f"next_stage: {result.get('next_stage', '-')}",
+            f"changed: {result.get('changed', False)}",
+            f"order_id: {result.get('order_id', '-')}",
+            f"before_status: {result.get('before_status', '-')}",
+            f"after_status: {result.get('after_status', '-')}",
+            f"execution_enabled: {result.get('execution_enabled', '-')}",
+            f"real_preflight_status: {result.get('real_preflight_status', '-')}",
+            f"real_preflight_reason: {result.get('real_preflight_reason', '-')}",
+            f"before_sha256: {result.get('before_sha256', '-')}",
+            f"after_sha256: {result.get('after_sha256', '-')}",
+            f"backup_path: {result.get('backup_path', '-')}",
+            f"send_order_called: {result.get('send_order_called', False)}",
+            "Execution Preview auto-called: False",
+            "",
+            "blocked_reasons:",
+        ]
+        blocked_reasons = result.get("blocked_reasons")
+        if isinstance(blocked_reasons, list) and blocked_reasons:
+            lines.extend(f"- {reason}" for reason in blocked_reasons)
+        else:
+            lines.append("-")
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("REAL_READY Manual Preflight Result")
+        dialog.resize(760, 560)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText("\n".join(str(line) for line in lines))
+        body.setMinimumHeight(420)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("확인")
+        ok_button.setMinimumWidth(80)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def run_real_ready_preflight_manually(self) -> None:
+        order_id, accepted = QInputDialog.getText(
+            self,
+            "REAL_READY 수동 점검",
+            "EXECUTABLE order_id:",
+        )
+        if not accepted:
+            return
+
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            self.statusBarMessage("REAL_READY 수동 점검: order_id를 입력하세요.")
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        guard_path = REAL_TRADE_GUARD_PATH
+        snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        read_result = self.read_order_from_queue_by_id(order_id, queue_path)
+        if read_result.get("ok") is not True:
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": "read_order",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": read_result.get("blocked_reasons", []),
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("REAL_READY 수동 점검 차단")
+            return
+
+        guard = read_json_dict(guard_path)
+        if not guard:
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": "guard",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": ["real trade guard not found or empty"],
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("REAL_READY 수동 점검 차단")
+            return
+
+        order = read_result.get("order")
+        order_dict = order if isinstance(order, dict) else {}
+        preflight_preview = preview_real_order_preflight(
+            order_dict,
+            guard,
+            {"manual_real_preflight_confirmed": True},
+        )
+        self._last_real_preflight_preview_result = preflight_preview
+        self._last_real_preflight_queue_snapshot = snapshot
+
+        if preflight_preview.get("real_preflight_preview") is not True:
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": preflight_preview.get("preflight_stage"),
+                "next_stage": preflight_preview.get("next_stage"),
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": preflight_preview.get("blocked_reasons", []),
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("REAL_READY 수동 점검 차단")
+            return
+
+        if not self.confirm_real_preflight_commit(order_dict, guard, preflight_preview, queue_path, snapshot):
+            self.statusBarMessage("REAL_READY 수동 점검 취소")
+            return
+
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": "stale_preview",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "blocked_reasons": ["queue file changed after real preflight preview; rerun REAL Preflight"],
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("REAL_READY 수동 점검 차단")
+            return
+
+        result = commit_real_order_preflight(
+            preflight_preview,
+            queue_path,
+            guard_path=guard_path,
+            preview_queue_snapshot=snapshot,
+            context={"manual_real_preflight_commit_confirmed": True},
+        )
+        self.show_real_preflight_result(result)
+        status_text = "완료" if result.get("real_preflight_committed") else "차단"
+        self.statusBarMessage(f"REAL_READY 수동 점검 {status_text}")
+
+    def preview_execution_for_real_ready_order_manual(self) -> None:
+        order_id, accepted = QInputDialog.getText(
+            self,
+            "Execution Preview",
+            "REAL_READY order_id:",
+        )
+        if not accepted:
+            return
+
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            self.statusBarMessage("Execution Preview: order_id를 입력하세요.")
+            return
+
+        try:
+            guard = read_json_dict(REAL_TRADE_GUARD_PATH)
+            result = preview_execution_for_real_ready_order(order_id, guard)
+            self._last_execution_preview_result = result
+            self._last_execution_preview_queue_snapshot = AutoTradeSettingWindow.queue_file_snapshot(ORDER_QUEUE_PATH)
+            AutoTradeSettingWindow.update_manual_queue_commit_button_state(self)
+            report = build_execution_preview_report(result)
+            preview_context = {
+                "source": "gui_execution_preview_button",
+                "guard": guard,
+                "legacy_execution_preview_result": result,
+            }
+            controller_result = build_execution_readiness_preview_from_context(
+                order_id=order_id,
+                preview_context=preview_context,
+            )
+            formatted_result = (
+                controller_result.get("formatted_result")
+                if isinstance(controller_result, dict)
+                else None
+            )
+            readiness_text = ""
+            if isinstance(formatted_result, dict):
+                readiness_text = str(formatted_result.get("text", "") or "")
+            if readiness_text:
+                readiness_report = dict(report)
+                readiness_report["text"] = readiness_text
+                readiness_report["readiness_controller_result"] = controller_result
+                report = readiness_report
+            self.show_execution_preview_report(report)
+            status_text = "통과" if report.get("ok") else "차단"
+            self.statusBarMessage(f"Execution Preview {status_text}: {order_id}")
+        except Exception as exc:
+            self.statusBarMessage(f"Execution Preview 실패: {exc}")
+            QMessageBox.critical(
+                self,
+                "Execution Preview 실패",
+                f"Execution Preview 처리 중 오류가 발생했습니다.\n\n{exc}",
+            )
+
+    def show_execution_preview_report(self, report: dict[str, object]) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Execution Preview Report")
+        dialog.resize(900, 650)
+
+        layout = QVBoxLayout()
+        title_label = QLabel("Execution Preview Report")
+        title_font = title_label.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 1)
+        title_label.setFont(title_font)
+        layout.addWidget(title_label)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(str(report.get("text", "")))
+        body.setMinimumHeight(500)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("확인")
+        ok_button.setMinimumWidth(80)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def execution_preview_result_dict(self) -> dict[str, object]:
+        result = getattr(self, "_last_execution_preview_result", None)
+        return result if isinstance(result, dict) else {}
+
+    def queue_write_preview_from_last_execution_preview(self) -> dict[str, object]:
+        result = AutoTradeSettingWindow.execution_preview_result_dict(self)
+        if isinstance(result.get("queue_write_preview_result"), dict):
+            return result["queue_write_preview_result"]
+
+        preview_result = result.get("preview_result")
+        if isinstance(preview_result, dict) and isinstance(preview_result.get("queue_write_preview_result"), dict):
+            return preview_result["queue_write_preview_result"]
+
+        return {}
+
+    def queue_file_snapshot(queue_path: Path) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "path": str(queue_path),
+            "sha256": None,
+            "size": None,
+            "mtime": None,
+            "orders_count": None,
+            "error": None,
+        }
+        try:
+            data = queue_path.read_bytes()
+            stat = queue_path.stat()
+            snapshot["sha256"] = hashlib.sha256(data).hexdigest().upper()
+            snapshot["size"] = stat.st_size
+            snapshot["mtime"] = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+            try:
+                decoded = json.loads(data.decode("utf-8"))
+                orders = decoded.get("orders") if isinstance(decoded, dict) else None
+                snapshot["orders_count"] = len(orders) if isinstance(orders, list) else None
+            except Exception as exc:
+                snapshot["error"] = f"orders_count unavailable: {exc}"
+        except Exception as exc:
+            snapshot["error"] = str(exc)
+
+        return snapshot
+
+    def last_execution_preview_queue_snapshot(self) -> dict[str, object]:
+        snapshot = getattr(self, "_last_execution_preview_queue_snapshot", None)
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def update_manual_queue_commit_button_state(self) -> None:
+        button = getattr(self, "btn_manual_queue_commit", None)
+        if button is None:
+            return
+
+        queue_write_preview = AutoTradeSettingWindow.queue_write_preview_from_last_execution_preview(self)
+        button.setEnabled(queue_write_preview.get("write_preview") is True)
+
+    def manual_queue_commit_confirmation_text(
+        self,
+        queue_write_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object] | None = None,
+    ) -> str:
+        record = queue_write_preview_result.get("order_queued_record_preview")
+        record_dict = record if isinstance(record, dict) else {}
+        snapshot = queue_snapshot if isinstance(queue_snapshot, dict) else AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+
+        return "\n".join(
+            [
+                "수동 Queue 저장 확인",
+                "",
+                "이 작업은 ORDER_QUEUED record를 order_queue JSON에 저장합니다.",
+                "SendOrder 호출이 아닙니다.",
+                "주문 전송이 아닙니다.",
+                "자동 실행 루프에 연결되지 않습니다.",
+                "",
+                f"order_id: {record_dict.get('order_id', '-')}",
+                f"request_hash: {record_dict.get('request_hash', '-')}",
+                f"lock_id: {record_dict.get('lock_id', '-')}",
+                f"queue_pending_id: {record_dict.get('queue_pending_id', '-')}",
+                f"order_queued_id: {record_dict.get('id', '-')}",
+                f"queue_path: {queue_path}",
+                f"before_sha256: {snapshot.get('sha256', '-')}",
+                f"file_size: {snapshot.get('size', '-')}",
+                f"mtime: {snapshot.get('mtime', '-')}",
+                f"orders_count: {snapshot.get('orders_count', '-')}",
+                f"backup_path: {queue_path}.bak",
+                "",
+                "계속하려면 수동 Queue 저장 실행을 선택하세요.",
+            ]
+        )
+
+    def confirm_manual_queue_commit(
+        self,
+        queue_write_preview_result: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object] | None = None,
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("수동 Queue 저장 확인")
+        dialog.resize(720, 420)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(self.manual_queue_commit_confirmation_text(queue_write_preview_result, queue_path, queue_snapshot))
+        body.setMinimumHeight(300)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("수동 Queue 저장 실행")
+        cancel_button = QPushButton("취소")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def show_manual_queue_commit_result(self, result: dict[str, object]) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Queue Commit Result")
+        dialog.resize(760, 520)
+
+        commit_result = result.get("commit_result")
+        commit_result_dict = commit_result if isinstance(commit_result, dict) else {}
+        lines = [
+            "Manual Queue Commit Result",
+            "",
+            f"manual_commit: {result.get('manual_commit')}",
+            f"commit_stage: {result.get('commit_stage')}",
+            f"next_stage: {result.get('next_stage')}",
+            f"before_sha256: {result.get('before_sha256', '-')}",
+            f"after_sha256: {result.get('after_sha256', '-')}",
+            f"changed: {commit_result_dict.get('changed', result.get('changed', '-'))}",
+            f"status: {commit_result_dict.get('status', '-')}",
+            f"order_id: {commit_result_dict.get('order_id', '-')}",
+            f"order_queued_id: {commit_result_dict.get('order_queued_id', '-')}",
+            f"request_hash: {commit_result_dict.get('request_hash', '-')}",
+            f"lock_id: {commit_result_dict.get('lock_id', '-')}",
+            f"order_queue_path: {commit_result_dict.get('order_queue_path', '-')}",
+            f"backup_path: {commit_result_dict.get('backup_path', '-')}",
+            f"send_order_called: {commit_result_dict.get('send_order_called', False)}",
+            f"execution_enabled: {commit_result_dict.get('execution_enabled', False)}",
+            "",
+            "blocked_reasons:",
+        ]
+        blocked_reasons = result.get("blocked_reasons")
+        if isinstance(blocked_reasons, list) and blocked_reasons:
+            lines.extend(f"- {reason}" for reason in blocked_reasons)
+        else:
+            lines.append("-")
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText("\n".join(str(line) for line in lines))
+        body.setMinimumHeight(380)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("확인")
+        ok_button.setMinimumWidth(80)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def commit_last_execution_preview_queue_manually(self) -> None:
+        queue_write_preview = self.queue_write_preview_from_last_execution_preview()
+        if queue_write_preview.get("write_preview") is not True:
+            self.statusBarMessage("수동 Queue 저장: 먼저 유효한 Execution Preview를 실행하세요.")
+            self.update_manual_queue_commit_button_state()
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        preview_snapshot = AutoTradeSettingWindow.last_execution_preview_queue_snapshot(self)
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if not preview_snapshot.get("sha256"):
+            result = {
+                "manual_commit": False,
+                "commit_stage": "stale_preview",
+                "next_stage": "BLOCKED",
+                "commit_result": None,
+                "before_sha256": preview_snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "changed": False,
+                "blocked_reasons": ["queue snapshot from preview is required"],
+            }
+            self.show_manual_queue_commit_result(result)
+            self.statusBarMessage("수동 Queue 저장 차단: Execution Preview를 다시 실행하세요.")
+            return
+
+        if preview_snapshot.get("sha256") != current_snapshot.get("sha256"):
+            result = {
+                "manual_commit": False,
+                "commit_stage": "stale_preview",
+                "next_stage": "BLOCKED",
+                "commit_result": None,
+                "before_sha256": preview_snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "changed": False,
+                "blocked_reasons": ["queue file changed after preview; rerun Execution Preview"],
+            }
+            self.show_manual_queue_commit_result(result)
+            self.statusBarMessage("수동 Queue 저장 차단: Execution Preview를 다시 실행하세요.")
+            return
+
+        if not self.confirm_manual_queue_commit(queue_write_preview, queue_path, current_snapshot):
+            self.statusBarMessage("수동 Queue 저장: 취소됨")
+            return
+
+        result = commit_execution_queue_manually(
+            queue_write_preview,
+            queue_path,
+            context={
+                "manual_queue_write_confirmed": True,
+                "manual_runtime_queue_write_confirmed": True,
+            },
+        )
+        after_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        result["before_sha256"] = current_snapshot.get("sha256")
+        result["after_sha256"] = after_snapshot.get("sha256")
+        result["changed"] = current_snapshot.get("sha256") != after_snapshot.get("sha256")
+        self.show_manual_queue_commit_result(result)
+        status_text = "완료" if result.get("manual_commit") else "차단"
+        self.statusBarMessage(f"수동 Queue 저장 {status_text}")
+
+    def int_state_value(self, state: dict[str, object], key: str) -> int:
+        try:
+            return int(state.get(key, 0) or 0)
+        except Exception:
+            return 0
+
+    def resume_status_after_pause(self, state: dict[str, object]) -> tuple[str, dict[str, object], str]:
+        return auto_trade_resume_status_after_pause(self, state)
+
+    def pre_start_review_check(self, routine_name: str, stock_dir: Path, code: str, name: str) -> dict[str, object]:
+        """
+        자동매매 시작 전 사전점검.
+
+        프로그램이 먼저 점검하고, 문제 없는 종목만 RUNNING으로 전환한다.
+        문제 소지가 있는 종목은 REVIEW_REQUIRED로 전환한 뒤 검토관리창에서 HTS 검토 후 처리한다.
+        """
+        item = build_review_required_item(routine_name, stock_dir, code, name)
+        state = read_json_dict(stock_dir / "state.json")
+        before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+
+        data_reasons = auto_trade_setting_data_inconsistency_reasons(state)
+        if data_reasons:
+            return build_review_required_item(routine_name, stock_dir, code, name, data_reasons)
+
+        # PAUSED 상태는 일시중지 기간 중 신호 검토 정책을 추가 반영한다.
+        if before_status == "PAUSED":
+            new_status, metadata, reason = self.resume_status_after_pause(state)
+            if new_status == "REVIEW_REQUIRED":
+                forced = [reason]
+                item = build_review_required_item(routine_name, stock_dir, code, name, forced)
+                item["resume_metadata"] = metadata
+                return item
+
+        return item
+
+    def mark_review_required(
+        self,
+        stock_dir: Path,
+        code: str,
+        name: str,
+        item: dict[str, object],
+        source: str = "",
+    ) -> bool:
+        reasons = unique_review_reasons(list(item.get("review_reasons", [])))
+        reason_text = " / ".join(reasons) if reasons else "수동 검토 필요"
+        review_location = str(
+            source
+            or item.get("review_location", "")
+            or item.get("review_source", "")
+            or item.get("detected_by", "")
+            or "-"
+        ).strip() or "-"
+
+        metadata = {
+            "review_required": True,
+            "review_status": "PENDING",
+            "review_location": review_location,
+            "review_reason": reason_text,
+            "review_checked_at": now_text(),
+            "missed_buy_signal_count": safe_int_value(item.get("missed_buy_signal_count"), 0),
+            "missed_sell_signal_count": safe_int_value(item.get("missed_sell_signal_count"), 0),
+            "last_checked_price": safe_float_value(item.get("current_price"), 0.0),
+            "last_checked_pnl_rate": str(item.get("pnl_rate_text", "-")),
+        }
+        resume_metadata = item.get("resume_metadata")
+        if isinstance(resume_metadata, dict):
+            metadata.update(resume_metadata)
+
+        return self.update_stock_status(stock_dir, code, name, "REVIEW_REQUIRED", metadata, reason_text)
+
+    def update_stock_status(
+        self,
+        stock_dir: Path,
+        code: str,
+        name: str,
+        new_status: str,
+        extra_state: dict[str, object] | None = None,
+        log_suffix: str = "",
+    ) -> bool:
+        return auto_trade_update_stock_status(
+            self,
+            stock_dir,
+            code,
+            name,
+            new_status,
+            extra_state,
+            log_suffix,
+        )
+
+    def operation_policy_protected_status(self, status: object) -> bool:
+        return auto_trade_operation_policy_protected_status(self, status)
+
+    def recalculate_stock_status_by_operation_policy(
+        self,
+        stock_dir: Path,
+        code: str,
+        name: str,
+        reason: str,
+        extra_state: dict[str, object] | None = None,
+        silent_unchanged: bool = False,
+    ) -> tuple[str, str, str]:
+        return auto_trade_recalculate_stock_status_by_operation_policy(
+            self,
+            stock_dir,
+            code,
+            name,
+            reason,
+            extra_state,
+            silent_unchanged,
+        )
+    def recalculate_all_status_by_operation_policy(
+        self,
+        reason: str,
+        silent_unchanged: bool = False,
+        write_changelog_when_unchanged: bool = True,
+    ) -> dict[str, int]:
+        return auto_trade_recalculate_all_status_by_operation_policy(
+            self,
+            reason,
+            silent_unchanged,
+            write_changelog_when_unchanged,
+        )
+    def update_stock_operation_mode(
+        self,
+        stock_dir: Path,
+        code: str,
+        name: str,
+        operation_mode: str,
+        config_updates: dict[str, object] | None = None,
+    ) -> bool:
+        return auto_trade_update_stock_operation_mode(
+            self,
+            stock_dir,
+            code,
+            name,
+            operation_mode,
+            config_updates,
+        )
+
+    def unregister_selected_auto_trade_stocks(self) -> None:
+        unregister_selected_auto_trade_stocks(self)
+
+    def statusBar_message(self, message: str, timeout_ms: int = 7000) -> None:
+        parent = self.parent()
+        status_bar_getter = getattr(parent, "statusBar", None)
+        if callable(status_bar_getter):
+            try:
+                status_bar_getter().showMessage(message, timeout_ms)
+            except Exception:
+                pass
+
+
+    def open_operation_environment_settings(self) -> None:
+        """스케줄매매관리 대체: 운영환경설정 창을 연다."""
+        dialog = OperationEnvironmentSettingsDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.statusBarMessage("환경설정 저장 완료")
+            self.refresh_all()
+
+    def open_selected_stock_policy_settings(self) -> None:
+        """종목 우클릭용 개별종목 설정 창."""
+        selected = self.selected_stock_info()
+        if selected is None:
+            QMessageBox.warning(self, "선택 오류", "개별종목 설정은 종목 1개를 선택한 상태에서 사용할 수 있습니다.")
+            return
+        stock_dir, code, name = selected
+        dialog = StockPolicyOverrideDialog(stock_dir, code, name, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.refresh_all()
+
+    def set_global_schedule_time(self) -> None:
+        """하위 호환용: 스케줄매매관리 창을 연다."""
+        self.open_schedule_trade_management_window()
+
+    def open_schedule_trade_management_window(self) -> None:
+        dialog = ScheduleTradeManagementDialog(self)
+        dialog.exec_()
+        self.refresh_all()
+
+    def set_selected_individual_schedule_time(self) -> None:
+        selected = self.selected_stock_infos()
+        if not selected:
+            QMessageBox.warning(self, "선택 오류", "시간을 변경할 종목을 1개 이상 선택하세요.")
+            return
+
+        first_config = read_json_dict(selected[0][0] / "config.json")
+        if not first_config:
+            first_config = default_config()
+        start_time, end_buy_time, _ = effective_schedule_times(first_config)
+
+        dialog = ScheduleOperationDialog(self, start_time, end_buy_time, len(selected))
+        dialog.setWindowTitle("종목 시간 예외 설정")
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.set_selected_operation_mode(
+            "SCHEDULED",
+            schedule_config_updates(
+                dialog.start_time(),
+                dialog.end_buy_time(),
+            ),
+        )
+
+    def reset_selected_schedule_to_global(self) -> None:
+        selected = self.selected_stock_infos()
+        if not selected:
+            QMessageBox.warning(self, "선택 오류", "기본 시간으로 리셋할 종목을 1개 이상 선택하세요.")
+            return
+
+        global_schedule = read_global_schedule()
+        self.set_selected_operation_mode(
+            "SCHEDULED",
+            schedule_config_updates(
+                global_schedule["start_time"],
+                global_schedule["end_buy_time"],
+            ),
+        )
+
+    def set_selected_schedule_operation_mode(self) -> None:
+        auto_trade_set_selected_schedule_operation_mode(self)
+
+    def set_selected_operation_mode(
+        self,
+        operation_mode: str,
+        config_updates: dict[str, object] | None = None,
+    ) -> None:
+        auto_trade_set_selected_operation_mode(self, operation_mode, config_updates)
+
+    def set_selected_stocks_buy_end(self) -> None:
+        auto_trade_set_selected_stocks_buy_end(self)
+
+    def run_current_routine_stability_check(self) -> None:
+        auto_trade_run_current_routine_stability_check(self)
+
+    def split_start_targets(
+        self,
+        selected: list[tuple[Path, str, str]],
+    ) -> tuple[list[tuple[Path, str, str]], list[str]]:
+        """
+        매매시작 대상과 제외 대상을 분리한다.
+
+        정책:
+        - STOPPED: 강제종료/정지 상태이므로 매매시작 가능
+        - MONITORING/WATCHING/WATCH/WATCH_BUY: 화면상 감시/대기지만 주문 비활성 상태이므로
+          매매시작 버튼으로 현재 시간/운영방식에 맞게 재판정 가능
+        - RUNNING/SELL_ONLY/REVIEW_REQUIRED/EMERGENCY 계열은 보호 상태로 제외
+        """
+        targets: list[tuple[Path, str, str]] = []
+        skipped: list[str] = []
+
+        start_allowed_statuses = {
+            "STOPPED",
+            "STOP",
+            "WAIT",
+            "WAIT_BUY",
+            "WAIT_SELL",
+            "MONITORING",
+            "WATCHING",
+            "WATCH",
+            "WATCH_BUY",
+        }
+
+        for stock_dir, code, name in selected:
+            state = read_json_dict(stock_dir / "state.json")
+            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+            if status in start_allowed_statuses:
+                targets.append((stock_dir, code, name))
+            else:
+                skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
+
+        return targets, skipped
+
+    def split_stop_targets(
+        self,
+        selected: list[tuple[Path, str, str]],
+    ) -> tuple[list[tuple[Path, str, str]], list[str]]:
+        """
+        강제종료 대상과 제외 대상을 분리한다.
+
+        강제종료는 최상위 중지 명령이다.
+        조기마감/자동마감/청산중처럼 trade_enabled=False가 될 수 있는 상태도
+        현재 동작을 끊기 위해 강제종료 대상에 포함한다.
+
+        제외 기준은 상태값 자체가 STOPPED 계열인 경우만 사용한다.
+        """
+        targets: list[tuple[Path, str, str]] = []
+        skipped: list[str] = []
+
+        stopped_statuses = {
+            "STOPPED",
+            "STOP",
+        }
+
+        for stock_dir, code, name in selected:
+            state = read_json_dict(stock_dir / "state.json")
+            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+
+            if status in stopped_statuses:
+                skipped.append(f"{code} {name}(이미 중지됨)")
+                continue
+
+            targets.append((stock_dir, code, name))
+
+        return targets, skipped
+
+    def stop_risk_parts(self, stock_dir: Path) -> list[str]:
+        """강제종료 시 검토관리로 보내야 하는 보유/미체결 사유."""
+        state = read_json_dict(stock_dir / "state.json")
+        holding_qty = safe_int_value(state.get("holding_qty"), 0)
+        pending_exists, pending_qty = pending_order_summary(stock_dir, state)
+
+        parts: list[str] = []
+        if holding_qty > 0:
+            parts.append(f"보유 {holding_qty:,}주")
+        if pending_exists:
+            parts.append(f"미체결 {pending_qty:,}주")
+        return parts
+
+    def stop_warning_items(self, selected: list[tuple[Path, str, str]]) -> list[str]:
+        """
+        강제종료 전 검토관리 이동 예정 종목을 반환한다.
+        """
+        items: list[str] = []
+        for stock_dir, code, name in selected:
+            parts = self.stop_risk_parts(stock_dir)
+            if parts:
+                items.append(f"{code} {name}({', '.join(parts)})")
+        return items
+
+    def confirm_stop_targets_once(self, selected: list[tuple[Path, str, str]]) -> bool:
+        """강제종료 전 확인창은 1개만 표시한다.
+
+        확인창 안에서 일반 중지 대상과 검토관리 대상을 함께 보여준다.
+        """
+        stop_items: list[str] = []
+        review_items: list[str] = []
+
+        for stock_dir, code, name in selected:
+            risk_parts = self.stop_risk_parts(stock_dir)
+            if risk_parts:
+                review_items.append(f"{code} {name}({', '.join(risk_parts)})")
+            else:
+                stop_items.append(f"{code} {name}")
+
+        def preview_lines(title: str, items: list[str]) -> str:
+            if not items:
+                return f"{title}: 없음"
+            preview = "\n".join(f"- {item}" for item in items[:12])
+            if len(items) > 12:
+                preview += f"\n- 외 {len(items) - 12}개"
+            return f"{title}:\n{preview}"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("강제종료 확인")
+        dialog.resize(420, 360)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+
+        title_label = QLabel("강제종료 선택종목")
+        title_font = title_label.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 1)
+        title_label.setFont(title_font)
+        layout.addWidget(title_label)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText(
+            f"{preview_lines('중지 대상', stop_items)}\n\n"
+            f"{preview_lines('검토관리 대상', review_items)}"
+        )
+        body.setMinimumHeight(210)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        question_label = QLabel("진행하시겠습니까?")
+        layout.addWidget(question_label)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("진행")
+        cancel_button = QPushButton("취소")
+        proceed_button.setMinimumWidth(80)
+        cancel_button.setMinimumWidth(80)
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def show_auto_trade_result_dialog(self, title: str, heading: str, lines: list[str]) -> None:
+        """강제종료 확인창과 같은 형식의 결과 표시 전용 창."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(420, 320)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+
+        title_label = QLabel(heading)
+        title_font = title_label.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 1)
+        title_label.setFont(title_font)
+        layout.addWidget(title_label)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText("\n".join(lines))
+        body.setMinimumHeight(180)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("확인")
+        ok_button.setMinimumWidth(80)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def start_selected_auto_trades(self) -> None:
+        auto_trade_start_selected_auto_trades(self)
+
+
+    def apply_selected_early_close_default(self, checked: bool = False) -> None:
+        # QPushButton.clicked may pass a checked(bool) argument.
+        # The default early-close method is read inside auto_trade_apply_selected_early_close_default().
+        auto_trade_apply_selected_early_close_default(self)
+
+    def apply_selected_early_close_profit_loss(self) -> None:
+        auto_trade_apply_selected_early_close_profit_loss(self)
+
+    def apply_selected_early_close(
+        self,
+        method: str,
+        profit_percent: str = "",
+        loss_percent: str = "",
+        source: str = "우클릭",
+        extra_policy: dict[str, object] | None = None,
+    ) -> None:
+        if extra_policy is None and (str(profit_percent).strip() or str(loss_percent).strip()):
+            extra_policy = {
+                "profit_percent": str(profit_percent).strip(),
+                "loss_percent": str(loss_percent).strip(),
+            }
+        auto_trade_apply_selected_early_close(
+            self,
+            method,
+            source=source,
+            extra_policy=extra_policy,
+        )
+    def stop_selected_auto_trades(self) -> None:
+        auto_trade_stop_selected_auto_trades(self)
+
+    def open_review_required_window(self) -> None:
+        auto_trade_open_review_required_window(self)
+
+    def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
+        """부모 창 상태바에 메시지를 전달한다.
+
+        분리 모듈에서는 MainWindow를 직접 참조하지 않는다.
+        부모가 statusBar()를 제공하면 사용하고, 아니면 창 제목만 갱신한다.
+        """
+        parent = self.parent()
+        status_bar_getter = getattr(parent, "statusBar", None)
+        if callable(status_bar_getter):
+            try:
+                status_bar_getter().showMessage(message, timeout_ms)
+            except Exception:
+                pass
+        self.setWindowTitle(f"자동매매설정 - {message}")
+
+    def open_order_status_window(self) -> None:
+        open_auto_trade_order_status_window(self)
+
+    def open_log_view_window(self) -> None:
+        open_auto_trade_log_view_window(self)
+
+    def show_deferred_message(self) -> None:
+        show_deferred_config_message(self)
+
+
+def base_stock_routine_assignments() -> dict[tuple[str, str], set[str]]:
+    """
+    기초종목.txt 기준 종목-루틴 연결 정보를 반환한다.
+
+    자동매매설정 창은 루틴 폴더에 남은 종목 폴더만으로 종목을 표시하지 않고,
+    기초종목.txt 에 실제 연결된 종목만 표시한다.
+    """
+    result: dict[tuple[str, str], set[str]] = {}
+    for stock in read_base_stocks():
+        code = str(stock.get("code", "")).strip()
+        name = str(stock.get("name", "")).strip()
+        routines = stock.get("routines", [])
+        if not code or not name:
+            continue
+        if isinstance(routines, list):
+            routine_set = {str(routine).strip() for routine in routines if str(routine).strip()}
+        else:
+            routine_text = str(routines).strip()
+            routine_set = {routine_text} if routine_text else set()
+        result[(code, name)] = routine_set
+    return result
+
+
+def is_stock_assigned_to_routine(code: str, name: str, routine_name: str) -> bool:
+    """
+    기초종목.txt 기준으로 종목이 해당 루틴에 연결되어 있는지 확인한다.
+    """
+    assignments = base_stock_routine_assignments()
+    return routine_name in assignments.get((code, name), set())
+
+
+def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
+    """
+    자동매매설정 표시용 루틴 종목 폴더 목록을 반환한다.
+
+    루틴 폴더 안에 물리 폴더가 남아 있어도 기초종목.txt 에 연결 정보가 없으면
+    자동매매설정 창에는 표시하지 않는다.
+    """
+    routine_name = routine_display_name(routine_dir)
+    result: list[Path] = []
+    for stock_dir in get_stock_dirs_in_routine(routine_dir):
+        code, name = parse_stock_folder_name(stock_dir.name)
+        if not is_stock_assigned_to_routine(code, name, routine_name):
+            continue
+        if is_review_required_stock_dir(stock_dir):
+            continue
+        result.append(stock_dir)
+    return result
+
+
+def reset_runtime_orders_for_force_unregister(stock_dir: Path) -> bool:
+    """
+    강제 등록해제 시 자동매매설정 표에 남는 매결/도결/미체결 흔적을 제거한다.
+
+    정책:
+    - 현재 화면과 판단 기준이 되는 orders.json 은 빈 주문 목록으로 초기화한다.
+    - 기존 주문 기록은 즉시 삭제하지 않고 orders_archive.json 에 보존한다.
+    - config.json, logs 폴더, 루틴 종목 폴더는 건드리지 않는다.
+    """
+    orders_path = stock_dir / "orders.json"
+    archive_path = stock_dir / "orders_archive.json"
+
+    current_orders = read_orders_data(orders_path)
+
+    try:
+        if current_orders:
+            archive_data = read_json_dict(archive_path)
+            archives = archive_data.get("archives", [])
+            if not isinstance(archives, list):
+                archives = []
+
+            archives.append(
+                {
+                    "archived_at": now_text(),
+                    "reason": "강제 등록해제 상태초기화로 orders.json 현재 표시/판단 흔적 초기화",
+                    "orders": current_orders,
+                }
+            )
+
+            archive_path.write_text(
+                json.dumps({"archives": archives}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        orders_path.write_text(json.dumps(default_orders(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def reset_runtime_state_for_force_unregister(stock_dir: Path) -> bool:
+    """
+    강제 등록해제 시 runtime 폴더와 설정/로그는 유지하되,
+    현재 운영상태(state.json)와 화면 판단용 주문 흔적(orders.json)을 초기화한다.
+    """
+    state_path = stock_dir / "state.json"
+    state = read_json_dict(state_path)
+    if not state:
+        state = default_state()
+
+    reset_values = {
+        "status": "STOPPED",
+        "trade_set_status": "WAIT_BUY",
+        "current_set_no": 1,
+        "current_round": 0,
+        "avg_price": 0,
+        "holding_qty": 0,
+        "holding_amount": 0,
+        "buy_count": 0,
+        "last_buy_price": 0,
+        "last_buy_time": "",
+        "last_sell_time": "",
+        "pending_order": False,
+        "pending_qty": 0,
+        "remaining_qty": 0,
+        "unfilled_qty": 0,
+        "buy_pending_qty": 0,
+        "sell_pending_qty": 0,
+        "paused_at": "",
+        "resumed_at": "",
+        "review_required": False,
+        "review_reason": "",
+        "missed_buy_signal_count": 0,
+        "missed_sell_signal_count": 0,
+        "pause_signal_check_status": "UNCHECKED",
+        "ignore_signals_before": "",
+        "updated_at": now_text(),
+    }
+    state.update(reset_values)
+
+    try:
+        if not reset_runtime_orders_for_force_unregister(stock_dir):
+            return False
+        if not write_state_json(stock_dir, state):
+            return False
+        return True
+    except Exception:
+        return False

@@ -1,0 +1,34 @@
+처리불가 리포트
+발생시각: 2026-06-03 14:10:35
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 3개
+
+1. 005930 삼성전자
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 감시/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 028260 삼성물산
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\028260_삼성물산\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\028260_삼성물산\orders.json
+
+3. 247540 에코프로비엠
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\247540_에코프로비엠\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\247540_에코프로비엠\orders.json

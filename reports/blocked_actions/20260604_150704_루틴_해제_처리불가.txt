@@ -1,0 +1,25 @@
+처리불가 리포트
+발생시각: 2026-06-04 15:07:04
+작업종류: 루틴 해제
+대상 루틴: 등록확인폴더
+처리불가 종목 수: 2개
+
+1. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+2. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json

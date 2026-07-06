@@ -1,0 +1,10 @@
+{
+  "routine": "MACD",
+  "total_budget": 1000000,
+  "used_budget": 0,
+  "available_budget": 1000000,
+  "reserved_order_budget": 0,
+  "daily_realized_pnl": 0,
+  "daily_loss_limit_percent": -3,
+  "updated_at": "2026-05-31 14:53:34"
+}

@@ -1,0 +1,122 @@
+[
+  {
+    "code": "005930",
+    "name": "삼성전자",
+    "market": "KOSPI",
+    "chosung": "ㅅㅅㅈㅈ"
+  },
+  {
+    "code": "000660",
+    "name": "SK하이닉스",
+    "market": "KOSPI",
+    "chosung": "SKㅎㅇㄴㅅ"
+  },
+  {
+    "code": "035420",
+    "name": "NAVER",
+    "market": "KOSPI",
+    "chosung": "NAVER"
+  },
+  {
+    "code": "035720",
+    "name": "카카오",
+    "market": "KOSPI",
+    "chosung": "ㅋㅋㅇ"
+  },
+  {
+    "code": "005380",
+    "name": "현대차",
+    "market": "KOSPI",
+    "chosung": "ㅎㄷㅊ"
+  },
+  {
+    "code": "051910",
+    "name": "LG화학",
+    "market": "KOSPI",
+    "chosung": "LGㅎㅎ"
+  },
+  {
+    "code": "006400",
+    "name": "삼성SDI",
+    "market": "KOSPI",
+    "chosung": "ㅅㅅSDI"
+  },
+  {
+    "code": "068270",
+    "name": "셀트리온",
+    "market": "KOSPI",
+    "chosung": "ㅅㅌㄹㅇ"
+  },
+  {
+    "code": "105560",
+    "name": "KB금융",
+    "market": "KOSPI",
+    "chosung": "KBㄱㅇ"
+  },
+  {
+    "code": "055550",
+    "name": "신한지주",
+    "market": "KOSPI",
+    "chosung": "ㅅㅎㅈㅈ"
+  },
+  {
+    "code": "028260",
+    "name": "삼성물산",
+    "market": "KOSPI",
+    "chosung": "ㅅㅅㅁㅅ"
+  },
+  {
+    "code": "012330",
+    "name": "현대모비스",
+    "market": "KOSPI",
+    "chosung": "ㅎㄷㅁㅂㅅ"
+  },
+  {
+    "code": "066570",
+    "name": "LG전자",
+    "market": "KOSPI",
+    "chosung": "LGㅈㅈ"
+  },
+  {
+    "code": "096770",
+    "name": "SK이노베이션",
+    "market": "KOSPI",
+    "chosung": "SKㅇㄴㅂㅇㅅ"
+  },
+  {
+    "code": "003550",
+    "name": "LG",
+    "market": "KOSPI",
+    "chosung": "LG"
+  },
+  {
+    "code": "323410",
+    "name": "카카오뱅크",
+    "market": "KOSPI",
+    "chosung": "ㅋㅋㅇㅂㅋ"
+  },
+  {
+    "code": "247540",
+    "name": "에코프로비엠",
+    "market": "KOSDAQ",
+    "chosung": "ㅇㅋㅍㄹㅂㅇ"
+  },
+  {
+    "code": "086520",
+    "name": "에코프로",
+    "market": "KOSDAQ",
+    "chosung": "ㅇㅋㅍㄹ"
+  },
+  {
+    "code": "091990",
+    "name": "셀트리온헬스케어",
+    "market": "KOSDAQ",
+    "chosung": "ㅅㅌㄹㅇㅎㅅㅋㅇ"
+  },
+  {
+    "code": "293490",
+    "name": "카카오게임즈",
+    "market": "KOSDAQ",
+    "chosung": "ㅋㅋㅇㄱㅇㅈ"
+  }
+]

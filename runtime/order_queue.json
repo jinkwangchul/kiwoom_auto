@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-03 10:08:43",
+  "orders": [
+    {
+      "id": "ORDER_20260703_100843_003550_SELL_1",
+      "created_at": "2026-07-03 10:08:43",
+      "updated_at": "2026-07-03 10:08:43",
+      "status": "PENDING",
+      "source": "routine_signals",
+      "source_signal_id": "TEST_PENDING_SELL_20260703_100843_077836",
+      "routine": "??????",
+      "code": "003550",
+      "name": "LG",
+      "side": "SELL",
+      "order_type": "SELL_NO_HOLDING_CANDIDATE",
+      "quantity": 0,
+      "amount": null,
+      "price": 158.0,
+      "candidate_status": "NO_HOLDING_QTY",
+      "candidate_reason": "SELL 신호이나 보유수량 0 (REAL_OR_STATE_HOLDING_ZERO)",
+      "budget_source": null,
+      "price_basis": "latest_price",
+      "quantity_estimated": 0,
+      "execution_enabled": false,
+      "reason": "temporary verification signal",
+      "signal_index": 999,
+      "delay_bar": null,
+      "tick_key": "manual_order_queue_candidate_test",
+      "holding_source": "REAL_OR_STATE_HOLDING_ZERO"
+    }
+  ]
+}

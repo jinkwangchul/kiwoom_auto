@@ -1,0 +1,20 @@
+{
+  "routine": "지표추종매매",
+  "enabled": true,
+  "created_at": "2026-06-15 19:03:54",
+  "updated_at": "2026-06-15 19:04:12",
+  "routine_name": "지표추종매매",
+  "assigned_routine": "지표추종매매",
+  "active_routine": "지표추종매매",
+  "routines": [
+    "지표추종매매"
+  ],
+  "real_trade_enabled": true,
+  "real_trade_policy_updated_at": "2026-06-15 19:04:12",
+  "operation_mode": "SCHEDULED",
+  "operation_mode_updated_at": "2026-06-16 08:18:10",
+  "start_time": "09:30:00",
+  "end_buy_time": "13:30:00",
+  "trade_start_time": "09:30:00",
+  "buy_end_time": "13:30:00"
+}

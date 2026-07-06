@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "name": "등록확인루틴",
+  "enabled": true,
+  "version": "0.1.0",
+  "routine_type": "utility",
+  "entry_file": "routine.py",
+  "module_name": "register_check_routine",
+  "description": "등록 확인 및 테스트용 루틴 패키지입니다. 현재는 패키지 자동인식용 더미 routine.py를 포함합니다.",
+  "source": {
+    "created_from": "legacy_routine_folder_budget_json",
+    "legacy_dir": "_등록확인폴더",
+    "migrated_at": "2026-06-16 07:44:43"
+  },
+  "budget": {
+    "total_budget": 1000000,
+    "used_budget": 0,
+    "available_budget": 1000000,
+    "reserved_order_budget": 0,
+    "daily_realized_pnl": 0,
+    "daily_loss_limit_percent": -3,
+    "legacy_updated_at": "2026-05-31 14:53:34"
+  },
+  "safety": {
+    "auto_restore_after_missing": false,
+    "delete_stock_when_routine_missing": false,
+    "exclude_auto_trade_when_missing": true,
+    "move_to_review_if_holding_or_pending": true
+  },
+  "runtime": {
+    "execution_enabled": false,
+    "note": "현재 routine.py는 자동 인식 및 구조 전환용 더미입니다. 실제 매매 실행은 메인 엔진 안정화 후 별도 연결합니다."
+  }
+}

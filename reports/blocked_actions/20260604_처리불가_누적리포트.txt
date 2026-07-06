@@ -1,0 +1,603 @@
+처리불가 누적 리포트
+작성일자: 2026-06-04
+작성방식: 1일 1파일 누적 기록
+======================================================================
+[2026-06-04 15:43:18]
+작업종류: 루틴 해제
+대상 루틴: 등록확인폴더
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 감시/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:47:08]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+2. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:47:52]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:48:24]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 15:53:36]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 15:53:44]
+작업종류: 루틴 해제
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+2. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:53:49]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+2. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:53:55]
+작업종류: 루틴 해제
+대상 루틴: 등록확인폴더
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 감시/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:54:25]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+2. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 15:54:33]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 15:54:45]
+작업종류: 루틴 해제
+대상 루틴: 등록확인폴더
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 감시/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035720 카카오
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 16:00:45]
+작업종류: 루틴 해제
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+2. 035720 카카오
+   - 차단 사유: 매수/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+3. 051910 LG화학
+   - 차단 사유: 매수/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\051910_LG화학\orders.json
+
+======================================================================
+[2026-06-04 16:24:08]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:24:31]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:24:56]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:26:17]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:33:50]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 차단 사유: 감시/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:36:53]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 16:41:19]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 17:05:08]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 17:11:30]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 차단 사유: 감시/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+======================================================================
+[2026-06-04 17:22:14]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035720 카카오
+   - 차단 사유: BUY_SELL 상태, 보유 12345
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 12345
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+======================================================================
+[2026-06-04 17:22:37]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 035720 카카오
+   - 차단 사유: BUY_SELL 상태, 보유 12345
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 12345
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+======================================================================
+[2026-06-04 17:24:02]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 차단 사유: 감시/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+======================================================================
+[2026-06-04 17:24:36]
+작업종류: 루틴 해제
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 차단 사유: 감시/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json
+
+2. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+3. 035720 카카오
+   - 차단 사유: BUY_SELL 상태, 보유 12345
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 12345
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+======================================================================
+[2026-06-04 17:39:55]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 035420 NAVER
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 감시중
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json
+
+2. 035720 카카오
+   - 차단 사유: BUY_SELL 상태, 보유 12345
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 매수/매도
+   - 보유수량: 12345
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\035720_카카오\orders.json
+
+======================================================================
+[2026-06-04 18:04:00]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 005930 삼성전자
+   - 차단 사유: 감시/매도 상태
+   - 현재 루틴: 등록확인폴더
+   - 운영상태: 감시/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_등록확인폴더\005930_삼성전자\orders.json

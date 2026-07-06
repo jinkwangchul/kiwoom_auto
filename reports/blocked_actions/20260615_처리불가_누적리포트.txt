@@ -1,0 +1,663 @@
+처리불가 누적 리포트
+작성일자: 2026-06-15
+작성방식: 1일 1파일 누적 기록
+======================================================================
+[2026-06-15 09:27:11]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 09:59:03]
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 003550 LG
+   - 차단 사유: 검토종목 상태, 보유 12313120
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\003550_LG\orders.json
+
+======================================================================
+[2026-06-15 09:59:53]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 006400 삼성SDI
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+2. 028260 삼성물산
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+3. 051910 LG화학
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+4. 066570 LG전자
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+======================================================================
+[2026-06-15 10:23:45]
+작업종류: 루틴 해제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 10:47:23]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 006400 삼성SDI
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+2. 028260 삼성물산
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+3. 051910 LG화학
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+4. 066570 LG전자
+   - 차단 사유: 등록 루틴이 없습니다.
+   - 현재 루틴: 미등록
+   - 운영상태: 검토종목
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+======================================================================
+[2026-06-15 11:15:03]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 13:42:28]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 2개
+----------------------------------------------------------------------
+1. 005380 현대차
+   - 차단 사유: 검토종목 상태, 보유 97986867
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+2. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 13:57:10]
+작업종류: 종목 삭제
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+3. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 13:57:39]
+작업종류: 종목 삭제
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+3. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 14:22:17]
+작업종류: 종목 삭제
+처리불가 종목 수: 1개
+----------------------------------------------------------------------
+1. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 15:13:57]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 15:58:45]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 15:59:15]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: 검토종목 상태, 보유 1231230
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: 검토종목 상태, 보유 12313120
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: 검토종목 상태, 보유 97986867
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 16:10:58]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 16:13:41]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 16:16:35]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 16:17:07]
+작업종류: 종목 삭제
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 18:39:14]
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 4개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: 검토종목 상태, 보유 1231230
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: 검토종목 상태, 보유 12313120
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: 검토종목 상태, 보유 97986867
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json
+
+4. 055550 신한지주
+   - 차단 사유: 검토종목 상태, 보유 222222
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 222222
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\055550_신한지주\orders.json
+
+======================================================================
+[2026-06-15 18:43:25]
+작업종류: 종목 삭제
+처리불가 종목 수: 3개
+----------------------------------------------------------------------
+1. 000660 SK하이닉스
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 1231230
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\000660_SK하이닉스\orders.json
+
+2. 003550 LG
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 12313120
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\003550_LG\orders.json
+
+3. 005380 현대차
+   - 차단 사유: MACD매매루틴: 검토종목 상태
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 검토종목
+   - 보유수량: 97986867
+   - 현재 미체결: 매수 0 / 매도 0
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\stocks\005380_현대차\orders.json

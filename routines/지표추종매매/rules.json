@@ -1,0 +1,681 @@
+{
+  "schema_version": "1.0",
+  "routine_name": "지표추종매매",
+  "rules_version": "0.2.0",
+  "enabled": true,
+  "principle": {
+    "signal_only": true,
+    "allowed_order_signals": [
+      "BUY",
+      "SELL"
+    ],
+    "non_signal": {
+      "signal": null,
+      "description": "조건 미충족, 데이터 부족, 루틴 비활성 등은 주문신호 없음으로 처리한다. 별도 주문신호로 저장하지 않는다."
+    },
+    "execution_enabled": false,
+    "order_execution_owner": "main_order_engine"
+  },
+  "bar": {
+    "bar_minutes": 1,
+    "buy_delay_bar": 1,
+    "sell_delay_bar": 1,
+    "delay_bar_note": "0봉/1봉 선택 가능. 기본은 1봉 확정 기준."
+  },
+  "indicators": {
+    "macd": {
+      "fast": 12,
+      "slow": 26,
+      "signal": 9
+    },
+    "rsi": {
+      "period": 14
+    },
+    "moving_averages": [
+      5,
+      20,
+      60
+    ]
+  },
+  "buy": {
+    "enabled": true,
+    "groups_logic": "OR",
+    "groups": [
+      {
+        "enabled": true,
+        "name": "매수조건1",
+        "conditions_logic": "AND",
+        "conditions": [
+          {
+            "enabled": true,
+            "not": false,
+            "target": "OSC",
+            "operator": "TURN_UP",
+            "description": "MACD 오실레이터 하락 후 상승 전환"
+          }
+        ]
+      },
+      {
+        "enabled": false,
+        "name": "매수조건2",
+        "conditions_logic": "AND",
+        "conditions": []
+      },
+      {
+        "enabled": false,
+        "name": "매수조건3",
+        "conditions_logic": "AND",
+        "conditions": []
+      },
+      {
+        "enabled": false,
+        "name": "매수조건4",
+        "conditions_logic": "AND",
+        "conditions": []
+      },
+      {
+        "enabled": false,
+        "name": "매수조건5",
+        "conditions_logic": "AND",
+        "conditions": []
+      }
+    ]
+  },
+  "sell": {
+    "enabled": true,
+    "signal_logic": "OR",
+    "note": "MACD SELL과 수익률 SELL은 같은 레벨의 독립 SELL 신호다. 둘 다 활성화된 경우 signal_logic 값으로 AND/OR 결합한다.",
+    "signals": {
+      "macd_sell": {
+        "enabled": true,
+        "delay_bar": 1,
+        "groups_logic": "OR",
+        "groups": [
+          {
+            "enabled": true,
+            "name": "매도조건_MACD_OSC_TURN_DOWN",
+            "conditions_logic": "AND",
+            "conditions": [
+              {
+                "enabled": true,
+                "not": false,
+                "target": "OSC",
+                "operator": "TURN_DOWN",
+                "description": "MACD 오실레이터 상승 후 하락 전환"
+              }
+            ]
+          }
+        ]
+      },
+      "profit_rate_sell": {
+        "enabled": false,
+        "profit_rate_percent": null,
+        "basis": "average_price",
+        "description": "평단 대비 수익률이 지정 퍼센트 이상일 때 SELL 신호 후보. 기본 비활성."
+      }
+    },
+    "filters": {
+      "rsi": {
+        "enabled": false,
+        "conditions": []
+      },
+      "moving_average": {
+        "enabled": false,
+        "conditions": []
+      },
+      "price_compare": {
+        "enabled": false,
+        "conditions": []
+      }
+    }
+  },
+  "buy_management": {
+    "enabled": false,
+    "status": "reserved",
+    "note": "다중매수, 평단 기반 추매, 능동매수는 실테스트 전 미확정. 현재는 비활성 보류.",
+    "multi_buy": {
+      "enabled": false,
+      "mode": null,
+      "max_count": null,
+      "price_gap_type": null,
+      "price_gap_value": null,
+      "allocation_type": null,
+      "allocation_values": []
+    },
+    "average_price_control": {
+      "enabled": false,
+      "basis": "current_price_vs_average_price",
+      "threshold_percent": null,
+      "note": "평단 기반 매수강도 보정은 미확정."
+    }
+  },
+  "order_policy": {
+    "enabled": false,
+    "status": "reserved",
+    "note": "실제 주문방식은 메인 주문관리 계층에서 실행한다. 루틴은 정책 제안만 가능.",
+    "buy_order_type": null,
+    "sell_order_type": null,
+    "retry_policy": {
+      "enabled": false
+    }
+  },
+  "cancel_policy": {
+    "enabled": false,
+    "status": "reserved",
+    "note": "CANCEL은 루틴 신호가 아니다. 주문후보/주문관리 계층에서 별도 확정 필요."
+  },
+  "safety": {
+    "queue_only_buy_sell": true,
+    "ignore_non_signal_for_queue": true,
+    "kiwoom_sendorder_in_routine": false,
+    "mock_allowed": true,
+    "real_order_allowed": false
+  },
+  "indicator_follow_ui_state": {
+    "ui_state_version": "0.1",
+    "updated_at": "2026-07-02T13:51:37+09:00",
+    "state": {
+      "basic": {
+        "basic_signal_interval_combo": "5",
+        "basic_duplicate_signal_combo": "후행신호 우선",
+        "basic_error_policy_combo": "매매중지",
+        "buy_signal_expr_line": "RESTORE_TEST_BUY_EXPR",
+        "sell_signal_expr_line": "A and B and C",
+        "sell_method_select_a_check": true,
+        "sell_method_select_b_check": false,
+        "sell_method_select_c_check": false
+      },
+      "buy_ui": {
+        "signal_filter": {
+          "buy_ocr_bar_line": "0",
+          "buy_ocr_compare_combo": "이하",
+          "buy_ocr_sign_combo": "-",
+          "buy_ocr_turn_combo": "상승",
+          "buy_ocr_value_line": "91",
+          "buy_bollinger_compare_combo": "이상",
+          "buy_bollinger_direction_combo": "하향",
+          "buy_bollinger_value_line": "0.1",
+          "buy_ma_compare_combo": "돌파",
+          "buy_ma_direction_combo": "상향",
+          "buy_ma_value_line": "60",
+          "buy_rsi_compare_combo": "이하",
+          "buy_rsi_period_line": "14",
+          "buy_rsi_value_line": "45"
+        },
+        "base": {
+          "detail_mode_combo": "회차기준",
+          "down_line": "2",
+          "hoga_combo": "다중호가",
+          "order_combo": "주문가",
+          "ratio_compare_combo": "이상",
+          "ratio_count_line": "3",
+          "ratio_direction_combo": "상향",
+          "ratio_left_combo": "주문가",
+          "ratio_right_combo": "주문가",
+          "ratio_value_line": "0.15",
+          "time_count_line": "3",
+          "time_mode_combo": "다중시간",
+          "time_order_combo": "주문가",
+          "time_range_combo": "이내",
+          "time_unit_combo": "초",
+          "time_value_line": "30",
+          "up_line": "0"
+        },
+        "repeat": {
+          "active_compare_combo": "이상",
+          "active_direction_combo": "상향",
+          "active_ratio_line": "0.45",
+          "apply_all_check": false,
+          "budget_ratio_line": "0.5",
+          "round_budget_line": "0.5",
+          "round_operator_combo": "+"
+        },
+        "price_compare": {
+          "above_active_compare_combo": "이상",
+          "above_active_direction_combo": "상향",
+          "above_active_ratio_line": "0.45",
+          "above_budget_ratio_line": "0.5",
+          "above_condition_combo": ">",
+          "above_mode_combo": "회차기준",
+          "above_round_budget_line": "0.5",
+          "above_round_operator_combo": "+",
+          "budget_ratio_line": "0.5",
+          "check": false,
+          "condition_combo": "=<",
+          "mode_combo": "회차기준",
+          "round_budget_line": "0.5",
+          "round_operator_combo": "+"
+        },
+        "situation": {
+          "action_combo": "일괄취소",
+          "compare_combo": "이상",
+          "direction_combo": "상향",
+          "left_combo": "주문가",
+          "ratio_line": "0.15",
+          "right_combo": "현재가",
+          "type_combo": "가격비교",
+          "unfilled_scope_combo": "매회",
+          "unfilled_time_line": "10",
+          "unfilled_unit_combo": "초"
+        },
+        "additional": {
+          "check": false,
+          "compare_combo": "이하",
+          "direction_combo": "상향",
+          "method_combo": "시장가",
+          "ratio_line": "0.5"
+        },
+        "cycle": {
+          "round_increase_check": "단일호가",
+          "amount_increase_check": "다중시간",
+          "active_buy_check": "가격비교",
+          "buy_cycle_hoga_down_line": "2",
+          "buy_cycle_hoga_mode_combo": "단일호가",
+          "buy_cycle_hoga_up_line": "0",
+          "buy_cycle_order_combo": "주문가",
+          "buy_cycle_pending_scope_combo": "매회",
+          "buy_cycle_pending_unit_combo": "초",
+          "buy_cycle_pending_value_line": "10",
+          "buy_cycle_price_action_combo": "일괄취소",
+          "buy_cycle_price_compare_combo": "이상",
+          "buy_cycle_price_direction_combo": "상향",
+          "buy_cycle_price_left_combo": "주문가",
+          "buy_cycle_price_right_combo": "현재가",
+          "buy_cycle_price_value_line": "0.15",
+          "buy_cycle_ratio_compare_combo": "이상",
+          "buy_cycle_ratio_count_line": "3",
+          "buy_cycle_ratio_direction_combo": "상향",
+          "buy_cycle_ratio_left_combo": "주문가",
+          "buy_cycle_ratio_right_combo": "현재가",
+          "buy_cycle_ratio_value_line": "0.15",
+          "buy_cycle_situation_mode_combo": "가격비교",
+          "buy_cycle_time_count_line": "3",
+          "buy_cycle_time_mode_combo": "다중시간",
+          "buy_cycle_time_order_combo": "현재가",
+          "buy_cycle_time_range_combo": "이내",
+          "buy_cycle_time_unit_combo": "초",
+          "buy_cycle_time_value_line": "30"
+        },
+        "exit": {
+          "buy_exit_count_check": false,
+          "buy_exit_count_line": "3",
+          "buy_exit_price_check": true,
+          "buy_exit_price_compare_combo": "이상",
+          "buy_exit_price_direction_combo": "상향",
+          "buy_exit_price_left_combo": "주문가",
+          "buy_exit_price_right_combo": "현재가",
+          "buy_exit_price_value_line": "0.15",
+          "buy_exit_time_check": false,
+          "buy_exit_time_line": "2",
+          "buy_exit_time_unit_combo": "분"
+        },
+        "close": {},
+        "legacy_summary": {}
+      },
+      "sell_ui": {
+        "signal_conditions": {
+          "condition_a": {
+            "gap_check": true,
+            "gap_compare_combo": "이내",
+            "gap_direction_combo": "상하",
+            "gap_left_combo": "주문가",
+            "gap_logic_combo": "AND",
+            "gap_right_combo": "평단가",
+            "gap_value_line": "0.25",
+            "ocr_check": true,
+            "ocr_compare_combo": "이상",
+            "ocr_convert_line": "0",
+            "ocr_direction_combo": "하락",
+            "ocr_logic_combo": "AND",
+            "ocr_sign_combo": "+",
+            "ocr_value_line": "73",
+            "rsi_check": true,
+            "rsi_compare_combo": "이하",
+            "rsi_period_line": "14",
+            "rsi_value_line": "45"
+          },
+          "condition_b": {
+            "bollinger_check": true,
+            "bollinger_compare_combo": "이상",
+            "bollinger_direction_combo": "하향",
+            "bollinger_logic_combo": "AND",
+            "bollinger_value_line": "0.1",
+            "gap_check": true,
+            "gap_compare_combo": "이내",
+            "gap_direction_combo": "상하",
+            "gap_left_combo": "주문가",
+            "gap_right_combo": "현재가",
+            "gap_value_line": "0.25",
+            "price_box_check": true,
+            "price_box_compare_combo": "이상",
+            "price_box_direction_combo": "하향",
+            "price_box_logic_combo": "AND",
+            "price_box_value_line": "0.1"
+          },
+          "condition_c": {
+            "array_check": true,
+            "array_first_compare_combo": ">",
+            "array_first_period_combo": "5",
+            "array_second_compare_combo": ">",
+            "array_second_period_combo": "20",
+            "array_third_period_combo": "60",
+            "gap_check": true,
+            "gap_compare_combo": "이내",
+            "gap_direction_combo": "상하",
+            "gap_left_combo": "주문가",
+            "gap_logic_combo": "AND",
+            "gap_right_combo": "현재가",
+            "gap_value_line": "0.25",
+            "macd_check": true,
+            "macd_compare_combo": "이하",
+            "macd_kind_combo": "MACD선",
+            "macd_logic_combo": "AND",
+            "macd_sign_combo": "-",
+            "macd_value_line": "1.0"
+          }
+        },
+        "selected_sets": {
+          "a": true,
+          "b": false,
+          "c": false
+        },
+        "setting_a": {
+          "complete_policy_carry_check": true,
+          "complete_policy_market_check": true,
+          "exit_count_check": false,
+          "exit_count_line": "8765",
+          "exit_price_check": false,
+          "exit_price_compare": "이상",
+          "exit_price_direction": "상향",
+          "exit_price_left": "주문가",
+          "exit_price_right": "현재가",
+          "exit_price_value": "0.15",
+          "exit_time_check": false,
+          "exit_time_line": "2",
+          "exit_time_unit": "분",
+          "perform1_multi_down_line": "0",
+          "perform1_multi_up_line": "3",
+          "perform1_single_combo": "주문가",
+          "perform1_title_combo": "단일호가",
+          "perform2_ratio_compare": "이상",
+          "perform2_ratio_count": "3",
+          "perform2_ratio_direction": "상향",
+          "perform2_ratio_left": "주문가",
+          "perform2_ratio_right": "주문가",
+          "perform2_ratio_value": "0.15",
+          "perform2_time_count": "3",
+          "perform2_time_order": "주문가",
+          "perform2_time_range": "이내",
+          "perform2_time_unit": "초",
+          "perform2_time_value": "30",
+          "perform2_title_combo": "다중시간",
+          "perform3_pending_scope": "매회",
+          "perform3_pending_unit": "초",
+          "perform3_pending_value": "20",
+          "perform3_price_action": "매도리셋",
+          "perform3_price_compare": "이상",
+          "perform3_price_direction": "상향",
+          "perform3_price_left": "주문가",
+          "perform3_price_right": "현재가",
+          "perform3_price_value": "0.15",
+          "perform3_title_combo": "가격비교",
+          "repeat_perform1_multi_down_line": "0",
+          "repeat_perform1_multi_up_line": "3",
+          "repeat_perform1_single_combo": "주문가",
+          "repeat_perform1_title_combo": "단일호가",
+          "repeat_perform2_ratio_compare": "이상",
+          "repeat_perform2_ratio_count": "3",
+          "repeat_perform2_ratio_direction": "상향",
+          "repeat_perform2_ratio_left": "주문가",
+          "repeat_perform2_ratio_right": "주문가",
+          "repeat_perform2_ratio_value": "0.15",
+          "repeat_perform2_time_count": "3",
+          "repeat_perform2_time_order": "주문가",
+          "repeat_perform2_time_range": "이내",
+          "repeat_perform2_time_unit": "초",
+          "repeat_perform2_time_value": "30",
+          "repeat_perform2_title_combo": "다중시간",
+          "repeat_perform3_pending_scope": "매회",
+          "repeat_perform3_pending_unit": "초",
+          "repeat_perform3_pending_value": "20",
+          "repeat_perform3_price_action": "매도리셋",
+          "repeat_perform3_price_compare": "이상",
+          "repeat_perform3_price_direction": "상향",
+          "repeat_perform3_price_left": "주문가",
+          "repeat_perform3_price_right": "현재가",
+          "repeat_perform3_price_value": "0.15",
+          "repeat_perform3_title_combo": "가격비교"
+        },
+        "setting_b": {
+          "complete_policy_carry_check": true,
+          "complete_policy_market_check": true,
+          "exit_count_check": false,
+          "exit_count_line": "3",
+          "exit_price_check": false,
+          "exit_price_compare": "이상",
+          "exit_price_direction": "상향",
+          "exit_price_left": "주문가",
+          "exit_price_right": "현재가",
+          "exit_price_value": "0.15",
+          "exit_time_check": false,
+          "exit_time_line": "2",
+          "exit_time_unit": "분",
+          "perform1_multi_down_line": "0",
+          "perform1_multi_up_line": "3",
+          "perform1_single_combo": "주문가",
+          "perform1_title_combo": "단일호가",
+          "perform2_ratio_compare": "이상",
+          "perform2_ratio_count": "3",
+          "perform2_ratio_direction": "상향",
+          "perform2_ratio_left": "주문가",
+          "perform2_ratio_right": "주문가",
+          "perform2_ratio_value": "0.15",
+          "perform2_time_count": "3",
+          "perform2_time_order": "주문가",
+          "perform2_time_range": "이내",
+          "perform2_time_unit": "초",
+          "perform2_time_value": "30",
+          "perform2_title_combo": "다중시간",
+          "perform3_pending_scope": "매회",
+          "perform3_pending_unit": "초",
+          "perform3_pending_value": "20",
+          "perform3_price_action": "매도리셋",
+          "perform3_price_compare": "이상",
+          "perform3_price_direction": "상향",
+          "perform3_price_left": "주문가",
+          "perform3_price_right": "현재가",
+          "perform3_price_value": "0.15",
+          "perform3_title_combo": "가격비교",
+          "repeat_perform1_multi_down_line": "0",
+          "repeat_perform1_multi_up_line": "3",
+          "repeat_perform1_single_combo": "주문가",
+          "repeat_perform1_title_combo": "단일호가",
+          "repeat_perform2_ratio_compare": "이상",
+          "repeat_perform2_ratio_count": "3",
+          "repeat_perform2_ratio_direction": "상향",
+          "repeat_perform2_ratio_left": "주문가",
+          "repeat_perform2_ratio_right": "주문가",
+          "repeat_perform2_ratio_value": "0.15",
+          "repeat_perform2_time_count": "3",
+          "repeat_perform2_time_order": "주문가",
+          "repeat_perform2_time_range": "이내",
+          "repeat_perform2_time_unit": "초",
+          "repeat_perform2_time_value": "30",
+          "repeat_perform2_title_combo": "다중시간",
+          "repeat_perform3_pending_scope": "매회",
+          "repeat_perform3_pending_unit": "초",
+          "repeat_perform3_pending_value": "20",
+          "repeat_perform3_price_action": "매도리셋",
+          "repeat_perform3_price_compare": "이상",
+          "repeat_perform3_price_direction": "상향",
+          "repeat_perform3_price_left": "주문가",
+          "repeat_perform3_price_right": "현재가",
+          "repeat_perform3_price_value": "0.15",
+          "repeat_perform3_title_combo": "가격비교"
+        },
+        "setting_c": {
+          "complete_policy_carry_check": true,
+          "complete_policy_market_check": true,
+          "exit_count_check": false,
+          "exit_count_line": "3",
+          "exit_price_check": false,
+          "exit_price_compare": "이상",
+          "exit_price_direction": "상향",
+          "exit_price_left": "주문가",
+          "exit_price_right": "현재가",
+          "exit_price_value": "0.15",
+          "exit_time_check": false,
+          "exit_time_line": "2",
+          "exit_time_unit": "분",
+          "perform1_multi_down_line": "0",
+          "perform1_multi_up_line": "3",
+          "perform1_single_combo": "주문가",
+          "perform1_title_combo": "단일호가",
+          "perform2_ratio_compare": "이상",
+          "perform2_ratio_count": "3",
+          "perform2_ratio_direction": "상향",
+          "perform2_ratio_left": "주문가",
+          "perform2_ratio_right": "주문가",
+          "perform2_ratio_value": "0.15",
+          "perform2_time_count": "3",
+          "perform2_time_order": "주문가",
+          "perform2_time_range": "이내",
+          "perform2_time_unit": "초",
+          "perform2_time_value": "30",
+          "perform2_title_combo": "다중시간",
+          "perform3_pending_scope": "매회",
+          "perform3_pending_unit": "초",
+          "perform3_pending_value": "20",
+          "perform3_price_action": "매도리셋",
+          "perform3_price_compare": "이상",
+          "perform3_price_direction": "상향",
+          "perform3_price_left": "주문가",
+          "perform3_price_right": "현재가",
+          "perform3_price_value": "0.15",
+          "perform3_title_combo": "가격비교",
+          "repeat_perform1_multi_down_line": "0",
+          "repeat_perform1_multi_up_line": "3",
+          "repeat_perform1_single_combo": "주문가",
+          "repeat_perform1_title_combo": "단일호가",
+          "repeat_perform2_ratio_compare": "이상",
+          "repeat_perform2_ratio_count": "3",
+          "repeat_perform2_ratio_direction": "상향",
+          "repeat_perform2_ratio_left": "주문가",
+          "repeat_perform2_ratio_right": "주문가",
+          "repeat_perform2_ratio_value": "0.15",
+          "repeat_perform2_time_count": "3",
+          "repeat_perform2_time_order": "주문가",
+          "repeat_perform2_time_range": "이내",
+          "repeat_perform2_time_unit": "초",
+          "repeat_perform2_time_value": "30",
+          "repeat_perform2_title_combo": "다중시간",
+          "repeat_perform3_pending_scope": "매회",
+          "repeat_perform3_pending_unit": "초",
+          "repeat_perform3_pending_value": "20",
+          "repeat_perform3_price_action": "매도리셋",
+          "repeat_perform3_price_compare": "이상",
+          "repeat_perform3_price_direction": "상향",
+          "repeat_perform3_price_left": "주문가",
+          "repeat_perform3_price_right": "현재가",
+          "repeat_perform3_price_value": "0.15",
+          "repeat_perform3_title_combo": "가격비교"
+        },
+        "legacy_summary": {
+          "sell_method_select_a_check": true,
+          "sell_method_select_b_check": false,
+          "sell_method_select_c_check": false
+        }
+      },
+      "complete_ui": {}
+    }
+  },
+  "indicator_follow_rule_pending": {
+    "version": "0.1",
+    "source": "indicator_follow_ui_state",
+    "source_ui_state_hash": "e1810912a7125545bb655693aaf724dd05f86819b48c0f456d1c4f1bd6c56d8b",
+    "mode": "merge_add_candidate",
+    "mapped_paths": [
+      "bar.bar_minutes",
+      "buy.groups[0].conditions",
+      "indicators.rsi",
+      "sell.signals.ui_preview_condition_c_macd_sell"
+    ],
+    "candidates": {
+      "bar": {
+        "path": "bar.bar_minutes",
+        "value": 5
+      },
+      "buy": {
+        "merge_into": "buy.groups[0].conditions",
+        "skip_existing": [
+          {
+            "target": "OSC",
+            "operator": "TURN_UP",
+            "reason": "already exists in current buy.groups[0]"
+          }
+        ],
+        "add_conditions": [
+          {
+            "enabled": true,
+            "not": false,
+            "target": "OSC",
+            "operator": "<=",
+            "value": -91.0,
+            "description": "UI preview: buy OCR/OSC threshold condition"
+          }
+        ]
+      },
+      "indicators": {
+        "rsi": {
+          "path": "indicators.rsi",
+          "value": {
+            "period": 14
+          },
+          "ui_filter": {
+            "period": 14,
+            "operator": "<=",
+            "threshold": 45.0
+          }
+        }
+      },
+      "sell": {
+        "add_signal_candidate": {
+          "path": "sell.signals.ui_preview_condition_c_macd_sell",
+          "enabled": false,
+          "preview_candidate": true,
+          "groups_logic": "OR",
+          "groups": [
+            {
+              "enabled": true,
+              "name": "UI_PREVIEW_SELL_MACD_CONDITION_C",
+              "conditions_logic": "AND",
+              "conditions": [
+                {
+                  "enabled": true,
+                  "not": false,
+                  "target": "MACD",
+                  "operator": "<=",
+                  "value": -1.0,
+                  "description": "UI preview: sell condition C MACD line threshold"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "warnings": [
+      "sell condition C MACD is an add_signal_candidate and does not replace existing macd_sell",
+      "buy method mapping is postponed",
+      "repeat buy mapping is postponed",
+      "price compare buy mapping is postponed",
+      "situation response mapping is postponed",
+      "additional feature mapping is postponed",
+      "cycle setting mapping is postponed",
+      "exit condition mapping is postponed",
+      "sell method A/B/C mapping is postponed",
+      "pending order policy mapping is postponed",
+      "completion policy mapping is postponed"
+    ]
+  }
+}

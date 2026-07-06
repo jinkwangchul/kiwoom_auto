@@ -1,0 +1,64 @@
+처리불가 리포트
+발생시각: 2026-06-03 12:41:34
+작업종류: 종목 삭제
+처리불가 종목 수: 6개
+
+1. 028260 삼성물산
+   - 현재 루틴: 미등록
+   - 운영상태: 미지정
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수중지 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+2. 012330 현대모비스
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수중지
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수중지 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\012330_현대모비스\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\012330_현대모비스\orders.json
+
+3. 003550 LG
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\003550_LG\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\003550_LG\orders.json
+
+4. 323410 카카오뱅크
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\323410_카카오뱅크\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\323410_카카오뱅크\orders.json
+
+5. 247540 에코프로비엠
+   - 현재 루틴: 미등록
+   - 운영상태: 미지정
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: -
+   - orders.json: -
+
+6. 086520 에코프로
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수중지
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: MACD매매루틴: 매수중지 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\086520_에코프로\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\086520_에코프로\orders.json

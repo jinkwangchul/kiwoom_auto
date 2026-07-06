@@ -1,0 +1,15 @@
+처리불가 리포트
+발생시각: 2026-06-04 15:05:35
+작업종류: 루틴 해제
+대상 루틴: MACD매매루틴
+처리불가 종목 수: 1개
+
+1. 035420 NAVER
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: WATCH_SELL
+   - 보유수량: 99999
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: WATCH_SELL 상태, 보유 99999
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\035420_NAVER\orders.json

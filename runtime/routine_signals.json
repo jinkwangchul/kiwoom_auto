@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-03 10:08:43",
+  "signals": [
+    {
+      "id": "20260702_191057_003550_SELL_1",
+      "created_at": "2026-07-02 19:10:57",
+      "routine": "지표추종매매",
+      "code": "003550",
+      "name": "LG",
+      "signal": "SELL",
+      "reason": "매도조건 충족(OR)",
+      "matched_groups": [
+        "매도조건_MACD_OSC_TURN_DOWN"
+      ],
+      "details": [
+        "PASS OSC TURN_DOWN",
+        "profit_rate_sell 비활성"
+      ],
+      "signal_index": 58,
+      "delay_bar": 1,
+      "tick_key": "sample-candles-1782987057",
+      "status": "BLOCKED",
+      "source": "routine_signal_probe",
+      "execution_enabled": false,
+      "updated_at": "2026-07-03 08:24:07",
+      "preview_summary": {
+        "signal_id": "20260702_191057_003550_SELL_1",
+        "signal_type": "SELL",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NO_HOLDING_QTY",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매매 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NO_HOLDING_QTY"
+    },
+    {
+      "id": "20260702_192133_003550_SELL_2",
+      "created_at": "2026-07-02 19:21:33",
+      "routine": "지표추종매매",
+      "code": "003550",
+      "name": "LG",
+      "signal": "SELL",
+      "reason": "매도조건 충족(OR)",
+      "matched_groups": [
+        "매도조건_MACD_OSC_TURN_DOWN"
+      ],
+      "details": [
+        "PASS OSC TURN_DOWN",
+        "profit_rate_sell 비활성"
+      ],
+      "signal_index": 58,
+      "delay_bar": 1,
+      "tick_key": "manual_signal_probe_helper_test",
+      "status": "BLOCKED",
+      "source": "routine_signal_probe",
+      "execution_enabled": false,
+      "updated_at": "2026-07-03 08:28:34",
+      "preview_summary": {
+        "signal_id": "20260702_192133_003550_SELL_2",
+        "signal_type": "SELL",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NO_HOLDING_QTY",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매매 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NO_HOLDING_QTY"
+    },
+    {
+      "id": "20260702_194340_003550_BUY_3",
+      "created_at": "2026-07-02 19:43:40",
+      "routine": "지표추종매매",
+      "code": "003550",
+      "name": "LG",
+      "signal": "BUY",
+      "reason": "매수조건 충족",
+      "matched_groups": [
+        "매수조건1"
+      ],
+      "details": [
+        "PASS OSC TURN_UP",
+        "그룹 비활성",
+        "그룹 비활성",
+        "그룹 비활성",
+        "그룹 비활성"
+      ],
+      "signal_index": 1,
+      "delay_bar": 1,
+      "tick_key": "adapter_save_probe_test",
+      "status": "BLOCKED",
+      "source": "routine_signal_probe",
+      "execution_enabled": false,
+      "updated_at": "2026-07-03 08:28:34",
+      "preview_summary": {
+        "signal_id": "20260702_194340_003550_BUY_3",
+        "signal_type": "BUY",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NEED_BUDGET",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매매 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NEED_BUDGET"
+    },
+    {
+      "id": "20260702_205933_003550_SELL_4",
+      "created_at": "2026-07-02 20:59:33",
+      "routine": "지표추종매매",
+      "code": "003550",
+      "name": "LG",
+      "signal": "SELL",
+      "reason": "매도조건 충족(OR)",
+      "matched_groups": [
+        "매도조건_MACD_OSC_TURN_DOWN"
+      ],
+      "details": [
+        "PASS OSC TURN_DOWN",
+        "profit_rate_sell 비활성"
+      ],
+      "signal_index": 58,
+      "delay_bar": 1,
+      "tick_key": "manual_signal_probe_actual_003550_20260702_205933",
+      "status": "BLOCKED",
+      "source": "routine_signal_probe",
+      "execution_enabled": false,
+      "updated_at": "2026-07-03 08:28:34",
+      "preview_summary": {
+        "signal_id": "20260702_205933_003550_SELL_4",
+        "signal_type": "SELL",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NO_HOLDING_QTY",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매매 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NO_HOLDING_QTY"
+    },
+    {
+      "id": "20260703_085128_003550_SELL_5",
+      "created_at": "2026-07-03 08:51:28",
+      "routine": "지표추종매매",
+      "code": "003550",
+      "name": "LG",
+      "signal": "SELL",
+      "reason": "매도조건 충족(OR)",
+      "matched_groups": [
+        "매도조건_MACD_OSC_TURN_DOWN"
+      ],
+      "details": [
+        "PASS OSC TURN_DOWN",
+        "profit_rate_sell 비활성"
+      ],
+      "signal_index": 58,
+      "delay_bar": 1,
+      "tick_key": "manual_timer_test_20260703_085128_704165",
+      "status": "BLOCKED",
+      "source": "routine_signal_probe",
+      "execution_enabled": false,
+      "updated_at": "2026-07-03 08:51:28",
+      "preview_summary": {
+        "signal_id": "20260703_085128_003550_SELL_5",
+        "signal_type": "SELL",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NO_HOLDING_QTY",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매도 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NO_HOLDING_QTY"
+    },
+    {
+      "id": "TEST_PENDING_SELL_20260703_100843_077836",
+      "created_at": "2026-07-03 10:08:43",
+      "updated_at": "2026-07-03 10:08:43",
+      "status": "BLOCKED",
+      "routine": "??????",
+      "code": "003550",
+      "name": "LG",
+      "signal": "SELL",
+      "signal_index": 999,
+      "reason": "temporary verification signal",
+      "tick_key": "manual_order_queue_candidate_test",
+      "execution_enabled": false,
+      "source": "manual_verification",
+      "preview_summary": {
+        "signal_id": "TEST_PENDING_SELL_20260703_100843_077836",
+        "signal_type": "SELL",
+        "payload_built": true,
+        "order_manager_allowed": false,
+        "payload_candidate_status": "NO_HOLDING_QTY",
+        "send_order_called": false,
+        "files_mutated": false
+      },
+      "order_manager_result": {
+        "ok": true,
+        "allowed": false,
+        "reason": "매매 비활성 상태",
+        "order_executor_called": false,
+        "state_saved": false
+      },
+      "payload_candidate_status": "NO_HOLDING_QTY"
+    }
+  ]
+}

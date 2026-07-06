@@ -1,0 +1,14 @@
+처리불가 리포트
+발생시각: 2026-06-03 14:29:59
+작업종류: 루틴 지정 사전검사
+처리불가 종목 수: 1개
+
+1. 247540 에코프로비엠
+   - 현재 루틴: MACD매매루틴
+   - 운영상태: 매수/매도
+   - 보유수량: 0
+   - 현재 미체결: 매수 0 / 매도 0
+   - 차단 사유: 매수/매도 상태
+   - 권장 조치: HTS에서 보유수량과 현재 미체결 주문을 확인한 뒤 감시종료 또는 검토관리 절차로 상태를 정리하세요.
+   - state.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\247540_에코프로비엠\state.json
+   - orders.json: C:\Users\JIN KWANG CHUL\Documents\kiwoom_auto\_MACD매매루틴\247540_에코프로비엠\orders.json

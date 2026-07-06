@@ -1,0 +1,52 @@
+{
+  "regular_market": {
+    "start_time": "09:00:00",
+    "end_time": "15:20:00"
+  },
+  "extra_sessions": [
+    {
+      "name": "장전프리",
+      "start_time": "08:00:00",
+      "end_time": "08:50:00"
+    },
+    {
+      "name": "마감후NTX",
+      "start_time": "15:30:00",
+      "end_time": "19:50:00"
+    },
+    {
+      "name": "미지정",
+      "start_time": "00:00:00",
+      "end_time": "00:00:00"
+    }
+  ],
+  "scheduled_operation": {
+    "default_start_time": "09:30:00",
+    "default_end_buy_time": "13:30:00",
+    "after_buy_end_status": "감시/매도"
+  },
+  "manual_operation": {
+    "use_regular_market": true,
+    "use_extra_session_1": false,
+    "use_extra_session_2": false,
+    "use_extra_session_3": false,
+    "enabled_status": "매수/매도",
+    "disabled_status": "감시/대기",
+    "use_liquidation_policy": false
+  },
+  "auto_close": {
+    "method": "루틴매도신호",
+    "profit_percent": "2.07",
+    "loss_percent": "0.45"
+  },
+  "early_close": {
+    "method": "루틴매도신호",
+    "profit_percent": "",
+    "loss_percent": ""
+  },
+  "liquidation": {
+    "minutes_before_regular_close": "10",
+    "method": "시장가"
+  },
+  "updated_at": "2026-06-16 08:18:22"
+}
