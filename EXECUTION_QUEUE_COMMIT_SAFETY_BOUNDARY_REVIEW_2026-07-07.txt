@@ -1,0 +1,348 @@
+Execution Queue Commit Safety Boundary Review
+Date: 2026-07-07
+
+Scope
+-----
+This review fixes the safety contract before implementing a real Queue Commit
+Executor. It is documentation only. No Python implementation, runtime write,
+order_queue write, rules.json update, GUI wiring, SendOrder, Broker, or Kiwoom
+call is included in this step.
+
+
+1. Reviewed Existing Modules
+----------------------------
+- execution_queue_commit_contract_preview.py
+  - Builds preview-only commit_contract and commit_plan from approval/readiness
+    results and an order_contract.
+  - Output keeps preview_only=True, runtime_write=False, queue_write=False,
+    queue_commit_called=False, send_order_called=False.
+
+- execution_queue_commit_dry_run.py
+  - Re-validates commit_contract_preview, queue target, queue snapshot,
+    duplicate order state, and runtime lock state without writes.
+  - READY state is DRY_RUN_READY only.
+
+- execution_queue_writer.py
+  - Existing preview builder: preview_execution_queue_write(...).
+  - Existing writer: commit_execution_queue_write(...).
+  - Existing atomic write helper: _write_json_atomic(...).
+  - Existing queue reader/validator: _read_queue_file(...).
+  - Existing duplicate check: _existing_duplicate_reason(...).
+  - Existing backup behavior: shutil.copy2(target_path, str(target_path)+".bak").
+
+- execution_queue_commit_service.py
+  - Manual wrapper around commit_execution_queue_write(...).
+  - Runtime order_queue.json path requires queue commit readiness policy and
+    extra manual confirmation.
+  - Does not call SendOrder.
+
+- execution_queue_commit_readiness_policy.py
+  - Preview-only policy after Runtime commit.
+  - Requires runtime commit result and queue write preview identity match.
+  - Does not call queue commit service.
+
+- execution_queue_committed_review.py
+  - Post-queue-commit review layer.
+  - Requires committed ORDER_QUEUED record and keeps send_order_called=False.
+  - Produces FINAL_SEND_GATE_REQUIRED as next stage.
+
+- order_queue_reader.py
+  - Reads runtime/order_queue.json without mutation.
+  - Current queue schema is dict root with integer version and orders list.
+
+
+2. Current Runtime Folder State
+-------------------------------
+- runtime/order_queue.json exists.
+  - Current root shape: {"version": 1, "updated_at": "...", "orders": [...]}
+  - Existing orders list currently contains one PENDING test-like record.
+
+- runtime/order_executions.json does not exist.
+- runtime/order_locks.json does not exist.
+
+This means a Queue Commit Executor must not assume execution runtime files
+exist, and must not create them. Its direct write target should be only
+runtime/order_queue.json unless a future separate policy explicitly widens the
+scope.
+
+
+3. Actual Write Targets
+-----------------------
+Allowed direct write target for the future Queue Commit Executor:
+- runtime/order_queue.json
+
+Files that must remain untouched by Queue Commit Executor:
+- runtime/order_executions.json
+- runtime/order_locks.json
+- routines/*/rules.json
+- GUI files
+- SendOrder/Broker/Kiwoom related state
+- Any reports or runtime logs unless a separate explicit report writer is added
+
+The Executor should reject any target path that is not the explicit configured
+queue path. It should not auto-create parent folders.
+
+
+4. Write Prohibition Boundaries
+-------------------------------
+Queue Commit Executor must never:
+- Modify rules.json.
+- Connect to GUI or trigger GUI refresh.
+- Call SendOrder.
+- Call Broker adapters.
+- Call Kiwoom/OpenAPI directly.
+- Modify runtime/order_executions.json.
+- Modify runtime/order_locks.json.
+- Create missing runtime files.
+- Continue automatically into Final Send Gate or SendOrder.
+
+Successful Queue Commit should still have:
+- send_order_called=False
+- execution_enabled=False
+- next_stage=QUEUE_COMMITTED_REVIEW_REQUIRED
+
+
+5. Queue Commit Executor Entry Conditions
+-----------------------------------------
+Minimum required inputs before any write attempt:
+- dry_run.status == DRY_RUN_READY
+- dry_run.preview_only == True
+- dry_run.runtime_write == False
+- dry_run.queue_write == False
+- dry_run.queue_commit_called == False
+- commit_contract_preview.status == READY
+- commit_contract exists
+- commit_plan exists
+- commit_plan.target or equivalent queue target exists
+- approval status is APPROVED
+- readiness status is READY
+- order_contract.status == REAL_READY
+- order_contract.execution_enabled == True
+- order_contract.preview_only == True
+- no runtime lock
+- no duplicate order
+- explicit manual Queue Commit confirmation
+- explicit runtime queue path confirmation if target is runtime/order_queue.json
+
+Recommended manual confirmations:
+- manual_queue_commit_confirmed == True
+- manual_queue_write_confirmed == True
+- manual_runtime_queue_write_confirmed == True for runtime/order_queue.json
+
+
+6. Commit-Time Rechecks
+-----------------------
+The Executor must re-read current state immediately before write and recheck:
+- Queue file exists.
+- Queue file root is a dict.
+- Queue file version is an int.
+- Queue file orders is a list.
+- Queue file orders contain only dicts.
+- Duplicate order_id.
+- Duplicate request_hash if request_hash exists in the final record.
+- Duplicate lock_id if lock_id exists in the final record.
+- Runtime lock snapshot is still clear.
+- Emergency stop is still false.
+- Target path is the expected runtime/order_queue.json or injected safe path.
+- Parent directory already exists.
+- No target auto-creation except appending within an existing queue file.
+
+Race protection:
+- The queue snapshot used by dry-run is only advisory.
+- The actual file must be re-read and duplicate-checked immediately before
+  atomic replace.
+- Optional before_hash should be captured after the final read and before write.
+
+
+7. Atomic Write Contract
+------------------------
+Existing implementation pattern in execution_queue_writer.py:
+- Write temporary file in same directory:
+  .<filename>.<uuid>.tmp
+- json.dump(..., ensure_ascii=False, indent=2)
+- Append newline.
+- flush()
+- os.fsync(handle.fileno())
+- os.replace(tmp_path, queue_path)
+- finally cleanup tmp_path if still present
+
+Recommended Executor behavior:
+- Reuse this pattern.
+- Keep tmp file in the same folder as order_queue.json so os.replace is atomic
+  on the same filesystem.
+- Never write directly to order_queue.json.
+- Never mkdir.
+- If temp write fails, original order_queue.json remains untouched.
+- If os.replace fails, original order_queue.json should remain untouched.
+- Always attempt temp cleanup.
+
+
+8. Backup and Rollback Policy
+-----------------------------
+Existing backup pattern:
+- backup_path = str(target_path) + ".bak"
+- shutil.copy2(target_path, backup_path)
+
+Recommended stronger policy for new Executor:
+- Create backup before atomic replace.
+- Backup in same directory as target.
+- Include commit id or timestamp to avoid overwriting previous backup:
+  order_queue.json.<commit_id>.bak
+  or order_queue.json.YYYYMMDD_HHMMSS.<short_uuid>.bak
+- Return backup_path in commit report.
+- If write fails before os.replace, no rollback is needed because original file
+  should still exist.
+- If os.replace succeeds but post-write verification fails, attempt rollback by
+  replacing current file with backup.
+- Return rollback_attempted and rollback_succeeded.
+- If rollback fails, return ERROR with a MANUAL_RESTORE_REQUIRED issue.
+
+Minimum rollback result fields:
+- rollback_attempted
+- rollback_succeeded
+- restored_from_backup
+- manual_restore_required
+
+
+9. Commit Report Contract
+-------------------------
+Future Queue Commit Executor should return a structured report with at least:
+- service_type or executor_type
+- status: COMMITTED | BLOCKED | INVALID | ERROR
+- commit_id
+- source_order_id
+- order_id
+- source_signal_id
+- code
+- side
+- quantity
+- price
+- request_hash
+- lock_id
+- execution_id
+- queue_path
+- before_hash
+- after_hash
+- backup_path
+- committed_at
+- committed_record
+- committed=True/False
+- changed=True/False
+- preview_only=False only after the actual write has succeeded
+- runtime_write=False
+- queue_write=True only after successful write
+- queue_commit_called=True only inside the actual Executor result
+- send_order_called=False
+- execution_enabled=False
+- next_stage=QUEUE_COMMITTED_REVIEW_REQUIRED on success
+- issues
+- warnings
+- rollback_attempted
+- rollback_succeeded
+- restored_from_backup
+
+preview_only false transition:
+- All upstream layers remain preview_only=True.
+- Only the actual Queue Commit Executor result may use preview_only=False.
+- The transition must happen only after all confirmations, final rechecks,
+  atomic write, and read-back verification pass.
+
+
+10. Post-Commit Review Need
+---------------------------
+Yes, a post-commit review layer is required.
+
+Existing layer:
+- execution_queue_committed_review.py
+
+Needed checks after commit:
+- order_queue.json after_hash differs from before_hash.
+- The committed ORDER_QUEUED record exists in the re-read queue file.
+- Record identity matches commit report:
+  order_id, source_signal_id, execution_id, request_hash, lock_id.
+- Record status == ORDER_QUEUED.
+- send_order_called == False.
+- execution_enabled == False.
+- next_stage remains QUEUE_COMMITTED_REVIEW_REQUIRED before any Final Send Gate.
+- No SendOrder or Broker call happened.
+
+The post-commit review should be a separate step before Final Send Gate.
+
+
+11. Test Design for Future Executor
+-----------------------------------
+Required test cases:
+- Normal commit from dry-run ready contract to explicit temp queue file.
+- Runtime/order_queue.json target remains guarded by explicit manual flags.
+- Duplicate race:
+  - dry-run passes
+  - queue file gains same order_id/request_hash/lock_id before commit
+  - executor blocks before write.
+- Runtime lock race:
+  - dry-run passes
+  - runtime snapshot or lock input changes before commit
+  - executor blocks before write.
+- Malformed queue:
+  - non-dict root blocks
+  - version not int blocks
+  - orders missing/not list blocks
+  - orders containing non-dict blocks.
+- Target path guard:
+  - missing queue path blocks
+  - parent missing blocks
+  - target missing blocks unless a separate init policy exists.
+- Atomic write failure:
+  - temp write failure preserves original.
+  - replace failure preserves original.
+- Post-write verification failure:
+  - rollback attempted.
+  - backup restored.
+  - if restore fails, ERROR and manual_restore_required.
+- Backup:
+  - backup file created before write.
+  - backup content equals before content.
+- Report:
+  - commit_id, identity, hashes, backup_path, committed_at all present.
+- Protection:
+  - runtime/order_executions.json not created.
+  - runtime/order_locks.json not created.
+  - rules.json unchanged.
+  - SendOrder/Broker/Kiwoom/GUI not called.
+
+
+12. Next Minimal Implementation Candidate
+-----------------------------------------
+Add a separate Queue Commit Executor module, not by widening preview/dry-run
+layers:
+
+Candidate file:
+- execution_queue_commit_executor.py
+
+Candidate function:
+- execute_queue_commit_from_dry_run(...)
+
+Suggested input:
+- queue_commit_dry_run_result
+- commit_contract_preview
+- queue_path
+- runtime_snapshot
+- confirmations
+
+Suggested behavior:
+1. Validate dry_run.status == DRY_RUN_READY.
+2. Validate commit_contract_preview.status == READY.
+3. Validate manual confirmations.
+4. Validate explicit queue_path and target guard.
+5. Read current queue file.
+6. Capture before_hash.
+7. Recheck schema, duplicate, runtime lock, emergency stop.
+8. Create backup.
+9. Build updated queue data with appended ORDER_QUEUED record.
+10. Atomic write.
+11. Read back.
+12. Verify hash and record presence.
+13. Return commit report.
+14. Keep send_order_called=False and next_stage=QUEUE_COMMITTED_REVIEW_REQUIRED.
+
+Do not connect this Executor to GUI, Final Send Gate, SendOrder, Broker, or
+Kiwoom in the same step.

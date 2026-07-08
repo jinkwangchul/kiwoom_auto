@@ -1,0 +1,350 @@
+SendOrder Executor Safety Boundary Review
+Date: 2026-07-07
+
+Scope
+This review defines the safe boundary for a future executor that may call the
+real Kiwoom SendOrder API. It is a design/review document only. No Python code,
+runtime file, order queue, rules file, GUI, Broker, Kiwoom, or SendOrder call was
+modified or executed while producing this review.
+
+Reviewed modules and artifacts
+- kiwoom_send_order_call_preview.py
+- kiwoom_send_order_safety_gate.py
+- kiwoom_send_order_adapter_contract.py
+- broker_dispatch_preview.py
+- kiwoom_order_adapter.py
+- send_order_entrypoint.py
+- send_order_result_recorder.py
+- send_order_result_review_service.py
+- chejan_event_normalizer.py
+- chejan_event_review_service.py
+- chejan_event_recorder.py
+- runtime/order_queue.json
+- runtime/order_executions.json existence
+- runtime/order_locks.json existence
+
+Current runtime state observed
+- runtime/order_queue.json exists.
+- runtime/order_executions.json does not exist.
+- runtime/order_locks.json does not exist.
+- The current runtime/order_queue.json contains version, updated_at, and orders.
+- No runtime file should be created or modified by the first SendOrder executor.
+
+1. Actual SendOrder call location candidate
+The future executor should be a new isolated module, for example:
+- kiwoom_send_order_executor.py
+
+Candidate function:
+- execute_kiwoom_send_order_from_call_preview(...)
+
+The executor should be the only production layer allowed to call the injected
+Kiwoom adapter/object. It should not be imported by GUI code directly. It should
+not write runtime/order_queue.json or runtime/order_executions.json itself.
+
+Allowed call dependency should be explicit injection only:
+- kiwoom_api_adapter or broker_adapter passed as an argument
+- callable method name should be explicit, such as send_order or SendOrder
+
+Forbidden inside executor:
+- creating QAxWidget directly
+- resolving a global GUI object
+- importing GUI windows
+- importing controller real execution flow
+- calling queue commit
+- calling runtime commit
+- writing order_queue.json
+
+2. Final call input args format
+The current call preview builds send_order_args in this order:
+1. screen_no
+2. order_name
+3. account_no
+4. order_type
+5. code
+6. quantity
+7. price
+8. hoga
+9. original_order_no
+
+This matches the practical Kiwoom SendOrder argument shape:
+SendOrder(rqname, screen_no, acc_no, order_type, code, quantity, price, hoga, org_order_no)
+
+The naming difference is:
+- order_name in the preview is the Kiwoom rqname/order name argument.
+- original_order_no is the Kiwoom org_order_no argument.
+
+Executor entry should require:
+- call_preview.status == SEND_ORDER_CALL_READY
+- call_preview.send_order_args length == 9
+- call_preview.send_order_call_preview.send_order_args_ready == True
+- call_preview.send_order_called == False
+- call_preview.broker_called == False
+- call_context/executor_context final token still present if passed through
+- manual executor confirmation if real call is enabled
+
+3. Kiwoom SendOrder return value handling
+Kiwoom SendOrder commonly returns an integer immediate result.
+Recommended interpretation:
+- 0: immediate submit accepted by API layer; not final fill/acceptance.
+- non-zero: immediate API call failure or rejection candidate.
+- exception: uncertain or failed call; manual review required.
+
+Executor should return a structured result, for example:
+{
+  "status": "SEND_ORDER_CALLED" | "SEND_ORDER_BLOCKED" | "SEND_ORDER_FAILED" | "SEND_ORDER_UNCERTAIN" | "INVALID",
+  "send_order_called": true/false,
+  "kiwoom_called": true/false,
+  "broker_called": true/false,
+  "send_order_return_code": int/null,
+  "send_order_args": [...],
+  "broker_result": {...},
+  "runtime_write": false,
+  "queue_write": false,
+  "next_stage": "SEND_ORDER_RESULT_RECORD_REQUIRED" | "SEND_ORDER_FAILURE_REVIEW_REQUIRED" | "MANUAL_REVIEW_REQUIRED" | "BLOCKED",
+  "issues": [...],
+  "warnings": [...]
+}
+
+Do not treat return code 0 as execution completion. It only means the SendOrder
+function accepted the request for broker processing. Chejan/order events remain
+responsible for later acceptance, rejection, fill, partial fill, and cancel
+state.
+
+4. Failure return value handling
+For a non-zero SendOrder return code:
+- send_order_called should be True only if the real method was invoked.
+- kiwoom_called should be True only if the Kiwoom call boundary was crossed.
+- status should be SEND_ORDER_FAILED or SEND_ORDER_BLOCKED depending on whether
+  the API was actually called.
+- next_stage should be SEND_ORDER_FAILURE_REVIEW_REQUIRED.
+- runtime_write and queue_write must remain False.
+- The executor must not retry automatically.
+- The executor must not rollback queue/runtime state automatically.
+
+Failure result should include:
+- return code
+- mapped reason if a local mapping exists
+- raw broker/API response
+- call timestamp
+- dispatch_id/order_id/account_no/code/quantity/price/hoga
+- warning that manual review is required before any retry
+
+5. Exception handling
+If the injected adapter raises:
+- catch the exception at the executor boundary.
+- return SEND_ORDER_UNCERTAIN or SEND_ORDER_FAILED with next_stage MANUAL_REVIEW_REQUIRED.
+- set kiwoom_called according to whether the call was attempted.
+- keep runtime_write=False and queue_write=False.
+- never mask the uncertainty as success.
+- do not call result recorder automatically.
+- do not call Chejan recorder automatically.
+
+This is important because an exception may occur after Kiwoom accepted a request
+but before Python received a clean return. That case must be treated as
+uncertain and reviewed manually.
+
+6. Runtime recording after order submit
+The SendOrder executor should not write runtime/order_queue.json directly.
+The existing send_order_result_recorder.py already defines a separate explicit
+recording layer that:
+- requires an entrypoint result with send_order_executed True
+- requires send_order_called True
+- requires runtime_write_required True
+- requires manual_send_order_result_record_confirmed True
+- reads an explicit queue path
+- validates target ORDER_QUEUED record
+- creates a backup
+- writes atomically
+
+Recommended policy:
+- Executor returns result only.
+- Result Recorder records to order_queue only after manual confirmation.
+- Result Review validates recorded result.
+- Chejan layers handle later broker/order event state.
+
+7. order_queue status update policy
+The future executor should not change order_queue status itself.
+The existing result recorder updates queue record fields such as:
+- send_order_called
+- send_order_called_at
+- send_order_entrypoint_stage
+- send_order_result_status
+- send_order_result_recorded_at
+- broker
+- broker_result
+- broker_order_no when immediately available
+
+Queue write should remain outside the executor and behind:
+- explicit queue path
+- stale snapshot/hash check
+- manual confirmation
+- backup
+- atomic write
+
+8. order_executions recording timing
+runtime/order_executions.json currently does not exist.
+The SendOrder executor should not create it.
+
+If runtime execution status needs to be recorded, it should happen in a later
+runtime status update layer after:
+- SendOrder result review passes, or
+- Chejan event review/recording passes, depending on the target state.
+
+Recommended first phase:
+- no order_executions write in SendOrder executor
+- no order_locks write in SendOrder executor
+- queue result recorder remains the first persistent result write path
+
+9. Chejan responsibility separation
+Chejan is event-driven and should remain separate from immediate SendOrder
+return handling.
+
+Immediate SendOrder result answers:
+- Was the SendOrder function called?
+- What immediate code/result did it return?
+- Did the call boundary fail or become uncertain?
+
+Chejan answers:
+- Was an order accepted by broker?
+- What broker order number links the order?
+- Was it filled, partially filled, rejected, canceled, or left open?
+- What quantities/prices/remaining amounts are reported?
+
+Existing Chejan modules support this separation:
+- chejan_event_normalizer.py normalizes raw Kiwoom event data.
+- chejan_event_review_service.py links normalized event to send-order result and queue record.
+- chejan_event_recorder.py records reviewed Chejan events to the queue with explicit confirmation.
+
+10. Need for post-SendOrder review layer
+Yes. A SendOrder Executor Result Review layer is required before result
+recording or any further state transition.
+
+Review should validate:
+- executor result shape
+- send_order_called/kiwoom_called flags
+- return code semantics
+- dispatch_id/order_id/account_no/code identity
+- call preview hash or args hash if available
+- no queue/runtime write happened in executor
+- next_stage is recordable or manual review required
+
+Possible statuses:
+- SEND_ORDER_EXECUTOR_REVIEW_OK
+- SEND_ORDER_EXECUTOR_REVIEW_BLOCKED
+- SEND_ORDER_EXECUTOR_REVIEW_UNCERTAIN
+- INVALID
+
+11. Test strategy
+Unit tests for executor:
+- call preview READY + injected mock adapter returning 0 -> SEND_ORDER_CALLED
+- non-zero return code -> SEND_ORDER_FAILED, no write
+- adapter exception -> SEND_ORDER_UNCERTAIN, no write
+- missing adapter -> BLOCKED
+- adapter without callable send_order/SendOrder -> BLOCKED
+- call preview BLOCKED -> BLOCKED and adapter not called
+- call preview INVALID/malformed -> INVALID and adapter not called
+- args length mismatch -> INVALID
+- final token missing or stale if included -> BLOCKED
+- duplicate call prevention: input send_order_called True -> BLOCKED
+- runtime/order_queue/rules hashes unchanged
+- runtime/order_executions.json and runtime/order_locks.json not created
+
+Integration-style preview tests:
+- adapter contract -> safety gate -> call preview -> executor with mock adapter
+- executor result -> executor review
+- executor review -> result recorder preview/blocked path, without writing by default
+
+Failure and boundary tests:
+- Kiwoom adapter returns non-dict/raw int
+- Kiwoom adapter raises
+- Kiwoom adapter mutates args attempt; executor protects inputs with deepcopy
+- executor never imports GUI modules
+- executor never imports or calls queue commit/runtime commit
+- executor never calls Chejan recorder
+
+12. Need for mock broker adapter before real connection
+Yes. A strict mock Kiwoom adapter should be used before real connection.
+
+Recommended mock interface:
+- send_order(args) or send_order(screen_no, order_name, account_no, order_type, code, quantity, price, hoga, original_order_no)
+
+The safer option is an object with a single explicit method:
+- send_order(send_order_args: list) -> dict
+
+Mock adapter should capture:
+- called count
+- last args
+- configured return code
+- configured exception
+
+Real adapter should be introduced only after the executor contract is stable
+and covered by tests that prove no runtime/order_queue write occurs at the call
+boundary.
+
+SendOrder Executor entry conditions
+The future executor should require all of the following:
+- call_preview.status == SEND_ORDER_CALL_READY
+- call_preview.send_order_args is a 9-item list
+- call_preview.send_order_call_preview.send_order_args_ready == True
+- call_preview.send_order_called == False
+- call_preview.broker_called == False
+- safety gate previously returned SEND_ORDER_SAFE
+- adapter contract previously returned SEND_ORDER_CONTRACT_READY
+- explicit injected Kiwoom adapter exists
+- adapter callable exists
+- final executor confirmation exists
+- environment flag real_send_order_executor_enabled == True if this is a real call
+
+Call boundary
+The only allowed side effect in the executor is one explicit call to the
+injected adapter. Everything else is forbidden:
+- no file writes
+- no queue writes
+- no runtime writes
+- no GUI calls
+- no automatic result recording
+- no automatic Chejan handling
+- no retry
+
+Failure policy
+- Non-zero immediate return: failed result, manual review required.
+- Exception: uncertain/manual review required.
+- Missing adapter/callable: blocked, no call.
+- Malformed input: invalid, no call.
+- Any post-call uncertainty: do not record automatically.
+
+Runtime record policy
+- SendOrder executor does not write runtime/order_queue.json.
+- SendOrder executor does not create runtime/order_executions.json.
+- SendOrder executor does not create runtime/order_locks.json.
+- Existing send_order_result_recorder.py remains the queue write path after
+  explicit manual confirmation.
+- Chejan event recorder remains the broker event write path after explicit
+  review and confirmation.
+
+Next implementation candidates
+1. kiwoom_send_order_executor.py
+   - execute_kiwoom_send_order_from_call_preview(...)
+   - injected adapter only
+   - no file writes
+   - tests for return code 0, non-zero, exception, missing adapter
+
+2. tests/test_kiwoom_send_order_executor.py
+   - mock adapter only
+   - protected file hash checks
+   - no runtime/order_queue writes
+
+3. kiwoom_send_order_executor_result_review.py
+   - review executor result before result recording
+   - no writes
+
+4. Later only after review:
+   - optional integration with send_order_result_recorder.py behind manual
+     confirmation and explicit queue path.
+
+Conclusion
+Do not connect the real Kiwoom SendOrder call directly to GUI, Queue Commit,
+Runtime Commit, or Chejan recording. The safe next step is a narrow executor
+that calls only an explicitly injected adapter and returns a structured result
+without writing any files. Queue/runtime persistence and Chejan handling should
+remain separate stages with their own review and manual confirmations.

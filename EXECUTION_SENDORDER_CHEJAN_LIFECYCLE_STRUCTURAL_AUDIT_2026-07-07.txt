@@ -1,0 +1,379 @@
+Execution / SendOrder / Chejan / Lifecycle Pipeline Structural Audit
+Date: 2026-07-07
+Scope: structural audit only. No Python code changes, no runtime writes, no rules changes, no layer deletion or movement.
+
+1. Audit Target Summary
+
+This audit reviews the currently accumulated execution pipeline layers:
+
+- Execution Preview and Readiness layers
+- Queue Commit preview, dry-run, executor, and review layers
+- SendOrder dispatch, adapter, safety, executor, and review layers
+- SendOrder result recorder contract, recorder, and review layers
+- Chejan entry, raw event, classification, evidence, and evidence review layers
+- Chejan-to-Lifecycle transition preview, approval, commit contract preview, and dry-run layers
+
+The core pattern is consistent:
+
+Preview -> Readiness/Approval -> Contract -> Dry-run -> Executor -> Review -> Next boundary
+
+This pattern is safe for automatic trading, but the number of layers is now high enough that naming, grouping, and commit boundaries should be managed deliberately.
+
+2. Must Keep
+
+These layers directly contribute to safety boundaries or clear handoff contracts:
+
+- execution_readiness_validator.py
+  Reason: separates preview result validation from approval and queue write.
+
+- execution_approval_gate.py
+  Reason: explicit operator/policy approval boundary before queue commit planning.
+
+- execution_queue_commit_contract_preview.py
+  Reason: normalizes queue commit contract before dry-run/write.
+
+- execution_queue_commit_dry_run.py
+  Reason: rechecks duplicate and lock state without writing.
+
+- execution_queue_commit_executor.py
+  Reason: actual queue write boundary with confirmation, backup, verification, and rollback semantics.
+
+- execution_queue_commit_result_review.py
+  Reason: confirms queue write result before dispatch construction.
+
+- execution_order_dispatch_builder.py
+  Reason: converts queue commit review into broker-neutral dispatch contract.
+
+- broker_dispatch_preview.py
+  Reason: broker capability/session compatibility preview before Kiwoom-specific mapping.
+
+- kiwoom_send_order_adapter_contract.py
+  Reason: isolates Kiwoom SendOrder parameter contract.
+
+- kiwoom_send_order_safety_gate.py
+  Reason: final safety check before SendOrder call preview.
+
+- kiwoom_send_order_call_preview.py
+  Reason: final call argument preview before executor.
+
+- kiwoom_send_order_executor.py
+  Reason: actual injected adapter call boundary, with no direct Kiwoom object dependency.
+
+- kiwoom_send_order_executor_result_review.py
+  Reason: classifies SendOrder return status before recording.
+
+- send_order_result_recorder_contract.py
+  Reason: separates SendOrder review result from persistent record shape.
+
+- send_order_result_recorder_v1.py
+  Reason: actual record write boundary, currently temp-path oriented and guarded.
+
+- send_order_result_recorder_review.py
+  Reason: verifies recorder result before Chejan handoff.
+
+- send_order_record_review_to_chejan_entry_adapter.py
+  Reason: clean boundary from SendOrder record review to Chejan entry candidate.
+
+- chejan_entry_open_policy.py
+  Reason: explicit policy gate before accepting Chejan event input.
+
+- chejan_raw_event_contract.py
+  Reason: normalizes raw Chejan data into a contract.
+
+- chejan_event_classification_preview.py
+  Reason: keeps event interpretation candidate-only.
+
+- chejan_event_evidence_builder.py
+  Reason: records classification evidence without lifecycle finalization.
+
+- chejan_event_evidence_review.py
+  Reason: review-only validation before lifecycle candidate handoff.
+
+- chejan_to_lifecycle_transition_preview.py
+  Reason: maps candidate Chejan evidence to lifecycle transition preview without write.
+
+- lifecycle_transition_approval_gate.py
+  Reason: explicit operator/policy approval before lifecycle write planning.
+
+- lifecycle_commit_contract_preview.py
+  Reason: lifecycle write contract normalization before dry-run.
+
+- lifecycle_commit_dry_run.py
+  Reason: duplicate transition and runtime context validation without lifecycle write.
+
+3. Keep, But Consider Name or Role Adjustment
+
+- rule_apply_preview_execution_order_adapter.py
+  Current role is useful, but name is long. Consider grouping under a "rule_to_execution" naming family later.
+
+- rule_apply_preview_execution_preview_controller.py
+  Useful as a controller-level preview hook. Consider naming it as an orchestrator if it remains non-GUI and preview-only.
+
+- execution_queue_review_to_send_order_preview_adapter.py
+  Useful adapter. Name is accurate but very long; consider grouping under "send_order_preview_adapters" if modules are later packaged.
+
+- execution_final_send_gate_* layers
+  They provide a safe bridge to final_send_gate_service. If the final gate remains a single function, some input adapter/orchestrator policy layers may be grouped later.
+
+- execution_send_order_entrypoint_* layers
+  Keep while SendOrder entrypoint remains a distinct pre-broker boundary. Revisit once actual broker dispatch path stabilizes.
+
+- execution_broker_dispatch_open_policy.py and execution_broker_dispatch_orchestrator.py
+  Keep, but ensure they do not duplicate kiwoom_send_order_executor responsibilities. Broker dispatch and Kiwoom SendOrder executor need a clear separation:
+  broker dispatch = injected broker adapter call
+  Kiwoom SendOrder executor = direct SendOrder-like injected callable call
+
+- execution_runtime_status_update_* and execution_queue_status_update_* layers
+  Keep as preview-only post-broker orchestration, but do not confuse them with real runtime/order_queue file updates.
+
+- execution_lock_release_* and execution_post_execution_review.py
+  Keep for complete preview chain testing. Real lock release must remain separate from preview release.
+
+4. Integration Candidates
+
+These are candidates for future consolidation after behavior stabilizes. Do not merge now without tests and spec approval.
+
+- Final Send Gate readiness + input adapter + preview orchestrator
+  Potential consolidation: readiness policy and input adapter could become one "final_send_gate_input_preview" layer if responsibilities remain simple.
+
+- Final Send Gate open policy + call orchestrator
+  Potential consolidation: could become one "final_send_gate_service_preview_orchestrator" only if policy remains small and no environment flags expand.
+
+- SendOrder EntryPoint open policy + SendOrder EntryPoint orchestrator
+  Potential consolidation: if entrypoint remains preview-only and never calls broker, policy and orchestrator may be combined.
+
+- Broker Result Review + Broker Result Record Readiness Policy
+  Potential consolidation: review status could directly produce record readiness if no independent operator/environment policy is required.
+
+- Runtime Status Update Readiness + Runtime Status Update Orchestrator
+  Potential consolidation: if updater stays in-memory preview-only, readiness may be a section of the orchestrator.
+
+- Queue Status Update Readiness + Queue Status Update Orchestrator
+  Same as runtime status update.
+
+- Lock Release Readiness + Lock Release Orchestrator
+  Same pattern; safe but possibly verbose.
+
+- Chejan Event Classification Preview + Evidence Builder
+  Keep separate now because classification and evidence have different meanings. If evidence remains a thin wrapper, they can later become one "classification_evidence_preview" layer.
+
+- Lifecycle Approval Gate + Lifecycle Commit Contract Preview
+  Keep separate now because approval and contract-building are distinct. Consolidation should wait until a real lifecycle writer exists.
+
+5. Future Concepts
+
+These concepts are not complete and should not be treated as production-ready:
+
+- Full Chejan Pipeline
+- Order Lifecycle Manager
+- Order received finalization
+- Partial fill finalization
+- Full fill finalization
+- Order rejected finalization
+- Order cancelled finalization
+- Position update
+- Balance update
+- Multi-broker operation
+- Automatic retry
+- Real lifecycle storage writer
+- Real runtime status updater
+- Real queue status updater
+- Real lock release writer
+- GUI-connected execution flow
+
+6. Currently Forbidden Concepts
+
+These must remain blocked unless explicitly approved in a future task:
+
+- Direct Kiwoom OpenAPI calls outside an injected and gated adapter boundary
+- SendOrder calls without final confirmation and safety gate
+- Queue Commit without dry-run, approval, duplicate recheck, and write boundary checks
+- Runtime Commit without readiness policy and confirmation
+- Chejan live handler connection without an entry policy and raw event contract
+- Lifecycle creation or mutation from candidate Chejan events without approval, contract preview, dry-run, and write boundary
+- Position or balance mutation from Chejan candidates
+- Automatic retry after SendOrder failure or uncertain result
+- GUI auto-execution connection
+- rules.json mutation during execution pipeline work
+
+7. Actual Write Layers
+
+Current or intended write boundary layers:
+
+- execution_queue_commit_executor.py
+  Actual queue write boundary for runtime/order_queue.json.
+
+- send_order_result_recorder_v1.py
+  Actual SendOrder result recording boundary, currently intended for temp/test path and protected from project runtime writes unless explicitly opened later.
+
+Potential future write layers:
+
+- Lifecycle commit executor
+- Runtime status update executor
+- Queue status update executor
+- Lock release executor
+- Chejan event recorder write path
+
+Do not blur preview layers with these write layers.
+
+8. External Call Layers
+
+Actual or intended external call boundaries:
+
+- kiwoom_send_order_executor.py
+  Injected adapter call boundary. Must not directly instantiate or reach into Kiwoom.
+
+- execution_broker_dispatch_orchestrator.py
+  Injected broker_adapter boundary. Must not call Kiwoom directly.
+
+Potential future external boundary:
+
+- Chejan live event connection. Not implemented as a safe production boundary in this chain yet.
+
+9. Review-Only Layers
+
+Review-only layers are useful because they prevent automatic progression:
+
+- execution_queue_commit_result_review.py
+- kiwoom_send_order_executor_result_review.py
+- send_order_result_recorder_review.py
+- chejan_event_evidence_review.py
+- execution_broker_result_review.py
+- execution_post_execution_review.py
+
+These layers should not write, call broker APIs, process Chejan live events, or mutate lifecycle state.
+
+10. Dead Layer and Over-Layering Risk
+
+Risk exists in the post-queue and pre-SendOrder region:
+
+- Final Send Gate readiness/input/orchestrator/open/call chain is very granular.
+- SendOrder EntryPoint open/orchestrator chain may overlap with Kiwoom safety gate and call preview.
+- Broker Dispatch open/orchestrator may overlap with Kiwoom SendOrder executor if both remain active paths.
+- Runtime status update and queue status update preview layers may be conceptual until real writers exist.
+
+Practical interpretation:
+
+- Keep the layers for now because they are covered by tests and preserve explicit boundaries.
+- Avoid adding new adjacent policy/orchestrator pairs unless they introduce a genuinely new safety boundary.
+- Once the real Kiwoom path is chosen, collapse redundant pre-call layers only with contract tests in place.
+
+11. Stability Contribution
+
+Strong stability contributors:
+
+- Readiness validators
+- Approval gates
+- Contract previews
+- Dry-runs
+- Executor boundaries
+- Result reviews
+- Explicit injected adapters
+- Hash/immutability tests
+
+Lower stability contributors if left too granular:
+
+- Multiple open policy layers that only restate the previous result
+- Orchestrators that only wrap one function without a new safety check
+- Preview layers that duplicate the same identity checks without adding new context
+
+12. Kiwoom Integration Practicality
+
+The current path is safe but verbose. For real Kiwoom integration:
+
+- Keep one final safety gate immediately before SendOrder.
+- Keep one call preview that materializes exact SendOrder args.
+- Keep one executor that calls only an injected callable.
+- Keep one result review that classifies return values.
+- Keep recorder and Chejan pipeline strictly separated.
+
+Natural real integration path:
+
+Queue Commit Review
+-> Dispatch Builder
+-> Broker Dispatch Preview
+-> Kiwoom Adapter Contract
+-> Kiwoom Safety Gate
+-> Kiwoom Call Preview
+-> Kiwoom SendOrder Executor
+-> Executor Result Review
+-> Result Recorder Contract
+-> Result Recorder
+-> Recorder Review
+-> Chejan Entry Adapter
+
+The older Final Send Gate and EntryPoint chain should be evaluated for redundancy against this newer direct Kiwoom contract path.
+
+13. Host / Local Extension
+
+The layered contract style is favorable for Host/Local operation:
+
+- Local Ollama/OpenCode can analyze preview contracts without write access.
+- Host-controlled Codex can implement gated write layers.
+- Injected broker adapters allow mock/local tests and production adapters to remain separate.
+- Report-only and preview-only stages are easy to run safely on local machines.
+
+The cost is naming and navigation complexity. A future package layout may help, but no restructuring should happen until the active pipeline is stable.
+
+14. Documentation Reflection Scope
+
+Spec or documentation updates should eventually capture:
+
+- Which execution path is canonical: Final Send Gate chain or Kiwoom direct contract chain.
+- Which layers are production write/call boundaries.
+- Which layers are preview-only and must never mutate state.
+- Which Chejan/lifecycle concepts remain future-only.
+- Required test matrix for each boundary.
+
+Do not update MASTER_SPEC directly without explicit approval.
+
+15. Recommended Git Commit Units
+
+Recommended commit grouping:
+
+1. Local AI operating docs and analyzer tooling
+2. Execution preview/readiness/approval/queue contract chain
+3. Queue commit executor and result review
+4. Dispatch builder and broker/Kiwoom preview contracts
+5. SendOrder executor and result review
+6. SendOrder result recorder contract/recorder/review
+7. Chejan entry/raw/classification/evidence/evidence review
+8. Lifecycle transition/approval/commit preview/dry-run
+9. Structural audit documents
+
+Do not combine runtime write-capable changes with unrelated preview-only layers.
+
+16. Practical Judgment
+
+The pipeline is safe-first and test-heavy, which is appropriate for automatic trading. The main issue is not unsafe behavior but layer sprawl.
+
+Current best action:
+
+- Freeze new conceptual expansion.
+- Pick one canonical SendOrder path.
+- Add contract tests that prove the canonical path reaches the intended boundary.
+- Only then decide which redundant pre-SendOrder layers can be merged or retired.
+
+17. Next Recommended Work
+
+Recommended next tasks:
+
+1. Create a canonical pipeline map document that names the single preferred path from Queue Commit Review to SendOrder Result Recorder Review.
+2. Add an E2E contract test for that canonical path only.
+3. Mark alternate chains as legacy/experimental in documentation, not code, until removal is approved.
+4. Avoid implementing lifecycle write until lifecycle storage schema and rollback rules are explicitly reviewed.
+5. Avoid Chejan live handler connection until raw event contract and evidence review are stable against real sample events.
+
+18. Protection Result
+
+This audit is document-only. It does not authorize:
+
+- Python code changes
+- runtime writes
+- rules.json changes
+- SendOrder calls
+- Broker/Kiwoom calls
+- Chejan live connection
+- lifecycle writes
+- Git commit or push
+

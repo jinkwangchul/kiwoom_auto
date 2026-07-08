@@ -1,0 +1,95 @@
+Canonical SendOrder Path
+Date: 2026-07-07
+Scope: documentation and contract test only. No feature implementation, no layer deletion, no runtime write, no rules change.
+
+1. Official Canonical Path
+
+The current official SendOrder path is:
+
+Queue Commit Result Review
+-> Order Dispatch Builder
+-> Broker Dispatch Preview
+-> Kiwoom SendOrder Adapter Contract
+-> Kiwoom SendOrder Safety Gate
+-> Kiwoom SendOrder Call Preview
+-> Kiwoom SendOrder Executor
+-> Kiwoom SendOrder Executor Result Review
+
+This path is the preferred and canonical route from a verified queued order to SendOrder executor result review.
+
+2. Canonical Path Modules
+
+- execution_queue_commit_result_review.py
+- execution_order_dispatch_builder.py
+- broker_dispatch_preview.py
+- kiwoom_send_order_adapter_contract.py
+- kiwoom_send_order_safety_gate.py
+- kiwoom_send_order_call_preview.py
+- kiwoom_send_order_executor.py
+- kiwoom_send_order_executor_result_review.py
+
+3. Canonical Boundary Rules
+
+- Queue Commit Result Review must validate a committed queue item before dispatch construction.
+- Order Dispatch Builder must create a broker-neutral dispatch contract.
+- Broker Dispatch Preview must verify broker capability and market/session compatibility.
+- Kiwoom SendOrder Adapter Contract must convert broker dispatch preview into Kiwoom SendOrder contract.
+- Kiwoom SendOrder Safety Gate must be the final safety decision before call preview.
+- Kiwoom SendOrder Call Preview must materialize the exact 9 SendOrder args.
+- Kiwoom SendOrder Executor may call only an explicitly injected adapter callable.
+- Kiwoom SendOrder Executor Result Review must classify the executor result as OK, failed, uncertain, blocked, or invalid.
+
+4. Explicitly Non-Canonical Paths
+
+The following chains are not the current canonical SendOrder path:
+
+- Final Send Gate readiness/input/orchestrator/open/call chain
+- SendOrder EntryPoint open/orchestrator chain
+- Broker Dispatch Open Policy / Broker Dispatch Orchestrator chain
+- Broker Result Review / Broker Result Record Readiness chain
+- Runtime Status Update / Queue Status Update / Lock Release / Post Execution Review chain
+
+These chains may remain as alternate, experimental, legacy, or higher-level review candidates. They are not the official SendOrder execution route unless a future task explicitly changes the canonical path.
+
+5. External Call Rule
+
+Direct Kiwoom OpenAPI calls remain forbidden.
+
+The canonical path permits only:
+
+- One injected adapter call inside kiwoom_send_order_executor.py
+- No direct Kiwoom object creation
+- No GUI connection
+- No Chejan processing
+- No recorder call
+- No lifecycle transition
+- No automatic retry
+
+6. Protection Rules
+
+The canonical SendOrder path must not modify:
+
+- runtime/order_queue.json in project runtime
+- runtime/order_executions.json
+- runtime/order_locks.json
+- any rules.json
+
+The E2E contract test may use a temporary queue file to simulate a committed queue item. Project runtime files remain protected.
+
+7. Contract Test Requirement
+
+The canonical path must have an E2E contract test that verifies:
+
+- Final status reaches SEND_ORDER_REVIEW_OK
+- Fake adapter is called exactly once
+- Project runtime/order_queue/rules files remain unchanged
+- runtime/order_executions.json is not created
+- runtime/order_locks.json is not created
+- Chejan, recorder, lifecycle, GUI, and alternate chain functions are not called
+
+8. Practical Decision
+
+This canonical path is shorter and more directly aligned with Kiwoom SendOrder contract construction than the alternate final-send-gate and entrypoint chains.
+
+Keep alternate chains available for review or future orchestration only. Do not route production SendOrder work through them until a future structural decision explicitly changes this document.
+

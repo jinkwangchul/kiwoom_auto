@@ -1,0 +1,502 @@
+Post-SendOrder Boundary Audit
+Date: 2026-07-07
+Workspace: kiwoom_auto
+
+Purpose
+=======
+This audit fixes the boundary after Kiwoom SendOrder execution and SendOrder
+result recording, before any Chejan Pipeline work is allowed.
+
+This is a design/audit artifact only.
+No Python code, runtime files, order_queue.json, rules.json, Chejan handlers,
+Order Lifecycle Manager, position/balance update, or retry logic were modified
+by this audit.
+
+
+Inspected Modules
+=================
+Post-SendOrder implemented path:
+- kiwoom_send_order_executor.py
+- kiwoom_send_order_executor_result_review.py
+- send_order_result_recorder_contract.py
+- send_order_result_recorder_v1.py
+- send_order_result_recorder_review.py
+
+Existing Chejan-related modules:
+- chejan_event_normalizer.py
+- chejan_event_review_service.py
+- chejan_event_recorder.py
+
+Related older modules observed but not treated as the current new boundary:
+- send_order_result_recorder.py
+- send_order_result_review_service.py
+
+
+Responsibility Split
+====================
+
+1. SendOrder Executor responsibility
+------------------------------------
+Module: kiwoom_send_order_executor.py
+
+Current responsibility:
+- Calls only an explicitly injected SendOrder-like adapter.
+- Does not directly call Kiwoom/OpenAPI objects.
+- Does not call recorder logic.
+- Does not process Chejan.
+- Does not write runtime files.
+- Does not write queue files.
+
+Output meaning:
+- SEND_ORDER_SENT: adapter returned 0.
+- SEND_ORDER_FAILED: adapter returned non-zero or unknown return code.
+- ERROR: adapter raised an exception.
+- BLOCKED/INVALID: preconditions failed.
+
+Boundary decision:
+- SendOrder executor output proves only that the send-order call boundary was
+  reached and what immediate return code came back.
+- It must not be interpreted as order accepted, filled, partially filled,
+  rejected, canceled, or lifecycle-complete.
+
+
+2. SendOrder Executor Result Review responsibility
+--------------------------------------------------
+Module: kiwoom_send_order_executor_result_review.py
+
+Current responsibility:
+- Classifies executor result as:
+  - SEND_ORDER_REVIEW_OK
+  - SEND_ORDER_REVIEW_FAILED
+  - SEND_ORDER_REVIEW_UNCERTAIN
+  - BLOCKED
+  - INVALID
+- Verifies adapter call count and identity against call preview.
+- Marks recording_deferred=True and chejan_deferred=True.
+- Sets record_ready only for a clean SendOrder return code 0.
+- Does not record.
+- Does not process Chejan.
+- Does not write runtime or queue files.
+
+Boundary decision:
+- SEND_ORDER_REVIEW_OK means "ready to record the SendOrder call result".
+- It does not mean broker order acceptance or fill confirmation.
+- Chejan remains deferred even when review is OK.
+
+
+3. SendOrder Result Recorder Contract responsibility
+----------------------------------------------------
+Module: send_order_result_recorder_contract.py
+
+Current responsibility:
+- Converts SEND_ORDER_REVIEW_OK plus explicit record_context into a
+  RECORD_READY recorder contract.
+- Requires:
+  - dispatch_id
+  - order_id
+  - source_order_id
+  - source_signal_id
+  - code
+  - side
+  - quantity
+  - price
+  - hoga
+  - send_order_return_code
+  - send_order_status
+  - review_status
+  - recorded_at
+- Does not write.
+- Does not call Chejan.
+- Does not create lifecycle/position/balance state.
+
+Boundary decision:
+- This contract is a SendOrder-call-result record contract only.
+- It is not a Chejan event contract and must not contain fill state as truth.
+
+
+4. SendOrder Result Recorder v1 responsibility
+----------------------------------------------
+Module: send_order_result_recorder_v1.py
+
+Current responsibility:
+- Writes RECORD_READY contract only into an explicit temp/test
+  order_executions.json path.
+- Blocks actual project runtime/order_executions.json.
+- Requires existing record file and valid schema.
+- Uses backup, atomic write, post-write verification, and rollback.
+- Does not write order_queue.json.
+- Does not write order_locks.json.
+- Does not process Chejan.
+
+Boundary decision:
+- This is the first SendOrder-result runtime-write layer, but currently only
+  for temp/test paths.
+- Actual project runtime/order_executions.json remains closed.
+
+
+5. SendOrder Result Recorder Review responsibility
+--------------------------------------------------
+Module: send_order_result_recorder_review.py
+
+Current responsibility:
+- Review-only verification of recorder v1 result and persisted temp record.
+- Confirms expected record_id exists and matches record_report identity.
+- Returns:
+  - RECORD_REVIEW_OK
+  - RECORD_REVIEW_BLOCKED
+  - INVALID
+  - ERROR
+- Keeps chejan_ready=False and chejan_called=False.
+- Does not write runtime or queue files.
+
+Boundary decision:
+- RECORD_REVIEW_OK means the SendOrder call result record exists.
+- It is still not a Chejan event and not an order lifecycle state.
+
+
+Recorder Information vs Chejan Information
+==========================================
+
+Recorder currently records:
+- dispatch_id
+- order_id
+- source_order_id
+- source_signal_id
+- code
+- side
+- quantity
+- price
+- hoga
+- send_order_return_code
+- send_order_status
+- review_status
+- record_id
+- recorded_at
+- recorder metadata
+
+Recorder must not claim:
+- broker_order_no as confirmed, unless supplied by a later accepted event
+  source.
+- order accepted/open state.
+- partial fill.
+- full fill.
+- rejection.
+- cancellation.
+- position update.
+- balance update.
+- lifecycle completion.
+
+Chejan should own:
+- Raw Kiwoom Chejan FID event normalization.
+- broker_order_no received from Kiwoom.
+- order_status from Chejan.
+- order_quantity, filled_quantity, remaining_quantity.
+- order_price, filled_price.
+- ORDER_OPEN / ORDER_ACCEPTED style event evidence.
+- ORDER_REJECTED.
+- ORDER_CANCELED.
+- PARTIAL_FILL.
+- FULL_FILL.
+- Linkage of Chejan event to the queued order record.
+- Event history appended to the queued order record, if explicitly committed.
+
+
+order_executions.json Role
+==========================
+
+Current role:
+- Stores execution/runtime records.
+- In this new post-SendOrder branch, temp/test order_executions.json can store
+  the SendOrder call result record.
+- It can prove the SendOrder immediate result was recorded.
+
+Not current role:
+- It does not yet drive live project execution status updates.
+- It does not yet own broker lifecycle state transitions.
+- It does not yet own fill ledgers, position ledgers, or balance updates.
+- Actual project runtime/order_executions.json remains closed for this branch.
+
+Future role candidate:
+- Store immutable SendOrder-call result record first.
+- Later receive explicit status updates after Chejan review/recording contracts
+  are complete.
+- Never infer fills or lifecycle completion from SendOrder return code alone.
+
+
+order_queue.json State Change Timing
+====================================
+
+Current safe interpretation:
+- Queue commit creates ORDER_QUEUED before SendOrder.
+- SendOrder result recording does not update order_queue.json.
+- Chejan event recorder is the first observed existing layer that appends
+  Chejan event history to an existing ORDER_QUEUED record.
+
+Do not change order_queue.json at SendOrder result recorder stage.
+
+Queue state changes should happen only after separate gates/contracts define:
+- which order_queue record is targeted,
+- which SendOrder result review proves the SendOrder call happened,
+- which normalized Chejan event is linked,
+- whether manual Chejan record confirmation is present,
+- whether queue snapshot is still current,
+- whether broker_order_no is present or safely enriched.
+
+
+Order Concept Introduction Timing
+=================================
+
+Do not introduce these concepts as completed state at SendOrder result time:
+- 주문접수
+- 체결
+- 부분체결
+- 취소
+- 거부
+
+Earliest valid introduction points:
+
+1. 주문접수 / ORDER_OPEN / ORDER_ACCEPTED
+   - After normalized Chejan event is reviewed and linked.
+   - Requires broker_order_no policy and order identity match.
+
+2. 주문거부 / ORDER_REJECTED
+   - After Chejan event normalization detects reject/error status and review
+     links it to the order.
+
+3. 취소 / ORDER_CANCELED
+   - After Chejan event normalization detects cancellation and review links it.
+
+4. 부분체결 / PARTIAL_FILL
+   - After Chejan normalized event has filled_quantity > 0 and
+     remaining_quantity > 0.
+   - Requires fill recorder contract before any ledger update.
+
+5. 체결완료 / FULL_FILL
+   - After Chejan normalized event has filled_quantity > 0 and
+     remaining_quantity == 0.
+   - Requires fill recorder contract before lifecycle/position/balance update.
+
+
+Existing Chejan Modules Observed
+================================
+
+chejan_event_normalizer.py:
+- Pure in-memory normalizer.
+- Does not write files.
+- Does not create fills or positions.
+- Maps raw Chejan FID values into event_type such as:
+  - ORDER_REJECTED
+  - ORDER_CANCELED
+  - PARTIAL_FILL
+  - FULL_FILL
+  - ORDER_OPEN
+  - ORDER_UNKNOWN
+
+chejan_event_review_service.py:
+- Review-only linkage of normalized Chejan event to an order record.
+- Requires order_record.send_order_called == True.
+- Requires order_record.send_order_result_status == SEND_ORDER_CALLED.
+- Can route to:
+  - CHEJAN_EVENT_RECORD_REQUIRED
+  - FILL_RECORD_REQUIRED
+  - MANUAL_CHEJAN_REVIEW_REQUIRED
+- Does not write runtime files.
+
+chejan_event_recorder.py:
+- Writes reviewed Chejan event history to an explicit queue file.
+- Appends chejan_events on an existing ORDER_QUEUED record.
+- Requires manual_chejan_event_record_confirmed.
+- Does not update fill ledgers, positions, lifecycle manager, GUI, timers, or
+  broker APIs.
+
+Boundary concern:
+- Existing Chejan review currently expects an older shape:
+  send_order_result_review_result.result_review_ok == True and
+  next_stage == CHEJAN_OR_EXECUTION_EVENT_REQUIRED.
+- The new SendOrder recorder review currently returns RECORD_REVIEW_OK and
+  chejan_ready=False.
+- Therefore a bridge/open-policy contract is still needed before linking the
+  new post-SendOrder recorder path to existing Chejan review.
+
+
+Chejan Pipeline Entry Conditions
+================================
+
+Chejan Pipeline must remain closed until all of these are true:
+
+1. SendOrder call path completed:
+   - SendOrder executor status SEND_ORDER_SENT.
+   - Executor result review status SEND_ORDER_REVIEW_OK.
+   - Recorder contract status RECORD_READY.
+   - Recorder v1 status RECORDED.
+   - Recorder review status RECORD_REVIEW_OK.
+
+2. Queue/order record can be identified:
+   - order_queue record exists.
+   - ORDER_QUEUED record identity matches:
+     - order_id
+     - request_hash
+     - lock_id
+     - execution_id
+     - source_signal_id when available.
+   - queue snapshot is fresh.
+
+3. Chejan raw event exists:
+   - raw Kiwoom Chejan event captured separately.
+   - no synthetic Chejan event inferred from SendOrder return code.
+
+4. Chejan normalized event is valid:
+   - normalized == True.
+   - unresolved == False, or manual review path explicitly selected.
+   - broker == KIWOOM.
+   - event_type supported.
+
+5. Broker/order linkage is possible:
+   - broker_order_no is present from event or safely enrichable.
+   - account_no/code/side match queued order.
+   - event/order identity is not stale.
+
+6. Explicit manual confirmation:
+   - Chejan event record confirmation is present before any queue write.
+
+
+Contracts Needed Before Chejan Implementation/Wiring
+====================================================
+
+1. SendOrder Recorder Review to Chejan Review Adapter
+   - Converts RECORD_REVIEW_OK into the result_review shape expected by
+     chejan_event_review_service.py or defines a new explicit input shape.
+   - Must include:
+     - result_review_ok or equivalent readiness flag
+     - next_stage for Chejan entry
+     - order_id
+     - request_hash
+     - lock_id
+     - execution_id
+     - dispatch_id
+     - record_id
+     - send_order_return_code
+     - send_order_status
+
+2. Queue Order Record Lookup Preview
+   - Finds candidate ORDER_QUEUED record without writing.
+   - Confirms identity against SendOrder recorder review.
+   - Captures queue snapshot hash.
+
+3. Chejan Entry Open Policy
+   - Requires recorder review OK.
+   - Requires queue lookup OK.
+   - Requires raw Chejan event present.
+   - Requires environment flag for Chejan processing.
+   - Requires manual/operator confirmation if queue write is possible later.
+
+4. Chejan Event Normalize Orchestrator
+   - Calls existing normalizer only.
+   - No queue write.
+   - No fill/lifecycle/position/balance update.
+
+5. Chejan Event Review Orchestrator
+   - Calls existing review service only.
+   - Verifies adapter result and queued order identity.
+   - No queue write.
+
+6. Chejan Event Record Commit Policy
+   - Separate from review.
+   - Must gate any queue write.
+   - Must keep fill/lifecycle update separate.
+
+7. Fill Record Contract, if event_type is PARTIAL_FILL or FULL_FILL
+   - Required before any fill ledger or position/balance work.
+   - Must not be created implicitly by Chejan event recorder.
+
+
+Future Concepts Still Forbidden
+===============================
+
+Do not implement or wire these yet:
+- Chejan live event handler connection.
+- Automatic Chejan Pipeline entry from SendOrder executor.
+- Order Lifecycle Manager.
+- 주문접수 as committed lifecycle state.
+- 부분체결 as committed lifecycle state.
+- 체결완료 as committed lifecycle state.
+- 주문거부 as committed lifecycle state.
+- 취소 as committed lifecycle state.
+- Position update.
+- Balance update.
+- Fill ledger.
+- Automatic retry after SendOrder failure.
+- Automatic retry after Chejan timeout.
+- Multi-broker routing.
+- GUI auto-update.
+- Direct project runtime/order_executions.json write from the new recorder path.
+- Direct project runtime/order_queue.json update from SendOrder result recorder.
+
+
+Chejan-Before Boundary Summary
+==============================
+
+Completed before Chejan:
+- SendOrder call executor with injected adapter only.
+- SendOrder executor result review.
+- SendOrder result recorder contract builder.
+- SendOrder result recorder v1 for explicit temp/test order_executions.json.
+- SendOrder result recorder result review.
+
+Not completed before Chejan:
+- New recorder-review to Chejan-review adapter.
+- Queue record lookup bridge from new recorder record to ORDER_QUEUED record.
+- Chejan entry open policy.
+- Live Chejan event capture.
+- Chejan event processing orchestration for the new path.
+- Fill/lifecycle/position/balance contracts.
+
+
+Next Minimal Implementation Candidates
+======================================
+
+Recommended next step:
+1. Implement a preview-only
+   send_order_record_review_to_chejan_entry_adapter.py
+
+Purpose:
+- Accept RECORD_REVIEW_OK.
+- Accept queued order record or queue lookup preview.
+- Produce an in-memory Chejan entry candidate contract.
+- Do not call chejan_event_normalizer.py.
+- Do not call chejan_event_review_service.py.
+- Do not write queue/runtime files.
+
+Second step:
+2. Implement chejan_entry_open_policy.py
+
+Purpose:
+- Verify adapter result, raw Chejan event presence, operator/environment flags,
+  and queue snapshot freshness before normalizer/review are allowed.
+
+Third step:
+3. Implement Chejan normalize/review orchestrator.
+
+Purpose:
+- Call existing normalizer and review service only when open policy is READY.
+- Still no queue write.
+
+Fourth step:
+4. Add Chejan event record commit policy before using chejan_event_recorder.py.
+
+
+Safety Decision
+===============
+
+It is not safe to jump directly from SendOrder result recorder review to
+chejan_event_recorder.py.
+
+Reason:
+- Recorder review proves only that the SendOrder immediate result was recorded.
+- Existing Chejan recorder writes order_queue.json.
+- Existing Chejan review expects a specific result-review input shape and an
+  ORDER_QUEUED record with send_order_called/send_order_result_status fields.
+- The new path has not yet standardized the bridge contract.
+
+Therefore the next safe unit is preview-only adapter/policy work, not Chejan
+record commit or lifecycle work.

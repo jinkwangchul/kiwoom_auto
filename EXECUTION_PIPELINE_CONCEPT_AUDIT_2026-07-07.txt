@@ -1,0 +1,210 @@
+Execution Pipeline Concept Audit
+Date: 2026-07-07
+
+Scope
+This audit separates the current Execution/Queue/Dispatch/SendOrder layers into
+implemented layers, preview-only layers, write layers, external-call layers,
+review-only layers, unconnected layers, future concepts, and explicitly
+deferred/forbidden concepts. It also defines what the current E2E contract test
+is allowed to prove.
+
+Audited files
+- rule_apply_preview_execution_order_adapter.py
+- rule_apply_preview_execution_preview_controller.py
+- execution_readiness_validator.py
+- execution_approval_gate.py
+- execution_queue_commit_contract_preview.py
+- execution_queue_commit_dry_run.py
+- execution_queue_commit_executor.py
+- execution_queue_commit_result_review.py
+- execution_order_dispatch_builder.py
+- broker_dispatch_preview.py
+- kiwoom_send_order_adapter_contract.py
+- kiwoom_send_order_safety_gate.py
+- kiwoom_send_order_call_preview.py
+- kiwoom_send_order_executor.py
+- kiwoom_send_order_executor_result_review.py
+
+A. Implemented layers
+The following layers have concrete Python implementations and focused tests:
+- Rule Apply Preview -> Execution Order Adapter
+- Rule Apply Preview Execution Preview Controller
+- Execution Readiness Validator
+- Execution Approval Gate
+- Queue Commit Contract Preview
+- Queue Commit Dry-run Executor
+- Queue Commit Executor
+- Queue Commit Result Review
+- Order Dispatch Builder
+- Broker Dispatch Preview
+- Kiwoom SendOrder Adapter Contract
+- Kiwoom SendOrder Safety Gate
+- Kiwoom SendOrder Call Preview
+- Kiwoom SendOrder Executor
+- Kiwoom SendOrder Executor Result Review
+
+Important limitation:
+Implemented means the local layer exists and has tests. It does not mean the
+entire real trading lifecycle is complete.
+
+B. Preview-only layers
+These layers only construct or validate in-memory contracts and do not write
+runtime files or call SendOrder/Kiwoom:
+- rule_apply_preview_execution_order_adapter.py
+- rule_apply_preview_execution_preview_controller.py
+- execution_readiness_validator.py
+- execution_approval_gate.py
+- execution_queue_commit_contract_preview.py
+- execution_queue_commit_dry_run.py
+- execution_order_dispatch_builder.py
+- broker_dispatch_preview.py
+- kiwoom_send_order_adapter_contract.py
+- kiwoom_send_order_safety_gate.py
+- kiwoom_send_order_call_preview.py
+
+C. Actual write layers
+The only current write layer in this audited chain is:
+- execution_queue_commit_executor.py
+
+Its write scope is intentionally narrow:
+- target must resolve to runtime/order_queue.json
+- target file must already exist
+- in E2E contract tests it must use only a temp runtime/order_queue.json
+- it must not write project runtime/order_queue.json
+- it must not create runtime/order_executions.json
+- it must not create runtime/order_locks.json
+- it must not modify rules.json
+
+No audited layer currently writes order_executions or order_locks.
+
+D. Actual external call layers
+The current external-call boundary is:
+- kiwoom_send_order_executor.py
+
+This layer calls only an explicitly injected callable:
+- send_order_adapter(*send_order_args)
+
+It must not:
+- resolve or instantiate a Kiwoom GUI object
+- call QAxWidget directly
+- import GUI code
+- write runtime/order_queue.json
+- call recorders
+- process Chejan
+- retry automatically
+
+In tests, this external call is represented only by a fake injected adapter.
+
+E. Review-only layers
+These layers inspect already-produced results and do not perform writes or
+external calls:
+- execution_queue_commit_result_review.py
+- kiwoom_send_order_executor_result_review.py
+
+They are allowed to classify results and set readiness flags. They must not
+record results, process Chejan, retry, write queue/runtime files, or call
+SendOrder.
+
+F. Currently unconnected or not wired to GUI/controller
+The audited chain is not yet wired to real GUI execution buttons or a real
+ExecutionController entrypoint:
+- no GUI automatic connection is complete
+- no real ExecutionController orchestration is complete
+- no automatic SendOrder flow is connected from GUI
+- no automatic result recording is connected after SendOrder review
+
+The E2E contract only proves a synthetic/test pipeline can connect the current
+layers in sequence.
+
+G. Future concepts, not completed
+The following must remain future concepts and must not be marked complete:
+- Chejan Pipeline
+- Order Lifecycle Manager
+- 주문접수
+- 부분체결
+- 체결완료
+- 주문거부
+- 포지션 반영
+- 잔고 반영
+- 자동 재시도
+- 다중 Broker 운영
+
+These concepts require separate design, storage contracts, review gates,
+failure policies, and tests.
+
+H. Deferred/forbidden concepts for the current chain
+The following are explicitly deferred/forbidden in the current audited chain:
+- Chejan processing inside SendOrder executor
+- result recorder invocation inside SendOrder executor/result review
+- automatic retry after failed SendOrder
+- runtime/order_executions.json creation from this chain
+- runtime/order_locks.json creation or lock release from this chain
+- position update
+- balance update
+- GUI auto execution wiring
+- direct Kiwoom/OpenAPI object lookup
+- direct Broker adapter lookup
+- multi-broker routing beyond preview capability checks
+
+Current E2E contract meaning
+The E2E contract is allowed to prove:
+- synthetic Rule Apply Preview can create a REAL_READY order contract
+- preview controller can produce execution/queue preview results
+- readiness and approval can pass
+- queue commit contract and dry-run can pass
+- queue commit can write only to a temp runtime/order_queue.json
+- queue commit result can be reviewed
+- dispatch and broker preview contracts can be built
+- Kiwoom SendOrder adapter/safety/call preview contracts can be built
+- injected fake adapter can be called once by the executor
+- executor result review can reach SEND_ORDER_REVIEW_OK
+
+The E2E contract is not allowed to prove:
+- real GUI integration
+- real Kiwoom/OpenAPI integration
+- real broker acceptance
+- Chejan event handling
+- order lifecycle status transitions
+- fill, partial fill, rejection, position, or balance updates
+- automatic retry
+- production multi-broker operation
+
+Current top-level sequence under test
+Rule Apply Preview
+-> Execution Order Adapter
+-> Execution Preview Controller
+-> Execution Readiness Validator
+-> Execution Approval Gate
+-> Queue Commit Contract Preview
+-> Queue Commit Dry-run Executor
+-> Queue Commit Executor
+-> Queue Commit Result Review
+-> Order Dispatch Builder
+-> Broker Dispatch Preview
+-> Kiwoom SendOrder Adapter Contract
+-> SendOrder Safety Gate
+-> SendOrder Call Preview
+-> SendOrder Executor
+-> SendOrder Executor Result Review
+
+Expected terminal status for current implemented chain
+- SEND_ORDER_REVIEW_OK
+
+Required invariants
+- project runtime/order_queue.json unchanged
+- project runtime/order_executions.json not created
+- project runtime/order_locks.json not created
+- routines/*/rules.json unchanged
+- Chejan functions not called
+- result recorder not called
+- GUI functions not called
+- real Kiwoom functions not called
+- fake adapter called exactly once
+- automatic retry not attempted
+
+Conclusion
+The current implemented chain is sufficient for a synthetic preview-to-temp
+queue-to-fake SendOrder E2E contract. It is not a complete real order lifecycle.
+The next production decisions should be about carefully connecting result
+recording, Chejan review/recording, and lifecycle state management as separate
+explicitly-gated stages, not by folding them into the SendOrder executor.
