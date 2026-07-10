@@ -160,8 +160,11 @@ def execute_runtime_commit(
     issues: list[str] = []
     warnings: list[str] = []
 
-    commit_id = transaction_manifest.get("commit_id", "") if isinstance(transaction_manifest, dict) else ""
-    transaction_id = transaction_manifest.get("transaction_id", "") if isinstance(transaction_manifest, dict) else ""
+    manifest_commit_id = transaction_manifest.get("commit_id", "") if isinstance(transaction_manifest, dict) else ""
+    manifest_transaction_id = transaction_manifest.get("transaction_id", "") if isinstance(transaction_manifest, dict) else ""
+    manifest_target_set_hash = transaction_manifest.get("target_set_hash", "") if isinstance(transaction_manifest, dict) else ""
+    commit_id = manifest_commit_id
+    transaction_id = manifest_transaction_id
     # Prefer the storage_plan identity so M6-13 persistence/journal writes match
     # the caller-provided transaction_id/commit_id exactly.
     if isinstance(storage_plan, dict):
@@ -333,6 +336,38 @@ def execute_runtime_commit(
     # NOTE: _persist_manifest references `token`, which is assigned after token
     # validation below; the actual persist call is performed post-validation
     # (still before backup/write) to keep the manifest accurate.
+
+    manifest_identity_issues: list[str] = []
+    if isinstance(storage_plan, dict):
+        storage_commit_id = storage_plan.get("commit_id")
+        if manifest_commit_id and storage_commit_id and manifest_commit_id != storage_commit_id:
+            manifest_identity_issues.append("transaction_manifest commit_id mismatch with storage_plan")
+    if isinstance(storage_plan, dict) and isinstance(guard_plan, dict):
+        storage_transaction_id = storage_plan.get("transaction_id")
+        guard_transaction_id = guard_plan.get("transaction_id")
+        if storage_transaction_id and guard_transaction_id and storage_transaction_id != guard_transaction_id:
+            manifest_identity_issues.append("storage_plan transaction_id mismatch with guard_plan")
+    if isinstance(transaction_manifest, dict):
+        manifest_target_paths = _normalize_targets(transaction_manifest.get("target_paths"))
+        if manifest_target_set_hash and manifest_target_paths:
+            manifest_computed_hash = build_runtime_commit_transaction_manifest(
+                commit_id=manifest_commit_id or "runtime-commit",
+                target_paths=manifest_target_paths,
+                execution_plan_hash=plan_hash or "runtime-plan",
+                approval_token_id="runtime-token",
+                expected_payload_hash="runtime-payload",
+            ).get("target_set_hash", "")
+            if manifest_computed_hash and manifest_target_set_hash != manifest_computed_hash:
+                manifest_identity_issues.append("transaction_manifest target_set_hash mismatch")
+    if manifest_identity_issues:
+        _close_journal(RECOVERY_STATUS_ABORTED, details={"stage": "MANIFEST_IDENTITY", "errors": manifest_identity_issues})
+        return _build_result(
+            status=STATUS_BLOCKED,
+            transaction_id=transaction_id,
+            commit_id=commit_id,
+            issues=manifest_identity_issues,
+            warnings=warnings,
+        )
 
     if not isinstance(gate_result, dict):
         return _build_result(

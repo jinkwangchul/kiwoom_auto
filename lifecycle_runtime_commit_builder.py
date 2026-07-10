@@ -24,6 +24,7 @@ Builder does NOT:
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from hashlib import sha256
 from typing import Any
@@ -47,6 +48,17 @@ def _as_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
+
+
+def _hash_json(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _validate_required_text(value: Any, field: str, issues: list[str]) -> str:
@@ -110,7 +122,7 @@ def build_transaction_manifest(
         issues.append("expected_payload_hash is required")
 
     targets = sorted(target_paths) if target_paths else []
-    target_set_hash = sha256(str(targets).encode("utf-8")).hexdigest() if targets else ""
+    target_set_hash = _hash_json({"target_paths": targets}) if targets else ""
 
     meta = deepcopy(metadata) if isinstance(metadata, dict) else {}
 
@@ -352,17 +364,29 @@ def build_adapter_request(
     This is the main entry point that constructs all adapter inputs.
     """
     issues: list[str] = []
+    nested_contract = commit_contract_preview.get("commit_contract")
+    contract = (
+        nested_contract
+        if (
+            isinstance(nested_contract, dict)
+            and (
+                nested_contract.get("lifecycle_commit_request")
+                or nested_contract.get("commit_id")
+            )
+        )
+        else commit_contract_preview
+    )
 
     if not storage_root or not isinstance(storage_root, str) or not storage_root.strip():
         issues.append("storage_root must be a non-empty string")
 
-    lifecycle_request = commit_contract_preview.get("lifecycle_commit_request", {})
+    lifecycle_request = contract.get("lifecycle_commit_request", {})
     if isinstance(lifecycle_request, dict):
         request, validation_issues = validate_lifecycle_request(lifecycle_request)
         if validation_issues:
             issues.extend(validation_issues)
 
-    commit_id = _as_text(commit_contract_preview.get("commit_id"))
+    commit_id = _as_text(contract.get("commit_id"))
     if not commit_id:
         commit_id = _as_text(lifecycle_request.get("commit_id"))
     if not commit_id:
@@ -384,7 +408,7 @@ def build_adapter_request(
 
     result = {
         "lifecycle_commit_request": deepcopy(lifecycle_request),
-        "gate_result": build_gate_result(commit_contract_preview=commit_contract_preview),
+        "gate_result": build_gate_result(commit_contract_preview=contract),
         "transaction_manifest": build_transaction_manifest(
             commit_id=commit_id,
             transaction_id=transaction_id,
@@ -402,7 +426,7 @@ def build_adapter_request(
             storage_root=storage_root,
             commit_id=commit_id,
             transaction_id=transaction_id,
-            target_set_hash=sha256(str(sorted(expected_targets.keys())).encode("utf-8")).hexdigest() if expected_targets else "",
+            target_set_hash=_hash_json({"target_paths": sorted(expected_targets.keys())}) if expected_targets else "",
             owner_id=owner_id,
         ),
         "token_storage_plan": build_token_storage_plan(
