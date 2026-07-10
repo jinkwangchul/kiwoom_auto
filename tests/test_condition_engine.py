@@ -467,5 +467,220 @@ class ConditionEngineTest(unittest.TestCase):
         )
 
 
+class IndicatorFollowBuyRsiFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_routine_engine_module()
+
+    def _candles(self, closes=None):
+        return [{"close": close, "volume": 100} for close in (closes or [10, 11, 12])]
+
+    def _config(self, *, delay_bar=0, rsi_filter=None, sell_pass=False):
+        config = deepcopy(self.module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
+        config["indicators"] = {"rsi": {"period": 2}}
+        config["buy"]["delay_bar"] = delay_bar
+        config["buy"]["groups"] = [
+            {
+                "enabled": True,
+                "name": "ui_buy_conditions",
+                "conditions": [{"enabled": True, "target": "CLOSE", "operator": ">=", "value": 0}],
+            }
+        ]
+        if rsi_filter is not None:
+            config["buy"]["filters"] = {"rsi": deepcopy(rsi_filter)}
+        config["sell"] = {
+            "delay_bar": delay_bar,
+            "signals": {
+                "macd_sell": {
+                    "enabled": bool(sell_pass),
+                    "groups": [
+                        {
+                            "enabled": True,
+                            "name": "sell_pass",
+                            "conditions": [{"target": "CLOSE", "operator": ">=", "value": 0}],
+                        }
+                    ],
+                }
+            },
+        }
+        return config
+
+    def _signal(self, rsi_filter, *, closes=None, delay_bar=0, sell_pass=False, context=None):
+        config = self._config(delay_bar=delay_bar, rsi_filter=rsi_filter, sell_pass=sell_pass)
+        return self.module.evaluate_indicator_follow_routine(self._candles(closes), config, context or {})
+
+    def _add_pending_ui_filter(self, config, ui_filter):
+        config["indicator_follow_rule_pending"] = {
+            "candidates": {
+                "indicators": {
+                    "rsi": {
+                        "path": "indicators.rsi",
+                        "value": {"period": ui_filter.get("period", 2)},
+                        "ui_filter": deepcopy(ui_filter),
+                    }
+                }
+            }
+        }
+
+    def _rsi_detail(self, signal):
+        return next((detail for detail in signal.details if "filter_type=RSI" in detail), "")
+
+    def test_buy_rsi_filter_disabled_keeps_buy_result(self):
+        signal = self._signal({"enabled": False, "period": 2, "operator": "<=", "threshold": 1})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("enabled=False", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_lte_passes_on_equal_threshold(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": "<=", "threshold": 100})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("evaluated_value=100.0", self._rsi_detail(signal))
+        self.assertIn("passed=True", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_lte_blocks_when_above_threshold(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": "<=", "threshold": 99})
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual(signal.reason, "BUY RSI filter blocked")
+        self.assertIn("reason=not_matched", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_ignores_pending_ui_filter_without_official_filter(self):
+        config = self._config()
+        config["buy"].pop("filters", None)
+        self._add_pending_ui_filter(config, {"period": 2, "operator": "<=", "threshold": 99})
+
+        signal = self.module.evaluate_indicator_follow_routine(self._candles(), config, {})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual("", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_uses_official_filter_when_pending_differs(self):
+        config = self._config(rsi_filter={"enabled": True, "period": 2, "operator": ">=", "threshold": 100})
+        self._add_pending_ui_filter(config, {"period": 2, "operator": "<=", "threshold": 99})
+
+        signal = self.module.evaluate_indicator_follow_routine(self._candles(), config, {})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("operator=>=", self._rsi_detail(signal))
+        self.assertIn("threshold=100.0", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_pending_threshold_changes_do_not_change_execution(self):
+        first_config = self._config()
+        second_config = self._config()
+        first_config["buy"].pop("filters", None)
+        second_config["buy"].pop("filters", None)
+        self._add_pending_ui_filter(first_config, {"period": 2, "operator": "<=", "threshold": 99})
+        self._add_pending_ui_filter(second_config, {"period": 2, "operator": "<=", "threshold": 1})
+
+        first = self.module.signal_to_dict(self.module.evaluate_indicator_follow_routine(self._candles(), first_config, {}))
+        second = self.module.signal_to_dict(self.module.evaluate_indicator_follow_routine(self._candles(), second_config, {}))
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["signal"], "BUY")
+
+    def test_buy_rsi_filter_bad_pending_operator_does_not_block_without_official_filter(self):
+        config = self._config()
+        config["buy"].pop("filters", None)
+        self._add_pending_ui_filter(config, {"period": 2, "operator": "!=", "threshold": 50})
+
+        signal = self.module.evaluate_indicator_follow_routine(self._candles(), config, {})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual("", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_gte_passes_on_equal_threshold(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": ">=", "threshold": 100})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("passed=True", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_gte_blocks_when_below_threshold(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": ">=", "threshold": 101})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=not_matched", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_blocks_when_data_is_insufficient(self):
+        signal = self._signal({"enabled": True, "period": 14, "operator": "<=", "threshold": 50})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=insufficient_data", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_blocks_invalid_period(self):
+        signal = self._signal({"enabled": True, "period": 0, "operator": "<=", "threshold": 50})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=invalid_period", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_blocks_invalid_threshold(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": "<=", "threshold": "bad"})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=invalid_threshold", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_blocks_unsupported_operator(self):
+        signal = self._signal({"enabled": True, "period": 2, "operator": "!=", "threshold": 50})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=unsupported_operator", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_uses_delay_bar_zero_index(self):
+        signal = self._signal(
+            {"enabled": True, "period": 2, "operator": "<=", "threshold": 70},
+            closes=[10, 12, 14, 13],
+            delay_bar=0,
+        )
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual(signal.signal_index, 3)
+        self.assertIn("evaluated_value=66.666667", self._rsi_detail(signal))
+        self.assertIn("evaluation_index=3", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_uses_delay_bar_one_index(self):
+        signal = self._signal(
+            {"enabled": True, "period": 2, "operator": ">=", "threshold": 90},
+            closes=[10, 12, 14, 13],
+            delay_bar=1,
+        )
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual(signal.signal_index, 2)
+        self.assertIn("evaluated_value=100.0", self._rsi_detail(signal))
+        self.assertIn("evaluation_index=2", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_does_not_affect_sell_result(self):
+        signal = self._signal(
+            {"enabled": True, "period": 2, "operator": ">=", "threshold": 101},
+            sell_pass=True,
+        )
+
+        self.assertEqual(signal.signal, "SELL")
+        self.assertEqual(signal.matched_groups, ["sell_pass"])
+        self.assertEqual("", self._rsi_detail(signal))
+
+    def test_buy_rsi_filter_does_not_mutate_inputs(self):
+        config = self._config(rsi_filter={"enabled": True, "period": 2, "operator": "<=", "threshold": 100})
+        candles = self._candles()
+        context = {"probe": {"value": 1}}
+        original_config = deepcopy(config)
+        original_candles = deepcopy(candles)
+        original_context = deepcopy(context)
+
+        self.module.evaluate_indicator_follow_routine(candles, config, context)
+
+        self.assertEqual(config, original_config)
+        self.assertEqual(candles, original_candles)
+        self.assertEqual(context, original_context)
+
+    def test_buy_rsi_filter_is_deterministic_for_same_input(self):
+        config = self._config(rsi_filter={"enabled": True, "period": 2, "operator": "<=", "threshold": 100})
+        candles = self._candles()
+
+        first = self.module.signal_to_dict(self.module.evaluate_indicator_follow_routine(candles, config, {}))
+        second = self.module.signal_to_dict(self.module.evaluate_indicator_follow_routine(candles, config, {}))
+
+        self.assertEqual(first, second)
+
+
 if __name__ == "__main__":
     unittest.main()

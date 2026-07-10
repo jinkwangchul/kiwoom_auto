@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from engines.condition_engine import evaluate_groups_or
-from engines.indicator_engine import build_indicator_series
+from engines.indicator_engine import build_indicator_series, close_prices, rsi
 from engines.signal_result import RoutineSignal, signal_to_dict
 
 
@@ -136,6 +136,15 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _nested_get(mapping: dict[str, Any], *keys: str) -> Any:
     current: Any = mapping
     for key in keys:
@@ -143,6 +152,164 @@ def _nested_get(mapping: dict[str, Any], *keys: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _indicator_rsi_config(config: dict[str, Any]) -> dict[str, Any]:
+    indicators = config.get("indicators")
+    if isinstance(indicators, dict) and isinstance(indicators.get("rsi"), dict):
+        return indicators["rsi"]
+    value = config.get("rsi")
+    return value if isinstance(value, dict) else {}
+
+
+def _buy_rsi_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("rsi"), dict):
+        return filters["rsi"]
+
+    value = buy_cfg.get("rsi")
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _first_rsi_condition(filter_cfg: dict[str, Any]) -> dict[str, Any]:
+    conditions = filter_cfg.get("conditions")
+    if isinstance(conditions, list):
+        for condition in conditions:
+            if isinstance(condition, dict):
+                merged = dict(filter_cfg)
+                merged.update(condition)
+                return merged
+    return filter_cfg
+
+
+def _normalize_rsi_operator(value: Any) -> str | None:
+    raw_value = str(value).strip()
+    operator = raw_value.upper()
+    if operator in {"<=", "LTE", "LE", "BELOW_OR_EQUAL"} or raw_value == "이하":
+        return "<="
+    if operator in {">=", "GTE", "GE", "ABOVE_OR_EQUAL"} or raw_value == "이상":
+        return ">="
+    return None
+
+
+def _rsi_detail(
+    *,
+    enabled: bool,
+    period: Any,
+    operator: Any,
+    threshold: Any,
+    evaluated_value: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+) -> str:
+    return (
+        "filter_type=RSI "
+        f"enabled={enabled} "
+        f"period={period} "
+        f"operator={operator} "
+        f"threshold={threshold} "
+        f"evaluated_value={evaluated_value} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+
+
+def _evaluate_buy_rsi_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    candles: list[dict[str, Any]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    filter_cfg = _buy_rsi_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    indicator_cfg = _indicator_rsi_config(config)
+    condition = _first_rsi_condition(filter_cfg)
+    enabled = bool(filter_cfg.get("enabled", True))
+    raw_period = condition.get("period", indicator_cfg.get("period", 14))
+    raw_operator = condition.get("operator", condition.get("compare_operator", condition.get("compare")))
+    raw_threshold = condition.get("threshold", condition.get("value"))
+
+    if not enabled:
+        return True, _rsi_detail(
+            enabled=False,
+            period=raw_period,
+            operator=raw_operator,
+            threshold=raw_threshold,
+            evaluated_value=None,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+
+    period = _safe_int(raw_period)
+    operator = _normalize_rsi_operator(raw_operator)
+    threshold = _safe_float(raw_threshold)
+
+    if period is None or period <= 0:
+        return False, _rsi_detail(
+            enabled=True,
+            period=raw_period,
+            operator=raw_operator,
+            threshold=raw_threshold,
+            evaluated_value=None,
+            passed=False,
+            reason="invalid_period",
+            evaluation_index=evaluation_index,
+        )
+    if threshold is None:
+        return False, _rsi_detail(
+            enabled=True,
+            period=period,
+            operator=raw_operator,
+            threshold=raw_threshold,
+            evaluated_value=None,
+            passed=False,
+            reason="invalid_threshold",
+            evaluation_index=evaluation_index,
+        )
+    if operator is None:
+        return False, _rsi_detail(
+            enabled=True,
+            period=period,
+            operator=raw_operator,
+            threshold=threshold,
+            evaluated_value=None,
+            passed=False,
+            reason="unsupported_operator",
+            evaluation_index=evaluation_index,
+        )
+
+    rsi_values = rsi(close_prices(candles), period)
+    evaluated_value = rsi_values[evaluation_index] if 0 <= evaluation_index < len(rsi_values) else None
+    if evaluated_value is None:
+        return False, _rsi_detail(
+            enabled=True,
+            period=period,
+            operator=operator,
+            threshold=threshold,
+            evaluated_value=None,
+            passed=False,
+            reason="insufficient_data",
+            evaluation_index=evaluation_index,
+        )
+
+    passed = evaluated_value <= threshold if operator == "<=" else evaluated_value >= threshold
+    return passed, _rsi_detail(
+        enabled=True,
+        period=period,
+        operator=operator,
+        threshold=threshold,
+        evaluated_value=round(evaluated_value, 6),
+        passed=passed,
+        reason="matched" if passed else "not_matched",
+        evaluation_index=evaluation_index,
+    )
 
 
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
@@ -327,6 +494,11 @@ def evaluate_indicator_follow_routine(
     if buy_passed:
         matched = [result.group_name for result in buy_results if result.passed]
         details = [detail for result in buy_results for detail in result.details]
+        rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(cfg, buy_cfg, candles, buy_index)
+        if rsi_detail:
+            details.append(rsi_detail)
+        if not rsi_passed:
+            return RoutineSignal(None, "BUY RSI filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [
