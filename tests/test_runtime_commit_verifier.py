@@ -15,6 +15,7 @@ from runtime_commit_verifier import (
     STATUS_INVALID,
     STATUS_READY,
     create_runtime_commit_verifier_plan,
+    verify_runtime_commit,
 )
 from runtime_backup_manager import create_runtime_backup_plan
 from runtime_rollback_manager import create_runtime_rollback_plan
@@ -293,6 +294,275 @@ class TestRuntimeCommitVerifier(unittest.TestCase):
             rollback_plan=rollback_plan,
         )
         self.assertEqual(plan["verify_status"], STATUS_BLOCKED)
+
+    # === verify_runtime_commit 추가 테스트 ===
+
+    # 1. identical expected/actual → READY
+    def test_identical_targets_ready(self):
+        expected = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+        actual = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+
+    # 2. matched_targets 집계
+    def test_matched_targets_aggregated(self):
+        expected = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+        actual = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(len(result["matched_targets"]), 2)
+
+    # 3. missing target → BLOCKED
+    def test_missing_target_blocked(self):
+        expected = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+        actual = {"a.json": {"value": 1}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+        self.assertTrue(any("b.json" in m for m in result["missing_targets"]))
+
+    # 4. missing target → rollback_required=True
+    def test_missing_target_rollback_required(self):
+        expected = {"a.json": {"value": 1}, "b.json": {"value": 2}}
+        actual = {"a.json": {"value": 1}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertTrue(result["rollback_required"])
+
+    # 5. mismatch → BLOCKED
+    def test_mismatch_blocked(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 999}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+        self.assertIn("a.json", result["mismatched_targets"])
+
+    # 6. mismatch → rollback_required=True
+    def test_mismatch_rollback_required(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 999}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertTrue(result["rollback_required"])
+
+    # 7. unexpected target 기본 warning
+    def test_unexpected_target_warning(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 1}, "c.json": {"value": 3}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+        self.assertTrue(any("c.json" in w for w in result["warnings"]))
+
+    # 8. strict_compare unexpected → BLOCKED
+    def test_strict_compare_unexpected_blocked(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 1}, "c.json": {"value": 3}}
+        verification_plan = {"strict_compare": True}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+            verification_plan=verification_plan,
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+
+    # 9. dict key 순서 차이 → READY
+    def test_dict_key_order_ignored(self):
+        expected = {"a.json": {"x": 1, "y": 2}}
+        actual = {"a.json": {"y": 2, "x": 1}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+
+    # 10. list 순서 차이 → BLOCKED
+    def test_list_order_matters(self):
+        expected = {"a.json": {"items": [1, 2, 3]}}
+        actual = {"a.json": {"items": [3, 2, 1]}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+
+    # 11. compare_fields 지정 비교
+    def test_compare_fields_specified(self):
+        expected = {"a.json": {"x": 1, "y": 2}}
+        actual = {"a.json": {"x": 1, "y": 999}}
+        verification_plan = {"compare_fields": ["x"]}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+            verification_plan=verification_plan,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+
+    # 12. 비지정 필드 차이 무시
+    def test_uncompared_fields_ignored(self):
+        expected = {"a.json": {"x": 1, "y": 2}}
+        actual = {"a.json": {"x": 1, "z": 999}}
+        verification_plan = {"compare_fields": ["x"]}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+            verification_plan=verification_plan,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+
+    # 13. hash 일치 → READY
+    def test_hash_match_ready(self):
+        expected = {"a.json": {"expected_hash": "abc123"}}
+        actual = {"a.json": {"actual_hash": "abc123"}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_READY)
+
+    # 14. hash 불일치 → BLOCKED
+    def test_hash_mismatch_blocked(self):
+        expected = {"a.json": {"expected_hash": "abc123"}}
+        actual = {"a.json": {"actual_hash": "def456"}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+
+    # 15. commit_id 없음 → INVALID
+    def test_invalid_without_commit_id(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 1}}
+
+        result = verify_runtime_commit(
+            commit_id="",
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_INVALID)
+
+    # 16. expected_targets 타입 오류 → INVALID
+    def test_invalid_expected_targets_type(self):
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets="not-a-dict",
+            actual_targets={},
+        )
+        self.assertEqual(result["verification_status"], STATUS_INVALID)
+
+    # 17. actual_targets 타입 오류 → INVALID
+    def test_invalid_actual_targets_type(self):
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets={},
+            actual_targets="not-a-dict",
+        )
+        self.assertEqual(result["verification_status"], STATUS_INVALID)
+
+    # 18. verification_plan 타입 오류 → INVALID
+    def test_invalid_verification_plan_type(self):
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets={},
+            actual_targets={},
+            verification_plan="not-a-dict",
+        )
+        self.assertEqual(result["verification_status"], STATUS_INVALID)
+
+    # 19. expected_targets 비어 있음 → BLOCKED
+    def test_empty_expected_targets_blocked(self):
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets={},
+            actual_targets={},
+        )
+        self.assertEqual(result["verification_status"], STATUS_BLOCKED)
+
+    # 20. rules.json target → INVALID
+    def test_invalid_rules_json_target(self):
+        expected = {"rules.json": {"value": 1}}
+        actual = {"rules.json": {"value": 1}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        self.assertEqual(result["verification_status"], STATUS_INVALID)
+
+    # 21. safety flags 전체 False
+    def test_all_safety_flags_false(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 1}}
+
+        result = verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        for value in result["safety_flags"].values():
+            self.assertFalse(value)
+
+    # 22. 실제 runtime 파일 변경 없음
+    def test_no_runtime_files_changed(self):
+        expected = {"a.json": {"value": 1}}
+        actual = {"a.json": {"value": 1}}
+
+        before_mtime = {p.name: p.stat().st_mtime_ns for p in RUNTIME_DIR.glob("*.json")}
+        verify_runtime_commit(
+            commit_id=self.commit_id,
+            expected_targets=expected,
+            actual_targets=actual,
+        )
+        after_mtime = {p.name: p.stat().st_mtime_ns for p in RUNTIME_DIR.glob("*.json")}
+        self.assertEqual(before_mtime, after_mtime)
+
+    # 23. 기존 19개 테스트 회귀 없음 (이미 테스트됨)
 
 
 if __name__ == "__main__":
