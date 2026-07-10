@@ -197,9 +197,25 @@ def execute_runtime_commit(
     )
     journal_ok = journal.get("create_status") == CREATE_OK
     if journal_ok:
-        append_recovery_stage(
+        start_stage = append_recovery_stage(
             journal=journal, stage="EXECUTE_START", status=STAGE_STATUS_SUCCEEDED,
             details={"consumer_id": consumer_id},
+        )
+        if start_stage.get("append_status") != "APPENDED":
+            return _build_result(
+                status=STATUS_BLOCKED,
+                transaction_id=transaction_id,
+                commit_id=commit_id,
+                issues=["recovery journal start append failed"],
+                warnings=warnings,
+            )
+    else:
+        return _build_result(
+            status=STATUS_BLOCKED,
+            transaction_id=transaction_id,
+            commit_id=commit_id,
+            issues=["recovery journal create failed"] + list(journal.get("issues") or []),
+            warnings=warnings,
         )
 
     def _record_stage(stage: str, ok: bool, details: dict | None = None) -> None:
@@ -230,9 +246,21 @@ def execute_runtime_commit(
 
     _tx_journal_seq = {"n": 0}
 
-    def _persist_manifest() -> None:
-        if not persistence_ok:
+    def _sync_local_storage_plan(actual_transaction_id: str) -> None:
+        if not isinstance(sp, dict):
             return
+        sp["transaction_id"] = actual_transaction_id
+        storage_root = sp.get("storage_root")
+        if isinstance(storage_root, str) and storage_root:
+            transaction_dir = Path(storage_root) / "transactions" / actual_transaction_id
+            sp["transaction_dir"] = str(transaction_dir)
+            sp["manifest_path"] = str(transaction_dir / "manifest.json")
+            sp["journal_path"] = str(transaction_dir / "journal.jsonl")
+
+    def _persist_manifest() -> tuple[bool, list[str]]:
+        nonlocal transaction_id
+        if not persistence_ok:
+            return True, []
         try:
             manifest = build_runtime_commit_transaction_manifest(
                 commit_id=commit_id,
@@ -249,23 +277,23 @@ def execute_runtime_commit(
             manifest["transaction_status"] = "IN_PROGRESS"
             manifest["current_stage"] = "MANIFEST_CREATED"
             manifest["stage_history"] = ["MANIFEST_CREATED"]
-            sp["transaction_id"] = manifest["transaction_id"]
-            # Keep the caller's storage_plan identity in sync so downstream
-            # reads (using the original plan) observe the same transaction_id.
-            if isinstance(storage_plan, dict):
-                storage_plan["transaction_id"] = manifest["transaction_id"]
-            write_runtime_transaction_manifest(storage_plan=sp, manifest=manifest)
-        except Exception:
-            pass
+            transaction_id = manifest["transaction_id"]
+            _sync_local_storage_plan(transaction_id)
+            result = write_runtime_transaction_manifest(storage_plan=sp, manifest=manifest)
+            if result.get("write_status") not in ("WRITTEN", "UNCHANGED"):
+                return False, ["transaction manifest write failed"] + list(result.get("issues") or [])
+            return True, []
+        except Exception as exc:  # noqa: BLE001 - surfaced as executor failure
+            return False, [f"transaction manifest write failed: {exc}"]
 
-    def _append_tx_journal(stage: str, event_status: str, details: dict | None = None) -> None:
+    def _append_tx_journal(stage: str, event_status: str, details: dict | None = None) -> tuple[bool, list[str]]:
         if not persistence_ok:
-            return
+            return True, []
         if stage not in TRANSACTION_STAGES:
-            return
+            return True, []
         _tx_journal_seq["n"] += 1
         try:
-            append_runtime_transaction_journal_event(
+            result = append_runtime_transaction_journal_event(
                 storage_plan=sp,
                 event={
                     "event_version": "M6_RUNTIME_JOURNAL_EVENT_V1",
@@ -295,8 +323,11 @@ def execute_runtime_commit(
                     },
                 },
             )
-        except Exception:
-            pass
+            if result.get("append_status") not in ("APPENDED", "UNCHANGED"):
+                return False, [f"transaction journal append failed at {stage}"] + list(result.get("issues") or [])
+            return True, []
+        except Exception as exc:  # noqa: BLE001 - surfaced as executor failure
+            return False, [f"transaction journal append failed at {stage}: {exc}"]
 
     # Persist manifest at execution start (before any side effects).
     # NOTE: _persist_manifest references `token`, which is assigned after token
@@ -360,7 +391,7 @@ def execute_runtime_commit(
     token_read = read_runtime_commit_approval_token(storage_plan=token_storage_plan)
     if token_read.get("read_status") != "OK":
         issues.append("token not found or invalid")
-        _safe_release_lock(guard_plan, consumer_id)
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
         return _build_result(
             status=STATUS_BLOCKED,
             transaction_id=transaction_id,
@@ -368,6 +399,7 @@ def execute_runtime_commit(
             gate_valid=gate_valid,
             guard_evaluated=guard_evaluated,
             lock_acquired=lock_acquired,
+            lock_released=lock_released,
             issues=issues,
             warnings=warnings,
         )
@@ -376,7 +408,7 @@ def execute_runtime_commit(
     
     if not isinstance(token, dict):
         issues.append("token record is not a valid dict")
-        _safe_release_lock(guard_plan, consumer_id)
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
         return _build_result(
             status=STATUS_BLOCKED,
             transaction_id=transaction_id,
@@ -384,6 +416,7 @@ def execute_runtime_commit(
             gate_valid=gate_valid,
             guard_evaluated=guard_evaluated,
             lock_acquired=lock_acquired,
+            lock_released=lock_released,
             issues=issues,
             warnings=warnings,
         )
@@ -395,7 +428,7 @@ def execute_runtime_commit(
     )
     if not token_validation.get("valid_for_execution"):
         issues.append(f"token validation failed: {token_validation.get('token_status')}")
-        _safe_release_lock(guard_plan, consumer_id)
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
         return _build_result(
             status=STATUS_BLOCKED,
             transaction_id=transaction_id,
@@ -403,12 +436,13 @@ def execute_runtime_commit(
             gate_valid=gate_valid,
             guard_evaluated=guard_evaluated,
             lock_acquired=lock_acquired,
+            lock_released=lock_released,
             issues=issues,
             warnings=warnings,
         )
 
     if token.get("token_status") != TOKEN_STATUS_ISSUED:
-        _safe_release_lock(guard_plan, consumer_id)
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
         return _build_result(
             status=STATUS_BLOCKED,
             transaction_id=transaction_id,
@@ -417,6 +451,7 @@ def execute_runtime_commit(
             guard_evaluated=guard_evaluated,
             lock_acquired=lock_acquired,
             token_validated=True,
+            lock_released=lock_released,
             issues=["token already consumed"],
             warnings=warnings,
         )
@@ -425,8 +460,38 @@ def execute_runtime_commit(
 
     # Persist the transaction manifest now that the token is validated and
     # before any backup/write side effects occur (M6-13 requirement).
-    _persist_manifest()
-    _append_tx_journal("MANIFEST_CREATED", "RECORDED", details={"consumer_id": consumer_id})
+    persisted, persist_issues = _persist_manifest()
+    if not persisted:
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
+        return _build_result(
+            status=STATUS_BLOCKED,
+            transaction_id=transaction_id,
+            commit_id=commit_id,
+            gate_valid=gate_valid,
+            guard_evaluated=guard_evaluated,
+            lock_acquired=lock_acquired,
+            token_validated=token_validated,
+            lock_released=lock_released,
+            issues=persist_issues,
+            warnings=warnings,
+        )
+    journal_appended, journal_issues = _append_tx_journal(
+        "MANIFEST_CREATED", "RECORDED", details={"consumer_id": consumer_id}
+    )
+    if not journal_appended:
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
+        return _build_result(
+            status=STATUS_BLOCKED,
+            transaction_id=transaction_id,
+            commit_id=commit_id,
+            gate_valid=gate_valid,
+            guard_evaluated=guard_evaluated,
+            lock_acquired=lock_acquired,
+            token_validated=token_validated,
+            lock_released=lock_released,
+            issues=journal_issues,
+            warnings=warnings,
+        )
 
     backup_created = True
     backup_root = Path(storage_plan.get("storage_root", tempfile.gettempdir())) / "backups" / commit_id if storage_plan else Path(tempfile.gettempdir())
@@ -460,7 +525,26 @@ def execute_runtime_commit(
             warnings=warnings,
         )
 
-    _append_tx_journal("BACKUP_DONE", "SUCCEEDED", details={"backup_root": str(backup_root)})
+    backup_journal_ok, backup_journal_issues = _append_tx_journal(
+        "BACKUP_DONE", "SUCCEEDED", details={"backup_root": str(backup_root)}
+    )
+    if not backup_journal_ok:
+        _record_stage("BACKUP", False, details={"errors": backup_journal_issues})
+        _close_journal(RECOVERY_STATUS_ABORTED, details={"stage": "BACKUP_JOURNAL", "errors": backup_journal_issues})
+        lock_released = _safe_release_lock(guard_plan, consumer_id)
+        return _build_result(
+            status=STATUS_ABORTED,
+            transaction_id=transaction_id,
+            commit_id=commit_id,
+            gate_valid=gate_valid,
+            guard_evaluated=guard_evaluated,
+            lock_acquired=lock_acquired,
+            token_validated=token_validated,
+            backup_created=backup_created,
+            lock_released=lock_released,
+            issues=backup_journal_issues,
+            warnings=warnings,
+        )
     _record_stage("BACKUP", True, details={"backup_root": str(backup_root)})
 
     write_success = True

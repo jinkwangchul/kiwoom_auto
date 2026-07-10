@@ -594,6 +594,13 @@ class TestRuntimeCommitRealExecutorPersistence(unittest.TestCase):
             consumer_id=self.consumer_id,
         )
 
+    def _result_storage_plan(self, result):
+        return create_runtime_transaction_storage_plan(
+            storage_root=self.storage_root,
+            commit_id=self.commit_id,
+            transaction_id=result["transaction_id"],
+        )
+
     def test_manifest_persisted_on_success(self) -> None:
         from runtime_commit_transaction_persistence import read_runtime_commit_manifest
         target_file = self.components["target_file"]
@@ -601,7 +608,7 @@ class TestRuntimeCommitRealExecutorPersistence(unittest.TestCase):
         result = self._run({str(target_file): {"old": "data"}}, {str(target_file): {"old": "data"}})
         self.assertEqual(result["execute_status"], STATUS_COMMITTED)
         # Manifest must exist under storage_root/transactions/<tx_id>/manifest.json
-        manifest_read = read_runtime_commit_manifest(storage_plan=self.components["storage_plan"])
+        manifest_read = read_runtime_commit_manifest(storage_plan=self._result_storage_plan(result))
         self.assertEqual(manifest_read["read_status"], "OK")
         self.assertEqual(manifest_read["manifest"]["transaction_status"], "IN_PROGRESS")
 
@@ -611,7 +618,7 @@ class TestRuntimeCommitRealExecutorPersistence(unittest.TestCase):
         target_file.write_text(json.dumps({"old": "data"}), encoding="utf-8")
         result = self._run({str(target_file): {"old": "data"}}, {str(target_file): {"old": "data"}})
         self.assertEqual(result["execute_status"], STATUS_COMMITTED)
-        journal_read = read_runtime_transaction_journal(storage_plan=self.components["storage_plan"])
+        journal_read = read_runtime_transaction_journal(storage_plan=self._result_storage_plan(result))
         self.assertEqual(journal_read["read_status"], "OK")
         stages = [e.get("stage") for e in journal_read["events"]]
         self.assertIn("MANIFEST_CREATED", stages)
@@ -634,7 +641,7 @@ class TestRuntimeCommitRealExecutorPersistence(unittest.TestCase):
             {str(bad_path): {"new": "data"}},
         )
         self.assertEqual(result["execute_status"], STATUS_ABORTED)
-        journal_read = read_runtime_transaction_journal(storage_plan=self.components["storage_plan"])
+        journal_read = read_runtime_transaction_journal(storage_plan=self._result_storage_plan(result))
         self.assertEqual(journal_read["read_status"], "OK")
         stages = [e.get("stage") for e in journal_read["events"]]
         self.assertIn("MANIFEST_CREATED", stages)
@@ -653,7 +660,7 @@ class TestRuntimeCommitRealExecutorPersistence(unittest.TestCase):
             {str(target_file): {"new": "data"}},
         )
         self.assertEqual(result["execute_status"], STATUS_ROLLED_BACK)
-        journal_read = read_runtime_transaction_journal(storage_plan=self.components["storage_plan"])
+        journal_read = read_runtime_transaction_journal(storage_plan=self._result_storage_plan(result))
         self.assertEqual(journal_read["read_status"], "OK")
         stages = [e.get("stage") for e in journal_read["events"]]
         self.assertIn("VERIFY_DONE", stages)
