@@ -23883,3 +23883,52 @@
 파일: state.json
 내용: 프로그램재시작 안전초기화: 중지 17개 / 검토관리 0개
 작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: lifecycle_execution_dispatcher_preview.py / lifecycle_execution_commit_preview.py / lifecycle_execution_runtime_apply_preview.py
+내용: Runtime Commit Boundary preview layer 추가: dispatcher/commit/runtime_apply preview (preview_only 고정, 실제 commit/runtime 반영 금지)
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: tests/test_lifecycle_execution_dispatcher_preview.py / tests/test_lifecycle_execution_commit_preview.py / tests/test_lifecycle_execution_runtime_apply_preview.py
+내용: Runtime Commit Boundary preview layer 단위/통합 테스트 추가
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: MASTER_SPEC_갱신자료_runtime_commit_boundary.md
+내용: MASTER_SPEC 갱신 후보: Runtime Commit Boundary / Eligibility / Contract(Atomic Apply/Verification/Rollback Plan) / Safety Gate / Review
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: 작업재개요약_runtime_commit_boundary.md
+내용: Runtime Commit Boundary 작업재개요약 추가
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: REFERENCE_EDITION_runtime_commit_boundary.md
+내용: Reference Edition 재생성 (Execution Preview Pipeline + Runtime Commit Boundary 통합본)
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: ADD
+파일: 00_REFERENCE_INDEX.md
+내용: Reference Index 신규 생성 (갱신자료/작업재개요약/Reference Edition 인덱스)
+작성자: admin
+
+[2026-07-09 21:03:22]
+버전: v1.2
+구분: CHECK
+파일: runtime/*.json / routines/*/rules.json
+내용: 보호 파일 변경 없음 확인: Runtime Commit Boundary 완료 (전체 unittest 2858 tests OK)
+작성자: admin

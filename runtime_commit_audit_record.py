@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Runtime Commit Audit Record for Real Runtime Commit (M6-5).
+"""Runtime Commit Audit Manifest Preview for Real Runtime Commit (M6-5).
 
-This module builds a *preview-only* audit record for a runtime commit. It does NOT
-write any files, does NOT read actual runtime files, and does NOT touch protected
-runtime files.
+This module builds a *preview-only* pre-execution audit manifest for a runtime
+commit. It does NOT write any files, does NOT read actual runtime files, and
+does NOT touch protected runtime files.
 
 Scope boundaries (M6-5):
 - ``preview_only`` is always True.
@@ -60,7 +60,7 @@ def create_runtime_commit_audit_record(
     runtime_snapshot: Optional[Any] = None,
     operator_context: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Build a preview-only audit record for a runtime commit.
+    """Build a preview-only pre-execution audit manifest for a runtime commit.
 
     Args:
         commit_id: Identifier for the runtime commit.
@@ -76,6 +76,27 @@ def create_runtime_commit_audit_record(
         commit_id, audit_records_preview, audit_metadata, safety_flags (all False),
         issues, warnings.
     """
+    return create_runtime_commit_audit_manifest_preview(
+        commit_id=commit_id,
+        backup_plan=backup_plan,
+        rollback_plan=rollback_plan,
+        verification_result=verification_result,
+        audit_records=audit_records,
+        runtime_snapshot=runtime_snapshot,
+        operator_context=operator_context,
+    )
+
+
+def create_runtime_commit_audit_manifest_preview(
+    commit_id: Optional[str] = None,
+    backup_plan: Optional[dict[str, Any]] = None,
+    rollback_plan: Optional[dict[str, Any]] = None,
+    verification_result: Optional[dict[str, Any]] = None,
+    audit_records: Optional[Sequence[Any]] = None,
+    runtime_snapshot: Optional[Any] = None,
+    operator_context: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Build a preview-only pre-execution audit manifest for a runtime commit."""
     issues: list[str] = []
     warnings: list[str] = []
 
@@ -200,7 +221,11 @@ def _build_audit_record(
             })
 
     audit_metadata = {
-        "plan_type": "RUNTIME_COMMIT_AUDIT_RECORD",
+        "plan_type": "RUNTIME_COMMIT_AUDIT_MANIFEST_PREVIEW",
+        "record_type": "RUNTIME_COMMIT_AUDIT_MANIFEST_PREVIEW",
+        "audit_phase": "PRE_EXECUTION",
+        "persisted": False,
+        "post_commit_record": False,
         "commit_id": commit_str,
         "record_count": len(records_preview),
         "backup_target_count": len(backup_plan.get("backup_targets", [])) if backup_plan else 0,
@@ -218,6 +243,12 @@ def _build_audit_record(
         "audit_status": status,
         "preview_only": True,
         "commit_id": commit_str,
+        "record_type": "RUNTIME_COMMIT_AUDIT_MANIFEST_PREVIEW",
+        "audit_phase": "PRE_EXECUTION",
+        "persisted": False,
+        "post_commit_record": False,
+        "audit_written": False,
+        "actual_execution": False,
         "audit_records_preview": records_preview,
         "audit_metadata": audit_metadata,
         "safety_flags": _build_safety_flags(),

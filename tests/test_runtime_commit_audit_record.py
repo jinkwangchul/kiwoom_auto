@@ -15,6 +15,7 @@ from runtime_commit_audit_record import (
     STATUS_INVALID,
     STATUS_READY,
     create_runtime_commit_audit_record,
+    create_runtime_commit_audit_manifest_preview,
 )
 from runtime_backup_manager import create_runtime_backup_plan
 from runtime_rollback_manager import create_runtime_rollback_plan
@@ -67,6 +68,21 @@ class TestRuntimeCommitAuditRecord(unittest.TestCase):
         )
         self.assertEqual(result["audit_status"], STATUS_READY)
         self.assertTrue(result["preview_only"])
+
+    def test_alias_api_matches_existing_api(self):
+        original = create_runtime_commit_audit_record(commit_id=self.commit_id)
+        alias = create_runtime_commit_audit_manifest_preview(commit_id=self.commit_id)
+        self.assertEqual(original["audit_status"], alias["audit_status"])
+        self.assertEqual(original["record_type"], alias["record_type"])
+
+    def test_manifest_preview_responsibility_fields(self):
+        result = create_runtime_commit_audit_record(commit_id=self.commit_id)
+        self.assertEqual(result["record_type"], "RUNTIME_COMMIT_AUDIT_MANIFEST_PREVIEW")
+        self.assertEqual(result["audit_phase"], "PRE_EXECUTION")
+        self.assertFalse(result["persisted"])
+        self.assertFalse(result["post_commit_record"])
+        self.assertFalse(result["audit_written"])
+        self.assertFalse(result["actual_execution"])
 
     # 2. commit_id 포함 확인
     def test_commit_id_present(self):
