@@ -312,6 +312,275 @@ def _evaluate_buy_rsi_filter(
     )
 
 
+def _buy_macd_position_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("macd_position"), dict):
+        return filters["macd_position"]
+    return {}
+
+
+def _normalize_macd_position_target(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    mapping = {
+        "MACD": "MACD",
+        "MACD선": "MACD",
+        "SIGNAL": "SIGNAL",
+        "시그널선": "SIGNAL",
+    }
+    if raw in mapping:
+        return mapping[raw]
+    if upper in mapping:
+        return mapping[upper]
+    return None
+
+
+def _normalize_macd_position_direction(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    if raw == "상향" or upper == "UP":
+        return "up"
+    if raw == "하향" or upper == "DOWN":
+        return "down"
+    if raw == "상하" or upper == "BOTH":
+        return "both"
+    return None
+
+
+def _normalize_macd_position_compare(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    if raw == "이상" or upper in {">=", "GTE", "GE", "ABOVE_OR_EQUAL"}:
+        return ">="
+    if raw == "이하" or upper in {"<=", "LTE", "LE", "BELOW_OR_EQUAL"}:
+        return "<="
+    if raw == "이내" or upper in {"WITHIN", "IN"}:
+        return "within"
+    if raw == "이탈" or upper in {"BREAKOUT", "OUT", "DEVIATION"}:
+        return "breakout"
+    return None
+
+
+def _macd_position_detail(
+    *,
+    enabled: bool,
+    target: Any,
+    compare_target: Any,
+    direction: Any,
+    compare: Any,
+    value: Any,
+    evaluated_gap: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+) -> str:
+    return (
+        "filter_type=MACD_POSITION "
+        f"enabled={enabled} "
+        f"target={target} "
+        f"compare_target={compare_target} "
+        f"direction={direction} "
+        f"compare={compare} "
+        f"value={value} "
+        f"evaluated_gap={evaluated_gap} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+
+
+def _evaluate_buy_macd_position_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    filter_cfg = _buy_macd_position_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    enabled = bool(filter_cfg.get("enabled", True))
+    raw_target = filter_cfg.get("target", "MACD")
+    raw_compare_target = filter_cfg.get("compare_target", "SIGNAL")
+    raw_direction = filter_cfg.get("direction", "상향")
+    raw_compare = filter_cfg.get("compare", "이상")
+    raw_value = filter_cfg.get("value", filter_cfg.get("threshold"))
+
+    if not enabled:
+        return True, _macd_position_detail(
+            enabled=False,
+            target=raw_target,
+            compare_target=raw_compare_target,
+            direction=raw_direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+
+    target = _normalize_macd_position_target(raw_target)
+    compare_target = _normalize_macd_position_target(raw_compare_target)
+    direction = _normalize_macd_position_direction(raw_direction)
+    compare = _normalize_macd_position_compare(raw_compare)
+    value = _safe_float(raw_value)
+
+    if target is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=raw_target,
+            compare_target=raw_compare_target,
+            direction=raw_direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="invalid_target",
+            evaluation_index=evaluation_index,
+        )
+    if compare_target is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=raw_compare_target,
+            direction=raw_direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="invalid_compare_target",
+            evaluation_index=evaluation_index,
+        )
+    if target == compare_target:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=raw_direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="identical_targets",
+            evaluation_index=evaluation_index,
+        )
+    if direction is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=raw_direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="unsupported_direction",
+            evaluation_index=evaluation_index,
+        )
+    if compare is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=direction,
+            compare=raw_compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="unsupported_compare",
+            evaluation_index=evaluation_index,
+        )
+    if value is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=direction,
+            compare=compare,
+            value=raw_value,
+            evaluated_gap=None,
+            passed=False,
+            reason="invalid_value",
+            evaluation_index=evaluation_index,
+        )
+
+    target_series = series_map.get(target)
+    compare_series = series_map.get(compare_target)
+    if not isinstance(target_series, list) or not isinstance(compare_series, list):
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=direction,
+            compare=compare,
+            value=value,
+            evaluated_gap=None,
+            passed=False,
+            reason="missing_series",
+            evaluation_index=evaluation_index,
+        )
+    if not (0 <= evaluation_index < len(target_series)) or not (0 <= evaluation_index < len(compare_series)):
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=direction,
+            compare=compare,
+            value=value,
+            evaluated_gap=None,
+            passed=False,
+            reason="insufficient_data",
+            evaluation_index=evaluation_index,
+        )
+
+    target_value = target_series[evaluation_index]
+    compare_value = compare_series[evaluation_index]
+    if target_value is None or compare_value is None:
+        return False, _macd_position_detail(
+            enabled=True,
+            target=target,
+            compare_target=compare_target,
+            direction=direction,
+            compare=compare,
+            value=value,
+            evaluated_gap=None,
+            passed=False,
+            reason="insufficient_data",
+            evaluation_index=evaluation_index,
+        )
+
+    gap = target_value - compare_value
+    if direction == "up":
+        diff = gap
+    elif direction == "down":
+        diff = -gap
+    else:
+        diff = abs(gap)
+
+    if compare == ">=":
+        passed = diff >= value
+    elif compare == "<=":
+        passed = diff <= value
+    elif compare == "within":
+        passed = abs(gap) <= value
+    else:
+        passed = abs(gap) > value
+
+    return passed, _macd_position_detail(
+        enabled=True,
+        target=target,
+        compare_target=compare_target,
+        direction=direction,
+        compare=compare,
+        value=value,
+        evaluated_gap=round(gap, 8),
+        passed=passed,
+        reason="matched" if passed else "not_matched",
+        evaluation_index=evaluation_index,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -499,6 +768,11 @@ def evaluate_indicator_follow_routine(
             details.append(rsi_detail)
         if not rsi_passed:
             return RoutineSignal(None, "BUY RSI filter blocked", matched, details, buy_index, buy_delay)
+        macd_pos_passed, macd_pos_detail = _evaluate_buy_macd_position_filter(cfg, buy_cfg, series_map, buy_index)
+        if macd_pos_detail:
+            details.append(macd_pos_detail)
+        if not macd_pos_passed:
+            return RoutineSignal(None, "BUY MACD position filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [
