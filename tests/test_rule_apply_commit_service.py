@@ -618,56 +618,6 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 ["buy.groups[0].conditions"],
             )
 
-    def test_buy_macd_position_condition_added_and_other_sections_unchanged(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            rules_path = Path(temp_dir) / "rules.json"
-            session_path = Path(temp_dir) / "approval_session.json"
-            self._write_rules(rules_path, self.current_rules)
-            original_ui_state = deepcopy(self.ui_state)
-            self.ui_state["buy_ui"]["signal_filter"]["buy_ocr_value_line"] = ""
-            self.ui_state["buy_ui"]["signal_filter"].update({
-                "buy_macd_position_enabled": True,
-                "buy_macd_position_target": "MACD",
-                "buy_macd_position_compare_target": "SIGNAL",
-                "buy_macd_position_operator": "<=",
-                "buy_macd_position_not": True,
-            })
-            try:
-                apply_preview, gate, context = self._build_apply_and_gate(
-                    rules_path,
-                    session_path,
-                    {"buy.groups[0].conditions": "APPROVED"},
-                )
-            finally:
-                self.ui_state = original_ui_state
-
-            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
-                rules_path,
-                apply_preview,
-                gate,
-                context,
-            )
-            saved = json.loads(rules_path.read_text(encoding="utf-8"))
-            conditions = saved["buy"]["groups"][0]["conditions"]
-
-            self.assertTrue(result["ok"], result)
-            self.assertTrue(any(
-                condition.get("target") == "MACD"
-                and condition.get("operator") == "<="
-                and condition.get("compare_target") == "SIGNAL"
-                and condition.get("not") is True
-                for condition in conditions
-            ))
-            self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
-            self.assertEqual(saved["sell"], self.current_rules["sell"])
-            self.assertEqual(saved["indicators"], self.current_rules["indicators"])
-            self.assertEqual(
-                [patch["target_path"] for patch in result["applied_patches"]],
-                ["buy.groups[0].conditions"],
-            )
-            self.assertTrue(result["post_validation"]["ok"])
-            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
-
     def test_buy_ma_price_compare_and_bollinger_conditions_added_and_other_sections_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"

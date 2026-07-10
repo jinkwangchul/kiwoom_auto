@@ -244,58 +244,6 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 ["indicators.rsi"],
             )
 
-    def test_dry_run_commits_macd_position_candidate_then_rolls_back_temp_rules(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            original_ui_state = deepcopy(self.ui_state)
-            self.ui_state["buy_ui"]["signal_filter"]["buy_ocr_value_line"] = ""
-            self.ui_state["buy_ui"]["signal_filter"].update({
-                "buy_macd_position_enabled": True,
-                "buy_macd_position_target": "MACD",
-                "buy_macd_position_compare_target": "SIGNAL",
-                "buy_macd_position_operator": "<=",
-                "buy_macd_position_not": True,
-            })
-            try:
-                rules_path, session_path, preview, rules = self._prepare_actual_inputs(
-                    temp_dir,
-                    {"buy.groups[0].conditions": "APPROVED"},
-                )
-            finally:
-                self.ui_state = original_ui_state
-
-            workspace = Path(temp_dir) / "workspace"
-            actual_before = self._file_sha256(rules_path)
-
-            result = rule_commit_dry_run_service.run_rule_commit_dry_run(
-                rules_path,
-                session_path,
-                workspace,
-                {
-                    "preview_result": preview,
-                    "preserve_workspace_on_success": True,
-                },
-            )
-            temp_rules = json.loads((workspace / "rules.json").read_text(encoding="utf-8"))
-            final_diff = result["commit_preview"]["final_diff"]
-
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(actual_before, self._file_sha256(rules_path))
-            self.assertTrue(result["actual_rules_unchanged"])
-            self.assertTrue(result["rollback_result"]["rollback_completed"])
-            self.assertTrue(result["rollback_verified"])
-            self.assertEqual(self._stable_hash(rules), self._stable_hash(temp_rules))
-            self.assertEqual(len(final_diff), 1)
-            self.assertEqual(final_diff[0]["path"], "buy.groups[0].conditions")
-            self.assertEqual(final_diff[0]["operation"], "merge_conditions")
-            self.assertEqual(final_diff[0]["condition"]["target"], "MACD")
-            self.assertEqual(final_diff[0]["condition"]["operator"], "<=")
-            self.assertEqual(final_diff[0]["condition"]["compare_target"], "SIGNAL")
-            self.assertIs(final_diff[0]["condition"]["not"], True)
-            self.assertEqual(
-                [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
-                ["buy.groups[0].conditions"],
-            )
-
     def test_dry_run_commits_ma_price_compare_and_bollinger_then_rolls_back_temp_rules(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             original_ui_state = deepcopy(self.ui_state)

@@ -260,75 +260,6 @@ def _truthy_ui(value: Any) -> bool:
     return text in {"1", "true", "yes", "y", "on", "checked", "enabled", "사용", "활성"}
 
 
-def _macd_position_operator(text: Any) -> str | None:
-    value = str(text or "").strip()
-    mapping = {
-        ">": ">",
-        "gt": ">",
-        "above": ">",
-        "초과": ">",
-        ">=": ">=",
-        "gte": ">=",
-        "이상": ">=",
-        "<": "<",
-        "lt": "<",
-        "below": "<",
-        "미만": "<",
-        "<=": "<=",
-        "lte": "<=",
-        "이하": "<=",
-        "=": "=",
-        "==": "==",
-        "eq": "==",
-        "같음": "==",
-    }
-    return mapping.get(value.lower(), mapping.get(value))
-
-
-def _build_buy_macd_position_conditions(signal_filter: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]]:
-    if not _truthy_ui(signal_filter.get("buy_macd_position_enabled")):
-        return []
-
-    target_text = str(signal_filter.get("buy_macd_position_target") or "MACD").strip().upper()
-    compare_text = str(signal_filter.get("buy_macd_position_compare_target") or "SIGNAL").strip().upper()
-    target = {
-        "MACD": "MACD",
-        "MACD선": "MACD",
-        "SIGNAL": "SIGNAL",
-        "시그널선": "SIGNAL",
-    }.get(target_text, target_text)
-    compare_target = {
-        "MACD": "MACD",
-        "MACD선": "MACD",
-        "SIGNAL": "SIGNAL",
-        "시그널선": "SIGNAL",
-    }.get(compare_text, compare_text)
-    operator = _macd_position_operator(signal_filter.get("buy_macd_position_operator"))
-    if target not in {"MACD", "SIGNAL"}:
-        warnings.append(f"buy MACD position target is not mapped: {signal_filter.get('buy_macd_position_target')!r}")
-        return []
-    if compare_target not in {"MACD", "SIGNAL"}:
-        warnings.append(
-            f"buy MACD position compare target is not mapped: {signal_filter.get('buy_macd_position_compare_target')!r}"
-        )
-        return []
-    if target == compare_target:
-        warnings.append("buy MACD position target and compare target are identical")
-        return []
-    if operator is None:
-        warnings.append(f"buy MACD position operator is not mapped: {signal_filter.get('buy_macd_position_operator')!r}")
-        return []
-
-    return [{
-        "enabled": True,
-        "not": _truthy_ui(signal_filter.get("buy_macd_position_not")),
-        "target": target,
-        "operator": operator,
-        "compare_target": compare_target,
-        "description": "UI preview: buy MACD/SIGNAL position condition",
-    }]
-
-
 def _optional_filter_enabled(values: dict[str, Any], enabled_key: str, value_key: str) -> bool:
     if enabled_key in values:
         return _truthy_ui(values.get(enabled_key))
@@ -585,7 +516,6 @@ def build_engine_rules_preview_from_ui_state(
     signal_filter = _as_dict(buy_ui.get("signal_filter"))
     price_compare = _as_dict(buy_ui.get("price_compare"))
     buy_conditions = _build_buy_osc_conditions(signal_filter, warnings)
-    buy_conditions.extend(_build_buy_macd_position_conditions(signal_filter, warnings))
     buy_conditions.extend(_build_buy_ma_conditions(signal_filter, warnings))
     buy_conditions.extend(_build_buy_bollinger_conditions(signal_filter, warnings))
     buy_conditions.extend(_build_buy_price_compare_conditions(price_compare, warnings))
