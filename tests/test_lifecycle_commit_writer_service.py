@@ -12,6 +12,18 @@ from unittest import mock
 from execution_runtime_commit_plan_orchestrator import ORCHESTRATOR_TYPE
 from lifecycle_commit_service import commit_lifecycle
 from lifecycle_commit_writer import LifecycleCommitWriter
+from lifecycle_runtime_commit_builder import (
+    build_lifecycle_runtime_commit_adapter_request,
+    build_gate_result,
+    build_transaction_manifest,
+    build_storage_plan,
+    build_guard_plan,
+    build_token_storage_plan,
+    build_expected_targets,
+    build_new_targets,
+    build_consumer_id,
+    validate_lifecycle_request,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -458,6 +470,371 @@ class LifecycleCommitWriterServiceTest(unittest.TestCase):
         self.assertIn("INVALID_COMMIT_PLAN_ORCHESTRATOR_TYPE", result["issues"])
         self.assertEqual([], _rows(self.db_path, "transitions"))
         self.assertEqual([], _rows(self.db_path, "journal"))
+
+
+class LifecycleRuntimeCommitBuilderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.storage_root = self.temp_dir.name
+        self.db_path = Path(self.temp_dir.name) / "test.sqlite3"
+        from lifecycle_commit_writer import LifecycleCommitWriter
+        self.writer = LifecycleCommitWriter(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _lifecycle_request(self, **overrides: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "lifecycle_id": "life-builder-1",
+            "commit_id": "commit-builder-1",
+            "transaction_id": "tx-builder-1",
+            "requested_action": "RUNTIME_COMMIT",
+            "source_stage": "LIFECYCLE_COMMIT_SERVICE",
+            "runtime_commit_boundary_status": "RUNTIME_COMMIT_BOUNDARY_READY",
+            "preview_only": True,
+            "metadata": {"source": "test"},
+        }
+        result.update(overrides)
+        return result
+
+    def _commit_contract_preview(self, **overrides: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "contract_type": "ORDER_LIFECYCLE_COMMIT_CONTRACT_PREVIEW",
+            "commit_id": "commit-builder-1",
+            "lifecycle_commit_request": {
+                "lifecycle_id": "life-builder-1",
+                "commit_id": "commit-builder-1",
+                "transaction_id": "tx-builder-1",
+                "requested_action": "RUNTIME_COMMIT",
+                "source_stage": "LIFECYCLE_COMMIT_SERVICE",
+                "runtime_commit_boundary_status": "RUNTIME_COMMIT_BOUNDARY_READY",
+                "preview_only": True,
+                "metadata": {"source": "test"},
+            },
+            "commit_contract": {
+                "contract_type": "ORDER_LIFECYCLE_COMMIT_CONTRACT_PREVIEW",
+                "contract_version": "preview-1",
+                "preview_only": True,
+                "lifecycle_write": False,
+                "runtime_write": False,
+                "queue_write": False,
+                "candidate_lifecycle_event": "ORDER_RECEIVED",
+                "evidence_id": "EVIDENCE_BUILDER_1",
+                "record_id": "RECORD_BUILDER_1",
+                "order_id": "ORDER_BUILDER_1",
+                "dispatch_id": "DISPATCH_BUILDER_1",
+                "source_signal_id": "SIGNAL_BUILDER_1",
+                "order_queued_id": "ORDER_QUEUED_BUILDER_1",
+                "target_name": "temp_lifecycle",
+                "lifecycle_store": "temp_store",
+                "required_next_service": "ORDER_LIFECYCLE_COMMIT_SERVICE",
+            },
+            "commit_plan": {
+                "planned_records": [{"record_id": "planned-1"}],
+                "planned_targets": {"target.json": {"old": "value"}},
+            },
+            "issues": [],
+            "warnings": [],
+            "preview_only": True,
+        }
+        result.update(overrides)
+        return result
+
+    def test_build_gate_result(self) -> None:
+        result = build_gate_result(commit_contract_preview=self._commit_contract_preview())
+
+        self.assertEqual("APPROVED", result["gate_status"])
+        self.assertEqual("commit-builder-1", result["commit_id"])
+        self.assertEqual([], result["issues"])
+
+    def test_build_transaction_manifest(self) -> None:
+        result = build_transaction_manifest(
+            commit_id="commit-builder-1",
+            transaction_id="tx-builder-1",
+            execution_plan_hash="plan-hash-1",
+            approval_token_id="token-1",
+            expected_payload_hash="payload-hash-1",
+            target_paths=["target.json"],
+        )
+
+        self.assertEqual("M6_RUNTIME_TRANSACTION_V1", result["contract_version"])
+        self.assertEqual("commit-builder-1", result["commit_id"])
+        self.assertEqual("tx-builder-1", result["transaction_id"])
+        self.assertEqual("CREATED", result["transaction_status"])
+        self.assertEqual(["MANIFEST_CREATED"], result["stage_history"])
+
+    def test_build_storage_plan(self) -> None:
+        result = build_storage_plan(
+            storage_root=self.storage_root,
+            commit_id="commit-builder-1",
+            transaction_id="tx-builder-1",
+        )
+
+        self.assertEqual("READY", result["storage_status"])
+        self.assertEqual(self.storage_root, result["storage_root"])
+        self.assertIn("transactions", result["transaction_dir"])
+        self.assertIn("manifest.json", result["manifest_path"])
+        self.assertIn("journal.jsonl", result["journal_path"])
+
+    def test_build_guard_plan(self) -> None:
+        result = build_guard_plan(
+            storage_root=self.storage_root,
+            commit_id="commit-builder-1",
+            transaction_id="tx-builder-1",
+            target_set_hash="hash-123",
+            owner_id="owner-1",
+        )
+
+        self.assertEqual("READY", result["guard_status"])
+        self.assertEqual("commit-builder-1", result["commit_id"])
+        self.assertEqual("tx-builder-1", result["transaction_id"])
+        self.assertEqual("hash-123", result["target_set_hash"])
+        self.assertEqual("owner-1", result["owner_id"])
+        self.assertTrue(result["lock_path"].endswith(".json"))
+
+    def test_build_token_storage_plan(self) -> None:
+        result = build_token_storage_plan(
+            storage_root=self.storage_root,
+            token_id="token-1",
+            commit_id="commit-builder-1",
+        )
+
+        self.assertEqual("READY", result["plan_status"])
+        self.assertEqual(self.storage_root, result["storage_root"])
+        self.assertEqual("token-1", result["token_id"])
+        self.assertEqual("commit-builder-1", result["commit_id"])
+        self.assertTrue(result["token_path"].endswith("token-1.json"))
+        self.assertTrue(result["claim_path"].endswith("token-1.consume.lock"))
+
+    def test_build_expected_targets(self) -> None:
+        result = build_expected_targets(planned_targets={"target.json": {"old": "value"}})
+
+        self.assertEqual({"target.json": {"old": "value"}}, result)
+
+    def test_build_expected_targets_normalizes_paths(self) -> None:
+        result = build_expected_targets(planned_targets={"Target.JSON": {"old": "value"}})
+
+        self.assertIn("target.json", result)
+
+    def test_build_new_targets(self) -> None:
+        result = build_new_targets(
+            planned_targets={"target.json": {"new": "value"}},
+        )
+
+        self.assertEqual({"target.json": {"new": "value"}}, result)
+
+    def test_build_consumer_id(self) -> None:
+        self.assertEqual("owner-1", build_consumer_id(owner_id="owner-1"))
+        self.assertEqual("override-1", build_consumer_id(owner_id="owner-1", consumer_override="override-1"))
+        self.assertEqual("lifecycle_consumer", build_consumer_id())
+
+    def test_validate_lifecycle_request_valid(self) -> None:
+        request = self._lifecycle_request()
+        result, issues = validate_lifecycle_request(request)
+
+        self.assertEqual([], issues)
+
+    def test_validate_lifecycle_request_missing_field(self) -> None:
+        request = self._lifecycle_request()
+        del request["transaction_id"]
+        result, issues = validate_lifecycle_request(request)
+
+        self.assertTrue(any("transaction_id" in issue for issue in issues))
+
+    def test_build_adapter_request_complete(self) -> None:
+        preview = self._commit_contract_preview()
+        plan = preview["commit_plan"]
+
+        result = build_lifecycle_runtime_commit_adapter_request(
+            commit_contract_preview=preview,
+            commit_plan=plan,
+            storage_root=self.storage_root,
+            owner_id="owner-1",
+            token_id="token-1",
+        )
+
+        self.assertIn("lifecycle_commit_request", result)
+        self.assertIn("gate_result", result)
+        self.assertIn("transaction_manifest", result)
+        self.assertIn("storage_plan", result)
+        self.assertIn("guard_plan", result)
+        self.assertIn("token_storage_plan", result)
+        self.assertIn("expected_targets", result)
+        self.assertIn("new_targets", result)
+        self.assertIn("consumer_id", result)
+        self.assertEqual("owner-1", result["consumer_id"])
+
+    def test_build_adapter_request_generates_from_lifecycle_request(self) -> None:
+        preview = {
+            "commit_id": "commit-builder-1",
+            "lifecycle_commit_request": self._lifecycle_request(),
+        }
+        plan = {
+            "planned_records": [{"record_id": "planned-1"}],
+            "planned_targets": {"target.json": {"new": "value"}},
+        }
+
+        result = build_lifecycle_runtime_commit_adapter_request(
+            commit_contract_preview=preview,
+            commit_plan=plan,
+            storage_root=self.storage_root,
+            owner_id="owner-1",
+        )
+
+        self.assertEqual("commit-builder-1", result["transaction_manifest"]["commit_id"])
+        self.assertEqual("tx-builder-1", result["transaction_manifest"]["transaction_id"])
+
+    def test_build_adapter_request_missing_storage_root(self) -> None:
+        preview = {"commit_id": "commit-1", "lifecycle_commit_request": self._lifecycle_request()}
+        plan = {"planned_records": [], "planned_targets": {}}
+
+        result = build_lifecycle_runtime_commit_adapter_request(
+            commit_contract_preview=preview,
+            commit_plan=plan,
+            storage_root="",
+            owner_id="owner-1",
+        )
+
+        self.assertTrue(len(result.get("build_issues", [])) > 0)
+
+    def test_service_uses_builder_when_no_payload_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage_root = temp_dir
+            preview = self._commit_contract_preview()
+            plan_orch = {
+                "orchestrator_type": ORCHESTRATOR_TYPE,
+                "status": "READY",
+                "commit_ready": True,
+                "commit_plan": {
+                    "planned_records": [{"record_id": "planned-1"}],
+                    "planned_targets": {},
+                },
+                "issues": [],
+                "warnings": [],
+            }
+
+            with mock.patch("lifecycle_runtime_commit_adapter.adapt_and_execute_lifecycle_runtime_commit") as adapter:
+                adapter.return_value = {
+                    "adapter_status": "COMMITTED",
+                    "executor_called": True,
+                    "issues": [],
+                }
+
+                result = commit_lifecycle(
+                    preview,
+                    plan_orch,
+                    self.writer,
+                    queue_commit_executor=lambda plan: {"ok": True},
+                    context={"storage_root": storage_root, "owner_id": "owner-1"},
+                )
+
+                self.assertEqual("COMMITTED", result["status"])
+                self.assertEqual(1, adapter.call_count)
+
+    def test_builder_does_not_mutate_inputs(self) -> None:
+        preview = self._commit_contract_preview()
+        plan = {
+            "planned_records": [{"record_id": "planned-1"}],
+            "planned_targets": {"target.json": {"key": "value"}},
+        }
+        original_plan = copy.deepcopy(plan)
+        original_preview = copy.deepcopy(preview)
+
+        result = build_lifecycle_runtime_commit_adapter_request(
+            commit_contract_preview=preview,
+            commit_plan=plan,
+            storage_root=self.storage_root,
+            owner_id="owner-1",
+        )
+
+        self.assertEqual(original_plan, plan)
+        self.assertEqual(original_preview, preview)
+
+    def test_adapter_receives_correct_inputs_from_builder(self) -> None:
+        storage_root = self.storage_root
+        owner_id = "owner-1"
+        token_id = "token-1"
+
+        preview = self._commit_contract_preview()
+        plan = {
+            "planned_records": [{"record_id": "planned-1"}],
+            "planned_targets": {"target.json": {"key": "value"}},
+        }
+
+        adapter_calls: list[dict[str, object]] = []
+
+        def capturing_executor(**kwargs: object) -> dict[str, object]:
+            adapter_calls.append(copy.deepcopy(kwargs))
+            return {
+                "adapter_status": "COMMITTED",
+                "executor_called": True,
+                "issues": [],
+            }
+
+        with mock.patch(
+            "lifecycle_runtime_commit_adapter.adapt_and_execute_lifecycle_runtime_commit",
+            side_effect=capturing_executor,
+        ):
+            result = commit_lifecycle(
+                preview,
+                {
+                    "orchestrator_type": ORCHESTRATOR_TYPE,
+                    "status": "READY",
+                    "commit_ready": True,
+                    "commit_plan": plan,
+                    "issues": [],
+                    "warnings": [],
+                },
+                self.writer,
+                queue_commit_executor=lambda plan: {"ok": True},
+                context={"storage_root": storage_root, "owner_id": owner_id, "token_id": token_id},
+            )
+
+        self.assertEqual("COMMITTED", result["status"])
+        self.assertEqual(1, len(adapter_calls))
+        call = adapter_calls[0]
+        self.assertIn("lifecycle_commit_request", call)
+        self.assertIn("gate_result", call)
+        self.assertIn("transaction_manifest", call)
+        self.assertIn("storage_plan", call)
+        self.assertIn("guard_plan", call)
+        self.assertIn("token_storage_plan", call)
+        self.assertIn("expected_targets", call)
+        self.assertIn("new_targets", call)
+        self.assertIn("consumer_id", call)
+
+    def test_legacy_executor_not_called_when_builder_used(self) -> None:
+        storage_root = self.storage_root
+
+        with mock.patch("lifecycle_runtime_commit_adapter.adapt_and_execute_lifecycle_runtime_commit") as adapter, \
+             mock.patch("execution_runtime_commit_service.commit_execution_runtime_plan") as legacy:
+            adapter.return_value = {
+                "adapter_status": "COMMITTED",
+                "executor_called": True,
+                "issues": [],
+            }
+
+            result = commit_lifecycle(
+                self._commit_contract_preview(),
+                {
+                    "orchestrator_type": ORCHESTRATOR_TYPE,
+                    "status": "READY",
+                    "commit_ready": True,
+                    "commit_plan": {
+                        "planned_records": [{"record_id": "planned-1"}],
+                        "planned_targets": {},
+                    },
+                    "issues": [],
+                    "warnings": [],
+                },
+                self.writer,
+                queue_commit_executor=lambda plan: {"ok": True},
+                context={"storage_root": storage_root, "owner_id": "owner-1"},
+            )
+
+        self.assertEqual("COMMITTED", result["status"])
+        adapter.assert_called_once()
+        legacy.assert_not_called()
 
 
 if __name__ == "__main__":

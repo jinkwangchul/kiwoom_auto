@@ -20,6 +20,9 @@ from typing import Any, Callable
 
 from lifecycle_commit_writer import LifecycleCommitWriter
 from execution_runtime_commit_plan_orchestrator import ORCHESTRATOR_TYPE
+from lifecycle_runtime_commit_builder import (
+    build_lifecycle_runtime_commit_adapter_request,
+)
 
 
 SERVICE_TYPE = "ORDER_LIFECYCLE_COMMIT_SERVICE"
@@ -85,12 +88,18 @@ def commit_lifecycle(
 
     commit_plan = deepcopy(plan_orch.get("commit_plan") or {})
 
-    if (
+    # Check if we need runtime commit executor
+    # If no explicit executor provided and planned_records exist, we need either:
+    # 1. An adapter payload in commit_plan or context, OR
+    # 2. A storage_root in context (for the Builder to construct the payload)
+    needs_runtime = (
         runtime_commit_executor is None
         and commit_plan.get("planned_records")
-        and not _runtime_adapter_payload(commit_plan, context)
-    ):
-        return _result(status="BLOCKED", issues=["RUNTIME_COMMIT_ADAPTER_INPUT_REQUIRED"])
+    )
+    if needs_runtime and not _runtime_adapter_payload(commit_plan, context):
+        ctx = _as_dict(context)
+        if not ctx.get("storage_root"):
+            return _result(status="BLOCKED", issues=["RUNTIME_COMMIT_ADAPTER_INPUT_REQUIRED"])
 
     # Persist prepared transition
     prep = writer.prepare_commit(preview.get("commit_contract"), commit_plan, preview.get("commit_plan"), context)
@@ -106,9 +115,9 @@ def commit_lifecycle(
     queue_issues: list[str] = []
 
     try:
-        # If no explicit runtime executor was provided, call the Lifecycle -> M6
-        # adapter only when the caller supplied the full adapter payload. Do not
-        # fall back to the legacy execution_runtime_commit_service automatically.
+        # If no explicit runtime executor was provided, use the Builder to
+        # construct adapter request from lifecycle inputs, then call the
+        # Lifecycle -> M6 runtime commit adapter.
         if runtime_commit_executor is None:
             try:
                 from lifecycle_runtime_commit_adapter import (
@@ -121,7 +130,33 @@ def commit_lifecycle(
                 def _runtime_wrapper(plan: dict[str, Any]) -> dict[str, Any]:
                     payload = _runtime_adapter_payload(plan, context)
                     if not payload:
-                        return {"ok": False, "issues": ["RUNTIME_COMMIT_ADAPTER_INPUT_REQUIRED"]}
+                        ctx = _as_dict(context)
+                        storage_root = ctx.get("storage_root", "")
+                        owner_id = ctx.get("owner_id", "lifecycle_consumer")
+                        token_id = ctx.get("token_id")
+                        exec_hash = ctx.get("execution_plan_hash")
+                        payload_hash = ctx.get("expected_payload_hash")
+                        consumer_override = ctx.get("consumer_id")
+
+                        if not storage_root:
+                            return {"ok": False, "issues": ["storage_root is required in context"]}
+
+                        try:
+                            payload = build_lifecycle_runtime_commit_adapter_request(
+                                commit_contract_preview=preview,
+                                commit_plan=plan,
+                                storage_root=storage_root,
+                                owner_id=owner_id,
+                                token_id=token_id,
+                                execution_plan_hash=exec_hash,
+                                expected_payload_hash=payload_hash,
+                                consumer_override=consumer_override,
+                            )
+                            if payload.get("build_issues"):
+                                return {"ok": False, "issues": list(payload.get("build_issues"))}
+                        except Exception as exc:  # pragma: no cover - defensive
+                            return {"ok": False, "issues": [f"BUILDER_EXCEPTION: {type(exc).__name__}"]}
+
                     try:
                         res = default_runtime_commit(**payload)
                     except Exception as exc:  # pragma: no cover - defensive
