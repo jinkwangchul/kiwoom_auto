@@ -8,16 +8,14 @@ Flow:
  4. If external writes succeed, call writer.finalize_commit(token, success=True)
     otherwise call writer.finalize_commit(token, success=False)
 
-This module intentionally keeps runtime/queue write invocations simple and
-reuses existing functions where available (e.g., commit_execution_runtime_plan).
-The orchestrator accepts callbacks to perform external writes to keep the
-module decoupled from concrete IO implementations and easier to test.
+This module intentionally keeps runtime/queue write invocations simple. The
+default runtime path delegates to the Lifecycle -> M6 runtime commit adapter,
+while explicit callbacks remain supported for tests and compatibility paths.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
-from pathlib import Path
 from typing import Any, Callable
 
 from lifecycle_commit_writer import LifecycleCommitWriter
@@ -29,6 +27,21 @@ SERVICE_TYPE = "ORDER_LIFECYCLE_COMMIT_SERVICE"
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _runtime_adapter_payload(
+    commit_plan: dict[str, Any],
+    context: Any,
+) -> dict[str, Any]:
+    for source in (
+        commit_plan.get("runtime_commit_adapter"),
+        commit_plan.get("runtime_commit_adapter_request"),
+        _as_dict(context).get("runtime_commit_adapter"),
+        _as_dict(context).get("runtime_commit_adapter_request"),
+    ):
+        if isinstance(source, dict):
+            return deepcopy(source)
+    return {}
 
 
 def _result(*, status: str, issues: list[str] | None = None, warnings: list[str] | None = None, commit_token: str | None = None) -> dict[str, Any]:
@@ -72,6 +85,13 @@ def commit_lifecycle(
 
     commit_plan = deepcopy(plan_orch.get("commit_plan") or {})
 
+    if (
+        runtime_commit_executor is None
+        and commit_plan.get("planned_records")
+        and not _runtime_adapter_payload(commit_plan, context)
+    ):
+        return _result(status="BLOCKED", issues=["RUNTIME_COMMIT_ADAPTER_INPUT_REQUIRED"])
+
     # Persist prepared transition
     prep = writer.prepare_commit(preview.get("commit_contract"), commit_plan, preview.get("commit_plan"), context)
     if not prep.get("ok"):
@@ -86,30 +106,32 @@ def commit_lifecycle(
     queue_issues: list[str] = []
 
     try:
-        # If no explicit executors were provided, try to call project's
-        # execution_runtime_commit_service.commit_execution_runtime_plan and
-        # execution_queue_commit_service.commit_execution_queue_manually via
-        # dynamic imports so we don't create hard module-level dependencies.
+        # If no explicit runtime executor was provided, call the Lifecycle -> M6
+        # adapter only when the caller supplied the full adapter payload. Do not
+        # fall back to the legacy execution_runtime_commit_service automatically.
         if runtime_commit_executor is None:
             try:
-                from execution_runtime_commit_service import commit_execution_runtime_plan as default_runtime_commit
+                from lifecycle_runtime_commit_adapter import (
+                    adapt_and_execute_lifecycle_runtime_commit as default_runtime_commit,
+                )
             except Exception:
                 default_runtime_commit = None
 
             if default_runtime_commit is not None:
                 def _runtime_wrapper(plan: dict[str, Any]) -> dict[str, Any]:
-                    # default_runtime_commit expects (commit_plan_orchestrator_result, order_executions_path, order_locks_path, ...)
-                    targets = plan.get("planned_targets") if isinstance(plan, dict) else {}
-                    order_exec = targets.get("order_executions") if isinstance(targets, dict) else None
-                    order_locks = targets.get("order_locks") if isinstance(targets, dict) else None
+                    payload = _runtime_adapter_payload(plan, context)
+                    if not payload:
+                        return {"ok": False, "issues": ["RUNTIME_COMMIT_ADAPTER_INPUT_REQUIRED"]}
                     try:
-                        res = default_runtime_commit(plan_orch, order_exec, order_locks, context=context)
+                        res = default_runtime_commit(**payload)
                     except Exception as exc:  # pragma: no cover - defensive
-                        return {"ok": False, "issues": [f"RUNTIME_COMMIT_EXCEPTION: {exc}"]}
-                    # interpret result dict
-                    if isinstance(res, dict) and res.get("status") == "COMMITTED":
+                        return {"ok": False, "issues": [f"RUNTIME_COMMIT_ADAPTER_EXCEPTION: {type(exc).__name__}"]}
+                    if isinstance(res, dict) and res.get("adapter_status") == "COMMITTED":
                         return {"ok": True, **res}
-                    return {"ok": False, "issues": list(res.get("issues") or [res.get("status") or "RUNTIME_COMMIT_FAILED"]) }
+                    if isinstance(res, dict):
+                        status = res.get("adapter_status") or "RUNTIME_COMMIT_ADAPTER_FAILED"
+                        return {"ok": False, **res, "issues": list(res.get("issues") or [status])}
+                    return {"ok": False, "issues": ["RUNTIME_COMMIT_ADAPTER_RETURNED_NON_DICT"]}
 
                 runtime_commit_executor = _runtime_wrapper
 
