@@ -91,7 +91,6 @@ def _macd_sell_section(sell_cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 
-
 def _profit_rate_sell_section(sell_cfg: dict[str, Any]) -> dict[str, Any]:
     """SELL 설정에서 수익률 SELL 섹션을 추출한다.
 
@@ -583,6 +582,193 @@ def _evaluate_buy_price_compare_filter(
     )
 
 
+def _buy_bollinger_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Get Bollinger filter configuration from buy filters."""
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("bollinger"), dict):
+        return filters["bollinger"]
+    return {}
+
+
+def _bollinger_detail(
+    *,
+    enabled: bool,
+    operator: Any,
+    value: Any,
+    close_price: Any,
+    bollinger_value: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+) -> str:
+    return (
+        "filter_type=BOLLINGER "
+        f"enabled={enabled} "
+        "target=CLOSE "
+        "compare_target=BOLLINGER "
+        f"operator={operator} "
+        f"value={value} "
+        f"close_price={close_price} "
+        f"bollinger_value={bollinger_value} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+
+
+def _evaluate_buy_bollinger_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    """Evaluate BUY Bollinger filter.
+
+    The Bollinger filter compares the close price against the Bollinger Band value.
+    - compare_target="BOLLINGER" refers to the lower Bollinger Band (for "above" conditions)
+    - The value is the offset from the band (positive for above lower band, negative for below)
+    """
+    filter_cfg = _buy_bollinger_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    conditions = filter_cfg.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=None,
+            value=None,
+            close_price=None,
+            bollinger_value=None,
+            passed=False,
+            reason="missing_conditions",
+            evaluation_index=evaluation_index,
+        )
+
+    # Process only the first condition (similar to other filters)
+    condition = conditions[0] if conditions else {}
+    if not isinstance(condition, dict):
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=None,
+            value=None,
+            close_price=None,
+            bollinger_value=None,
+            passed=False,
+            reason="invalid_condition",
+            evaluation_index=evaluation_index,
+        )
+
+    enabled = bool(filter_cfg.get("enabled", True))
+    if not enabled:
+        return True, _bollinger_detail(
+            enabled=False,
+            operator=None,
+            value=None,
+            close_price=None,
+            bollinger_value=None,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+
+    operator = str(condition.get("operator", "")).strip().upper()
+    raw_value = condition.get("value")
+    compare_target = condition.get("compare_target")
+    raw_period = condition.get("period")
+
+    # Validate optional per-condition period override.
+    # The band period is taken from config; if a condition supplies its own
+    # period it must be a positive integer, otherwise the filter is blocked.
+    if raw_period is not None:
+        period = _safe_int(raw_period)
+        if period is None or period <= 0:
+            return False, _bollinger_detail(
+                enabled=True,
+                operator=operator,
+                value=raw_value,
+                close_price=None,
+                bollinger_value=None,
+                passed=False,
+                reason="invalid_period",
+                evaluation_index=evaluation_index,
+            )
+
+    # Validate operator
+    if operator not in {">", ">=", "<", "<="}:
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=operator,
+            value=raw_value,
+            close_price=None,
+            bollinger_value=None,
+            passed=False,
+            reason="unsupported_operator",
+            evaluation_index=evaluation_index,
+        )
+
+    # Validate value (offset from the band must be numeric when supplied)
+    value = _safe_float(raw_value)
+    if raw_value is not None and value is None:
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=operator,
+            value=raw_value,
+            close_price=None,
+            bollinger_value=None,
+            passed=False,
+            reason="invalid_value",
+            evaluation_index=evaluation_index,
+        )
+
+    # Get close price
+    close_series = series_map.get("CLOSE")
+    close_price = close_series[evaluation_index] if isinstance(close_series, list) and 0 <= evaluation_index < len(close_series) else None
+
+    # Get Bollinger band value
+    bollinger_series = series_map.get("BOLLINGER")
+    bollinger_value = bollinger_series[evaluation_index] if isinstance(bollinger_series, list) and 0 <= evaluation_index < len(bollinger_series) else None
+
+    if close_price is None or bollinger_value is None:
+        return False, _bollinger_detail(
+            enabled=True,
+            operator=operator,
+            value=raw_value,
+            close_price=close_price,
+            bollinger_value=bollinger_value,
+            passed=False,
+            reason="insufficient_data",
+            evaluation_index=evaluation_index,
+        )
+
+    # Calculate the threshold value
+    # The value in the condition represents the offset from the Bollinger band
+    threshold = bollinger_value + (value if value is not None else 0.0)
+
+    # Evaluate the condition
+    if operator == ">=":
+        passed = close_price >= threshold
+    elif operator == ">":
+        passed = close_price > threshold
+    elif operator == "<=":
+        passed = close_price <= threshold
+    elif operator == "<":
+        passed = close_price < threshold
+    else:
+        passed = False
+
+    return passed, _bollinger_detail(
+        enabled=True,
+        operator=operator,
+        value=raw_value,
+        close_price=round(close_price, 8),
+        bollinger_value=round(bollinger_value, 8),
+        passed=passed,
+        reason="matched" if passed else "not_matched",
+        evaluation_index=evaluation_index,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -699,11 +885,11 @@ def evaluate_indicator_follow_routine(
 ) -> RoutineSignal:
     """MACD 루틴을 평가한다.
 
-반환 원칙:
-- BUY / SELL 조건 충족 시에만 공식 주문신호를 반환한다.
-- 조건 미충족, 데이터 부족, 루틴 비활성은 signal=None으로 반환한다.
-- 비신호를 별도 주문신호로 승격하지 않는다.
-"""
+    반환 원칙:
+    - BUY / SELL 조건 충족 시에만 공식 주문신호를 반환한다.
+    - 조건 미충족, 데이터 부족, 루틴 비활성은 signal=None으로 반환한다.
+    - 비신호를 별도 주문신호로 승격하지 않는다.
+    """
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
     if isinstance(context, dict) and isinstance(context.get("candles"), list):
         candles = context["candles"]
@@ -800,6 +986,11 @@ def evaluate_indicator_follow_routine(
             details.append(price_compare_detail)
         if not price_compare_passed:
             return RoutineSignal(None, "BUY price compare filter blocked", matched, details, buy_index, buy_delay)
+        bollinger_passed, bollinger_detail = _evaluate_buy_bollinger_filter(cfg, buy_cfg, series_map, buy_index)
+        if bollinger_detail:
+            details.append(bollinger_detail)
+        if not bollinger_passed:
+            return RoutineSignal(None, "BUY bollinger filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [

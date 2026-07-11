@@ -510,6 +510,14 @@ def _post_validation(
         and diff.get("path") == "buy.filters.price_compare"
         and isinstance(diff.get("value"), dict)
     ]
+    allowed_buy_bollinger_filter_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_filter"
+        and diff.get("path") == "buy.filters.bollinger"
+        and isinstance(diff.get("value"), dict)
+    ]
 
     if any(isinstance(condition, dict) and condition.get("target") == "OSC" and condition.get("operator") == "TURN_UP" for condition in pre_conditions):
         add_check(
@@ -567,6 +575,11 @@ def _post_validation(
             if path == "buy.filters.price_compare":
                 add_check(
                     "final_diff_buy_price_compare_filter_matches",
+                    _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
+                )
+            if path == "buy.filters.bollinger":
+                add_check(
+                    "final_diff_buy_bollinger_filter_matches",
                     _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
                 )
         if operation == "add_signal":
@@ -675,6 +688,15 @@ def _post_validation(
             )
         elif _path_exists(post_normalized, "buy.filters"):
             _get_path(post_normalized, "buy.filters").pop("price_compare", None)
+            if _get_path(post_normalized, "buy.filters") == {} and not _path_exists(pre_normalized, "buy.filters"):
+                _get_path(post_normalized, "buy").pop("filters", None)
+    if allowed_buy_bollinger_filter_diffs and _path_exists(post_normalized, "buy.filters.bollinger"):
+        if _path_exists(pre_normalized, "buy.filters.bollinger"):
+            _get_path(post_normalized, "buy.filters")["bollinger"] = deepcopy(
+                _get_path(pre_normalized, "buy.filters.bollinger")
+            )
+        elif _path_exists(post_normalized, "buy.filters"):
+            _get_path(post_normalized, "buy.filters").pop("bollinger", None)
             if _get_path(post_normalized, "buy.filters") == {} and not _path_exists(pre_normalized, "buy.filters"):
                 _get_path(post_normalized, "buy").pop("filters", None)
     if _path_exists(pre_normalized, "buy.groups[0].conditions") and _path_exists(post_normalized, "buy.groups[0].conditions"):

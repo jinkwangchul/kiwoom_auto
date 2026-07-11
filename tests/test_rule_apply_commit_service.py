@@ -698,19 +698,74 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                     }],
                 },
             )
-            self.assertTrue(any(
-                condition.get("target") == "CLOSE"
-                and condition.get("operator") == ">="
-                and condition.get("value") == -0.1
-                for condition in conditions
-            ))
+            # bollinger candidate exists in the preview but is NOT approved in
+            # this test, so it must not be applied to the rules.
+            self.assertNotIn("bollinger", saved.get("buy", {}).get("filters", {}))
             self.assertFalse(any(condition.get("compare_target") == "AVG_PRICE" for condition in conditions))
             self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
             self.assertEqual(saved["sell"], self.current_rules["sell"])
             self.assertEqual(saved["indicators"], self.current_rules["indicators"])
             self.assertEqual(
                 [patch["target_path"] for patch in result["applied_patches"]],
-                ["buy.groups[0].conditions", "buy.filters.moving_average", "buy.filters.price_compare"],
+                ["buy.filters.moving_average", "buy.filters.price_compare"],
+            )
+            self.assertTrue(result["post_validation"]["ok"])
+            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
+
+    def test_buy_bollinger_filter_committed_via_set_filter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            self._write_rules(rules_path, self.current_rules)
+            original_ui_state = deepcopy(self.ui_state)
+            self.ui_state["buy_ui"]["signal_filter"] = {
+                "buy_ocr_value_line": "",
+                "buy_rsi_value_line": "",
+                "buy_bollinger_enabled": True,
+                "buy_bollinger_direction_combo": "하향",
+                "buy_bollinger_value_line": "0.1",
+                "buy_bollinger_compare_combo": "이상",
+            }
+            try:
+                apply_preview, gate, context = self._build_apply_and_gate(
+                    rules_path,
+                    session_path,
+                    {"buy.filters.bollinger": "APPROVED"},
+                )
+            finally:
+                self.ui_state = original_ui_state
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                saved["buy"]["filters"]["bollinger"],
+                {
+                    "enabled": True,
+                    "conditions": [{
+                        "enabled": True,
+                        "not": False,
+                        "target": "CLOSE",
+                        "operator": ">=",
+                        "compare_target": "BOLLINGER",
+                        "value": -0.1,
+                        "description": "UI preview: BUY current price / Bollinger filter",
+                    }],
+                },
+            )
+            self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
+            self.assertEqual(saved["sell"], self.current_rules["sell"])
+            self.assertEqual(saved["indicators"], self.current_rules["indicators"])
+            self.assertEqual(saved["buy"]["groups"], self.current_rules["buy"]["groups"])
+            self.assertEqual(
+                [patch["target_path"] for patch in result["applied_patches"]],
+                ["buy.filters.bollinger"],
             )
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])

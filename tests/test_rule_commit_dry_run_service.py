@@ -244,6 +244,53 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 ["indicators.rsi"],
             )
 
+    def test_dry_run_commits_bollinger_filter_then_rolls_back_temp_rules(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_ui_state = deepcopy(self.ui_state)
+            self.ui_state["buy_ui"]["signal_filter"] = {
+                "buy_ocr_value_line": "",
+                "buy_rsi_value_line": "",
+                "buy_bollinger_enabled": True,
+                "buy_bollinger_direction_combo": "하향",
+                "buy_bollinger_value_line": "0.1",
+                "buy_bollinger_compare_combo": "이상",
+            }
+            try:
+                rules_path, session_path, preview, rules = self._prepare_actual_inputs(
+                    temp_dir,
+                    {"buy.filters.bollinger": "APPROVED"},
+                )
+            finally:
+                self.ui_state = original_ui_state
+            workspace = Path(temp_dir) / "workspace"
+            actual_before = self._file_sha256(rules_path)
+
+            result = rule_commit_dry_run_service.run_rule_commit_dry_run(
+                rules_path,
+                session_path,
+                workspace,
+                {
+                    "preview_result": preview,
+                    "preserve_workspace_on_success": True,
+                },
+            )
+            temp_rules = json.loads((workspace / "rules.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(actual_before, self._file_sha256(rules_path))
+            self.assertTrue(result["actual_rules_unchanged"])
+            self.assertTrue(result["rollback_result"]["rollback_completed"])
+            self.assertTrue(result["rollback_verified"])
+            # temp rules are rolled back to the original (bollinger not persisted)
+            self.assertEqual(self._stable_hash(rules), self._stable_hash(temp_rules))
+            # the dry-run commit applied the bollinger set_filter patch
+            self.assertEqual(
+                [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
+                ["buy.filters.bollinger"],
+            )
+            self.assertTrue(result["commit_result"]["post_validation"]["ok"])
+            self.assertEqual(result["commit_result"]["post_validation"]["unexpected_changes"], [])
+
     def test_dry_run_commits_ma_price_compare_and_bollinger_then_rolls_back_temp_rules(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             original_ui_state = deepcopy(self.ui_state)
@@ -301,26 +348,22 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             self.assertTrue(result["rollback_verified"])
             self.assertEqual(self._stable_hash(rules), self._stable_hash(temp_rules))
             self.assertEqual([diff["path"] for diff in final_diff], [
-                "buy.groups[0].conditions",
                 "buy.filters.moving_average",
                 "buy.filters.price_compare",
             ])
-            self.assertEqual(final_diff[0]["condition"]["target"], "CLOSE")
-            self.assertEqual(final_diff[0]["condition"]["operator"], ">=")
-            self.assertEqual(final_diff[0]["condition"]["value"], -0.1)
+            self.assertEqual(final_diff[0]["operation"], "set_filter")
+            self.assertEqual(final_diff[0]["value"]["conditions"][0]["target"], "CLOSE")
+            self.assertEqual(final_diff[0]["value"]["conditions"][0]["operator"], "CROSS_UP")
+            self.assertEqual(final_diff[0]["value"]["conditions"][0]["compare_target"], "MA")
+            self.assertEqual(final_diff[0]["value"]["conditions"][0]["period"], 60)
             self.assertEqual(final_diff[1]["operation"], "set_filter")
             self.assertEqual(final_diff[1]["value"]["conditions"][0]["target"], "CLOSE")
-            self.assertEqual(final_diff[1]["value"]["conditions"][0]["operator"], "CROSS_UP")
-            self.assertEqual(final_diff[1]["value"]["conditions"][0]["compare_target"], "MA")
-            self.assertEqual(final_diff[1]["value"]["conditions"][0]["period"], 60)
-            self.assertEqual(final_diff[2]["operation"], "set_filter")
-            self.assertEqual(final_diff[2]["value"]["conditions"][0]["target"], "CLOSE")
-            self.assertEqual(final_diff[2]["value"]["conditions"][0]["operator"], ">=")
-            self.assertEqual(final_diff[2]["value"]["conditions"][0]["compare_target"], "AVG_PRICE")
-            self.assertEqual(final_diff[2]["value"]["conditions"][0]["value"], 0.15)
+            self.assertEqual(final_diff[1]["value"]["conditions"][0]["operator"], ">=")
+            self.assertEqual(final_diff[1]["value"]["conditions"][0]["compare_target"], "AVG_PRICE")
+            self.assertEqual(final_diff[1]["value"]["conditions"][0]["value"], 0.15)
             self.assertEqual(
                 [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
-                ["buy.groups[0].conditions", "buy.filters.moving_average", "buy.filters.price_compare"],
+                ["buy.filters.moving_average", "buy.filters.price_compare"],
             )
 
     def test_success_cleanup_deletes_workspace_by_default(self):

@@ -62,6 +62,7 @@ BAR_MINUTES_PATH = "bar.bar_minutes"
 BUY_CONDITIONS_PATH = "buy.groups[0].conditions"
 BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
 BUY_PRICE_COMPARE_FILTER_PATH = "buy.filters.price_compare"
+BUY_BOLLINGER_FILTER_PATH = "buy.filters.bollinger"
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
@@ -127,6 +128,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_PRICE_COMPARE_FILTER_PATH: (
             "UI preview-only BUY price-compare filter candidate."
+        ),
+        BUY_BOLLINGER_FILTER_PATH: (
+            "UI preview-only BUY current-price/Bollinger filter candidate."
         ),
         "sell.signals.macd_sell": (
             "UI preview-only sell MACD condition candidate; does not replace existing rules."
@@ -327,6 +331,11 @@ def _price_compare_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _bollinger_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
 def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     parts = path.split(".")
     current: Any = root
@@ -343,29 +352,36 @@ def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     return True
 
 
-def _build_buy_bollinger_conditions(signal_filter: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]]:
+def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     if not _optional_filter_enabled(signal_filter, "buy_bollinger_enabled", "buy_bollinger_value_line"):
-        return []
+        return None
 
     threshold = _safe_float(signal_filter.get("buy_bollinger_value_line"))
     operator = _compare_operator(signal_filter.get("buy_bollinger_compare_combo"))
     if threshold is None:
         warnings.append("buy Bollinger threshold is not numeric")
-        return []
+        return None
     if operator is None:
         warnings.append(f"buy Bollinger compare is not mapped: {signal_filter.get('buy_bollinger_compare_combo')!r}")
-        return []
+        return None
 
     direction = str(signal_filter.get("buy_bollinger_direction_combo") or "").strip()
     signed_threshold = -abs(threshold) if direction == "\ud558\ud5a5" else abs(threshold)
-    return [{
-        "enabled": True,
-        "not": False,
-        "target": "CLOSE",
-        "operator": operator,
-        "value": signed_threshold,
-        "description": "UI preview: buy Bollinger threshold condition",
-    }]
+    return {
+        "path": BUY_BOLLINGER_FILTER_PATH,
+        "value": {
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "CLOSE",
+                "operator": operator,
+                "compare_target": "BOLLINGER",
+                "value": signed_threshold,
+                "description": "UI preview: BUY current price / Bollinger filter",
+            }],
+        },
+    }
 
 
 def _price_compare_operator(value: Any) -> str | None:
@@ -622,7 +638,6 @@ def build_engine_rules_preview_from_ui_state(
     signal_filter = _as_dict(buy_ui.get("signal_filter"))
     price_compare = _as_dict(buy_ui.get("price_compare"))
     buy_conditions = _build_buy_osc_conditions(signal_filter, warnings)
-    buy_conditions.extend(_build_buy_bollinger_conditions(signal_filter, warnings))
     if buy_conditions:
         buy_candidate = _build_buy_merge_candidate(source_rules, buy_conditions, warnings)
         if buy_candidate:
@@ -634,6 +649,11 @@ def build_engine_rules_preview_from_ui_state(
     if buy_ma_filter_candidate:
         _set_path_value(preview_rules, BUY_MOVING_AVERAGE_FILTER_PATH, buy_ma_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["moving_average"] = buy_ma_filter_candidate
+
+    buy_bollinger_filter_candidate = _build_buy_bollinger_filter_candidate(signal_filter, warnings)
+    if buy_bollinger_filter_candidate:
+        _set_path_value(preview_rules, BUY_BOLLINGER_FILTER_PATH, buy_bollinger_filter_candidate["value"])
+        preview_candidates.setdefault("filters", {})["bollinger"] = buy_bollinger_filter_candidate
 
     buy_price_compare_filter_candidate = _build_buy_price_compare_filter_candidate(price_compare, warnings)
     if buy_price_compare_filter_candidate:
@@ -696,6 +716,8 @@ def build_engine_rules_preview_from_ui_state(
     ]
     if buy_ma_filter_candidate:
         mapped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+    if buy_bollinger_filter_candidate:
+        mapped_paths.append(BUY_BOLLINGER_FILTER_PATH)
     if buy_price_compare_filter_candidate:
         mapped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
     mapped_paths.extend([
@@ -766,6 +788,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         filter_path = str(buy_ma_filter.get("path") or BUY_MOVING_AVERAGE_FILTER_PATH)
         candidate_paths[filter_path] = "set_filter"
 
+    buy_bollinger_filter = _as_dict(_as_dict(candidates.get("filters")).get("bollinger"))
+    if buy_bollinger_filter:
+        filter_path = str(buy_bollinger_filter.get("path") or BUY_BOLLINGER_FILTER_PATH)
+        candidate_paths[filter_path] = "set_filter"
+
     buy_price_compare_filter = _as_dict(_as_dict(candidates.get("filters")).get("price_compare"))
     if buy_price_compare_filter:
         filter_path = str(buy_price_compare_filter.get("path") or BUY_PRICE_COMPARE_FILTER_PATH)
@@ -824,6 +851,7 @@ def build_rule_approval_session_fingerprint(
         BAR_MINUTES_PATH: _get_path_value(rules, BAR_MINUTES_PATH),
         BUY_CONDITIONS_PATH: _get_path_value(rules, BUY_CONDITIONS_PATH),
         BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
+        BUY_BOLLINGER_FILTER_PATH: _get_path_value(rules, BUY_BOLLINGER_FILTER_PATH),
         BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
@@ -1242,6 +1270,27 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == BUY_BOLLINGER_FILTER_PATH:
+            filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("bollinger"))
+            candidate_value = _bollinger_filter_value(filter_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY bollinger filter value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_BOLLINGER_FILTER_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY bollinger filter is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_BOLLINGER_FILTER_PATH,
+                "target_path": BUY_BOLLINGER_FILTER_PATH,
+                "operation": "set_filter",
+                "value": candidate_value,
+                "risk": "low",
+            })
+            continue
+
         if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
             sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
             if not sell_candidate:
@@ -1394,7 +1443,7 @@ def apply_approved_rule_patch_preview(
             continue
 
         if operation == "set_filter":
-            if target_path not in {BUY_MOVING_AVERAGE_FILTER_PATH, BUY_PRICE_COMPARE_FILTER_PATH}:
+            if target_path not in {BUY_MOVING_AVERAGE_FILTER_PATH, BUY_PRICE_COMPARE_FILTER_PATH, BUY_BOLLINGER_FILTER_PATH}:
                 skipped_patches.append(_apply_skipped(patch, "unsupported filter target path"))
                 warnings.append(f"unsupported filter target path: {target_path}")
                 continue
@@ -1524,6 +1573,16 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BUY_PRICE_COMPARE_FILTER_PATH,
             "operation": "set_filter",
             "change_type": "set_buy_price_compare_filter",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_filter" and target_path == BUY_BOLLINGER_FILTER_PATH:
+        diffs.append({
+            "path": BUY_BOLLINGER_FILTER_PATH,
+            "operation": "set_filter",
+            "change_type": "set_buy_bollinger_filter",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -1858,6 +1917,7 @@ def approve_engine_rule_candidates(
         BUY_CONDITIONS_PATH,
         BUY_MOVING_AVERAGE_FILTER_PATH,
         BUY_PRICE_COMPARE_FILTER_PATH,
+        BUY_BOLLINGER_FILTER_PATH,
         RSI_INDICATOR_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
     }
@@ -1951,6 +2011,18 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
             warnings.append("BUY price_compare filter approval skipped: target path is not writable")
 
+    if BUY_BOLLINGER_FILTER_PATH in approved_paths:
+        filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("bollinger"))
+        candidate_value = _bollinger_filter_value(filter_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_BOLLINGER_FILTER_PATH)
+            warnings.append("BUY bollinger filter approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_BOLLINGER_FILTER_PATH, candidate_value):
+            applied_paths.append(BUY_BOLLINGER_FILTER_PATH)
+        else:
+            skipped_paths.append(BUY_BOLLINGER_FILTER_PATH)
+            warnings.append("BUY bollinger filter approval skipped: target path is not writable")
+
     if SELL_MACD_SIGNAL_PREVIEW_PATH in approved_paths:
         sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         sell_section = approved_rules.setdefault("sell", {})
@@ -2022,6 +2094,10 @@ def compare_engine_rules_preview(
         elif path == BUY_PRICE_COMPARE_FILTER_PATH:
             preview_value = _price_compare_filter_value(
                 _as_dict(_as_dict(preview_candidates.get("filters")).get("price_compare"))
+            )
+        elif path == BUY_BOLLINGER_FILTER_PATH:
+            preview_value = _bollinger_filter_value(
+                _as_dict(_as_dict(preview_candidates.get("filters")).get("bollinger"))
             )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
