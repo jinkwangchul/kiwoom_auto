@@ -444,6 +444,145 @@ def _evaluate_buy_moving_average_filter(
     )
 
 
+def _buy_price_compare_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("price_compare"), dict):
+        return filters["price_compare"]
+    return {}
+
+
+def _price_compare_detail(
+    *,
+    enabled: bool,
+    target: Any,
+    operator: Any,
+    compare_target: Any,
+    value: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+) -> str:
+    return (
+        "filter_type=PRICE_COMPARE "
+        f"enabled={enabled} "
+        f"target={target} "
+        f"operator={operator} "
+        f"compare_target={compare_target} "
+        f"value={value} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+
+
+def _series_value_at(series_map: dict[str, list[float | None]], key: Any, index: int) -> float | None:
+    series = series_map.get(str(key or "").strip().upper())
+    if not isinstance(series, list):
+        return None
+    if index < 0:
+        index = len(series) + index
+    if index < 0 or index >= len(series):
+        return None
+    return series[index]
+
+
+def _evaluate_buy_price_compare_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    filter_cfg = _buy_price_compare_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    enabled = bool(filter_cfg.get("enabled", True))
+    if not enabled:
+        return True, _price_compare_detail(
+            enabled=False,
+            target=None,
+            operator=None,
+            compare_target=None,
+            value=None,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+
+    conditions = filter_cfg.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        return False, _price_compare_detail(
+            enabled=True,
+            target=None,
+            operator=None,
+            compare_target=None,
+            value=None,
+            passed=False,
+            reason="missing_conditions",
+            evaluation_index=evaluation_index,
+        )
+
+    logic = _logic(filter_cfg.get("conditions_logic", filter_cfg.get("logic", "AND")), "AND")
+    condition_results = []
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            continue
+        target = condition.get("target")
+        compare_target = condition.get("compare_target")
+        operator = condition.get("operator")
+        if target not in {"CLOSE", "ORDER_PRICE", "AVG_PRICE"} or compare_target not in {"CLOSE", "ORDER_PRICE", "AVG_PRICE"}:
+            return False, _price_compare_detail(
+                enabled=True,
+                target=target,
+                operator=operator,
+                compare_target=compare_target,
+                value=condition.get("value"),
+                passed=False,
+                reason="unsupported_target",
+                evaluation_index=evaluation_index,
+            )
+        if _series_value_at(series_map, target, evaluation_index) is None or _series_value_at(series_map, compare_target, evaluation_index) is None:
+            return False, _price_compare_detail(
+                enabled=True,
+                target=target,
+                operator=operator,
+                compare_target=compare_target,
+                value=condition.get("value"),
+                passed=False,
+                reason="insufficient_data",
+                evaluation_index=evaluation_index,
+            )
+        result = evaluate_condition(condition, series_map, evaluation_index)
+        condition_results.append((condition, result))
+
+    if not condition_results:
+        return False, _price_compare_detail(
+            enabled=True,
+            target=None,
+            operator=None,
+            compare_target=None,
+            value=None,
+            passed=False,
+            reason="missing_conditions",
+            evaluation_index=evaluation_index,
+        )
+
+    passed = all(result.passed for _, result in condition_results) if logic == "AND" else any(
+        result.passed for _, result in condition_results
+    )
+    first_condition = condition_results[0][0]
+    return passed, _price_compare_detail(
+        enabled=True,
+        target=first_condition.get("target"),
+        operator=first_condition.get("operator"),
+        compare_target=first_condition.get("compare_target"),
+        value=first_condition.get("value"),
+        passed=passed,
+        reason="matched" if passed else "not_matched",
+        evaluation_index=evaluation_index,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -456,6 +595,25 @@ def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested
         if value is not None:
             return value
     return None
+
+
+def _enrich_price_compare_series(series_map: dict[str, list[float | None]], context: dict[str, Any] | None) -> None:
+    close_series = series_map.get("CLOSE")
+    length = len(close_series) if isinstance(close_series, list) else 0
+    order_price = _context_float(
+        context,
+        ("order_price", "buy_order_price", "planned_order_price", "mock_order_price"),
+        (("order", "price"), ("planned_order", "price"), ("buy", "order_price")),
+    )
+    average_price = _context_float(
+        context,
+        ("average_price", "avg_price", "position_average_price", "mock_average_price"),
+        (("position", "average_price"), ("position", "avg_price"), ("holding", "average_price"), ("holding", "avg_price")),
+    )
+    if order_price is not None:
+        series_map["ORDER_PRICE"] = [order_price] * length
+    if average_price is not None:
+        series_map["AVG_PRICE"] = [average_price] * length
 
 
 def _context_holding_qty(context: dict[str, Any] | None) -> float | None:
@@ -557,6 +715,7 @@ def evaluate_indicator_follow_routine(
         return RoutineSignal(None, "봉데이터 부족", [], [], -1, 0)
 
     series_map = build_indicator_series(candles, cfg)
+    _enrich_price_compare_series(series_map, context)
 
     buy_cfg = _section(cfg, "buy")
     sell_cfg = _section(cfg, "sell")
@@ -636,6 +795,11 @@ def evaluate_indicator_follow_routine(
             details.append(ma_detail)
         if not ma_passed:
             return RoutineSignal(None, "BUY moving average filter blocked", matched, details, buy_index, buy_delay)
+        price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(cfg, buy_cfg, series_map, buy_index)
+        if price_compare_detail:
+            details.append(price_compare_detail)
+        if not price_compare_passed:
+            return RoutineSignal(None, "BUY price compare filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [

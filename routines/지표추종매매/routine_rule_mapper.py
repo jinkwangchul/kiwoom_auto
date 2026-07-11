@@ -61,6 +61,7 @@ _MISSING = object()
 BAR_MINUTES_PATH = "bar.bar_minutes"
 BUY_CONDITIONS_PATH = "buy.groups[0].conditions"
 BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
+BUY_PRICE_COMPARE_FILTER_PATH = "buy.filters.price_compare"
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
@@ -105,6 +106,8 @@ def _preview_diff_risk(path: str) -> str:
         return "low"
     if path == BUY_MOVING_AVERAGE_FILTER_PATH:
         return "low"
+    if path == BUY_PRICE_COMPARE_FILTER_PATH:
+        return "low"
     if path in {"buy.groups", BUY_CONDITIONS_PATH}:
         return "medium"
     return "low"
@@ -121,6 +124,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_MOVING_AVERAGE_FILTER_PATH: (
             "UI preview-only BUY current-price/MA60 filter candidate."
+        ),
+        BUY_PRICE_COMPARE_FILTER_PATH: (
+            "UI preview-only BUY price-compare filter candidate."
         ),
         "sell.signals.macd_sell": (
             "UI preview-only sell MACD condition candidate; does not replace existing rules."
@@ -316,6 +322,11 @@ def _moving_average_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _price_compare_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
 def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     parts = path.split(".")
     current: Any = root
@@ -357,40 +368,101 @@ def _build_buy_bollinger_conditions(signal_filter: dict[str, Any], warnings: lis
     }]
 
 
-def _build_buy_price_compare_conditions(price_compare: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]]:
-    if not _optional_filter_enabled(price_compare, "enabled", "ratio_line"):
-        return []
+def _price_compare_operator(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if text == "=<":
+        return "<="
+    return _compare_operator(text)
 
-    type_text = str(price_compare.get("type_combo") or "").strip()
-    if type_text and type_text != "\uac00\uaca9\ube44\uad50":
-        return []
 
-    target = _series_target(price_compare.get("left_combo"))
-    compare_target = _series_target(price_compare.get("right_combo"))
-    threshold = _safe_float(price_compare.get("ratio_line"))
-    operator = _compare_operator(price_compare.get("compare_combo"))
-    if target is None:
-        warnings.append(f"buy price compare left target is not mapped: {price_compare.get('left_combo')!r}")
-        return []
-    if compare_target is None:
-        warnings.append(f"buy price compare right target is not mapped: {price_compare.get('right_combo')!r}")
-        return []
-    if threshold is None:
-        warnings.append("buy price compare ratio is not numeric")
-        return []
-    if operator is None:
-        warnings.append(f"buy price compare operator is not mapped: {price_compare.get('compare_combo')!r}")
-        return []
-
-    return [{
+def _price_compare_condition(
+    *,
+    target: str,
+    operator: str,
+    compare_target: str,
+    value: float | None = None,
+    description: str,
+) -> dict[str, Any]:
+    condition: dict[str, Any] = {
         "enabled": True,
         "not": False,
         "target": target,
         "operator": operator,
         "compare_target": compare_target,
-        "value": threshold,
-        "description": "UI preview: buy price compare condition",
-    }]
+        "description": description,
+    }
+    if value is not None:
+        condition["value"] = value
+    return condition
+
+
+def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    if "check" in price_compare:
+        if not _truthy_ui(price_compare.get("check")):
+            return None
+    elif not _optional_filter_enabled(price_compare, "enabled", "ratio_line"):
+        return None
+
+    type_text = str(price_compare.get("type_combo") or "").strip()
+    if type_text and type_text != "\uac00\uaca9\ube44\uad50":
+        return None
+
+    target = _series_target(price_compare.get("left_combo"))
+    compare_target = _series_target(price_compare.get("right_combo"))
+    threshold = _safe_float(price_compare.get("ratio_line"))
+    operator = _price_compare_operator(price_compare.get("compare_combo"))
+    if any(key in price_compare for key in ("left_combo", "right_combo", "ratio_line", "compare_combo")):
+        if target is None:
+            warnings.append(f"buy price compare left target is not mapped: {price_compare.get('left_combo')!r}")
+            return None
+        if compare_target is None:
+            warnings.append(f"buy price compare right target is not mapped: {price_compare.get('right_combo')!r}")
+            return None
+        if threshold is None:
+            warnings.append("buy price compare ratio is not numeric")
+            return None
+        if operator is None:
+            warnings.append(f"buy price compare operator is not mapped: {price_compare.get('compare_combo')!r}")
+            return None
+
+        conditions = [_price_compare_condition(
+            target=target,
+            operator=operator,
+            compare_target=compare_target,
+            value=threshold,
+            description="UI preview: BUY price compare filter condition",
+        )]
+    else:
+        below_operator = _price_compare_operator(price_compare.get("condition_combo"))
+        above_operator = _price_compare_operator(price_compare.get("above_condition_combo"))
+        conditions: list[dict[str, Any]] = []
+        if below_operator is None:
+            warnings.append(f"buy price compare condition is not mapped: {price_compare.get('condition_combo')!r}")
+            return None
+        if above_operator is None:
+            warnings.append(f"buy price compare above condition is not mapped: {price_compare.get('above_condition_combo')!r}")
+            return None
+        conditions.append(_price_compare_condition(
+            target="AVG_PRICE",
+            operator=below_operator,
+            compare_target="ORDER_PRICE",
+            description="UI preview: BUY price compare below-branch filter condition",
+        ))
+        conditions.append(_price_compare_condition(
+            target="AVG_PRICE",
+            operator=above_operator,
+            compare_target="ORDER_PRICE",
+            description="UI preview: BUY price compare above-branch filter condition",
+        ))
+
+    return {
+        "path": BUY_PRICE_COMPARE_FILTER_PATH,
+        "value": {
+            "enabled": True,
+            "conditions_logic": "OR",
+            "conditions": conditions,
+        },
+    }
 
 
 def _build_sell_condition_c_indicator_condition(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
@@ -551,7 +623,6 @@ def build_engine_rules_preview_from_ui_state(
     price_compare = _as_dict(buy_ui.get("price_compare"))
     buy_conditions = _build_buy_osc_conditions(signal_filter, warnings)
     buy_conditions.extend(_build_buy_bollinger_conditions(signal_filter, warnings))
-    buy_conditions.extend(_build_buy_price_compare_conditions(price_compare, warnings))
     if buy_conditions:
         buy_candidate = _build_buy_merge_candidate(source_rules, buy_conditions, warnings)
         if buy_candidate:
@@ -562,9 +633,12 @@ def build_engine_rules_preview_from_ui_state(
     buy_ma_filter_candidate = _build_buy_ma_filter_candidate(signal_filter, warnings)
     if buy_ma_filter_candidate:
         _set_path_value(preview_rules, BUY_MOVING_AVERAGE_FILTER_PATH, buy_ma_filter_candidate["value"])
-        preview_candidates["filters"] = {
-            "moving_average": buy_ma_filter_candidate,
-        }
+        preview_candidates.setdefault("filters", {})["moving_average"] = buy_ma_filter_candidate
+
+    buy_price_compare_filter_candidate = _build_buy_price_compare_filter_candidate(price_compare, warnings)
+    if buy_price_compare_filter_candidate:
+        _set_path_value(preview_rules, BUY_PRICE_COMPARE_FILTER_PATH, buy_price_compare_filter_candidate["value"])
+        preview_candidates.setdefault("filters", {})["price_compare"] = buy_price_compare_filter_candidate
 
     rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, warnings)
     if rsi_candidate:
@@ -622,6 +696,8 @@ def build_engine_rules_preview_from_ui_state(
     ]
     if buy_ma_filter_candidate:
         mapped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+    if buy_price_compare_filter_candidate:
+        mapped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
     mapped_paths.extend([
         RSI_INDICATOR_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
@@ -690,6 +766,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         filter_path = str(buy_ma_filter.get("path") or BUY_MOVING_AVERAGE_FILTER_PATH)
         candidate_paths[filter_path] = "set_filter"
 
+    buy_price_compare_filter = _as_dict(_as_dict(candidates.get("filters")).get("price_compare"))
+    if buy_price_compare_filter:
+        filter_path = str(buy_price_compare_filter.get("path") or BUY_PRICE_COMPARE_FILTER_PATH)
+        candidate_paths[filter_path] = "set_filter"
+
     rsi_candidate = _as_dict(_as_dict(candidates.get("indicators")).get("rsi"))
     if rsi_candidate:
         rsi_path = str(rsi_candidate.get("path") or RSI_INDICATOR_PATH)
@@ -743,6 +824,7 @@ def build_rule_approval_session_fingerprint(
         BAR_MINUTES_PATH: _get_path_value(rules, BAR_MINUTES_PATH),
         BUY_CONDITIONS_PATH: _get_path_value(rules, BUY_CONDITIONS_PATH),
         BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
+        BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
         SELL_MACD_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_MACD_SIGNAL_TARGET_PATH),
@@ -1139,6 +1221,27 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == BUY_PRICE_COMPARE_FILTER_PATH:
+            filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("price_compare"))
+            candidate_value = _price_compare_filter_value(filter_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY price_compare filter value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_PRICE_COMPARE_FILTER_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY price_compare filter is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_PRICE_COMPARE_FILTER_PATH,
+                "target_path": BUY_PRICE_COMPARE_FILTER_PATH,
+                "operation": "set_filter",
+                "value": candidate_value,
+                "risk": "low",
+            })
+            continue
+
         if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
             sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
             if not sell_candidate:
@@ -1291,7 +1394,7 @@ def apply_approved_rule_patch_preview(
             continue
 
         if operation == "set_filter":
-            if target_path != BUY_MOVING_AVERAGE_FILTER_PATH:
+            if target_path not in {BUY_MOVING_AVERAGE_FILTER_PATH, BUY_PRICE_COMPARE_FILTER_PATH}:
                 skipped_patches.append(_apply_skipped(patch, "unsupported filter target path"))
                 warnings.append(f"unsupported filter target path: {target_path}")
                 continue
@@ -1411,6 +1514,16 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BUY_MOVING_AVERAGE_FILTER_PATH,
             "operation": "set_filter",
             "change_type": "set_buy_current_price_ma60_filter",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_filter" and target_path == BUY_PRICE_COMPARE_FILTER_PATH:
+        diffs.append({
+            "path": BUY_PRICE_COMPARE_FILTER_PATH,
+            "operation": "set_filter",
+            "change_type": "set_buy_price_compare_filter",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -1744,6 +1857,7 @@ def approve_engine_rule_candidates(
         BAR_MINUTES_PATH,
         BUY_CONDITIONS_PATH,
         BUY_MOVING_AVERAGE_FILTER_PATH,
+        BUY_PRICE_COMPARE_FILTER_PATH,
         RSI_INDICATOR_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
     }
@@ -1825,6 +1939,18 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
             warnings.append("BUY moving_average filter approval skipped: target path is not writable")
 
+    if BUY_PRICE_COMPARE_FILTER_PATH in approved_paths:
+        filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("price_compare"))
+        candidate_value = _price_compare_filter_value(filter_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
+            warnings.append("BUY price_compare filter approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_PRICE_COMPARE_FILTER_PATH, candidate_value):
+            applied_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
+        else:
+            skipped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
+            warnings.append("BUY price_compare filter approval skipped: target path is not writable")
+
     if SELL_MACD_SIGNAL_PREVIEW_PATH in approved_paths:
         sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         sell_section = approved_rules.setdefault("sell", {})
@@ -1893,6 +2019,10 @@ def compare_engine_rules_preview(
             preview_value = _moving_average_filter_value(
                 _as_dict(_as_dict(preview_candidates.get("filters")).get("moving_average"))
             )
+        elif path == BUY_PRICE_COMPARE_FILTER_PATH:
+            preview_value = _price_compare_filter_value(
+                _as_dict(_as_dict(preview_candidates.get("filters")).get("price_compare"))
+            )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH:
@@ -1905,6 +2035,8 @@ def compare_engine_rules_preview(
         if path == BUY_CONDITIONS_PATH and preview_exists:
             status = "merge_candidate"
         elif path == BUY_MOVING_AVERAGE_FILTER_PATH and preview_exists:
+            status = "changed" if current_exists else "added"
+        elif path == BUY_PRICE_COMPARE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH and preview_exists:
             status = "add_signal_candidate"

@@ -796,5 +796,149 @@ class IndicatorFollowBuyMovingAverageFilterTest(unittest.TestCase):
         self.assertEqual(candles, original_candles)
 
 
+class IndicatorFollowBuyPriceCompareFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_routine_engine_module()
+
+    def _candles(self):
+        return [{"close": close, "volume": 100} for close in [9, 10, 12, 13]]
+
+    def _config(self, price_compare_filter=None, *, sell_pass=False, pending_filter=None):
+        config = deepcopy(self.module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
+        config["buy"]["delay_bar"] = 0
+        config["buy"]["groups"] = [
+            {
+                "enabled": True,
+                "name": "ui_buy_conditions",
+                "conditions": [{"enabled": True, "target": "CLOSE", "operator": ">=", "value": 0}],
+            }
+        ]
+        if price_compare_filter is not None:
+            config["buy"]["filters"] = {"price_compare": deepcopy(price_compare_filter)}
+        if pending_filter is not None:
+            config["indicator_follow_rule_pending"] = {
+                "candidates": {"filters": {"price_compare": deepcopy(pending_filter)}}
+            }
+        config["sell"] = {
+            "delay_bar": 0,
+            "signals": {
+                "macd_sell": {
+                    "enabled": bool(sell_pass),
+                    "groups": [
+                        {
+                            "enabled": True,
+                            "name": "sell_pass",
+                            "conditions": [{"target": "CLOSE", "operator": ">=", "value": 0}],
+                        }
+                    ],
+                }
+            },
+        }
+        return config
+
+    def _filter(self, *, enabled=True, operator="<=", target="AVG_PRICE", compare_target="ORDER_PRICE"):
+        return {
+            "enabled": enabled,
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": target,
+                "operator": operator,
+                "compare_target": compare_target,
+            }],
+        }
+
+    def _actual_gui_filter(self):
+        return {
+            "enabled": True,
+            "conditions_logic": "OR",
+            "conditions": [
+                {"enabled": True, "not": False, "target": "AVG_PRICE", "operator": "<", "compare_target": "ORDER_PRICE"},
+                {"enabled": True, "not": False, "target": "AVG_PRICE", "operator": ">", "compare_target": "ORDER_PRICE"},
+            ],
+        }
+
+    def _signal(self, price_compare_filter=None, *, context=None, sell_pass=False, pending_filter=None):
+        config = self._config(price_compare_filter, sell_pass=sell_pass, pending_filter=pending_filter)
+        return self.module.evaluate_indicator_follow_routine(self._candles(), config, context or {})
+
+    def _price_detail(self, signal):
+        return next((detail for detail in signal.details if "filter_type=PRICE_COMPARE" in detail), "")
+
+    def test_buy_price_compare_filter_absent_keeps_buy_result(self):
+        signal = self._signal(None, context={"order_price": 10, "average_price": 10})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual("", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_passes_after_buy_main_signal(self):
+        signal = self._signal(self._filter(), context={"order_price": 10, "average_price": 9})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("filter_type=PRICE_COMPARE", self._price_detail(signal))
+        self.assertIn("passed=True", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_blocks_buy_only(self):
+        signal = self._signal(self._filter(), context={"order_price": 10, "average_price": 11})
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual(signal.reason, "BUY price compare filter blocked")
+        self.assertIn("reason=not_matched", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_disabled_keeps_buy_result(self):
+        signal = self._signal(self._filter(enabled=False), context={"order_price": 10, "average_price": 11})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("enabled=False", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_blocks_missing_context_data(self):
+        signal = self._signal(self._filter(), context={"average_price": 9})
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual(signal.reason, "BUY price compare filter blocked")
+        self.assertIn("reason=insufficient_data", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_blocks_unsupported_target(self):
+        signal = self._signal(self._filter(target="UNKNOWN"), context={"order_price": 10, "average_price": 9})
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=unsupported_target", self._price_detail(signal))
+
+    def test_actual_gui_price_compare_filter_blocks_equality_gap(self):
+        signal = self._signal(self._actual_gui_filter(), context={"order_price": 10, "average_price": 10})
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual(signal.reason, "BUY price compare filter blocked")
+
+    def test_buy_price_compare_pending_candidate_does_not_affect_execution(self):
+        pending = {"path": "buy.filters.price_compare", "value": self._filter()}
+        signal = self._signal(None, context={"order_price": 10, "average_price": 11}, pending_filter=pending)
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual("", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_does_not_affect_sell_result(self):
+        signal = self._signal(self._filter(), context={"order_price": 10, "average_price": 11}, sell_pass=True)
+
+        self.assertEqual(signal.signal, "SELL")
+        self.assertEqual("", self._price_detail(signal))
+
+    def test_buy_price_compare_filter_does_not_mutate_inputs_and_is_deterministic(self):
+        config = self._config(self._filter())
+        candles = self._candles()
+        context = {"order_price": 10, "average_price": 9}
+        original_config = deepcopy(config)
+        original_candles = deepcopy(candles)
+        original_context = deepcopy(context)
+
+        first = self.module.evaluate_indicator_follow_routine(candles, config, context)
+        second = self.module.evaluate_indicator_follow_routine(candles, config, context)
+
+        self.assertEqual(first, second)
+        self.assertEqual(config, original_config)
+        self.assertEqual(candles, original_candles)
+        self.assertEqual(context, original_context)
+
+
 if __name__ == "__main__":
     unittest.main()

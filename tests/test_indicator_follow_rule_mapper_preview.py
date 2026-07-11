@@ -308,7 +308,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
         candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["buy"]
-        ma_filter = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["moving_average"]
+        filters = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]
+        ma_filter = filters["moving_average"]
+        price_compare_filter = filters["price_compare"]
         self.assertEqual(candidate["merge_into"], "buy.groups[0].conditions")
         self.assertEqual(ma_filter["path"], "buy.filters.moving_average")
         self.assertEqual(ma_filter["value"], {
@@ -323,8 +325,23 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "description": "UI preview: BUY current price / 60MA filter",
             }],
         })
+        self.assertEqual(price_compare_filter["path"], "buy.filters.price_compare")
+        self.assertEqual(price_compare_filter["value"], {
+            "enabled": True,
+            "conditions_logic": "OR",
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "CLOSE",
+                "operator": ">=",
+                "compare_target": "AVG_PRICE",
+                "description": "UI preview: BUY price compare filter condition",
+                "value": 0.15,
+            }],
+        })
         self.assertEqual(result["preview_rules"]["buy"]["filters"]["moving_average"], ma_filter["value"])
-        self.assertEqual(len(candidate["add_conditions"]), 2)
+        self.assertEqual(result["preview_rules"]["buy"]["filters"]["price_compare"], price_compare_filter["value"])
+        self.assertEqual(len(candidate["add_conditions"]), 1)
         self.assertEqual(candidate["add_conditions"][0], {
             "enabled": True,
             "not": False,
@@ -333,14 +350,48 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "value": -0.1,
             "description": "UI preview: buy Bollinger threshold condition",
         })
-        self.assertEqual(candidate["add_conditions"][1], {
+
+    def test_actual_buy_price_compare_gui_fields_create_price_compare_filter(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_ocr_value_line"] = ""
+        state["buy_ui"]["price_compare"] = {
+            "check": True,
+            "condition_combo": "=<",
+            "mode_combo": "\ud68c\ucc28\uae30\uc900",
+            "above_condition_combo": ">",
+            "above_mode_combo": "\ud68c\ucc28\uae30\uc900",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+        price_compare_filter = candidates["filters"]["price_compare"]
+        self.assertNotIn("buy", candidates)
+        self.assertEqual(price_compare_filter["path"], "buy.filters.price_compare")
+        self.assertEqual(price_compare_filter["value"], {
             "enabled": True,
-            "not": False,
-            "target": "CLOSE",
-            "operator": ">=",
-            "compare_target": "AVG_PRICE",
-            "value": 0.15,
-            "description": "UI preview: buy price compare condition",
+            "conditions_logic": "OR",
+            "conditions": [
+                {
+                    "enabled": True,
+                    "not": False,
+                    "target": "AVG_PRICE",
+                    "operator": "<=",
+                    "compare_target": "ORDER_PRICE",
+                    "description": "UI preview: BUY price compare below-branch filter condition",
+                },
+                {
+                    "enabled": True,
+                    "not": False,
+                    "target": "AVG_PRICE",
+                    "operator": ">",
+                    "compare_target": "ORDER_PRICE",
+                    "description": "UI preview: BUY price compare above-branch filter condition",
+                },
+            ],
         })
 
     def test_buy_ma_price_compare_and_bollinger_disabled_do_not_create_candidate(self):
