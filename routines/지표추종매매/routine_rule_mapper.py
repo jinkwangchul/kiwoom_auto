@@ -63,6 +63,8 @@ BUY_CONDITIONS_PATH = "buy.groups[0].conditions"
 BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
 BUY_PRICE_COMPARE_FILTER_PATH = "buy.filters.price_compare"
 BUY_BOLLINGER_FILTER_PATH = "buy.filters.bollinger"
+BUY_EXECUTION_BASE_PATH = "buy.execution.base"
+BUY_EXECUTION_REPEAT_PATH = "buy.execution.repeat"
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
@@ -109,6 +111,8 @@ def _preview_diff_risk(path: str) -> str:
         return "low"
     if path == BUY_PRICE_COMPARE_FILTER_PATH:
         return "low"
+    if path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+        return "medium"
     if path in {"buy.groups", BUY_CONDITIONS_PATH}:
         return "medium"
     return "low"
@@ -131,6 +135,12 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_BOLLINGER_FILTER_PATH: (
             "UI preview-only BUY current-price/Bollinger filter candidate."
+        ),
+        BUY_EXECUTION_BASE_PATH: (
+            "UI preview-only BUY execution base policy candidate."
+        ),
+        BUY_EXECUTION_REPEAT_PATH: (
+            "UI preview-only BUY execution repeat policy candidate."
         ),
         "sell.signals.macd_sell": (
             "UI preview-only sell MACD condition candidate; does not replace existing rules."
@@ -336,6 +346,11 @@ def _bollinger_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _execution_policy_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
 def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     parts = path.split(".")
     current: Any = root
@@ -350,6 +365,170 @@ def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
         return False
     current[parts[-1]] = deepcopy(value)
     return True
+
+
+def _has_ui_value(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        if value not in (None, ""):
+            return True
+    return False
+
+
+def _choice_token(value: Any, mapping: dict[str, str], default: str | None = None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    normalized = text.upper()
+    if normalized in set(mapping.values()):
+        return normalized
+    return mapping.get(text, normalized)
+
+
+def _price_basis_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\uc8fc\ubb38\uac00": "ORDER_PRICE",
+        "\ud604\uc7ac\uac00": "CURRENT_PRICE",
+        "\uc885\uac00": "CLOSE",
+        "\uc2dc\uc7a5\uac00": "MARKET",
+        "\ud3c9\ub2e8\uac00": "AVG_PRICE",
+    })
+
+
+def _hoga_mode_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\ub2e8\uc77c\ud638\uac00": "SINGLE",
+        "\ub2e4\uc911\ud638\uac00": "MULTI",
+    })
+
+
+def _point_mode_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\uc120\ud0dd\uc5c6\uc74c": "NONE",
+        "\ub2e4\uc911\uc2dc\uac04": "MULTI_TIME",
+        "\ub2e4\uc911\ube44\uc728": "MULTI_RATIO",
+    }, "NONE")
+
+
+def _point_unit_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\ubd84": "MINUTE",
+        "\ucd08": "SECOND",
+        "\ubd09": "BAR",
+    })
+
+
+def _range_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\uc774\ub0b4": "WITHIN",
+        "\uac04\uaca9": "INTERVAL",
+    })
+
+
+def _direction_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\uc0c1\ud5a5": "UP",
+        "\ud558\ud5a5": "DOWN",
+        "\uc0c1\ud558": "BOTH",
+    })
+
+
+def _ratio_compare_token(value: Any) -> str | None:
+    operator = _compare_operator(value)
+    if operator is not None:
+        return operator
+    return _choice_token(value, {
+        "\uc774\ub0b4": "WITHIN",
+        "\uc774\ud0c8": "OUTSIDE",
+    })
+
+
+def _detail_mode_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "\ud68c\ucc28\uae30\uc900": "ROUND",
+        "\uc608\uc0b0\uae30\uc900": "BUDGET",
+        "\ub2a5\ub3d9\ub9e4\uc218": "ACTIVE_BUY",
+    })
+
+
+def _round_operator_token(value: Any) -> str | None:
+    return _choice_token(value, {
+        "+": "ADD",
+        "x": "MULTIPLY",
+        "X": "MULTIPLY",
+        "*": "MULTIPLY",
+    })
+
+
+def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    keys = (
+        "hoga_combo",
+        "order_combo",
+        "up_line",
+        "down_line",
+        "time_mode_combo",
+        "time_value_line",
+        "time_unit_combo",
+        "time_range_combo",
+        "time_count_line",
+        "time_order_combo",
+        "ratio_left_combo",
+        "ratio_right_combo",
+        "ratio_direction_combo",
+        "ratio_value_line",
+        "ratio_compare_combo",
+        "ratio_count_line",
+    )
+    if not _has_ui_value(base, keys):
+        return None
+
+    value = {
+        "hoga_mode": _hoga_mode_token(base.get("hoga_combo")),
+        "order_price_basis": _price_basis_token(base.get("order_combo")),
+        "hoga_up": _safe_int(base.get("up_line")),
+        "hoga_down": _safe_int(base.get("down_line")),
+        "point_mode": _point_mode_token(base.get("time_mode_combo")),
+        "point_value": _safe_float(base.get("time_value_line")),
+        "point_unit": _point_unit_token(base.get("time_unit_combo")),
+        "point_range": _range_token(base.get("time_range_combo")),
+        "point_count": _safe_int(base.get("time_count_line")),
+        "ratio_left": _price_basis_token(base.get("ratio_left_combo") or base.get("time_order_combo")),
+        "ratio_right": _price_basis_token(base.get("ratio_right_combo")),
+        "ratio_direction": _direction_token(base.get("ratio_direction_combo")),
+        "ratio_value": _safe_float(base.get("ratio_value_line")),
+        "ratio_compare": _ratio_compare_token(base.get("ratio_compare_combo")),
+        "ratio_count": _safe_int(base.get("ratio_count_line")),
+    }
+    return {
+        "path": BUY_EXECUTION_BASE_PATH,
+        "operation": "set_execution_policy",
+        "value": value,
+    }
+
+
+def _build_buy_execution_repeat_candidate(repeat: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    if not _truthy_ui(repeat.get("apply_all_check")):
+        return None
+
+    value = {
+        "apply_all": True,
+        "detail_mode": _detail_mode_token(repeat.get("detail_mode_combo")),
+        "round_operator": _round_operator_token(repeat.get("round_operator_combo")),
+        "round_budget_value": _safe_float(repeat.get("round_budget_line")),
+        "budget_ratio": _safe_float(repeat.get("budget_ratio_line")),
+        "active_direction": _direction_token(repeat.get("active_direction_combo")),
+        "active_ratio": _safe_float(repeat.get("active_ratio_line")),
+        "active_compare": _ratio_compare_token(repeat.get("active_compare_combo")),
+    }
+    return {
+        "path": BUY_EXECUTION_REPEAT_PATH,
+        "operation": "set_execution_policy",
+        "value": value,
+    }
 
 
 def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
@@ -637,6 +816,8 @@ def build_engine_rules_preview_from_ui_state(
     buy_ui = _as_dict(state.get("buy_ui"))
     signal_filter = _as_dict(buy_ui.get("signal_filter"))
     price_compare = _as_dict(buy_ui.get("price_compare"))
+    execution_base = _as_dict(buy_ui.get("base"))
+    execution_repeat = _as_dict(buy_ui.get("repeat"))
     buy_conditions = _build_buy_osc_conditions(signal_filter, warnings)
     if buy_conditions:
         buy_candidate = _build_buy_merge_candidate(source_rules, buy_conditions, warnings)
@@ -659,6 +840,16 @@ def build_engine_rules_preview_from_ui_state(
     if buy_price_compare_filter_candidate:
         _set_path_value(preview_rules, BUY_PRICE_COMPARE_FILTER_PATH, buy_price_compare_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["price_compare"] = buy_price_compare_filter_candidate
+
+    buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, warnings)
+    if buy_execution_base_candidate:
+        _set_path_value(preview_rules, BUY_EXECUTION_BASE_PATH, buy_execution_base_candidate["value"])
+        preview_candidates.setdefault("execution", {})["base"] = buy_execution_base_candidate
+
+    buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(execution_repeat, warnings)
+    if buy_execution_repeat_candidate:
+        _set_path_value(preview_rules, BUY_EXECUTION_REPEAT_PATH, buy_execution_repeat_candidate["value"])
+        preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate
 
     rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, warnings)
     if rsi_candidate:
@@ -697,9 +888,11 @@ def build_engine_rules_preview_from_ui_state(
         "candidates": preview_candidates,
     }
 
+    if not buy_execution_base_candidate:
+        warnings.append("buy method mapping is postponed")
+    if not buy_execution_repeat_candidate:
+        warnings.append("repeat buy mapping is postponed")
     warnings.extend([
-        "buy method mapping is postponed",
-        "repeat buy mapping is postponed",
         "price compare buy mapping is postponed",
         "situation response mapping is postponed",
         "additional feature mapping is postponed",
@@ -720,6 +913,10 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_BOLLINGER_FILTER_PATH)
     if buy_price_compare_filter_candidate:
         mapped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
+    if buy_execution_base_candidate:
+        mapped_paths.append(BUY_EXECUTION_BASE_PATH)
+    if buy_execution_repeat_candidate:
+        mapped_paths.append(BUY_EXECUTION_REPEAT_PATH)
     mapped_paths.extend([
         RSI_INDICATOR_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
@@ -798,6 +995,16 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         filter_path = str(buy_price_compare_filter.get("path") or BUY_PRICE_COMPARE_FILTER_PATH)
         candidate_paths[filter_path] = "set_filter"
 
+    buy_execution_base = _as_dict(_as_dict(candidates.get("execution")).get("base"))
+    if buy_execution_base:
+        execution_path = str(buy_execution_base.get("path") or BUY_EXECUTION_BASE_PATH)
+        candidate_paths[execution_path] = "set_execution_policy"
+
+    buy_execution_repeat = _as_dict(_as_dict(candidates.get("execution")).get("repeat"))
+    if buy_execution_repeat:
+        execution_path = str(buy_execution_repeat.get("path") or BUY_EXECUTION_REPEAT_PATH)
+        candidate_paths[execution_path] = "set_execution_policy"
+
     rsi_candidate = _as_dict(_as_dict(candidates.get("indicators")).get("rsi"))
     if rsi_candidate:
         rsi_path = str(rsi_candidate.get("path") or RSI_INDICATOR_PATH)
@@ -853,6 +1060,8 @@ def build_rule_approval_session_fingerprint(
         BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
         BUY_BOLLINGER_FILTER_PATH: _get_path_value(rules, BUY_BOLLINGER_FILTER_PATH),
         BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
+        BUY_EXECUTION_BASE_PATH: _get_path_value(rules, BUY_EXECUTION_BASE_PATH),
+        BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
         SELL_MACD_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_MACD_SIGNAL_TARGET_PATH),
@@ -1291,6 +1500,48 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == BUY_EXECUTION_BASE_PATH:
+            execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
+            candidate_value = _execution_policy_value(execution_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution base value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_EXECUTION_BASE_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution base policy is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_EXECUTION_BASE_PATH,
+                "target_path": BUY_EXECUTION_BASE_PATH,
+                "operation": "set_execution_policy",
+                "value": candidate_value,
+                "risk": "medium",
+            })
+            continue
+
+        if path == BUY_EXECUTION_REPEAT_PATH:
+            execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+            candidate_value = _execution_policy_value(execution_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution repeat value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_EXECUTION_REPEAT_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY execution repeat policy is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_EXECUTION_REPEAT_PATH,
+                "target_path": BUY_EXECUTION_REPEAT_PATH,
+                "operation": "set_execution_policy",
+                "value": candidate_value,
+                "risk": "medium",
+            })
+            continue
+
         if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
             sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
             if not sell_candidate:
@@ -1463,6 +1714,27 @@ def apply_approved_rule_patch_preview(
             })
             continue
 
+        if operation == "set_execution_policy":
+            if target_path not in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
+                skipped_patches.append(_apply_skipped(patch, "unsupported execution policy target path"))
+                warnings.append(f"unsupported execution policy target path: {target_path}")
+                continue
+
+            value = patch.get("value")
+            if not isinstance(value, dict):
+                skipped_patches.append(_apply_skipped(patch, "execution policy value is not a dict"))
+                continue
+            if not _set_path_value(applied_rules_preview, target_path, value):
+                skipped_patches.append(_apply_skipped(patch, "target execution policy path is not writable"))
+                continue
+
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
         if operation == "add_signal":
             if target_path != SELL_MACD_SIGNAL_TARGET_PATH:
                 skipped_patches.append(_apply_skipped(patch, "unsupported signal target path"))
@@ -1583,6 +1855,26 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BUY_BOLLINGER_FILTER_PATH,
             "operation": "set_filter",
             "change_type": "set_buy_bollinger_filter",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_execution_policy" and target_path == BUY_EXECUTION_BASE_PATH:
+        diffs.append({
+            "path": BUY_EXECUTION_BASE_PATH,
+            "operation": "set_execution_policy",
+            "change_type": "set_buy_execution_base",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_execution_policy" and target_path == BUY_EXECUTION_REPEAT_PATH:
+        diffs.append({
+            "path": BUY_EXECUTION_REPEAT_PATH,
+            "operation": "set_execution_policy",
+            "change_type": "set_buy_execution_repeat",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -1918,6 +2210,8 @@ def approve_engine_rule_candidates(
         BUY_MOVING_AVERAGE_FILTER_PATH,
         BUY_PRICE_COMPARE_FILTER_PATH,
         BUY_BOLLINGER_FILTER_PATH,
+        BUY_EXECUTION_BASE_PATH,
+        BUY_EXECUTION_REPEAT_PATH,
         RSI_INDICATOR_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
     }
@@ -2023,6 +2317,30 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_BOLLINGER_FILTER_PATH)
             warnings.append("BUY bollinger filter approval skipped: target path is not writable")
 
+    if BUY_EXECUTION_BASE_PATH in approved_paths:
+        execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
+        candidate_value = _execution_policy_value(execution_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_EXECUTION_BASE_PATH)
+            warnings.append("BUY execution base approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_EXECUTION_BASE_PATH, candidate_value):
+            applied_paths.append(BUY_EXECUTION_BASE_PATH)
+        else:
+            skipped_paths.append(BUY_EXECUTION_BASE_PATH)
+            warnings.append("BUY execution base approval skipped: target path is not writable")
+
+    if BUY_EXECUTION_REPEAT_PATH in approved_paths:
+        execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+        candidate_value = _execution_policy_value(execution_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
+            warnings.append("BUY execution repeat approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_EXECUTION_REPEAT_PATH, candidate_value):
+            applied_paths.append(BUY_EXECUTION_REPEAT_PATH)
+        else:
+            skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
+            warnings.append("BUY execution repeat approval skipped: target path is not writable")
+
     if SELL_MACD_SIGNAL_PREVIEW_PATH in approved_paths:
         sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         sell_section = approved_rules.setdefault("sell", {})
@@ -2099,6 +2417,14 @@ def compare_engine_rules_preview(
             preview_value = _bollinger_filter_value(
                 _as_dict(_as_dict(preview_candidates.get("filters")).get("bollinger"))
             )
+        elif path == BUY_EXECUTION_BASE_PATH:
+            preview_value = _execution_policy_value(
+                _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
+            )
+        elif path == BUY_EXECUTION_REPEAT_PATH:
+            preview_value = _execution_policy_value(
+                _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
+            )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH:
@@ -2113,6 +2439,8 @@ def compare_engine_rules_preview(
         elif path == BUY_MOVING_AVERAGE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path == BUY_PRICE_COMPARE_FILTER_PATH and preview_exists:
+            status = "changed" if current_exists else "added"
+        elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
             status = "changed" if current_exists else "added"
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH and preview_exists:
             status = "add_signal_candidate"

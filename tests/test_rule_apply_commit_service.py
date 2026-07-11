@@ -770,6 +770,117 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])
 
+    def test_buy_execution_base_and_repeat_committed_via_set_execution_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            self._write_rules(rules_path, self.current_rules)
+            original_ui_state = deepcopy(self.ui_state)
+            self.ui_state["buy_ui"]["base"] = {
+                "hoga_combo": "\ub2e8\uc77c\ud638\uac00",
+                "order_combo": "\uc8fc\ubb38\uac00",
+                "up_line": "2",
+                "down_line": "1",
+                "time_mode_combo": "\ub2e4\uc911\uc2dc\uac04",
+                "time_value_line": "3",
+                "time_unit_combo": "\ubd84",
+                "time_range_combo": "\uc774\ub0b4",
+                "time_count_line": "4",
+                "time_order_combo": "\ud604\uc7ac\uac00",
+                "ratio_left_combo": "\uc8fc\ubb38\uac00",
+                "ratio_right_combo": "\ud3c9\ub2e8\uac00",
+                "ratio_direction_combo": "\uc0c1\ud5a5",
+                "ratio_value_line": "1.5",
+                "ratio_compare_combo": "\uc774\uc0c1",
+                "ratio_count_line": "2",
+            }
+            self.ui_state["buy_ui"]["repeat"] = {
+                "apply_all_check": True,
+                "detail_mode_combo": "\ud68c\ucc28\uae30\uc900",
+                "round_operator_combo": "+",
+                "round_budget_line": "100000",
+                "budget_ratio_line": "25",
+                "active_direction_combo": "\ud558\ud5a5",
+                "active_ratio_line": "0.7",
+                "active_compare_combo": "\uc774\ud558",
+            }
+            try:
+                apply_preview, gate, context = self._build_apply_and_gate(
+                    rules_path,
+                    session_path,
+                    {
+                        "buy.execution.base": "APPROVED",
+                        "buy.execution.repeat": "APPROVED",
+                    },
+                )
+            finally:
+                self.ui_state = original_ui_state
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                saved["buy"]["execution"]["base"],
+                {
+                    "hoga_mode": "SINGLE",
+                    "order_price_basis": "ORDER_PRICE",
+                    "hoga_up": 2,
+                    "hoga_down": 1,
+                    "point_mode": "MULTI_TIME",
+                    "point_value": 3.0,
+                    "point_unit": "MINUTE",
+                    "point_range": "WITHIN",
+                    "point_count": 4,
+                    "ratio_left": "ORDER_PRICE",
+                    "ratio_right": "AVG_PRICE",
+                    "ratio_direction": "UP",
+                    "ratio_value": 1.5,
+                    "ratio_compare": ">=",
+                    "ratio_count": 2,
+                },
+            )
+            self.assertEqual(
+                saved["buy"]["execution"]["repeat"],
+                {
+                    "apply_all": True,
+                    "detail_mode": "ROUND",
+                    "round_operator": "ADD",
+                    "round_budget_value": 100000.0,
+                    "budget_ratio": 25.0,
+                    "active_direction": "DOWN",
+                    "active_ratio": 0.7,
+                    "active_compare": "<=",
+                },
+            )
+            self.assertEqual(saved["buy"]["groups"], self.current_rules["buy"]["groups"])
+            self.assertEqual(saved["sell"], self.current_rules["sell"])
+            self.assertEqual(saved["indicators"], self.current_rules["indicators"])
+            self.assertEqual(
+                [patch["target_path"] for patch in result["applied_patches"]],
+                ["buy.execution.base", "buy.execution.repeat"],
+            )
+            self.assertTrue(result["post_validation"]["ok"])
+            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
+
+    def test_unapproved_buy_execution_extra_path_is_blocked_by_post_validation(self):
+        def mutate(apply_preview):
+            apply_preview["applied_rules_preview"].setdefault("buy", {}).setdefault("execution", {})["extra"] = {
+                "enabled": True,
+            }
+
+        result = self._commit_mutated_apply_preview(
+            {"buy.groups[0].conditions": "APPROVED"},
+            mutate,
+        )
+
+        self._assert_post_validation_blocked(result, "buy.execution")
+
     def test_rsi_indicator_updated_and_other_sections_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"

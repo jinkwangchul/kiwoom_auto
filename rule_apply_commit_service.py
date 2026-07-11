@@ -518,6 +518,22 @@ def _post_validation(
         and diff.get("path") == "buy.filters.bollinger"
         and isinstance(diff.get("value"), dict)
     ]
+    allowed_buy_execution_base_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_execution_policy"
+        and diff.get("path") == "buy.execution.base"
+        and isinstance(diff.get("value"), dict)
+    ]
+    allowed_buy_execution_repeat_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_execution_policy"
+        and diff.get("path") == "buy.execution.repeat"
+        and isinstance(diff.get("value"), dict)
+    ]
 
     if any(isinstance(condition, dict) and condition.get("target") == "OSC" and condition.get("operator") == "TURN_UP" for condition in pre_conditions):
         add_check(
@@ -582,6 +598,21 @@ def _post_validation(
                     "final_diff_buy_bollinger_filter_matches",
                     _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
                 )
+        if operation == "set_execution_policy":
+            path = str(diff.get("path") or "")
+            if path == "buy.execution.base":
+                add_check(
+                    "final_diff_buy_execution_base_matches",
+                    _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
+                )
+            elif path == "buy.execution.repeat":
+                add_check(
+                    "final_diff_buy_execution_repeat_matches",
+                    _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value"),
+                )
+            else:
+                add_check("final_diff_buy_execution_policy_path_allowed", False, path)
+                add_unexpected(path or "<missing>", "unsupported buy.execution policy path")
         if operation == "add_signal":
             path = str(diff.get("path") or "")
             signal_exists = _path_exists(post_rules, path)
@@ -699,6 +730,24 @@ def _post_validation(
             _get_path(post_normalized, "buy.filters").pop("bollinger", None)
             if _get_path(post_normalized, "buy.filters") == {} and not _path_exists(pre_normalized, "buy.filters"):
                 _get_path(post_normalized, "buy").pop("filters", None)
+    if allowed_buy_execution_base_diffs and _path_exists(post_normalized, "buy.execution.base"):
+        if _path_exists(pre_normalized, "buy.execution.base"):
+            _get_path(post_normalized, "buy.execution")["base"] = deepcopy(
+                _get_path(pre_normalized, "buy.execution.base")
+            )
+        elif _path_exists(post_normalized, "buy.execution"):
+            _get_path(post_normalized, "buy.execution").pop("base", None)
+            if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
+                _get_path(post_normalized, "buy").pop("execution", None)
+    if allowed_buy_execution_repeat_diffs and _path_exists(post_normalized, "buy.execution.repeat"):
+        if _path_exists(pre_normalized, "buy.execution.repeat"):
+            _get_path(post_normalized, "buy.execution")["repeat"] = deepcopy(
+                _get_path(pre_normalized, "buy.execution.repeat")
+            )
+        elif _path_exists(post_normalized, "buy.execution"):
+            _get_path(post_normalized, "buy.execution").pop("repeat", None)
+            if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
+                _get_path(post_normalized, "buy").pop("execution", None)
     if _path_exists(pre_normalized, "buy.groups[0].conditions") and _path_exists(post_normalized, "buy.groups[0].conditions"):
         _get_path(post_normalized, "buy.groups[0]")["conditions"] = deepcopy(_get_path(pre_normalized, "buy.groups[0].conditions"))
     if isinstance(post_normalized.get("sell", {}).get("signals"), dict) and allowed_sell_signal_diffs:
