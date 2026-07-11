@@ -68,6 +68,28 @@ from gui_routine_registry import get_routine_records
 import rule_approval_session_file_service as rule_approval_session_file_service
 
 
+DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
+
+
+def _is_restore_test_expression(value):
+    text = str(value or "").strip().upper()
+    return text.startswith("RESTORE_TEST_") and text.endswith("_EXPR")
+
+
+def normalize_indicator_follow_basic_ui_state(state):
+    """Return a copied UI state with invalid test BUY expressions restored."""
+    if not isinstance(state, dict):
+        return state
+    normalized = deepcopy(state)
+    basic = normalized.get("basic")
+    if not isinstance(basic, dict):
+        return normalized
+    buy_expr = str(basic.get("buy_signal_expr_line") or "").strip()
+    if not buy_expr or _is_restore_test_expression(buy_expr):
+        basic["buy_signal_expr_line"] = DEFAULT_BUY_SIGNAL_EXPR
+    return normalized
+
+
 class IndicatorFollowRoutineSettingsDialog(
     IndicatorFollowControlTabMixin,
     IndicatorFollowBuyControlsMixin,
@@ -1845,6 +1867,7 @@ class IndicatorFollowRoutineSettingsDialog(
             })
             return result
 
+        state = normalize_indicator_follow_basic_ui_state(state)
         self._apply_named_ui_values(state.get("basic", {}), result=result)
 
         buy_ui = state.get("buy_ui", {})
