@@ -60,6 +60,7 @@ def build_apply_preview_hash(apply_preview: dict[str, Any]) -> str:
 _MISSING = object()
 BAR_MINUTES_PATH = "bar.bar_minutes"
 BUY_CONDITIONS_PATH = "buy.groups[0].conditions"
+BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
 RSI_INDICATOR_PATH = "indicators.rsi"
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
@@ -102,6 +103,8 @@ def _preview_diff_risk(path: str) -> str:
         return "high"
     if path == RSI_INDICATOR_PATH:
         return "low"
+    if path == BUY_MOVING_AVERAGE_FILTER_PATH:
+        return "low"
     if path in {"buy.groups", BUY_CONDITIONS_PATH}:
         return "medium"
     return "low"
@@ -115,6 +118,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         RSI_INDICATOR_PATH: (
             "UI preview-only RSI indicator candidate using the existing indicators.rsi structure."
+        ),
+        BUY_MOVING_AVERAGE_FILTER_PATH: (
+            "UI preview-only BUY current-price/MA60 filter candidate."
         ),
         "sell.signals.macd_sell": (
             "UI preview-only sell MACD condition candidate; does not replace existing rules."
@@ -266,14 +272,14 @@ def _optional_filter_enabled(values: dict[str, Any], enabled_key: str, value_key
     return values.get(value_key) not in (None, "")
 
 
-def _build_buy_ma_conditions(signal_filter: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]]:
+def _build_buy_ma_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     if not _optional_filter_enabled(signal_filter, "buy_ma_enabled", "buy_ma_value_line"):
-        return []
+        return None
 
     period = _safe_int(signal_filter.get("buy_ma_value_line"))
     if period is None or period <= 0:
         warnings.append("buy MA period is not numeric")
-        return []
+        return None
 
     direction = str(signal_filter.get("buy_ma_direction_combo") or "").strip()
     compare_text = str(signal_filter.get("buy_ma_compare_combo") or "").strip()
@@ -285,17 +291,45 @@ def _build_buy_ma_conditions(signal_filter: dict[str, Any], warnings: list[str])
             operator = "CROSS_UP"
     if operator is None:
         warnings.append(f"buy MA compare is not mapped: {signal_filter.get('buy_ma_compare_combo')!r}")
-        return []
+        return None
 
-    return [{
+    value = {
         "enabled": True,
-        "not": False,
-        "target": "CLOSE",
-        "operator": operator,
-        "compare_target": "MA",
-        "period": period,
-        "description": "UI preview: buy price/MA condition",
-    }]
+        "conditions": [{
+            "enabled": True,
+            "not": False,
+            "target": "CLOSE",
+            "operator": operator,
+            "compare_target": "MA",
+            "period": period,
+            "description": "UI preview: BUY current price / 60MA filter",
+        }],
+    }
+    return {
+        "path": BUY_MOVING_AVERAGE_FILTER_PATH,
+        "value": value,
+    }
+
+
+def _moving_average_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
+def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
+    parts = path.split(".")
+    current: Any = root
+    for part in parts[:-1]:
+        if not isinstance(current, dict):
+            return False
+        child = current.setdefault(part, {})
+        if not isinstance(child, dict):
+            return False
+        current = child
+    if not isinstance(current, dict):
+        return False
+    current[parts[-1]] = deepcopy(value)
+    return True
 
 
 def _build_buy_bollinger_conditions(signal_filter: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]]:
@@ -516,7 +550,6 @@ def build_engine_rules_preview_from_ui_state(
     signal_filter = _as_dict(buy_ui.get("signal_filter"))
     price_compare = _as_dict(buy_ui.get("price_compare"))
     buy_conditions = _build_buy_osc_conditions(signal_filter, warnings)
-    buy_conditions.extend(_build_buy_ma_conditions(signal_filter, warnings))
     buy_conditions.extend(_build_buy_bollinger_conditions(signal_filter, warnings))
     buy_conditions.extend(_build_buy_price_compare_conditions(price_compare, warnings))
     if buy_conditions:
@@ -525,6 +558,13 @@ def build_engine_rules_preview_from_ui_state(
             preview_candidates["buy"] = buy_candidate
     else:
         warnings.append("buy OCR/OSC candidate group was not generated")
+
+    buy_ma_filter_candidate = _build_buy_ma_filter_candidate(signal_filter, warnings)
+    if buy_ma_filter_candidate:
+        _set_path_value(preview_rules, BUY_MOVING_AVERAGE_FILTER_PATH, buy_ma_filter_candidate["value"])
+        preview_candidates["filters"] = {
+            "moving_average": buy_ma_filter_candidate,
+        }
 
     rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, warnings)
     if rsi_candidate:
@@ -576,14 +616,20 @@ def build_engine_rules_preview_from_ui_state(
         "completion policy mapping is postponed",
     ])
 
+    mapped_paths = [
+        BAR_MINUTES_PATH,
+        BUY_CONDITIONS_PATH,
+    ]
+    if buy_ma_filter_candidate:
+        mapped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+    mapped_paths.extend([
+        RSI_INDICATOR_PATH,
+        SELL_MACD_SIGNAL_PREVIEW_PATH,
+    ])
+
     return {
         "preview_rules": preview_rules,
-        "mapped_paths": [
-            BAR_MINUTES_PATH,
-            BUY_CONDITIONS_PATH,
-            RSI_INDICATOR_PATH,
-            SELL_MACD_SIGNAL_PREVIEW_PATH,
-        ],
+        "mapped_paths": mapped_paths,
         "warnings": warnings,
     }
 
@@ -639,6 +685,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         merge_path = str(buy_candidate.get("merge_into") or BUY_CONDITIONS_PATH)
         candidate_paths[merge_path] = "merge_conditions"
 
+    buy_ma_filter = _as_dict(_as_dict(candidates.get("filters")).get("moving_average"))
+    if buy_ma_filter:
+        filter_path = str(buy_ma_filter.get("path") or BUY_MOVING_AVERAGE_FILTER_PATH)
+        candidate_paths[filter_path] = "set_filter"
+
     rsi_candidate = _as_dict(_as_dict(candidates.get("indicators")).get("rsi"))
     if rsi_candidate:
         rsi_path = str(rsi_candidate.get("path") or RSI_INDICATOR_PATH)
@@ -691,6 +742,7 @@ def build_rule_approval_session_fingerprint(
     current_rule_targets = {
         BAR_MINUTES_PATH: _get_path_value(rules, BAR_MINUTES_PATH),
         BUY_CONDITIONS_PATH: _get_path_value(rules, BUY_CONDITIONS_PATH),
+        BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
         SELL_MACD_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_MACD_SIGNAL_TARGET_PATH),
@@ -1066,6 +1118,27 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == BUY_MOVING_AVERAGE_FILTER_PATH:
+            filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("moving_average"))
+            candidate_value = _moving_average_filter_value(filter_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY moving_average filter value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_MOVING_AVERAGE_FILTER_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY moving_average filter is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_MOVING_AVERAGE_FILTER_PATH,
+                "target_path": BUY_MOVING_AVERAGE_FILTER_PATH,
+                "operation": "set_filter",
+                "value": candidate_value,
+                "risk": "low",
+            })
+            continue
+
         if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
             sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
             if not sell_candidate:
@@ -1217,6 +1290,27 @@ def apply_approved_rule_patch_preview(
             })
             continue
 
+        if operation == "set_filter":
+            if target_path != BUY_MOVING_AVERAGE_FILTER_PATH:
+                skipped_patches.append(_apply_skipped(patch, "unsupported filter target path"))
+                warnings.append(f"unsupported filter target path: {target_path}")
+                continue
+
+            value = patch.get("value")
+            if not isinstance(value, dict):
+                skipped_patches.append(_apply_skipped(patch, "filter value is not a dict"))
+                continue
+            if not _set_path_value(applied_rules_preview, target_path, value):
+                skipped_patches.append(_apply_skipped(patch, "target filter path is not writable"))
+                continue
+
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
         if operation == "add_signal":
             if target_path != SELL_MACD_SIGNAL_TARGET_PATH:
                 skipped_patches.append(_apply_skipped(patch, "unsupported signal target path"))
@@ -1310,6 +1404,16 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
                 ],
                 "replace": False,
             })
+        return diffs
+
+    if operation == "set_filter" and target_path == BUY_MOVING_AVERAGE_FILTER_PATH:
+        diffs.append({
+            "path": BUY_MOVING_AVERAGE_FILTER_PATH,
+            "operation": "set_filter",
+            "change_type": "set_buy_current_price_ma60_filter",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
         return diffs
 
     if operation == "add_signal" and target_path == SELL_MACD_SIGNAL_TARGET_PATH:
@@ -1636,7 +1740,13 @@ def approve_engine_rule_candidates(
     preview_candidates = _as_dict(
         _as_dict(preview_rules.get("indicator_follow_rule_preview")).get("candidates")
     )
-    known_paths = {BAR_MINUTES_PATH, BUY_CONDITIONS_PATH, RSI_INDICATOR_PATH, SELL_MACD_SIGNAL_PREVIEW_PATH}
+    known_paths = {
+        BAR_MINUTES_PATH,
+        BUY_CONDITIONS_PATH,
+        BUY_MOVING_AVERAGE_FILTER_PATH,
+        RSI_INDICATOR_PATH,
+        SELL_MACD_SIGNAL_PREVIEW_PATH,
+    }
     applied_paths: list[str] = []
     skipped_paths: list[str] = []
     warnings: list[str] = []
@@ -1703,6 +1813,18 @@ def approve_engine_rule_candidates(
                 if added_count == 0:
                     warnings.append("buy approval applied with no new conditions")
 
+    if BUY_MOVING_AVERAGE_FILTER_PATH in approved_paths:
+        filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("moving_average"))
+        candidate_value = _moving_average_filter_value(filter_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+            warnings.append("BUY moving_average filter approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_MOVING_AVERAGE_FILTER_PATH, candidate_value):
+            applied_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+        else:
+            skipped_paths.append(BUY_MOVING_AVERAGE_FILTER_PATH)
+            warnings.append("BUY moving_average filter approval skipped: target path is not writable")
+
     if SELL_MACD_SIGNAL_PREVIEW_PATH in approved_paths:
         sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         sell_section = approved_rules.setdefault("sell", {})
@@ -1767,6 +1889,10 @@ def compare_engine_rules_preview(
         current_value = _get_path_value(current, path)
         if path == BUY_CONDITIONS_PATH:
             preview_value = _as_dict(preview_candidates.get("buy"))
+        elif path == BUY_MOVING_AVERAGE_FILTER_PATH:
+            preview_value = _moving_average_filter_value(
+                _as_dict(_as_dict(preview_candidates.get("filters")).get("moving_average"))
+            )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH:
@@ -1778,6 +1904,8 @@ def compare_engine_rules_preview(
 
         if path == BUY_CONDITIONS_PATH and preview_exists:
             status = "merge_candidate"
+        elif path == BUY_MOVING_AVERAGE_FILTER_PATH and preview_exists:
+            status = "changed" if current_exists else "added"
         elif path == SELL_MACD_SIGNAL_PREVIEW_PATH and preview_exists:
             status = "add_signal_candidate"
         elif current_exists and preview_exists:

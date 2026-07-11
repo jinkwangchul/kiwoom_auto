@@ -308,18 +308,24 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
         candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["buy"]
+        ma_filter = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["moving_average"]
         self.assertEqual(candidate["merge_into"], "buy.groups[0].conditions")
-        self.assertEqual(len(candidate["add_conditions"]), 3)
-        self.assertEqual(candidate["add_conditions"][0], {
+        self.assertEqual(ma_filter["path"], "buy.filters.moving_average")
+        self.assertEqual(ma_filter["value"], {
             "enabled": True,
-            "not": False,
-            "target": "CLOSE",
-            "operator": "CROSS_UP",
-            "compare_target": "MA",
-            "period": 60,
-            "description": "UI preview: buy price/MA condition",
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "CLOSE",
+                "operator": "CROSS_UP",
+                "compare_target": "MA",
+                "period": 60,
+                "description": "UI preview: BUY current price / 60MA filter",
+            }],
         })
-        self.assertEqual(candidate["add_conditions"][1], {
+        self.assertEqual(result["preview_rules"]["buy"]["filters"]["moving_average"], ma_filter["value"])
+        self.assertEqual(len(candidate["add_conditions"]), 2)
+        self.assertEqual(candidate["add_conditions"][0], {
             "enabled": True,
             "not": False,
             "target": "CLOSE",
@@ -327,7 +333,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "value": -0.1,
             "description": "UI preview: buy Bollinger threshold condition",
         })
-        self.assertEqual(candidate["add_conditions"][2], {
+        self.assertEqual(candidate["add_conditions"][1], {
             "enabled": True,
             "not": False,
             "target": "CLOSE",
@@ -363,7 +369,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertNotIn("buy", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
 
-    def test_buy_ma_same_period_condition_has_no_commit_diff(self):
+    def test_buy_ma_same_filter_has_no_commit_diff(self):
         state = deepcopy(self.ui_state)
         state["buy_ui"]["signal_filter"] = {
             "buy_ocr_value_line": "",
@@ -374,25 +380,28 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "buy_ma_compare_combo": "\ub3cc\ud30c",
         }
         current_rules = deepcopy(self.current_rules)
-        current_rules["buy"]["groups"][0]["conditions"].append({
+        current_rules.setdefault("buy", {}).setdefault("filters", {})["moving_average"] = {
             "enabled": True,
-            "not": False,
-            "target": "CLOSE",
-            "operator": "CROSS_UP",
-            "compare_target": "MA",
-            "period": 60,
-            "description": "UI preview: buy price/MA condition",
-        })
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "CLOSE",
+                "operator": "CROSS_UP",
+                "compare_target": "MA",
+                "period": 60,
+                "description": "UI preview: BUY current price / 60MA filter",
+            }],
+        }
         preview = self.mapper.build_engine_rules_preview_from_ui_state(state, current_rules)
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.moving_average": "APPROVED"},
         )
 
         patch_preview = self.mapper.build_approved_rule_patch_preview(current_rules, preview, approval)
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.moving_average": "APPROVED"},
         )
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(current_rules, preview)
         session["fingerprint"] = fingerprint["fingerprint"]
@@ -576,6 +585,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             [
                 "bar.bar_minutes",
                 "buy.groups[0].conditions",
+                "buy.filters.moving_average",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -592,6 +602,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(
             saved_pending["candidates"]["buy"]["merge_into"],
             generated_pending["candidates"]["buy"]["merge_into"],
+        )
+        self.assertEqual(
+            saved_pending["candidates"]["filters"]["moving_average"],
+            generated_pending["candidates"]["filters"]["moving_average"],
+        )
+        self.assertEqual(
+            saved_pending["candidates"]["filters"]["moving_average"]["path"],
+            "buy.filters.moving_average",
         )
         self.assertEqual(
             saved_pending["candidates"]["sell"]["add_signal_candidate"]["path"],

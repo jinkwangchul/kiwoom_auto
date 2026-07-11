@@ -270,7 +270,10 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             try:
                 rules_path, session_path, preview, rules = self._prepare_actual_inputs(
                     temp_dir,
-                    {"buy.groups[0].conditions": "APPROVED"},
+                    {
+                        "buy.filters.moving_average": "APPROVED",
+                        "buy.groups[0].conditions": "APPROVED",
+                    },
                 )
             finally:
                 self.ui_state = original_ui_state
@@ -299,17 +302,20 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             self.assertEqual([diff["path"] for diff in final_diff], [
                 "buy.groups[0].conditions",
                 "buy.groups[0].conditions",
-                "buy.groups[0].conditions",
+                "buy.filters.moving_average",
             ])
             self.assertEqual(final_diff[0]["condition"]["target"], "CLOSE")
-            self.assertEqual(final_diff[0]["condition"]["operator"], "CROSS_UP")
-            self.assertEqual(final_diff[0]["condition"]["compare_target"], "MA")
-            self.assertEqual(final_diff[0]["condition"]["period"], 60)
-            self.assertEqual(final_diff[1]["condition"]["value"], -0.1)
-            self.assertEqual(final_diff[2]["condition"]["compare_target"], "AVG_PRICE")
+            self.assertEqual(final_diff[0]["condition"]["operator"], ">=")
+            self.assertEqual(final_diff[0]["condition"]["value"], -0.1)
+            self.assertEqual(final_diff[1]["condition"]["compare_target"], "AVG_PRICE")
+            self.assertEqual(final_diff[2]["operation"], "set_filter")
+            self.assertEqual(final_diff[2]["value"]["conditions"][0]["target"], "CLOSE")
+            self.assertEqual(final_diff[2]["value"]["conditions"][0]["operator"], "CROSS_UP")
+            self.assertEqual(final_diff[2]["value"]["conditions"][0]["compare_target"], "MA")
+            self.assertEqual(final_diff[2]["value"]["conditions"][0]["period"], 60)
             self.assertEqual(
                 [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
-                ["buy.groups[0].conditions"],
+                ["buy.groups[0].conditions", "buy.filters.moving_average"],
             )
 
     def test_success_cleanup_deletes_workspace_by_default(self):

@@ -648,7 +648,10 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 apply_preview, gate, context = self._build_apply_and_gate(
                     rules_path,
                     session_path,
-                    {"buy.groups[0].conditions": "APPROVED"},
+                    {
+                        "buy.filters.moving_average": "APPROVED",
+                        "buy.groups[0].conditions": "APPROVED",
+                    },
                 )
             finally:
                 self.ui_state = original_ui_state
@@ -663,13 +666,21 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             conditions = saved["buy"]["groups"][0]["conditions"]
 
             self.assertTrue(result["ok"], result)
-            self.assertTrue(any(
-                condition.get("target") == "CLOSE"
-                and condition.get("operator") == "CROSS_UP"
-                and condition.get("compare_target") == "MA"
-                and condition.get("period") == 60
-                for condition in conditions
-            ))
+            self.assertEqual(
+                saved["buy"]["filters"]["moving_average"],
+                {
+                    "enabled": True,
+                    "conditions": [{
+                        "enabled": True,
+                        "not": False,
+                        "target": "CLOSE",
+                        "operator": "CROSS_UP",
+                        "compare_target": "MA",
+                        "period": 60,
+                        "description": "UI preview: BUY current price / 60MA filter",
+                    }],
+                },
+            )
             self.assertTrue(any(
                 condition.get("target") == "CLOSE"
                 and condition.get("operator") == ">="
@@ -688,7 +699,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertEqual(saved["indicators"], self.current_rules["indicators"])
             self.assertEqual(
                 [patch["target_path"] for patch in result["applied_patches"]],
-                ["buy.groups[0].conditions"],
+                ["buy.groups[0].conditions", "buy.filters.moving_average"],
             )
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])

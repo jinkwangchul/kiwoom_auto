@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from engines.condition_engine import evaluate_groups_or
+from engines.condition_engine import evaluate_condition, evaluate_groups_or
 from engines.indicator_engine import build_indicator_series, close_prices, rsi
 from engines.signal_result import RoutineSignal, signal_to_dict
 
@@ -312,6 +312,138 @@ def _evaluate_buy_rsi_filter(
     )
 
 
+def _buy_moving_average_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("moving_average"), dict):
+        return filters["moving_average"]
+    return {}
+
+
+def _first_moving_average_condition(filter_cfg: dict[str, Any]) -> dict[str, Any]:
+    conditions = filter_cfg.get("conditions")
+    if isinstance(conditions, list):
+        for condition in conditions:
+            if isinstance(condition, dict):
+                merged = dict(filter_cfg)
+                merged.update(condition)
+                return merged
+    return filter_cfg
+
+
+def _moving_average_detail(
+    *,
+    enabled: bool,
+    period: Any,
+    operator: Any,
+    current_value: Any,
+    ma_value: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+) -> str:
+    return (
+        "filter_type=MOVING_AVERAGE "
+        f"enabled={enabled} "
+        "target=CLOSE "
+        "compare_target=MA "
+        f"period={period} "
+        f"operator={operator} "
+        f"current_value={current_value} "
+        f"ma_value={ma_value} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+
+
+def _evaluate_buy_moving_average_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    filter_cfg = _buy_moving_average_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    condition = _first_moving_average_condition(filter_cfg)
+    enabled = bool(filter_cfg.get("enabled", True))
+    raw_period = condition.get("period", filter_cfg.get("period", 60))
+    operator = str(condition.get("operator", filter_cfg.get("operator", "CROSS_UP")) or "").strip().upper()
+    period = _safe_int(raw_period)
+
+    if not enabled:
+        return True, _moving_average_detail(
+            enabled=False,
+            period=raw_period,
+            operator=operator,
+            current_value=None,
+            ma_value=None,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+    if period is None or period <= 0:
+        return False, _moving_average_detail(
+            enabled=True,
+            period=raw_period,
+            operator=operator,
+            current_value=None,
+            ma_value=None,
+            passed=False,
+            reason="invalid_period",
+            evaluation_index=evaluation_index,
+        )
+    if condition.get("target", "CLOSE") != "CLOSE" or condition.get("compare_target", "MA") != "MA":
+        return False, _moving_average_detail(
+            enabled=True,
+            period=period,
+            operator=operator,
+            current_value=None,
+            ma_value=None,
+            passed=False,
+            reason="unsupported_target",
+            evaluation_index=evaluation_index,
+        )
+
+    ma_key = f"MA{period}"
+    close_series = series_map.get("CLOSE")
+    ma_series = series_map.get(ma_key)
+    current_value = close_series[evaluation_index] if isinstance(close_series, list) and 0 <= evaluation_index < len(close_series) else None
+    ma_value = ma_series[evaluation_index] if isinstance(ma_series, list) and 0 <= evaluation_index < len(ma_series) else None
+    if current_value is None or ma_value is None:
+        return False, _moving_average_detail(
+            enabled=True,
+            period=period,
+            operator=operator,
+            current_value=current_value,
+            ma_value=ma_value,
+            passed=False,
+            reason="insufficient_data",
+            evaluation_index=evaluation_index,
+        )
+
+    runtime_condition = {
+        "enabled": True,
+        "not": bool(condition.get("not", False)),
+        "target": "CLOSE",
+        "operator": operator,
+        "compare_target": "MA",
+        "period": period,
+    }
+    result = evaluate_condition(runtime_condition, series_map, evaluation_index)
+    return result.passed, _moving_average_detail(
+        enabled=True,
+        period=period,
+        operator=operator,
+        current_value=round(current_value, 8),
+        ma_value=round(ma_value, 8),
+        passed=result.passed,
+        reason="matched" if result.passed else "not_matched",
+        evaluation_index=evaluation_index,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -499,6 +631,11 @@ def evaluate_indicator_follow_routine(
             details.append(rsi_detail)
         if not rsi_passed:
             return RoutineSignal(None, "BUY RSI filter blocked", matched, details, buy_index, buy_delay)
+        ma_passed, ma_detail = _evaluate_buy_moving_average_filter(cfg, buy_cfg, series_map, buy_index)
+        if ma_detail:
+            details.append(ma_detail)
+        if not ma_passed:
+            return RoutineSignal(None, "BUY moving average filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [

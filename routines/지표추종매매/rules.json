@@ -597,6 +597,7 @@
     "mapped_paths": [
       "bar.bar_minutes",
       "buy.groups[0].conditions",
+      "buy.filters.moving_average",
       "indicators.rsi",
       "sell.signals.ui_preview_condition_c_macd_sell"
     ],
@@ -624,6 +625,25 @@
             "description": "UI preview: buy OCR/OSC threshold condition"
           }
         ]
+      },
+      "filters": {
+        "moving_average": {
+          "path": "buy.filters.moving_average",
+          "value": {
+            "enabled": true,
+            "conditions": [
+              {
+                "enabled": true,
+                "not": false,
+                "target": "CLOSE",
+                "operator": "CROSS_UP",
+                "compare_target": "MA",
+                "period": 60,
+                "description": "UI preview: BUY current price / 60MA filter"
+              }
+            ]
+          }
+        }
       },
       "indicators": {
         "rsi": {

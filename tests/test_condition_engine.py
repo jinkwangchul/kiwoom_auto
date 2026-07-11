@@ -682,5 +682,119 @@ class IndicatorFollowBuyRsiFilterTest(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class IndicatorFollowBuyMovingAverageFilterTest(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_routine_engine_module()
+
+    def _candles(self, closes):
+        return [{"close": close, "volume": 100} for close in closes]
+
+    def _config(self, moving_average_filter=None, *, sell_pass=False):
+        config = deepcopy(self.module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
+        config["moving_averages"] = [60]
+        config["buy"]["delay_bar"] = 0
+        config["buy"]["groups"] = [
+            {
+                "enabled": True,
+                "name": "ui_buy_conditions",
+                "conditions": [{"enabled": True, "target": "CLOSE", "operator": ">=", "value": 0}],
+            }
+        ]
+        if moving_average_filter is not None:
+            config["buy"]["filters"] = {"moving_average": deepcopy(moving_average_filter)}
+        config["sell"] = {
+            "delay_bar": 0,
+            "signals": {
+                "macd_sell": {
+                    "enabled": bool(sell_pass),
+                    "groups": [
+                        {
+                            "enabled": True,
+                            "name": "sell_pass",
+                            "conditions": [{"target": "CLOSE", "operator": ">=", "value": 0}],
+                        }
+                    ],
+                }
+            },
+        }
+        return config
+
+    def _filter(self, *, enabled=True, period=60, operator="CROSS_UP"):
+        return {
+            "enabled": enabled,
+            "conditions": [{
+                "enabled": True,
+                "not": False,
+                "target": "CLOSE",
+                "operator": operator,
+                "compare_target": "MA",
+                "period": period,
+            }],
+        }
+
+    def _signal(self, closes, moving_average_filter=None, *, sell_pass=False):
+        config = self._config(moving_average_filter, sell_pass=sell_pass)
+        return self.module.evaluate_indicator_follow_routine(self._candles(closes), config, {})
+
+    def _ma_detail(self, signal):
+        return next((detail for detail in signal.details if "filter_type=MOVING_AVERAGE" in detail), "")
+
+    def test_buy_moving_average_filter_absent_keeps_buy_result(self):
+        signal = self._signal([10] * 60 + [9], None)
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual("", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_cross_up_passes(self):
+        signal = self._signal([10] * 60 + [20], self._filter())
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("period=60", self._ma_detail(signal))
+        self.assertIn("operator=CROSS_UP", self._ma_detail(signal))
+        self.assertIn("passed=True", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_cross_up_blocks_buy_only(self):
+        signal = self._signal([10] * 60 + [9], self._filter())
+
+        self.assertIsNone(signal.signal)
+        self.assertEqual(signal.reason, "BUY moving average filter blocked")
+        self.assertIn("reason=not_matched", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_disabled_keeps_buy_result(self):
+        signal = self._signal([10] * 60 + [9], self._filter(enabled=False))
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertIn("enabled=False", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_blocks_insufficient_data(self):
+        signal = self._signal([10, 11, 12], self._filter())
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=insufficient_data", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_blocks_invalid_period(self):
+        signal = self._signal([10] * 60 + [20], self._filter(period=0))
+
+        self.assertIsNone(signal.signal)
+        self.assertIn("reason=invalid_period", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_does_not_affect_sell_result(self):
+        signal = self._signal([10] * 60 + [9], self._filter(), sell_pass=True)
+
+        self.assertEqual(signal.signal, "SELL")
+        self.assertEqual("", self._ma_detail(signal))
+
+    def test_buy_moving_average_filter_does_not_mutate_inputs(self):
+        config = self._config(self._filter())
+        candles = self._candles([10] * 60 + [20])
+        original_config = deepcopy(config)
+        original_candles = deepcopy(candles)
+
+        self.module.evaluate_indicator_follow_routine(candles, config, {})
+
+        self.assertEqual(config, original_config)
+        self.assertEqual(candles, original_candles)
+
+
 if __name__ == "__main__":
     unittest.main()
