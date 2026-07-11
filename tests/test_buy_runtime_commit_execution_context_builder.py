@@ -158,6 +158,8 @@ class BuyRuntimeCommitExecutionContextBuilderTest(unittest.TestCase):
         self.assertEqual("BUY_RUNTIME_COMMIT_EXECUTION_CONTEXT_V1", context["context_version"])
         self.assertTrue(context["context_id"].startswith("BUY_RUNTIME_COMMIT_CONTEXT_"))
         self.assertEqual(token_issue["token_issue_request_id"], context["token_id"])
+        self.assertTrue(context["approval_granted"])
+        self.assertEqual("operator-1", context["reviewer_id"])
         self.assertEqual(transaction["commit_id"], context["commit_id"])
         self.assertEqual(transaction["transaction_id"], context["transaction_id"])
         self.assertEqual(transaction["execution_plan_hash"], context["execution_plan_hash"])
@@ -179,6 +181,7 @@ class BuyRuntimeCommitExecutionContextBuilderTest(unittest.TestCase):
         self.assertFalse(context["execution_allowed"])
         self.assertFalse(context["execution_started"])
         self.assertFalse(context["runtime_write"])
+        self.assertEqual("operator-1", context["token_metadata"]["reviewer_id"])
         self.assertEqual(context["context_id"], result["context_summary"]["context_id"])
         self.assertEqual("BUY Runtime Commit Execution Context", result["context_report"]["title"])
 
