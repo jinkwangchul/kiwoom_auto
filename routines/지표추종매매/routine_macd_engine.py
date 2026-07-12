@@ -961,6 +961,273 @@ def _evaluate_buy_ocr_filter(
     )
 
 
+BUY_FILTER_ORDER = ("rsi", "moving_average", "price_compare", "bollinger", "ocr")
+
+
+def _buy_composite_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and "composite" in filters:
+        composite = filters.get("composite")
+        if isinstance(composite, dict):
+            return composite
+        return {"enabled": True, "_invalid_config": True}
+    return {}
+
+
+def _buy_filter_config_map(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        "rsi": _buy_rsi_filter_config(config, buy_cfg),
+        "moving_average": _buy_moving_average_filter_config(config, buy_cfg),
+        "price_compare": _buy_price_compare_filter_config(config, buy_cfg),
+        "bollinger": _buy_bollinger_filter_config(config, buy_cfg),
+        "ocr": _buy_ocr_filter_config(config, buy_cfg),
+    }
+
+
+def _composite_logic(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    return text if text in {"AND", "OR"} else None
+
+
+def _composite_detail(
+    *,
+    enabled: bool,
+    logic: Any,
+    passed: bool,
+    reason: str,
+    referenced_filters: list[str],
+    unreferenced_required_filters: list[str],
+    group_results: list[str],
+) -> str:
+    return (
+        "filter_type=COMPOSITE "
+        f"enabled={enabled} "
+        f"logic={logic} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"referenced_filters={','.join(referenced_filters)} "
+        f"unreferenced_required_filters={','.join(unreferenced_required_filters)} "
+        f"group_results={';'.join(group_results)}"
+    )
+
+
+def _evaluate_buy_composite_filter(
+    composite_cfg: dict[str, Any],
+    filter_results: dict[str, dict[str, Any]],
+) -> tuple[bool, str | None]:
+    if not composite_cfg or not bool(composite_cfg.get("enabled", False)):
+        return True, None
+
+    if composite_cfg.get("_invalid_config"):
+        return False, _composite_detail(
+            enabled=True,
+            logic=composite_cfg.get("logic"),
+            passed=False,
+            reason="invalid_config",
+            referenced_filters=[],
+            unreferenced_required_filters=[],
+            group_results=[],
+        )
+
+    top_logic = _composite_logic(composite_cfg.get("logic", "AND"))
+    if top_logic is None:
+        return False, _composite_detail(
+            enabled=True,
+            logic=composite_cfg.get("logic"),
+            passed=False,
+            reason="invalid_logic",
+            referenced_filters=[],
+            unreferenced_required_filters=[],
+            group_results=[],
+        )
+
+    include_policy = str(composite_cfg.get("include_unreferenced_active_filters", "AND_REQUIRED") or "").strip().upper()
+    if include_policy != "AND_REQUIRED":
+        return False, _composite_detail(
+            enabled=True,
+            logic=top_logic,
+            passed=False,
+            reason="unsupported_unreferenced_policy",
+            referenced_filters=[],
+            unreferenced_required_filters=[],
+            group_results=[],
+        )
+
+    groups = composite_cfg.get("groups")
+    if not isinstance(groups, list) or not groups:
+        return False, _composite_detail(
+            enabled=True,
+            logic=top_logic,
+            passed=False,
+            reason="missing_groups",
+            referenced_filters=[],
+            unreferenced_required_filters=[],
+            group_results=[],
+        )
+
+    active_group_seen = False
+    referenced_filters: list[str] = []
+    group_passes: list[bool] = []
+    group_results: list[str] = []
+
+    for group_index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            return False, _composite_detail(
+                enabled=True,
+                logic=top_logic,
+                passed=False,
+                reason="invalid_group",
+                referenced_filters=referenced_filters,
+                unreferenced_required_filters=[],
+                group_results=group_results,
+            )
+        if not bool(group.get("enabled", True)):
+            continue
+        active_group_seen = True
+        group_logic = _composite_logic(group.get("logic", "AND"))
+        if group_logic is None:
+            return False, _composite_detail(
+                enabled=True,
+                logic=top_logic,
+                passed=False,
+                reason="invalid_group_logic",
+                referenced_filters=referenced_filters,
+                unreferenced_required_filters=[],
+                group_results=group_results,
+            )
+        filters = group.get("filters")
+        if not isinstance(filters, list) or not filters:
+            return False, _composite_detail(
+                enabled=True,
+                logic=top_logic,
+                passed=False,
+                reason="missing_group_filters",
+                referenced_filters=referenced_filters,
+                unreferenced_required_filters=[],
+                group_results=group_results,
+            )
+
+        seen_in_group: set[str] = set()
+        active_filter_passes: list[bool] = []
+        group_tokens: list[str] = []
+        for raw_name in filters:
+            name = str(raw_name or "").strip().lower()
+            if name == "composite":
+                return False, _composite_detail(
+                    enabled=True,
+                    logic=top_logic,
+                    passed=False,
+                    reason="self_reference",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=group_results,
+                )
+            if name not in BUY_FILTER_ORDER:
+                return False, _composite_detail(
+                    enabled=True,
+                    logic=top_logic,
+                    passed=False,
+                    reason="unknown_filter",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=group_results,
+                )
+            if name in seen_in_group:
+                return False, _composite_detail(
+                    enabled=True,
+                    logic=top_logic,
+                    passed=False,
+                    reason="duplicate_filter_in_group",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=group_results,
+                )
+            seen_in_group.add(name)
+            if name not in referenced_filters:
+                referenced_filters.append(name)
+            result = filter_results.get(name)
+            if not isinstance(result, dict):
+                return False, _composite_detail(
+                    enabled=True,
+                    logic=top_logic,
+                    passed=False,
+                    reason="missing_filter_result",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=group_results,
+                )
+            if not result.get("configured", False):
+                return False, _composite_detail(
+                    enabled=True,
+                    logic=top_logic,
+                    passed=False,
+                    reason="missing_filter_result",
+                    referenced_filters=referenced_filters,
+                    unreferenced_required_filters=[],
+                    group_results=group_results,
+                )
+            if not result.get("enabled", True):
+                group_tokens.append(f"{name}:disabled_ignored")
+                continue
+            passed = bool(result.get("passed", False))
+            active_filter_passes.append(passed)
+            group_tokens.append(f"{name}:{'PASS' if passed else 'FAIL'}")
+
+        if not active_filter_passes:
+            return False, _composite_detail(
+                enabled=True,
+                logic=top_logic,
+                passed=False,
+                reason="group_has_no_active_filters",
+                referenced_filters=referenced_filters,
+                unreferenced_required_filters=[],
+                group_results=group_results + [f"group{group_index}:BLOCK:{','.join(group_tokens)}"],
+            )
+
+        group_passed = all(active_filter_passes) if group_logic == "AND" else any(active_filter_passes)
+        group_passes.append(group_passed)
+        group_results.append(f"group{group_index}:{group_logic}:{'PASS' if group_passed else 'FAIL'}:{','.join(group_tokens)}")
+
+    if not active_group_seen:
+        return False, _composite_detail(
+            enabled=True,
+            logic=top_logic,
+            passed=False,
+            reason="all_groups_disabled",
+            referenced_filters=referenced_filters,
+            unreferenced_required_filters=[],
+            group_results=group_results,
+        )
+
+    composite_passed = all(group_passes) if top_logic == "AND" else any(group_passes)
+    unreferenced_required = [
+        name
+        for name in BUY_FILTER_ORDER
+        if name not in referenced_filters
+        and isinstance(filter_results.get(name), dict)
+        and filter_results[name].get("configured", False)
+        and filter_results[name].get("enabled", True)
+    ]
+    unreferenced_passed = all(bool(filter_results[name].get("passed", False)) for name in unreferenced_required)
+    passed = composite_passed and unreferenced_passed
+    if passed:
+        reason = "matched"
+    elif not composite_passed:
+        reason = "not_matched"
+    else:
+        reason = "unreferenced_required_failed"
+
+    return passed, _composite_detail(
+        enabled=True,
+        logic=top_logic,
+        passed=passed,
+        reason=reason,
+        referenced_filters=referenced_filters,
+        unreferenced_required_filters=unreferenced_required,
+        group_results=group_results,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -1163,6 +1430,68 @@ def evaluate_indicator_follow_routine(
     if buy_passed:
         matched = [result.group_name for result in buy_results if result.passed]
         details = [detail for result in buy_results for detail in result.details]
+        composite_cfg = _buy_composite_filter_config(cfg, buy_cfg)
+        if composite_cfg and bool(composite_cfg.get("enabled", False)):
+            filter_cfgs = _buy_filter_config_map(cfg, buy_cfg)
+            filter_results: dict[str, dict[str, Any]] = {}
+
+            rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(cfg, buy_cfg, candles, buy_index)
+            if rsi_detail:
+                details.append(rsi_detail)
+            filter_results["rsi"] = {
+                "passed": rsi_passed,
+                "detail": rsi_detail,
+                "configured": bool(filter_cfgs["rsi"]),
+                "enabled": bool(filter_cfgs["rsi"].get("enabled", True)) if filter_cfgs["rsi"] else False,
+            }
+
+            ma_passed, ma_detail = _evaluate_buy_moving_average_filter(cfg, buy_cfg, series_map, buy_index)
+            if ma_detail:
+                details.append(ma_detail)
+            filter_results["moving_average"] = {
+                "passed": ma_passed,
+                "detail": ma_detail,
+                "configured": bool(filter_cfgs["moving_average"]),
+                "enabled": bool(filter_cfgs["moving_average"].get("enabled", True)) if filter_cfgs["moving_average"] else False,
+            }
+
+            price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(cfg, buy_cfg, series_map, buy_index)
+            if price_compare_detail:
+                details.append(price_compare_detail)
+            filter_results["price_compare"] = {
+                "passed": price_compare_passed,
+                "detail": price_compare_detail,
+                "configured": bool(filter_cfgs["price_compare"]),
+                "enabled": bool(filter_cfgs["price_compare"].get("enabled", True)) if filter_cfgs["price_compare"] else False,
+            }
+
+            bollinger_passed, bollinger_detail = _evaluate_buy_bollinger_filter(cfg, buy_cfg, series_map, buy_index)
+            if bollinger_detail:
+                details.append(bollinger_detail)
+            filter_results["bollinger"] = {
+                "passed": bollinger_passed,
+                "detail": bollinger_detail,
+                "configured": bool(filter_cfgs["bollinger"]),
+                "enabled": bool(filter_cfgs["bollinger"].get("enabled", True)) if filter_cfgs["bollinger"] else False,
+            }
+
+            ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(cfg, buy_cfg, series_map, buy_index)
+            if ocr_detail:
+                details.append(ocr_detail)
+            filter_results["ocr"] = {
+                "passed": ocr_passed,
+                "detail": ocr_detail,
+                "configured": bool(filter_cfgs["ocr"]),
+                "enabled": bool(filter_cfgs["ocr"].get("enabled", True)) if filter_cfgs["ocr"] else False,
+            }
+
+            composite_passed, composite_detail = _evaluate_buy_composite_filter(composite_cfg, filter_results)
+            if composite_detail:
+                details.append(composite_detail)
+            if not composite_passed:
+                return RoutineSignal(None, "BUY composite filter blocked", matched, details, buy_index, buy_delay)
+            return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
+
         rsi_passed, rsi_detail = _evaluate_buy_rsi_filter(cfg, buy_cfg, candles, buy_index)
         if rsi_detail:
             details.append(rsi_detail)
