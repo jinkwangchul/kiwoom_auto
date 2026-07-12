@@ -29,6 +29,9 @@ class ConditionEngineTest(unittest.TestCase):
             "MA60": [10.0, 10.0, 11.0],
             "MA120": [13.0, 12.0, 12.0],
             "AVG_PRICE": [11.0, 11.0, 11.5],
+            "BOLLINGER_LOWER": [8.0, 9.0, 10.0],
+            "BOLLINGER_MIDDLE": [9.0, 10.0, 11.0],
+            "BOLLINGER_UPPER": [10.0, 11.0, 12.0],
         }
 
     def assertConditionPassed(self, condition):
@@ -107,6 +110,11 @@ class ConditionEngineTest(unittest.TestCase):
 
     def test_bollinger_candidate_threshold_condition(self):
         self.assertConditionPassed({"target": "CLOSE", "operator": ">=", "value": -0.1})
+
+    def test_bollinger_explicit_series_keys_are_supported(self):
+        self.assertConditionPassed({"target": "BOLLINGER_LOWER", "operator": "<=", "compare_target": "BOLLINGER_MIDDLE"})
+        self.assertConditionPassed({"target": "BOLLINGER_MIDDLE", "operator": "<=", "compare_target": "BOLLINGER_UPPER"})
+        self.assertConditionPassed({"target": "CLOSE", "operator": ">=", "compare_target": "BOLLINGER_UPPER"})
 
     def test_and_group_requires_all_conditions(self):
         group = {

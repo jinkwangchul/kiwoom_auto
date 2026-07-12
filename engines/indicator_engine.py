@@ -213,7 +213,7 @@ def build_indicator_series(
     bollinger_period = int(bollinger_cfg.get("period", 20) or 20)
     bollinger_std = safe_float(bollinger_cfg.get("std", 2.0)) or 2.0
 
-    bollinger_lower, _bollinger_middle, _bollinger_upper = bollinger_band(
+    bollinger_lower, bollinger_middle, bollinger_upper = bollinger_band(
         closes, bollinger_period, bollinger_std
     )
 
@@ -225,6 +225,9 @@ def build_indicator_series(
         "OSC": osc,
         "RSI": rsi(closes, rsi_period),
         "BOLLINGER": bollinger_lower,
+        "BOLLINGER_LOWER": bollinger_lower,
+        "BOLLINGER_MIDDLE": bollinger_middle,
+        "BOLLINGER_UPPER": bollinger_upper,
     }
 
     ma_periods = cfg.get("moving_averages", [5, 20, 60])
