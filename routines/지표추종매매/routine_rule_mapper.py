@@ -64,6 +64,7 @@ BUY_MOVING_AVERAGE_FILTER_PATH = "buy.filters.moving_average"
 BUY_PRICE_COMPARE_FILTER_PATH = "buy.filters.price_compare"
 BUY_BOLLINGER_FILTER_PATH = "buy.filters.bollinger"
 BUY_OCR_FILTER_PATH = "buy.filters.ocr"
+BUY_RSI_FILTER_PATH = "buy.filters.rsi"
 BUY_EXECUTION_BASE_PATH = "buy.execution.base"
 BUY_EXECUTION_REPEAT_PATH = "buy.execution.repeat"
 RSI_INDICATOR_PATH = "indicators.rsi"
@@ -114,6 +115,8 @@ def _preview_diff_risk(path: str) -> str:
         return "low"
     if path == BUY_OCR_FILTER_PATH:
         return "low"
+    if path == BUY_RSI_FILTER_PATH:
+        return "low"
     if path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
         return "medium"
     if path in {"buy.groups", BUY_CONDITIONS_PATH}:
@@ -141,6 +144,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_OCR_FILTER_PATH: (
             "UI preview-only BUY OCR/OSC filter candidate."
+        ),
+        BUY_RSI_FILTER_PATH: (
+            "UI preview-only BUY RSI filter candidate."
         ),
         BUY_EXECUTION_BASE_PATH: (
             "UI preview-only BUY execution base policy candidate."
@@ -308,6 +314,42 @@ def _build_buy_ocr_filter_candidate(signal_filter: dict[str, Any], warnings: lis
     }
 
 
+def _build_buy_rsi_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    if "buy_rsi_enabled" in signal_filter and not _truthy_ui(signal_filter.get("buy_rsi_enabled")):
+        return None
+
+    raw_period = signal_filter.get("buy_rsi_period_line")
+    raw_threshold = signal_filter.get("buy_rsi_value_line")
+    if raw_period in (None, "") or raw_threshold in (None, ""):
+        return None
+
+    period = _safe_int(raw_period)
+    operator = _compare_operator(signal_filter.get("buy_rsi_compare_combo"))
+    threshold = _safe_float(raw_threshold)
+    if period is None:
+        warnings.append("buy RSI period is not numeric")
+        return None
+    if operator is None:
+        warnings.append(f"buy RSI compare is not mapped: {signal_filter.get('buy_rsi_compare_combo')!r}")
+        return None
+    if threshold is None:
+        warnings.append("buy RSI threshold is not numeric")
+        return None
+
+    return {
+        "path": BUY_RSI_FILTER_PATH,
+        "value": {
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "operator": operator,
+                "threshold": threshold,
+                "period": period,
+            }],
+        },
+    }
+
+
 def _truthy_ui(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -376,6 +418,11 @@ def _bollinger_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ocr_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    return deepcopy(value) if isinstance(value, dict) else {}
+
+
+def _rsi_filter_value(candidate: dict[str, Any]) -> dict[str, Any]:
     value = candidate.get("value")
     return deepcopy(value) if isinstance(value, dict) else {}
 
@@ -882,6 +929,11 @@ def build_engine_rules_preview_from_ui_state(
         _set_path_value(preview_rules, BUY_PRICE_COMPARE_FILTER_PATH, buy_price_compare_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["price_compare"] = buy_price_compare_filter_candidate
 
+    buy_rsi_filter_candidate = _build_buy_rsi_filter_candidate(signal_filter, warnings)
+    if buy_rsi_filter_candidate:
+        _set_path_value(preview_rules, BUY_RSI_FILTER_PATH, buy_rsi_filter_candidate["value"])
+        preview_candidates.setdefault("filters", {})["rsi"] = buy_rsi_filter_candidate
+
     buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, warnings)
     if buy_execution_base_candidate:
         _set_path_value(preview_rules, BUY_EXECUTION_BASE_PATH, buy_execution_base_candidate["value"])
@@ -957,6 +1009,8 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_OCR_FILTER_PATH)
     if buy_price_compare_filter_candidate:
         mapped_paths.append(BUY_PRICE_COMPARE_FILTER_PATH)
+    if buy_rsi_filter_candidate:
+        mapped_paths.append(BUY_RSI_FILTER_PATH)
     if buy_execution_base_candidate:
         mapped_paths.append(BUY_EXECUTION_BASE_PATH)
     if buy_execution_repeat_candidate:
@@ -1039,6 +1093,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         filter_path = str(buy_ocr_filter.get("path") or BUY_OCR_FILTER_PATH)
         candidate_paths[filter_path] = "set_filter"
 
+    buy_rsi_filter = _as_dict(_as_dict(candidates.get("filters")).get("rsi"))
+    if buy_rsi_filter:
+        filter_path = str(buy_rsi_filter.get("path") or BUY_RSI_FILTER_PATH)
+        candidate_paths[filter_path] = "set_filter"
+
     buy_price_compare_filter = _as_dict(_as_dict(candidates.get("filters")).get("price_compare"))
     if buy_price_compare_filter:
         filter_path = str(buy_price_compare_filter.get("path") or BUY_PRICE_COMPARE_FILTER_PATH)
@@ -1109,6 +1168,7 @@ def build_rule_approval_session_fingerprint(
         BUY_MOVING_AVERAGE_FILTER_PATH: _get_path_value(rules, BUY_MOVING_AVERAGE_FILTER_PATH),
         BUY_BOLLINGER_FILTER_PATH: _get_path_value(rules, BUY_BOLLINGER_FILTER_PATH),
         BUY_OCR_FILTER_PATH: _get_path_value(rules, BUY_OCR_FILTER_PATH),
+        BUY_RSI_FILTER_PATH: _get_path_value(rules, BUY_RSI_FILTER_PATH),
         BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
         BUY_EXECUTION_BASE_PATH: _get_path_value(rules, BUY_EXECUTION_BASE_PATH),
         BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
@@ -1571,6 +1631,27 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == BUY_RSI_FILTER_PATH:
+            filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("rsi"))
+            candidate_value = _rsi_filter_value(filter_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY rsi filter value is not available"))
+                continue
+
+            current_value = _get_path_value(current, BUY_RSI_FILTER_PATH)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "BUY rsi filter is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": BUY_RSI_FILTER_PATH,
+                "target_path": BUY_RSI_FILTER_PATH,
+                "operation": "set_filter",
+                "value": candidate_value,
+                "risk": "low",
+            })
+            continue
+
         if path == BUY_EXECUTION_BASE_PATH:
             execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
             candidate_value = _execution_policy_value(execution_candidate)
@@ -1770,6 +1851,7 @@ def apply_approved_rule_patch_preview(
                 BUY_PRICE_COMPARE_FILTER_PATH,
                 BUY_BOLLINGER_FILTER_PATH,
                 BUY_OCR_FILTER_PATH,
+                BUY_RSI_FILTER_PATH,
             }:
                 skipped_patches.append(_apply_skipped(patch, "unsupported filter target path"))
                 warnings.append(f"unsupported filter target path: {target_path}")
@@ -1941,6 +2023,16 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "path": BUY_OCR_FILTER_PATH,
             "operation": "set_filter",
             "change_type": "set_buy_ocr_filter",
+            "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_filter" and target_path == BUY_RSI_FILTER_PATH:
+        diffs.append({
+            "path": BUY_RSI_FILTER_PATH,
+            "operation": "set_filter",
+            "change_type": "set_buy_rsi_filter",
             "value": deepcopy(patch.get("value")),
             "replace": False,
         })
@@ -2297,6 +2389,7 @@ def approve_engine_rule_candidates(
         BUY_PRICE_COMPARE_FILTER_PATH,
         BUY_BOLLINGER_FILTER_PATH,
         BUY_OCR_FILTER_PATH,
+        BUY_RSI_FILTER_PATH,
         BUY_EXECUTION_BASE_PATH,
         BUY_EXECUTION_REPEAT_PATH,
         RSI_INDICATOR_PATH,
@@ -2416,6 +2509,18 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_OCR_FILTER_PATH)
             warnings.append("BUY ocr filter approval skipped: target path is not writable")
 
+    if BUY_RSI_FILTER_PATH in approved_paths:
+        filter_candidate = _as_dict(_as_dict(preview_candidates.get("filters")).get("rsi"))
+        candidate_value = _rsi_filter_value(filter_candidate)
+        if not candidate_value:
+            skipped_paths.append(BUY_RSI_FILTER_PATH)
+            warnings.append("BUY rsi filter approval skipped: value is not available")
+        elif _set_path_value(approved_rules, BUY_RSI_FILTER_PATH, candidate_value):
+            applied_paths.append(BUY_RSI_FILTER_PATH)
+        else:
+            skipped_paths.append(BUY_RSI_FILTER_PATH)
+            warnings.append("BUY rsi filter approval skipped: target path is not writable")
+
     if BUY_EXECUTION_BASE_PATH in approved_paths:
         execution_candidate = _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
         candidate_value = _execution_policy_value(execution_candidate)
@@ -2520,6 +2625,10 @@ def compare_engine_rules_preview(
             preview_value = _ocr_filter_value(
                 _as_dict(_as_dict(preview_candidates.get("filters")).get("ocr"))
             )
+        elif path == BUY_RSI_FILTER_PATH:
+            preview_value = _rsi_filter_value(
+                _as_dict(_as_dict(preview_candidates.get("filters")).get("rsi"))
+            )
         elif path == BUY_EXECUTION_BASE_PATH:
             preview_value = _execution_policy_value(
                 _as_dict(_as_dict(preview_candidates.get("execution")).get("base"))
@@ -2544,6 +2653,8 @@ def compare_engine_rules_preview(
         elif path == BUY_PRICE_COMPARE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path == BUY_OCR_FILTER_PATH and preview_exists:
+            status = "changed" if current_exists else "added"
+        elif path == BUY_RSI_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
             status = "changed" if current_exists else "added"

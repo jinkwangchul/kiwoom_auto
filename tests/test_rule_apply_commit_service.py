@@ -772,6 +772,49 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])
 
+    def test_buy_rsi_filter_committed_via_set_filter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            self._write_rules(rules_path, self.current_rules)
+            apply_preview, gate, context = self._build_apply_and_gate(
+                rules_path,
+                session_path,
+                {"buy.filters.rsi": "APPROVED"},
+            )
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                saved["buy"]["filters"]["rsi"],
+                {
+                    "enabled": True,
+                    "conditions": [{
+                        "enabled": True,
+                        "operator": "<=",
+                        "threshold": 45.0,
+                        "period": 14,
+                    }],
+                },
+            )
+            self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
+            self.assertEqual(saved["sell"], self.current_rules["sell"])
+            self.assertEqual(saved["indicators"], self.current_rules["indicators"])
+            self.assertEqual(saved["buy"]["groups"], self.current_rules["buy"]["groups"])
+            self.assertEqual(
+                [patch["target_path"] for patch in result["applied_patches"]],
+                ["buy.filters.rsi"],
+            )
+            self.assertTrue(result["post_validation"]["ok"])
+            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
+
     def test_buy_execution_base_and_repeat_committed_via_set_execution_policy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
@@ -1190,6 +1233,17 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
         )
 
         self._assert_post_validation_blocked(result, "buy.filters.ocr")
+
+    def test_deep_compare_detects_final_diff_buy_rsi_filter_changed(self):
+        def mutate(apply_preview):
+            apply_preview["applied_rules_preview"]["buy"]["filters"]["rsi"]["conditions"][0]["threshold"] = 46.0
+
+        result = self._commit_mutated_apply_preview(
+            {"buy.filters.rsi": "APPROVED"},
+            mutate,
+        )
+
+        self._assert_post_validation_blocked(result, "buy.filters.rsi")
 
     def test_approval_session_file_is_not_modified(self):
         with tempfile.TemporaryDirectory() as temp_dir:

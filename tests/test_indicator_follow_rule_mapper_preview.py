@@ -149,6 +149,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             [
                 "bar.bar_minutes",
                 "buy.filters.ocr",
+                "buy.filters.rsi",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -174,6 +175,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(namespace["mode"], "merge_add_candidate")
         self.assertIn("bar", namespace["candidates"])
         self.assertIn("ocr", namespace["candidates"]["filters"])
+        self.assertIn("rsi", namespace["candidates"]["filters"])
         self.assertNotIn("buy", namespace["candidates"])
         self.assertIn("indicators", namespace["candidates"])
         self.assertIn("sell", namespace["candidates"])
@@ -216,6 +218,50 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
         self.assertEqual(result["preview_rules"]["indicators"]["rsi"], {"period": 14})
 
+    def test_buy_rsi_filter_candidate_uses_official_filter_path(self):
+        result = self._build_preview()
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["rsi"]
+
+        self.assertEqual(candidate["path"], "buy.filters.rsi")
+        self.assertEqual(
+            candidate["value"],
+            {
+                "enabled": True,
+                "conditions": [{
+                    "enabled": True,
+                    "operator": "<=",
+                    "threshold": 45.0,
+                    "period": 14,
+                }],
+            },
+        )
+        self.assertEqual(result["preview_rules"]["buy"]["filters"]["rsi"], candidate["value"])
+
+    def test_buy_rsi_filter_operator_above_maps_to_greater_equal(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_rsi_compare_combo"] = "\uc774\uc0c1"
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["rsi"]["value"]["conditions"][0]
+
+        self.assertEqual(condition["operator"], ">=")
+
+    def test_buy_rsi_filter_disabled_does_not_create_filter_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_rsi_enabled"] = False
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+
+        self.assertNotIn("rsi", candidates.get("filters", {}))
+        self.assertIn("rsi", candidates["indicators"])
+
     def test_rsi_empty_value_does_not_create_candidate(self):
         state = deepcopy(self.ui_state)
         state["buy_ui"]["signal_filter"]["buy_rsi_value_line"] = ""
@@ -227,6 +273,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
 
         self.assertNotIn("indicators", candidates)
+        self.assertNotIn("rsi", candidates.get("filters", {}))
+        self.assertNotIn("buy.filters.rsi", self.mapper.build_rule_approval_session(result)["decisions"])
         self.assertNotIn("indicators.rsi", self.mapper.build_rule_approval_session(result)["decisions"])
 
     def test_rsi_same_indicator_has_no_commit_diff(self):
@@ -576,6 +624,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("source_ui_state_hash", pending)
         self.assertEqual(pending["source_ui_state_hash"], self.mapper.build_ui_state_hash(self.ui_state))
         self.assertIn("ocr", pending["candidates"]["filters"])
+        self.assertIn("rsi", pending["candidates"]["filters"])
         self.assertNotIn("buy", pending["candidates"])
         self.assertIn("sell", pending["candidates"])
 
@@ -589,6 +638,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             [
                 "bar.bar_minutes",
                 "buy.filters.ocr",
+                "buy.filters.rsi",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -1074,6 +1124,33 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(patch["value"]["conditions"][1]["operator"], "<=")
         self.assertEqual(patch["value"]["conditions"][1]["value"], -91.0)
 
+    def test_build_approved_rule_patch_preview_builds_buy_rsi_filter_patch(self):
+        preview = self._build_preview()
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"buy.filters.rsi": "APPROVED"},
+        )
+
+        result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+        patch = result["patches"][0]
+
+        self.assertEqual(patch["operation"], "set_filter")
+        self.assertEqual(patch["source_path"], "buy.filters.rsi")
+        self.assertEqual(patch["target_path"], "buy.filters.rsi")
+        self.assertEqual(
+            patch["value"],
+            {
+                "enabled": True,
+                "conditions": [{
+                    "enabled": True,
+                    "operator": "<=",
+                    "threshold": 45.0,
+                    "period": 14,
+                }],
+            },
+        )
+        self.assertEqual(patch["risk"], "low")
+
     def test_build_approved_rule_patch_preview_builds_sell_add_signal_patch(self):
         preview = self._build_preview()
         approval = self.mapper.evaluate_rule_candidate_approval(
@@ -1131,6 +1208,25 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             },
             result["skipped_paths"],
         )
+
+    def test_build_approved_rule_patch_preview_skips_buy_rsi_non_approved_decisions(self):
+        preview = self._build_preview()
+        for decision in ("PENDING", "REJECTED", "DEFERRED", "APPLIED_PREVIEW_ONLY"):
+            approval = self.mapper.evaluate_rule_candidate_approval(
+                preview,
+                {"buy.filters.rsi": decision},
+            )
+
+            result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+
+            self.assertEqual(result["patches"], [])
+            self.assertIn(
+                {
+                    "path": "buy.filters.rsi",
+                    "reason": f"decision is {decision}",
+                },
+                result["skipped_paths"],
+            )
 
     def test_build_approved_rule_patch_preview_warns_unknown_approved_path(self):
         preview = self._build_preview()
@@ -1286,6 +1382,24 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(result["applied_patches"][0]["operation"], "set_indicator")
         self.assertEqual(indicators["rsi"], {"period": 14})
         self.assertEqual(indicators["macd"], self.current_rules["indicators"]["macd"])
+
+    def test_apply_approved_rule_patch_preview_buy_rsi_sets_filter_only(self):
+        patch_preview = self._build_patch_preview({"buy.filters.rsi": "APPROVED"})
+
+        result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+
+        self.assertEqual(result["summary"]["applied"], 1)
+        self.assertEqual(result["applied_patches"][0]["operation"], "set_filter")
+        self.assertEqual(result["applied_rules_preview"]["buy"]["filters"]["rsi"], {
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "operator": "<=",
+                "threshold": 45.0,
+                "period": 14,
+            }],
+        })
+        self.assertEqual(result["applied_rules_preview"]["indicators"], self.current_rules["indicators"])
 
     def test_apply_approved_rule_patch_preview_buy_merge_adds_one_condition(self):
         patch_preview = self._build_patch_preview({"buy.filters.ocr": "APPROVED"})
@@ -1540,6 +1654,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             [
                 "bar.bar_minutes",
                 "buy.filters.ocr",
+                "buy.filters.rsi",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -1955,6 +2070,33 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(diff["operation"], "set_indicator")
         self.assertEqual(diff["change_type"], "set_rsi_indicator")
         self.assertEqual(diff["value"], {"period": 14})
+        self.assertFalse(diff["replace"])
+
+    def test_build_rule_commit_preview_buy_rsi_approved_builds_set_filter_diff(self):
+        preview, session = self._build_commit_session({"buy.filters.rsi": "APPROVED"})
+
+        result = self.mapper.build_rule_commit_preview(
+            self.current_rules,
+            preview,
+            session,
+            {"approval_session_dirty": False},
+        )
+
+        self.assertTrue(result["commit_allowed"])
+        self.assertEqual(len(result["final_diff"]), 1)
+        diff = result["final_diff"][0]
+        self.assertEqual(diff["path"], "buy.filters.rsi")
+        self.assertEqual(diff["operation"], "set_filter")
+        self.assertEqual(diff["change_type"], "set_buy_rsi_filter")
+        self.assertEqual(diff["value"], {
+            "enabled": True,
+            "conditions": [{
+                "enabled": True,
+                "operator": "<=",
+                "threshold": 45.0,
+                "period": 14,
+            }],
+        })
         self.assertFalse(diff["replace"])
 
     def test_build_rule_commit_preview_sell_approved_builds_add_signal_diff(self):
