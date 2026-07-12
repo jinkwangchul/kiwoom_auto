@@ -135,6 +135,38 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[1]
         return next((project_root / "routines").glob("*/rules.json"))
 
+    def _composite_config(self, *, enabled=True, logic="OR", groups=None, policy="AND_REQUIRED"):
+        return {
+            "enabled": enabled,
+            "logic": logic,
+            "include_unreferenced_active_filters": policy,
+            "groups": deepcopy(groups) if groups is not None else [
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["rsi", "moving_average"],
+                },
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["bollinger", "ocr"],
+                },
+            ],
+        }
+
+    def _build_preview_with_composite(self, composite):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["signal_filter"]["buy_composite"] = deepcopy(composite)
+        return self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+
+    def _composite_candidate_value(self, preview):
+        return (
+            preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["composite"]["value"]
+        )
+
     def test_mapper_returns_preview_without_mutating_rules(self):
         result = self._build_preview()
 
@@ -261,6 +293,120 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertNotIn("rsi", candidates.get("filters", {}))
         self.assertIn("rsi", candidates["indicators"])
+
+    def test_buy_composite_absent_does_not_create_candidate(self):
+        result = self._build_preview()
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+
+        self.assertNotIn("composite", candidates.get("filters", {}))
+        self.assertNotIn("buy.filters.composite", result["mapped_paths"])
+        self.assertNotIn("buy.filters.composite", self.mapper.build_rule_approval_session(result)["decisions"])
+
+    def test_buy_composite_enabled_creates_official_filter_candidate(self):
+        result = self._build_preview_with_composite(self._composite_config())
+        value = self._composite_candidate_value(result)
+
+        self.assertEqual(result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["composite"]["path"], "buy.filters.composite")
+        self.assertIn("buy.filters.composite", result["mapped_paths"])
+        self.assertEqual(
+            value,
+            {
+                "enabled": True,
+                "logic": "OR",
+                "include_unreferenced_active_filters": "AND_REQUIRED",
+                "groups": [
+                    {
+                        "enabled": True,
+                        "logic": "AND",
+                        "filters": ["rsi", "moving_average"],
+                    },
+                    {
+                        "enabled": True,
+                        "logic": "AND",
+                        "filters": ["bollinger", "ocr"],
+                    },
+                ],
+            },
+        )
+        self.assertEqual(result["preview_rules"]["buy"]["filters"]["composite"], value)
+
+    def test_buy_composite_disabled_preserves_group_settings(self):
+        groups = [
+            {"enabled": True, "logic": "OR", "filters": ["rsi", "ocr"]},
+            {"enabled": False, "logic": "AND", "filters": ["bollinger", "price_compare"]},
+        ]
+
+        result = self._build_preview_with_composite(self._composite_config(enabled=False, logic="AND", groups=groups))
+        value = self._composite_candidate_value(result)
+
+        self.assertEqual(value["enabled"], False)
+        self.assertEqual(value["logic"], "AND")
+        self.assertEqual(value["groups"], groups)
+
+    def test_buy_composite_maps_top_and_group_logic(self):
+        groups = [
+            {"enabled": True, "logic": "OR", "filters": ["rsi"]},
+            {"enabled": True, "logic": "AND", "filters": ["ocr"]},
+        ]
+
+        and_result = self._build_preview_with_composite(self._composite_config(logic="AND", groups=groups))
+        or_result = self._build_preview_with_composite(self._composite_config(logic="OR", groups=groups))
+
+        self.assertEqual(self._composite_candidate_value(and_result)["logic"], "AND")
+        self.assertEqual(self._composite_candidate_value(or_result)["logic"], "OR")
+        self.assertEqual([group["logic"] for group in self._composite_candidate_value(and_result)["groups"]], ["OR", "AND"])
+
+    def test_buy_composite_preserves_three_or_more_groups_in_order(self):
+        groups = [
+            {"enabled": True, "logic": "AND", "filters": ["rsi"]},
+            {"enabled": False, "logic": "OR", "filters": ["moving_average"]},
+            {"enabled": True, "logic": "AND", "filters": ["price_compare", "bollinger", "ocr"]},
+        ]
+
+        result = self._build_preview_with_composite(self._composite_config(groups=groups))
+
+        self.assertEqual(self._composite_candidate_value(result)["groups"], groups)
+
+    def test_buy_composite_supports_all_filter_names(self):
+        groups = [{
+            "enabled": True,
+            "logic": "AND",
+            "filters": ["rsi", "moving_average", "price_compare", "bollinger", "ocr"],
+        }]
+
+        result = self._build_preview_with_composite(self._composite_config(groups=groups))
+
+        self.assertEqual(self._composite_candidate_value(result)["groups"][0]["filters"], groups[0]["filters"])
+
+    def test_buy_composite_allows_same_filter_across_different_groups(self):
+        groups = [
+            {"enabled": True, "logic": "AND", "filters": ["rsi"]},
+            {"enabled": True, "logic": "OR", "filters": ["rsi", "ocr"]},
+        ]
+
+        result = self._build_preview_with_composite(self._composite_config(groups=groups))
+
+        self.assertEqual(self._composite_candidate_value(result)["groups"], groups)
+
+    def test_buy_composite_invalid_configs_do_not_create_candidate(self):
+        invalid_cases = {
+            "unknown_filter": self._composite_config(groups=[{"enabled": True, "logic": "AND", "filters": ["unknown"]}]),
+            "duplicate_same_group": self._composite_config(groups=[{"enabled": True, "logic": "AND", "filters": ["rsi", "rsi"]}]),
+            "empty_active_group": self._composite_config(groups=[{"enabled": True, "logic": "AND", "filters": []}]),
+            "all_groups_inactive": self._composite_config(groups=[{"enabled": False, "logic": "AND", "filters": ["rsi"]}]),
+            "unsupported_policy": self._composite_config(policy="IGNORE_UNREFERENCED"),
+            "bad_top_logic": self._composite_config(logic="XOR"),
+            "bad_group_logic": self._composite_config(groups=[{"enabled": True, "logic": "XOR", "filters": ["rsi"]}]),
+        }
+
+        for name, composite in invalid_cases.items():
+            with self.subTest(name=name):
+                result = self._build_preview_with_composite(composite)
+                candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+
+                self.assertNotIn("composite", candidates.get("filters", {}))
+                self.assertNotIn("buy.filters.composite", result["mapped_paths"])
+                self.assertNotIn("buy.filters.composite", self.mapper.build_rule_approval_session(result)["decisions"])
 
     def test_rsi_empty_value_does_not_create_candidate(self):
         state = deepcopy(self.ui_state)
@@ -1151,6 +1297,22 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
         self.assertEqual(patch["risk"], "low")
 
+    def test_build_approved_rule_patch_preview_builds_buy_composite_filter_patch(self):
+        preview = self._build_preview_with_composite(self._composite_config())
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"buy.filters.composite": "APPROVED"},
+        )
+
+        result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+        patch = result["patches"][0]
+
+        self.assertEqual(patch["operation"], "set_filter")
+        self.assertEqual(patch["source_path"], "buy.filters.composite")
+        self.assertEqual(patch["target_path"], "buy.filters.composite")
+        self.assertEqual(patch["value"], self._composite_candidate_value(preview))
+        self.assertEqual(patch["risk"], "low")
+
     def test_build_approved_rule_patch_preview_builds_sell_add_signal_patch(self):
         preview = self._build_preview()
         approval = self.mapper.evaluate_rule_candidate_approval(
@@ -1223,6 +1385,25 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.assertIn(
                 {
                     "path": "buy.filters.rsi",
+                    "reason": f"decision is {decision}",
+                },
+                result["skipped_paths"],
+            )
+
+    def test_build_approved_rule_patch_preview_skips_buy_composite_non_approved_decisions(self):
+        preview = self._build_preview_with_composite(self._composite_config())
+        for decision in ("PENDING", "REJECTED", "DEFERRED", "APPLIED_PREVIEW_ONLY"):
+            approval = self.mapper.evaluate_rule_candidate_approval(
+                preview,
+                {"buy.filters.composite": decision},
+            )
+
+            result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+
+            self.assertEqual(result["patches"], [])
+            self.assertIn(
+                {
+                    "path": "buy.filters.composite",
                     "reason": f"decision is {decision}",
                 },
                 result["skipped_paths"],
@@ -1399,6 +1580,24 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "period": 14,
             }],
         })
+        self.assertEqual(result["applied_rules_preview"]["indicators"], self.current_rules["indicators"])
+
+    def test_apply_approved_rule_patch_preview_buy_composite_sets_filter_only(self):
+        preview = self._build_preview_with_composite(self._composite_config())
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"buy.filters.composite": "APPROVED"},
+        )
+        patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+
+        result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+
+        self.assertEqual(result["summary"]["applied"], 1)
+        self.assertEqual(result["applied_patches"][0]["operation"], "set_filter")
+        self.assertEqual(
+            result["applied_rules_preview"]["buy"]["filters"]["composite"],
+            self._composite_candidate_value(preview),
+        )
         self.assertEqual(result["applied_rules_preview"]["indicators"], self.current_rules["indicators"])
 
     def test_apply_approved_rule_patch_preview_buy_merge_adds_one_condition(self):
@@ -2097,6 +2296,32 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
                 "period": 14,
             }],
         })
+        self.assertFalse(diff["replace"])
+
+    def test_build_rule_commit_preview_buy_composite_approved_builds_set_filter_diff(self):
+        preview = self._build_preview_with_composite(self._composite_config())
+        session = self.mapper.build_rule_approval_session(
+            preview,
+            {"buy.filters.composite": "APPROVED"},
+        )
+        fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
+        session["fingerprint"] = fingerprint["fingerprint"]
+        session["fingerprint_detail"] = fingerprint
+
+        result = self.mapper.build_rule_commit_preview(
+            self.current_rules,
+            preview,
+            session,
+            {"approval_session_dirty": False},
+        )
+
+        self.assertTrue(result["commit_allowed"])
+        self.assertEqual(len(result["final_diff"]), 1)
+        diff = result["final_diff"][0]
+        self.assertEqual(diff["path"], "buy.filters.composite")
+        self.assertEqual(diff["operation"], "set_filter")
+        self.assertEqual(diff["change_type"], "set_buy_composite_filter")
+        self.assertEqual(diff["value"], self._composite_candidate_value(preview))
         self.assertFalse(diff["replace"])
 
     def test_build_rule_commit_preview_sell_approved_builds_add_signal_diff(self):

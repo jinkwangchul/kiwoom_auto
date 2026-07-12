@@ -109,6 +109,28 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
     def _write_rules(self, path, rules):
         Path(path).write_text(json.dumps(rules, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _composite_config(self):
+        return {
+            "enabled": True,
+            "logic": "OR",
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["rsi", "moving_average"],
+                },
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["bollinger", "ocr"],
+                },
+            ],
+        }
+
+    def _enable_composite_ui_state(self):
+        self.ui_state["buy_ui"]["signal_filter"]["buy_composite"] = self._composite_config()
+
     def _build_preview(self, rules=None):
         return self.mapper.build_engine_rules_preview_from_ui_state(
             deepcopy(self.ui_state),
@@ -815,6 +837,43 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])
 
+    def test_buy_composite_filter_committed_via_set_filter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            self._write_rules(rules_path, self.current_rules)
+            original_ui_state = deepcopy(self.ui_state)
+            self._enable_composite_ui_state()
+            try:
+                apply_preview, gate, context = self._build_apply_and_gate(
+                    rules_path,
+                    session_path,
+                    {"buy.filters.composite": "APPROVED"},
+                )
+            finally:
+                self.ui_state = original_ui_state
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(saved["buy"]["filters"]["composite"], self._composite_config())
+            self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
+            self.assertEqual(saved["sell"], self.current_rules["sell"])
+            self.assertEqual(saved["indicators"], self.current_rules["indicators"])
+            self.assertEqual(saved["buy"]["groups"], self.current_rules["buy"]["groups"])
+            self.assertEqual(
+                [patch["target_path"] for patch in result["applied_patches"]],
+                ["buy.filters.composite"],
+            )
+            self.assertTrue(result["post_validation"]["ok"])
+            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
+
     def test_buy_execution_base_and_repeat_committed_via_set_execution_policy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"
@@ -1244,6 +1303,22 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
         )
 
         self._assert_post_validation_blocked(result, "buy.filters.rsi")
+
+    def test_deep_compare_detects_final_diff_buy_composite_filter_changed(self):
+        def mutate(apply_preview):
+            apply_preview["applied_rules_preview"]["buy"]["filters"]["composite"]["logic"] = "AND"
+
+        original_ui_state = deepcopy(self.ui_state)
+        self._enable_composite_ui_state()
+        try:
+            result = self._commit_mutated_apply_preview(
+                {"buy.filters.composite": "APPROVED"},
+                mutate,
+            )
+        finally:
+            self.ui_state = original_ui_state
+
+        self._assert_post_validation_blocked(result, "buy.filters.composite")
 
     def test_approval_session_file_is_not_modified(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -534,6 +534,14 @@ def _post_validation(
         and diff.get("path") == "buy.filters.rsi"
         and isinstance(diff.get("value"), dict)
     ]
+    allowed_buy_composite_filter_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_filter"
+        and diff.get("path") == "buy.filters.composite"
+        and isinstance(diff.get("value"), dict)
+    ]
     allowed_buy_execution_base_diffs = [
         diff
         for diff in final_diff
@@ -630,6 +638,14 @@ def _post_validation(
                 )
                 if not matches:
                     add_unexpected(path, "final_diff buy RSI filter missing or changed in post rules")
+            if path == "buy.filters.composite":
+                matches = _path_exists(post_rules, path) and _get_path(post_rules, path) == diff.get("value")
+                add_check(
+                    "final_diff_buy_composite_filter_matches",
+                    matches,
+                )
+                if not matches:
+                    add_unexpected(path, "final_diff buy composite filter missing or changed in post rules")
         if operation == "set_execution_policy":
             path = str(diff.get("path") or "")
             if path == "buy.execution.base":
@@ -778,6 +794,15 @@ def _post_validation(
             )
         elif _path_exists(post_normalized, "buy.filters"):
             _get_path(post_normalized, "buy.filters").pop("rsi", None)
+            if _get_path(post_normalized, "buy.filters") == {} and not _path_exists(pre_normalized, "buy.filters"):
+                _get_path(post_normalized, "buy").pop("filters", None)
+    if allowed_buy_composite_filter_diffs and _path_exists(post_normalized, "buy.filters.composite"):
+        if _path_exists(pre_normalized, "buy.filters.composite"):
+            _get_path(post_normalized, "buy.filters")["composite"] = deepcopy(
+                _get_path(pre_normalized, "buy.filters.composite")
+            )
+        elif _path_exists(post_normalized, "buy.filters"):
+            _get_path(post_normalized, "buy.filters").pop("composite", None)
             if _get_path(post_normalized, "buy.filters") == {} and not _path_exists(pre_normalized, "buy.filters"):
                 _get_path(post_normalized, "buy").pop("filters", None)
     if allowed_buy_execution_base_diffs and _path_exists(post_normalized, "buy.execution.base"):
