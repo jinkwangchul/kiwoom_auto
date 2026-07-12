@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from execution_runtime_allowlist import OPERATION_WRITE
 from execution_runtime_real_commit_readiness_policy import (
     POLICY_TYPE,
     STATUS_READY,
@@ -87,6 +88,36 @@ class ExecutionRuntimeRealCommitReadinessPolicyTest(unittest.TestCase):
         self.assertFalse(result["runtime_write"])
         self.assertTrue(result["preview_only"])
         self.assertTrue(result["environment_checks"]["allow_project_runtime_commit"])
+        self.assertTrue(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertTrue(result["allowlist_decisions"]["runtime_target"]["allowed"])
+
+    def test_unregistered_allowlist_target_blocks(self) -> None:
+        result = self._evaluate(logical_target="order_queue")
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["runtime_commit_allowed"])
+        self.assertFalse(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertIn("RUNTIME_ALLOWLIST_BLOCKED: UNREGISTERED_LOGICAL_TARGET", result["issues"])
+        self.assertEqual("UNREGISTERED_LOGICAL_TARGET", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
+
+    def test_allowlist_write_operation_blocks(self) -> None:
+        result = self._evaluate(allowlist_operation=OPERATION_WRITE)
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["runtime_commit_allowed"])
+        self.assertFalse(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertTrue(
+            any(issue.startswith("RUNTIME_ALLOWLIST_BLOCKED:") for issue in result["issues"])
+        )
+        self.assertIn("RUNTIME_WRITE_DISABLED", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
+
+    def test_allowlist_path_validation_reason_is_reported(self) -> None:
+        result = self._evaluate(logical_target="runtime/order_executions.json")
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["runtime_commit_allowed"])
+        self.assertIn("RUNTIME_ALLOWLIST_BLOCKED: LOGICAL_TARGET_MUST_NOT_BE_PATH", result["issues"])
+        self.assertEqual("LOGICAL_TARGET_MUST_NOT_BE_PATH", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
 
     def test_runtime_api_result_not_ready_blocks(self) -> None:
         result = self._evaluate(runtime_api_result=self._runtime_api_result("BLOCKED"))

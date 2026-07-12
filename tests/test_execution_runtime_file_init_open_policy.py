@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from execution_runtime_allowlist import OPERATION_WRITE
 from execution_runtime_file_init_approval_gate import approve_execution_runtime_file_init
 from execution_runtime_file_init_commit_plan_orchestrator import (
     run_execution_runtime_file_init_commit_plan_orchestrator,
@@ -122,6 +123,36 @@ class ExecutionRuntimeFileInitOpenPolicyTest(unittest.TestCase):
         self.assertTrue(result["required_confirmations"]["manual_project_runtime_path_confirmed"])
         self.assertTrue(result["environment_checks"]["real_runtime_file_init_enabled"])
         self.assertTrue(result["environment_checks"]["allow_project_runtime_file_init"])
+        self.assertTrue(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertTrue(result["allowlist_decisions"]["runtime_target"]["allowed"])
+
+    def test_unregistered_allowlist_target_blocks(self) -> None:
+        result = self._evaluate(logical_target="order_queue")
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["file_init_allowed"])
+        self.assertFalse(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertIn("RUNTIME_ALLOWLIST_BLOCKED: UNREGISTERED_LOGICAL_TARGET", result["issues"])
+        self.assertEqual("UNREGISTERED_LOGICAL_TARGET", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
+
+    def test_allowlist_write_operation_blocks(self) -> None:
+        result = self._evaluate(allowlist_operation=OPERATION_WRITE)
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["file_init_allowed"])
+        self.assertFalse(result["environment_checks"]["runtime_allowlist_valid"])
+        self.assertTrue(
+            any(issue.startswith("RUNTIME_ALLOWLIST_BLOCKED:") for issue in result["issues"])
+        )
+        self.assertIn("RUNTIME_WRITE_DISABLED", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
+
+    def test_allowlist_path_validation_reason_is_reported(self) -> None:
+        result = self._evaluate(logical_target="runtime/order_executions.json")
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertFalse(result["file_init_allowed"])
+        self.assertIn("RUNTIME_ALLOWLIST_BLOCKED: LOGICAL_TARGET_MUST_NOT_BE_PATH", result["issues"])
+        self.assertEqual("LOGICAL_TARGET_MUST_NOT_BE_PATH", result["allowlist_decisions"]["runtime_target"]["blocked_reason"])
 
     def test_orchestrator_blocked_stays_blocked(self) -> None:
         result = self._evaluate(file_init_commit_plan_orchestrator_result=self._orchestrator(status_case="BLOCKED"))

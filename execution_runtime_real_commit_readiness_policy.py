@@ -12,6 +12,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from execution_runtime_allowlist import OPERATION_PREVIEW, validate_runtime_target
+
 
 POLICY_TYPE = "EXECUTION_RUNTIME_REAL_COMMIT_READINESS_POLICY"
 STATUS_READY = "READY_TO_OPEN_RUNTIME_COMMIT"
@@ -53,6 +55,7 @@ def _result(
     warnings: list[str] | None = None,
     required_confirmations: dict[str, Any] | None = None,
     environment_checks: dict[str, Any] | None = None,
+    allowlist_decisions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "policy_type": POLICY_TYPE,
@@ -64,6 +67,7 @@ def _result(
         "warnings": list(warnings or []),
         "required_confirmations": deepcopy(required_confirmations or {}),
         "environment_checks": deepcopy(environment_checks or {}),
+        "allowlist_decisions": deepcopy(allowlist_decisions or {}),
     }
 
 
@@ -75,6 +79,8 @@ def evaluate_execution_runtime_real_commit_readiness(
     order_locks_path: Any,
     confirmations: Any = None,
     environment_flags: Any = None,
+    logical_target: Any = "order_executions",
+    allowlist_operation: Any = OPERATION_PREVIEW,
 ) -> dict[str, Any]:
     """Evaluate whether real project-runtime commit may be opened."""
     if not isinstance(runtime_api_result, dict):
@@ -110,6 +116,13 @@ def evaluate_execution_runtime_real_commit_readiness(
     order_executions_is_project_runtime = _under_project_runtime(order_executions_text)
     order_locks_is_project_runtime = _under_project_runtime(order_locks_text)
     project_runtime_target = order_executions_is_project_runtime or order_locks_is_project_runtime
+    runtime_root = _project_runtime_root()
+    allowlist_decision = validate_runtime_target(
+        logical_target,
+        runtime_root=runtime_root,
+        operation=allowlist_operation,
+    ).to_dict()
+    allowlist_decisions = {"runtime_target": allowlist_decision}
 
     required_confirmations = {
         "manual_execution_runtime_commit_confirmed": confirmation_flags.get(
@@ -126,6 +139,7 @@ def evaluate_execution_runtime_real_commit_readiness(
         "allow_project_runtime_commit": env_flags.get("allow_project_runtime_commit") is True,
         "order_executions_is_project_runtime": order_executions_is_project_runtime,
         "order_locks_is_project_runtime": order_locks_is_project_runtime,
+        "runtime_allowlist_valid": allowlist_decision.get("allowed") is True,
     }
 
     issues: list[str] = []
@@ -142,12 +156,21 @@ def evaluate_execution_runtime_real_commit_readiness(
             issues=["COMMIT_PLAN_ORCHESTRATOR_INVALID"],
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
     if commit_status != "READY":
         issues.append("COMMIT_PLAN_ORCHESTRATOR_NOT_READY")
 
     if commit_plan_orchestrator_result.get("commit_ready") is not True:
         issues.append("COMMIT_READY_IS_NOT_TRUE")
+
+    if allowlist_decision.get("allowed") is not True:
+        reason = (
+            allowlist_decision.get("blocked_reason")
+            or allowlist_decision.get("reason")
+            or allowlist_decision.get("status")
+        )
+        issues.append(f"RUNTIME_ALLOWLIST_BLOCKED: {reason}")
 
     if project_runtime_target and not environment_checks["allow_project_runtime_commit"]:
         issues.append("PROJECT_RUNTIME_COMMIT_NOT_ALLOWED")
@@ -170,6 +193,7 @@ def evaluate_execution_runtime_real_commit_readiness(
             + list(commit_plan_orchestrator_result.get("warnings") or []),
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
 
     return _result(
@@ -179,4 +203,5 @@ def evaluate_execution_runtime_real_commit_readiness(
         + list(commit_plan_orchestrator_result.get("warnings") or []),
         required_confirmations=required_confirmations,
         environment_checks=environment_checks,
+        allowlist_decisions=allowlist_decisions,
     )

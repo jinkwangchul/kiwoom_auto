@@ -12,6 +12,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from execution_runtime_allowlist import OPERATION_PREVIEW, validate_runtime_target
+
 
 POLICY_TYPE = "EXECUTION_RUNTIME_FILE_INIT_OPEN_POLICY"
 STATUS_READY = "READY_TO_OPEN_FILE_INIT"
@@ -59,6 +61,7 @@ def _result(
     warnings: list[str] | None = None,
     required_confirmations: dict[str, Any] | None = None,
     environment_checks: dict[str, Any] | None = None,
+    allowlist_decisions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "policy_type": POLICY_TYPE,
@@ -68,6 +71,7 @@ def _result(
         "runtime_write": False,
         "required_confirmations": deepcopy(required_confirmations or {}),
         "environment_checks": deepcopy(environment_checks or {}),
+        "allowlist_decisions": deepcopy(allowlist_decisions or {}),
         "issues": list(issues or []),
         "warnings": list(warnings or []),
     }
@@ -78,6 +82,8 @@ def evaluate_execution_runtime_file_init_open_policy(
     file_init_commit_plan_orchestrator_result: Any,
     confirmations: Any = None,
     environment_flags: Any = None,
+    logical_target: Any = "order_executions",
+    allowlist_operation: Any = OPERATION_PREVIEW,
 ) -> dict[str, Any]:
     """Evaluate whether project runtime file initialization may be opened."""
     if not isinstance(file_init_commit_plan_orchestrator_result, dict):
@@ -93,6 +99,13 @@ def evaluate_execution_runtime_file_init_open_policy(
     targets = _targets_from_orchestrator(orchestrator)
     order_executions_is_project_runtime = _under_project_runtime(targets.get("order_executions"))
     order_locks_is_project_runtime = _under_project_runtime(targets.get("order_locks"))
+    runtime_root = _project_runtime_root()
+    allowlist_decision = validate_runtime_target(
+        logical_target,
+        runtime_root=runtime_root,
+        operation=allowlist_operation,
+    ).to_dict()
+    allowlist_decisions = {"runtime_target": allowlist_decision}
 
     required_confirmations = {
         "manual_runtime_file_init_commit_confirmed": confirmation_flags.get(
@@ -109,6 +122,7 @@ def evaluate_execution_runtime_file_init_open_policy(
         "allow_project_runtime_file_init": env_flags.get("allow_project_runtime_file_init") is True,
         "order_executions_is_project_runtime": order_executions_is_project_runtime,
         "order_locks_is_project_runtime": order_locks_is_project_runtime,
+        "runtime_allowlist_valid": allowlist_decision.get("allowed") is True,
     }
 
     status = orchestrator.get("status")
@@ -122,6 +136,7 @@ def evaluate_execution_runtime_file_init_open_policy(
             warnings=warnings,
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
     if status == "SKIPPED":
         return _result(
@@ -130,6 +145,7 @@ def evaluate_execution_runtime_file_init_open_policy(
             warnings=warnings or ["FILE_INIT_ALREADY_SKIPPED"],
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
     if status != "READY":
         return _result(
@@ -139,11 +155,19 @@ def evaluate_execution_runtime_file_init_open_policy(
             warnings=warnings,
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
 
     issues: list[str] = []
     if orchestrator.get("init_commit_ready") is not True:
         issues.append("INIT_COMMIT_READY_IS_NOT_TRUE")
+    if allowlist_decision.get("allowed") is not True:
+        reason = (
+            allowlist_decision.get("blocked_reason")
+            or allowlist_decision.get("reason")
+            or allowlist_decision.get("status")
+        )
+        issues.append(f"RUNTIME_ALLOWLIST_BLOCKED: {reason}")
     if not required_confirmations["manual_runtime_file_init_commit_confirmed"]:
         issues.append("MANUAL_RUNTIME_FILE_INIT_COMMIT_CONFIRMATION_REQUIRED")
     if not required_confirmations["manual_project_runtime_path_confirmed"]:
@@ -161,6 +185,7 @@ def evaluate_execution_runtime_file_init_open_policy(
             warnings=warnings,
             required_confirmations=required_confirmations,
             environment_checks=environment_checks,
+            allowlist_decisions=allowlist_decisions,
         )
 
     return _result(
@@ -169,4 +194,5 @@ def evaluate_execution_runtime_file_init_open_policy(
         warnings=warnings,
         required_confirmations=required_confirmations,
         environment_checks=environment_checks,
+        allowlist_decisions=allowlist_decisions,
     )
