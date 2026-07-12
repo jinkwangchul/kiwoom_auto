@@ -23932,3 +23932,31 @@
 파일: runtime/*.json / routines/*/rules.json
 내용: 보호 파일 변경 없음 확인: Runtime Commit Boundary 완료 (전체 unittest 2858 tests OK)
 작성자: admin
+
+[2026-07-11 08:19:12]
+버전: v1.1
+구분: UPDATE
+파일: state.json
+내용: 프로그램재시작 안전초기화: 중지 17개 / 검토관리 0개
+작성자: admin
+
+[2026-07-11 15:23:39]
+버전: v1.1
+구분: UPDATE
+파일: state.json
+내용: 프로그램재시작 안전초기화: 중지 17개 / 검토관리 0개
+작성자: admin
+
+[2026-07-11 16:14:17]
+버전: v1.1
+구분: UPDATE
+파일: state.json
+내용: 프로그램재시작 안전초기화: 중지 17개 / 검토관리 0개
+작성자: admin
+
+[2026-07-12 14:19:00]
+버전: v1.1
+구분: ADD
+파일: Runtime Execution Preview Pipeline (execution_runtime_*.py)
+내용: Runtime Execution Preview Pipeline 확장 — 추가 계층: Runtime Allowlist / Runtime Path Resolver / Readiness·Open Policy Integration / Commit Request Contract / Validation Gate / Handoff Preview / Commit Service Preview Route / Order Executions Pilot Boundary / Production Pilot Approval Gate / Approval Token Contract / Pilot Token Route Preview / Execution Gate Bridge Preview / Execution Gate Dry-run Adapter / Final Authorization Preview. 기록: 실제 Runtime Write 미연결, Commit Service 실제 호출 없음, Runtime Commit Execution Gate 실제 호출 없음, runtime_commit_approval_token_store 저장/조회/소비 미사용, Order Queue 미연결, SendOrder 미연결. 현재 종료 지점: Execution Gate 호출 직전까지 Preview Pipeline 구축 완료. 다음 시작 지점: 기존 Runtime Commit Execution Gate와 실제 Execution Layer 연결 설계.
+작성자: general_code_model
