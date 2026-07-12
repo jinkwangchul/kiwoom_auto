@@ -24,7 +24,10 @@ class ConditionEngineTest(unittest.TestCase):
             "MACD": [0.1, 0.2, 0.5],
             "SIGNAL": [0.2, 0.3, 0.4],
             "CLOSE": [9.0, 10.0, 12.0],
+            "MA5": [13.0, 14.0, 15.0],
+            "MA20": [10.0, 11.0, 12.0],
             "MA60": [10.0, 10.0, 11.0],
+            "MA120": [13.0, 12.0, 12.0],
             "AVG_PRICE": [11.0, 11.0, 11.5],
         }
 
@@ -48,6 +51,51 @@ class ConditionEngineTest(unittest.TestCase):
             "compare_target": "MA",
             "period": 60,
         })
+
+    def test_explicit_moving_average_series_key_condition(self):
+        self.assertConditionPassed({"target": "MA5", "operator": ">", "compare_target": "MA20"})
+
+    def test_moving_average_compare_period_contract(self):
+        self.assertConditionPassed({
+            "target": "MA",
+            "period": 5,
+            "operator": ">",
+            "compare_target": "MA",
+            "compare_period": 20,
+        })
+        self.assertConditionPassed({
+            "target": "MA",
+            "period": 20,
+            "operator": ">",
+            "compare_target": "MA",
+            "compare_period": 60,
+        })
+        self.assertConditionPassed({
+            "target": "MA",
+            "period": 60,
+            "operator": "<",
+            "compare_target": "MA",
+            "compare_period": 120,
+        })
+
+    def test_moving_average_legacy_compare_target_matches_compare_period_contract(self):
+        official = evaluate_condition(
+            {
+                "target": "MA",
+                "period": 5,
+                "operator": ">",
+                "compare_target": "MA",
+                "compare_period": 20,
+            },
+            self.series_map,
+        )
+        legacy = evaluate_condition(
+            {"target": "MA", "period": 5, "operator": ">", "compare_target": "MA20"},
+            self.series_map,
+        )
+
+        self.assertEqual(official.passed, legacy.passed)
+        self.assertTrue(legacy.passed, legacy)
 
     def test_price_compare_condition_uses_percent_offset(self):
         self.assertConditionPassed({

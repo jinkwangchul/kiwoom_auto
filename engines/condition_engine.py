@@ -113,7 +113,10 @@ def _safe_float(value: Any) -> float | None:
 def _series_key(condition: dict[str, Any], target_key: str = "target") -> str:
     target = _norm(condition.get(target_key))
     if target == "MA":
-        period = int(_safe_float(condition.get("period")) or 0)
+        period_key = "compare_period" if target_key == "compare_target" else "period"
+        period = int(_safe_float(condition.get(period_key)) or 0)
+        if period <= 0 and target_key == "compare_target":
+            period = int(_safe_float(condition.get("period")) or 0)
         return f"MA{period}" if period > 0 else "MA"
     return target
 
