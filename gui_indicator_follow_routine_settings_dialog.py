@@ -1819,6 +1819,121 @@ class IndicatorFollowRoutineSettingsDialog(
                 result["skipped"].append(skipped)
         return result
 
+    def _default_buy_composite_ui_state(self):
+        return {
+            "enabled": False,
+            "logic": "OR",
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": [
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["rsi", "moving_average"],
+                },
+                {
+                    "enabled": True,
+                    "logic": "AND",
+                    "filters": ["bollinger", "ocr"],
+                },
+            ],
+        }
+
+    def _buy_composite_filter_names(self):
+        return ["rsi", "moving_average", "price_compare", "bollinger", "ocr"]
+
+    def _set_buy_composite_warning(self, message):
+        label = getattr(self, "buy_composite_warning_label", None)
+        if label is None:
+            return
+        if hasattr(label, "setText"):
+            label.setText(message or "")
+        if hasattr(label, "setVisible"):
+            label.setVisible(bool(message))
+
+    def _collect_buy_composite_ui_state(self):
+        groups = []
+        for group_index in (1, 2):
+            filters = []
+            for filter_name in self._buy_composite_filter_names():
+                check_name = f"buy_composite_group_{group_index}_{filter_name}_check"
+                if self._read_ui_widget_value(check_name) is True:
+                    filters.append(filter_name)
+            groups.append({
+                "enabled": bool(self._read_ui_widget_value(f"buy_composite_group_{group_index}_enabled_check")),
+                "logic": str(self._read_ui_widget_value(f"buy_composite_group_{group_index}_logic_combo") or "AND"),
+                "filters": filters,
+            })
+
+        return {
+            "enabled": bool(self._read_ui_widget_value("buy_composite_enabled_check")),
+            "logic": str(self._read_ui_widget_value("buy_composite_logic_combo") or "OR"),
+            "include_unreferenced_active_filters": "AND_REQUIRED",
+            "groups": groups,
+        }
+
+    def _apply_buy_composite_ui_state(self, values, result=None):
+        result = result if result is not None else {"applied": [], "skipped": []}
+        state = deepcopy(values) if isinstance(values, dict) else self._default_buy_composite_ui_state()
+        groups = state.get("groups")
+        if not isinstance(groups, list):
+            groups = self._default_buy_composite_ui_state()["groups"]
+
+        if len(groups) > 2:
+            message = (
+                "Composite setting exceeds the UI-supported group count. "
+                "Existing settings are preserved, but this screen cannot edit them."
+            )
+            self._set_buy_composite_warning(message)
+            result["skipped"].append({
+                "name": "buy_ui.signal_filter.buy_composite",
+                "reason": "unsupported_group_count",
+                "groups": len(groups),
+            })
+            for name in vars(self):
+                if name.startswith("buy_composite_"):
+                    widget = getattr(self, name, None)
+                    if hasattr(widget, "setEnabled"):
+                        widget.setEnabled(False)
+            return result
+
+        self._set_buy_composite_warning("")
+        self._apply_ui_widget_value("buy_composite_enabled_check", bool(state.get("enabled", False)))
+        self._apply_ui_widget_value("buy_composite_logic_combo", state.get("logic", "OR"))
+        self._apply_ui_widget_value("buy_composite_include_unreferenced_combo", "AND_REQUIRED")
+
+        default_groups = self._default_buy_composite_ui_state()["groups"]
+        for group_index in (1, 2):
+            group = groups[group_index - 1] if group_index <= len(groups) and isinstance(groups[group_index - 1], dict) else default_groups[group_index - 1]
+            self._apply_ui_widget_value(
+                f"buy_composite_group_{group_index}_enabled_check",
+                bool(group.get("enabled", False)),
+            )
+            self._apply_ui_widget_value(
+                f"buy_composite_group_{group_index}_logic_combo",
+                group.get("logic", "AND"),
+            )
+
+            selected_filters = set()
+            for filter_name in group.get("filters", []):
+                if filter_name in self._buy_composite_filter_names():
+                    selected_filters.add(filter_name)
+                else:
+                    result["skipped"].append({
+                        "name": f"buy_ui.signal_filter.buy_composite.groups[{group_index - 1}].filters",
+                        "reason": "unknown_filter",
+                        "value": filter_name,
+                    })
+
+            for filter_name in self._buy_composite_filter_names():
+                self._apply_ui_widget_value(
+                    f"buy_composite_group_{group_index}_{filter_name}_check",
+                    filter_name in selected_filters,
+                )
+
+        if hasattr(self, "_sync_buy_composite_control_states"):
+            self._sync_buy_composite_control_states()
+        return result
+
     def _sync_indicator_follow_ui_after_apply(self):
         errors = []
         sync_names = [
@@ -1872,7 +1987,17 @@ class IndicatorFollowRoutineSettingsDialog(
 
         buy_ui = state.get("buy_ui", {})
         if isinstance(buy_ui, dict):
-            self._apply_named_ui_values(buy_ui.get("signal_filter", {}), result=result)
+            signal_filter = buy_ui.get("signal_filter", {})
+            flat_signal_filter = {
+                key: value
+                for key, value in signal_filter.items()
+                if key != "buy_composite"
+            } if isinstance(signal_filter, dict) else {}
+            self._apply_named_ui_values(flat_signal_filter, result=result)
+            self._apply_buy_composite_ui_state(
+                signal_filter.get("buy_composite") if isinstance(signal_filter, dict) else None,
+                result=result,
+            )
             self._apply_prefixed_ui_values(buy_ui.get("base", {}), "buy_base_", result=result)
             self._apply_prefixed_ui_values(buy_ui.get("repeat", {}), "buy_base_", result=result)
             self._apply_prefixed_ui_values(
@@ -2010,6 +2135,7 @@ class IndicatorFollowRoutineSettingsDialog(
                 **self._collect_prefixed_ui_values(("buy_bollinger_",)),
                 **self._collect_prefixed_ui_values(("buy_ma_",)),
                 **self._collect_prefixed_ui_values(("buy_rsi_",)),
+                "buy_composite": self._collect_buy_composite_ui_state(),
             },
             "base": self._collect_named_ui_values_without_prefix(
                 buy_base_section_names,

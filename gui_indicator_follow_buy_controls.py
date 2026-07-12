@@ -158,6 +158,139 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         layout.addStretch(1)
         return box
 
+    def _make_buy_composite_filter_controls(self):
+        box = QGroupBox("Composite BUY Filter")
+        box.setStyleSheet(
+            "QGroupBox { font-weight: bold; } "
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+        )
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setSpacing(4)
+
+        def make_combo(items, current, width):
+            combo = QComboBox()
+            combo.addItems(items)
+            combo.setCurrentText(current)
+            combo.setFixedWidth(width)
+            combo.setFixedHeight(28)
+            combo.setStyleSheet("font-size: 8pt;")
+            return combo
+
+        def make_check(text, checked=False):
+            check = QCheckBox(text)
+            check.setChecked(checked)
+            check.setFixedHeight(28)
+            check.setStyleSheet("font-size: 8pt;")
+            return check
+
+        def make_label(text, width=None):
+            label = QLabel(text)
+            label.setFixedHeight(28)
+            label.setStyleSheet("font-size: 8pt;")
+            if width is not None:
+                label.setFixedWidth(width)
+            return label
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(4)
+        layout.addLayout(top_row)
+
+        self.buy_composite_enabled_check = make_check("Use Composite", False)
+        self.buy_composite_logic_combo = make_combo(["AND", "OR"], "OR", 62)
+        self.buy_composite_include_unreferenced_combo = make_combo(["AND_REQUIRED"], "AND_REQUIRED", 128)
+        self.buy_composite_include_unreferenced_combo.setEnabled(False)
+        top_row.addWidget(self.buy_composite_enabled_check)
+        top_row.addWidget(make_label("Logic", 38))
+        top_row.addWidget(self.buy_composite_logic_combo)
+        top_row.addWidget(make_label("Unreferenced", 84))
+        top_row.addWidget(self.buy_composite_include_unreferenced_combo)
+        top_row.addStretch(1)
+
+        self.buy_composite_warning_label = QLabel("")
+        self.buy_composite_warning_label.setStyleSheet("font-size: 8pt; color: #8a4b00;")
+        self.buy_composite_warning_label.setVisible(False)
+        layout.addWidget(self.buy_composite_warning_label)
+
+        filter_specs = [
+            ("rsi", "RSI"),
+            ("moving_average", "MA"),
+            ("price_compare", "Price"),
+            ("bollinger", "Bollinger"),
+            ("ocr", "OCR"),
+        ]
+        default_filters = {
+            1: {"rsi", "moving_average"},
+            2: {"bollinger", "ocr"},
+        }
+
+        for group_index in (1, 2):
+            row = QHBoxLayout()
+            row.setContentsMargins(12, 0, 0, 0)
+            row.setSpacing(4)
+            layout.addLayout(row)
+
+            enabled = make_check(f"Group {group_index}", True)
+            logic = make_combo(["AND", "OR"], "AND", 62)
+            setattr(self, f"buy_composite_group_{group_index}_enabled_check", enabled)
+            setattr(self, f"buy_composite_group_{group_index}_logic_combo", logic)
+
+            row.addWidget(enabled)
+            row.addWidget(logic)
+            for filter_name, label in filter_specs:
+                check = make_check(label, filter_name in default_filters[group_index])
+                setattr(self, f"buy_composite_group_{group_index}_{filter_name}_check", check)
+                row.addWidget(check)
+            row.addStretch(1)
+
+        def connect_signal(widget, signal_name, callback):
+            signal = getattr(widget, signal_name, None)
+            if hasattr(signal, "connect"):
+                signal.connect(callback)
+
+        connect_signal(
+            self.buy_composite_enabled_check,
+            "toggled",
+            lambda *_args: self._sync_buy_composite_control_states(),
+        )
+        for group_index in (1, 2):
+            group_enabled = getattr(self, f"buy_composite_group_{group_index}_enabled_check")
+            connect_signal(group_enabled, "toggled", lambda *_args: self._sync_buy_composite_control_states())
+
+        self._sync_buy_composite_control_states()
+        return box
+
+    def _sync_buy_composite_control_states(self):
+        enabled_widget = getattr(self, "buy_composite_enabled_check", None)
+        composite_enabled = enabled_widget.isChecked() if hasattr(enabled_widget, "isChecked") else False
+
+        for name in (
+            "buy_composite_logic_combo",
+            "buy_composite_include_unreferenced_combo",
+        ):
+            widget = getattr(self, name, None)
+            if hasattr(widget, "setEnabled"):
+                widget.setEnabled(composite_enabled and name != "buy_composite_include_unreferenced_combo")
+
+        for group_index in (1, 2):
+            group_enabled_widget = getattr(self, f"buy_composite_group_{group_index}_enabled_check", None)
+            group_enabled = (
+                group_enabled_widget.isChecked()
+                if hasattr(group_enabled_widget, "isChecked")
+                else False
+            )
+            if hasattr(group_enabled_widget, "setEnabled"):
+                group_enabled_widget.setEnabled(composite_enabled)
+
+            for name in [f"buy_composite_group_{group_index}_logic_combo"] + [
+                f"buy_composite_group_{group_index}_{filter_name}_check"
+                for filter_name in ("rsi", "moving_average", "price_compare", "bollinger", "ocr")
+            ]:
+                widget = getattr(self, name, None)
+                if hasattr(widget, "setEnabled"):
+                    widget.setEnabled(composite_enabled and group_enabled)
+
     def _make_buy_method_overview_controls_legacy(self):
         box = QGroupBox("")
         box.setStyleSheet(
@@ -1791,6 +1924,7 @@ class IndicatorFollowBuyControlsMixin(IndicatorFollowBuyMethodControlsMixin):
         first_layout.setSpacing(8)
         first_layout.addWidget(self._make_buy_method_overview_controls(("base", "repeat", "price_compare")))
         first_layout.addWidget(self._make_buy_filter_overview_controls())
+        first_layout.addWidget(self._make_buy_composite_filter_controls())
         first_layout.addStretch(1)
         top_grid.addWidget(first_column, 0, 0)
 
