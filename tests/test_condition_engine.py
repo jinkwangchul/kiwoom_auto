@@ -338,6 +338,46 @@ class ConditionEngineTest(unittest.TestCase):
         self.assertEqual(signal.signal, "BUY")
         self.assertEqual(signal.matched_groups, ["ui_buy_conditions"])
 
+    def test_disabled_ui_condition_a_signal_is_not_evaluated(self):
+        module = _load_routine_engine_module()
+        config = deepcopy(module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
+        config["buy"]["delay_bar"] = 0
+        config["buy"]["groups"] = [
+            {
+                "enabled": True,
+                "name": "ui_buy_conditions",
+                "conditions": [
+                    {"enabled": True, "not": False, "target": "CLOSE", "operator": ">=", "value": 12}
+                ],
+            }
+        ]
+        config["sell"] = {
+            "delay_bar": 0,
+            "signals": {
+                "macd_sell": {"enabled": False, "groups": []},
+                "ui_condition_a": {
+                    "enabled": False,
+                    "groups": [
+                        {
+                            "enabled": True,
+                            "name": "disabled_ui_condition_a",
+                            "conditions": [{"target": "CLOSE", "operator": ">=", "value": 12}],
+                        }
+                    ],
+                },
+            },
+        }
+        candles = [
+            {"close": 10, "volume": 100},
+            {"close": 11, "volume": 100},
+            {"close": 12, "volume": 100},
+        ]
+
+        signal = module.evaluate_indicator_follow_routine(candles, config, {})
+
+        self.assertEqual(signal.signal, "BUY")
+        self.assertEqual(signal.matched_groups, ["ui_buy_conditions"])
+
     def test_sell_signal_is_returned_when_ui_sell_signal_conditions_pass(self):
         module = _load_routine_engine_module()
         config = deepcopy(module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
