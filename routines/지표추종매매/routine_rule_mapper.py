@@ -971,7 +971,9 @@ def build_engine_rules_preview_from_ui_state(
     current_rules: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build a preview-only engine rules candidate from saved UI state."""
-    warnings: list[str] = []
+    validation_warnings: list[str] = []
+    postponed: list[str] = []
+    legacy_notices: list[str] = []
     preview_rules = deepcopy(current_rules) if isinstance(current_rules, dict) else {}
     source_rules = current_rules if isinstance(current_rules, dict) else {}
     preview_rules["bar"] = {}
@@ -981,7 +983,7 @@ def build_engine_rules_preview_from_ui_state(
     basic = _as_dict(state.get("basic"))
     bar_minutes = _safe_int(basic.get("basic_signal_interval_combo"))
     if bar_minutes is None:
-        warnings.append("basic signal interval is not numeric; bar.bar_minutes not mapped")
+        validation_warnings.append("basic signal interval is not numeric; bar.bar_minutes not mapped")
     else:
         preview_rules["bar"]["bar_minutes"] = bar_minutes
         preview_candidates["bar"] = {
@@ -995,56 +997,58 @@ def build_engine_rules_preview_from_ui_state(
     execution_base = _as_dict(buy_ui.get("base"))
     execution_repeat = _as_dict(buy_ui.get("repeat"))
 
-    buy_ocr_filter_candidate = _build_buy_ocr_filter_candidate(signal_filter, warnings)
+    buy_ocr_filter_candidate = _build_buy_ocr_filter_candidate(signal_filter, validation_warnings)
     if buy_ocr_filter_candidate:
         _set_path_value(preview_rules, BUY_OCR_FILTER_PATH, buy_ocr_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["ocr"] = buy_ocr_filter_candidate
 
     buy_candidate = None
-    buy_conditions = [] if buy_ocr_filter_candidate else _build_buy_osc_conditions(signal_filter, warnings)
+    buy_conditions = [] if buy_ocr_filter_candidate else _build_buy_osc_conditions(signal_filter, validation_warnings)
     if buy_conditions:
-        buy_candidate = _build_buy_merge_candidate(source_rules, buy_conditions, warnings)
+        buy_candidate = _build_buy_merge_candidate(source_rules, buy_conditions, validation_warnings)
         if buy_candidate:
             preview_candidates["buy"] = buy_candidate
+    elif buy_ocr_filter_candidate:
+        legacy_notices.append("legacy buy OCR/OSC merge candidate skipped because buy.filters.ocr is available")
     else:
-        warnings.append("buy OCR/OSC candidate group was not generated")
+        validation_warnings.append("buy OCR/OSC candidate group was not generated")
 
-    buy_ma_filter_candidate = _build_buy_ma_filter_candidate(signal_filter, warnings)
+    buy_ma_filter_candidate = _build_buy_ma_filter_candidate(signal_filter, validation_warnings)
     if buy_ma_filter_candidate:
         _set_path_value(preview_rules, BUY_MOVING_AVERAGE_FILTER_PATH, buy_ma_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["moving_average"] = buy_ma_filter_candidate
 
-    buy_bollinger_filter_candidate = _build_buy_bollinger_filter_candidate(signal_filter, warnings)
+    buy_bollinger_filter_candidate = _build_buy_bollinger_filter_candidate(signal_filter, validation_warnings)
     if buy_bollinger_filter_candidate:
         _set_path_value(preview_rules, BUY_BOLLINGER_FILTER_PATH, buy_bollinger_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["bollinger"] = buy_bollinger_filter_candidate
 
-    buy_price_compare_filter_candidate = _build_buy_price_compare_filter_candidate(price_compare, warnings)
+    buy_price_compare_filter_candidate = _build_buy_price_compare_filter_candidate(price_compare, validation_warnings)
     if buy_price_compare_filter_candidate:
         _set_path_value(preview_rules, BUY_PRICE_COMPARE_FILTER_PATH, buy_price_compare_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["price_compare"] = buy_price_compare_filter_candidate
 
-    buy_rsi_filter_candidate = _build_buy_rsi_filter_candidate(signal_filter, warnings)
+    buy_rsi_filter_candidate = _build_buy_rsi_filter_candidate(signal_filter, validation_warnings)
     if buy_rsi_filter_candidate:
         _set_path_value(preview_rules, BUY_RSI_FILTER_PATH, buy_rsi_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["rsi"] = buy_rsi_filter_candidate
 
-    buy_composite_filter_candidate = _build_buy_composite_filter_candidate(signal_filter, warnings)
+    buy_composite_filter_candidate = _build_buy_composite_filter_candidate(signal_filter, validation_warnings)
     if buy_composite_filter_candidate:
         _set_path_value(preview_rules, BUY_COMPOSITE_FILTER_PATH, buy_composite_filter_candidate["value"])
         preview_candidates.setdefault("filters", {})["composite"] = buy_composite_filter_candidate
 
-    buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, warnings)
+    buy_execution_base_candidate = _build_buy_execution_base_candidate(execution_base, validation_warnings)
     if buy_execution_base_candidate:
         _set_path_value(preview_rules, BUY_EXECUTION_BASE_PATH, buy_execution_base_candidate["value"])
         preview_candidates.setdefault("execution", {})["base"] = buy_execution_base_candidate
 
-    buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(execution_repeat, warnings)
+    buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(execution_repeat, validation_warnings)
     if buy_execution_repeat_candidate:
         _set_path_value(preview_rules, BUY_EXECUTION_REPEAT_PATH, buy_execution_repeat_candidate["value"])
         preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate
 
-    rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, warnings)
+    rsi_candidate = _build_rsi_indicator_candidate(source_rules, signal_filter, validation_warnings)
     if rsi_candidate:
         indicators_section = preview_rules.setdefault("indicators", {})
         if isinstance(indicators_section, dict):
@@ -1056,7 +1060,7 @@ def build_engine_rules_preview_from_ui_state(
     sell_ui = _as_dict(state.get("sell_ui"))
     signal_conditions = _as_dict(sell_ui.get("signal_conditions"))
     condition_c = _as_dict(signal_conditions.get("condition_c"))
-    sell_indicator_condition = _build_sell_condition_c_indicator_condition(condition_c, warnings)
+    sell_indicator_condition = _build_sell_condition_c_indicator_condition(condition_c, validation_warnings)
     if sell_indicator_condition:
         preview_candidates["sell"] = {
             "add_signal_candidate": {
@@ -1072,9 +1076,9 @@ def build_engine_rules_preview_from_ui_state(
                 }],
             }
         }
-        warnings.append("sell condition C MACD is an add_signal_candidate and does not replace existing macd_sell")
+        legacy_notices.append("sell condition C MACD is an add_signal_candidate and does not replace existing macd_sell")
     else:
-        warnings.append("sell condition C MACD candidate group was not generated")
+        validation_warnings.append("sell condition C MACD candidate group was not generated")
 
     preview_rules["indicator_follow_rule_preview"] = {
         "mode": "merge_add_candidate",
@@ -1082,11 +1086,10 @@ def build_engine_rules_preview_from_ui_state(
     }
 
     if not buy_execution_base_candidate:
-        warnings.append("buy method mapping is postponed")
+        postponed.append("buy method mapping is postponed")
     if not buy_execution_repeat_candidate:
-        warnings.append("repeat buy mapping is postponed")
-    warnings.extend([
-        "price compare buy mapping is postponed",
+        postponed.append("repeat buy mapping is postponed")
+    postponed.extend([
         "situation response mapping is postponed",
         "additional feature mapping is postponed",
         "cycle setting mapping is postponed",
@@ -1122,9 +1125,13 @@ def build_engine_rules_preview_from_ui_state(
         SELL_MACD_SIGNAL_PREVIEW_PATH,
     ])
 
+    warnings = list(validation_warnings) + list(postponed)
     return {
         "preview_rules": preview_rules,
         "mapped_paths": mapped_paths,
+        "validation_warnings": validation_warnings,
+        "postponed": postponed,
+        "legacy_notices": legacy_notices,
         "warnings": warnings,
     }
 
@@ -1150,6 +1157,9 @@ def build_engine_rules_pending_from_ui_state(
     return {
         "pending_rules": pending_rules,
         "preview_result": preview_result,
+        "validation_warnings": list(preview_result.get("validation_warnings", [])),
+        "postponed": list(preview_result.get("postponed", [])),
+        "legacy_notices": list(preview_result.get("legacy_notices", [])),
         "warnings": list(preview_result.get("warnings", [])),
     }
 
@@ -2737,9 +2747,17 @@ def compare_engine_rules_preview(
     preview = _as_dict(preview_result)
     preview_rules = _as_dict(preview.get("preview_rules"))
     mapped_paths = preview.get("mapped_paths")
-    warnings = preview.get("warnings")
     paths = mapped_paths if isinstance(mapped_paths, list) else []
-    warning_list = warnings if isinstance(warnings, list) else []
+    validation_warnings = preview.get("validation_warnings")
+    postponed = preview.get("postponed")
+    legacy_notices = preview.get("legacy_notices")
+    fallback_warnings = preview.get("warnings")
+    validation_warning_list = validation_warnings if isinstance(validation_warnings, list) else []
+    postponed_list = postponed if isinstance(postponed, list) else []
+    legacy_notice_list = legacy_notices if isinstance(legacy_notices, list) else []
+    if not validation_warning_list and not postponed_list and isinstance(fallback_warnings, list):
+        validation_warning_list = fallback_warnings
+    warning_list = list(validation_warning_list) + list(postponed_list)
     preview_candidates = _as_dict(
         _as_dict(preview_rules.get("indicator_follow_rule_preview")).get("candidates")
     )
@@ -2751,7 +2769,10 @@ def compare_engine_rules_preview(
         "missing": 0,
         "merge_candidate": 0,
         "add_signal_candidate": 0,
-        "postponed": len(warning_list),
+        "validation": len(validation_warning_list),
+        "postponed": len(postponed_list),
+        "legacy": len(legacy_notice_list),
+        "warnings_total": len(warning_list),
     }
     changes: list[dict[str, Any]] = []
 
@@ -2839,5 +2860,8 @@ def compare_engine_rules_preview(
     return {
         "changes": changes,
         "summary": summary,
+        "validation_warnings": list(validation_warning_list),
+        "postponed": list(postponed_list),
+        "legacy_notices": list(legacy_notice_list),
         "warnings": list(warning_list),
     }

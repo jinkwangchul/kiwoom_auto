@@ -194,6 +194,23 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertTrue(all(isinstance(warning, str) for warning in result["warnings"]))
         self.assertTrue(all(warning.isascii() for warning in result["warnings"]))
 
+    def test_report_classifies_validation_postponed_and_legacy_messages(self):
+        result = self._build_preview()
+
+        self.assertEqual(result["validation_warnings"], [])
+        self.assertEqual(len(result["postponed"]), 9)
+        self.assertEqual(len(result["legacy_notices"]), 2)
+        self.assertEqual(result["warnings"], result["validation_warnings"] + result["postponed"])
+        self.assertTrue(all("legacy" not in warning.lower() for warning in result["warnings"]))
+
+    def test_completed_buy_filters_are_not_reported_as_postponed(self):
+        result = self._build_preview()
+        warning_text = "\n".join(result["warnings"])
+
+        for completed_filter in ("RSI", "OCR", "composite", "price compare"):
+            self.assertNotIn(f"{completed_filter} mapping is postponed", warning_text)
+            self.assertNotIn(f"{completed_filter} buy mapping is postponed", warning_text)
+
     def test_preview_bar_contains_only_bar_minutes(self):
         result = self._build_preview()
         preview_bar = result["preview_rules"]["bar"]
@@ -748,11 +765,18 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(diff["changes"][0]["status"], "missing")
         self.assertEqual(diff["summary"]["missing"], 1)
 
-    def test_compare_preview_uses_warning_count_for_postponed_summary(self):
+    def test_compare_preview_reports_classified_warning_counts(self):
         result = self._build_preview()
         diff = self.mapper.compare_engine_rules_preview(self.current_rules, result)
 
+        self.assertEqual(diff["summary"]["validation"], len(result["validation_warnings"]))
         self.assertEqual(diff["summary"]["postponed"], len(result["warnings"]))
+        self.assertEqual(diff["summary"]["postponed"], len(result["postponed"]))
+        self.assertEqual(diff["summary"]["legacy"], len(result["legacy_notices"]))
+        self.assertEqual(diff["summary"]["warnings_total"], len(result["warnings"]))
+        self.assertEqual(diff["validation_warnings"], result["validation_warnings"])
+        self.assertEqual(diff["postponed"], result["postponed"])
+        self.assertEqual(diff["legacy_notices"], result["legacy_notices"])
         self.assertEqual(diff["warnings"], result["warnings"])
 
     def test_build_pending_namespace_without_mutating_rules(self):
