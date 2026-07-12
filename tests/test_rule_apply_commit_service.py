@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from importlib.util import module_from_spec, spec_from_file_location
@@ -197,7 +197,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             gate["commit_allowed"] = False
             before = self._file_sha256(rules_path)
@@ -221,7 +221,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             _apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -242,7 +242,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             apply_preview = deepcopy(apply_preview)
             apply_preview.pop("applied_rules_preview", None)
@@ -265,7 +265,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context["expected_file_sha256"] = "mismatch"
 
@@ -287,7 +287,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context["expected_rules_hash"] = "mismatch"
 
@@ -309,7 +309,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             gate = deepcopy(gate)
             gate["rules_hash_check"]["current_rules_hash"] = "mismatch"
@@ -332,7 +332,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context.pop("allowed_rules_path", None)
 
@@ -358,7 +358,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context["allowed_rules_path"] = str(allowed_path.resolve())
 
@@ -386,7 +386,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 other_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context["allowed_rules_path"] = str(allowed_path.resolve())
 
@@ -408,7 +408,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             context["allowed_rules_path"] = str(rules_path.resolve())
 
@@ -430,7 +430,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -453,7 +453,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             changed = deepcopy(apply_preview)
             changed["applied_rules_preview"]["buy"]["groups"][0]["conditions"].append({
@@ -486,7 +486,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             gate = deepcopy(gate)
             gate.pop("apply_preview_hash", None)
@@ -512,7 +512,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             gate = deepcopy(gate)
             gate["apply_preview_hash"] = "mismatch"
@@ -540,7 +540,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -569,7 +569,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             before = self._file_sha256(rules_path)
             rule_apply_commit_service._create_backup = failing_backup
@@ -595,7 +595,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -606,16 +606,18 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             )
             saved = json.loads(rules_path.read_text(encoding="utf-8"))
             conditions = saved["buy"]["groups"][0]["conditions"]
+            ocr_filter = saved["buy"]["filters"]["ocr"]
 
             self.assertTrue(result["ok"])
             self.assertTrue(any(condition.get("target") == "OSC" and condition.get("operator") == "TURN_UP" for condition in conditions))
-            self.assertTrue(any(condition.get("target") == "OSC" and condition.get("operator") == "<=" and condition.get("value") == -91.0 for condition in conditions))
+            self.assertEqual(ocr_filter["conditions_logic"], "AND")
+            self.assertTrue(any(condition.get("target") == "OSC" and condition.get("operator") == "<=" and condition.get("value") == -91.0 for condition in ocr_filter["conditions"]))
             self.assertEqual(len(saved["buy"]["groups"]), len(self.current_rules["buy"]["groups"]))
             self.assertEqual(saved.get("bar"), self.current_rules.get("bar"))
             self.assertEqual(saved["sell"], self.current_rules["sell"])
             self.assertEqual(
                 [patch["target_path"] for patch in result["applied_patches"]],
-                ["buy.groups[0].conditions"],
+                ["buy.filters.ocr"],
             )
 
     def test_buy_ma_price_compare_and_bollinger_conditions_added_and_other_sections_unchanged(self):
@@ -651,7 +653,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                     {
                         "buy.filters.moving_average": "APPROVED",
                         "buy.filters.price_compare": "APPROVED",
-                        "buy.groups[0].conditions": "APPROVED",
+                        "buy.filters.ocr": "APPROVED",
                     },
                 )
             finally:
@@ -875,7 +877,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             }
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -947,7 +949,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 rules_path,
                 session_path,
                 {
-                    "buy.groups[0].conditions": "APPROVED",
+                    "buy.filters.ocr": "APPROVED",
                     "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
                 },
             )
@@ -973,7 +975,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 session_path,
                 {
                     "bar.bar_minutes": "APPROVED",
-                    "buy.groups[0].conditions": "APPROVED",
+                    "buy.filters.ocr": "APPROVED",
                     "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
                 },
             )
@@ -1020,7 +1022,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["buy"]["groups"][1]["enabled"] = True
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1031,7 +1033,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["buy"]["groups"][0]["name"] = "changed"
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1045,7 +1047,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             ]
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1056,7 +1058,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["buy"]["groups"][0]["conditions"][0]["operator"] = "TURN_DOWN"
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1068,7 +1070,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             conditions.append(deepcopy(conditions[-1]))
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1142,7 +1144,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
         for expected_path, mutate in cases:
             with self.subTest(expected_path=expected_path):
                 result = self._commit_mutated_apply_preview(
-                    {"buy.groups[0].conditions": "APPROVED"},
+                    {"buy.filters.ocr": "APPROVED"},
                     mutate,
                     rules,
                 )
@@ -1160,7 +1162,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["unknown_namespace"] = {"value": True}
 
         result = self._commit_mutated_apply_preview(
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
             mutate,
         )
 
@@ -1168,8 +1170,8 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
     def test_deep_compare_detects_final_diff_buy_condition_missing(self):
         def mutate(apply_preview):
-            conditions = apply_preview["applied_rules_preview"]["buy"]["groups"][0]["conditions"]
-            apply_preview["applied_rules_preview"]["buy"]["groups"][0]["conditions"] = [
+            conditions = apply_preview["applied_rules_preview"]["buy"]["filters"]["ocr"]["conditions"]
+            apply_preview["applied_rules_preview"]["buy"]["filters"]["ocr"]["conditions"] = [
                 condition
                 for condition in conditions
                 if not (
@@ -1181,13 +1183,13 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
         result = self._commit_mutated_apply_preview(
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             },
             mutate,
         )
 
-        self._assert_post_validation_blocked(result, "buy.groups[0].conditions")
+        self._assert_post_validation_blocked(result, "buy.filters.ocr")
 
     def test_approval_session_file_is_not_modified(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1197,7 +1199,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             session_before = self._file_sha256(session_path)
 
@@ -1221,7 +1223,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -1243,7 +1245,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"buy.groups[0].conditions": "APPROVED"},
+                {"buy.filters.ocr": "APPROVED"},
             )
             original_apply = deepcopy(apply_preview)
             original_gate = deepcopy(gate)
@@ -1626,3 +1628,4 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

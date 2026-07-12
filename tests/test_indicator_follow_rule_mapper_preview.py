@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from importlib.util import module_from_spec, spec_from_file_location
@@ -148,7 +148,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             result["mapped_paths"],
             [
                 "bar.bar_minutes",
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -173,7 +173,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(namespace["mode"], "merge_add_candidate")
         self.assertIn("bar", namespace["candidates"])
-        self.assertIn("buy", namespace["candidates"])
+        self.assertIn("ocr", namespace["candidates"]["filters"])
+        self.assertNotIn("buy", namespace["candidates"])
         self.assertIn("indicators", namespace["candidates"])
         self.assertIn("sell", namespace["candidates"])
 
@@ -185,25 +186,19 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.current_rules["buy"]["groups"],
         )
 
-    def test_buy_merge_candidate_records_existing_turn_up_and_threshold_add(self):
+    def test_buy_ocr_filter_candidate_records_turn_up_and_threshold_conditions(self):
         result = self._build_preview()
-        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["buy"]
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["ocr"]
 
-        self.assertEqual(candidate["merge_into"], "buy.groups[0].conditions")
-        self.assertEqual(
-            candidate["skip_existing"],
-            [
-                {
-                    "target": "OSC",
-                    "operator": "TURN_UP",
-                    "reason": "already exists in current buy.groups[0]",
-                }
-            ],
-        )
-        self.assertEqual(len(candidate["add_conditions"]), 1)
-        self.assertEqual(candidate["add_conditions"][0]["target"], "OSC")
-        self.assertEqual(candidate["add_conditions"][0]["operator"], "<=")
-        self.assertEqual(candidate["add_conditions"][0]["value"], -91.0)
+        self.assertEqual(candidate["path"], "buy.filters.ocr")
+        self.assertEqual(candidate["value"]["enabled"], True)
+        self.assertEqual(candidate["value"]["conditions_logic"], "AND")
+        self.assertEqual(len(candidate["value"]["conditions"]), 2)
+        self.assertEqual(candidate["value"]["conditions"][0]["target"], "OSC")
+        self.assertEqual(candidate["value"]["conditions"][0]["operator"], "TURN_UP")
+        self.assertEqual(candidate["value"]["conditions"][1]["target"], "OSC")
+        self.assertEqual(candidate["value"]["conditions"][1]["operator"], "<=")
+        self.assertEqual(candidate["value"]["conditions"][1]["value"], -91.0)
 
     def test_rsi_indicator_candidate_uses_existing_indicator_shape(self):
         result = self._build_preview()
@@ -277,7 +272,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
 
         self.assertNotIn("buy", candidates)
-        self.assertNotIn("buy.groups[0].conditions", self.mapper.build_rule_approval_session(result)["decisions"])
+        self.assertNotIn("buy.filters.ocr", self.mapper.build_rule_approval_session(result)["decisions"])
 
     def test_buy_ma_price_compare_and_bollinger_candidates_as_filters(self):
         """Test that MA, Bollinger, and price_compare filters are created as filters (not buy conditions)."""
@@ -446,26 +441,40 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
     def test_buy_ocr_same_threshold_has_no_commit_diff(self):
         current_rules = deepcopy(self.current_rules)
-        current_rules["buy"]["groups"][0]["conditions"].append({
+        current_rules.setdefault("buy", {}).setdefault("filters", {})["ocr"] = {
             "enabled": True,
-            "not": False,
-            "target": "OSC",
-            "operator": "<=",
-            "value": -91.0,
-        })
+            "conditions_logic": "AND",
+            "conditions": [
+                {
+                    "enabled": True,
+                    "not": False,
+                    "target": "OSC",
+                    "operator": "TURN_UP",
+                    "description": "UI preview: buy OCR/OSC turn condition",
+                },
+                {
+                    "enabled": True,
+                    "not": False,
+                    "target": "OSC",
+                    "operator": "<=",
+                    "value": -91.0,
+                    "description": "UI preview: buy OCR/OSC threshold condition",
+                },
+            ],
+        }
         preview = self.mapper.build_engine_rules_preview_from_ui_state(
             deepcopy(self.ui_state),
             current_rules,
         )
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         patch_preview = self.mapper.build_approved_rule_patch_preview(current_rules, preview, approval)
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(current_rules, preview)
         session["fingerprint"] = fingerprint["fingerprint"]
@@ -510,12 +519,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(self.current_rules, original_rules)
         self.assertEqual(result, original_preview)
         self.assertEqual(changes["bar.bar_minutes"]["status"], "changed")
-        self.assertEqual(changes["buy.groups[0].conditions"]["status"], "merge_candidate")
+        self.assertEqual(changes["buy.filters.ocr"]["status"], "added")
         self.assertEqual(
             changes["sell.signals.ui_preview_condition_c_macd_sell"]["status"],
             "add_signal_candidate",
         )
-        self.assertEqual(changes["buy.groups[0].conditions"]["risk"], "medium")
+        self.assertEqual(changes["buy.filters.ocr"]["risk"], "low")
         self.assertEqual(changes["sell.signals.ui_preview_condition_c_macd_sell"]["risk"], "low")
         self.assertNotIn("sell.signals.macd_sell", changes)
 
@@ -566,7 +575,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(pending["source"], "indicator_follow_ui_state")
         self.assertIn("source_ui_state_hash", pending)
         self.assertEqual(pending["source_ui_state_hash"], self.mapper.build_ui_state_hash(self.ui_state))
-        self.assertIn("buy", pending["candidates"])
+        self.assertIn("ocr", pending["candidates"]["filters"])
+        self.assertNotIn("buy", pending["candidates"])
         self.assertIn("sell", pending["candidates"])
 
     def test_preview_first_mapping_paths_are_minimal_and_stable(self):
@@ -578,7 +588,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             result["mapped_paths"],
             [
                 "bar.bar_minutes",
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -586,7 +596,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertNotIn("timeframe", result["mapped_paths"])
         self.assertEqual(preview_rules["bar"], {"bar_minutes": 5})
         self.assertEqual(pending_preview["bar"], {"path": "bar.bar_minutes", "value": 5})
-        self.assertEqual(pending_preview["buy"]["merge_into"], "buy.groups[0].conditions")
+        self.assertEqual(pending_preview["filters"]["ocr"]["path"], "buy.filters.ocr")
         self.assertEqual(pending_preview["indicators"]["rsi"]["path"], "indicators.rsi")
         self.assertEqual(
             pending_preview["sell"]["add_signal_candidate"]["path"],
@@ -610,7 +620,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         # the generated paths include all expected paths
         expected_paths = [
             "bar.bar_minutes",
-            "buy.groups[0].conditions",
+            "buy.filters.ocr",
             "buy.filters.moving_average",
             "indicators.rsi",
             "sell.signals.ui_preview_condition_c_macd_sell",
@@ -622,6 +632,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         # Check that the saved paths are a subset of generated paths (allowing for hash differences)
         for path in saved_pending["mapped_paths"]:
+            if path == "buy.groups[0].conditions":
+                continue
             self.assertIn(path, generated_pending["mapped_paths"], f"Saved path {path} not found in generated paths")
 
         self.assertEqual(
@@ -633,9 +645,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             saved_pending["candidates"]["indicators"]["rsi"],
             generated_pending["candidates"]["indicators"]["rsi"],
         )
+        self.assertNotIn("buy", generated_pending["candidates"])
         self.assertEqual(
-            saved_pending["candidates"]["buy"]["merge_into"],
-            generated_pending["candidates"]["buy"]["merge_into"],
+            generated_pending["candidates"]["filters"]["ocr"]["path"],
+            "buy.filters.ocr",
         )
         self.assertEqual(
             saved_pending["candidates"]["filters"]["moving_average"],
@@ -676,23 +689,25 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self.mapper.approve_engine_rule_candidates(
             self.current_rules,
             preview,
-            ["buy.groups[0].conditions"],
+            ["buy.filters.ocr"],
         )
         conditions = result["rules"]["buy"]["groups"][0]["conditions"]
+        ocr_filter = result["rules"]["buy"]["filters"]["ocr"]
 
-        self.assertIn("buy.groups[0].conditions", result["applied_paths"])
-        self.assertEqual(len(conditions), 2)
+        self.assertIn("buy.filters.ocr", result["applied_paths"])
+        self.assertEqual(len(conditions), 1)
         self.assertEqual(conditions[0], self.current_rules["buy"]["groups"][0]["conditions"][0])
-        self.assertEqual(conditions[1]["target"], "OSC")
-        self.assertEqual(conditions[1]["operator"], "<=")
-        self.assertEqual(conditions[1]["value"], -91.0)
+        self.assertEqual(ocr_filter["conditions"][0]["operator"], "TURN_UP")
+        self.assertEqual(ocr_filter["conditions"][1]["target"], "OSC")
+        self.assertEqual(ocr_filter["conditions"][1]["operator"], "<=")
+        self.assertEqual(ocr_filter["conditions"][1]["value"], -91.0)
 
     def test_approve_buy_merge_does_not_duplicate_turn_up(self):
         preview = self._build_preview()
         result = self.mapper.approve_engine_rule_candidates(
             self.current_rules,
             preview,
-            ["buy.groups[0].conditions"],
+            ["buy.filters.ocr"],
         )
         conditions = result["rules"]["buy"]["groups"][0]["conditions"]
         turn_up_count = sum(
@@ -775,7 +790,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.current_rules,
             preview,
             [
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
         )
@@ -801,10 +816,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self.mapper.approve_engine_rule_candidates(
             self.current_rules,
             preview,
-            {"approved_paths": ["buy.groups[0].conditions"]},
+            {"approved_paths": ["buy.filters.ocr"]},
         )
 
-        self.assertIn("buy.groups[0].conditions", result["applied_paths"])
+        self.assertIn("buy.filters.ocr", result["applied_paths"])
 
     def test_evaluate_rule_candidate_approval_defaults_to_pending(self):
         preview = self._build_preview()
@@ -817,10 +832,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(result["rejected_paths"], [])
         self.assertEqual(result["deferred_paths"], [])
         self.assertEqual(
-            result["candidate_decisions"]["buy.groups[0].conditions"],
+            result["candidate_decisions"]["buy.filters.ocr"],
             {
                 "decision": "PENDING",
-                "candidate_type": "merge_conditions",
+                "candidate_type": "set_filter",
             },
         )
         self.assertEqual(
@@ -878,12 +893,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         result = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
-        self.assertEqual(result["approved_paths"], ["buy.groups[0].conditions"])
+        self.assertEqual(result["approved_paths"], ["buy.filters.ocr"])
         self.assertEqual(
-            result["candidate_decisions"]["buy.groups[0].conditions"]["decision"],
+            result["candidate_decisions"]["buy.filters.ocr"]["decision"],
             "APPROVED",
         )
         self.assertEqual(
@@ -911,12 +926,12 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self.mapper.evaluate_rule_candidate_approval(
             preview,
             {
-                "buy.groups[0].conditions": "REJECTED",
+                "buy.filters.ocr": "REJECTED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
             },
         )
 
-        self.assertEqual(result["rejected_paths"], ["buy.groups[0].conditions"])
+        self.assertEqual(result["rejected_paths"], ["buy.filters.ocr"])
         self.assertEqual(result["deferred_paths"], ["sell.signals.ui_preview_condition_c_macd_sell"])
         self.assertEqual(result["approved_paths"], [])
 
@@ -925,14 +940,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         result = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPLIED_PREVIEW_ONLY"},
+            {"buy.filters.ocr": "APPLIED_PREVIEW_ONLY"},
         )
 
         self.assertEqual(result["approved_paths"], [])
         self.assertEqual(result["rejected_paths"], [])
         self.assertEqual(result["deferred_paths"], [])
         self.assertEqual(
-            result["candidate_decisions"]["buy.groups[0].conditions"]["decision"],
+            result["candidate_decisions"]["buy.filters.ocr"]["decision"],
             "APPLIED_PREVIEW_ONLY",
         )
 
@@ -942,7 +957,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mapper.evaluate_rule_candidate_approval(
                 preview,
-                {"buy.groups[0].conditions": "UNKNOWN"},
+                {"buy.filters.ocr": "UNKNOWN"},
             )
 
     def test_evaluate_rule_candidate_approval_warns_unknown_path(self):
@@ -963,17 +978,17 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             preview,
             {
                 "candidate_decisions": {
-                    "buy.groups[0].conditions": {"decision": "APPROVED"},
+                    "buy.filters.ocr": {"decision": "APPROVED"},
                 }
             },
         )
 
-        self.assertEqual(result["approved_paths"], ["buy.groups[0].conditions"])
+        self.assertEqual(result["approved_paths"], ["buy.filters.ocr"])
 
     def test_evaluate_rule_candidate_approval_does_not_mutate_inputs(self):
         preview = self._build_preview()
         approval_decisions = {
-            "buy.groups[0].conditions": "APPROVED",
+            "buy.filters.ocr": "APPROVED",
             "sell.signals.ui_preview_condition_c_macd_sell": "REJECTED",
         }
         original_preview = deepcopy(preview)
@@ -991,7 +1006,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.mapper.evaluate_rule_candidate_approval(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
             },
         )
@@ -1014,17 +1029,17 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
         patch = result["patches"][0]
 
-        self.assertEqual(patch["operation"], "merge_conditions")
-        self.assertEqual(patch["source_path"], "buy.groups[0].conditions")
-        self.assertEqual(patch["target_path"], "buy.groups[0].conditions")
+        self.assertEqual(patch["operation"], "set_filter")
+        self.assertEqual(patch["source_path"], "buy.filters.ocr")
+        self.assertEqual(patch["target_path"], "buy.filters.ocr")
         self.assertNotIn("buy.groups", patch)
-        self.assertEqual(patch["risk"], "medium")
+        self.assertEqual(patch["risk"], "low")
 
     def test_build_approved_rule_patch_preview_builds_bar_patch(self):
         preview = self._build_preview()
@@ -1046,26 +1061,18 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
         patch = result["patches"][0]
 
-        self.assertEqual(
-            patch["skip_existing"],
-            [
-                {
-                    "target": "OSC",
-                    "operator": "TURN_UP",
-                    "reason": "already exists in current buy.groups[0]",
-                }
-            ],
-        )
-        self.assertEqual(len(patch["add_conditions"]), 1)
-        self.assertEqual(patch["add_conditions"][0]["target"], "OSC")
-        self.assertEqual(patch["add_conditions"][0]["operator"], "<=")
-        self.assertEqual(patch["add_conditions"][0]["value"], -91.0)
+        self.assertEqual(patch["value"]["enabled"], True)
+        self.assertEqual(patch["value"]["conditions_logic"], "AND")
+        self.assertEqual(len(patch["value"]["conditions"]), 2)
+        self.assertEqual(patch["value"]["conditions"][0]["operator"], "TURN_UP")
+        self.assertEqual(patch["value"]["conditions"][1]["operator"], "<=")
+        self.assertEqual(patch["value"]["conditions"][1]["value"], -91.0)
 
     def test_build_approved_rule_patch_preview_builds_sell_add_signal_patch(self):
         preview = self._build_preview()
@@ -1095,7 +1102,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
             {
-                "buy.groups[0].conditions": "REJECTED",
+                "buy.filters.ocr": "REJECTED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
             },
         )
@@ -1104,14 +1111,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(result["patches"], [])
         reasons = {item["path"]: item["reason"] for item in result["skipped_paths"]}
-        self.assertEqual(reasons["buy.groups[0].conditions"], "decision is REJECTED")
+        self.assertEqual(reasons["buy.filters.ocr"], "decision is REJECTED")
         self.assertEqual(reasons["sell.signals.ui_preview_condition_c_macd_sell"], "decision is DEFERRED")
 
     def test_build_approved_rule_patch_preview_skips_applied_preview_only(self):
         preview = self._build_preview()
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
-            {"buy.groups[0].conditions": "APPLIED_PREVIEW_ONLY"},
+            {"buy.filters.ocr": "APPLIED_PREVIEW_ONLY"},
         )
 
         result = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
@@ -1119,7 +1126,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(result["patches"], [])
         self.assertIn(
             {
-                "path": "buy.groups[0].conditions",
+                "path": "buy.filters.ocr",
                 "reason": "decision is APPLIED_PREVIEW_ONLY",
             },
             result["skipped_paths"],
@@ -1207,7 +1214,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             },
         )
@@ -1227,7 +1234,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         approval = self.mapper.evaluate_rule_candidate_approval(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             },
         )
@@ -1281,25 +1288,28 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(indicators["macd"], self.current_rules["indicators"]["macd"])
 
     def test_apply_approved_rule_patch_preview_buy_merge_adds_one_condition(self):
-        patch_preview = self._build_patch_preview({"buy.groups[0].conditions": "APPROVED"})
+        patch_preview = self._build_patch_preview({"buy.filters.ocr": "APPROVED"})
 
         result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
-        conditions = result["applied_rules_preview"]["buy"]["groups"][0]["conditions"]
+        ocr_filter = result["applied_rules_preview"]["buy"]["filters"]["ocr"]
 
         self.assertEqual(result["summary"]["applied"], 1)
-        self.assertEqual(result["applied_patches"][0]["operation"], "merge_conditions")
-        self.assertEqual(len(conditions), 2)
-        self.assertEqual(conditions[1]["target"], "OSC")
-        self.assertEqual(conditions[1]["operator"], "<=")
-        self.assertEqual(conditions[1]["value"], -91.0)
+        self.assertEqual(result["applied_patches"][0]["operation"], "set_filter")
+        self.assertEqual(len(ocr_filter["conditions"]), 2)
+        self.assertEqual(ocr_filter["conditions"][0]["operator"], "TURN_UP")
+        self.assertEqual(ocr_filter["conditions"][1]["target"], "OSC")
+        self.assertEqual(ocr_filter["conditions"][1]["operator"], "<=")
+        self.assertEqual(ocr_filter["conditions"][1]["value"], -91.0)
 
     def test_apply_approved_rule_patch_preview_buy_keeps_existing_turn_up(self):
-        patch_preview = self._build_patch_preview({"buy.groups[0].conditions": "APPROVED"})
+        patch_preview = self._build_patch_preview({"buy.filters.ocr": "APPROVED"})
 
         result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
         conditions = result["applied_rules_preview"]["buy"]["groups"][0]["conditions"]
+        ocr_filter = result["applied_rules_preview"]["buy"]["filters"]["ocr"]
 
         self.assertEqual(conditions[0], self.current_rules["buy"]["groups"][0]["conditions"][0])
+        self.assertEqual(ocr_filter["conditions"][0]["operator"], "TURN_UP")
         turn_up_count = sum(
             1
             for condition in conditions
@@ -1311,15 +1321,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         patch_preview = {
             "patches": [
                 {
-                    "source_path": "buy.groups[0].conditions",
-                    "target_path": "buy.groups[0].conditions",
-                    "operation": "merge_conditions",
-                    "add_conditions": [
-                        {
-                            "target": "OSC",
-                            "operator": "TURN_UP",
-                        }
-                    ],
+                    "source_path": "buy.filters.ocr",
+                    "target_path": "buy.filters.ocr",
+                    "operation": "set_filter",
                 }
             ]
         }
@@ -1330,10 +1334,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(len(conditions), 1)
         self.assertEqual(result["summary"]["applied"], 0)
         self.assertEqual(result["summary"]["skipped"], 1)
-        self.assertEqual(result["skipped_patches"][0]["reason"], "no new conditions to add")
+        self.assertEqual(result["skipped_patches"][0]["reason"], "filter value is not a dict")
 
     def test_apply_approved_rule_patch_preview_does_not_replace_buy_groups(self):
-        patch_preview = self._build_patch_preview({"buy.groups[0].conditions": "APPROVED"})
+        patch_preview = self._build_patch_preview({"buy.filters.ocr": "APPROVED"})
 
         result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
         groups = result["applied_rules_preview"]["buy"]["groups"]
@@ -1397,7 +1401,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
     def test_apply_approved_rule_patch_preview_does_not_mutate_inputs(self):
         patch_preview = self._build_patch_preview(
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             }
         )
@@ -1413,7 +1417,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         before = self._rules_json_hash()
         patch_preview = self._build_patch_preview(
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             }
         )
@@ -1430,7 +1434,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(session["mode"], "approval_session")
         self.assertEqual(session["session_status"], "ACTIVE")
         self.assertEqual(session["decisions"]["bar.bar_minutes"], "PENDING")
-        self.assertEqual(session["decisions"]["buy.groups[0].conditions"], "PENDING")
+        self.assertEqual(session["decisions"]["buy.filters.ocr"], "PENDING")
         self.assertEqual(session["decisions"]["indicators.rsi"], "PENDING")
         self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "PENDING")
         self.assertTrue(session["updated_at"])
@@ -1441,7 +1445,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         session = self.mapper.build_rule_approval_session(preview)
 
         self.assertEqual(session["candidate_types"]["bar.bar_minutes"], "set_value")
-        self.assertEqual(session["candidate_types"]["buy.groups[0].conditions"], "merge_conditions")
+        self.assertEqual(session["candidate_types"]["buy.filters.ocr"], "set_filter")
         self.assertEqual(session["candidate_types"]["indicators.rsi"], "set_indicator")
         self.assertEqual(
             session["candidate_types"]["sell.signals.ui_preview_condition_c_macd_sell"],
@@ -1453,10 +1457,10 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
-        self.assertEqual(session["decisions"]["buy.groups[0].conditions"], "APPROVED")
+        self.assertEqual(session["decisions"]["buy.filters.ocr"], "APPROVED")
         self.assertEqual(session["decisions"]["bar.bar_minutes"], "PENDING")
         self.assertEqual(session["decisions"]["indicators.rsi"], "PENDING")
         self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "PENDING")
@@ -1477,7 +1481,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mapper.build_rule_approval_session(
                 preview,
-                {"buy.groups[0].conditions": "UNKNOWN"},
+                {"buy.filters.ocr": "UNKNOWN"},
             )
 
     def test_update_rule_approval_session_updates_buy_approved(self):
@@ -1485,11 +1489,11 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         updated = self.mapper.update_rule_approval_session(
             session,
-            "buy.groups[0].conditions",
+            "buy.filters.ocr",
             "APPROVED",
         )
 
-        self.assertEqual(updated["decisions"]["buy.groups[0].conditions"], "APPROVED")
+        self.assertEqual(updated["decisions"]["buy.filters.ocr"], "APPROVED")
         self.assertEqual(updated["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "PENDING")
 
     def test_update_rule_approval_session_updates_sell_supported_decisions(self):
@@ -1513,13 +1517,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.mapper.update_rule_approval_session(session, "unknown.path", "APPROVED")
 
         with self.assertRaises(ValueError):
-            self.mapper.update_rule_approval_session(session, "buy.groups[0].conditions", "UNKNOWN")
+            self.mapper.update_rule_approval_session(session, "buy.filters.ocr", "UNKNOWN")
 
     def test_update_rule_approval_session_does_not_mutate_original(self):
         session = self.mapper.build_rule_approval_session(self._build_preview())
         original = deepcopy(session)
 
-        self.mapper.update_rule_approval_session(session, "buy.groups[0].conditions", "APPROVED")
+        self.mapper.update_rule_approval_session(session, "buy.filters.ocr", "APPROVED")
 
         self.assertEqual(session, original)
 
@@ -1535,7 +1539,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             first["candidate_paths"],
             [
                 "bar.bar_minutes",
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "indicators.rsi",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
@@ -1545,9 +1549,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
     def test_build_rule_approval_session_fingerprint_changes_for_candidate_payload(self):
         preview = self._build_preview()
         changed_preview = deepcopy(preview)
-        changed_preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["buy"][
-            "add_conditions"
-        ][0]["value"] = -92.0
+        changed_preview["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["filters"]["ocr"][
+            "value"
+        ]["conditions"][1]["value"] = -92.0
 
         first = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
         changed = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, changed_preview)
@@ -1584,7 +1588,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
         session["fingerprint"] = fingerprint["fingerprint"]
 
@@ -1621,7 +1625,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
         session = self.mapper.build_rule_approval_session(preview)
         session["fingerprint"] = fingerprint["fingerprint"]
-        session["candidate_types"]["buy.groups[0].conditions"] = "add_signal"
+        session["candidate_types"]["buy.filters.ocr"] = "add_signal"
 
         result = self.mapper.validate_rule_approval_session_for_preview(
             session,
@@ -1654,7 +1658,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         saved = self.mapper.build_rule_approval_session(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
             },
         )
@@ -1663,7 +1667,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         restored = self.mapper.restore_rule_approval_session_for_preview(saved, self.current_rules, preview)
 
         self.assertEqual(restored["restore_status"], "RESTORED")
-        self.assertEqual(restored["decisions"]["buy.groups[0].conditions"], "APPROVED")
+        self.assertEqual(restored["decisions"]["buy.filters.ocr"], "APPROVED")
         self.assertEqual(restored["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "DEFERRED")
 
     def test_restore_rule_approval_session_for_preview_resets_mismatch_to_pending(self):
@@ -1671,7 +1675,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         saved = self.mapper.build_rule_approval_session(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             },
         )
@@ -1691,14 +1695,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
         saved = self.mapper.build_rule_approval_session(preview)
         saved["fingerprint"] = fingerprint["fingerprint"]
-        saved["decisions"]["buy.groups[0].conditions"] = "UNKNOWN"
+        saved["decisions"]["buy.filters.ocr"] = "UNKNOWN"
 
         restored = self.mapper.restore_rule_approval_session_for_preview(saved, self.current_rules, preview)
 
         self.assertEqual(restored["restore_status"], "RESTORED")
-        self.assertEqual(restored["decisions"]["buy.groups[0].conditions"], "PENDING")
+        self.assertEqual(restored["decisions"]["buy.filters.ocr"], "PENDING")
         self.assertIn(
-            "unknown approval decision ignored for buy.groups[0].conditions: UNKNOWN",
+            "unknown approval decision ignored for buy.filters.ocr: UNKNOWN",
             restored["warnings"],
         )
 
@@ -1706,7 +1710,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
         original_rules = deepcopy(self.current_rules)
         original_preview = deepcopy(preview)
@@ -1725,7 +1729,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
@@ -1749,13 +1753,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         result = self.mapper.build_rule_pipeline_preview(self.current_rules, preview, session)
 
-        self.assertEqual(result["patch_preview"]["patches"][0]["operation"], "merge_conditions")
-        self.assertEqual(result["apply_preview"]["applied_patches"][0]["operation"], "merge_conditions")
+        self.assertEqual(result["patch_preview"]["patches"][0]["operation"], "set_filter")
+        self.assertEqual(result["apply_preview"]["applied_patches"][0]["operation"], "set_filter")
 
     def test_build_rule_pipeline_preview_sell_approved_creates_add_signal_patch_and_apply(self):
         preview = self._build_preview()
@@ -1775,7 +1779,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             with self.subTest(decision=decision):
                 session = self.mapper.build_rule_approval_session(
                     preview,
-                    {"buy.groups[0].conditions": decision},
+                    {"buy.filters.ocr": decision},
                 )
 
                 result = self.mapper.build_rule_pipeline_preview(self.current_rules, preview, session)
@@ -1788,7 +1792,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         session = self.mapper.build_rule_approval_session(
             preview,
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             },
         )
@@ -1807,7 +1811,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         preview = self._build_preview()
         session = self.mapper.build_rule_approval_session(
             preview,
-            {"buy.groups[0].conditions": "APPROVED"},
+            {"buy.filters.ocr": "APPROVED"},
         )
 
         self.mapper.update_rule_approval_session(
@@ -1836,7 +1840,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         return self.mapper._stable_hash(self.current_rules if rules is None else rules)
 
     def test_build_apply_preview_hash_is_stable_for_same_subset(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         pipeline = self.mapper.build_rule_pipeline_preview(self.current_rules, preview, session)
         apply_preview = pipeline["apply_preview"]
 
@@ -1846,7 +1850,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
     def test_build_apply_preview_hash_changes_when_applied_rules_preview_changes(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         pipeline = self.mapper.build_rule_pipeline_preview(self.current_rules, preview, session)
         apply_preview = deepcopy(pipeline["apply_preview"])
         changed = deepcopy(apply_preview)
@@ -1862,7 +1866,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
     def test_build_apply_preview_hash_ignores_warnings(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         pipeline = self.mapper.build_rule_pipeline_preview(self.current_rules, preview, session)
         apply_preview = deepcopy(pipeline["apply_preview"])
         changed = deepcopy(apply_preview)
@@ -1892,7 +1896,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(result["apply_preview_hash_algorithm"], "stable_json_sha256")
 
     def test_build_rule_commit_preview_buy_approved_builds_merge_diff(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
 
         result = self.mapper.build_rule_commit_preview(
             self.current_rules,
@@ -1906,13 +1910,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(result["apply_preview_hash_algorithm"], "stable_json_sha256")
         self.assertEqual(len(result["final_diff"]), 1)
         diff = result["final_diff"][0]
-        self.assertEqual(diff["path"], "buy.groups[0].conditions")
-        self.assertEqual(diff["operation"], "merge_conditions")
-        self.assertEqual(diff["change_type"], "add_condition")
-        self.assertEqual(diff["condition"]["target"], "OSC")
-        self.assertEqual(diff["condition"]["operator"], "<=")
-        self.assertEqual(diff["condition"]["value"], -91.0)
-        self.assertIn("buy.groups", diff["preserved"])
+        self.assertEqual(diff["path"], "buy.filters.ocr")
+        self.assertEqual(diff["operation"], "set_filter")
+        self.assertEqual(diff["change_type"], "set_buy_ocr_filter")
+        self.assertEqual(diff["value"]["conditions_logic"], "AND")
+        self.assertEqual(diff["value"]["conditions"][0]["operator"], "TURN_UP")
+        self.assertEqual(diff["value"]["conditions"][1]["operator"], "<=")
+        self.assertEqual(diff["value"]["conditions"][1]["value"], -91.0)
         self.assertFalse(diff["replace"])
 
     def test_build_rule_commit_preview_bar_approved_builds_set_value_diff(self):
@@ -1978,7 +1982,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
     def test_build_rule_commit_preview_buy_and_sell_approved_builds_two_diffs(self):
         preview, session = self._build_commit_session(
             {
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             }
         )
@@ -1994,14 +1998,14 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(len(result["final_diff"]), 2)
         self.assertEqual(
             [diff["operation"] for diff in result["final_diff"]],
-            ["merge_conditions", "add_signal"],
+            ["set_filter", "add_signal"],
         )
 
     def test_build_rule_commit_preview_all_three_approved_builds_three_diffs(self):
         preview, session = self._build_commit_session(
             {
                 "bar.bar_minutes": "APPROVED",
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             }
         )
@@ -2018,13 +2022,13 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             [diff["path"] for diff in result["final_diff"]],
             [
                 "bar.bar_minutes",
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "sell.signals.ui_condition_c_macd_sell",
             ],
         )
 
     def test_build_rule_commit_preview_dirty_session_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
 
         result = self.mapper.build_rule_commit_preview(
             self.current_rules,
@@ -2040,7 +2044,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
     def test_build_rule_commit_preview_fingerprint_mismatch_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         session["fingerprint"] = "stale"
 
         result = self.mapper.build_rule_commit_preview(
@@ -2077,7 +2081,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
     def test_build_rule_commit_preview_safety_checks_are_false(self):
         preview, session = self._build_commit_session({
-            "buy.groups[0].conditions": "APPROVED",
+            "buy.filters.ocr": "APPROVED",
             "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
         })
 
@@ -2102,7 +2106,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
     def test_build_rule_commit_preview_does_not_mutate_inputs(self):
         preview, session = self._build_commit_session({
-            "buy.groups[0].conditions": "APPROVED",
+            "buy.filters.ocr": "APPROVED",
             "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
         })
         original_rules = deepcopy(self.current_rules)
@@ -2123,7 +2127,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
     def test_build_rule_commit_preview_does_not_write_rules_json(self):
         before = self._rules_json_hash()
         preview, session = self._build_commit_session({
-            "buy.groups[0].conditions": "APPROVED",
+            "buy.filters.ocr": "APPROVED",
             "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
         })
 
@@ -2177,7 +2181,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertTrue(result["blocked_reasons"])
 
     def test_evaluate_rule_commit_gate_stale_session_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         session["fingerprint"] = "stale"
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
@@ -2201,7 +2205,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
     def test_evaluate_rule_commit_gate_dirty_true_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
             self._save_commit_gate_session(session, session_path)
@@ -2224,7 +2228,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         )
 
     def test_evaluate_rule_commit_gate_manual_confirmation_missing_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
             self._save_commit_gate_session(session, session_path)
@@ -2244,7 +2248,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("manual rule commit confirmation is required", result["blocked_reasons"])
 
     def test_evaluate_rule_commit_gate_expected_hash_missing_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
             self._save_commit_gate_session(session, session_path)
@@ -2263,7 +2267,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("expected rules hash is required", result["blocked_reasons"])
 
     def test_evaluate_rule_commit_gate_rules_hash_mismatch_is_blocked(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
             self._save_commit_gate_session(session, session_path)
@@ -2335,7 +2339,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertIn("target path conflict", result["blocked_reasons"])
 
     def test_evaluate_rule_commit_gate_allows_valid_saved_session_with_manual_confirm(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "approval_session.json"
             self._save_commit_gate_session(session, session_path)
@@ -2361,7 +2365,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
     def test_evaluate_rule_commit_gate_does_not_write_rules_json_or_call_save(self):
         before = self._rules_json_hash()
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         original_save = rule_approval_session_file_service.save_rule_approval_session
         calls = {"save": 0}
 
@@ -2392,7 +2396,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(before, self._rules_json_hash())
 
     def test_evaluate_rule_commit_gate_does_not_mutate_inputs(self):
-        preview, session = self._build_commit_session({"buy.groups[0].conditions": "APPROVED"})
+        preview, session = self._build_commit_session({"buy.filters.ocr": "APPROVED"})
         original_rules = deepcopy(self.current_rules)
         original_preview = deepcopy(preview)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2421,7 +2425,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             self.current_rules,
             preview,
             [
-                "buy.groups[0].conditions",
+                "buy.filters.ocr",
                 "sell.signals.ui_preview_condition_c_macd_sell",
             ],
         )
@@ -2631,3 +2635,4 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

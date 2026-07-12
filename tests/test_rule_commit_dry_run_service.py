@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from importlib.util import module_from_spec, spec_from_file_location
@@ -121,7 +121,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
 
     def _prepare_actual_inputs(self, root, decisions=None, rules=None):
         rules = deepcopy(self.current_rules if rules is None else rules)
-        decisions = {"buy.groups[0].conditions": "APPROVED"} if decisions is None else decisions
+        decisions = {"buy.filters.ocr": "APPROVED"} if decisions is None else decisions
         actual_dir = Path(root) / "actual"
         rules_path = actual_dir / "rules.json"
         session_path = actual_dir / "approval_session.json"
@@ -173,14 +173,14 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             self.assertEqual(rollback_safety_path.parent, workspace / "backups" / "rollback_safety")
             self.assertEqual(
                 [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
-                ["buy.groups[0].conditions"],
+                ["buy.filters.ocr"],
             )
 
     def test_dry_run_commits_all_approved_candidates_then_rolls_back_temp_rules(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             decisions = {
                 "bar.bar_minutes": "APPROVED",
-                "buy.groups[0].conditions": "APPROVED",
+                "buy.filters.ocr": "APPROVED",
                 "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
             }
             rules_path, session_path, preview, rules = self._prepare_actual_inputs(temp_dir, decisions)
@@ -208,7 +208,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 [patch["target_path"] for patch in result["commit_result"]["applied_patches"]],
                 [
                     "bar.bar_minutes",
-                    "buy.groups[0].conditions",
+                    "buy.filters.ocr",
                     "sell.signals.ui_condition_c_macd_sell",
                 ],
             )
@@ -320,7 +320,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                     {
                         "buy.filters.moving_average": "APPROVED",
                         "buy.filters.price_compare": "APPROVED",
-                        "buy.groups[0].conditions": "APPROVED",
+                        "buy.filters.ocr": "APPROVED",
                     },
                 )
             finally:
@@ -632,3 +632,4 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
