@@ -69,9 +69,22 @@ BUY_COMPOSITE_FILTER_PATH = "buy.filters.composite"
 BUY_EXECUTION_BASE_PATH = "buy.execution.base"
 BUY_EXECUTION_REPEAT_PATH = "buy.execution.repeat"
 RSI_INDICATOR_PATH = "indicators.rsi"
+SELL_CONDITION_C_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c"
+APPROVED_SELL_CONDITION_C_SIGNAL_KEY = "ui_condition_c"
+SELL_CONDITION_C_SIGNAL_TARGET_PATH = f"sell.signals.{APPROVED_SELL_CONDITION_C_SIGNAL_KEY}"
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
 SELL_MACD_SIGNAL_TARGET_PATH = f"sell.signals.{APPROVED_SELL_MACD_SIGNAL_KEY}"
+_SELL_ADD_SIGNAL_TARGETS = {
+    SELL_CONDITION_C_SIGNAL_PREVIEW_PATH: (
+        SELL_CONDITION_C_SIGNAL_TARGET_PATH,
+        APPROVED_SELL_CONDITION_C_SIGNAL_KEY,
+    ),
+    SELL_MACD_SIGNAL_PREVIEW_PATH: (
+        SELL_MACD_SIGNAL_TARGET_PATH,
+        APPROVED_SELL_MACD_SIGNAL_KEY,
+    ),
+}
 _RULE_CANDIDATE_DECISIONS = {
     "PENDING",
     "APPROVED",
@@ -104,6 +117,8 @@ def _get_path_value(data: dict[str, Any], path: str) -> Any:
 
 
 def _preview_diff_risk(path: str) -> str:
+    if path == SELL_CONDITION_C_SIGNAL_PREVIEW_PATH:
+        return "low"
     if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
         return "low"
     if path == "sell.signals.macd_sell":
@@ -165,6 +180,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         SELL_MACD_SIGNAL_PREVIEW_PATH: (
             "UI preview-only add signal candidate; existing sell.signals.macd_sell is unchanged."
+        ),
+        SELL_CONDITION_C_SIGNAL_PREVIEW_PATH: (
+            "UI preview-only condition C add signal candidate; existing sell.signals.macd_sell is unchanged."
         ),
     }
     return notes.get(path, "UI preview candidate path.")
@@ -838,7 +856,6 @@ def _build_buy_price_compare_filter_candidate(price_compare: dict[str, Any], war
 
 def _build_sell_condition_c_indicator_condition(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
     if condition_c.get("macd_check") is False:
-        warnings.append("sell condition C MACD row is unchecked")
         return None
 
     target = {
@@ -869,6 +886,111 @@ def _build_sell_condition_c_indicator_condition(condition_c: dict[str, Any], war
         "value": value,
         "description": "UI preview: sell condition C MACD line threshold",
     }
+
+
+def _build_sell_condition_c_array_conditions(condition_c: dict[str, Any], warnings: list[str]) -> list[dict[str, Any]] | None:
+    if condition_c.get("array_check") is False:
+        return []
+
+    if not any(key in condition_c for key in (
+        "array_first_period_combo",
+        "array_first_compare_combo",
+        "array_second_period_combo",
+        "array_second_compare_combo",
+        "array_third_period_combo",
+    )):
+        return []
+
+    first_period = _safe_int(condition_c.get("array_first_period_combo"))
+    second_period = _safe_int(condition_c.get("array_second_period_combo"))
+    third_period = _safe_int(condition_c.get("array_third_period_combo"))
+    first_operator = _direct_compare_operator(condition_c.get("array_first_compare_combo"))
+    second_operator = _direct_compare_operator(condition_c.get("array_second_compare_combo"))
+
+    if first_period is None or first_period <= 0:
+        warnings.append("sell condition C ARRAY first period is not numeric")
+        return None
+    if second_period is None or second_period <= 0:
+        warnings.append("sell condition C ARRAY second period is not numeric")
+        return None
+    if third_period is None or third_period <= 0:
+        warnings.append("sell condition C ARRAY third period is not numeric")
+        return None
+    if first_operator not in {">", ">=", "<", "<="}:
+        warnings.append(f"sell condition C ARRAY first compare is not mapped: {condition_c.get('array_first_compare_combo')!r}")
+        return None
+    if second_operator not in {">", ">=", "<", "<="}:
+        warnings.append(f"sell condition C ARRAY second compare is not mapped: {condition_c.get('array_second_compare_combo')!r}")
+        return None
+
+    return [
+        {
+            "enabled": True,
+            "not": False,
+            "target": "MA",
+            "period": first_period,
+            "operator": first_operator,
+            "compare_target": "MA",
+            "compare_period": second_period,
+            "description": "UI preview: sell condition C ARRAY first MA comparison",
+        },
+        {
+            "enabled": True,
+            "not": False,
+            "target": "MA",
+            "period": second_period,
+            "operator": second_operator,
+            "compare_target": "MA",
+            "compare_period": third_period,
+            "description": "UI preview: sell condition C ARRAY second MA comparison",
+        },
+    ]
+
+
+def _build_sell_condition_c_signal_candidate(condition_c: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+    conditions: list[dict[str, Any]] = []
+
+    macd_condition = _build_sell_condition_c_indicator_condition(condition_c, warnings)
+    if macd_condition:
+        conditions.append(macd_condition)
+
+    if condition_c.get("gap_check") is True:
+        warnings.append("sell condition C GAP mapping is postponed until gap direction semantics are finalized")
+
+    array_conditions = _build_sell_condition_c_array_conditions(condition_c, warnings)
+    if array_conditions is None:
+        return None
+    conditions.extend(array_conditions)
+
+    if not conditions:
+        return None
+
+    return {
+        "path": SELL_CONDITION_C_SIGNAL_PREVIEW_PATH,
+        "candidate_type": "add_signal",
+        "value": {
+            "enabled": False,
+            "preview_candidate": True,
+            "groups_logic": "OR",
+            "groups": [{
+                "enabled": True,
+                "name": "UI_PREVIEW_SELL_CONDITION_C",
+                "conditions_logic": "AND",
+                "conditions": conditions,
+            }],
+        },
+    }
+
+
+def _sell_add_signal_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    if isinstance(value, dict):
+        return deepcopy(value)
+    return deepcopy(candidate)
+
+
+def _sell_add_signal_target(source_path: str) -> tuple[str, str] | None:
+    return _SELL_ADD_SIGNAL_TARGETS.get(source_path)
 
 
 def _condition_matches(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
@@ -1060,25 +1182,14 @@ def build_engine_rules_preview_from_ui_state(
     sell_ui = _as_dict(state.get("sell_ui"))
     signal_conditions = _as_dict(sell_ui.get("signal_conditions"))
     condition_c = _as_dict(signal_conditions.get("condition_c"))
-    sell_indicator_condition = _build_sell_condition_c_indicator_condition(condition_c, validation_warnings)
-    if sell_indicator_condition:
+    sell_condition_c_candidate = _build_sell_condition_c_signal_candidate(condition_c, validation_warnings)
+    if sell_condition_c_candidate:
         preview_candidates["sell"] = {
-            "add_signal_candidate": {
-                "path": SELL_MACD_SIGNAL_PREVIEW_PATH,
-                "enabled": False,
-                "preview_candidate": True,
-                "groups_logic": "OR",
-                "groups": [{
-                    "enabled": True,
-                    "name": "UI_PREVIEW_SELL_MACD_CONDITION_C",
-                    "conditions_logic": "AND",
-                    "conditions": [sell_indicator_condition],
-                }],
-            }
+            "add_signal_candidate": sell_condition_c_candidate,
         }
-        legacy_notices.append("sell condition C MACD is an add_signal_candidate and does not replace existing macd_sell")
+        legacy_notices.append("sell condition C is an add_signal_candidate and does not replace existing macd_sell")
     else:
-        validation_warnings.append("sell condition C MACD candidate group was not generated")
+        validation_warnings.append("sell condition C candidate group was not generated")
 
     preview_rules["indicator_follow_rule_preview"] = {
         "mode": "merge_add_candidate",
@@ -1122,8 +1233,9 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_EXECUTION_REPEAT_PATH)
     mapped_paths.extend([
         RSI_INDICATOR_PATH,
-        SELL_MACD_SIGNAL_PREVIEW_PATH,
     ])
+    if sell_condition_c_candidate:
+        mapped_paths.append(SELL_CONDITION_C_SIGNAL_PREVIEW_PATH)
 
     warnings = list(validation_warnings) + list(postponed)
     return {
@@ -1237,7 +1349,7 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
 
     sell_candidate = _as_dict(_as_dict(candidates.get("sell")).get("add_signal_candidate"))
     if sell_candidate:
-        signal_path = str(sell_candidate.get("path") or SELL_MACD_SIGNAL_PREVIEW_PATH)
+        signal_path = str(sell_candidate.get("path") or SELL_CONDITION_C_SIGNAL_PREVIEW_PATH)
         candidate_paths[signal_path] = "add_signal"
 
     return candidate_paths
@@ -1292,6 +1404,7 @@ def build_rule_approval_session_fingerprint(
         BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
+        SELL_CONDITION_C_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_CONDITION_C_SIGNAL_TARGET_PATH),
         SELL_MACD_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_MACD_SIGNAL_TARGET_PATH),
     }
     normalized_targets = {
@@ -1833,27 +1946,30 @@ def build_approved_rule_patch_preview(
             })
             continue
 
-        if path == SELL_MACD_SIGNAL_PREVIEW_PATH:
+        sell_target = _sell_add_signal_target(path)
+        if sell_target:
+            target_path, _target_key = sell_target
             sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
             if not sell_candidate:
                 skipped_paths.append(_patch_skipped(path, "sell add_signal_candidate is not available"))
                 continue
 
-            signal = deepcopy(sell_candidate)
+            signal = _sell_add_signal_payload(sell_candidate)
             signal.pop("path", None)
+            signal.pop("candidate_type", None)
             signal.pop("preview_candidate", None)
             signal["enabled"] = False
-            existing_signal = _get_path_value(current, SELL_MACD_SIGNAL_TARGET_PATH)
+            existing_signal = _get_path_value(current, target_path)
             if existing_signal is not _MISSING:
                 if existing_signal == signal:
                     skipped_paths.append(_patch_skipped(path, "sell signal is unchanged"))
                 else:
-                    skipped_paths.append(_patch_skipped(path, f"target path already exists: {SELL_MACD_SIGNAL_TARGET_PATH}"))
+                    skipped_paths.append(_patch_skipped(path, f"target path already exists: {target_path}"))
                 continue
 
             patches.append({
-                "source_path": SELL_MACD_SIGNAL_PREVIEW_PATH,
-                "target_path": SELL_MACD_SIGNAL_TARGET_PATH,
+                "source_path": path,
+                "target_path": target_path,
                 "operation": "add_signal",
                 "signal": signal,
                 "risk": "high",
@@ -2034,7 +2150,15 @@ def apply_approved_rule_patch_preview(
             continue
 
         if operation == "add_signal":
-            if target_path != SELL_MACD_SIGNAL_TARGET_PATH:
+            sell_target_key = next(
+                (
+                    signal_key
+                    for allowed_path, signal_key in _SELL_ADD_SIGNAL_TARGETS.values()
+                    if target_path == allowed_path
+                ),
+                None,
+            )
+            if sell_target_key is None:
                 skipped_patches.append(_apply_skipped(patch, "unsupported signal target path"))
                 warnings.append(f"unsupported signal target path: {target_path}")
                 continue
@@ -2058,8 +2182,9 @@ def apply_approved_rule_patch_preview(
                 skipped_patches.append(_apply_skipped(patch, "signal is not available"))
                 continue
             signal.pop("preview_candidate", None)
+            signal.pop("candidate_type", None)
             signal["enabled"] = False
-            signals[APPROVED_SELL_MACD_SIGNAL_KEY] = signal
+            signals[sell_target_key] = signal
             applied_patches.append({
                 "source_path": patch.get("source_path"),
                 "target_path": target_path,
@@ -2208,10 +2333,10 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
         })
         return diffs
 
-    if operation == "add_signal" and target_path == SELL_MACD_SIGNAL_TARGET_PATH:
+    if operation == "add_signal" and target_path in {target for target, _key in _SELL_ADD_SIGNAL_TARGETS.values()}:
         signal = _as_dict(patch.get("signal"))
         diffs.append({
-            "path": SELL_MACD_SIGNAL_TARGET_PATH,
+            "path": target_path,
             "operation": "add_signal",
             "change_type": "add_disabled_signal",
             "enabled": False,
@@ -2544,6 +2669,7 @@ def approve_engine_rule_candidates(
         BUY_EXECUTION_BASE_PATH,
         BUY_EXECUTION_REPEAT_PATH,
         RSI_INDICATOR_PATH,
+        SELL_CONDITION_C_SIGNAL_PREVIEW_PATH,
         SELL_MACD_SIGNAL_PREVIEW_PATH,
     }
     applied_paths: list[str] = []
@@ -2708,27 +2834,34 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: target path is not writable")
 
-    if SELL_MACD_SIGNAL_PREVIEW_PATH in approved_paths:
+    for sell_preview_path in (SELL_CONDITION_C_SIGNAL_PREVIEW_PATH, SELL_MACD_SIGNAL_PREVIEW_PATH):
+        if sell_preview_path not in approved_paths:
+            continue
+        sell_target = _sell_add_signal_target(sell_preview_path)
+        if sell_target is None:
+            continue
+        _target_path, target_key = sell_target
         sell_candidate = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         sell_section = approved_rules.setdefault("sell", {})
         if not isinstance(sell_section, dict):
-            skipped_paths.append(SELL_MACD_SIGNAL_PREVIEW_PATH)
+            skipped_paths.append(sell_preview_path)
             warnings.append("sell approval skipped: sell section is not a dict")
         else:
             signals = sell_section.setdefault("signals", {})
             if not isinstance(signals, dict):
-                skipped_paths.append(SELL_MACD_SIGNAL_PREVIEW_PATH)
+                skipped_paths.append(sell_preview_path)
                 warnings.append("sell approval skipped: sell.signals is not a dict")
             elif not sell_candidate:
-                skipped_paths.append(SELL_MACD_SIGNAL_PREVIEW_PATH)
+                skipped_paths.append(sell_preview_path)
                 warnings.append("sell approval skipped: add_signal_candidate is not available")
             else:
-                approved_signal = deepcopy(sell_candidate)
+                approved_signal = _sell_add_signal_payload(sell_candidate)
                 approved_signal.pop("path", None)
+                approved_signal.pop("candidate_type", None)
                 approved_signal.pop("preview_candidate", None)
                 approved_signal["enabled"] = False
-                signals[APPROVED_SELL_MACD_SIGNAL_KEY] = approved_signal
-                applied_paths.append(SELL_MACD_SIGNAL_PREVIEW_PATH)
+                signals[target_key] = approved_signal
+                applied_paths.append(sell_preview_path)
 
     return {
         "rules": approved_rules,
@@ -2817,7 +2950,7 @@ def compare_engine_rules_preview(
             )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
-        elif path == SELL_MACD_SIGNAL_PREVIEW_PATH:
+        elif path in {SELL_CONDITION_C_SIGNAL_PREVIEW_PATH, SELL_MACD_SIGNAL_PREVIEW_PATH}:
             preview_value = _as_dict(_as_dict(preview_candidates.get("sell")).get("add_signal_candidate"))
         else:
             preview_value = _get_path_value(preview_rules, path)
@@ -2838,7 +2971,7 @@ def compare_engine_rules_preview(
             status = "changed" if current_exists else "added"
         elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
             status = "changed" if current_exists else "added"
-        elif path == SELL_MACD_SIGNAL_PREVIEW_PATH and preview_exists:
+        elif path in {SELL_CONDITION_C_SIGNAL_PREVIEW_PATH, SELL_MACD_SIGNAL_PREVIEW_PATH} and preview_exists:
             status = "add_signal_candidate"
         elif current_exists and preview_exists:
             status = "same" if current_value == preview_value else "changed"

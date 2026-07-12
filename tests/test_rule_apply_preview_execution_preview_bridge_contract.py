@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -129,7 +129,7 @@ class RuleApplyPreviewExecutionPreviewBridgeContractTest(unittest.TestCase):
             {
                 "bar.bar_minutes": "APPROVED",
                 "buy.groups[0].conditions": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                "sell.signals.ui_preview_condition_c": "APPROVED",
             },
         )
         patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
@@ -217,3 +217,4 @@ class RuleApplyPreviewExecutionPreviewBridgeContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

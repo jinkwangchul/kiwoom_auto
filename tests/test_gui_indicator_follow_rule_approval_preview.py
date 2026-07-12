@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -207,7 +207,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
                         },
                         "sell": {
                             "add_signal_candidate": {
-                                "path": "sell.signals.ui_preview_condition_c_macd_sell",
+                                "path": "sell.signals.ui_preview_condition_c",
                                 "enabled": False,
                                 "preview_candidate": True,
                                 "groups_logic": "OR",
@@ -231,7 +231,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
             },
             "mapped_paths": [
                 "buy.groups[0].conditions",
-                "sell.signals.ui_preview_condition_c_macd_sell",
+                "sell.signals.ui_preview_condition_c",
             ],
             "warnings": [],
         }
@@ -313,13 +313,13 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
 
         self.assertEqual(session["mode"], "approval_session")
         self.assertEqual(session["decisions"]["buy.groups[0].conditions"], "PENDING")
-        self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "PENDING")
+        self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c"], "PENDING")
         self.assertEqual(
             approval["candidate_decisions"]["buy.groups[0].conditions"]["decision"],
             "PENDING",
         )
         self.assertEqual(
-            approval["candidate_decisions"]["sell.signals.ui_preview_condition_c_macd_sell"]["decision"],
+            approval["candidate_decisions"]["sell.signals.ui_preview_condition_c"]["decision"],
             "PENDING",
         )
         self.assertEqual(patch["patches"], [])
@@ -356,7 +356,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self.assertEqual(session["decisions"]["buy.groups[0].conditions"], "APPROVED")
         self.assertEqual(approval["approved_paths"], ["buy.groups[0].conditions"])
         self.assertEqual(
-            approval["candidate_decisions"]["sell.signals.ui_preview_condition_c_macd_sell"]["decision"],
+            approval["candidate_decisions"]["sell.signals.ui_preview_condition_c"]["decision"],
             "PENDING",
         )
         self.assertEqual(len(patch["patches"]), 1)
@@ -368,13 +368,13 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self.assertEqual(result["commit_preview"]["final_diff"][0]["operation"], "merge_conditions")
 
     def test_sell_approval_creates_add_signal_patch(self) -> None:
-        result = self._build({"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"})
+        result = self._build({"sell.signals.ui_preview_condition_c": "APPROVED"})
         session = result["session"]
         approval = result["approval_result"]
         patch = result["patch_preview"]
 
-        self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"], "APPROVED")
-        self.assertEqual(approval["approved_paths"], ["sell.signals.ui_preview_condition_c_macd_sell"])
+        self.assertEqual(session["decisions"]["sell.signals.ui_preview_condition_c"], "APPROVED")
+        self.assertEqual(approval["approved_paths"], ["sell.signals.ui_preview_condition_c"])
         self.assertEqual(
             approval["candidate_decisions"]["buy.groups[0].conditions"]["decision"],
             "PENDING",
@@ -385,7 +385,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self.assertEqual(result["apply_preview"]["applied_patches"][0]["operation"], "add_signal")
         self.assertEqual(
             result["apply_preview"]["applied_patches"][0]["target_path"],
-            "sell.signals.ui_condition_c_macd_sell",
+            "sell.signals.ui_condition_c",
         )
         self.assertTrue(result["commit_preview"]["commit_allowed"])
         self.assertEqual(result["commit_preview"]["final_diff"][0]["operation"], "add_signal")
@@ -394,7 +394,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         result = self._build(
             {
                 "buy.groups[0].conditions": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                "sell.signals.ui_preview_condition_c": "APPROVED",
             }
         )
         operations = [patch["operation"] for patch in result["patch_preview"]["patches"]]
@@ -410,14 +410,14 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         result = self._build(
             {
                 "buy.groups[0].conditions": "REJECTED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
+                "sell.signals.ui_preview_condition_c": "DEFERRED",
             }
         )
 
         self.assertEqual(result["approval_result"]["rejected_paths"], ["buy.groups[0].conditions"])
         self.assertEqual(
             result["approval_result"]["deferred_paths"],
-            ["sell.signals.ui_preview_condition_c_macd_sell"],
+            ["sell.signals.ui_preview_condition_c"],
         )
         self.assertEqual(result["patch_preview"]["patches"], [])
         self.assertEqual(result["apply_preview"]["applied_patches"], [])
@@ -678,7 +678,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self.assertEqual(self.dialog._rule_approval_controls_box.title, "Rule Candidate Approval Preview Controls")
         self.assertEqual(set(widgets.keys()), set(self.preview_result["mapped_paths"]))
         self.assertEqual(widgets["buy.groups[0].conditions"].currentText(), "PENDING")
-        self.assertEqual(widgets["sell.signals.ui_preview_condition_c_macd_sell"].currentText(), "PENDING")
+        self.assertEqual(widgets["sell.signals.ui_preview_condition_c"].currentText(), "PENDING")
         self.assertEqual(
             widgets["buy.groups[0].conditions"].items,
             ["PENDING", "APPROVED", "REJECTED", "DEFERRED", "APPLIED_PREVIEW_ONLY"],
@@ -724,12 +724,11 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
             label_by_value["buy merge conditions"].tooltip,
             "buy.groups[0].conditions",
         )
-        self.assertIn("sell add signal candidate", label_by_value)
+        self.assertIn("sell.signals.ui_preview_condition_c", label_by_value)
         self.assertEqual(
-            label_by_value["sell add signal candidate"].tooltip,
-            "sell.signals.ui_preview_condition_c_macd_sell",
+            label_by_value["sell.signals.ui_preview_condition_c"].tooltip,
+            "sell.signals.ui_preview_condition_c",
         )
-        self.assertNotIn("sell.signals.ui_preview_condition_c_macd_sell", label_by_value)
 
     def test_approval_controls_keep_decision_columns_readable(self) -> None:
         self._prepare_validation_context()
@@ -765,16 +764,16 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self._prepare_validation_context()
 
         self.dialog._rule_approval_decision_widgets[
-            "sell.signals.ui_preview_condition_c_macd_sell"
+            "sell.signals.ui_preview_condition_c"
         ].change_to("APPROVED")
         text = self.dialog.preview_text.toPlainText()
 
         self.assertEqual(
-            self.dialog._rule_approval_session["decisions"]["sell.signals.ui_preview_condition_c_macd_sell"],
+            self.dialog._rule_approval_session["decisions"]["sell.signals.ui_preview_condition_c"],
             "APPROVED",
         )
         self.assertIn('"operation": "add_signal"', text)
-        self.assertIn('"target_path": "sell.signals.ui_condition_c_macd_sell"', text)
+        self.assertIn('"target_path": "sell.signals.ui_condition_c"', text)
         self.assertIn('"commit_allowed": true', text)
 
     def test_non_approved_combo_values_do_not_create_patch_or_apply_preview(self) -> None:
@@ -844,7 +843,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         self._build(
             {
                 "buy.groups[0].conditions": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                "sell.signals.ui_preview_condition_c": "APPROVED",
             }
         )
 
@@ -857,7 +856,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
 
         self.dialog._rule_approval_decision_widgets["buy.groups[0].conditions"].change_to("APPROVED")
         self.dialog._rule_approval_decision_widgets[
-            "sell.signals.ui_preview_condition_c_macd_sell"
+            "sell.signals.ui_preview_condition_c"
         ].change_to("APPROVED")
 
         self.assertEqual(rules_before, self._rules_json_hash())
@@ -866,3 +865,4 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

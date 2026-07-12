@@ -181,7 +181,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
             decisions = {
                 "bar.bar_minutes": "APPROVED",
                 "buy.filters.ocr": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                "sell.signals.ui_preview_condition_c": "APPROVED",
             }
             rules_path, session_path, preview, rules = self._prepare_actual_inputs(temp_dir, decisions)
             workspace = Path(temp_dir) / "workspace"
@@ -209,7 +209,7 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
                 [
                     "bar.bar_minutes",
                     "buy.filters.ocr",
-                    "sell.signals.ui_condition_c_macd_sell",
+                    "sell.signals.ui_condition_c",
                 ],
             )
 
@@ -632,4 +632,5 @@ class RuleCommitDryRunServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

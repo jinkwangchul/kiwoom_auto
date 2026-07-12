@@ -470,14 +470,16 @@ def _post_validation(
         and diff.get("path") == "buy.groups[0].conditions"
         and isinstance(diff.get("condition"), dict)
     ]
-    allowed_sell_signal_path = "sell.signals.ui_condition_c_macd_sell"
-    allowed_sell_signal_key = "ui_condition_c_macd_sell"
+    allowed_sell_signal_paths = {
+        "sell.signals.ui_condition_c": "ui_condition_c",
+        "sell.signals.ui_condition_c_macd_sell": "ui_condition_c_macd_sell",
+    }
     allowed_sell_signal_diffs = [
         diff
         for diff in final_diff
         if isinstance(diff, dict)
         and diff.get("operation") == "add_signal"
-        and diff.get("path") == allowed_sell_signal_path
+        and diff.get("path") in allowed_sell_signal_paths
     ]
     allowed_bar_minutes_diffs = [
         diff
@@ -721,22 +723,28 @@ def _post_validation(
                     add_unexpected(f"sell.signals.{key}", "existing sell signal changed")
 
         extra_signal_keys = set(post_signals) - set(pre_signals)
-        allowed_extra_keys = {allowed_sell_signal_key} if allowed_sell_signal_diffs else set()
+        allowed_extra_keys = {
+            allowed_sell_signal_paths[str(diff.get("path"))]
+            for diff in allowed_sell_signal_diffs
+            if str(diff.get("path")) in allowed_sell_signal_paths
+        }
         disallowed_extra_keys = extra_signal_keys - allowed_extra_keys
         add_check("sell_extra_signals_only_allowed_candidate", not disallowed_extra_keys)
         for key in sorted(disallowed_extra_keys):
             add_unexpected(f"sell.signals.{key}", "unapproved new sell signal added")
 
-        if allowed_sell_signal_diffs:
+        for diff in allowed_sell_signal_diffs:
+            allowed_sell_signal_path = str(diff.get("path"))
+            allowed_sell_signal_key = allowed_sell_signal_paths.get(allowed_sell_signal_path, "")
             signal = post_signals.get(allowed_sell_signal_key)
-            add_check("allowed_sell_signal_exists", isinstance(signal, dict))
+            add_check(f"allowed_sell_signal_exists:{allowed_sell_signal_key}", isinstance(signal, dict))
             if not isinstance(signal, dict):
                 add_unexpected(allowed_sell_signal_path, "final_diff sell signal missing from post rules")
             else:
                 enabled_false = signal.get("enabled") is False
                 no_preview_candidate = "preview_candidate" not in signal
-                add_check("allowed_sell_signal_disabled", enabled_false)
-                add_check("allowed_sell_signal_not_preview_candidate", no_preview_candidate)
+                add_check(f"allowed_sell_signal_disabled:{allowed_sell_signal_key}", enabled_false)
+                add_check(f"allowed_sell_signal_not_preview_candidate:{allowed_sell_signal_key}", no_preview_candidate)
                 if not enabled_false:
                     add_unexpected(allowed_sell_signal_path, "allowed sell signal is not disabled")
                 if not no_preview_candidate:
@@ -826,7 +834,8 @@ def _post_validation(
     if _path_exists(pre_normalized, "buy.groups[0].conditions") and _path_exists(post_normalized, "buy.groups[0].conditions"):
         _get_path(post_normalized, "buy.groups[0]")["conditions"] = deepcopy(_get_path(pre_normalized, "buy.groups[0].conditions"))
     if isinstance(post_normalized.get("sell", {}).get("signals"), dict) and allowed_sell_signal_diffs:
-        post_normalized["sell"]["signals"].pop(allowed_sell_signal_key, None)
+        for signal_key in allowed_extra_keys:
+            post_normalized["sell"]["signals"].pop(signal_key, None)
 
     normalized_diff_paths = _diff_paths(pre_normalized, post_normalized)
     add_check("normalized_rules_deep_equal_outside_allowed_paths", not normalized_diff_paths)

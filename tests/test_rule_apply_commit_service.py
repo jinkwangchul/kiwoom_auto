@@ -1025,7 +1025,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+                {"sell.signals.ui_preview_condition_c": "APPROVED"},
             )
 
             result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
@@ -1038,8 +1038,8 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             signals = saved["sell"]["signals"]
 
             self.assertTrue(result["ok"])
-            self.assertIn("ui_condition_c_macd_sell", signals)
-            self.assertFalse(signals["ui_condition_c_macd_sell"]["enabled"])
+            self.assertIn("ui_condition_c", signals)
+            self.assertFalse(signals["ui_condition_c"]["enabled"])
             self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
 
     def test_buy_and_sell_allowed_changes_pass_deep_compare(self):
@@ -1052,7 +1052,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 session_path,
                 {
                     "buy.filters.ocr": "APPROVED",
-                    "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                    "sell.signals.ui_preview_condition_c": "APPROVED",
                 },
             )
 
@@ -1078,7 +1078,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
                 {
                     "bar.bar_minutes": "APPROVED",
                     "buy.filters.ocr": "APPROVED",
-                    "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                    "sell.signals.ui_preview_condition_c": "APPROVED",
                 },
             )
 
@@ -1104,7 +1104,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview, gate, context = self._build_apply_and_gate(
                 rules_path,
                 session_path,
-                {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+                {"sell.signals.ui_preview_condition_c": "APPROVED"},
             )
             apply_preview = deepcopy(apply_preview)
             apply_preview["applied_rules_preview"]["sell"]["signals"].pop("macd_sell", None)
@@ -1183,7 +1183,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["sell"]["signals"]["macd_sell"]["enabled"] = False
 
         result = self._commit_mutated_apply_preview(
-            {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+            {"sell.signals.ui_preview_condition_c": "APPROVED"},
             mutate,
         )
 
@@ -1194,7 +1194,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["sell"]["signals"].pop("macd_sell", None)
 
         result = self._commit_mutated_apply_preview(
-            {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+            {"sell.signals.ui_preview_condition_c": "APPROVED"},
             mutate,
         )
 
@@ -1208,7 +1208,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             apply_preview["applied_rules_preview"]["sell"]["signals"]["extra_sell"]["enabled"] = False
 
         result = self._commit_mutated_apply_preview(
-            {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+            {"sell.signals.ui_preview_condition_c": "APPROVED"},
             mutate,
             rules,
         )
@@ -1223,7 +1223,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             }
 
         result = self._commit_mutated_apply_preview(
-            {"sell.signals.ui_preview_condition_c_macd_sell": "APPROVED"},
+            {"sell.signals.ui_preview_condition_c": "APPROVED"},
             mutate,
         )
 
@@ -1286,7 +1286,7 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
         result = self._commit_mutated_apply_preview(
             {
                 "buy.filters.ocr": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "APPROVED",
+                "sell.signals.ui_preview_condition_c": "APPROVED",
             },
             mutate,
         )
@@ -1757,4 +1757,5 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

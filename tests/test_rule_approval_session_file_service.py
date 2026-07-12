@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from importlib.util import module_from_spec, spec_from_file_location
@@ -68,7 +68,7 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
                         },
                         "sell": {
                             "add_signal_candidate": {
-                                "path": "sell.signals.ui_preview_condition_c_macd_sell",
+                                "path": "sell.signals.ui_preview_condition_c",
                                 "enabled": False,
                                 "preview_candidate": True,
                                 "groups": [
@@ -89,7 +89,7 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
             },
             "mapped_paths": [
                 "buy.groups[0].conditions",
-                "sell.signals.ui_preview_condition_c_macd_sell",
+                "sell.signals.ui_preview_condition_c",
             ],
             "warnings": [],
         }
@@ -113,7 +113,7 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
             self.preview_result,
             {
                 "buy.groups[0].conditions": "APPROVED",
-                "sell.signals.ui_preview_condition_c_macd_sell": "DEFERRED",
+                "sell.signals.ui_preview_condition_c": "DEFERRED",
             },
         )
         fingerprint = self.mapper.build_rule_approval_session_fingerprint(
@@ -214,7 +214,7 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
 
     def test_restore_path_mismatch_resets_to_pending(self) -> None:
         saved = self._session()
-        saved["decisions"].pop("sell.signals.ui_preview_condition_c_macd_sell")
+        saved["decisions"].pop("sell.signals.ui_preview_condition_c")
 
         result = service.restore_saved_rule_approval_session(
             saved,
@@ -299,3 +299,4 @@ class RuleApprovalSessionFileServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
