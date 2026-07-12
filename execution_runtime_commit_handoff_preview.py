@@ -19,6 +19,7 @@ from execution_runtime_commit_request_validation_gate import (
 
 
 HANDOFF_TYPE = "EXECUTION_RUNTIME_COMMIT_HANDOFF_PREVIEW"
+SERVICE_HANDOFF_TYPE = "EXECUTION_RUNTIME_COMMIT_SERVICE_HANDOFF_PREVIEW"
 STATUS_READY = "READY"
 STATUS_BLOCKED = "BLOCKED"
 
@@ -88,6 +89,64 @@ def build_execution_runtime_commit_handoff_preview(validation_gate_result: Any) 
     )
 
 
+def build_execution_runtime_commit_service_handoff_preview(handoff_preview: Any) -> dict[str, Any]:
+    """Prepare a dry-run-only Commit Service input preview from READY handoff."""
+    if not isinstance(handoff_preview, dict):
+        return _service_result(status=STATUS_INVALID, issues=["MALFORMED_HANDOFF_PREVIEW"])
+
+    handoff = deepcopy(handoff_preview)
+    commit_service_input = _as_dict(handoff.get("commit_service_input_preview"))
+    request_fingerprint = _text(handoff.get("request_fingerprint"))
+    logical_target = _text(handoff.get("logical_target"))
+    operation = _text(handoff.get("operation"))
+    runtime_target = _text(handoff.get("runtime_target"))
+    relative_path = _text(handoff.get("relative_path"))
+    issues = _as_list(handoff.get("issues"))
+
+    if handoff.get("handoff_type") != HANDOFF_TYPE:
+        issues.append("INVALID_HANDOFF_TYPE")
+    if handoff.get("status") != STATUS_READY or handoff.get("handoff_ready") is not True:
+        issues.append("HANDOFF_NOT_READY")
+    if handoff.get("preview_only") is not True:
+        issues.append("PREVIEW_ONLY_REQUIRED")
+    if handoff.get("runtime_write") is not False:
+        issues.append("RUNTIME_WRITE_MUST_BE_FALSE")
+    if handoff.get("commit_service_called") is True:
+        issues.append("COMMIT_SERVICE_ALREADY_CALLED")
+    if not commit_service_input:
+        issues.append("MISSING_COMMIT_SERVICE_INPUT_PREVIEW")
+    if not request_fingerprint:
+        issues.append("MISSING_REQUEST_FINGERPRINT")
+    if _text(commit_service_input.get("request_fingerprint")) != request_fingerprint:
+        issues.append("REQUEST_FINGERPRINT_MISMATCH")
+    if _text(commit_service_input.get("logical_target")) != logical_target:
+        issues.append("LOGICAL_TARGET_MISMATCH")
+    if _text(commit_service_input.get("operation")) != operation:
+        issues.append("OPERATION_MISMATCH")
+    if _text(commit_service_input.get("runtime_target")) != runtime_target:
+        issues.append("RUNTIME_TARGET_MISMATCH")
+    if _text(commit_service_input.get("relative_path")) != relative_path:
+        issues.append("RELATIVE_PATH_MISMATCH")
+    if commit_service_input.get("preview_only") is not True:
+        issues.append("COMMIT_SERVICE_INPUT_PREVIEW_ONLY_REQUIRED")
+    if commit_service_input.get("runtime_write") is not False:
+        issues.append("COMMIT_SERVICE_INPUT_RUNTIME_WRITE_MUST_BE_FALSE")
+
+    status = STATUS_READY if not issues else _blocked_status(handoff.get("status"), issues)
+    return _service_result(
+        status=status,
+        request_fingerprint=request_fingerprint,
+        logical_target=logical_target,
+        operation=operation,
+        runtime_target=runtime_target,
+        relative_path=relative_path,
+        handoff_preview=handoff,
+        commit_service_input_preview=commit_service_input,
+        issues=_dedupe(issues),
+        warnings=_as_list(handoff.get("warnings")),
+    )
+
+
 def _result(
     *,
     status: str,
@@ -128,6 +187,48 @@ def _result(
         "validation_summary": deepcopy(validation_summary or {}),
         "commit_service_input_preview": commit_service_input_preview,
         "preview_only": True,
+        "runtime_write": False,
+        "commit_service_called": False,
+        "issues": list(issues or []),
+        "warnings": list(warnings or []),
+    }
+
+
+def _service_result(
+    *,
+    status: str,
+    request_fingerprint: str = "",
+    logical_target: str = "",
+    operation: str = "",
+    runtime_target: str = "",
+    relative_path: str = "",
+    handoff_preview: dict[str, Any] | None = None,
+    commit_service_input_preview: dict[str, Any] | None = None,
+    issues: list[Any] | None = None,
+    warnings: list[Any] | None = None,
+) -> dict[str, Any]:
+    service_preview_ready = status == STATUS_READY and not issues
+    return {
+        "service_handoff_type": SERVICE_HANDOFF_TYPE,
+        "status": status,
+        "service_preview_ready": service_preview_ready,
+        "request_fingerprint": request_fingerprint,
+        "logical_target": logical_target,
+        "operation": operation,
+        "runtime_target": runtime_target,
+        "relative_path": relative_path,
+        "commit_service_route_preview": {
+            "service_type": "EXECUTION_RUNTIME_COMMIT_SERVICE",
+            "function": "commit_execution_runtime_plan",
+            "dry_run_only": True,
+            "preview_only": True,
+            "runtime_write": False,
+            "call_allowed": False,
+        },
+        "handoff_preview": deepcopy(handoff_preview or {}),
+        "commit_service_input_preview": deepcopy(commit_service_input_preview or {}),
+        "preview_only": True,
+        "dry_run_only": True,
         "runtime_write": False,
         "commit_service_called": False,
         "issues": list(issues or []),
