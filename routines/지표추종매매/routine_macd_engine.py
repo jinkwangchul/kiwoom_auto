@@ -817,8 +817,8 @@ def _ocr_condition_data_available(
 
     for index in required_indexes:
         if index < 0:
-            index = len(series) + index
-        if index < 0 or index >= len(series) or series[index] is None:
+            return False
+        if index >= len(series) or series[index] is None:
             return False
 
     compare_target = condition.get("compare_target")
@@ -840,8 +840,8 @@ def _ocr_condition_data_available(
             compare_indexes.append(evaluation_index - 1)
         for index in compare_indexes:
             if index < 0:
-                index = len(compare_series) + index
-            if index < 0 or index >= len(compare_series) or compare_series[index] is None:
+                return False
+            if index >= len(compare_series) or compare_series[index] is None:
                 return False
         compare_condition["compare_target"] = compare_target
 

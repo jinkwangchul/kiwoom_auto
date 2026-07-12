@@ -105,6 +105,56 @@ class RoutineMacdOcrFilterTest(unittest.TestCase):
         self.assertTrue(down_passed, down_detail)
         self.assertEqual("matched", self._reason(down_detail))
 
+    def test_turn_up_at_index_zero_blocks_without_negative_index_wrap(self):
+        filter_cfg = {"enabled": True, "conditions": [{"target": "OSC", "operator": "TURN_UP"}]}
+
+        passed, detail = self.engine._evaluate_buy_ocr_filter(
+            self.default_config, self._buy_cfg(filter_cfg), {"OSC": [3.0, 2.0, 3.0]}, 0
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual("insufficient_data", self._reason(detail))
+
+    def test_turn_up_at_index_one_blocks_without_negative_index_wrap(self):
+        filter_cfg = {"enabled": True, "conditions": [{"target": "OSC", "operator": "TURN_UP"}]}
+
+        passed, detail = self.engine._evaluate_buy_ocr_filter(
+            self.default_config, self._buy_cfg(filter_cfg), {"OSC": [3.0, 2.0, 3.0]}, 1
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual("insufficient_data", self._reason(detail))
+
+    def test_turn_up_at_index_two_evaluates_normally(self):
+        filter_cfg = {"enabled": True, "conditions": [{"target": "OSC", "operator": "TURN_UP"}]}
+
+        passed, detail = self.engine._evaluate_buy_ocr_filter(
+            self.default_config, self._buy_cfg(filter_cfg), {"OSC": [3.0, 2.0, 3.0]}, 2
+        )
+
+        self.assertTrue(passed, detail)
+        self.assertEqual("matched", self._reason(detail))
+
+    def test_cross_up_compare_target_previous_bar_shortage_blocks_without_wrap(self):
+        filter_cfg = {
+            "enabled": True,
+            "conditions": [{
+                "target": "OSC",
+                "operator": "CROSS_UP",
+                "compare_target": "SIGNAL",
+            }],
+        }
+
+        passed, detail = self.engine._evaluate_buy_ocr_filter(
+            self.default_config,
+            self._buy_cfg(filter_cfg),
+            {"OSC": [1.0, 3.0], "SIGNAL": [2.0, 2.0]},
+            0,
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual("insufficient_data", self._reason(detail))
+
     def test_threshold_above_and_below_conditions(self):
         gte_filter = {"enabled": True, "conditions": [{"target": "OSC", "operator": ">=", "value": 2.0}]}
         lte_filter = {"enabled": True, "conditions": [{"target": "OSC", "operator": "<=", "value": 2.0}]}
