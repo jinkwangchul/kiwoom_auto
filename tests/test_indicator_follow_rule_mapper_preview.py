@@ -879,7 +879,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             saved_pending["candidates"]["filters"]["moving_average"]["path"],
             "buy.filters.moving_average",
         )
-        generated_sell_candidate = generated_pending["candidates"]["sell"]["add_signal_candidate"]
+        generated_sell_candidate = generated_pending["candidates"]["sell"]["add_signal_candidates"][
+            "sell.signals.ui_preview_condition_c"
+        ]
         self.assertEqual(generated_sell_candidate["path"], "sell.signals.ui_preview_condition_c")
         self.assertEqual(
             generated_sell_candidate["value"]["groups"][0]["name"],
@@ -998,6 +1000,184 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertNotIn(
             "sell.signals.ui_preview_condition_c",
             self.mapper.build_rule_approval_session(result)["decisions"],
+        )
+
+    def test_sell_condition_a_ocr_only_creates_unified_signal_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "상승",
+            "ocr_compare_combo": "이하",
+            "ocr_sign_combo": "-",
+            "ocr_value_line": "91",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]
+        conditions = candidate["value"]["groups"][0]["conditions"]
+
+        self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_a")
+        self.assertEqual(candidate["value"]["groups"][0]["name"], "condition_a")
+        self.assertFalse(candidate["value"]["enabled"])
+        self.assertEqual([condition["target"] for condition in conditions], ["OSC", "OSC"])
+        self.assertEqual([condition["operator"] for condition in conditions], ["TURN_UP", "<="])
+        self.assertEqual(conditions[1]["value"], -91.0)
+
+    def test_sell_condition_a_rsi_only_creates_unified_signal_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "rsi_check": True,
+            "rsi_period_line": "14",
+            "rsi_compare_combo": "이상",
+            "rsi_value_line": "70",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]
+        conditions = candidate["value"]["groups"][0]["conditions"]
+
+        self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_a")
+        self.assertEqual(conditions, [{
+            "enabled": True,
+            "not": False,
+            "target": "RSI",
+            "period": 14,
+            "operator": ">=",
+            "value": 70.0,
+            "description": "UI preview: sell condition A RSI threshold condition",
+        }])
+
+    def test_sell_condition_a_preserves_ocr_then_rsi_order(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "하락",
+            "ocr_compare_combo": "이상",
+            "ocr_sign_combo": "+",
+            "ocr_value_line": "10",
+            "rsi_check": True,
+            "rsi_period_line": "14",
+            "rsi_compare_combo": "이하",
+            "rsi_value_line": "30",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidates"]
+        conditions = candidates["sell.signals.ui_preview_condition_a"]["value"]["groups"][0]["conditions"]
+
+        self.assertEqual([condition["target"] for condition in conditions], ["OSC", "OSC", "RSI"])
+        self.assertEqual([condition["operator"] for condition in conditions], ["TURN_DOWN", ">=", "<="])
+        self.assertIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
+        self.assertIn("sell.signals.ui_preview_condition_c", result["mapped_paths"])
+
+    def test_sell_condition_a_gap_only_is_deferred_without_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "gap_check": True,
+            "gap_left_combo": "주문가",
+            "gap_right_combo": "현재가",
+            "gap_direction_combo": "상하",
+            "gap_value_line": "0.25",
+            "gap_compare_combo": "이내",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+
+        self.assertNotIn("sell", candidates)
+        self.assertIn(
+            "sell condition A GAP mapping is postponed until gap semantics are finalized",
+            result["warnings"],
+        )
+
+    def test_sell_condition_a_empty_config_does_not_create_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": False,
+            "rsi_check": False,
+            "gap_check": False,
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+
+        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
+        self.assertNotIn("sell.signals.ui_preview_condition_a", result["mapped_paths"])
+
+    def test_sell_condition_a_approval_apply_and_commit_preview(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "상승",
+            "rsi_check": True,
+            "rsi_period_line": "14",
+            "rsi_compare_combo": "이상",
+            "rsi_value_line": "70",
+        }
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"sell.signals.ui_preview_condition_a": "APPROVED"},
+        )
+
+        patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+        apply_preview = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+        session = self.mapper.build_rule_approval_session(preview, {"sell.signals.ui_preview_condition_a": "APPROVED"})
+        fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
+        session["fingerprint"] = fingerprint["fingerprint"]
+        commit_preview = self.mapper.build_rule_commit_preview(self.current_rules, preview, session, apply_preview)
+        signals = apply_preview["applied_rules_preview"]["sell"]["signals"]
+
+        self.assertEqual(patch_preview["patches"][0]["source_path"], "sell.signals.ui_preview_condition_a")
+        self.assertEqual(patch_preview["patches"][0]["target_path"], "sell.signals.ui_condition_a")
+        self.assertIn("ui_condition_a", signals)
+        self.assertFalse(signals["ui_condition_a"]["enabled"])
+        self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
+        self.assertTrue(commit_preview["commit_allowed"])
+        self.assertEqual(commit_preview["final_diff"][0]["path"], "sell.signals.ui_condition_a")
+
+    def test_sell_condition_a_non_approved_decisions_do_not_create_patch(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "상승",
+        }
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        for decision in ("PENDING", "REJECTED", "DEFERRED"):
+            with self.subTest(decision=decision):
+                approval = self.mapper.evaluate_rule_candidate_approval(
+                    preview,
+                    {"sell.signals.ui_preview_condition_a": decision},
+                )
+                patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+                self.assertEqual(patch_preview["patches"], [])
+
+    def test_sell_condition_a_existing_signal_overwrite_is_blocked(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "상승",
+        }
+        current_rules = deepcopy(self.current_rules)
+        current_rules["sell"]["signals"]["ui_condition_a"] = {"enabled": False}
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(current_rules))
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"sell.signals.ui_preview_condition_a": "APPROVED"},
+        )
+
+        patch_preview = self.mapper.build_approved_rule_patch_preview(current_rules, preview, approval)
+
+        self.assertEqual(patch_preview["patches"], [])
+        self.assertIn(
+            {
+                "path": "sell.signals.ui_preview_condition_a",
+                "reason": "target path already exists: sell.signals.ui_condition_a",
+            },
+            patch_preview["skipped_paths"],
         )
 
     def test_sell_condition_c_array_only_creates_unified_signal_candidate(self):
