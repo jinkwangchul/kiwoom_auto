@@ -769,6 +769,198 @@ def _evaluate_buy_bollinger_filter(
     )
 
 
+def _buy_ocr_filter_config(config: dict[str, Any], buy_cfg: dict[str, Any]) -> dict[str, Any]:
+    filters = buy_cfg.get("filters")
+    if isinstance(filters, dict) and isinstance(filters.get("ocr"), dict):
+        return filters["ocr"]
+    return {}
+
+
+def _ocr_detail(
+    *,
+    enabled: bool,
+    logic: Any,
+    passed: bool,
+    reason: str,
+    evaluation_index: int,
+    condition_details: list[str] | None = None,
+) -> str:
+    detail = (
+        "filter_type=OCR "
+        f"enabled={enabled} "
+        f"logic={logic} "
+        f"passed={passed} "
+        f"reason={reason} "
+        f"evaluation_index={evaluation_index}"
+    )
+    if condition_details:
+        detail += " condition_details=" + "|".join(str(item).replace(" ", "_") for item in condition_details)
+    return detail
+
+
+def _ocr_condition_data_available(
+    condition: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> bool:
+    target = str(condition.get("target", "OSC") or "OSC").strip().upper()
+    series = series_map.get(target)
+    if not isinstance(series, list):
+        return False
+
+    operator = str(condition.get("operator", "") or "").strip().upper()
+    required_indexes = [evaluation_index]
+    if operator in {"TURN_UP", "TURN_DOWN"}:
+        required_indexes.extend([evaluation_index - 1, evaluation_index - 2])
+    elif operator in {"TREND_UP", "TREND_DOWN", "CROSS_UP", "CROSS_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN"}:
+        required_indexes.append(evaluation_index - 1)
+
+    for index in required_indexes:
+        if index < 0:
+            index = len(series) + index
+        if index < 0 or index >= len(series) or series[index] is None:
+            return False
+
+    compare_target = condition.get("compare_target")
+    if compare_target:
+        compare_condition = dict(condition)
+        compare_key = "MA"
+        if str(compare_target).strip().upper() == "MA":
+            period = _safe_int(condition.get("period"))
+            if period is None or period <= 0:
+                return False
+            compare_key = f"MA{period}"
+        else:
+            compare_key = str(compare_target).strip().upper()
+        compare_series = series_map.get(compare_key)
+        if not isinstance(compare_series, list):
+            return False
+        compare_indexes = [evaluation_index]
+        if operator in {"CROSS_UP", "CROSS_DOWN"}:
+            compare_indexes.append(evaluation_index - 1)
+        for index in compare_indexes:
+            if index < 0:
+                index = len(compare_series) + index
+            if index < 0 or index >= len(compare_series) or compare_series[index] is None:
+                return False
+        compare_condition["compare_target"] = compare_target
+
+    return True
+
+
+def _ocr_condition_error(
+    condition: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> str | None:
+    target = str(condition.get("target", "OSC") or "OSC").strip().upper()
+    operator = str(condition.get("operator", "") or "").strip().upper()
+    supported_operators = {
+        "TURN_UP", "TURN_DOWN", "TREND_UP", "TREND_DOWN",
+        "CROSS_UP", "CROSS_DOWN", "ZERO_CROSS_UP", "ZERO_CROSS_DOWN",
+        ">", ">=", "<", "<=", "=", "==", "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW",
+    }
+
+    if operator not in supported_operators:
+        return "unsupported_operator"
+    if target not in series_map:
+        return "unsupported_target"
+    if condition.get("compare_target") == "MA":
+        period = _safe_int(condition.get("period"))
+        if period is None or period <= 0:
+            return "invalid_period"
+    if operator in {">", ">=", "<", "<=", "=", "==", "GT", "GTE", "LT", "LTE", "EQ", "ABOVE", "BELOW"} and not condition.get("compare_target"):
+        if _safe_float(condition.get("value")) is None:
+            return "invalid_value"
+    if not _ocr_condition_data_available(condition, series_map, evaluation_index):
+        return "insufficient_data"
+    return None
+
+
+def _evaluate_buy_ocr_filter(
+    config: dict[str, Any],
+    buy_cfg: dict[str, Any],
+    series_map: dict[str, list[float | None]],
+    evaluation_index: int,
+) -> tuple[bool, str | None]:
+    filter_cfg = _buy_ocr_filter_config(config, buy_cfg)
+    if not filter_cfg:
+        return True, None
+
+    enabled = bool(filter_cfg.get("enabled", True))
+    logic = _logic(filter_cfg.get("conditions_logic", filter_cfg.get("logic", "AND")), "AND")
+    if not enabled:
+        return True, _ocr_detail(
+            enabled=False,
+            logic=logic,
+            passed=True,
+            reason="disabled",
+            evaluation_index=evaluation_index,
+        )
+
+    conditions = filter_cfg.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        return False, _ocr_detail(
+            enabled=True,
+            logic=logic,
+            passed=False,
+            reason="missing_conditions",
+            evaluation_index=evaluation_index,
+        )
+
+    condition_results = []
+    condition_details: list[str] = []
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            return False, _ocr_detail(
+                enabled=True,
+                logic=logic,
+                passed=False,
+                reason="invalid_condition",
+                evaluation_index=evaluation_index,
+                condition_details=condition_details,
+            )
+        runtime_condition = dict(condition)
+        runtime_condition.setdefault("target", "OSC")
+        error = _ocr_condition_error(runtime_condition, series_map, evaluation_index)
+        if error is not None:
+            condition_details.append(
+                f"{runtime_condition.get('target')} {runtime_condition.get('operator')} reason={error}"
+            )
+            return False, _ocr_detail(
+                enabled=True,
+                logic=logic,
+                passed=False,
+                reason=error,
+                evaluation_index=evaluation_index,
+                condition_details=condition_details,
+            )
+        result = evaluate_condition(runtime_condition, series_map, evaluation_index)
+        condition_results.append(result)
+        condition_details.append(("PASS " if result.passed else "FAIL ") + result.detail)
+
+    if not condition_results:
+        return False, _ocr_detail(
+            enabled=True,
+            logic=logic,
+            passed=False,
+            reason="missing_conditions",
+            evaluation_index=evaluation_index,
+        )
+
+    passed = all(result.passed for result in condition_results) if logic == "AND" else any(
+        result.passed for result in condition_results
+    )
+    return passed, _ocr_detail(
+        enabled=True,
+        logic=logic,
+        passed=passed,
+        reason="matched" if passed else "not_matched",
+        evaluation_index=evaluation_index,
+        condition_details=condition_details,
+    )
+
+
 def _context_float(context: dict[str, Any] | None, keys: tuple[str, ...], nested: tuple[tuple[str, ...], ...] = ()) -> float | None:
     if not isinstance(context, dict):
         return None
@@ -991,6 +1183,11 @@ def evaluate_indicator_follow_routine(
             details.append(bollinger_detail)
         if not bollinger_passed:
             return RoutineSignal(None, "BUY bollinger filter blocked", matched, details, buy_index, buy_delay)
+        ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(cfg, buy_cfg, series_map, buy_index)
+        if ocr_detail:
+            details.append(ocr_detail)
+        if not ocr_passed:
+            return RoutineSignal(None, "BUY OCR filter blocked", matched, details, buy_index, buy_delay)
         return RoutineSignal("BUY", "매수조건 충족", matched, details, buy_index, buy_delay)
 
     sell_results = [
