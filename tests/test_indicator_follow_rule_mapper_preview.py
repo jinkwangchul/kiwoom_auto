@@ -1180,6 +1180,243 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             patch_preview["skipped_paths"],
         )
 
+    def test_sell_condition_b_bollinger_upper_gte_creates_signal_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["add_signal_candidate"]
+        condition = candidate["value"]["groups"][0]["conditions"][0]
+
+        self.assertEqual(candidate["path"], "sell.signals.ui_preview_condition_b")
+        self.assertEqual(candidate["value"]["groups"][0]["name"], "condition_b")
+        self.assertFalse(candidate["value"]["enabled"])
+        self.assertEqual(condition["target"], "CLOSE")
+        self.assertEqual(condition["operator"], ">=")
+        self.assertEqual(condition["compare_target"], "BOLLINGER_UPPER")
+        self.assertEqual(condition["value"], 0.1)
+
+    def test_sell_condition_b_bollinger_upper_lte_creates_signal_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이하",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"][
+            "add_signal_candidate"
+        ]["value"]["groups"][0]["conditions"][0]
+
+        self.assertEqual(condition["operator"], "<=")
+        self.assertEqual(condition["compare_target"], "BOLLINGER_UPPER")
+        self.assertEqual(condition["value"], 0.1)
+
+    def test_sell_condition_b_bollinger_lower_gte_uses_negative_offset(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "하향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"][
+            "add_signal_candidate"
+        ]["value"]["groups"][0]["conditions"][0]
+
+        self.assertEqual(condition["operator"], ">=")
+        self.assertEqual(condition["compare_target"], "BOLLINGER_LOWER")
+        self.assertEqual(condition["value"], -0.1)
+
+    def test_sell_condition_b_bollinger_lower_lte_uses_negative_offset(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "하향",
+            "bollinger_compare_combo": "이하",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        condition = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"][
+            "add_signal_candidate"
+        ]["value"]["groups"][0]["conditions"][0]
+
+        self.assertEqual(condition["operator"], "<=")
+        self.assertEqual(condition["compare_target"], "BOLLINGER_LOWER")
+        self.assertEqual(condition["value"], -0.1)
+
+    def test_sell_condition_b_bollinger_inactive_does_not_create_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": False,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+
+        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
+        self.assertNotIn("sell.signals.ui_preview_condition_b", result["mapped_paths"])
+
+    def test_sell_condition_b_price_box_only_is_postponed_without_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "price_box_check": True,
+            "price_box_direction_combo": "상향",
+            "price_box_compare_combo": "이상",
+            "price_box_value_line": "0.1",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+
+        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
+        self.assertIn(
+            "sell condition B Price Box mapping is postponed until price box series semantics are finalized",
+            result["warnings"],
+        )
+
+    def test_sell_condition_b_gap_only_is_postponed_without_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "gap_check": True,
+            "gap_left_combo": "주문가",
+            "gap_right_combo": "현재가",
+            "gap_direction_combo": "상하",
+            "gap_value_line": "0.25",
+            "gap_compare_combo": "이내",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+
+        self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
+        self.assertIn("sell condition B GAP mapping is postponed until gap semantics are finalized", result["warnings"])
+
+    def test_sell_condition_b_or_not_logic_blocks_candidate(self):
+        for logic in ("OR", "NOT"):
+            with self.subTest(logic=logic):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+                state["sell_ui"]["signal_conditions"]["condition_b"] = {
+                    "bollinger_check": True,
+                    "bollinger_direction_combo": "상향",
+                    "bollinger_compare_combo": "이상",
+                    "bollinger_value_line": "0.1",
+                    "bollinger_logic_combo": logic,
+                }
+
+                result = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+
+                self.assertNotIn("sell", result["preview_rules"]["indicator_follow_rule_preview"]["candidates"])
+                self.assertIn(f"sell condition B Bollinger logic is not supported: '{logic}'", result["warnings"])
+
+    def test_sell_condition_b_approval_apply_and_commit_preview(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_a"] = {
+            "ocr_check": True,
+            "ocr_turn_combo": "상승",
+        }
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"sell.signals.ui_preview_condition_b": "APPROVED"},
+        )
+
+        patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+        apply_preview = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+        session = self.mapper.build_rule_approval_session(preview, {"sell.signals.ui_preview_condition_b": "APPROVED"})
+        fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
+        session["fingerprint"] = fingerprint["fingerprint"]
+        commit_preview = self.mapper.build_rule_commit_preview(self.current_rules, preview, session, apply_preview)
+        signals = apply_preview["applied_rules_preview"]["sell"]["signals"]
+
+        self.assertEqual(patch_preview["patches"][0]["source_path"], "sell.signals.ui_preview_condition_b")
+        self.assertEqual(patch_preview["patches"][0]["target_path"], "sell.signals.ui_condition_b")
+        self.assertIn("ui_condition_b", signals)
+        self.assertFalse(signals["ui_condition_b"]["enabled"])
+        self.assertNotIn("ui_condition_a", signals)
+        self.assertNotIn("ui_condition_c", signals)
+        self.assertEqual(signals["macd_sell"], self.current_rules["sell"]["signals"]["macd_sell"])
+        self.assertIn("sell.signals.ui_preview_condition_a", preview["mapped_paths"])
+        self.assertIn("sell.signals.ui_preview_condition_c", preview["mapped_paths"])
+        self.assertTrue(commit_preview["commit_allowed"])
+        self.assertEqual(commit_preview["final_diff"][0]["path"], "sell.signals.ui_condition_b")
+
+    def test_sell_condition_b_non_approved_decisions_do_not_create_patch(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(self.current_rules))
+        for decision in ("PENDING", "REJECTED", "DEFERRED"):
+            with self.subTest(decision=decision):
+                approval = self.mapper.evaluate_rule_candidate_approval(
+                    preview,
+                    {"sell.signals.ui_preview_condition_b": decision},
+                )
+                patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+                self.assertEqual(patch_preview["patches"], [])
+
+    def test_sell_condition_b_existing_signal_overwrite_is_blocked(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_b"] = {
+            "bollinger_check": True,
+            "bollinger_direction_combo": "상향",
+            "bollinger_compare_combo": "이상",
+            "bollinger_value_line": "0.1",
+            "bollinger_logic_combo": "AND",
+        }
+        current_rules = deepcopy(self.current_rules)
+        current_rules["sell"]["signals"]["ui_condition_b"] = {"enabled": False}
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(state, deepcopy(current_rules))
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"sell.signals.ui_preview_condition_b": "APPROVED"},
+        )
+
+        patch_preview = self.mapper.build_approved_rule_patch_preview(current_rules, preview, approval)
+
+        self.assertEqual(patch_preview["patches"], [])
+        self.assertIn(
+            {
+                "path": "sell.signals.ui_preview_condition_b",
+                "reason": "target path already exists: sell.signals.ui_condition_b",
+            },
+            patch_preview["skipped_paths"],
+        )
+
     def test_sell_condition_c_array_only_creates_unified_signal_candidate(self):
         state = deepcopy(self.ui_state)
         condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]

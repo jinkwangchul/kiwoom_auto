@@ -471,6 +471,8 @@ def _post_validation(
         and isinstance(diff.get("condition"), dict)
     ]
     allowed_sell_signal_paths = {
+        "sell.signals.ui_condition_a": "ui_condition_a",
+        "sell.signals.ui_condition_b": "ui_condition_b",
         "sell.signals.ui_condition_c": "ui_condition_c",
         "sell.signals.ui_condition_c_macd_sell": "ui_condition_c_macd_sell",
     }
