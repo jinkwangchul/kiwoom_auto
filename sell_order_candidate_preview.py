@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Preview-only SELL order candidate builder.
 
-Phase 2 supports METHOD action candidates and separate COMPLETION action
-candidates for market-selling remaining quantity. It never creates executable
-order requests and never connects runtime, queue, execution, or SendOrder.
+Phase 3 supports separate METHOD, COMPLETION, and PENDING action candidates.
+It never creates executable order requests and never connects runtime, queue,
+execution, or SendOrder.
 """
 
 from __future__ import annotations
@@ -22,7 +22,9 @@ STATUS_INVALID = "INVALID"
 STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
 ACTION_SOURCE = "METHOD"
 ACTION_SOURCE_COMPLETION = "COMPLETION"
+ACTION_SOURCE_PENDING = "PENDING"
 POLICY_MARKET_SELL_REMAINING = "MARKET_SELL_REMAINING"
+POLICY_CANCEL_PENDING_ORDER = "CANCEL_PENDING_ORDER"
 SAFETY_FLAGS = ("execution_connected", "runtime_write", "send_order", "queue_write")
 
 _SINGLE_HOGA_TERMS = {"SINGLE", "SINGLE_HOGA", "single", "\ub2e8\uc77c\ud638\uac00"}
@@ -177,6 +179,7 @@ def _candidate(
     method_set: str | None,
     action_source: str,
     symbol: str | None,
+    order_id: str | None = None,
     quantity: float | None,
     price: float | None,
     hoga: str | None,
@@ -199,6 +202,7 @@ def _candidate(
         "signal_id": _signal_id(signal),
         "method_set": method_set,
         "action_source": action_source,
+        "order_id": order_id,
         "quantity": quantity,
         "price": price,
         "hoga": hoga,
@@ -359,12 +363,87 @@ def _completion_candidate(
         method_set=_method_set(method) or _text(completion.get("method_set")) or None,
         action_source=ACTION_SOURCE_COMPLETION,
         symbol=symbol,
+        order_id=None,
         quantity=quantity,
         price=None,
         hoga=hoga,
         order_type=order_type,
         method_snapshot=method_snapshot,
         source_previews={"completion": deepcopy(completion)},
+        reasons=list(reasons + invalid),
+        warnings=warnings,
+    )
+
+
+def _pending_candidate(
+    *,
+    pending: dict[str, Any] | None,
+    signal: dict[str, Any],
+    method: dict[str, Any],
+    method_snapshot: dict[str, Any] | None,
+    symbol: str | None,
+) -> dict[str, Any] | None:
+    if pending is None:
+        return None
+
+    reasons: list[str] = []
+    invalid: list[str] = []
+    warnings: list[str] = []
+    action = _as_dict(pending.get("action_preview"))
+    order_id = _text(pending.get("order_id") or action.get("order_id"))
+    quantity = _number(pending.get("remaining_qty"))
+    if quantity is None:
+        quantity = _number(action.get("remaining_qty"))
+
+    invalid.extend(_safety_reasons(pending, action))
+
+    pending_status = _text(pending.get("status"))
+    if pending_status == STATUS_NOT_APPLICABLE:
+        return None
+    if pending_status == STATUS_INVALID:
+        invalid.extend(_as_list(pending.get("reasons")) or ["pending preview is invalid"])
+    elif pending_status == STATUS_BLOCKED:
+        reasons.extend(_as_list(pending.get("reasons")) or ["pending preview is blocked"])
+    elif pending_status != STATUS_READY:
+        reasons.append(f"pending preview status is not READY: {pending_status or '<empty>'}")
+
+    if pending.get("policy") != POLICY_CANCEL_PENDING_ORDER:
+        reasons.append("pending policy must be CANCEL_PENDING_ORDER")
+    if action.get("action") != POLICY_CANCEL_PENDING_ORDER:
+        reasons.append("pending action must be CANCEL_PENDING_ORDER")
+
+    if not order_id:
+        reasons.append("pending order_id is required")
+    if quantity is None:
+        reasons.append("pending remaining_qty is required")
+    elif quantity <= 0:
+        reasons.append("pending remaining_qty is not greater than 0")
+
+    if not symbol:
+        reasons.append("symbol is required")
+
+    if invalid:
+        status = STATUS_INVALID
+    elif quantity is not None and quantity <= 0:
+        status = STATUS_NOT_APPLICABLE
+    elif reasons:
+        status = STATUS_BLOCKED
+    else:
+        status = STATUS_READY
+
+    return _candidate(
+        status=status,
+        signal=signal,
+        method_set=_method_set(method) or _text(pending.get("method_set")) or None,
+        action_source=ACTION_SOURCE_PENDING,
+        symbol=symbol,
+        order_id=order_id or None,
+        quantity=quantity,
+        price=None,
+        hoga=None,
+        order_type=None,
+        method_snapshot=method_snapshot,
+        source_previews={"pending": deepcopy(pending)},
         reasons=list(reasons + invalid),
         warnings=warnings,
     )
@@ -474,6 +553,7 @@ def build_sell_order_candidate_preview(
         method_set=_method_set(method),
         action_source=ACTION_SOURCE,
         symbol=symbol,
+        order_id=None,
         quantity=quantity if status == STATUS_READY else quantity,
         price=price,
         hoga=hoga,
@@ -495,9 +575,15 @@ def build_sell_order_candidate_preview(
     if completion_candidate is not None:
         candidates.append(completion_candidate)
 
-    if pending and pending.get("status") == STATUS_READY:
-        warnings.append("pending_action_source_not_supported_in_phase_2")
-        method_candidate["warnings"].append("pending_action_source_not_supported_in_phase_2")
+    pending_candidate = _pending_candidate(
+        pending=pending,
+        signal=signal,
+        method=method,
+        method_snapshot=snapshot_copy,
+        symbol=symbol,
+    )
+    if pending_candidate is not None:
+        candidates.append(pending_candidate)
 
     ready_sources = [candidate.get("action_source") for candidate in candidates if candidate.get("status") == STATUS_READY]
     if len(ready_sources) > 1:

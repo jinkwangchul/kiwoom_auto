@@ -82,6 +82,36 @@ class SellOrderCandidatePreviewTest(unittest.TestCase):
                 return candidate
         return None
 
+    def _pending(self, **overrides):
+        pending = {
+            "preview_type": "SELL_PENDING_POLICY_PREVIEW",
+            "status": "READY",
+            "method_set": "setting_a",
+            "policy": "CANCEL_PENDING_ORDER",
+            "order_id": "ORD-1",
+            "remaining_qty": 5,
+            "action_preview": {
+                "action": "CANCEL_PENDING_ORDER",
+                "scope": "EACH",
+                "order_id": "ORD-1",
+                "remaining_qty": 5,
+                "cancel_order_called": False,
+                "execution_connected": False,
+            },
+            "execution_connected": False,
+            "runtime_write": False,
+            "send_order": False,
+            "queue_write": False,
+        }
+        pending.update(overrides)
+        return pending
+
+    def _pending_candidate(self, result):
+        for candidate in result["candidates"]:
+            if candidate["action_source"] == "PENDING":
+                return candidate
+        return None
+
     def _build(self, **overrides):
         kwargs = {
             "sell_signal_preview": self._signal(),
@@ -371,17 +401,129 @@ class SellOrderCandidatePreviewTest(unittest.TestCase):
         for candidate in result["candidates"]:
             self.assertIn("multiple_ready_action_sources", candidate["warnings"])
 
-    def test_pending_ready_is_not_converted_in_phase_2(self):
-        pending = {
-            "preview_type": "SELL_PENDING_POLICY_PREVIEW",
-            "status": "READY",
-            "action_preview": {"action": "CANCEL_PENDING_ORDER"},
-        }
+    def test_pending_ready_creates_pending_candidate(self):
+        result = self._build(pending_preview=self._pending())
+
+        pending = self._pending_candidate(result)
+        self.assertIsNotNone(pending)
+        self.assertEqual("READY", pending["status"])
+        self.assertEqual("PENDING", pending["action_source"])
+
+    def test_pending_candidate_preserves_order_id(self):
+        result = self._build(pending_preview=self._pending(order_id="ORD-2"))
+
+        self.assertEqual("ORD-2", self._pending_candidate(result)["order_id"])
+
+    def test_pending_candidate_uses_remaining_qty(self):
+        result = self._build(pending_preview=self._pending(remaining_qty=6))
+
+        self.assertEqual(6, self._pending_candidate(result)["quantity"])
+
+    def test_pending_candidate_does_not_create_order_or_candidate(self):
+        result = self._build(pending_preview=self._pending())
+        pending = self._pending_candidate(result)
+
+        self.assertFalse(pending["order_request_created"])
+        self.assertFalse(pending["candidate_created"])
+
+    def test_pending_blocked_is_propagated_to_pending_candidate(self):
+        result = self._build(pending_preview=self._pending(status="BLOCKED", reasons=["pending blocked"]))
+        pending = self._pending_candidate(result)
+
+        self.assertEqual("BLOCKED", pending["status"])
+        self.assertIn("pending blocked", pending["reasons"])
+
+    def test_pending_invalid_is_propagated_to_pending_candidate(self):
+        result = self._build(pending_preview=self._pending(status="INVALID", reasons=["pending invalid"]))
+        pending = self._pending_candidate(result)
+
+        self.assertEqual("INVALID", pending["status"])
+        self.assertIn("pending invalid", pending["reasons"])
+
+    def test_pending_not_applicable_creates_no_pending_candidate(self):
+        result = self._build(pending_preview=self._pending(status="NOT_APPLICABLE"))
+
+        self.assertIsNone(self._pending_candidate(result))
+
+    def test_pending_missing_order_id_is_blocked(self):
+        pending = self._pending(order_id="")
+        pending["action_preview"]["order_id"] = ""
 
         result = self._build(pending_preview=pending)
 
-        self.assertEqual(["METHOD"], [candidate["action_source"] for candidate in result["candidates"]])
-        self.assertIn("pending_action_source_not_supported_in_phase_2", result["warnings"])
+        self.assertEqual("BLOCKED", self._pending_candidate(result)["status"])
+        self.assertIn("pending order_id is required", self._pending_candidate(result)["reasons"])
+
+    def test_pending_missing_remaining_qty_is_blocked(self):
+        pending = self._pending()
+        pending.pop("remaining_qty")
+        pending["action_preview"].pop("remaining_qty")
+
+        result = self._build(pending_preview=pending)
+
+        self.assertEqual("BLOCKED", self._pending_candidate(result)["status"])
+        self.assertIn("pending remaining_qty is required", self._pending_candidate(result)["reasons"])
+
+    def test_pending_remaining_qty_zero_or_negative_is_not_applicable(self):
+        zero = self._build(pending_preview=self._pending(remaining_qty=0))
+        negative = self._build(pending_preview=self._pending(remaining_qty=-1))
+
+        self.assertEqual("NOT_APPLICABLE", self._pending_candidate(zero)["status"])
+        self.assertEqual("NOT_APPLICABLE", self._pending_candidate(negative)["status"])
+
+    def test_pending_safety_flag_true_is_invalid(self):
+        result = self._build(pending_preview=self._pending(runtime_write=True))
+
+        self.assertEqual("INVALID", self._pending_candidate(result)["status"])
+        self.assertIn("safety flag must be false: runtime_write", self._pending_candidate(result)["reasons"])
+
+    def test_pending_wrong_policy_or_action_is_blocked(self):
+        wrong_policy = self._build(pending_preview=self._pending(policy="OTHER"))
+        wrong_action = self._build(pending_preview=self._pending(action_preview={"action": "OTHER"}))
+
+        self.assertEqual("BLOCKED", self._pending_candidate(wrong_policy)["status"])
+        self.assertIn("pending policy must be CANCEL_PENDING_ORDER", self._pending_candidate(wrong_policy)["reasons"])
+        self.assertEqual("BLOCKED", self._pending_candidate(wrong_action)["status"])
+        self.assertIn("pending action must be CANCEL_PENDING_ORDER", self._pending_candidate(wrong_action)["reasons"])
+
+    def test_method_completion_and_pending_ready_keep_three_candidates(self):
+        result = self._build(completion_preview=self._completion(), pending_preview=self._pending())
+
+        self.assertEqual(
+            ["METHOD", "COMPLETION", "PENDING"],
+            [candidate["action_source"] for candidate in result["candidates"]],
+        )
+
+    def test_three_ready_action_sources_warning(self):
+        result = self._build(completion_preview=self._completion(), pending_preview=self._pending())
+
+        self.assertIn("multiple_ready_action_sources", result["warnings"])
+        for candidate in result["candidates"]:
+            self.assertIn("multiple_ready_action_sources", candidate["warnings"])
+
+    def test_pending_snapshot_is_deepcopy(self):
+        pending = self._pending(nested={"value": 1})
+
+        result = self._build(pending_preview=pending)
+        self._pending_candidate(result)["source_previews"]["pending"]["nested"]["value"] = 2
+
+        self.assertEqual(1, pending["nested"]["value"])
+
+    def test_pending_input_is_not_mutated(self):
+        signal = self._signal()
+        method = self._method()
+        pending = self._pending()
+        market = self._market()
+        before = (deepcopy(signal), deepcopy(method), deepcopy(pending), deepcopy(market))
+
+        build_sell_order_candidate_preview(
+            signal,
+            method,
+            pending_preview=pending,
+            market_context=market,
+        )
+
+        self.assertEqual(before, (signal, method, pending, market))
 
     def test_completion_snapshot_is_deepcopy(self):
         completion = self._completion(nested={"value": 1})
