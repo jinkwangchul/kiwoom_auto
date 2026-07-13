@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Preview-only SELL order candidate builder.
 
-Phase 1 supports only METHOD action candidates for single-hoga full-position
-SELL previews. It never creates executable order requests and never connects
-runtime, queue, execution, or SendOrder.
+Phase 2 supports METHOD action candidates and separate COMPLETION action
+candidates for market-selling remaining quantity. It never creates executable
+order requests and never connects runtime, queue, execution, or SendOrder.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ STATUS_BLOCKED = "BLOCKED"
 STATUS_INVALID = "INVALID"
 STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
 ACTION_SOURCE = "METHOD"
+ACTION_SOURCE_COMPLETION = "COMPLETION"
+POLICY_MARKET_SELL_REMAINING = "MARKET_SELL_REMAINING"
 SAFETY_FLAGS = ("execution_connected", "runtime_write", "send_order", "queue_write")
 
 _SINGLE_HOGA_TERMS = {"SINGLE", "SINGLE_HOGA", "single", "\ub2e8\uc77c\ud638\uac00"}
@@ -84,6 +86,12 @@ def _method_snapshot(preview: dict[str, Any]) -> Any:
 def _method_set(preview: dict[str, Any]) -> str | None:
     value = _text(preview.get("method_set"))
     return value or None
+
+
+def _looks_like_market_context(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(key in value for key in ("current_price", "holding_qty", "average_price", "order_price"))
 
 
 def _symbol(signal: dict[str, Any], market: dict[str, Any]) -> str | None:
@@ -162,6 +170,48 @@ def _safety_reasons(*containers: Any) -> list[str]:
     return reasons
 
 
+def _candidate(
+    *,
+    status: str,
+    signal: dict[str, Any],
+    method_set: str | None,
+    action_source: str,
+    symbol: str | None,
+    quantity: float | None,
+    price: float | None,
+    hoga: str | None,
+    order_type: str | None,
+    method_snapshot: dict[str, Any] | None,
+    source_previews: dict[str, Any],
+    reasons: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "preview_type": PREVIEW_TYPE,
+        "preview_only": True,
+        "execution_connected": False,
+        "runtime_write": False,
+        "queue_write": False,
+        "send_order": False,
+        "status": status,
+        "symbol": symbol,
+        "side": "SELL",
+        "signal_id": _signal_id(signal),
+        "method_set": method_set,
+        "action_source": action_source,
+        "quantity": quantity,
+        "price": price,
+        "hoga": hoga,
+        "order_type": order_type,
+        "order_request_created": False,
+        "candidate_created": False,
+        "method_snapshot": deepcopy(method_snapshot),
+        "source_previews": deepcopy(source_previews),
+        "reasons": list(reasons),
+        "warnings": list(warnings),
+    }
+
+
 def _hoga_and_price(snapshot: dict[str, Any], market: dict[str, Any]) -> tuple[str | None, float | None, list[str]]:
     reasons: list[str] = []
     single_value = snapshot.get("perform1_single_combo")
@@ -210,6 +260,7 @@ def _result(
     order_type: str | None,
     reasons: list[str],
     warnings: list[str],
+    candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "preview_type": PREVIEW_TYPE,
@@ -239,19 +290,110 @@ def _result(
         "runtime_context_snapshot": deepcopy(runtime),
         "reasons": list(reasons),
         "warnings": list(warnings),
+        "candidates": deepcopy(candidates or []),
     }
+
+
+def _completion_candidate(
+    *,
+    completion: dict[str, Any] | None,
+    signal: dict[str, Any],
+    method: dict[str, Any],
+    method_snapshot: dict[str, Any] | None,
+    symbol: str | None,
+) -> dict[str, Any] | None:
+    if completion is None:
+        return None
+
+    reasons: list[str] = []
+    invalid: list[str] = []
+    warnings: list[str] = []
+    quantity: float | None = _number(completion.get("remaining_qty"))
+    hoga: str | None = None
+    order_type: str | None = None
+
+    invalid.extend(_safety_reasons(completion, _as_dict(completion.get("action_preview"))))
+
+    completion_status = _text(completion.get("status"))
+    if completion_status == STATUS_NOT_APPLICABLE:
+        return None
+    if completion_status == STATUS_INVALID:
+        invalid.extend(_as_list(completion.get("reasons")) or ["completion preview is invalid"])
+    elif completion_status == STATUS_BLOCKED:
+        reasons.extend(_as_list(completion.get("reasons")) or ["completion preview is blocked"])
+    elif completion_status != STATUS_READY:
+        reasons.append(f"completion preview status is not READY: {completion_status or '<empty>'}")
+
+    action = _as_dict(completion.get("action_preview"))
+    if completion.get("policy") != POLICY_MARKET_SELL_REMAINING:
+        reasons.append("completion policy must be MARKET_SELL_REMAINING")
+    if action.get("action") != POLICY_MARKET_SELL_REMAINING:
+        reasons.append("completion action must be MARKET_SELL_REMAINING")
+
+    if quantity is None:
+        reasons.append("completion remaining_qty is required")
+    elif quantity <= 0:
+        reasons.append("completion remaining_qty is not greater than 0")
+
+    if not symbol:
+        reasons.append("symbol is required")
+
+    mapped_hoga, hoga_warnings = _mapped_hoga("MARKET")
+    mapped_type, type_warnings = _mapped_order_type()
+    hoga = mapped_hoga
+    order_type = mapped_type
+    warnings.extend(hoga_warnings + type_warnings)
+
+    if invalid:
+        status = STATUS_INVALID
+    elif quantity is not None and quantity <= 0:
+        status = STATUS_NOT_APPLICABLE
+    elif reasons:
+        status = STATUS_BLOCKED
+    else:
+        status = STATUS_READY
+
+    return _candidate(
+        status=status,
+        signal=signal,
+        method_set=_method_set(method) or _text(completion.get("method_set")) or None,
+        action_source=ACTION_SOURCE_COMPLETION,
+        symbol=symbol,
+        quantity=quantity,
+        price=None,
+        hoga=hoga,
+        order_type=order_type,
+        method_snapshot=method_snapshot,
+        source_previews={"completion": deepcopy(completion)},
+        reasons=list(reasons + invalid),
+        warnings=warnings,
+    )
 
 
 def build_sell_order_candidate_preview(
     sell_signal_preview: Any,
     method_preview: Any,
+    completion_preview: Any = None,
+    pending_preview: Any = None,
     market_context: Any = None,
     order_context: Any = None,
     runtime_context: Any = None,
 ) -> dict[str, Any]:
     """Build a METHOD-source SELL order candidate preview without side effects."""
+    if _looks_like_market_context(completion_preview):
+        old_market_context = completion_preview
+        old_order_context = pending_preview
+        old_runtime_context = market_context
+        completion_preview = None
+        pending_preview = None
+        market_context = old_market_context
+        order_context = old_order_context
+        runtime_context = old_runtime_context
+
     signal = deepcopy(_as_dict(sell_signal_preview))
     method = deepcopy(_as_dict(method_preview))
+    completion = deepcopy(completion_preview) if isinstance(completion_preview, dict) else None
+    pending = deepcopy(pending_preview) if isinstance(pending_preview, dict) else None
     market = deepcopy(_as_dict(market_context))
     order = deepcopy(_as_dict(order_context))
     runtime = deepcopy(_as_dict(runtime_context))
@@ -326,6 +468,43 @@ def build_sell_order_candidate_preview(
     else:
         status = STATUS_READY
 
+    method_candidate = _candidate(
+        status=status,
+        signal=signal,
+        method_set=_method_set(method),
+        action_source=ACTION_SOURCE,
+        symbol=symbol,
+        quantity=quantity if status == STATUS_READY else quantity,
+        price=price,
+        hoga=hoga,
+        order_type=order_type,
+        method_snapshot=snapshot_copy,
+        source_previews={"method_preview": deepcopy(method)},
+        reasons=list(reasons + invalid),
+        warnings=warnings,
+    )
+
+    candidates = [method_candidate]
+    completion_candidate = _completion_candidate(
+        completion=completion,
+        signal=signal,
+        method=method,
+        method_snapshot=snapshot_copy,
+        symbol=symbol,
+    )
+    if completion_candidate is not None:
+        candidates.append(completion_candidate)
+
+    if pending and pending.get("status") == STATUS_READY:
+        warnings.append("pending_action_source_not_supported_in_phase_2")
+        method_candidate["warnings"].append("pending_action_source_not_supported_in_phase_2")
+
+    ready_sources = [candidate.get("action_source") for candidate in candidates if candidate.get("status") == STATUS_READY]
+    if len(ready_sources) > 1:
+        warnings.append("multiple_ready_action_sources")
+        for candidate in candidates:
+            candidate["warnings"].append("multiple_ready_action_sources")
+
     return _result(
         status=status,
         signal=signal,
@@ -342,4 +521,5 @@ def build_sell_order_candidate_preview(
         order_type=order_type,
         reasons=list(reasons + invalid),
         warnings=warnings,
+        candidates=candidates,
     )

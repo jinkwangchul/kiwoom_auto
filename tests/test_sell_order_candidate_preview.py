@@ -55,6 +55,33 @@ class SellOrderCandidatePreviewTest(unittest.TestCase):
         market.update(overrides)
         return market
 
+    def _completion(self, **overrides):
+        completion = {
+            "preview_type": "SELL_COMPLETION_POLICY_PREVIEW",
+            "status": "READY",
+            "method_set": "setting_a",
+            "policy": "MARKET_SELL_REMAINING",
+            "remaining_qty": 3,
+            "action_preview": {
+                "action": "MARKET_SELL_REMAINING",
+                "quantity": 3,
+                "order_request_created": False,
+                "execution_connected": False,
+            },
+            "execution_connected": False,
+            "runtime_write": False,
+            "send_order": False,
+            "queue_write": False,
+        }
+        completion.update(overrides)
+        return completion
+
+    def _completion_candidate(self, result):
+        for candidate in result["candidates"]:
+            if candidate["action_source"] == "COMPLETION":
+                return candidate
+        return None
+
     def _build(self, **overrides):
         kwargs = {
             "sell_signal_preview": self._signal(),
@@ -251,6 +278,148 @@ class SellOrderCandidatePreviewTest(unittest.TestCase):
         result = self._build(method_preview=method)
 
         self.assertEqual(method, result["source_previews"]["method_preview"])
+
+    def test_completion_ready_creates_separate_completion_candidate(self):
+        result = self._build(completion_preview=self._completion())
+
+        completion = self._completion_candidate(result)
+        self.assertIsNotNone(completion)
+        self.assertEqual("READY", completion["status"])
+        self.assertEqual("COMPLETION", completion["action_source"])
+
+    def test_completion_candidate_uses_remaining_qty(self):
+        result = self._build(completion_preview=self._completion(remaining_qty=4))
+
+        self.assertEqual(4, self._completion_candidate(result)["quantity"])
+
+    def test_completion_candidate_is_market_sell_with_no_price(self):
+        result = self._build(completion_preview=self._completion())
+        completion = self._completion_candidate(result)
+
+        self.assertEqual("MARKET", completion["hoga"])
+        self.assertEqual("SELL", completion["order_type"])
+        self.assertIsNone(completion["price"])
+
+    def test_completion_candidate_does_not_create_order_or_candidate(self):
+        result = self._build(completion_preview=self._completion())
+        completion = self._completion_candidate(result)
+
+        self.assertFalse(completion["order_request_created"])
+        self.assertFalse(completion["candidate_created"])
+
+    def test_completion_not_applicable_creates_no_completion_candidate(self):
+        result = self._build(completion_preview=self._completion(status="NOT_APPLICABLE"))
+
+        self.assertIsNone(self._completion_candidate(result))
+        self.assertEqual(["METHOD"], [candidate["action_source"] for candidate in result["candidates"]])
+
+    def test_completion_blocked_is_propagated_to_completion_candidate(self):
+        result = self._build(completion_preview=self._completion(status="BLOCKED", reasons=["completion blocked"]))
+        completion = self._completion_candidate(result)
+
+        self.assertEqual("BLOCKED", completion["status"])
+        self.assertIn("completion blocked", completion["reasons"])
+
+    def test_completion_invalid_is_propagated_to_completion_candidate(self):
+        result = self._build(completion_preview=self._completion(status="INVALID", reasons=["completion invalid"]))
+        completion = self._completion_candidate(result)
+
+        self.assertEqual("INVALID", completion["status"])
+        self.assertIn("completion invalid", completion["reasons"])
+
+    def test_completion_missing_remaining_qty_is_blocked(self):
+        completion = self._completion()
+        completion.pop("remaining_qty")
+
+        result = self._build(completion_preview=completion)
+
+        self.assertEqual("BLOCKED", self._completion_candidate(result)["status"])
+        self.assertIn("completion remaining_qty is required", self._completion_candidate(result)["reasons"])
+
+    def test_completion_remaining_qty_zero_or_negative_is_not_applicable(self):
+        zero = self._build(completion_preview=self._completion(remaining_qty=0))
+        negative = self._build(completion_preview=self._completion(remaining_qty=-1))
+
+        self.assertEqual("NOT_APPLICABLE", self._completion_candidate(zero)["status"])
+        self.assertEqual("NOT_APPLICABLE", self._completion_candidate(negative)["status"])
+
+    def test_completion_wrong_policy_or_action_is_blocked(self):
+        wrong_policy = self._build(completion_preview=self._completion(policy="CARRY_TO_NEXT_SIGNAL"))
+        wrong_action = self._build(completion_preview=self._completion(action_preview={"action": "OTHER"}))
+
+        self.assertEqual("BLOCKED", self._completion_candidate(wrong_policy)["status"])
+        self.assertIn("completion policy must be MARKET_SELL_REMAINING", self._completion_candidate(wrong_policy)["reasons"])
+        self.assertEqual("BLOCKED", self._completion_candidate(wrong_action)["status"])
+        self.assertIn("completion action must be MARKET_SELL_REMAINING", self._completion_candidate(wrong_action)["reasons"])
+
+    def test_completion_safety_flag_true_is_invalid(self):
+        result = self._build(completion_preview=self._completion(runtime_write=True))
+
+        self.assertEqual("INVALID", self._completion_candidate(result)["status"])
+        self.assertIn("safety flag must be false: runtime_write", self._completion_candidate(result)["reasons"])
+
+    def test_method_and_completion_ready_keep_two_candidates(self):
+        result = self._build(completion_preview=self._completion())
+
+        self.assertEqual(["METHOD", "COMPLETION"], [candidate["action_source"] for candidate in result["candidates"]])
+        self.assertEqual(["READY", "READY"], [candidate["status"] for candidate in result["candidates"]])
+
+    def test_multiple_ready_action_sources_warning(self):
+        result = self._build(completion_preview=self._completion())
+
+        self.assertIn("multiple_ready_action_sources", result["warnings"])
+        for candidate in result["candidates"]:
+            self.assertIn("multiple_ready_action_sources", candidate["warnings"])
+
+    def test_pending_ready_is_not_converted_in_phase_2(self):
+        pending = {
+            "preview_type": "SELL_PENDING_POLICY_PREVIEW",
+            "status": "READY",
+            "action_preview": {"action": "CANCEL_PENDING_ORDER"},
+        }
+
+        result = self._build(pending_preview=pending)
+
+        self.assertEqual(["METHOD"], [candidate["action_source"] for candidate in result["candidates"]])
+        self.assertIn("pending_action_source_not_supported_in_phase_2", result["warnings"])
+
+    def test_completion_snapshot_is_deepcopy(self):
+        completion = self._completion(nested={"value": 1})
+
+        result = self._build(completion_preview=completion)
+        self._completion_candidate(result)["source_previews"]["completion"]["nested"]["value"] = 2
+
+        self.assertEqual(1, completion["nested"]["value"])
+
+    def test_completion_input_is_not_mutated(self):
+        signal = self._signal()
+        method = self._method()
+        completion = self._completion()
+        market = self._market()
+        before = (deepcopy(signal), deepcopy(method), deepcopy(completion), deepcopy(market))
+
+        build_sell_order_candidate_preview(
+            signal,
+            method,
+            completion_preview=completion,
+            market_context=market,
+        )
+
+        self.assertEqual(before, (signal, method, completion, market))
+
+    def test_old_positional_call_compatibility(self):
+        signal = self._signal()
+        method = self._method()
+        market = self._market()
+        order = {"legacy": True}
+        runtime = {"legacy_runtime": True}
+
+        result = build_sell_order_candidate_preview(signal, method, market, order, runtime)
+
+        self.assertEqual("READY", result["status"])
+        self.assertEqual(market, result["market_context_snapshot"])
+        self.assertEqual(order, result["order_context_snapshot"])
+        self.assertEqual(runtime, result["runtime_context_snapshot"])
 
 
 if __name__ == "__main__":
