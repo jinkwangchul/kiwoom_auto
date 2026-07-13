@@ -38,25 +38,25 @@ def build_sell_common_execution_preview(
     if not isinstance(adapter_preview, dict):
         result["status"] = INVALID
         result["reasons"].append("adapter_preview must be a dict")
-        return result
+        return _finish(result)
 
     result["adapter_preview_snapshot"] = deepcopy(adapter_preview)
 
     if adapter_preview.get("preview_type") != SOURCE_PREVIEW_TYPE:
         result["status"] = INVALID
         result["reasons"].append("adapter_preview preview_type is invalid")
-        return result
+        return _finish(result)
 
     if _has_forbidden_safety_flag(adapter_preview):
         result["status"] = INVALID
         result["reasons"].append("adapter_preview safety flag violation")
-        return result
+        return _finish(result)
 
     candidates = adapter_preview.get("order_candidates")
     if not isinstance(candidates, list):
         result["status"] = INVALID
         result["reasons"].append("order_candidates must be a list")
-        return result
+        return _finish(result)
 
     if isinstance(adapter_preview.get("warnings"), list):
         result["warnings"].extend(deepcopy(adapter_preview["warnings"]))
@@ -68,7 +68,7 @@ def build_sell_common_execution_preview(
         result["status"] = BLOCKED
         result["reasons"].append(guard_block_reason)
         result["summary"]["blocked_candidate_count"] = len(candidates)
-        return result
+        return _finish(result)
 
     has_invalid = False
     for index, candidate in enumerate(candidates):
@@ -117,7 +117,7 @@ def build_sell_common_execution_preview(
         if not result["reasons"]:
             result["reasons"].append("no eligible SELL common execution preview candidates")
 
-    return result
+    return _finish(result)
 
 
 def _base_result(
@@ -127,6 +127,7 @@ def _base_result(
     return {
         "preview_type": PREVIEW_TYPE,
         "preview_only": True,
+        "common_execution_ready": False,
         "execution_connected": False,
         "pipeline_preview_called": False,
         "runtime_write": False,
@@ -151,6 +152,11 @@ def _base_result(
         "adapter_preview_snapshot": deepcopy(adapter_preview) if isinstance(adapter_preview, dict) else {},
         "guard_context_snapshot": deepcopy(guard_context) if isinstance(guard_context, dict) else {},
     }
+
+
+def _finish(result: dict[str, Any]) -> dict[str, Any]:
+    result["common_execution_ready"] = result.get("status") == READY
+    return result
 
 
 def _guard_block_reason(guard_context: Any) -> str | None:
