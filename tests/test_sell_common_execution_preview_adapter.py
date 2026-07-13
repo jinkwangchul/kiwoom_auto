@@ -94,6 +94,7 @@ class SellCommonExecutionPreviewAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "READY")
         self.assertEqual(result["candidate_results"][0]["action_source"], "METHOD")
+        self.assertTrue(result["common_execution_ready"])
 
     def test_completion_limit_ready(self):
         result = build_sell_common_execution_preview(_adapter_preview([_candidate("COMPLETION")]), _guard())
@@ -136,6 +137,7 @@ class SellCommonExecutionPreviewAdapterTests(unittest.TestCase):
             result = build_sell_common_execution_preview(_adapter_preview([_candidate("METHOD")]))
 
         self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["common_execution_ready"])
         self.assertFalse(result["pipeline_preview_called"])
         pipeline.assert_not_called()
 
@@ -325,6 +327,7 @@ class SellCommonExecutionPreviewAdapterTests(unittest.TestCase):
         result = build_sell_common_execution_preview({"preview_type": "OTHER", "order_candidates": []}, _guard())
 
         self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["common_execution_ready"])
 
     def test_adapter_preview_must_be_dict(self):
         result = build_sell_common_execution_preview(None, _guard())
