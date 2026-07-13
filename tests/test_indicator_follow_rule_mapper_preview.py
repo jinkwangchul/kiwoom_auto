@@ -198,7 +198,7 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         result = self._build_preview()
 
         self.assertEqual(result["validation_warnings"], [])
-        self.assertEqual(len(result["postponed"]), 9)
+        self.assertEqual(len(result["postponed"]), 8)
         self.assertEqual(len(result["legacy_notices"]), 2)
         self.assertEqual(result["warnings"], result["validation_warnings"] + result["postponed"])
         self.assertTrue(all("legacy" not in warning.lower() for warning in result["warnings"]))
@@ -3717,6 +3717,132 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
 
         self.assertEqual(approved["rules"]["buy"]["filters"], current_rules["buy"]["filters"])
         self.assertIn("base", approved["rules"]["buy"]["execution"])
+
+    def test_sell_method_candidates_use_method_policy_namespace(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": True}
+        state["sell_ui"]["setting_a"] = {
+            "perform1_title_combo": "\ub2e8\uc77c\ud638\uac00",
+            "perform1_single_combo": "\uc8fc\ubb38\uac00",
+        }
+        state["sell_ui"]["setting_b"] = {
+            "perform1_title_combo": "\ub2e4\uc911\ud638\uac00",
+            "perform1_multi_up_line": "3",
+            "perform1_multi_down_line": "1",
+        }
+        state["sell_ui"]["setting_c"] = {
+            "perform2_title_combo": "\ub2e4\uc911\uc2dc\uac04",
+            "perform2_time_value": "30",
+            "perform2_time_unit": "\ubd84",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+        candidates = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]
+        method_candidates = candidates["sell"]["method_policy_candidates"]
+
+        self.assertEqual(method_candidates["sell.method.selected_sets"]["value"], ["setting_a", "setting_c"])
+        self.assertEqual(method_candidates["sell.method.setting_a"]["candidate_type"], "set_method_policy")
+        self.assertEqual(method_candidates["sell.method.setting_b"]["candidate_type"], "set_method_policy")
+        self.assertEqual(method_candidates["sell.method.setting_c"]["candidate_type"], "set_method_policy")
+        self.assertTrue(method_candidates["sell.method.setting_a"]["value"]["preview_only"])
+        self.assertFalse(method_candidates["sell.method.setting_b"]["value"]["runtime_write"])
+        self.assertFalse(method_candidates["sell.method.setting_c"]["value"]["send_order"])
+        self.assertIn("sell.method.selected_sets", result["mapped_paths"])
+        self.assertIn("sell.method.setting_a", result["mapped_paths"])
+        session = self.mapper.build_rule_approval_session(result)
+        self.assertEqual(session["candidate_types"]["sell.method.selected_sets"], "set_method_policy")
+        self.assertEqual(session["candidate_types"]["sell.method.setting_a"], "set_method_policy")
+
+    def test_sell_method_approval_apply_and_commit_preview_touch_only_method_namespace(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": False}
+        state["sell_ui"]["setting_a"] = {
+            "perform1_title_combo": "\ub2e8\uc77c\ud638\uac00",
+            "perform1_single_combo": "\uc8fc\ubb38\uac00",
+        }
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {
+                "sell.method.selected_sets": "APPROVED",
+                "sell.method.setting_a": "APPROVED",
+            },
+        )
+        patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+        apply_preview = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+        session = self.mapper.build_rule_approval_session(
+            preview,
+            {
+                "sell.method.selected_sets": "APPROVED",
+                "sell.method.setting_a": "APPROVED",
+            },
+        )
+        fingerprint = self.mapper.build_rule_approval_session_fingerprint(self.current_rules, preview)
+        session["fingerprint"] = fingerprint["fingerprint"]
+        session["fingerprint_detail"] = fingerprint
+        commit_preview = self.mapper.build_rule_commit_preview(
+            self.current_rules,
+            preview,
+            session,
+            {"approval_session_dirty": False},
+        )
+
+        self.assertEqual([patch["operation"] for patch in patch_preview["patches"]], ["set_method_policy", "set_method_policy"])
+        self.assertEqual(apply_preview["applied_rules_preview"]["sell"]["method"]["selected_sets"], ["setting_a"])
+        self.assertEqual(
+            apply_preview["applied_rules_preview"]["sell"]["method"]["setting_a"]["perform1_title_combo"],
+            "\ub2e8\uc77c\ud638\uac00",
+        )
+        self.assertEqual(apply_preview["applied_rules_preview"]["sell"]["signals"], self.current_rules["sell"]["signals"])
+        self.assertTrue(commit_preview["commit_allowed"], commit_preview)
+        self.assertEqual([diff["operation"] for diff in commit_preview["final_diff"]], ["set_method_policy", "set_method_policy"])
+
+    def test_sell_method_non_approved_decisions_do_not_patch(self):
+        for decision in ("PENDING", "REJECTED", "DEFERRED"):
+            with self.subTest(decision=decision):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["selected_sets"] = {"a": True, "b": False, "c": False}
+                state["sell_ui"]["setting_a"] = {"perform1_title_combo": "\ub2e8\uc77c\ud638\uac00"}
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    deepcopy(state),
+                    deepcopy(self.current_rules),
+                )
+                approval = self.mapper.evaluate_rule_candidate_approval(
+                    preview,
+                    {
+                        "sell.method.selected_sets": decision,
+                        "sell.method.setting_a": decision,
+                    },
+                )
+                patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+                apply_preview = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+
+                self.assertEqual(patch_preview["patches"], [])
+                self.assertNotIn("method", apply_preview["applied_rules_preview"].get("sell", {}))
+
+    def test_sell_method_arbitrary_path_is_not_applied(self):
+        patch_preview = {
+            "mode": "approved_rule_patch_preview",
+            "stage": "RULE_PATCH_PREVIEW",
+            "patches": [{
+                "source_path": "sell.method.extra",
+                "target_path": "sell.method.extra",
+                "operation": "set_method_policy",
+                "value": {"enabled": True},
+            }],
+        }
+
+        result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+
+        self.assertEqual(result["applied_patches"], [])
+        self.assertEqual(result["skipped_patches"][0]["reason"], "unsupported method policy target path")
+        self.assertNotIn("method", result["applied_rules_preview"].get("sell", {}))
 
 
 if __name__ == "__main__":

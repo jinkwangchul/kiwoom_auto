@@ -570,6 +570,20 @@ def _post_validation(
         and diff.get("path") == "buy.execution.repeat"
         and isinstance(diff.get("value"), dict)
     ]
+    allowed_sell_method_paths = {
+        "sell.method.selected_sets",
+        "sell.method.setting_a",
+        "sell.method.setting_b",
+        "sell.method.setting_c",
+    }
+    allowed_sell_method_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_method_policy"
+        and diff.get("path") in allowed_sell_method_paths
+        and "value" in diff
+    ]
 
     if any(isinstance(condition, dict) and condition.get("target") == "OSC" and condition.get("operator") == "TURN_UP" for condition in pre_conditions):
         add_check(
@@ -705,6 +719,17 @@ def _post_validation(
             else:
                 add_check("final_diff_sell_set_signal_path_allowed", False, path)
                 add_unexpected(path or "<missing>", "unsupported sell set_signal path")
+        if operation == "set_method_policy":
+            path = str(diff.get("path") or "")
+            value = diff.get("value")
+            if path in allowed_sell_method_paths:
+                matches = _path_exists(post_rules, path) and _get_path(post_rules, path) == value
+                add_check("final_diff_sell_method_policy_matches", matches)
+                if not matches:
+                    add_unexpected(path, "sell method policy missing or changed in post rules")
+            else:
+                add_check("final_diff_sell_method_policy_path_allowed", False, path)
+                add_unexpected(path or "<missing>", "unsupported sell method policy path")
 
     if isinstance(pre_buy_groups, list) and isinstance(post_buy_groups, list) and pre_buy_groups and post_buy_groups:
         add_check("buy_non_target_groups_unchanged", pre_buy_groups[1:] == post_buy_groups[1:])
@@ -872,6 +897,19 @@ def _post_validation(
             _get_path(post_normalized, "buy.execution").pop("repeat", None)
             if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
                 _get_path(post_normalized, "buy").pop("execution", None)
+    for diff in allowed_sell_method_diffs:
+        path = str(diff.get("path") or "")
+        if not _path_exists(post_normalized, path):
+            continue
+        parent_path, leaf = path.rsplit(".", 1)
+        if _path_exists(pre_normalized, path):
+            _get_path(post_normalized, parent_path)[leaf] = deepcopy(_get_path(pre_normalized, path))
+        elif _path_exists(post_normalized, parent_path):
+            _get_path(post_normalized, parent_path).pop(leaf, None)
+            if _get_path(post_normalized, parent_path) == {} and not _path_exists(pre_normalized, parent_path):
+                grandparent_path, parent_leaf = parent_path.rsplit(".", 1)
+                if _path_exists(post_normalized, grandparent_path):
+                    _get_path(post_normalized, grandparent_path).pop(parent_leaf, None)
     if allowed_profit_rate_signal_diffs and _path_exists(post_normalized, "sell.signals.profit_rate_sell"):
         if _path_exists(pre_normalized, "sell.signals.profit_rate_sell"):
             _get_path(post_normalized, "sell.signals")["profit_rate_sell"] = deepcopy(

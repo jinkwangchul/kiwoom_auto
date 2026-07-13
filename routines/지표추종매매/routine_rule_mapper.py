@@ -69,6 +69,21 @@ BUY_COMPOSITE_FILTER_PATH = "buy.filters.composite"
 BUY_EXECUTION_BASE_PATH = "buy.execution.base"
 BUY_EXECUTION_REPEAT_PATH = "buy.execution.repeat"
 RSI_INDICATOR_PATH = "indicators.rsi"
+SELL_METHOD_SELECTED_SETS_PATH = "sell.method.selected_sets"
+SELL_METHOD_SETTING_A_PATH = "sell.method.setting_a"
+SELL_METHOD_SETTING_B_PATH = "sell.method.setting_b"
+SELL_METHOD_SETTING_C_PATH = "sell.method.setting_c"
+_SELL_METHOD_PATHS = {
+    SELL_METHOD_SELECTED_SETS_PATH,
+    SELL_METHOD_SETTING_A_PATH,
+    SELL_METHOD_SETTING_B_PATH,
+    SELL_METHOD_SETTING_C_PATH,
+}
+_SELL_METHOD_SETTING_PATHS = {
+    "setting_a": SELL_METHOD_SETTING_A_PATH,
+    "setting_b": SELL_METHOD_SETTING_B_PATH,
+    "setting_c": SELL_METHOD_SETTING_C_PATH,
+}
 SELL_CONDITION_A_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_a"
 APPROVED_SELL_CONDITION_A_SIGNAL_KEY = "ui_condition_a"
 SELL_CONDITION_A_SIGNAL_TARGET_PATH = f"sell.signals.{APPROVED_SELL_CONDITION_A_SIGNAL_KEY}"
@@ -161,6 +176,8 @@ def _preview_diff_risk(path: str) -> str:
         return "low"
     if path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH}:
         return "medium"
+    if path in _SELL_METHOD_PATHS:
+        return "medium"
     if path in {"buy.groups", BUY_CONDITIONS_PATH}:
         return "medium"
     return "low"
@@ -198,6 +215,18 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_EXECUTION_REPEAT_PATH: (
             "UI preview-only BUY execution repeat policy candidate."
+        ),
+        SELL_METHOD_SELECTED_SETS_PATH: (
+            "UI preview-only SELL method selected sets policy candidate."
+        ),
+        SELL_METHOD_SETTING_A_PATH: (
+            "UI preview-only SELL method setting A policy candidate."
+        ),
+        SELL_METHOD_SETTING_B_PATH: (
+            "UI preview-only SELL method setting B policy candidate."
+        ),
+        SELL_METHOD_SETTING_C_PATH: (
+            "UI preview-only SELL method setting C policy candidate."
         ),
         SELL_PROFIT_RATE_SIGNAL_PATH: (
             "UI preview-only profit_rate_sell set_signal candidate."
@@ -578,6 +607,12 @@ def _execution_policy_value(candidate: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(value) if isinstance(value, dict) else {}
 
 
+def _method_policy_value(candidate: dict[str, Any]) -> Any:
+    if "value" not in candidate:
+        return _MISSING
+    return deepcopy(candidate.get("value"))
+
+
 def _set_path_value(root: dict[str, Any], path: str, value: Any) -> bool:
     parts = path.split(".")
     current: Any = root
@@ -756,6 +791,49 @@ def _build_buy_execution_repeat_candidate(repeat: dict[str, Any], warnings: list
         "operation": "set_execution_policy",
         "value": value,
     }
+
+
+def _selected_sell_method_sets(value: Any) -> list[str] | None:
+    if not isinstance(value, dict):
+        return None
+    selected: list[str] = []
+    for ui_key, rule_key in (("a", "setting_a"), ("b", "setting_b"), ("c", "setting_c")):
+        if _truthy_ui(value.get(ui_key)):
+            selected.append(rule_key)
+    return selected
+
+
+def _build_sell_method_policy_candidates(sell_ui: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    selected_sets = _selected_sell_method_sets(sell_ui.get("selected_sets"))
+    if selected_sets is not None:
+        candidates[SELL_METHOD_SELECTED_SETS_PATH] = {
+            "path": SELL_METHOD_SELECTED_SETS_PATH,
+            "operation": "set_method_policy",
+            "candidate_type": "set_method_policy",
+            "value": selected_sets,
+            "preview_only": True,
+            "execution_connected": False,
+            "runtime_write": False,
+            "send_order": False,
+        }
+
+    for ui_key, path in _SELL_METHOD_SETTING_PATHS.items():
+        setting = sell_ui.get(ui_key)
+        if not isinstance(setting, dict) or not setting:
+            continue
+        value = deepcopy(setting)
+        value["preview_only"] = True
+        value["execution_connected"] = False
+        value["runtime_write"] = False
+        value["send_order"] = False
+        candidates[path] = {
+            "path": path,
+            "operation": "set_method_policy",
+            "candidate_type": "set_method_policy",
+            "value": value,
+        }
+    return candidates
 
 
 def _build_buy_bollinger_filter_candidate(signal_filter: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
@@ -1485,6 +1563,15 @@ def build_engine_rules_preview_from_ui_state(
         }
 
     sell_ui = _as_dict(state.get("sell_ui"))
+    sell_method_candidates = _build_sell_method_policy_candidates(sell_ui)
+    if sell_method_candidates:
+        method_preview = preview_rules.setdefault("sell", {}).setdefault("method", {})
+        if isinstance(method_preview, dict):
+            for path, candidate in sell_method_candidates.items():
+                value = _method_policy_value(candidate)
+                if value is not _MISSING:
+                    _set_path_value(preview_rules, path, value)
+
     sell_profit_rate_candidate = _build_sell_profit_rate_signal_candidate(sell_ui, validation_warnings)
     if sell_profit_rate_candidate:
         _set_path_value(preview_rules, SELL_PROFIT_RATE_SIGNAL_PATH, sell_profit_rate_candidate["value"])
@@ -1515,8 +1602,10 @@ def build_engine_rules_preview_from_ui_state(
     else:
         validation_warnings.append("sell condition C candidate group was not generated")
 
-    if sell_add_signal_candidates or sell_profit_rate_candidate:
+    if sell_add_signal_candidates or sell_profit_rate_candidate or sell_method_candidates:
         sell_candidates: dict[str, Any] = {}
+        if sell_method_candidates:
+            sell_candidates["method_policy_candidates"] = sell_method_candidates
         if sell_profit_rate_candidate:
             sell_candidates["set_signal_candidates"] = {
                 SELL_PROFIT_RATE_SIGNAL_PATH: sell_profit_rate_candidate,
@@ -1542,7 +1631,6 @@ def build_engine_rules_preview_from_ui_state(
         "additional feature mapping is postponed",
         "cycle setting mapping is postponed",
         "exit condition mapping is postponed",
-        "sell method A/B/C mapping is postponed",
         "pending order policy mapping is postponed",
         "completion policy mapping is postponed",
     ])
@@ -1570,6 +1658,7 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_EXECUTION_REPEAT_PATH)
     if sell_profit_rate_candidate:
         mapped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+    mapped_paths.extend(sell_method_candidates.keys())
     mapped_paths.extend([
         RSI_INDICATOR_PATH,
     ])
@@ -1686,6 +1775,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         candidate_paths[rsi_path] = "set_indicator"
 
     sell_candidates = _as_dict(candidates.get("sell"))
+    method_policy_candidates = _as_dict(sell_candidates.get("method_policy_candidates"))
+    for method_path, method_candidate in method_policy_candidates.items():
+        if isinstance(method_candidate, dict):
+            candidate_paths[str(method_path)] = "set_method_policy"
+
     set_signal_candidates = _as_dict(sell_candidates.get("set_signal_candidates"))
     for signal_path, signal_candidate in set_signal_candidates.items():
         if isinstance(signal_candidate, dict):
@@ -1752,6 +1846,10 @@ def build_rule_approval_session_fingerprint(
         BUY_PRICE_COMPARE_FILTER_PATH: _get_path_value(rules, BUY_PRICE_COMPARE_FILTER_PATH),
         BUY_EXECUTION_BASE_PATH: _get_path_value(rules, BUY_EXECUTION_BASE_PATH),
         BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
+        SELL_METHOD_SELECTED_SETS_PATH: _get_path_value(rules, SELL_METHOD_SELECTED_SETS_PATH),
+        SELL_METHOD_SETTING_A_PATH: _get_path_value(rules, SELL_METHOD_SETTING_A_PATH),
+        SELL_METHOD_SETTING_B_PATH: _get_path_value(rules, SELL_METHOD_SETTING_B_PATH),
+        SELL_METHOD_SETTING_C_PATH: _get_path_value(rules, SELL_METHOD_SETTING_C_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
         SELL_PROFIT_RATE_SIGNAL_PATH: _get_path_value(rules, SELL_PROFIT_RATE_SIGNAL_PATH),
@@ -2299,6 +2397,27 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path in _SELL_METHOD_PATHS:
+            method_candidate = _as_dict(_as_dict(_as_dict(preview_candidates.get("sell")).get("method_policy_candidates")).get(path))
+            candidate_value = _method_policy_value(method_candidate)
+            if candidate_value is _MISSING:
+                skipped_paths.append(_patch_skipped(path, "SELL method policy value is not available"))
+                continue
+
+            current_value = _get_path_value(current, path)
+            if current_value == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "SELL method policy is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": path,
+                "target_path": path,
+                "operation": "set_method_policy",
+                "value": candidate_value,
+                "risk": "medium",
+            })
+            continue
+
         if path == SELL_PROFIT_RATE_SIGNAL_PATH:
             signal_candidate = _sell_set_signal_candidate(preview_candidates, path)
             candidate_value = _profit_rate_signal_value(signal_candidate)
@@ -2530,6 +2649,25 @@ def apply_approved_rule_patch_preview(
             })
             continue
 
+        if operation == "set_method_policy":
+            if target_path not in _SELL_METHOD_PATHS:
+                skipped_patches.append(_apply_skipped(patch, "unsupported method policy target path"))
+                warnings.append(f"unsupported method policy target path: {target_path}")
+                continue
+            if "value" not in patch:
+                skipped_patches.append(_apply_skipped(patch, "method policy value is not available"))
+                continue
+            if not _set_path_value(applied_rules_preview, target_path, patch.get("value")):
+                skipped_patches.append(_apply_skipped(patch, "target method policy path is not writable"))
+                continue
+
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
         if operation == "set_signal":
             if target_path != SELL_PROFIT_RATE_SIGNAL_PATH:
                 skipped_patches.append(_apply_skipped(patch, "unsupported signal target path"))
@@ -2747,6 +2885,21 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "operation": "set_execution_policy",
             "change_type": "set_buy_execution_repeat",
             "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_method_policy" and target_path in _SELL_METHOD_PATHS:
+        diffs.append({
+            "path": target_path,
+            "operation": "set_method_policy",
+            "change_type": "set_sell_method_policy",
+            "value": deepcopy(patch.get("value")),
+            "preserved": [
+                "sell.signals",
+                "runtime",
+                "execution",
+            ],
             "replace": False,
         })
         return diffs
@@ -3104,6 +3257,10 @@ def approve_engine_rule_candidates(
         BUY_COMPOSITE_FILTER_PATH,
         BUY_EXECUTION_BASE_PATH,
         BUY_EXECUTION_REPEAT_PATH,
+        SELL_METHOD_SELECTED_SETS_PATH,
+        SELL_METHOD_SETTING_A_PATH,
+        SELL_METHOD_SETTING_B_PATH,
+        SELL_METHOD_SETTING_C_PATH,
         RSI_INDICATOR_PATH,
         SELL_PROFIT_RATE_SIGNAL_PATH,
         SELL_CONDITION_A_SIGNAL_PREVIEW_PATH,
@@ -3273,6 +3430,26 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: target path is not writable")
 
+    method_policy_candidates = _as_dict(_as_dict(preview_candidates.get("sell")).get("method_policy_candidates"))
+    for method_path in (
+        SELL_METHOD_SELECTED_SETS_PATH,
+        SELL_METHOD_SETTING_A_PATH,
+        SELL_METHOD_SETTING_B_PATH,
+        SELL_METHOD_SETTING_C_PATH,
+    ):
+        if method_path not in approved_paths:
+            continue
+        method_candidate = _as_dict(method_policy_candidates.get(method_path))
+        candidate_value = _method_policy_value(method_candidate)
+        if candidate_value is _MISSING:
+            skipped_paths.append(method_path)
+            warnings.append("SELL method policy approval skipped: value is not available")
+        elif _set_path_value(approved_rules, method_path, candidate_value):
+            applied_paths.append(method_path)
+        else:
+            skipped_paths.append(method_path)
+            warnings.append("SELL method policy approval skipped: target path is not writable")
+
     if SELL_PROFIT_RATE_SIGNAL_PATH in approved_paths:
         signal_candidate = _sell_set_signal_candidate(preview_candidates, SELL_PROFIT_RATE_SIGNAL_PATH)
         candidate_value = _profit_rate_signal_value(signal_candidate)
@@ -3419,6 +3596,10 @@ def compare_engine_rules_preview(
             preview_value = _execution_policy_value(
                 _as_dict(_as_dict(preview_candidates.get("execution")).get("repeat"))
             )
+        elif path in _SELL_METHOD_PATHS:
+            preview_value = _method_policy_value(
+                _as_dict(_as_dict(_as_dict(preview_candidates.get("sell")).get("method_policy_candidates")).get(path))
+            )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
         elif path == SELL_PROFIT_RATE_SIGNAL_PATH:
@@ -3445,6 +3626,8 @@ def compare_engine_rules_preview(
         elif path == BUY_COMPOSITE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
+            status = "changed" if current_exists else "added"
+        elif path in _SELL_METHOD_PATHS and preview_exists:
             status = "changed" if current_exists else "added"
         elif path == SELL_PROFIT_RATE_SIGNAL_PATH and preview_exists:
             status = "changed" if current_exists else "added"
