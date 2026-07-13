@@ -1417,6 +1417,181 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             patch_preview["skipped_paths"],
         )
 
+    def test_sell_profit_rate_state_absent_does_not_create_candidate(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+
+        self.assertNotIn("sell.signals.profit_rate_sell", result["mapped_paths"])
+        self.assertNotIn(
+            "set_signal_candidates",
+            result["preview_rules"]["indicator_follow_rule_preview"]["candidates"].get("sell", {}),
+        )
+
+    def test_sell_profit_rate_disabled_candidate_is_created(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["profit_rate_sell"] = {
+            "enabled": False,
+            "profit_rate_percent": 3.0,
+            "basis": "average_price",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["set_signal_candidates"][
+            "sell.signals.profit_rate_sell"
+        ]
+
+        self.assertEqual(candidate["candidate_type"], "set_signal")
+        self.assertEqual(candidate["path"], "sell.signals.profit_rate_sell")
+        self.assertEqual(candidate["value"], {
+            "enabled": False,
+            "profit_rate_percent": 3.0,
+            "basis": "average_price",
+        })
+        self.assertIn("sell.signals.profit_rate_sell", result["mapped_paths"])
+
+    def test_sell_profit_rate_enabled_numeric_string_candidate_is_created(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["profit_rate_sell"] = {
+            "enabled": True,
+            "profit_rate_percent": "3.0",
+            "basis": "average_price",
+        }
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            deepcopy(state),
+            deepcopy(self.current_rules),
+        )
+        session = self.mapper.build_rule_approval_session(result)
+        candidate = result["preview_rules"]["indicator_follow_rule_preview"]["candidates"]["sell"]["set_signal_candidates"][
+            "sell.signals.profit_rate_sell"
+        ]
+
+        self.assertEqual(candidate["value"]["profit_rate_percent"], 3.0)
+        self.assertEqual(session["candidate_types"]["sell.signals.profit_rate_sell"], "set_signal")
+
+    def test_sell_profit_rate_invalid_values_block_candidate(self):
+        cases = [
+            ({"enabled": True, "profit_rate_percent": "", "basis": "average_price"}, "not numeric"),
+            ({"enabled": True, "profit_rate_percent": "abc", "basis": "average_price"}, "not numeric"),
+            ({"enabled": True, "profit_rate_percent": -1, "basis": "average_price"}, "negative"),
+            ({"enabled": True, "profit_rate_percent": 3, "basis": "current_price"}, "basis"),
+        ]
+        for value, warning_text in cases:
+            with self.subTest(value=value):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+                state["sell_ui"]["profit_rate_sell"] = value
+
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    deepcopy(state),
+                    deepcopy(self.current_rules),
+                )
+
+                self.assertNotIn("sell.signals.profit_rate_sell", result["mapped_paths"])
+                self.assertTrue(any(warning_text in warning for warning in result["warnings"]), result["warnings"])
+
+    def test_sell_profit_rate_approved_merges_allowed_fields_only(self):
+        state = deepcopy(self.ui_state)
+        state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+        state["sell_ui"]["profit_rate_sell"] = {
+            "enabled": True,
+            "profit_rate_percent": 3.0,
+            "basis": "average_price",
+        }
+        current_rules = deepcopy(self.current_rules)
+        current_rules["sell"]["signals"]["profit_rate_sell"] = {
+            "enabled": False,
+            "profit_rate_percent": 1.0,
+            "target_profit_rate": 2.0,
+            "basis": "average_price",
+            "description": "keep me",
+        }
+        current_rules["sell"]["signals"]["ui_condition_a"] = {"enabled": False, "groups": []}
+        current_rules["sell"]["signals"]["ui_condition_b"] = {"enabled": False, "groups": []}
+        current_rules["sell"]["signals"]["ui_condition_c"] = {"enabled": False, "groups": []}
+
+        preview = self.mapper.build_engine_rules_preview_from_ui_state(deepcopy(state), deepcopy(current_rules))
+        approval = self.mapper.evaluate_rule_candidate_approval(
+            preview,
+            {"sell.signals.profit_rate_sell": "APPROVED"},
+        )
+        patch_preview = self.mapper.build_approved_rule_patch_preview(current_rules, preview, approval)
+        apply_preview = self.mapper.apply_approved_rule_patch_preview(current_rules, patch_preview)
+        session = self.mapper.build_rule_approval_session(preview, {"sell.signals.profit_rate_sell": "APPROVED"})
+        fingerprint = self.mapper.build_rule_approval_session_fingerprint(current_rules, preview)
+        session["fingerprint"] = fingerprint["fingerprint"]
+        session["fingerprint_detail"] = fingerprint
+        commit_preview = self.mapper.build_rule_commit_preview(
+            current_rules,
+            preview,
+            session,
+            {"approval_session_dirty": False},
+        )
+        signals = apply_preview["applied_rules_preview"]["sell"]["signals"]
+
+        self.assertEqual(patch_preview["patches"][0]["operation"], "set_signal")
+        self.assertEqual(patch_preview["patches"][0]["target_path"], "sell.signals.profit_rate_sell")
+        self.assertEqual(signals["profit_rate_sell"]["enabled"], True)
+        self.assertEqual(signals["profit_rate_sell"]["profit_rate_percent"], 3.0)
+        self.assertEqual(signals["profit_rate_sell"]["target_profit_rate"], 2.0)
+        self.assertEqual(signals["profit_rate_sell"]["description"], "keep me")
+        self.assertEqual(signals["macd_sell"], current_rules["sell"]["signals"]["macd_sell"])
+        self.assertEqual(signals["ui_condition_a"], current_rules["sell"]["signals"]["ui_condition_a"])
+        self.assertEqual(signals["ui_condition_b"], current_rules["sell"]["signals"]["ui_condition_b"])
+        self.assertEqual(signals["ui_condition_c"], current_rules["sell"]["signals"]["ui_condition_c"])
+        self.assertTrue(commit_preview["commit_allowed"], commit_preview)
+        self.assertEqual(commit_preview["final_diff"][0]["operation"], "set_signal")
+
+    def test_sell_profit_rate_non_approved_decisions_do_not_create_patch(self):
+        for decision in ("PENDING", "REJECTED", "DEFERRED"):
+            with self.subTest(decision=decision):
+                state = deepcopy(self.ui_state)
+                state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+                state["sell_ui"]["profit_rate_sell"] = {
+                    "enabled": True,
+                    "profit_rate_percent": 3.0,
+                    "basis": "average_price",
+                }
+                preview = self.mapper.build_engine_rules_preview_from_ui_state(
+                    deepcopy(state),
+                    deepcopy(self.current_rules),
+                )
+                approval = self.mapper.evaluate_rule_candidate_approval(
+                    preview,
+                    {"sell.signals.profit_rate_sell": decision},
+                )
+                patch_preview = self.mapper.build_approved_rule_patch_preview(self.current_rules, preview, approval)
+
+                self.assertEqual(patch_preview["patches"], [])
+
+    def test_apply_approved_rule_patch_preview_blocks_other_sell_set_signal_paths(self):
+        patch_preview = {
+            "mode": "approved_rule_patch_preview",
+            "stage": "RULE_PATCH_PREVIEW",
+            "patches": [{
+                "source_path": "sell.signals.macd_sell",
+                "target_path": "sell.signals.macd_sell",
+                "operation": "set_signal",
+                "value": {"enabled": False},
+            }],
+        }
+
+        result = self.mapper.apply_approved_rule_patch_preview(self.current_rules, patch_preview)
+
+        self.assertEqual(result["applied_patches"], [])
+        self.assertEqual(result["skipped_patches"][0]["reason"], "unsupported signal target path")
+        self.assertEqual(result["applied_rules_preview"]["sell"], self.current_rules["sell"])
+
     def test_sell_condition_c_array_only_creates_unified_signal_candidate(self):
         state = deepcopy(self.ui_state)
         condition_c = state["sell_ui"]["signal_conditions"]["condition_c"]

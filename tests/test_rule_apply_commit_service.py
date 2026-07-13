@@ -1017,6 +1017,64 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["post_validation"]["ok"])
             self.assertEqual(result["post_validation"]["unexpected_changes"], [])
 
+    def test_sell_profit_rate_signal_committed_via_set_signal_merge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rules_path = Path(temp_dir) / "rules.json"
+            session_path = Path(temp_dir) / "approval_session.json"
+            current_rules = deepcopy(self.current_rules)
+            current_rules["sell"]["signals"]["profit_rate_sell"] = {
+                "enabled": False,
+                "profit_rate_percent": 1.0,
+                "target_profit_rate": 2.0,
+                "basis": "average_price",
+                "description": "keep me",
+            }
+            current_rules["sell"]["signals"]["ui_condition_a"] = {"enabled": False, "groups": []}
+            current_rules["sell"]["signals"]["ui_condition_b"] = {"enabled": False, "groups": []}
+            current_rules["sell"]["signals"]["ui_condition_c"] = {"enabled": False, "groups": []}
+            self._write_rules(rules_path, current_rules)
+            original_ui_state = deepcopy(self.ui_state)
+            self.ui_state["sell_ui"]["signal_conditions"]["condition_c"]["macd_check"] = False
+            self.ui_state["sell_ui"]["profit_rate_sell"] = {
+                "enabled": True,
+                "profit_rate_percent": "3.0",
+                "basis": "average_price",
+            }
+            try:
+                apply_preview, gate, context = self._build_apply_and_gate(
+                    rules_path,
+                    session_path,
+                    {"sell.signals.profit_rate_sell": "APPROVED"},
+                    current_rules,
+                )
+            finally:
+                self.ui_state = original_ui_state
+
+            result = rule_apply_commit_service.commit_approved_rule_patch_to_rules(
+                rules_path,
+                apply_preview,
+                gate,
+                context,
+            )
+            saved = json.loads(rules_path.read_text(encoding="utf-8"))
+            signals = saved["sell"]["signals"]
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                [patch["target_path"] for patch in result["applied_patches"]],
+                ["sell.signals.profit_rate_sell"],
+            )
+            self.assertEqual(signals["profit_rate_sell"]["enabled"], True)
+            self.assertEqual(signals["profit_rate_sell"]["profit_rate_percent"], 3.0)
+            self.assertEqual(signals["profit_rate_sell"]["target_profit_rate"], 2.0)
+            self.assertEqual(signals["profit_rate_sell"]["description"], "keep me")
+            self.assertEqual(signals["macd_sell"], current_rules["sell"]["signals"]["macd_sell"])
+            self.assertEqual(signals["ui_condition_a"], current_rules["sell"]["signals"]["ui_condition_a"])
+            self.assertEqual(signals["ui_condition_b"], current_rules["sell"]["signals"]["ui_condition_b"])
+            self.assertEqual(signals["ui_condition_c"], current_rules["sell"]["signals"]["ui_condition_c"])
+            self.assertTrue(result["post_validation"]["ok"])
+            self.assertEqual(result["post_validation"]["unexpected_changes"], [])
+
     def test_sell_signal_added_disabled_and_macd_sell_unchanged(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             rules_path = Path(temp_dir) / "rules.json"

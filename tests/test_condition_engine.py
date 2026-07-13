@@ -643,6 +643,58 @@ class ConditionEngineTest(unittest.TestCase):
         )
 
 
+class IndicatorFollowProfitRateSellTest(unittest.TestCase):
+    def setUp(self):
+        self.module = _load_routine_engine_module()
+
+    def _candles(self):
+        return [
+            {"close": 100.0, "volume": 100},
+            {"close": 101.0, "volume": 100},
+            {"close": 102.0, "volume": 100},
+        ]
+
+    def _config(self, profit_rate_sell):
+        config = deepcopy(self.module.DEFAULT_INDICATOR_FOLLOW_CONFIG)
+        config["buy"]["enabled"] = False
+        config["sell"] = {
+            "enabled": True,
+            "signal_logic": "OR",
+            "delay_bar": 0,
+            "signals": {
+                "macd_sell": {"enabled": False, "groups": []},
+                "profit_rate_sell": deepcopy(profit_rate_sell),
+            },
+        }
+        return config
+
+    def test_profit_rate_percent_takes_priority_over_legacy_target_profit_rate(self):
+        signal = self.module.evaluate_indicator_follow_routine(
+            self._candles(),
+            self._config({
+                "enabled": True,
+                "profit_rate_percent": 3.0,
+                "target_profit_rate": 99.0,
+            }),
+            {"average_price": 100.0, "current_price": 104.0, "holding_qty": 1},
+        )
+
+        self.assertEqual(signal.signal, "SELL")
+        self.assertTrue(any("profit_rate_sell" in detail for detail in signal.details))
+
+    def test_target_profit_rate_fallback_still_triggers_sell(self):
+        signal = self.module.evaluate_indicator_follow_routine(
+            self._candles(),
+            self._config({
+                "enabled": True,
+                "target_profit_rate": 3.0,
+            }),
+            {"average_price": 100.0, "current_price": 104.0, "holding_qty": 1},
+        )
+
+        self.assertEqual(signal.signal, "SELL")
+
+
 class IndicatorFollowBuyRsiFilterTest(unittest.TestCase):
     def setUp(self):
         self.module = _load_routine_engine_module()

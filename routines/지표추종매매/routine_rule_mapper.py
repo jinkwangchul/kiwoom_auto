@@ -81,6 +81,12 @@ SELL_CONDITION_C_SIGNAL_TARGET_PATH = f"sell.signals.{APPROVED_SELL_CONDITION_C_
 SELL_MACD_SIGNAL_PREVIEW_PATH = "sell.signals.ui_preview_condition_c_macd_sell"
 APPROVED_SELL_MACD_SIGNAL_KEY = "ui_condition_c_macd_sell"
 SELL_MACD_SIGNAL_TARGET_PATH = f"sell.signals.{APPROVED_SELL_MACD_SIGNAL_KEY}"
+SELL_PROFIT_RATE_SIGNAL_PATH = "sell.signals.profit_rate_sell"
+_SELL_PROFIT_RATE_ALLOWED_FIELDS = {
+    "enabled",
+    "profit_rate_percent",
+    "basis",
+}
 _SELL_ADD_SIGNAL_TARGETS = {
     SELL_CONDITION_A_SIGNAL_PREVIEW_PATH: (
         SELL_CONDITION_A_SIGNAL_TARGET_PATH,
@@ -192,6 +198,9 @@ def _preview_diff_note(path: str) -> str:
         ),
         BUY_EXECUTION_REPEAT_PATH: (
             "UI preview-only BUY execution repeat policy candidate."
+        ),
+        SELL_PROFIT_RATE_SIGNAL_PATH: (
+            "UI preview-only profit_rate_sell set_signal candidate."
         ),
         "sell.signals.macd_sell": (
             "UI preview-only sell MACD condition candidate; does not replace existing rules."
@@ -1240,6 +1249,55 @@ def _sell_add_signal_candidate(preview_candidates: dict[str, Any], source_path: 
     return {}
 
 
+def _sell_set_signal_candidate(preview_candidates: dict[str, Any], source_path: str) -> dict[str, Any]:
+    sell_candidates = _as_dict(preview_candidates.get("sell"))
+    candidates_by_path = _as_dict(sell_candidates.get("set_signal_candidates"))
+    return _as_dict(candidates_by_path.get(source_path))
+
+
+def _profit_rate_signal_value(candidate: dict[str, Any]) -> dict[str, Any]:
+    value = candidate.get("value")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: deepcopy(value[key])
+        for key in ("enabled", "profit_rate_percent", "basis")
+        if key in value
+    }
+
+
+def _build_sell_profit_rate_signal_candidate(
+    sell_ui: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    profit_rate_sell = _as_dict(sell_ui.get("profit_rate_sell"))
+    if not profit_rate_sell:
+        return None
+
+    basis = str(profit_rate_sell.get("basis") or "").strip()
+    if basis != "average_price":
+        warnings.append(f"sell profit_rate_sell basis is not supported: {profit_rate_sell.get('basis')!r}")
+        return None
+
+    profit_rate_percent = _safe_float(profit_rate_sell.get("profit_rate_percent"))
+    if profit_rate_percent is None:
+        warnings.append("sell profit_rate_sell profit_rate_percent is not numeric")
+        return None
+    if profit_rate_percent < 0:
+        warnings.append("sell profit_rate_sell negative profit_rate_percent is not supported")
+        return None
+
+    return {
+        "path": SELL_PROFIT_RATE_SIGNAL_PATH,
+        "candidate_type": "set_signal",
+        "value": {
+            "enabled": bool(profit_rate_sell.get("enabled", False)),
+            "profit_rate_percent": profit_rate_percent,
+            "basis": basis,
+        },
+    }
+
+
 def _condition_matches(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
     if existing.get("target") != candidate.get("target"):
         return False
@@ -1427,6 +1485,10 @@ def build_engine_rules_preview_from_ui_state(
         }
 
     sell_ui = _as_dict(state.get("sell_ui"))
+    sell_profit_rate_candidate = _build_sell_profit_rate_signal_candidate(sell_ui, validation_warnings)
+    if sell_profit_rate_candidate:
+        _set_path_value(preview_rules, SELL_PROFIT_RATE_SIGNAL_PATH, sell_profit_rate_candidate["value"])
+
     signal_conditions = _as_dict(sell_ui.get("signal_conditions"))
     sell_add_signal_candidates: dict[str, dict[str, Any]] = {}
     condition_a = _as_dict(signal_conditions.get("condition_a"))
@@ -1453,11 +1515,18 @@ def build_engine_rules_preview_from_ui_state(
     else:
         validation_warnings.append("sell condition C candidate group was not generated")
 
-    if sell_add_signal_candidates:
-        preview_candidates["sell"] = {
-            "add_signal_candidate": next(iter(sell_add_signal_candidates.values())),
-            "add_signal_candidates": sell_add_signal_candidates,
-        }
+    if sell_add_signal_candidates or sell_profit_rate_candidate:
+        sell_candidates: dict[str, Any] = {}
+        if sell_profit_rate_candidate:
+            sell_candidates["set_signal_candidates"] = {
+                SELL_PROFIT_RATE_SIGNAL_PATH: sell_profit_rate_candidate,
+            }
+        if sell_add_signal_candidates:
+            sell_candidates.update({
+                "add_signal_candidate": next(iter(sell_add_signal_candidates.values())),
+                "add_signal_candidates": sell_add_signal_candidates,
+            })
+        preview_candidates["sell"] = sell_candidates
 
     preview_rules["indicator_follow_rule_preview"] = {
         "mode": "merge_add_candidate",
@@ -1499,6 +1568,8 @@ def build_engine_rules_preview_from_ui_state(
         mapped_paths.append(BUY_EXECUTION_BASE_PATH)
     if buy_execution_repeat_candidate:
         mapped_paths.append(BUY_EXECUTION_REPEAT_PATH)
+    if sell_profit_rate_candidate:
+        mapped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
     mapped_paths.extend([
         RSI_INDICATOR_PATH,
     ])
@@ -1615,6 +1686,11 @@ def _candidate_paths_from_preview(preview_result: dict[str, Any]) -> dict[str, s
         candidate_paths[rsi_path] = "set_indicator"
 
     sell_candidates = _as_dict(candidates.get("sell"))
+    set_signal_candidates = _as_dict(sell_candidates.get("set_signal_candidates"))
+    for signal_path, signal_candidate in set_signal_candidates.items():
+        if isinstance(signal_candidate, dict):
+            candidate_paths[str(signal_path)] = "set_signal"
+
     add_signal_candidates = _as_dict(sell_candidates.get("add_signal_candidates"))
     if add_signal_candidates:
         for signal_path, sell_candidate in add_signal_candidates.items():
@@ -1678,6 +1754,7 @@ def build_rule_approval_session_fingerprint(
         BUY_EXECUTION_REPEAT_PATH: _get_path_value(rules, BUY_EXECUTION_REPEAT_PATH),
         RSI_INDICATOR_PATH: _get_path_value(rules, RSI_INDICATOR_PATH),
         "sell.signals.macd_sell": _get_path_value(rules, "sell.signals.macd_sell"),
+        SELL_PROFIT_RATE_SIGNAL_PATH: _get_path_value(rules, SELL_PROFIT_RATE_SIGNAL_PATH),
         SELL_CONDITION_A_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_CONDITION_A_SIGNAL_TARGET_PATH),
         SELL_CONDITION_B_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_CONDITION_B_SIGNAL_TARGET_PATH),
         SELL_CONDITION_C_SIGNAL_TARGET_PATH: _get_path_value(rules, SELL_CONDITION_C_SIGNAL_TARGET_PATH),
@@ -2222,6 +2299,34 @@ def build_approved_rule_patch_preview(
             })
             continue
 
+        if path == SELL_PROFIT_RATE_SIGNAL_PATH:
+            signal_candidate = _sell_set_signal_candidate(preview_candidates, path)
+            candidate_value = _profit_rate_signal_value(signal_candidate)
+            if not candidate_value:
+                skipped_paths.append(_patch_skipped(path, "profit_rate_sell signal value is not available"))
+                continue
+
+            current_value = _get_path_value(current, SELL_PROFIT_RATE_SIGNAL_PATH)
+            current_signal = current_value if isinstance(current_value, dict) else {}
+            current_allowed = {
+                key: deepcopy(current_signal[key])
+                for key in ("enabled", "profit_rate_percent", "basis")
+                if key in current_signal
+            }
+            if current_allowed == candidate_value:
+                skipped_paths.append(_patch_skipped(path, "profit_rate_sell signal is unchanged"))
+                continue
+
+            patches.append({
+                "source_path": SELL_PROFIT_RATE_SIGNAL_PATH,
+                "target_path": SELL_PROFIT_RATE_SIGNAL_PATH,
+                "operation": "set_signal",
+                "value": candidate_value,
+                "allowed_fields": sorted(_SELL_PROFIT_RATE_ALLOWED_FIELDS),
+                "risk": "medium",
+            })
+            continue
+
         sell_target = _sell_add_signal_target(path)
         if sell_target:
             target_path, _target_key = sell_target
@@ -2425,6 +2530,43 @@ def apply_approved_rule_patch_preview(
             })
             continue
 
+        if operation == "set_signal":
+            if target_path != SELL_PROFIT_RATE_SIGNAL_PATH:
+                skipped_patches.append(_apply_skipped(patch, "unsupported signal target path"))
+                warnings.append(f"unsupported signal target path: {target_path}")
+                continue
+
+            value = patch.get("value")
+            if not isinstance(value, dict):
+                skipped_patches.append(_apply_skipped(patch, "signal value is not a dict"))
+                continue
+            if any(key not in _SELL_PROFIT_RATE_ALLOWED_FIELDS for key in value):
+                skipped_patches.append(_apply_skipped(patch, "signal value contains unsupported fields"))
+                continue
+
+            sell_section = applied_rules_preview.setdefault("sell", {})
+            if not isinstance(sell_section, dict):
+                skipped_patches.append(_apply_skipped(patch, "sell section is not a dict"))
+                continue
+            signals = sell_section.setdefault("signals", {})
+            if not isinstance(signals, dict):
+                skipped_patches.append(_apply_skipped(patch, "sell.signals is not a dict"))
+                continue
+            profit_signal = signals.setdefault("profit_rate_sell", {})
+            if not isinstance(profit_signal, dict):
+                skipped_patches.append(_apply_skipped(patch, "profit_rate_sell signal is not a dict"))
+                continue
+
+            for key in ("enabled", "profit_rate_percent", "basis"):
+                if key in value:
+                    profit_signal[key] = deepcopy(value[key])
+            applied_patches.append({
+                "source_path": patch.get("source_path"),
+                "target_path": target_path,
+                "operation": operation,
+            })
+            continue
+
         if operation == "add_signal":
             sell_target_key = next(
                 (
@@ -2605,6 +2747,24 @@ def _rule_commit_preview_diff_from_patch(patch: dict[str, Any]) -> list[dict[str
             "operation": "set_execution_policy",
             "change_type": "set_buy_execution_repeat",
             "value": deepcopy(patch.get("value")),
+            "replace": False,
+        })
+        return diffs
+
+    if operation == "set_signal" and target_path == SELL_PROFIT_RATE_SIGNAL_PATH:
+        diffs.append({
+            "path": SELL_PROFIT_RATE_SIGNAL_PATH,
+            "operation": "set_signal",
+            "change_type": "set_profit_rate_sell_signal",
+            "value": deepcopy(patch.get("value")),
+            "allowed_fields": sorted(_SELL_PROFIT_RATE_ALLOWED_FIELDS),
+            "preserved": [
+                "sell.signals.macd_sell",
+                "sell.signals.ui_condition_a",
+                "sell.signals.ui_condition_b",
+                "sell.signals.ui_condition_c",
+                "sell.signals.profit_rate_sell non-target fields",
+            ],
             "replace": False,
         })
         return diffs
@@ -2945,6 +3105,7 @@ def approve_engine_rule_candidates(
         BUY_EXECUTION_BASE_PATH,
         BUY_EXECUTION_REPEAT_PATH,
         RSI_INDICATOR_PATH,
+        SELL_PROFIT_RATE_SIGNAL_PATH,
         SELL_CONDITION_A_SIGNAL_PREVIEW_PATH,
         SELL_CONDITION_B_SIGNAL_PREVIEW_PATH,
         SELL_CONDITION_C_SIGNAL_PREVIEW_PATH,
@@ -3112,6 +3273,33 @@ def approve_engine_rule_candidates(
             skipped_paths.append(BUY_EXECUTION_REPEAT_PATH)
             warnings.append("BUY execution repeat approval skipped: target path is not writable")
 
+    if SELL_PROFIT_RATE_SIGNAL_PATH in approved_paths:
+        signal_candidate = _sell_set_signal_candidate(preview_candidates, SELL_PROFIT_RATE_SIGNAL_PATH)
+        candidate_value = _profit_rate_signal_value(signal_candidate)
+        if not candidate_value:
+            skipped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+            warnings.append("profit_rate_sell approval skipped: value is not available")
+        else:
+            sell_section = approved_rules.setdefault("sell", {})
+            if not isinstance(sell_section, dict):
+                skipped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+                warnings.append("profit_rate_sell approval skipped: sell section is not a dict")
+            else:
+                signals = sell_section.setdefault("signals", {})
+                if not isinstance(signals, dict):
+                    skipped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+                    warnings.append("profit_rate_sell approval skipped: sell.signals is not a dict")
+                else:
+                    profit_signal = signals.setdefault("profit_rate_sell", {})
+                    if not isinstance(profit_signal, dict):
+                        skipped_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+                        warnings.append("profit_rate_sell approval skipped: signal is not a dict")
+                    else:
+                        for key in ("enabled", "profit_rate_percent", "basis"):
+                            if key in candidate_value:
+                                profit_signal[key] = deepcopy(candidate_value[key])
+                        applied_paths.append(SELL_PROFIT_RATE_SIGNAL_PATH)
+
     for sell_preview_path in (
         SELL_CONDITION_A_SIGNAL_PREVIEW_PATH,
         SELL_CONDITION_B_SIGNAL_PREVIEW_PATH,
@@ -3233,6 +3421,10 @@ def compare_engine_rules_preview(
             )
         elif path == RSI_INDICATOR_PATH:
             preview_value = _as_dict(_as_dict(preview_candidates.get("indicators")).get("rsi")).get("value", _MISSING)
+        elif path == SELL_PROFIT_RATE_SIGNAL_PATH:
+            preview_value = _profit_rate_signal_value(
+                _sell_set_signal_candidate(preview_candidates, path)
+            )
         elif path in _SELL_ADD_SIGNAL_TARGETS:
             preview_value = _sell_add_signal_candidate(preview_candidates, path)
         else:
@@ -3253,6 +3445,8 @@ def compare_engine_rules_preview(
         elif path == BUY_COMPOSITE_FILTER_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path in {BUY_EXECUTION_BASE_PATH, BUY_EXECUTION_REPEAT_PATH} and preview_exists:
+            status = "changed" if current_exists else "added"
+        elif path == SELL_PROFIT_RATE_SIGNAL_PATH and preview_exists:
             status = "changed" if current_exists else "added"
         elif path in _SELL_ADD_SIGNAL_TARGETS and preview_exists:
             status = "add_signal_candidate"

@@ -483,6 +483,14 @@ def _post_validation(
         and diff.get("operation") == "add_signal"
         and diff.get("path") in allowed_sell_signal_paths
     ]
+    allowed_profit_rate_signal_diffs = [
+        diff
+        for diff in final_diff
+        if isinstance(diff, dict)
+        and diff.get("operation") == "set_signal"
+        and diff.get("path") == "sell.signals.profit_rate_sell"
+        and isinstance(diff.get("value"), dict)
+    ]
     allowed_bar_minutes_diffs = [
         diff
         for diff in final_diff
@@ -675,6 +683,28 @@ def _post_validation(
                 isinstance(signal, dict) and signal.get("enabled") is False,
             )
             add_check("final_diff_sell_macd_preserved", _path_exists(post_rules, "sell.signals.macd_sell"))
+        if operation == "set_signal":
+            path = str(diff.get("path") or "")
+            value = diff.get("value")
+            if path == "sell.signals.profit_rate_sell" and isinstance(value, dict):
+                signal_exists = _path_exists(post_rules, path)
+                signal = _get_path(post_rules, path) if signal_exists else None
+                allowed_fields = {"enabled", "profit_rate_percent", "basis"}
+                unsupported_fields = set(value) - allowed_fields
+                add_check("final_diff_profit_rate_signal_exists", signal_exists)
+                add_check("final_diff_profit_rate_signal_fields_allowed", not unsupported_fields)
+                if unsupported_fields:
+                    add_unexpected(path, f"unsupported profit_rate_sell fields: {sorted(unsupported_fields)}")
+                matches = (
+                    isinstance(signal, dict)
+                    and all(signal.get(key) == value.get(key) for key in value)
+                )
+                add_check("final_diff_profit_rate_signal_matches", matches)
+                if not matches:
+                    add_unexpected(path, "profit_rate_sell allowed fields missing or changed in post rules")
+            else:
+                add_check("final_diff_sell_set_signal_path_allowed", False, path)
+                add_unexpected(path or "<missing>", "unsupported sell set_signal path")
 
     if isinstance(pre_buy_groups, list) and isinstance(post_buy_groups, list) and pre_buy_groups and post_buy_groups:
         add_check("buy_non_target_groups_unchanged", pre_buy_groups[1:] == post_buy_groups[1:])
@@ -719,7 +749,16 @@ def _post_validation(
                 add_check(f"existing_sell_signal_present:{key}", False)
                 add_unexpected(f"sell.signals.{key}", "existing sell signal deleted")
             else:
-                unchanged = post_signals.get(key) == pre_signal
+                if key == "profit_rate_sell" and allowed_profit_rate_signal_diffs:
+                    expected_signal = deepcopy(pre_signal) if isinstance(pre_signal, dict) else pre_signal
+                    if isinstance(expected_signal, dict):
+                        for diff in allowed_profit_rate_signal_diffs:
+                            for field, value in diff.get("value", {}).items():
+                                if field in {"enabled", "profit_rate_percent", "basis"}:
+                                    expected_signal[field] = value
+                    unchanged = post_signals.get(key) == expected_signal
+                else:
+                    unchanged = post_signals.get(key) == pre_signal
                 add_check(f"existing_sell_signal_unchanged:{key}", unchanged)
                 if not unchanged:
                     add_unexpected(f"sell.signals.{key}", "existing sell signal changed")
@@ -833,6 +872,13 @@ def _post_validation(
             _get_path(post_normalized, "buy.execution").pop("repeat", None)
             if _get_path(post_normalized, "buy.execution") == {} and not _path_exists(pre_normalized, "buy.execution"):
                 _get_path(post_normalized, "buy").pop("execution", None)
+    if allowed_profit_rate_signal_diffs and _path_exists(post_normalized, "sell.signals.profit_rate_sell"):
+        if _path_exists(pre_normalized, "sell.signals.profit_rate_sell"):
+            _get_path(post_normalized, "sell.signals")["profit_rate_sell"] = deepcopy(
+                _get_path(pre_normalized, "sell.signals.profit_rate_sell")
+            )
+        elif _path_exists(post_normalized, "sell.signals"):
+            _get_path(post_normalized, "sell.signals").pop("profit_rate_sell", None)
     if _path_exists(pre_normalized, "buy.groups[0].conditions") and _path_exists(post_normalized, "buy.groups[0].conditions"):
         _get_path(post_normalized, "buy.groups[0]")["conditions"] = deepcopy(_get_path(pre_normalized, "buy.groups[0].conditions"))
     if isinstance(post_normalized.get("sell", {}).get("signals"), dict) and allowed_sell_signal_diffs:
