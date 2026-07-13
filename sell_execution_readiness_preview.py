@@ -18,6 +18,13 @@ INVALID = "INVALID"
 PREVIEW_TYPE = "SELL_EXECUTION_READINESS_PREVIEW"
 SOURCE_PREVIEW_TYPE = "SELL_COMMON_EXECUTION_PREVIEW_ADAPTER"
 EXCLUDED_ACTION_SOURCES = {"PENDING", "CANCEL_PENDING_ORDER"}
+_EXPECTED_STAGES = {
+    "execution_preview": "EXECUTION_PREVIEW",
+    "final_guard": "FINAL_EXECUTION_GUARD",
+    "lock_preview": "ORDER_LOCK_PREVIEW",
+    "request_hash_preview": "REQUEST_HASH_PREVIEW",
+    "execution_request_preview": "EXECUTION_REQUEST_PREVIEW",
+}
 
 _SAFETY_FLAGS = (
     "execution_connected",
@@ -285,7 +292,7 @@ def _classify_candidate(candidate: Any, index: int) -> dict[str, Any]:
         if not isinstance(stage_result, dict):
             reasons.append(f"{label} is required")
             continue
-        if not _stage_ok(stage_result):
+        if not _stage_ok(label, stage_result):
             reasons.append(f"{label} is not ready")
         else:
             stage_checks[label] = True
@@ -317,13 +324,13 @@ def _candidate_result(
     }
 
 
-def _stage_ok(stage_result: dict[str, Any]) -> bool:
-    if stage_result.get("ok") is False:
+def _stage_ok(label: str, stage_result: dict[str, Any]) -> bool:
+    if stage_result.get("stage") != _EXPECTED_STAGES.get(label):
         return False
-    if bool(stage_result.get("unresolved")):
+    if stage_result.get("ok") is not True:
         return False
-    if stage_result.get("stage") == "FINAL_EXECUTION_GUARD":
-        return stage_result.get("ok") is True
+    if stage_result.get("unresolved") is True:
+        return False
     return True
 
 

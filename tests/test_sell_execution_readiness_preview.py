@@ -213,6 +213,51 @@ class SellExecutionReadinessPreviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
 
+    def test_execution_preview_empty_dict_blocks(self):
+        candidate = _candidate()
+        candidate["execution_preview"] = {}
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
+    def test_stage_ok_missing_blocks(self):
+        candidate = _candidate()
+        candidate["execution_preview"].pop("ok")
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
+    def test_stage_ok_none_blocks(self):
+        candidate = _candidate()
+        candidate["execution_preview"]["ok"] = None
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
+    def test_wrong_stage_name_blocks(self):
+        candidate = _candidate()
+        candidate["execution_preview"]["stage"] = "WRONG_STAGE"
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
+    def test_unresolved_true_blocks(self):
+        candidate = _candidate()
+        candidate["execution_preview"]["unresolved"] = True
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
     def test_final_guard_required(self):
         result = build_sell_execution_readiness_preview(_common_preview(_candidate(include_final_guard=False)))
 
@@ -231,11 +276,29 @@ class SellExecutionReadinessPreviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("lock_preview is required", result["candidate_readiness"][0]["reasons"])
 
+    def test_lock_preview_empty_dict_blocks(self):
+        candidate = _candidate()
+        candidate["lock_preview"] = {}
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("lock_preview is not ready", result["candidate_readiness"][0]["reasons"])
+
     def test_request_hash_preview_required(self):
         result = build_sell_execution_readiness_preview(_common_preview(_candidate(include_hash=False)))
 
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("request_hash_preview is required", result["candidate_readiness"][0]["reasons"])
+
+    def test_request_hash_preview_empty_dict_blocks(self):
+        candidate = _candidate()
+        candidate["request_hash_preview"] = {}
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("request_hash_preview is not ready", result["candidate_readiness"][0]["reasons"])
 
     def test_request_hash_preview_failure_blocks(self):
         candidate = _candidate()
@@ -251,6 +314,15 @@ class SellExecutionReadinessPreviewTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("execution_request_preview is required", result["candidate_readiness"][0]["reasons"])
+
+    def test_execution_request_preview_empty_dict_blocks(self):
+        candidate = _candidate()
+        candidate["execution_request_preview"] = {}
+
+        result = build_sell_execution_readiness_preview(_common_preview(candidate))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_request_preview is not ready", result["candidate_readiness"][0]["reasons"])
 
     def test_execution_request_preview_failure_blocks(self):
         candidate = _candidate()
