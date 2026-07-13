@@ -307,6 +307,63 @@ class SellSignalGatePreviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "INVALID")
         self.assertIn("execution_readiness_preview status is INVALID", result["reasons"])
 
+    def test_upstream_unknown_status_invalid(self):
+        result = build_sell_signal_gate_preview(_readiness_preview(_readiness_candidate(), status="UNKNOWN"))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn("execution_readiness_preview status is invalid", result["reasons"])
+
+    def test_upstream_empty_status_invalid(self):
+        result = build_sell_signal_gate_preview(_readiness_preview(_readiness_candidate(), status=""))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn("execution_readiness_preview status is invalid", result["reasons"])
+
+    def test_upstream_none_status_invalid(self):
+        preview = _readiness_preview(_readiness_candidate())
+        preview["status"] = None
+
+        result = build_sell_signal_gate_preview(preview)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn("execution_readiness_preview status is invalid", result["reasons"])
+
+    def test_upstream_ready_with_readiness_ready_false_invalid(self):
+        preview = _readiness_preview(_readiness_candidate(), status="READY")
+        preview["readiness_ready"] = False
+
+        result = build_sell_signal_gate_preview(preview)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn("execution_readiness_preview readiness_ready must be True when status is READY", result["reasons"])
+
+    def test_upstream_ready_with_readiness_ready_missing_invalid(self):
+        preview = _readiness_preview(_readiness_candidate(), status="READY")
+        preview.pop("readiness_ready")
+
+        result = build_sell_signal_gate_preview(preview)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn("execution_readiness_preview readiness_ready must be True when status is READY", result["reasons"])
+
+    def test_upstream_ready_with_readiness_ready_true_opens_gate(self):
+        preview = _readiness_preview(_readiness_candidate(), status="READY")
+        preview["readiness_ready"] = True
+
+        result = build_sell_signal_gate_preview(preview)
+
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["opened_gates"][0]["gate_result"], "OPEN")
+
+    def test_upstream_blocked_with_readiness_ready_false_stays_blocked(self):
+        preview = _readiness_preview(status="BLOCKED")
+        preview["readiness_ready"] = False
+
+        result = build_sell_signal_gate_preview(preview)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("execution_readiness_preview status is BLOCKED", result["reasons"])
+
     def test_upstream_blocked_candidates_preserved(self):
         preview = _readiness_preview(_readiness_candidate())
         preview["blocked_candidate_readiness"] = [{"status": "BLOCKED", "reasons": ["market"]}]

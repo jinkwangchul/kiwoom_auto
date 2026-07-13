@@ -102,6 +102,14 @@ def build_sell_signal_gate_preview(
         result["status"] = BLOCKED
         result["reasons"].append("execution_readiness_preview status is BLOCKED")
         return _finish(result)
+    if upstream_status != READY:
+        result["status"] = INVALID
+        result["reasons"].append("execution_readiness_preview status is invalid")
+        return _finish(result)
+    if execution_readiness_preview.get("readiness_ready") is not True:
+        result["status"] = INVALID
+        result["reasons"].append("execution_readiness_preview readiness_ready must be True when status is READY")
+        return _finish(result)
 
     ready_candidates = execution_readiness_preview.get("ready_candidates")
     result["summary"]["candidate_count"] = len(ready_candidates)
