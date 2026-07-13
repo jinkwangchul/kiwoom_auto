@@ -226,6 +226,20 @@ class SellExecutionQueuePreviewTests(unittest.TestCase):
     def _guard(self) -> dict:
         return {"operator_confirmed": True, "real_trade_enabled": True, "account_no": "12345678"}
 
+    def _build_with_record(self, record: dict) -> dict:
+        queue_preview = _queue_write_preview(record=record)
+        with mock.patch(
+            "sell_execution_queue_preview.build_signal_gate_execution_queue_bridge",
+            return_value=_bridge(queue_preview=queue_preview),
+        ):
+            return build_sell_execution_queue_preview(_signal_gate_preview(_gate_candidate()))
+
+    def _assert_record_invalid(self, record: dict, expected_reason: str) -> None:
+        result = self._build_with_record(record)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertIn(expected_reason, result["candidate_queue_results"][0]["reasons"])
+
     def test_open_gate_and_real_ready_sell_builds_queue_preview_ready(self):
         result = build_sell_execution_queue_preview(_signal_gate_preview(_gate_candidate()), guard_context=self._guard())
 
@@ -469,6 +483,111 @@ class SellExecutionQueuePreviewTests(unittest.TestCase):
             result = build_sell_execution_queue_preview(_signal_gate_preview(_gate_candidate()))
 
         self.assertEqual(result["status"], "INVALID")
+
+    def test_record_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview id is required")
+
+    def test_record_source_signal_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["source_signal_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview source_signal_id is required")
+
+    def test_record_order_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["order_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview order_id is required")
+
+    def test_record_candidate_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["candidate_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview candidate_id is required")
+
+    def test_record_queue_pending_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["queue_pending_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview queue_pending_id is required")
+
+    def test_record_request_hash_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["request_hash"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview request_hash is required")
+
+    def test_record_lock_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["lock_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview lock_id is required")
+
+    def test_record_execution_id_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["execution_id"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview execution_id is required")
+
+    def test_record_execution_request_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["execution_request"] = {}
+
+        self._assert_record_invalid(record, "order_queued_record_preview execution_request must be a non-empty dict")
+
+    def test_record_queue_contract_version_missing_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["queue_contract_version"] = ""
+
+        self._assert_record_invalid(record, "order_queued_record_preview queue_contract_version is required")
+
+    def test_record_source_error_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["source"] = "other"
+
+        self._assert_record_invalid(record, "order_queued_record_preview source must be execution_queue_pending")
+
+    def test_record_order_id_mismatch_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["order_id"] = "OTHER_ORDER"
+
+        self._assert_record_invalid(record, "order_queued_record_preview order_id does not match real_ready_order")
+
+    def test_record_source_signal_id_mismatch_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["source_signal_id"] = "OTHER_SIG"
+
+        self._assert_record_invalid(record, "order_queued_record_preview source_signal_id does not match real_ready_order")
+
+    def test_record_request_hash_mismatch_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["execution_request"] = deepcopy(record["execution_request"])
+        record["execution_request"]["request_hash"] = "b" * 64
+
+        self._assert_record_invalid(record, "order_queued_record_preview request_hash does not match execution_request")
+
+    def test_record_lock_id_mismatch_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["execution_request"] = deepcopy(record["execution_request"])
+        record["execution_request"]["lock_id"] = "OTHER_LOCK"
+
+        self._assert_record_invalid(record, "order_queued_record_preview lock_id does not match execution_request")
+
+    def test_record_execution_id_mismatch_invalid(self):
+        record = _queue_write_preview()["order_queued_record_preview"]
+        record["execution_request"] = deepcopy(record["execution_request"])
+        record["execution_request"]["execution_id"] = "OTHER_EXEC"
+
+        self._assert_record_invalid(record, "order_queued_record_preview execution_id does not match execution_request")
+
+    def test_complete_order_queued_record_contract_ready(self):
+        result = self._build_with_record(_queue_write_preview()["order_queued_record_preview"])
+
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["summary"]["queue_ready_count"], 1)
 
     def test_duplicate_request_hash_blocked(self):
         first = build_sell_execution_queue_preview(_signal_gate_preview(_gate_candidate()), guard_context=self._guard())

@@ -53,6 +53,24 @@ _REQUIRED_LIST_FIELDS = (
 
 _EXCLUDED_ACTION_SOURCES = {"PENDING", "CANCEL_PENDING_ORDER"}
 
+_REQUIRED_QUEUE_RECORD_TEXT_FIELDS = (
+    "id",
+    "source_signal_id",
+    "order_id",
+    "candidate_id",
+    "queue_pending_id",
+    "request_hash",
+    "lock_id",
+    "execution_id",
+    "queue_contract_version",
+)
+
+_REQUIRED_EXECUTION_REQUEST_TEXT_FIELDS = (
+    "execution_id",
+    "request_hash",
+    "lock_id",
+)
+
 
 def build_sell_execution_queue_preview(
     signal_gate_preview: dict[str, Any],
@@ -306,7 +324,7 @@ def _build_candidate_queue_result(
             real_ready_order=real_ready_order,
         )
 
-    bridge_validation_status, bridge_reasons = _validate_bridge_preview(bridge_preview)
+    bridge_validation_status, bridge_reasons = _validate_bridge_preview(bridge_preview, real_ready_order)
     queue_write_preview = (
         bridge_preview.get("queue_write_preview_result")
         if isinstance(bridge_preview.get("queue_write_preview_result"), dict)
@@ -443,7 +461,10 @@ def _validate_real_ready_order(order: dict[str, Any]) -> tuple[str, list[str]]:
     return READY, []
 
 
-def _validate_bridge_preview(bridge_preview: dict[str, Any]) -> tuple[str, list[str]]:
+def _validate_bridge_preview(
+    bridge_preview: dict[str, Any],
+    real_ready_order: dict[str, Any],
+) -> tuple[str, list[str]]:
     if bridge_preview.get("stage") != BRIDGE_STAGE:
         return INVALID, ["bridge_preview stage is invalid"]
 
@@ -468,10 +489,13 @@ def _validate_bridge_preview(bridge_preview: dict[str, Any]) -> tuple[str, list[
     if not isinstance(queue_preview, dict):
         return INVALID, ["queue_write_preview_result must be a dict"]
 
-    return _validate_queue_write_preview(queue_preview)
+    return _validate_queue_write_preview(queue_preview, real_ready_order)
 
 
-def _validate_queue_write_preview(queue_preview: dict[str, Any]) -> tuple[str, list[str]]:
+def _validate_queue_write_preview(
+    queue_preview: dict[str, Any],
+    real_ready_order: dict[str, Any],
+) -> tuple[str, list[str]]:
     if queue_preview.get("write_preview") is not True:
         return BLOCKED, _queue_block_reasons(queue_preview, "write_preview is not True")
     if queue_preview.get("write_stage") != QUEUE_WRITE_STAGE_READY:
@@ -492,6 +516,32 @@ def _validate_queue_write_preview(queue_preview: dict[str, Any]) -> tuple[str, l
         return INVALID, ["order_queued_record_preview send_order_called must be False"]
     if record.get("execution_enabled") is not False:
         return INVALID, ["order_queued_record_preview execution_enabled must be False"]
+
+    if record.get("source") != "execution_queue_pending":
+        return INVALID, ["order_queued_record_preview source must be execution_queue_pending"]
+
+    for field in _REQUIRED_QUEUE_RECORD_TEXT_FIELDS:
+        if not _clean_text(record.get(field)):
+            return INVALID, [f"order_queued_record_preview {field} is required"]
+
+    execution_request = record.get("execution_request")
+    if not isinstance(execution_request, dict) or not execution_request:
+        return INVALID, ["order_queued_record_preview execution_request must be a non-empty dict"]
+
+    for field in _REQUIRED_EXECUTION_REQUEST_TEXT_FIELDS:
+        if not _clean_text(execution_request.get(field)):
+            return INVALID, [f"execution_request {field} is required"]
+
+    if _clean_text(record.get("source_signal_id")) != _clean_text(real_ready_order.get("source_signal_id")):
+        return INVALID, ["order_queued_record_preview source_signal_id does not match real_ready_order"]
+
+    expected_order_id = _clean_text(real_ready_order.get("id") or real_ready_order.get("order_id"))
+    if _clean_text(record.get("order_id")) != expected_order_id:
+        return INVALID, ["order_queued_record_preview order_id does not match real_ready_order"]
+
+    for field in _REQUIRED_EXECUTION_REQUEST_TEXT_FIELDS:
+        if _clean_text(record.get(field)) != _clean_text(execution_request.get(field)):
+            return INVALID, [f"order_queued_record_preview {field} does not match execution_request"]
     return READY, []
 
 
