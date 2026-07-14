@@ -25,6 +25,8 @@ ROUTINE_DEPENDENCY = None
 
 _IDENTITY_FIELDS = (
     "order_id",
+    "candidate_id",
+    "queue_pending_id",
     "request_hash",
     "lock_id",
     "execution_id",
@@ -180,22 +182,17 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
     queue_path_text = _clean_text(execution_result.get("queue_path"))
     backup_path_text = _clean_text(execution_result.get("backup_path"))
     safety_backup_path_text = _clean_text(execution_result.get("safety_backup_path"))
-    identity = execution_result.get("target_identity")
+    identities = _target_identities(execution_result)
 
     if not queue_path_text or not backup_path_text or not safety_backup_path_text:
         result["status"] = INVALID
         result["reasons"].append("queue_path, backup_path, and safety_backup_path are required")
         result["blocked_checks"].append({"status": INVALID, "reasons": deepcopy(result["reasons"])})
         return result
-    if not isinstance(identity, dict):
-        result["status"] = INVALID
-        result["reasons"].append("target_identity must be a dict")
-        result["blocked_checks"].append({"status": INVALID, "reasons": deepcopy(result["reasons"])})
-        return result
-    identity_errors = _identity_errors(identity)
+    identity_errors = _identities_errors(identities)
     if identity_errors:
         result["status"] = INVALID
-        result["reasons"].append("target_identity incomplete: " + ", ".join(identity_errors))
+        result["reasons"].append("target_identities incomplete: " + ", ".join(identity_errors))
         result["blocked_checks"].append({"status": INVALID, "reasons": deepcopy(result["reasons"])})
         return result
 
@@ -215,15 +212,15 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
         result["blocked_checks"].append({"status": INVALID, "reasons": deepcopy(result["reasons"])})
         return result
 
-    queue_matches = _matching_records(queue_data, identity)
-    safety_matches = _matching_records(safety_data, identity)
+    queue_counts = [len(_matching_records(queue_data, identity)) for identity in identities]
+    safety_counts = [len(_matching_records(safety_data, identity)) for identity in identities]
     check_errors = []
     if queue_data != backup_data:
         check_errors.append("queue json must match backup json after recovery")
-    if len(queue_matches) != 0:
+    if sum(queue_counts) != 0:
         check_errors.append("target identity must be absent from queue after recovery")
-    if len(safety_matches) != 1:
-        check_errors.append("safety backup must contain exactly one target identity")
+    if sum(safety_counts) != len(identities) or any(count != 1 for count in safety_counts):
+        check_errors.append("safety backup must contain exactly one record for each target identity")
     if check_errors:
         result["status"] = INVALID
         result["reasons"].extend(check_errors)
@@ -233,8 +230,10 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
                 "queue_path": queue_path_text,
                 "backup_path": backup_path_text,
                 "safety_backup_path": safety_backup_path_text,
-                "queue_matching_record_count": len(queue_matches),
-                "safety_backup_matching_record_count": len(safety_matches),
+                "queue_matching_record_count": sum(queue_counts),
+                "safety_backup_matching_record_count": sum(safety_counts),
+                "queue_matching_counts": queue_counts,
+                "safety_backup_matching_counts": safety_counts,
                 "reasons": deepcopy(check_errors),
             }
         )
@@ -247,9 +246,13 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
             "queue_path": queue_path_text,
             "backup_path": backup_path_text,
             "safety_backup_path": safety_backup_path_text,
-            "target_identity": deepcopy(identity),
+            "target_identity": deepcopy(identities[0]),
+            "target_identities": deepcopy(identities),
+            "target_count": len(identities),
             "queue_matching_record_count": 0,
-            "safety_backup_matching_record_count": 1,
+            "safety_backup_matching_record_count": len(identities),
+            "queue_matching_counts": queue_counts,
+            "safety_backup_matching_counts": safety_counts,
             "queue_matches_backup": True,
         }
     )
@@ -272,19 +275,33 @@ def _read_json_object(path: Path) -> tuple[dict[str, Any], str | None]:
 
 def _matching_records(queue_data: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
     records = []
+    fields = [field for field in _IDENTITY_FIELDS if _clean_text(identity.get(field))]
     for item in queue_data.get("orders", []):
         if not isinstance(item, dict):
             continue
-        if all(item.get(field) == identity.get(field) for field in _IDENTITY_FIELDS):
+        if all(item.get(field) == identity.get(field) for field in fields):
             records.append(item)
     return records
 
 
-def _identity_errors(identity: dict[str, Any]) -> list[str]:
+def _target_identities(execution_result: dict[str, Any]) -> list[dict[str, Any]]:
+    identities = execution_result.get("target_identities")
+    if isinstance(identities, list) and identities:
+        return [item for item in identities if isinstance(item, dict)]
+    identity = execution_result.get("target_identity")
+    return [identity] if isinstance(identity, dict) else []
+
+
+def _identities_errors(identities: list[dict[str, Any]]) -> list[str]:
     errors = []
-    for field in _IDENTITY_FIELDS:
-        if not _clean_text(identity.get(field)):
-            errors.append(field)
+    if not identities:
+        return ["target_identities"]
+    for index, identity in enumerate(identities):
+        for field in _IDENTITY_FIELDS:
+            if len(identities) == 1 and field in {"candidate_id", "queue_pending_id"}:
+                continue
+            if not _clean_text(identity.get(field)):
+                errors.append(f"target_identities[{index}].{field}")
     return errors
 
 

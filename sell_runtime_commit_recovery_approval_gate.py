@@ -28,6 +28,8 @@ ROUTINE_DEPENDENCY = None
 
 _IDENTITY_FIELDS = (
     "order_id",
+    "candidate_id",
+    "queue_pending_id",
     "request_hash",
     "lock_id",
     "execution_id",
@@ -130,6 +132,8 @@ def approve_sell_runtime_commit_recovery(
         "queue_path": plan["queue_path"],
         "backup_path": plan["backup_path"],
         "target_identity": deepcopy(plan["target_identity"]),
+        "target_identities": deepcopy(_target_identities(plan)),
+        "target_count": len(_target_identities(plan)),
         "queue_backup_diff": deepcopy(file_check["queue_backup_diff"]),
         "source_recovery_plan": deepcopy(plan),
         "restore_executed": False,
@@ -209,13 +213,17 @@ def _recovery_plan_contract_errors(recovery_plan: dict[str, Any]) -> list[str]:
         errors.append("recovery plan queue_path is required")
     if not _clean_text(plan.get("backup_path")):
         errors.append("recovery plan backup_path is required")
-    identity = plan.get("target_identity")
-    if not isinstance(identity, dict):
-        errors.append("recovery plan target_identity must be a dict")
-    else:
+    identities = _target_identities(plan)
+    if not identities:
+        errors.append("recovery plan target_identities must not be empty")
+    for index, identity in enumerate(identities):
         for field in _IDENTITY_FIELDS:
+            if len(identities) == 1 and field in {"candidate_id", "queue_pending_id"}:
+                continue
             if not _clean_text(identity.get(field)):
-                errors.append(f"target_identity.{field} is required")
+                errors.append(f"target_identities[{index}].{field} is required")
+    if plan.get("target_count", len(identities)) != len(identities):
+        errors.append("target_count must match target_identities length")
     diff = plan.get("queue_backup_diff")
     if not isinstance(diff, dict):
         errors.append("recovery plan queue_backup_diff must be a dict")
@@ -224,8 +232,8 @@ def _recovery_plan_contract_errors(recovery_plan: dict[str, Any]) -> list[str]:
             errors.append("queue_backup_changed must be True")
         if diff.get("target_record_changed") is not True:
             errors.append("target_record_changed must be True")
-        if diff.get("queue_matching_record_count") != 1:
-            errors.append("queue_matching_record_count must be 1")
+        if diff.get("queue_matching_record_count") != len(identities):
+            errors.append("queue_matching_record_count must match target_count")
         if diff.get("backup_matching_record_count") != 0:
             errors.append("backup_matching_record_count must be 0")
     return errors
@@ -246,10 +254,29 @@ def _approval_contract_errors(plan: dict[str, Any], approval_context: dict[str, 
         errors.append("approval queue_path does not match recovery plan")
     if _clean_text(approval_context.get("backup_path")) != _clean_text(plan.get("backup_path")):
         errors.append("approval backup_path does not match recovery plan")
-    identity = plan.get("target_identity") if isinstance(plan.get("target_identity"), dict) else {}
-    for identity_field, approval_field in _APPROVAL_IDENTITY_FIELDS.items():
-        if _clean_text(approval_context.get(approval_field)) != _clean_text(identity.get(identity_field)):
-            errors.append(f"approval {approval_field} does not match target_identity.{identity_field}")
+    target_identities = _target_identities(plan)
+    approved_identities = approval_context.get("approved_identities")
+    if approved_identities is None:
+        identity = target_identities[0] if target_identities else {}
+        for identity_field, approval_field in _APPROVAL_IDENTITY_FIELDS.items():
+            if _clean_text(approval_context.get(approval_field)) != _clean_text(identity.get(identity_field)):
+                errors.append(f"approval {approval_field} does not match target_identity.{identity_field}")
+        if len(target_identities) != 1:
+            errors.append("approved_identities is required for multi-target recovery")
+        return errors
+    if not isinstance(approved_identities, list):
+        errors.append("approved_identities must be a list")
+        return errors
+    if len(approved_identities) != len(target_identities):
+        errors.append("approved_identities length must match target_count")
+        return errors
+    for index, (approved, target) in enumerate(zip(approved_identities, target_identities)):
+        if not isinstance(approved, dict):
+            errors.append(f"approved_identities[{index}] must be a dict")
+            continue
+        for field in _IDENTITY_FIELDS:
+            if _clean_text(approved.get(field)) != _clean_text(target.get(field)):
+                errors.append(f"approved_identities[{index}].{field} does not match target_identities[{index}].{field}")
     return errors
 
 
@@ -257,7 +284,7 @@ def _verify_current_file_state(plan: dict[str, Any]) -> dict[str, Any]:
     result = {"status": BLOCKED, "reasons": [], "queue_backup_diff": {}}
     queue_path = Path(_clean_text(plan.get("queue_path")))
     backup_path = Path(_clean_text(plan.get("backup_path")))
-    identity = plan.get("target_identity") if isinstance(plan.get("target_identity"), dict) else {}
+    identities = _target_identities(plan)
 
     queue_data, queue_error = _read_json_object(queue_path)
     if queue_error:
@@ -271,15 +298,15 @@ def _verify_current_file_state(plan: dict[str, Any]) -> dict[str, Any]:
         result["reasons"].append("backup json invalid: " + backup_error)
         return result
 
-    diff = _queue_backup_diff(queue_data, backup_data, identity)
+    diff = _queue_backup_diff(queue_data, backup_data, identities)
     result["queue_backup_diff"] = diff
     planned_diff = plan.get("queue_backup_diff") if isinstance(plan.get("queue_backup_diff"), dict) else {}
-    if diff != planned_diff:
+    if not _diff_matches(diff, planned_diff, len(identities)):
         result["status"] = INVALID
         result["reasons"].append("current queue/backup state differs from recovery plan")
         return result
 
-    readiness_errors = _recovery_readiness_errors(diff)
+    readiness_errors = _recovery_readiness_errors(diff, len(identities))
     if readiness_errors:
         result["status"] = INVALID
         result["reasons"].extend(readiness_errors)
@@ -303,42 +330,76 @@ def _read_json_object(path: Path) -> tuple[dict[str, Any], str | None]:
     return data, None
 
 
+def _target_identities(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    identities = plan.get("target_identities")
+    if isinstance(identities, list) and identities:
+        return [item for item in identities if isinstance(item, dict)]
+    identity = plan.get("target_identity")
+    return [identity] if isinstance(identity, dict) else []
+
+
 def _matching_records(queue_data: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
     records = []
+    fields = [field for field in _IDENTITY_FIELDS if _clean_text(identity.get(field))]
     for item in queue_data.get("orders", []):
         if not isinstance(item, dict):
             continue
-        if all(item.get(field) == identity.get(field) for field in _IDENTITY_FIELDS):
+        if all(item.get(field) == identity.get(field) for field in fields):
             records.append(item)
     return records
 
 
-def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identities: list[dict[str, Any]]) -> dict[str, Any]:
     queue_orders = [item for item in queue_data.get("orders", []) if isinstance(item, dict)]
     backup_orders = [item for item in backup_data.get("orders", []) if isinstance(item, dict)]
-    queue_target = _matching_records(queue_data, identity)
-    backup_target = _matching_records(backup_data, identity)
+    queue_counts = [len(_matching_records(queue_data, identity)) for identity in identities]
+    backup_counts = [len(_matching_records(backup_data, identity)) for identity in identities]
     return {
         "queue_order_count": len(queue_orders),
         "backup_order_count": len(backup_orders),
-        "queue_matching_record_count": len(queue_target),
-        "backup_matching_record_count": len(backup_target),
+        "queue_matching_record_count": sum(queue_counts),
+        "backup_matching_record_count": sum(backup_counts),
+        "queue_matching_counts": queue_counts,
+        "backup_matching_counts": backup_counts,
         "queue_backup_changed": queue_orders != backup_orders,
-        "target_record_changed": queue_target != backup_target,
+        "target_record_changed": queue_counts != backup_counts,
     }
 
 
-def _recovery_readiness_errors(diff: dict[str, Any]) -> list[str]:
+def _recovery_readiness_errors(diff: dict[str, Any], target_count: int = 1) -> list[str]:
     errors: list[str] = []
     if diff.get("queue_backup_changed") is not True:
         errors.append("queue and backup are identical; restoring would not change target state")
     if diff.get("target_record_changed") is not True:
         errors.append("target record does not differ between queue and backup")
-    if diff.get("queue_matching_record_count") != 1:
-        errors.append("current queue must contain exactly one target record")
+    if diff.get("queue_matching_record_count") != target_count or any(count != 1 for count in diff.get("queue_matching_counts", [])):
+        errors.append("current queue must contain exactly one record for each target identity")
     if diff.get("backup_matching_record_count") != 0:
-        errors.append("backup must not contain the target record to prove a safe previous state")
+        errors.append("backup must not contain target records to prove a safe previous state")
     return errors
+
+
+def _diff_matches(current: dict[str, Any], planned: dict[str, Any], target_count: int) -> bool:
+    keys = (
+        "queue_order_count",
+        "backup_order_count",
+        "queue_matching_record_count",
+        "backup_matching_record_count",
+        "queue_backup_changed",
+        "target_record_changed",
+    )
+    if any(current.get(key) != planned.get(key) for key in keys):
+        return False
+    planned_queue_counts = planned.get("queue_matching_counts")
+    planned_backup_counts = planned.get("backup_matching_counts")
+    if planned_queue_counts is None and target_count == 1:
+        planned_queue_counts = [planned.get("queue_matching_record_count")]
+    if planned_backup_counts is None and target_count == 1:
+        planned_backup_counts = [planned.get("backup_matching_record_count")]
+    return (
+        current.get("queue_matching_counts") == planned_queue_counts
+        and current.get("backup_matching_counts") == planned_backup_counts
+    )
 
 
 def _finish(result: dict[str, Any]) -> dict[str, Any]:
