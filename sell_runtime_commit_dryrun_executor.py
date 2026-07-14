@@ -106,23 +106,29 @@ def build_sell_runtime_commit_dryrun(runtime_commit_validation: dict[str, Any]) 
         result["reasons"].append("no validated runtime commit candidates")
         return _finish(result)
 
-    has_invalid = False
+    candidate_count = len(candidates)
     for index, candidate in enumerate(candidates):
         action = _dryrun_action(candidate, index)
         result["commit_actions"].append(action)
         if action["status"] == READY:
             result["summary"]["dryrun_ready_count"] += 1
         elif action["status"] == INVALID:
-            has_invalid = True
             result["blocked_commit_actions"].append(deepcopy(action))
             result["summary"]["dryrun_invalid_count"] += 1
         else:
             result["blocked_commit_actions"].append(deepcopy(action))
             result["summary"]["dryrun_blocked_count"] += 1
 
-    if has_invalid:
+    invalid_count = result["summary"]["dryrun_invalid_count"]
+    blocked_count = result["summary"]["dryrun_blocked_count"]
+    ready_count = result["summary"]["dryrun_ready_count"]
+
+    if invalid_count > 0:
         result["status"] = INVALID
-    elif result["summary"]["dryrun_ready_count"] > 0:
+    elif blocked_count > 0:
+        result["status"] = BLOCKED
+        result["reasons"].append("one or more dry-run commit candidates are blocked")
+    elif ready_count == candidate_count and candidate_count > 0:
         result["status"] = READY
     else:
         result["status"] = BLOCKED
@@ -191,38 +197,46 @@ def _dryrun_action(candidate: Any, index: int) -> dict[str, Any]:
         return _action_result(index, INVALID, ["validated candidate must be a dict"])
 
     reasons: list[str] = []
+    structural_error = False
     if _status(candidate.get("status")) != READY:
         reasons.append("validated candidate status must be READY")
     if candidate.get("commit_allowed") is not True:
         reasons.append("validated candidate commit_allowed must be True")
     if _has_forbidden_safety_flag(candidate):
+        structural_error = True
         reasons.append("validated candidate safety flag violation")
 
     for field in _IDENTITY_FIELDS:
         if not _clean_text(candidate.get(field)):
+            structural_error = True
             reasons.append(f"{field} is required")
 
     execution_request = candidate.get("execution_request")
     if not isinstance(execution_request, dict) or not execution_request:
+        structural_error = True
         reasons.append("execution_request must be a non-empty dict")
         execution_request = {}
 
     record = candidate.get("order_queued_record_preview")
     if not isinstance(record, dict) or not record:
+        structural_error = True
         reasons.append("order_queued_record_preview must be a non-empty dict")
         record = {}
 
     for field in ("execution_id", "request_hash", "lock_id"):
         if _clean_text(candidate.get(field)) != _clean_text(execution_request.get(field)):
+            structural_error = True
             reasons.append(f"{field} must match execution_request")
         if _clean_text(candidate.get(field)) != _clean_text(record.get(field)):
+            structural_error = True
             reasons.append(f"{field} must match order_queued_record_preview")
 
     for field in ("source_signal_id", "order_id", "candidate_id", "queue_pending_id"):
         if _clean_text(candidate.get(field)) != _clean_text(record.get(field)):
+            structural_error = True
             reasons.append(f"{field} must match order_queued_record_preview")
 
-    status = BLOCKED if reasons else READY
+    status = INVALID if structural_error else BLOCKED if reasons else READY
     return _action_result(
         index,
         status,
@@ -293,6 +307,7 @@ def _commit_plan(result: dict[str, Any]) -> dict[str, Any]:
         "plan_type": "SELL_RUNTIME_COMMIT_DRYRUN_PLAN",
         "dry_run": True,
         "status": result["status"],
+        "commit_allowed": result["status"] == READY,
         "actions": deepcopy(result["commit_actions"]),
         "action_count": len(result["commit_actions"]),
         "ready_action_count": result["summary"]["dryrun_ready_count"],

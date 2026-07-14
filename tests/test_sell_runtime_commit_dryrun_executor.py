@@ -215,7 +215,7 @@ class SellRuntimeCommitDryRunExecutorTests(unittest.TestCase):
 
         result = build_sell_runtime_commit_dryrun(_validation(candidate))
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertIn("validated candidate safety flag violation", result["commit_actions"][0]["reasons"])
 
     def test_identity_preserved(self):
@@ -257,7 +257,7 @@ class SellRuntimeCommitDryRunExecutorTests(unittest.TestCase):
 
         result = build_sell_runtime_commit_dryrun(_validation(candidate))
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertIn("request_hash must match execution_request", result["commit_actions"][0]["reasons"])
 
     def test_mismatched_record_blocks(self):
@@ -266,7 +266,7 @@ class SellRuntimeCommitDryRunExecutorTests(unittest.TestCase):
 
         result = build_sell_runtime_commit_dryrun(_validation(candidate))
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertIn("order_id must match order_queued_record_preview", result["commit_actions"][0]["reasons"])
 
     def test_runtime_commit_preview_created(self):
@@ -303,6 +303,58 @@ class SellRuntimeCommitDryRunExecutorTests(unittest.TestCase):
         self.assertEqual(result["summary"]["dryrun_ready_count"], 2)
         self.assertFalse(result["summary"]["priority_selected"])
         self.assertFalse(result["summary"]["auto_selected"])
+
+    def test_all_candidates_ready_required_for_ready(self):
+        first = _validated_candidate()
+        second = _validated_candidate(_record(source_signal_id="SIG_2", order_id="ORDER_2"))
+
+        result = build_sell_runtime_commit_dryrun(_validation(first, second))
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["commit_allowed"])
+
+    def test_ready_plus_blocked_makes_overall_blocked(self):
+        blocked = _validated_candidate(_record(source_signal_id="SIG_2", order_id="ORDER_2"))
+        blocked["commit_allowed"] = False
+
+        result = build_sell_runtime_commit_dryrun(_validation(_validated_candidate(), blocked))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["commit_allowed"])
+        self.assertEqual(result["summary"]["dryrun_ready_count"], 1)
+        self.assertEqual(result["summary"]["dryrun_blocked_count"], 1)
+
+    def test_ready_plus_invalid_makes_overall_invalid(self):
+        invalid = _validated_candidate(_record(source_signal_id="SIG_2", order_id="ORDER_2"))
+        invalid["request_hash"] = ""
+
+        result = build_sell_runtime_commit_dryrun(_validation(_validated_candidate(), invalid))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["commit_allowed"])
+        self.assertEqual(result["summary"]["dryrun_ready_count"], 1)
+        self.assertEqual(result["summary"]["dryrun_invalid_count"], 1)
+
+    def test_identity_missing_is_invalid(self):
+        candidate = _validated_candidate()
+        candidate["lock_id"] = ""
+
+        result = build_sell_runtime_commit_dryrun(_validation(candidate))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["commit_allowed"])
+        self.assertIn("lock_id is required", result["commit_actions"][0]["reasons"])
+
+    def test_no_partial_commit_plan_is_allowed(self):
+        blocked = _validated_candidate(_record(source_signal_id="SIG_2", order_id="ORDER_2"))
+        blocked["commit_allowed"] = False
+
+        result = build_sell_runtime_commit_dryrun(_validation(_validated_candidate(), blocked))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["commit_allowed"])
+        self.assertFalse(result["commit_plan"].get("commit_allowed", False))
+        self.assertEqual(result["commit_plan"]["ready_action_count"], 1)
 
     def test_input_mutation_does_not_occur(self):
         validation = _validation()
