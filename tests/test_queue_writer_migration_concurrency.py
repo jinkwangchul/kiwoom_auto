@@ -14,10 +14,10 @@ from sell_runtime_commit_recovery_executor import execute_sell_runtime_commit_re
 from send_order_result_recorder import record_send_order_result
 
 
-def _queued_record(index: int, *, send_order_called: bool = False) -> dict:
+def _queued_record(index: int, *, send_order_called: bool = False, status: str = "ORDER_QUEUED") -> dict:
     return {
         "id": f"ORDER_QUEUED_ORDER_{index}",
-        "status": "ORDER_QUEUED",
+        "status": status,
         "source": "execution_queue_pending",
         "source_signal_id": f"SIG_{index}",
         "order_id": f"ORDER_{index}",
@@ -142,7 +142,7 @@ class QueueWriterMigrationConcurrencyTest(unittest.TestCase):
         return results
 
     def test_chejan_update_and_new_commit_do_not_lose_records(self) -> None:
-        self._write_queue([_queued_record(1, send_order_called=True)])
+        self._write_queue([_queued_record(1, send_order_called=True, status="SEND_CALL_ACCEPTED")])
 
         results = self._run_two(
             lambda: record_chejan_event(
@@ -165,7 +165,7 @@ class QueueWriterMigrationConcurrencyTest(unittest.TestCase):
         self.assertTrue(any(item.get("committed") for item in results))
 
     def test_same_chejan_event_concurrent_calls_append_once(self) -> None:
-        self._write_queue([_queued_record(1, send_order_called=True)])
+        self._write_queue([_queued_record(1, send_order_called=True, status="SEND_CALL_ACCEPTED")])
 
         def record() -> dict:
             return record_chejan_event(

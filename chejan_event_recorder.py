@@ -34,9 +34,13 @@ _EVENT_RECORD_TYPES = {
 }
 _FILL_RECORD_TYPES = {"PARTIAL_FILL", "FULL_FILL"}
 _BROKER_ACCEPT_EVENT_TYPES = {"ORDER_ACCEPTED", "ORDER_OPEN"}
-_SEND_RESULT_STATES = {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN"}
-_BROKER_ACTIVE_STATES = {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}
 _TERMINAL_STATES = {"FILLED", "CANCELLED", "PARTIAL_CANCELLED", "BROKER_REJECTED"}
+_LIFECYCLE_ALLOWED_SOURCE_STATUSES = {
+    "BROKER_ACCEPT": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN"},
+    "BROKER_REJECT": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN"},
+    "FILL": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED", "FILLED"},
+    "CANCEL": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"},
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -173,24 +177,10 @@ def _validate_target_record(record: dict[str, Any], review_result: dict[str, Any
             return _blocked("record_consistency", f"target record.{field} does not match chejan_review_result.{field}")
 
     status = _clean_text(record.get("status"))
-    if event_type in _BROKER_ACCEPT_EVENT_TYPES:
-        if status not in _SEND_RESULT_STATES and status != "ORDER_QUEUED":
-            return _blocked("record", f"target record.status cannot accept broker acceptance event: {status or 'missing'}")
-    elif event_type == "ORDER_REJECTED":
-        if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "PARTIAL_CANCELLED"}:
-            return _blocked("record", f"target record.status cannot transition to BROKER_REJECTED: {status}")
-        if status not in _SEND_RESULT_STATES and status != "BROKER_ACCEPTED" and status != "ORDER_QUEUED":
-            return _blocked("record", f"target record.status cannot accept broker rejection event: {status or 'missing'}")
-    elif event_type in _FILL_RECORD_TYPES:
-        if status in {"BROKER_REJECTED", "CANCELLED", "PARTIAL_CANCELLED"}:
-            return _blocked("record", f"target record.status cannot accept fill event: {status}")
-        if status not in _SEND_RESULT_STATES and status not in _BROKER_ACTIVE_STATES and status != "FILLED" and status != "ORDER_QUEUED":
-            return _blocked("record", f"target record.status cannot accept fill event: {status or 'missing'}")
-    elif event_type == "ORDER_CANCELED":
-        if status in {"FILLED", "BROKER_REJECTED", "CANCELLED", "PARTIAL_CANCELLED"}:
-            return _blocked("record", f"target record.status cannot accept cancel event: {status}")
-        if status not in _SEND_RESULT_STATES and status not in _BROKER_ACTIVE_STATES and status != "ORDER_QUEUED":
-            return _blocked("record", f"target record.status cannot accept cancel event: {status or 'missing'}")
+    transition_key = _transition_key(event_type)
+    allowed_statuses = _LIFECYCLE_ALLOWED_SOURCE_STATUSES.get(transition_key, set())
+    if status not in allowed_statuses:
+        return _blocked("record", f"target record.status cannot accept {transition_key} event: {status or 'missing'}")
 
     return None
 
@@ -372,6 +362,55 @@ def _price_or_none(value: Any) -> float | int | None:
         return None
 
 
+def _transition_key(event_type: str) -> str:
+    if event_type in _BROKER_ACCEPT_EVENT_TYPES:
+        return "BROKER_ACCEPT"
+    if event_type == "ORDER_REJECTED":
+        return "BROKER_REJECT"
+    if event_type in _FILL_RECORD_TYPES:
+        return "FILL"
+    if event_type == "ORDER_CANCELED":
+        return "CANCEL"
+    return "UNKNOWN"
+
+
+def _broker_average_fill_price(event: dict[str, Any]) -> float | int | None:
+    for field in (
+        "average_fill_price",
+        "avg_fill_price",
+        "average_price",
+        "cumulative_average_fill_price",
+        "broker_average_fill_price",
+    ):
+        value = _price_or_none(event.get(field))
+        if value is not None:
+            return value
+    raw_event = _as_dict(event.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    for fid in ("932", "930"):
+        value = _price_or_none(fid_values.get(fid))
+        if value is not None:
+            return value
+    return None
+
+
+def _weighted_average_fill_price(
+    *,
+    previous_average: Any,
+    previous_filled: int,
+    fill_delta: int,
+    last_fill_price: float | int | None,
+) -> float | int | None:
+    if fill_delta <= 0 or last_fill_price is None:
+        return _price_or_none(previous_average)
+    previous_average_value = _price_or_none(previous_average)
+    if previous_average_value is None or previous_filled <= 0:
+        return last_fill_price
+    total_filled = previous_filled + fill_delta
+    weighted = ((float(previous_average_value) * previous_filled) + (float(last_fill_price) * fill_delta)) / total_filled
+    return int(weighted) if weighted.is_integer() else weighted
+
+
 def _fill_blocked(record: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
     order_quantity = _int_or_none(event.get("order_quantity") or record.get("original_order_quantity") or record.get("quantity"))
     filled_quantity = _int_or_none(event.get("filled_quantity"))
@@ -454,11 +493,25 @@ def _apply_fill(
 ) -> None:
     previous_status = _clean_text(record.get("status"))
     previous_filled = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+    previous_remaining = _int_or_none(record.get("remaining_quantity"))
+    previous_average = _price_or_none(record.get("average_fill_price"))
     order_quantity = _int_or_none(event.get("order_quantity") or record.get("original_order_quantity") or record.get("quantity"))
-    filled_quantity = _int_or_none(event.get("filled_quantity")) or 0
     remaining_quantity = _int_or_none(event.get("remaining_quantity"))
+    explicit_filled_quantity = _int_or_none(event.get("filled_quantity"))
+    implied_filled_quantity = None
+    if order_quantity is not None and remaining_quantity is not None:
+        implied_filled_quantity = order_quantity - remaining_quantity
+    filled_candidates = [value for value in (explicit_filled_quantity, implied_filled_quantity) if value is not None]
+    filled_quantity = max(filled_candidates) if filled_candidates else 0
     filled_price = _price_or_none(event.get("filled_price"))
-    fill_delta = max(filled_quantity - previous_filled, 0)
+    explicit_fill_delta = max(filled_quantity - previous_filled, 0)
+    remaining_fill_delta = 0
+    average_previous_filled = previous_filled
+    if previous_remaining is not None and remaining_quantity is not None:
+        remaining_fill_delta = max(previous_remaining - remaining_quantity, 0)
+        if order_quantity is not None:
+            average_previous_filled = max(order_quantity - previous_remaining, 0)
+    fill_delta = max(explicit_fill_delta, remaining_fill_delta)
 
     if previous_status == "FILLED" and event_type == "PARTIAL_FILL":
         record.update(
@@ -469,6 +522,18 @@ def _apply_fill(
             }
         )
         return
+
+    average_fill_price = _broker_average_fill_price(event)
+    if average_fill_price is None:
+        if fill_delta > 0 and filled_price is not None:
+            if previous_average is not None and average_previous_filled > 0:
+                total_filled_for_average = average_previous_filled + fill_delta
+                weighted = ((float(previous_average) * average_previous_filled) + (float(filled_price) * fill_delta)) / total_filled_for_average
+                average_fill_price = int(weighted) if weighted.is_integer() else weighted
+            else:
+                average_fill_price = filled_price
+        else:
+            average_fill_price = previous_average
 
     final_fill = event_type == "FULL_FILL" or (order_quantity is not None and filled_quantity == order_quantity) or remaining_quantity == 0
     record.update(
@@ -492,8 +557,17 @@ def _apply_fill(
             "automatic_retry_allowed": False,
         }
     )
-    if filled_price is not None:
-        record["average_fill_price"] = filled_price
+    if fill_delta > 0:
+        broker_average = _broker_average_fill_price(event)
+        if broker_average is not None:
+            record["average_fill_price"] = broker_average
+        elif filled_price is not None:
+            if previous_average is not None and average_previous_filled > 0:
+                total_filled_for_average = average_previous_filled + fill_delta
+                weighted = ((float(previous_average) * average_previous_filled) + (float(filled_price) * fill_delta)) / total_filled_for_average
+                record["average_fill_price"] = int(weighted) if weighted.is_integer() else weighted
+            else:
+                record["average_fill_price"] = filled_price
     if final_fill:
         record["filled_at"] = received_at
         record["final_fill_event_id"] = _event_id(event_identity)
