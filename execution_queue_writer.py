@@ -1162,6 +1162,8 @@ _DISPATCH_CLAIM_IDENTITY_FIELDS = (
 _DISPATCH_CLAIM_BLOCKED_STATUSES = {
     "DISPATCH_CLAIMED",
     "SEND_ATTEMPTED",
+    "SEND_CALL_ACCEPTED",
+    "SEND_CALL_REJECTED",
     "SEND_UNCERTAIN",
     "BROKER_ACCEPTED",
     "BROKER_REJECTED",
@@ -1709,7 +1711,7 @@ def mark_send_order_attempted(
                 updated_record.update(
                     {
                         "status": "SEND_ATTEMPTED",
-                        "send_order_called": True,
+                        "send_order_called": False,
                         "send_order_attempted": True,
                         "send_order_attempt_recorded": True,
                         "send_order_attempt_id": normalized_attempt_id,
@@ -1721,7 +1723,10 @@ def mark_send_order_attempted(
                         "broker_call_executed": False,
                         "actual_order_sent": False,
                         "broker_api_called": False,
+                        "send_call_result_known": False,
                         "broker_result_known": False,
+                        "broker_accepted": False,
+                        "broker_rejected": False,
                         "automatic_retry_allowed": False,
                         "updated_at": _time_text(attempted_at),
                     }
@@ -1740,12 +1745,15 @@ def mark_send_order_attempted(
                         "dispatch_claim_id": normalized_claim_id,
                         "dispatch_generation": updated_record.get("dispatch_generation"),
                         "claimed_identity": deepcopy(normalized_identity),
-                        "send_order_called": True,
+                        "send_order_called": False,
                         "send_order_attempt_recorded": True,
                         "broker_call_executed": False,
                         "actual_order_sent": False,
                         "broker_api_called": False,
+                        "send_call_result_known": False,
                         "broker_result_known": False,
+                        "broker_accepted": False,
+                        "broker_rejected": False,
                         "automatic_retry_allowed": False,
                     },
                 }
@@ -1795,8 +1803,10 @@ def _broker_result_record_blocked(
         return _commit_blocked("broker_send_result", "dispatch claim id mismatch")
     if _clean_text(record.get("send_order_attempt_id")) != send_order_attempt_id:
         return _commit_blocked("broker_send_result", "send order attempt id mismatch")
-    if record.get("broker_result_known") is True or record.get("broker_accepted") is True or record.get("broker_rejected") is True or record.get("send_uncertain") is True:
+    if record.get("send_call_result_known") is True or record.get("send_call_accepted") is True or record.get("send_call_rejected") is True or record.get("send_uncertain") is True:
         return _commit_blocked("broker_send_result", "send order attempt already has broker result")
+    if record.get("broker_result_known") is True or record.get("broker_accepted") is True or record.get("broker_rejected") is True:
+        return _commit_blocked("broker_send_result", "send order attempt already has broker lifecycle result")
     return None
 
 
@@ -1827,7 +1837,7 @@ def _record_broker_send_result(
         return _with_queue_metadata(_commit_blocked("broker_send_result", "dispatch claim id is required"), expected_revision=expected_revision)
     if not normalized_attempt_id:
         return _with_queue_metadata(_commit_blocked("broker_send_result", "send order attempt id is required"), expected_revision=expected_revision)
-    if result_status not in {"BROKER_ACCEPTED", "BROKER_REJECTED", "SEND_UNCERTAIN"}:
+    if result_status not in {"SEND_CALL_ACCEPTED", "SEND_CALL_REJECTED", "SEND_UNCERTAIN"}:
         return _with_queue_metadata(_commit_blocked("broker_send_result", "broker send result status is invalid"), expected_revision=expected_revision)
 
     recorded_at = datetime.now()
@@ -1853,16 +1863,19 @@ def _record_broker_send_result(
                     "status": result_status,
                     "dispatch_claim_id": normalized_claim_id,
                     "send_order_attempt_id": normalized_attempt_id,
-                    "broker_result_recorded_at": _time_text(recorded_at),
+                    "send_call_result_recorded_at": _time_text(recorded_at),
                     "broker_return_code": broker_return_code,
+                    "broker_result_known": False,
+                    "broker_accepted": False,
+                    "broker_rejected": False,
                     "updated_at": _time_text(recorded_at),
                 }
-                if result_status == "BROKER_ACCEPTED":
+                if result_status == "SEND_CALL_ACCEPTED":
                     common.update(
                         {
-                            "broker_result_known": True,
-                            "broker_accepted": True,
-                            "broker_rejected": False,
+                            "send_call_result_known": True,
+                            "send_call_accepted": True,
+                            "send_call_rejected": False,
                             "send_uncertain": False,
                             "broker_error_code": "",
                             "broker_error_message": "",
@@ -1872,12 +1885,12 @@ def _record_broker_send_result(
                     )
                     if _clean_text(broker_order_no):
                         common["broker_order_no"] = _clean_text(broker_order_no)
-                elif result_status == "BROKER_REJECTED":
+                elif result_status == "SEND_CALL_REJECTED":
                     common.update(
                         {
-                            "broker_result_known": True,
-                            "broker_accepted": False,
-                            "broker_rejected": True,
+                            "send_call_result_known": True,
+                            "send_call_accepted": False,
+                            "send_call_rejected": True,
                             "send_uncertain": False,
                             "broker_error_code": _clean_text(broker_error_code),
                             "broker_error_message": _clean_text(broker_error_message),
@@ -1888,9 +1901,9 @@ def _record_broker_send_result(
                 else:
                     common.update(
                         {
-                            "broker_result_known": False,
-                            "broker_accepted": False,
-                            "broker_rejected": False,
+                            "send_call_result_known": False,
+                            "send_call_accepted": False,
+                            "send_call_rejected": False,
                             "send_uncertain": True,
                             "uncertain_reason": _clean_text(uncertain_reason) or "send order result is uncertain",
                             "uncertain_recorded_at": _time_text(recorded_at),
@@ -1904,14 +1917,18 @@ def _record_broker_send_result(
                 return {
                     "data": updated_data,
                     "result": {
-                        "broker_result_recorded": True,
+                        "send_call_result_recorded": True,
+                        "broker_result_recorded": False,
                         "status": result_status,
                         "dispatch_claim_id": normalized_claim_id,
                         "send_order_attempt_id": normalized_attempt_id,
-                        "broker_result_recorded_at": _time_text(recorded_at),
-                        "broker_result_known": common.get("broker_result_known"),
-                        "broker_accepted": common.get("broker_accepted"),
-                        "broker_rejected": common.get("broker_rejected"),
+                        "send_call_result_recorded_at": _time_text(recorded_at),
+                        "send_call_result_known": common.get("send_call_result_known"),
+                        "send_call_accepted": common.get("send_call_accepted"),
+                        "send_call_rejected": common.get("send_call_rejected"),
+                        "broker_result_known": False,
+                        "broker_accepted": False,
+                        "broker_rejected": False,
                         "send_uncertain": common.get("send_uncertain"),
                         "automatic_retry_allowed": common.get("automatic_retry_allowed"),
                         "manual_reconciliation_required": common.get("manual_reconciliation_required", False),
@@ -1943,9 +1960,11 @@ def _record_broker_send_result(
         verify=verify,
     )
     if result.get("committed") is True:
-        result.setdefault("broker_result_recorded", True)
+        result.setdefault("send_call_result_recorded", True)
+        result.setdefault("broker_result_recorded", False)
         result.setdefault("status", result_status)
     else:
+        result.setdefault("send_call_result_recorded", False)
         result.setdefault("broker_result_recorded", False)
     return result
 
@@ -1966,7 +1985,7 @@ def record_broker_send_accepted(
         identity,
         dispatch_claim_id=dispatch_claim_id,
         send_order_attempt_id=send_order_attempt_id,
-        result_status="BROKER_ACCEPTED",
+        result_status="SEND_CALL_ACCEPTED",
         broker_return_code=broker_return_code,
         broker_order_no=broker_order_no,
         context=context,
@@ -1991,7 +2010,7 @@ def record_broker_send_rejected(
         identity,
         dispatch_claim_id=dispatch_claim_id,
         send_order_attempt_id=send_order_attempt_id,
-        result_status="BROKER_REJECTED",
+        result_status="SEND_CALL_REJECTED",
         broker_return_code=broker_return_code,
         broker_error_code=broker_error_code,
         broker_error_message=broker_error_message,
@@ -2061,6 +2080,9 @@ def inspect_send_order_lifecycle(queue_path: str | Path, identity: Any, *, conte
                         "dispatch_generation": record.get("dispatch_generation"),
                         "send_order_attempt_id": record.get("send_order_attempt_id"),
                         "send_order_attempt_count": record.get("send_order_attempt_count", 0),
+                        "send_call_result_known": record.get("send_call_result_known", False),
+                        "send_call_accepted": record.get("send_call_accepted", False),
+                        "send_call_rejected": record.get("send_call_rejected", False),
                         "broker_result_known": record.get("broker_result_known", False),
                         "broker_accepted": record.get("broker_accepted", False),
                         "broker_rejected": record.get("broker_rejected", False),

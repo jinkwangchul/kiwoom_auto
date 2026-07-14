@@ -1910,7 +1910,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertTrue(result["attempt_recorded"])
         self.assertEqual("SEND_ATTEMPTED", result["status"])
         self.assertEqual("SEND_ATTEMPTED", record["status"])
-        self.assertTrue(record["send_order_called"])
+        self.assertFalse(record["send_order_called"])
         self.assertTrue(record["send_order_attempted"])
         self.assertTrue(record["send_order_attempt_recorded"])
         self.assertEqual(result["send_order_attempt_id"], record["send_order_attempt_id"])
@@ -1919,7 +1919,10 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertFalse(record["broker_call_executed"])
         self.assertFalse(record["actual_order_sent"])
         self.assertFalse(record["broker_api_called"])
+        self.assertFalse(record["send_call_result_known"])
         self.assertFalse(record["broker_result_known"])
+        self.assertFalse(record["broker_accepted"])
+        self.assertFalse(record["broker_rejected"])
         self.assertFalse(record["automatic_retry_allowed"])
         self.assertEqual(2, data["revision"])
         self.assertEqual(1, result["revision_before"])
@@ -2032,8 +2035,8 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                         broker_order_no="BRK_1",
                         expected_revision=2,
                     )
-                    expected_status = "BROKER_ACCEPTED"
-                    expected_flag = "broker_accepted"
+                    expected_status = "SEND_CALL_ACCEPTED"
+                    expected_flag = "send_call_accepted"
                 elif status == "rejected":
                     result = record_broker_send_rejected(
                         queue_path,
@@ -2045,8 +2048,8 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                         broker_error_message="rejected",
                         expected_revision=2,
                     )
-                    expected_status = "BROKER_REJECTED"
-                    expected_flag = "broker_rejected"
+                    expected_status = "SEND_CALL_REJECTED"
+                    expected_flag = "send_call_rejected"
                 else:
                     result = record_broker_send_uncertain(
                         queue_path,
@@ -2061,10 +2064,17 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
 
                 record = self._read_queue(queue_path)["orders"][0]
                 self.assertTrue(result["committed"])
-                self.assertTrue(result["broker_result_recorded"])
+                self.assertTrue(result["send_call_result_recorded"])
+                self.assertFalse(result["broker_result_recorded"])
                 self.assertEqual(expected_status, result["status"])
                 self.assertEqual(expected_status, record["status"])
                 self.assertTrue(record[expected_flag])
+                if status != "uncertain":
+                    self.assertTrue(record["send_call_result_known"])
+                self.assertFalse(record["actual_order_sent"])
+                self.assertFalse(record["broker_result_known"])
+                self.assertFalse(record["broker_accepted"])
+                self.assertFalse(record["broker_rejected"])
                 self.assertFalse(record["automatic_retry_allowed"])
                 self.assertEqual(3, self._read_queue(queue_path)["revision"])
                 if status == "uncertain":
