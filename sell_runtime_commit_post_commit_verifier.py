@@ -51,17 +51,16 @@ def verify_sell_runtime_commit_post_commit(real_executor_result: dict[str, Any])
         return _finish(result)
 
     upstream_status = _status(real_executor_result.get("status"))
-    if upstream_status == INVALID:
+    if upstream_status is None:
         result["status"] = INVALID
-        result["reasons"].append("real executor status is INVALID")
+        result["reasons"].append("real executor status must be READY, BLOCKED, or INVALID")
         return _finish(result)
+    upstream_invalid = upstream_status == INVALID
+    if upstream_invalid:
+        result["reasons"].append("real executor status is INVALID")
     if upstream_status == BLOCKED:
         result["status"] = BLOCKED
         result["reasons"].append("real executor status is BLOCKED")
-        return _finish(result)
-    if upstream_status != READY:
-        result["status"] = INVALID
-        result["reasons"].append("real executor status must be READY, BLOCKED, or INVALID")
         return _finish(result)
 
     if real_executor_result.get("queue_committed") is not True:
@@ -90,7 +89,10 @@ def verify_sell_runtime_commit_post_commit(real_executor_result: dict[str, Any])
     _extend_list(result["warnings"], verification.get("warnings"))
     _extend_list(result["reasons"], verification.get("reasons"))
 
-    if verification["status"] == READY:
+    if verification["status"] == READY and upstream_invalid:
+        result["status"] = INVALID
+        result["summary"]["verified_record_count"] = 1
+    elif verification["status"] == READY:
         result["status"] = READY
         result["summary"]["verified_record_count"] = 1
     elif verification["status"] == BLOCKED:
@@ -121,6 +123,7 @@ def _base_result(real_executor_result: Any) -> dict[str, Any]:
         "real_ready_state_changed": False,
         "status": BLOCKED,
         "post_commit_verified": False,
+        "post_commit_file_verified": False,
         "executor_snapshot": deepcopy(real_executor_result) if isinstance(real_executor_result, dict) else {},
         "verified_records": [],
         "blocked_verifications": [],
@@ -274,6 +277,7 @@ def _record_errors(record: dict[str, Any], execution_result: dict[str, Any]) -> 
 
 def _finish(result: dict[str, Any]) -> dict[str, Any]:
     result["post_commit_verified"] = result.get("status") == READY
+    result["post_commit_file_verified"] = len(result.get("verified_records", [])) == 1
     result["read_only"] = True
     result["runtime_write"] = False
     result["queue_write"] = False

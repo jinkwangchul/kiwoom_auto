@@ -153,6 +153,7 @@ class SellRuntimeCommitPostCommitVerifierTests(unittest.TestCase):
         self.assertEqual(result["verifier_type"], "SELL_RUNTIME_COMMIT_POST_COMMIT_VERIFIER")
         self.assertEqual(result["status"], "READY")
         self.assertTrue(result["post_commit_verified"])
+        self.assertTrue(result["post_commit_file_verified"])
         self.assertEqual(len(result["verified_records"]), 1)
 
     def test_missing_record_invalid(self):
@@ -161,6 +162,7 @@ class SellRuntimeCommitPostCommitVerifierTests(unittest.TestCase):
         result = verify_sell_runtime_commit_post_commit(self._executor_result(queue_path, backup_path))
 
         self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["post_commit_file_verified"])
 
     def test_duplicate_record_invalid(self):
         queue_path, backup_path = self._queue_files(orders=[_record(), _record()])
@@ -282,6 +284,19 @@ class SellRuntimeCommitPostCommitVerifierTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["post_commit_verified"])
+        self.assertTrue(result["post_commit_file_verified"])
+
+    def test_upstream_invalid_with_file_mismatch_keeps_file_unverified(self):
+        queue_path, backup_path = self._queue_files(orders=[_record(request_hash="mismatch")])
+
+        result = verify_sell_runtime_commit_post_commit(
+            self._executor_result(queue_path, backup_path, status="INVALID", committed=True)
+        )
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["post_commit_verified"])
+        self.assertFalse(result["post_commit_file_verified"])
 
     def test_queue_committed_false_blocked(self):
         queue_path, backup_path = self._queue_files()
