@@ -67,6 +67,23 @@ def _commit_blocked(stage: str, reason: str) -> dict[str, Any]:
     }
 
 
+def _post_write_failed_result(stage: str, reason: str, *, order_queue_path: str, backup_path: str | None = None) -> dict[str, Any]:
+    return {
+        "committed": True,
+        "write_stage": stage,
+        "next_stage": NEXT_STAGE_BLOCKED,
+        "changed": True,
+        "order_queue_path": order_queue_path,
+        "backup_path": backup_path,
+        "file_write": True,
+        "queue_write": True,
+        "queue_committed": True,
+        "post_write_verified": False,
+        "blocked_reasons": [reason],
+        "warnings": [],
+    }
+
+
 def _queue_metadata(
     *,
     revision_before: int | None = None,
@@ -83,12 +100,14 @@ def _queue_metadata(
         "cas_checked": cas_checked,
         "lock_acquired": lock_acquired,
         "lock_wait_ms": lock_wait_ms,
+        "file_write": False,
+        "post_write_verified": False,
     }
 
 
 def _with_queue_metadata(result: dict[str, Any], **metadata: Any) -> dict[str, Any]:
-    updated = dict(result)
-    updated.update(_queue_metadata(**metadata))
+    updated = _queue_metadata(**metadata)
+    updated.update(result)
     return updated
 
 
@@ -509,9 +528,14 @@ def commit_execution_queue_write(
                 after_data, after_blocked = _read_queue_file(target_path)
                 if after_blocked is not None:
                     return _with_queue_metadata(
-                        after_blocked,
+                        _post_write_failed_result(
+                            after_blocked.get("write_stage", "post_write_verify"),
+                            after_blocked.get("blocked_reasons", ["post-write queue read failed"])[0],
+                            order_queue_path=str(target_path),
+                            backup_path=backup_path,
+                        ),
                         revision_before=revision_before,
-                        revision_after=revision_before,
+                        revision_after=revision_after,
                         expected_revision=expected_revision,
                         cas_checked=expected_revision is not None,
                         lock_acquired=True,
@@ -519,9 +543,14 @@ def commit_execution_queue_write(
                     )
                 if _normalize_revision(after_data) != revision_after:
                     return _with_queue_metadata(
-                        _commit_blocked("post_write_verify", "order_queue revision did not advance as expected"),
+                        _post_write_failed_result(
+                            "post_write_verify",
+                            "order_queue revision did not advance as expected",
+                            order_queue_path=str(target_path),
+                            backup_path=backup_path,
+                        ),
                         revision_before=revision_before,
-                        revision_after=revision_before,
+                        revision_after=revision_after,
                         expected_revision=expected_revision,
                         cas_checked=expected_revision is not None,
                         lock_acquired=True,
@@ -543,6 +572,10 @@ def commit_execution_queue_write(
                         "status": record.get("status"),
                         "send_order_called": False,
                         "execution_enabled": False,
+                        "file_write": True,
+                        "queue_write": True,
+                        "queue_committed": True,
+                        "post_write_verified": True,
                         "blocked_reasons": [],
                         "warnings": [],
                     },
@@ -669,7 +702,8 @@ def commit_execution_queue_write_batch(
                             **_commit_blocked("write_queue", f"failed to write order_queue json: {exc}"),
                             "order_queue_path": str(target_path),
                             "backup_path": backup_path,
-                            "file_write": backup_path is not None,
+                            "file_write": False,
+                            "post_write_verified": False,
                             "queue_write": False,
                             "queue_committed": False,
                             "committed_count": 0,
@@ -685,9 +719,17 @@ def commit_execution_queue_write_batch(
                 after_data, after_blocked = _read_queue_file(target_path)
                 if after_blocked is not None:
                     return _with_queue_metadata(
-                        after_blocked,
+                        {
+                            **_post_write_failed_result(
+                                after_blocked.get("write_stage", "post_write_verify"),
+                                after_blocked.get("blocked_reasons", ["post-write queue read failed"])[0],
+                                order_queue_path=str(target_path),
+                                backup_path=backup_path,
+                            ),
+                            "committed_count": len(records),
+                        },
                         revision_before=revision_before,
-                        revision_after=revision_before,
+                        revision_after=revision_after,
                         expected_revision=expected_revision,
                         cas_checked=expected_revision is not None,
                         lock_acquired=True,
@@ -695,9 +737,17 @@ def commit_execution_queue_write_batch(
                     )
                 if _normalize_revision(after_data) != revision_after:
                     return _with_queue_metadata(
-                        _commit_blocked("post_write_verify", "order_queue revision did not advance as expected"),
+                        {
+                            **_post_write_failed_result(
+                                "post_write_verify",
+                                "order_queue revision did not advance as expected",
+                                order_queue_path=str(target_path),
+                                backup_path=backup_path,
+                            ),
+                            "committed_count": len(records),
+                        },
                         revision_before=revision_before,
-                        revision_after=revision_before,
+                        revision_after=revision_after,
                         expected_revision=expected_revision,
                         cas_checked=expected_revision is not None,
                         lock_acquired=True,
@@ -722,6 +772,10 @@ def commit_execution_queue_write_batch(
                         "execution_ids": [record.get("execution_id") for record in records],
                         "send_order_called": False,
                         "execution_enabled": False,
+                        "file_write": True,
+                        "queue_write": True,
+                        "queue_committed": True,
+                        "post_write_verified": True,
                         "blocked_reasons": [],
                         "warnings": [],
                     },

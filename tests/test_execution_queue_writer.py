@@ -4,18 +4,75 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 import msvcrt
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
+import execution_queue_writer as queue_writer
 from execution_queue_writer import (
     commit_execution_queue_write,
     commit_execution_queue_write_batch,
     preview_execution_queue_write,
 )
+
+
+def _process_queue_pending_result() -> dict:
+    return {
+        "queue_pending": True,
+        "queue_pending_stage": "queue_pending_created",
+        "queue_pending_id": "QUEUE_PENDING_EXEC_CANDIDATE_ORDER_1",
+        "created_from_candidate_id": "EXEC_CANDIDATE_ORDER_1",
+        "queue_contract_version": "preview-1",
+        "next_stage": "QUEUE_WRITER_REQUIRED",
+        "preview_only": True,
+        "no_write": True,
+        "blocked_reasons": [],
+        "warnings": [],
+        "order_id": "ORDER_1",
+        "source_signal_id": "SIG_1",
+        "request_hash_preview": "a" * 64,
+        "lock_preview": {"ok": True, "lock_id": "LOCK_1"},
+        "execution_request_preview": {
+            "ok": True,
+            "execution_request": {
+                "execution_id": "EXEC_1",
+                "order_id": "ORDER_1",
+                "source_signal_id": "SIG_1",
+                "lock_id": "LOCK_1",
+                "request_hash": "a" * 64,
+            },
+        },
+    }
+
+
+def _process_write_preview_for(index: int, *, same_request_hash: bool = False) -> dict:
+    pending = _process_queue_pending_result()
+    request_hash = "a" * 64 if same_request_hash else chr(96 + index) * 64
+    pending["order_id"] = f"ORDER_{index}"
+    pending["created_from_candidate_id"] = f"CANDIDATE_{index}"
+    pending["queue_pending_id"] = f"PENDING_{index}"
+    pending["request_hash_preview"] = request_hash
+    pending["lock_preview"]["lock_id"] = f"LOCK_{index}"
+    pending["execution_request_preview"]["execution_request"]["order_id"] = f"ORDER_{index}"
+    pending["execution_request_preview"]["execution_request"]["execution_id"] = f"EXEC_{index}"
+    pending["execution_request_preview"]["execution_request"]["request_hash"] = request_hash
+    pending["execution_request_preview"]["execution_request"]["lock_id"] = f"LOCK_{index}"
+    return preview_execution_queue_write(pending)
+
+
+def _process_commit_worker(queue_path: str, index: int, same_request_hash: bool, start_event: Any, result_queue: Any) -> None:
+    start_event.wait()
+    result = commit_execution_queue_write(
+        _process_write_preview_for(index, same_request_hash=same_request_hash),
+        queue_path,
+        context={"manual_queue_write_confirmed": True},
+    )
+    result_queue.put(result)
 
 
 class ExecutionQueueWriterPreviewTest(unittest.TestCase):
@@ -607,6 +664,64 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual(7, backup_data["revision"])
         self.assertEqual(8, self._read_queue(queue_path)["revision"])
 
+    def test_single_commit_read_failure_after_replace_preserves_side_effect_flags(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        original_read = queue_writer._read_queue_file
+        calls = {"count": 0}
+
+        def flaky_read(path: Path):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return original_read(path)
+            return {}, {
+                "committed": False,
+                "write_stage": "read_queue",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "blocked_reasons": ["post-write read failed"],
+                "warnings": [],
+            }
+
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=flaky_read):
+            result = commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual("read_queue", result["write_stage"])
+
+    def test_single_commit_revision_mismatch_after_replace_preserves_side_effect_flags(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        original_read = queue_writer._read_queue_file
+        calls = {"count": 0}
+
+        def mismatched_revision(path: Path):
+            calls["count"] += 1
+            data, blocked = original_read(path)
+            if calls["count"] > 1 and not blocked:
+                data["revision"] = 999
+            return data, blocked
+
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=mismatched_revision):
+            result = commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual("post_write_verify", result["write_stage"])
+
     def test_commit_creates_backup_file(self) -> None:
         result, _ = self._commit_to_temp_queue()
 
@@ -725,6 +840,102 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual(1, self._read_queue(queue_path)["revision"])
         self.assertEqual(0, result["revision_before"])
         self.assertEqual(1, result["revision_after"])
+
+    def test_batch_commit_read_failure_after_replace_preserves_side_effect_flags(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        previews = [
+            self._write_preview_for(
+                order_id="ORDER_1",
+                candidate_id="CANDIDATE_1",
+                queue_pending_id="PENDING_1",
+                request_hash="a" * 64,
+                lock_id="LOCK_1",
+                execution_id="EXEC_1",
+            ),
+            self._write_preview_for(
+                order_id="ORDER_2",
+                candidate_id="CANDIDATE_2",
+                queue_pending_id="PENDING_2",
+                request_hash="b" * 64,
+                lock_id="LOCK_2",
+                execution_id="EXEC_2",
+            ),
+        ]
+        original_read = queue_writer._read_queue_file
+        calls = {"count": 0}
+
+        def flaky_read(path: Path):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return original_read(path)
+            return {}, {
+                "committed": False,
+                "write_stage": "read_queue",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "blocked_reasons": ["post-write read failed"],
+                "warnings": [],
+            }
+
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=flaky_read):
+            result = commit_execution_queue_write_batch(previews, queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(2, result["committed_count"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual("read_queue", result["write_stage"])
+
+    def test_batch_commit_revision_mismatch_after_replace_preserves_side_effect_flags(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        previews = [
+            self._write_preview_for(
+                order_id="ORDER_1",
+                candidate_id="CANDIDATE_1",
+                queue_pending_id="PENDING_1",
+                request_hash="a" * 64,
+                lock_id="LOCK_1",
+                execution_id="EXEC_1",
+            ),
+            self._write_preview_for(
+                order_id="ORDER_2",
+                candidate_id="CANDIDATE_2",
+                queue_pending_id="PENDING_2",
+                request_hash="b" * 64,
+                lock_id="LOCK_2",
+                execution_id="EXEC_2",
+            ),
+        ]
+        original_read = queue_writer._read_queue_file
+        calls = {"count": 0}
+
+        def mismatched_revision(path: Path):
+            calls["count"] += 1
+            data, blocked = original_read(path)
+            if calls["count"] > 1 and not blocked:
+                data["revision"] = 999
+            return data, blocked
+
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=mismatched_revision):
+            result = commit_execution_queue_write_batch(previews, queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(2, result["committed_count"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual("post_write_verify", result["write_stage"])
 
     def test_same_request_hash_two_threads_only_one_commit(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -862,6 +1073,56 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertFalse(result["lock_acquired"])
         self.assertEqual(before, queue_path.read_text(encoding="utf-8"))
         self.assertFalse(Path(str(queue_path) + ".bak").exists())
+
+    def test_same_request_hash_two_processes_only_one_commit(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(target=_process_commit_worker, args=(str(queue_path), 1, True, start_event, result_queue)),
+            ctx.Process(target=_process_commit_worker, args=(str(queue_path), 2, True, start_event, result_queue)),
+        ]
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(10)
+            self.assertEqual(0, process.exitcode)
+        results = [result_queue.get(timeout=5) for _ in processes]
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(1, sum(1 for item in results if item.get("committed") is True))
+        self.assertEqual(1, len(data["orders"]))
+        self.assertEqual(1, data["revision"])
+
+    def test_different_orders_two_processes_both_commit_without_loss(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(target=_process_commit_worker, args=(str(queue_path), 1, False, start_event, result_queue)),
+            ctx.Process(target=_process_commit_worker, args=(str(queue_path), 2, False, start_event, result_queue)),
+        ]
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(10)
+            self.assertEqual(0, process.exitcode)
+        results = [result_queue.get(timeout=5) for _ in processes]
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(2, sum(1 for item in results if item.get("committed") is True))
+        self.assertEqual(["ORDER_1", "ORDER_2"], sorted(record["order_id"] for record in data["orders"]))
+        self.assertEqual(2, data["revision"])
 
     def test_batch_commit_duplicate_identity_is_blocked_before_write(self) -> None:
         tmp = tempfile.TemporaryDirectory()
