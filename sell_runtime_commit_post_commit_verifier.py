@@ -26,6 +26,8 @@ ROUTINE_DEPENDENCY = None
 
 _IDENTITY_FIELDS = (
     "order_id",
+    "candidate_id",
+    "queue_pending_id",
     "request_hash",
     "lock_id",
     "execution_id",
@@ -78,12 +80,14 @@ def verify_sell_runtime_commit_post_commit(real_executor_result: dict[str, Any])
         result["status"] = INVALID
         result["reasons"].append("execution_results must be a list")
         return _finish(result)
-    if len(execution_results) != 1:
+    if not execution_results:
         result["status"] = INVALID
-        result["reasons"].append("post-commit verifier requires exactly one execution_result")
+        result["reasons"].append("execution_results must not be empty")
         return _finish(result)
 
-    verification = _verify_execution_result(execution_results[0])
+    result["summary"]["expected_record_count"] = len(execution_results)
+
+    verification = _verify_execution_results(execution_results)
     result["verified_records"].extend(verification["verified_records"])
     result["blocked_verifications"].extend(verification["blocked_verifications"])
     _extend_list(result["warnings"], verification.get("warnings"))
@@ -91,16 +95,12 @@ def verify_sell_runtime_commit_post_commit(real_executor_result: dict[str, Any])
 
     if verification["status"] == READY and upstream_invalid:
         result["status"] = INVALID
-        result["summary"]["verified_record_count"] = 1
     elif verification["status"] == READY:
         result["status"] = READY
-        result["summary"]["verified_record_count"] = 1
     elif verification["status"] == BLOCKED:
         result["status"] = BLOCKED
-        result["summary"]["blocked_verification_count"] = 1
     else:
         result["status"] = INVALID
-        result["summary"]["invalid_verification_count"] = 1
 
     return _finish(result)
 
@@ -131,6 +131,7 @@ def _base_result(real_executor_result: Any) -> dict[str, Any]:
         "reasons": [],
         "summary": {
             "verified_record_count": 0,
+            "expected_record_count": 0,
             "blocked_verification_count": 0,
             "invalid_verification_count": 0,
             "runtime_write": False,
@@ -146,7 +147,7 @@ def _base_result(real_executor_result: Any) -> dict[str, Any]:
     }
 
 
-def _verify_execution_result(execution_result: Any) -> dict[str, Any]:
+def _verify_execution_results(execution_results: list[Any]) -> dict[str, Any]:
     result = {
         "status": BLOCKED,
         "verified_records": [],
@@ -154,87 +155,154 @@ def _verify_execution_result(execution_result: Any) -> dict[str, Any]:
         "warnings": [],
         "reasons": [],
     }
-    if not isinstance(execution_result, dict):
-        result["status"] = INVALID
-        result["reasons"].append("execution_result must be a dict")
-        result["blocked_verifications"].append({"status": INVALID, "reasons": deepcopy(result["reasons"])})
-        return result
+    normalized_results: list[dict[str, Any]] = []
+    commit_results: list[dict[str, Any]] = []
+    for execution_result in execution_results:
+        if not isinstance(execution_result, dict):
+            return _verification_error(INVALID, "execution_result must be a dict", result)
+        commit_result = execution_result.get("commit_result")
+        if not isinstance(commit_result, dict):
+            return _verification_error(INVALID, "commit_result must be a dict", result, execution_result)
+        if commit_result.get("committed") is not True:
+            return _verification_error(BLOCKED, "commit_result.committed must be True", result, execution_result)
+        normalized_results.append(execution_result)
+        commit_results.append(commit_result)
 
-    commit_result = execution_result.get("commit_result")
-    if not isinstance(commit_result, dict):
-        result["status"] = INVALID
-        result["reasons"].append("commit_result must be a dict")
-        result["blocked_verifications"].append({"status": INVALID, "execution_result": deepcopy(execution_result), "reasons": deepcopy(result["reasons"])})
-        return result
+    common_errors = _common_commit_errors(normalized_results, commit_results)
+    if common_errors:
+        return _verification_error(INVALID, "; ".join(common_errors), result)
 
-    if commit_result.get("committed") is not True:
-        result["status"] = BLOCKED
-        result["reasons"].append("commit_result.committed must be True")
-        result["blocked_verifications"].append({"status": BLOCKED, "execution_result": deepcopy(execution_result), "reasons": deepcopy(result["reasons"])})
-        return result
-
+    commit_result = commit_results[0]
     queue_path_text = _clean_text(commit_result.get("order_queue_path"))
     if not queue_path_text:
-        result["status"] = INVALID
-        result["reasons"].append("commit_result.order_queue_path is required")
-        result["blocked_verifications"].append({"status": INVALID, "execution_result": deepcopy(execution_result), "reasons": deepcopy(result["reasons"])})
-        return result
+        return _verification_error(INVALID, "commit_result.order_queue_path is required", result)
 
     queue_path = Path(queue_path_text)
     if not queue_path.exists():
-        result["status"] = INVALID
-        result["reasons"].append("order_queue_path does not exist")
-        result["blocked_verifications"].append({"status": INVALID, "queue_path": queue_path_text, "reasons": deepcopy(result["reasons"])})
-        return result
+        return _verification_error(INVALID, "order_queue_path does not exist", result, {"queue_path": queue_path_text})
 
     queue_data, queue_error = _read_json_object(queue_path)
     if queue_error:
-        result["status"] = INVALID
-        result["reasons"].append(queue_error)
-        result["blocked_verifications"].append({"status": INVALID, "queue_path": queue_path_text, "reasons": deepcopy(result["reasons"])})
-        return result
-
-    records = _matching_records(queue_data, execution_result)
-    if len(records) != 1:
-        result["status"] = INVALID
-        result["reasons"].append(f"expected exactly one matching ORDER_QUEUED record, found {len(records)}")
-        result["blocked_verifications"].append({"status": INVALID, "queue_path": queue_path_text, "matching_count": len(records), "reasons": deepcopy(result["reasons"])})
-        return result
-
-    record = records[0]
-    record_errors = _record_errors(record, execution_result)
-    if record_errors:
-        result["status"] = INVALID
-        result["reasons"].append("ORDER_QUEUED record mismatch: " + ", ".join(record_errors))
-        result["blocked_verifications"].append({"status": INVALID, "queue_path": queue_path_text, "record": deepcopy(record), "reasons": deepcopy(result["reasons"])})
-        return result
+        return _verification_error(INVALID, queue_error, result, {"queue_path": queue_path_text})
 
     backup_path_text = _clean_text(commit_result.get("backup_path"))
+    backup_data: dict[str, Any] | None = None
     if backup_path_text:
         backup_data, backup_error = _read_json_object(Path(backup_path_text))
         if backup_error:
-            result["status"] = INVALID
-            result["reasons"].append("backup json invalid: " + backup_error)
-            result["blocked_verifications"].append({"status": INVALID, "backup_path": backup_path_text, "reasons": deepcopy(result["reasons"])})
-            return result
+            return _verification_error(INVALID, "backup json invalid: " + backup_error, result, {"backup_path": backup_path_text})
         if not isinstance(backup_data.get("orders"), list):
-            result["status"] = INVALID
-            result["reasons"].append("backup json orders must be a list")
-            result["blocked_verifications"].append({"status": INVALID, "backup_path": backup_path_text, "reasons": deepcopy(result["reasons"])})
-            return result
+            return _verification_error(INVALID, "backup json orders must be a list", result, {"backup_path": backup_path_text})
+
+    for execution_result in normalized_results:
+        records = _matching_records(queue_data, execution_result)
+        if len(records) != 1:
+            return _verification_error(
+                INVALID,
+                f"expected exactly one matching ORDER_QUEUED record, found {len(records)}",
+                result,
+                {"queue_path": queue_path_text, "matching_count": len(records), "execution_result": deepcopy(execution_result)},
+            )
+
+        record = records[0]
+        record_errors = _record_errors(record, execution_result)
+        if record_errors:
+            return _verification_error(
+                INVALID,
+                "ORDER_QUEUED record mismatch: " + ", ".join(record_errors),
+                result,
+                {"queue_path": queue_path_text, "record": deepcopy(record), "execution_result": deepcopy(execution_result)},
+            )
+
+        if backup_data is not None and _matching_records(backup_data, execution_result):
+            return _verification_error(
+                INVALID,
+                "backup must not contain committed ORDER_QUEUED target identity",
+                result,
+                {"backup_path": backup_path_text, "execution_result": deepcopy(execution_result)},
+            )
+
+        result["verified_records"].append(
+            {
+                "status": READY,
+                "order_queue_path": queue_path_text,
+                "backup_path": backup_path_text or None,
+                "record": deepcopy(record),
+                "commit_result": deepcopy(execution_result.get("commit_result")),
+                "source_execution_result": deepcopy(execution_result),
+            }
+        )
 
     result["status"] = READY
-    result["verified_records"].append(
-        {
-            "status": READY,
-            "order_queue_path": queue_path_text,
-            "backup_path": backup_path_text or None,
-            "record": deepcopy(record),
-            "commit_result": deepcopy(commit_result),
-            "source_execution_result": deepcopy(execution_result),
-        }
-    )
     return result
+
+
+def _verification_error(
+    status: str,
+    reason: str,
+    result: dict[str, Any],
+    payload: Any = None,
+) -> dict[str, Any]:
+    result["status"] = status
+    result["reasons"].append(reason)
+    blocked = {"status": status, "reasons": deepcopy(result["reasons"])}
+    if isinstance(payload, dict):
+        blocked.update(deepcopy(payload))
+    elif payload is not None:
+        blocked["payload"] = deepcopy(payload)
+    result["blocked_verifications"].append(blocked)
+    return result
+
+
+def _common_commit_errors(
+    execution_results: list[dict[str, Any]],
+    commit_results: list[dict[str, Any]],
+) -> list[str]:
+    errors: list[str] = []
+    count = len(execution_results)
+    queue_paths = [_clean_text(commit_result.get("order_queue_path")) for commit_result in commit_results]
+    if len(set(queue_paths)) != 1:
+        errors.append("execution_result queue_path mismatch")
+
+    backup_paths = [_clean_text(commit_result.get("backup_path")) for commit_result in commit_results]
+    if len(set(backup_paths)) != 1:
+        errors.append("execution_result backup_path mismatch")
+
+    first_commit = commit_results[0]
+    for commit_result in commit_results[1:]:
+        if commit_result != first_commit:
+            errors.append("execution_results must reference the same commit_result")
+            break
+
+    committed_count = first_commit.get("committed_count")
+    committed_records = first_commit.get("committed_records")
+    if count > 1:
+        if committed_count != count:
+            errors.append("commit_result.committed_count mismatch")
+        if not isinstance(committed_records, list) or len(committed_records) != count:
+            errors.append("commit_result.committed_records count mismatch")
+        else:
+            for index, execution_result in enumerate(execution_results):
+                record = committed_records[index]
+                if not isinstance(record, dict):
+                    errors.append("commit_result.committed_records item must be dict")
+                    continue
+                for field in _IDENTITY_FIELDS:
+                    if record.get(field) != execution_result.get(field):
+                        errors.append(f"committed_records[{index}].{field}")
+
+        expected_lists = {
+            "order_ids": "order_id",
+            "request_hashes": "request_hash",
+            "lock_ids": "lock_id",
+            "execution_ids": "execution_id",
+        }
+        for list_field, identity_field in expected_lists.items():
+            expected = [execution_result.get(identity_field) for execution_result in execution_results]
+            if first_commit.get(list_field) != expected:
+                errors.append(f"commit_result.{list_field} order mismatch")
+
+    return sorted(set(errors))
 
 
 def _read_json_object(path: Path) -> tuple[dict[str, Any], str | None]:
@@ -277,7 +345,10 @@ def _record_errors(record: dict[str, Any], execution_result: dict[str, Any]) -> 
 
 def _finish(result: dict[str, Any]) -> dict[str, Any]:
     result["post_commit_verified"] = result.get("status") == READY
-    result["post_commit_file_verified"] = len(result.get("verified_records", [])) == 1
+    expected_count = result["summary"].get("expected_record_count") or len(result.get("verified_records", []))
+    result["post_commit_file_verified"] = (
+        expected_count > 0 and len(result.get("verified_records", [])) == expected_count
+    )
     result["read_only"] = True
     result["runtime_write"] = False
     result["queue_write"] = False
@@ -289,6 +360,7 @@ def _finish(result: dict[str, Any]) -> dict[str, Any]:
     result["order_request_created"] = False
     result["real_ready_state_changed"] = False
     result["summary"]["verified_record_count"] = len(result["verified_records"])
+    result["summary"]["expected_record_count"] = expected_count
     result["summary"]["blocked_verification_count"] = len(result["blocked_verifications"]) if result.get("status") == BLOCKED else 0
     result["summary"]["invalid_verification_count"] = len(result["blocked_verifications"]) if result.get("status") == INVALID else 0
     result["summary"]["runtime_write"] = False
