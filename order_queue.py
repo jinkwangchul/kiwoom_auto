@@ -16,6 +16,7 @@ STEP 9-C: 주문후보 계산 → 표시 수량 보강본.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,11 @@ try:
 except Exception:  # pragma: no cover
     build_order_candidate = None
 
+try:
+    from execution_queue_writer import mutate_order_queue
+except Exception:  # pragma: no cover
+    mutate_order_queue = None
+
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -47,11 +53,6 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _write_json(path: Path, data: Any) -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_signal_queue() -> dict[str, Any]:
@@ -72,10 +73,8 @@ def read_order_queue() -> dict[str, Any]:
     return data
 
 
-def write_order_queue(data: dict[str, Any]) -> None:
-    data["version"] = data.get("version", 1)
-    data["updated_at"] = now_text()
-    _write_json(ORDER_QUEUE_PATH, data)
+def write_order_queue(data: dict[str, Any]) -> dict[str, Any]:
+    return replace_order_queue(data)
 
 
 def _norm(value: Any) -> str:
@@ -90,6 +89,252 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
             str(order.get("code", "")),
             str(order.get("side", "")),
         ]
+    )
+
+
+def _source_signal_id(order: dict[str, Any]) -> str:
+    return str(order.get("source_signal_id", "") or "").strip()
+
+
+def _queue_result(
+    *,
+    ok: bool,
+    write_stage: str,
+    reason: str = "",
+    orders_created: int = 0,
+    duplicates: int = 0,
+    ignored: int = 0,
+    created_orders: list[dict[str, Any]] | None = None,
+    duplicate_orders: list[dict[str, Any]] | None = None,
+    mutation_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "write_stage": write_stage,
+        "reason": reason,
+        "orders_created": orders_created,
+        "duplicates": duplicates,
+        "ignored": ignored,
+        "order_queue_written": bool(_as_bool(mutation_result, "queue_write")),
+        "created_orders": deepcopy(created_orders or []),
+        "duplicate_orders": deepcopy(duplicate_orders or []),
+        "order_queue_path": str(ORDER_QUEUE_PATH),
+    }
+    if isinstance(mutation_result, dict):
+        for key in (
+            "committed",
+            "changed",
+            "file_write",
+            "queue_write",
+            "queue_committed",
+            "post_write_verified",
+            "revision_before",
+            "revision_after",
+            "expected_revision",
+            "cas_checked",
+            "lock_acquired",
+            "lock_wait_ms",
+            "backup_path",
+            "blocked_reasons",
+            "warnings",
+        ):
+            result[key] = deepcopy(mutation_result.get(key))
+    return result
+
+
+def _as_bool(value: Any, key: str) -> bool:
+    return isinstance(value, dict) and value.get(key) is True
+
+
+def _initial_order_queue() -> dict[str, Any]:
+    return {"version": 1, "revision": 0, "updated_at": "", "orders": []}
+
+
+def _candidate_duplicate_reason(order: dict[str, Any], orders: list[Any]) -> str | None:
+    source_signal_id = _source_signal_id(order)
+    if source_signal_id:
+        for existing in orders:
+            if isinstance(existing, dict) and _source_signal_id(existing) == source_signal_id:
+                return "duplicate source_signal_id"
+
+    key = _order_dedupe_key(order)
+    if key.strip("|"):
+        for existing in orders:
+            if isinstance(existing, dict) and _order_dedupe_key(existing) == key:
+                return "duplicate legacy candidate key"
+    return None
+
+
+def append_order_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    backup: bool = True,
+    context: dict[str, Any] | None = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Append legacy PENDING/APPROVED/BLOCKED candidates via the canonical writer."""
+    if not callable(mutate_order_queue):
+        return _queue_result(
+            ok=False,
+            write_stage="canonical_writer",
+            reason="execution_queue_writer.mutate_order_queue unavailable",
+            ignored=len(candidates),
+        )
+
+    valid_candidates = [deepcopy(item) for item in candidates if isinstance(item, dict)]
+    ignored = len(candidates) - len(valid_candidates)
+    if not valid_candidates:
+        return _queue_result(ok=True, write_stage="candidate_append_noop", ignored=ignored)
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            orders = []
+            data["orders"] = orders
+
+        created: list[dict[str, Any]] = []
+        duplicates_found: list[dict[str, Any]] = []
+        updated_data = deepcopy(data)
+        updated_orders = updated_data.get("orders")
+        if not isinstance(updated_orders, list):
+            updated_orders = []
+            updated_data["orders"] = updated_orders
+
+        for candidate in valid_candidates:
+            reason = _candidate_duplicate_reason(candidate, updated_orders)
+            if reason:
+                duplicate = deepcopy(candidate)
+                duplicate["duplicate_reason"] = reason
+                duplicates_found.append(duplicate)
+                continue
+            updated_orders.append(deepcopy(candidate))
+            created.append(deepcopy(candidate))
+
+        if not created:
+            return {
+                "blocked": {
+                    "committed": False,
+                    "write_stage": "duplicate",
+                    "next_stage": "BLOCKED",
+                    "changed": False,
+                    "blocked_reasons": ["duplicate legacy candidate"],
+                    "warnings": [],
+                    "legacy_duplicate_noop": True,
+                    "legacy_duplicates": len(duplicates_found),
+                    "legacy_duplicate_orders": duplicates_found,
+                }
+            }
+
+        return {
+            "data": updated_data,
+            "result": {
+                "legacy_candidates_created": len(created),
+                "legacy_duplicates": len(duplicates_found),
+                "legacy_created_orders": created,
+                "legacy_duplicate_orders": duplicates_found,
+            },
+        }
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        result = mutation.get("result")
+        created = result.get("legacy_created_orders", []) if isinstance(result, dict) else []
+        after_orders = after_data.get("orders", [])
+        if not isinstance(after_orders, list):
+            return {"write_stage": "legacy_candidate_verify", "blocked_reasons": ["orders must be a list after append"]}
+        for candidate in created:
+            if _candidate_duplicate_reason(candidate, [item for item in after_orders if item is not candidate]) is None:
+                continue
+            matches = [
+                item for item in after_orders
+                if isinstance(item, dict)
+                and _source_signal_id(item)
+                and _source_signal_id(item) == _source_signal_id(candidate)
+            ]
+            if _source_signal_id(candidate) and len(matches) != 1:
+                return {
+                    "write_stage": "legacy_candidate_verify",
+                    "blocked_reasons": ["appended source_signal_id must appear exactly once"],
+                }
+        return None
+
+    mutation_result = mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutate,
+        operation_name="legacy_order_candidate_append",
+        success_stage="legacy_order_candidates_appended",
+        next_stage="LEGACY_ORDER_CANDIDATE_REVIEW_REQUIRED",
+        backup=backup,
+        context=context or {"manual_queue_write_confirmed": True},
+        expected_revision=expected_revision,
+        verify=verify,
+        default_queue=_initial_order_queue(),
+    )
+
+    created_orders = mutation_result.get("legacy_created_orders", []) if isinstance(mutation_result, dict) else []
+    duplicate_orders = mutation_result.get("legacy_duplicate_orders", []) if isinstance(mutation_result, dict) else []
+    duplicate_count = int(mutation_result.get("legacy_duplicates", 0) or 0) if isinstance(mutation_result, dict) else 0
+
+    if mutation_result.get("legacy_duplicate_noop") is True:
+        return _queue_result(
+            ok=True,
+            write_stage="duplicate",
+            reason="duplicate legacy candidate",
+            duplicates=duplicate_count,
+            ignored=ignored,
+            duplicate_orders=duplicate_orders,
+            mutation_result=mutation_result,
+        )
+
+    if mutation_result.get("committed") is True and mutation_result.get("post_write_verified") is True:
+        return _queue_result(
+            ok=True,
+            write_stage="legacy_order_candidates_appended",
+            orders_created=len(created_orders),
+            duplicates=duplicate_count,
+            ignored=ignored,
+            created_orders=created_orders,
+            duplicate_orders=duplicate_orders,
+            mutation_result=mutation_result,
+        )
+
+    return _queue_result(
+        ok=False,
+        write_stage=str(mutation_result.get("write_stage", "legacy_order_candidate_append")),
+        reason="; ".join(str(item) for item in mutation_result.get("blocked_reasons", []) if item),
+        duplicates=duplicate_count,
+        ignored=ignored,
+        duplicate_orders=duplicate_orders,
+        mutation_result=mutation_result,
+    )
+
+
+def replace_order_queue(
+    data: dict[str, Any],
+    *,
+    backup: bool = True,
+    context: dict[str, Any] | None = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Replace the legacy order queue through the canonical writer boundary."""
+    if not callable(mutate_order_queue):
+        return _queue_result(ok=False, write_stage="canonical_writer", reason="execution_queue_writer.mutate_order_queue unavailable")
+    replacement = deepcopy(data) if isinstance(data, dict) else _initial_order_queue()
+    if not isinstance(replacement.get("orders"), list):
+        replacement["orders"] = []
+
+    def mutate(_: dict[str, Any]) -> dict[str, Any]:
+        return {"data": deepcopy(replacement)}
+
+    return mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutate,
+        operation_name="legacy_order_queue_replace",
+        success_stage="legacy_order_queue_replaced",
+        next_stage="LEGACY_ORDER_QUEUE_REVIEW_REQUIRED",
+        backup=backup,
+        context=context or {"manual_queue_write_confirmed": True},
+        expected_revision=expected_revision,
+        default_queue=_initial_order_queue(),
     )
 
 
