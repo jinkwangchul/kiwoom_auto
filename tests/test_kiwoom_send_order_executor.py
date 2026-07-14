@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from kiwoom_send_order_executor import execute_claimed_send_order, execute_kiwoom_send_order
+from execution_queue_writer import mark_send_order_attempted, mark_send_order_call_in_progress
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -358,6 +359,9 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertEqual(tuple(self._claimed_args()), adapter.calls[0])
         self.assertEqual("SEND_CALL_ACCEPTED", queued["status"])
         self.assertTrue(queued["send_order_called"])
+        self.assertTrue(queued["broker_call_executed"])
+        self.assertTrue(queued["broker_api_called"])
+        self.assertFalse(queued["call_execution_uncertain"])
         self.assertTrue(queued["send_call_accepted"])
         self.assertFalse(queued["broker_accepted"])
         self.assertFalse(queued["actual_order_sent"])
@@ -378,6 +382,10 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertTrue(result["send_call_rejected"])
         self.assertEqual(1, len(adapter.calls))
         self.assertEqual("SEND_CALL_REJECTED", queued["status"])
+        self.assertTrue(queued["send_order_called"])
+        self.assertTrue(queued["broker_call_executed"])
+        self.assertTrue(queued["broker_api_called"])
+        self.assertFalse(queued["call_execution_uncertain"])
         self.assertTrue(queued["send_call_rejected"])
         self.assertFalse(queued["actual_order_sent"])
 
@@ -397,6 +405,11 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
                 self.assertTrue(result["queue_result_recorded"])
                 self.assertEqual(1, len(adapter.calls))
                 self.assertEqual("SEND_UNCERTAIN", queued["status"])
+                self.assertTrue(queued["send_order_called"])
+                self.assertTrue(queued["broker_call_executed"])
+                self.assertTrue(queued["broker_api_called"])
+                self.assertFalse(queued["call_execution_uncertain"])
+                self.assertFalse(queued["send_call_result_known"])
                 self.assertTrue(queued["send_uncertain"])
                 self.assertTrue(queued["manual_reconciliation_required"])
                 self.assertFalse(queued["automatic_retry_allowed"])
@@ -468,7 +481,58 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         self.assertTrue(result["broker_api_called"])
         self.assertEqual(1, len(adapter.calls))
         self.assertEqual("SEND_CALL_IN_PROGRESS", queued["status"])
-        self.assertTrue(queued["send_order_called"])
+        self.assertFalse(queued["send_order_called"])
+        self.assertFalse(queued["broker_call_executed"])
+        self.assertFalse(queued["broker_api_called"])
+        self.assertTrue(queued["call_execution_uncertain"])
+        self.assertTrue(queued["manual_reconciliation_required"])
+
+    def test_send_call_in_progress_after_crash_blocks_automatic_reexecution(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            _claimed_identity(record),
+            dispatch_claim_id="CLAIM_1",
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+            attempt_id="ATTEMPT_CRASH",
+        )
+        marker = mark_send_order_call_in_progress(
+            queue_path,
+            _claimed_identity(record),
+            dispatch_claim_id="CLAIM_1",
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
+        adapter = ClaimedSendOrderCallable(0)
+
+        restarted = execute_claimed_send_order(
+            queue_path,
+            _claimed_identity(record),
+            "CLAIM_1",
+            "CLAIM_TOKEN",
+            "GUI_MANUAL",
+            3,
+            adapter,
+            self._claimed_args(),
+            {"send_order_attempt_id": "ATTEMPT_CRASH"},
+        )
+
+        queued = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+        self.assertTrue(marker["send_call_started"])
+        self.assertEqual("BLOCKED", restarted["status"])
+        self.assertFalse(restarted["callable_executed"])
+        self.assertEqual([], adapter.calls)
+        self.assertEqual("SEND_CALL_IN_PROGRESS", queued["status"])
+        self.assertFalse(queued["send_order_called"])
+        self.assertFalse(queued["broker_api_called"])
+        self.assertTrue(queued["call_execution_uncertain"])
+        self.assertFalse(queued["automatic_retry_allowed"])
+        self.assertTrue(queued["manual_reconciliation_required"])
 
     def test_same_claim_two_threads_only_one_callable_executes(self) -> None:
         tmp = tempfile.TemporaryDirectory()

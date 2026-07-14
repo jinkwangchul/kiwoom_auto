@@ -1877,13 +1877,14 @@ def mark_send_order_call_in_progress(
                 updated_record.update(
                     {
                         "status": "SEND_CALL_IN_PROGRESS",
-                        "send_order_called": True,
+                        "send_order_called": False,
                         "send_order_call_started": True,
                         "send_order_call_started_at": _time_text(started_at),
                         "send_order_call_revision": _normalize_revision(data),
-                        "broker_call_executed": True,
-                        "broker_api_called": True,
+                        "broker_call_executed": False,
+                        "broker_api_called": False,
                         "actual_order_sent": False,
+                        "call_execution_uncertain": True,
                         "send_call_result_known": False,
                         "send_call_accepted": False,
                         "send_call_rejected": False,
@@ -1903,10 +1904,11 @@ def mark_send_order_call_in_progress(
                         "send_order_attempt_id": normalized_attempt_id,
                         "send_order_call_started_at": _time_text(started_at),
                         "claimed_identity": deepcopy(normalized_identity),
-                        "send_order_called": True,
-                        "broker_call_executed": True,
-                        "broker_api_called": True,
+                        "send_order_called": False,
+                        "broker_call_executed": False,
+                        "broker_api_called": False,
                         "actual_order_sent": False,
+                        "call_execution_uncertain": True,
                         "send_call_result_known": False,
                         "automatic_retry_allowed": False,
                         "manual_reconciliation_required": True,
@@ -1923,8 +1925,10 @@ def mark_send_order_call_in_progress(
             return _commit_blocked("post_send_call_start_verify", "send call in-progress status was not persisted")
         if _clean_text(record.get("send_order_attempt_id")) != normalized_attempt_id:
             return _commit_blocked("post_send_call_start_verify", "send order attempt id mismatch after call start")
-        if record.get("send_order_called") is not True or record.get("broker_api_called") is not True:
-            return _commit_blocked("post_send_call_start_verify", "send call execution flags were not persisted")
+        if record.get("send_order_called") is not False or record.get("broker_api_called") is not False:
+            return _commit_blocked("post_send_call_start_verify", "send call execution flags were set before callable execution")
+        if record.get("call_execution_uncertain") is not True:
+            return _commit_blocked("post_send_call_start_verify", "call execution uncertainty marker was not persisted")
         return None
 
     result = mutate_order_queue(
@@ -2000,6 +2004,10 @@ def _record_broker_send_result(
                     "dispatch_claim_id": normalized_claim_id,
                     "send_order_attempt_id": normalized_attempt_id,
                     "send_call_result_recorded_at": _time_text(recorded_at),
+                    "send_order_called": True,
+                    "broker_call_executed": True,
+                    "broker_api_called": True,
+                    "call_execution_uncertain": False,
                     "broker_return_code": broker_return_code,
                     "broker_result_known": False,
                     "broker_accepted": False,
@@ -2059,6 +2067,10 @@ def _record_broker_send_result(
                         "dispatch_claim_id": normalized_claim_id,
                         "send_order_attempt_id": normalized_attempt_id,
                         "send_call_result_recorded_at": _time_text(recorded_at),
+                        "send_order_called": True,
+                        "broker_call_executed": True,
+                        "broker_api_called": True,
+                        "call_execution_uncertain": False,
                         "send_call_result_known": common.get("send_call_result_known"),
                         "send_call_accepted": common.get("send_call_accepted"),
                         "send_call_rejected": common.get("send_call_rejected"),
@@ -2218,6 +2230,7 @@ def inspect_send_order_lifecycle(queue_path: str | Path, identity: Any, *, conte
                         "send_order_attempt_count": record.get("send_order_attempt_count", 0),
                         "send_order_call_started": record.get("send_order_call_started", False),
                         "send_order_call_started_at": record.get("send_order_call_started_at"),
+                        "call_execution_uncertain": record.get("call_execution_uncertain", False),
                         "send_call_result_known": record.get("send_call_result_known", False),
                         "send_call_accepted": record.get("send_call_accepted", False),
                         "send_call_rejected": record.get("send_call_rejected", False),
