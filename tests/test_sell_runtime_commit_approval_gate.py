@@ -149,7 +149,7 @@ class SellRuntimeCommitApprovalGateTests(unittest.TestCase):
     def test_one_blocked_candidate_blocks_all_approval(self):
         result = build_sell_runtime_commit_approval_gate(_dryrun(_action(), _action(_record(order_id="ORDER_2"), status="BLOCKED")))
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertFalse(result["approval_granted"])
         self.assertFalse(result["commit_allowed"])
 
@@ -160,14 +160,15 @@ class SellRuntimeCommitApprovalGateTests(unittest.TestCase):
         self.assertFalse(result["approval_granted"])
         self.assertFalse(result["commit_allowed"])
 
-    def test_blocked_commit_actions_prevent_approval(self):
+    def test_ready_with_blocked_commit_actions_is_invalid(self):
         dryrun = _dryrun(_action())
         dryrun["blocked_commit_actions"] = [_action(_record(order_id="ORDER_2"), status="BLOCKED")]
 
         result = build_sell_runtime_commit_approval_gate(dryrun)
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertFalse(result["approval_granted"])
+        self.assertIn("READY dry-run must not contain blocked_commit_actions", result["reasons"])
 
     def test_summary_count_mismatch_is_invalid(self):
         dryrun = _dryrun(_action())
@@ -177,6 +178,42 @@ class SellRuntimeCommitApprovalGateTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "INVALID")
         self.assertFalse(result["commit_allowed"])
+
+    def test_ready_with_dryrun_blocked_count_is_invalid(self):
+        dryrun = _dryrun(_action())
+        dryrun["summary"]["dryrun_blocked_count"] = 1
+
+        result = build_sell_runtime_commit_approval_gate(dryrun)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["approval_granted"])
+
+    def test_ready_with_dryrun_invalid_count_is_invalid(self):
+        dryrun = _dryrun(_action())
+        dryrun["summary"]["dryrun_invalid_count"] = 1
+
+        result = build_sell_runtime_commit_approval_gate(dryrun)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["approval_granted"])
+
+    def test_ready_count_must_equal_commit_action_count(self):
+        dryrun = _dryrun(_action(), _action(_record(order_id="ORDER_2")))
+        dryrun["summary"]["dryrun_ready_count"] = 1
+
+        result = build_sell_runtime_commit_approval_gate(dryrun)
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["commit_allowed"])
+
+    def test_normal_all_ready_still_approves(self):
+        dryrun = _dryrun(_action(), _action(_record(order_id="ORDER_2")))
+
+        result = build_sell_runtime_commit_approval_gate(dryrun)
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["approval_granted"])
+        self.assertTrue(result["commit_allowed"])
 
     def test_commit_allowed_false_blocks(self):
         result = build_sell_runtime_commit_approval_gate(_dryrun(commit_allowed=False))
@@ -329,7 +366,7 @@ class SellRuntimeCommitApprovalGateTests(unittest.TestCase):
 
         result = build_sell_runtime_commit_approval_gate(_dryrun(_action(), blocked))
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
         self.assertFalse(result["approval_granted"])
         self.assertFalse(result["commit_allowed"])
         self.assertEqual(result["summary"]["approved_action_count"], 1)

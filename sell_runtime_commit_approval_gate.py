@@ -114,6 +114,10 @@ def build_sell_runtime_commit_approval_gate(runtime_commit_dryrun: dict[str, Any
         result["status"] = INVALID
         result["reasons"].append("runtime commit dry-run blocked_commit_actions must be a list")
         return _finish(result)
+    if blocked_commit_actions:
+        result["status"] = INVALID
+        result["reasons"].append("READY dry-run must not contain blocked_commit_actions")
+        return _finish(result)
 
     for index, action in enumerate(commit_actions):
         inspected = _inspect_commit_action(action, index)
@@ -129,12 +133,7 @@ def build_sell_runtime_commit_approval_gate(runtime_commit_dryrun: dict[str, Any
         _extend_list(result["warnings"], inspected.get("warnings"))
         _extend_list(result["reasons"], inspected.get("reasons"))
 
-    if blocked_commit_actions:
-        result["summary"]["approval_blocked_count"] += len(blocked_commit_actions)
-        result["blocked_approval_actions"].extend(deepcopy(blocked_commit_actions))
-        result["reasons"].append("runtime commit dry-run blocked_commit_actions must be empty")
-
-    if not _summary_counts_match(runtime_commit_dryrun.get("summary"), commit_actions):
+    if not _ready_summary_counts_match(runtime_commit_dryrun.get("summary"), commit_actions):
         result["status"] = INVALID
         result["reasons"].append("runtime commit dry-run summary count mismatch")
         return _finish(result)
@@ -290,16 +289,13 @@ def _identity_mismatches(action: dict[str, Any], execution_request: dict[str, An
     return sorted(set(mismatches))
 
 
-def _summary_counts_match(summary: Any, commit_actions: list[Any]) -> bool:
+def _ready_summary_counts_match(summary: Any, commit_actions: list[Any]) -> bool:
     if not isinstance(summary, dict):
         return False
-    ready_count = sum(1 for action in commit_actions if isinstance(action, dict) and _status(action.get("status")) == READY)
-    blocked_count = sum(1 for action in commit_actions if isinstance(action, dict) and _status(action.get("status")) == BLOCKED)
-    invalid_count = sum(1 for action in commit_actions if not isinstance(action, dict) or _status(action.get("status")) == INVALID)
     return (
-        summary.get("dryrun_ready_count") == ready_count
-        and summary.get("dryrun_blocked_count") == blocked_count
-        and summary.get("dryrun_invalid_count") == invalid_count
+        summary.get("dryrun_ready_count") == len(commit_actions)
+        and summary.get("dryrun_blocked_count") == 0
+        and summary.get("dryrun_invalid_count") == 0
     )
 
 
