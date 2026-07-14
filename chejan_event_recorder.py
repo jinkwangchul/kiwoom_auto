@@ -936,50 +936,129 @@ def _fill_identity(record: dict[str, Any]) -> str:
     return f"canonical_event_hash:{_canonical_json_hash(record)}"
 
 
+def _strong_identity_matches(fill: dict[str, Any], record: dict[str, Any]) -> bool:
+    checks = (
+        ("order_id", "order_id"),
+        ("execution_id", "execution_id"),
+        ("order_queued_id", "id"),
+        ("request_hash", "request_hash"),
+        ("lock_id", "lock_id"),
+    )
+    for fill_field, record_field in checks:
+        fill_value = _clean_text(fill.get(fill_field))
+        record_value = _clean_text(record.get(record_field))
+        if fill_value and record_value and fill_value == record_value:
+            return True
+    return False
+
+
 def _matching_fills(fills: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
-    identity = _record_identity(record)
-    broker_order_no = identity["broker_order_no"]
     matches: list[dict[str, Any]] = []
     for fill in fills:
-        if _clean_text(fill.get("order_id")) and _clean_text(fill.get("order_id")) != identity["order_id"]:
-            continue
-        if _clean_text(fill.get("execution_id")) and _clean_text(fill.get("execution_id")) != identity["execution_id"]:
-            continue
-        fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
-        if broker_order_no and fill_broker_order_no and fill_broker_order_no != broker_order_no:
-            continue
-        if fill_broker_order_no or _clean_text(fill.get("order_id")) or _clean_text(fill.get("execution_id")):
+        if _strong_identity_matches(fill, record):
             matches.append(fill)
     return matches
 
 
+def _fill_sort_key(indexed_fill: tuple[int, dict[str, Any]]) -> tuple[int, int, Any, str, str, int]:
+    index, fill = indexed_fill
+    normalized = _as_dict(fill.get("normalized_event"))
+    raw_event = _as_dict(normalized.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    sequence = (
+        _clean_text(fill.get("execution_no"))
+        or _clean_text(fill.get("broker_event_id"))
+        or _clean_text(fill.get("event_id"))
+        or _clean_text(fill.get("chejan_event_id"))
+        or _clean_text(fill.get("fill_no"))
+        or _clean_text(fill.get("trade_no"))
+        or _clean_text(normalized.get("execution_no"))
+        or _clean_text(fid_values.get("909"))
+    )
+    if sequence:
+        try:
+            sequence_key: Any = int(sequence)
+            sequence_kind = 0
+        except ValueError:
+            sequence_key = sequence
+            sequence_kind = 1
+        has_no_sequence = 0
+    else:
+        sequence_key = ""
+        sequence_kind = 1
+        has_no_sequence = 1
+    return (
+        has_no_sequence,
+        sequence_kind,
+        sequence_key,
+        _clean_text(fill.get("received_at")),
+        _clean_text(fill.get("recorded_at")),
+        index,
+    )
+
+
+def _fill_broker_average(fill: dict[str, Any]) -> float | int | None:
+    average = _broker_average_fill_price(fill)
+    if average is not None:
+        return average
+    normalized = _as_dict(fill.get("normalized_event"))
+    return _broker_average_fill_price(normalized)
+
+
 def _fill_ledger_summary(fills: list[dict[str, Any]], record: dict[str, Any]) -> dict[str, Any]:
-    matches = _matching_fills(fills, record)
+    matches = [
+        fill for _, fill in sorted(
+            enumerate(_matching_fills(fills, record)),
+            key=_fill_sort_key,
+        )
+    ]
     identities = [_fill_identity(fill) for fill in matches]
     duplicate_identities = sorted({identity for identity in identities if identities.count(identity) > 1})
-    total_quantity = 0
+    previous_cumulative = 0
+    max_cumulative = 0
+    delta_total = 0
+    effective_count = 0
     weighted_total = 0.0
+    repeated_identities: list[str] = []
+    out_of_order_identities: list[str] = []
     broker_order_mismatches: list[str] = []
     expected_broker_order_no = _clean_text(record.get("broker_order_no"))
     for fill in matches:
-        quantity = _int_or_none(fill.get("filled_quantity") or fill.get("quantity")) or 0
+        identity = _fill_identity(fill)
+        current_cumulative = _int_or_none(fill.get("filled_quantity") or fill.get("quantity")) or 0
         price = _price_or_none(fill.get("filled_price") or fill.get("price")) or 0
-        total_quantity += quantity
-        weighted_total += float(quantity) * float(price)
+        fill_delta = current_cumulative - previous_cumulative
+        if fill_delta < 0:
+            out_of_order_identities.append(identity)
+            max_cumulative = max(max_cumulative, current_cumulative)
+            continue
+        if fill_delta == 0:
+            repeated_identities.append(identity)
+            max_cumulative = max(max_cumulative, current_cumulative)
+            continue
+        effective_count += 1
+        delta_total += fill_delta
+        max_cumulative = max(max_cumulative, current_cumulative)
+        previous_cumulative = current_cumulative
+        weighted_total += float(fill_delta) * float(price)
         fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
         if expected_broker_order_no and fill_broker_order_no and fill_broker_order_no != expected_broker_order_no:
             broker_order_mismatches.append(fill_broker_order_no)
-    average = None
-    if total_quantity > 0:
-        value = weighted_total / total_quantity
+    average = next((avg for avg in (_fill_broker_average(fill) for fill in reversed(matches)) if avg is not None), None)
+    if average is None and delta_total > 0:
+        value = weighted_total / delta_total
         average = int(value) if value.is_integer() else value
     return {
         "fills": matches,
         "fills_ledger_count": len(matches),
         "fills_unique_count": len(set(identities)),
-        "fills_summed_quantity": total_quantity,
+        "fills_effective_count": effective_count,
+        "fills_summed_quantity": max_cumulative,
+        "fills_delta_quantity": delta_total,
         "fills_weighted_average_price": average,
         "duplicate_execution_identities": duplicate_identities,
+        "repeated_fill_identities": repeated_identities,
+        "out_of_order_fill_identities": out_of_order_identities,
         "broker_order_mismatches": broker_order_mismatches,
         "source_event_identities": identities,
     }
@@ -1027,18 +1106,20 @@ def _queue_fill_mismatches(record: dict[str, Any], fill_summary: dict[str, Any],
     queue_fill_count = _int_or_none(record.get("fill_count")) or 0
     queue_average = _price_or_none(record.get("average_fill_price"))
     fills_count = fill_summary["fills_ledger_count"]
-    fills_unique = fill_summary["fills_unique_count"]
+    fills_effective = fill_summary["fills_effective_count"]
     fills_quantity = fill_summary["fills_summed_quantity"]
     fills_average = fill_summary["fills_weighted_average_price"]
 
     if fill_summary["duplicate_execution_identities"]:
         reasons.append("duplicate execution identities in fills ledger")
+    if fill_summary["out_of_order_fill_identities"]:
+        reasons.append("out-of-order cumulative fill quantity in fills ledger")
     if fill_summary["broker_order_mismatches"]:
         reasons.append("broker_order_no mismatch between queue and fills ledger")
     if queue_cumulative != fills_quantity:
         reasons.append("queue cumulative filled quantity does not match fills ledger sum")
-    if queue_fill_count != fills_unique:
-        reasons.append("queue fill_count does not match unique fills ledger count")
+    if queue_fill_count != fills_effective:
+        reasons.append("queue fill_count does not match effective fills ledger count")
     if queue_average is not None and fills_average is not None and float(queue_average) != float(fills_average):
         reasons.append("queue average_fill_price does not match fills weighted average")
     if original_quantity is not None and queue_remaining is not None and queue_cumulative + queue_remaining != original_quantity:
@@ -1147,9 +1228,13 @@ def inspect_incomplete_order_reconciliation(
         "queue_fill_count": _int_or_none(record.get("fill_count")) or 0,
         "queue_average_fill_price": _price_or_none(record.get("average_fill_price")),
         "fills_ledger_count": fill_summary["fills_ledger_count"],
+        "fills_effective_count": fill_summary["fills_effective_count"],
         "fills_summed_quantity": fill_summary["fills_summed_quantity"],
+        "fills_delta_quantity": fill_summary["fills_delta_quantity"],
         "fills_weighted_average_price": fill_summary["fills_weighted_average_price"],
         "duplicate_execution_identities": fill_summary["duplicate_execution_identities"],
+        "repeated_fill_identities": fill_summary["repeated_fill_identities"],
+        "out_of_order_fill_identities": fill_summary["out_of_order_fill_identities"],
         "missing_identities": [
             field for field, value in _record_identity(record).items()
             if field != "broker_order_no" and not value

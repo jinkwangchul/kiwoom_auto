@@ -157,6 +157,7 @@ class ChejanEventRecorderTest(unittest.TestCase):
         return path
 
     def _fill(self, **overrides: object) -> dict[str, object]:
+        execution_no = overrides.pop("execution_no", "EXECUTION_909_1")
         fill = {
             "fill_id": "FILL_1",
             "event_type": "PARTIAL_FILL",
@@ -174,7 +175,7 @@ class ChejanEventRecorderTest(unittest.TestCase):
             "normalized_event": {
                 "event_type": "PARTIAL_FILL",
                 "broker_order_no": "BRK_1",
-                "raw_event": {"fid_values": {"909": "EXECUTION_909_1"}},
+                "raw_event": {"fid_values": {"909": execution_no}},
             },
         }
         fill.update(overrides)
@@ -1006,6 +1007,118 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertTrue(result["queue_fills_mismatch"])
             self.assertIn("queue cumulative filled quantity does not match fills ledger sum", result["blocked_reasons"])
 
+    def test_restart_reconciliation_uses_cumulative_fill_delta_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=5,
+                    remaining_quantity=5,
+                    fill_count=2,
+                    average_fill_price=1040,
+                ),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(fill_id="FILL_1", execution_no="1", filled_quantity=3, filled_price=1000, remaining_quantity=7),
+                    self._fill(fill_id="FILL_2", execution_no="2", filled_quantity=5, filled_price=1100, remaining_quantity=5),
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(5, result["fills_summed_quantity"])
+            self.assertEqual(5, result["fills_delta_quantity"])
+            self.assertEqual(1040, result["fills_weighted_average_price"])
+            self.assertFalse(result["queue_fills_mismatch"])
+
+    def test_restart_reconciliation_three_cumulative_events_use_deltas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=7,
+                    remaining_quantity=3,
+                    fill_count=3,
+                    average_fill_price=1142.857142857143,
+                ),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(fill_id="FILL_1", execution_no="1", filled_quantity=2, filled_price=1000, remaining_quantity=8),
+                    self._fill(fill_id="FILL_2", execution_no="2", filled_quantity=4, filled_price=1200, remaining_quantity=6),
+                    self._fill(fill_id="FILL_3", execution_no="3", filled_quantity=7, filled_price=1200, remaining_quantity=3),
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(7, result["fills_summed_quantity"])
+            self.assertEqual(7, result["fills_delta_quantity"])
+            self.assertEqual(1142.857142857143, result["fills_weighted_average_price"])
+
+    def test_restart_reconciliation_out_of_order_cumulative_fill_does_not_decrease_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=5,
+                    remaining_quantity=5,
+                    fill_count=2,
+                    average_fill_price=1000,
+                ),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(fill_id="FILL_1", execution_no="1", filled_quantity=5, filled_price=1000, remaining_quantity=5),
+                    self._fill(fill_id="FILL_2", execution_no="2", filled_quantity=3, filled_price=900, remaining_quantity=7),
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(5, result["fills_summed_quantity"])
+            self.assertIn("execution_no:2", result["out_of_order_fill_identities"])
+            self.assertIn("out-of-order cumulative fill quantity in fills ledger", result["blocked_reasons"])
+
+    def test_restart_reconciliation_repeated_cumulative_event_does_not_duplicate_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=3,
+                    remaining_quantity=7,
+                    fill_count=1,
+                    average_fill_price=1000,
+                ),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(fill_id="FILL_1", execution_no="1", filled_quantity=3, filled_price=1000, remaining_quantity=7),
+                    self._fill(fill_id="FILL_2", execution_no="2", filled_quantity=3, filled_price=1200, remaining_quantity=7),
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(3, result["fills_summed_quantity"])
+            self.assertEqual(3, result["fills_delta_quantity"])
+            self.assertEqual(1, result["fills_effective_count"])
+            self.assertIn("execution_no:2", result["repeated_fill_identities"])
+            self.assertFalse(result["queue_fills_mismatch"])
+
     def test_restart_reconciliation_detects_weighted_average_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_queue(
@@ -1058,6 +1171,34 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
             self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
             self.assertTrue(any("failed to read fills json" in warning for warning in result["warnings"]))
+
+    def test_restart_reconciliation_does_not_match_fill_by_broker_order_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="BROKER_ACCEPTED",
+                    broker_order_no=None,
+                    order_id="ORDER_1",
+                    execution_id="EXEC_1",
+                    request_hash="HASH_1",
+                    lock_id="LOCK_1",
+                ),
+            )
+            unrelated_fill = self._fill(
+                order_id="",
+                order_queued_id="",
+                execution_id="",
+                request_hash="",
+                lock_id="",
+                broker_order_no="BRK_1",
+            )
+            fills_path = self._write_fills(tmpdir, [unrelated_fill])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(broker_order_no=""), fills_path=fills_path)
+
+            self.assertEqual(0, result["fills_ledger_count"])
+            self.assertEqual(0, result["fills_summed_quantity"])
 
     def test_restart_reconciliation_send_call_in_progress_with_accept_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
