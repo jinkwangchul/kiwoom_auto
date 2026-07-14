@@ -107,6 +107,11 @@ class SellRuntimeCommitRecoveryPostCheckTests(unittest.TestCase):
         self.assertEqual(result["post_check_type"], "SELL_RUNTIME_COMMIT_RECOVERY_POST_CHECK")
         self.assertEqual(result["status"], "READY")
         self.assertTrue(result["post_recovery_verified"])
+        self.assertTrue(result["observed_runtime_write"])
+        self.assertTrue(result["observed_queue_write"])
+        self.assertTrue(result["observed_file_write"])
+        self.assertTrue(result["observed_rollback_executed"])
+        self.assertTrue(result["observed_backup_restored"])
         self.assertEqual(len(result["checked_records"]), 1)
 
     def test_queue_backup_mismatch_is_invalid(self):
@@ -183,10 +188,18 @@ class SellRuntimeCommitRecoveryPostCheckTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "INVALID")
         self.assertEqual(len(result["checked_records"]), 1)
+        self.assertTrue(result["observed_runtime_write"])
+        self.assertTrue(result["observed_queue_write"])
+        self.assertTrue(result["observed_file_write"])
+        self.assertTrue(result["observed_rollback_executed"])
+        self.assertTrue(result["observed_backup_restored"])
 
     def test_restore_not_executed_is_blocked(self):
         queue_path, backup_path, safety_path = self._files()
         executor = self._executor(queue_path, backup_path, safety_path)
+        executor["runtime_write"] = False
+        executor["queue_write"] = False
+        executor["file_write"] = False
         executor["backup_restored"] = False
         executor["rollback_executed"] = False
         executor["recovery_results"][0]["restore_executed"] = False
@@ -194,6 +207,29 @@ class SellRuntimeCommitRecoveryPostCheckTests(unittest.TestCase):
         result = check_sell_runtime_commit_recovery_post_commit(executor)
 
         self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["observed_runtime_write"])
+        self.assertFalse(result["observed_queue_write"])
+        self.assertFalse(result["observed_file_write"])
+        self.assertFalse(result["observed_rollback_executed"])
+        self.assertFalse(result["observed_backup_restored"])
+
+    def test_post_check_itself_remains_read_only_with_observed_effects(self):
+        queue_path, backup_path, safety_path = self._files()
+
+        result = check_sell_runtime_commit_recovery_post_commit(
+            self._executor(queue_path, backup_path, safety_path)
+        )
+
+        self.assertFalse(result["runtime_write"])
+        self.assertFalse(result["queue_write"])
+        self.assertFalse(result["file_write"])
+        self.assertFalse(result["rollback"])
+        self.assertFalse(result["backup_restored"])
+        self.assertTrue(result["summary"]["observed_runtime_write"])
+        self.assertTrue(result["summary"]["observed_queue_write"])
+        self.assertTrue(result["summary"]["observed_file_write"])
+        self.assertTrue(result["summary"]["observed_rollback_executed"])
+        self.assertTrue(result["summary"]["observed_backup_restored"])
 
     def test_wrong_executor_type_is_invalid(self):
         queue_path, backup_path, safety_path = self._files()

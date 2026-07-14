@@ -41,6 +41,7 @@ def check_sell_runtime_commit_recovery_post_commit(recovery_executor_result: dic
         return _finish(result)
 
     result["executor_snapshot"] = deepcopy(recovery_executor_result)
+    _apply_observed_effects(result, recovery_executor_result)
     _extend_list(result["warnings"], recovery_executor_result.get("warnings"))
     _extend_list(result["reasons"], recovery_executor_result.get("reasons"))
 
@@ -103,6 +104,11 @@ def _base_result(recovery_executor_result: Any) -> dict[str, Any]:
         "file_write": False,
         "rollback": False,
         "backup_restored": False,
+        "observed_runtime_write": False,
+        "observed_queue_write": False,
+        "observed_file_write": False,
+        "observed_rollback_executed": False,
+        "observed_backup_restored": False,
         "send_order": False,
         "broker_api_called": False,
         "actual_order_sent": False,
@@ -123,6 +129,11 @@ def _base_result(recovery_executor_result: Any) -> dict[str, Any]:
             "file_write": False,
             "rollback": False,
             "backup_restored": False,
+            "observed_runtime_write": False,
+            "observed_queue_write": False,
+            "observed_file_write": False,
+            "observed_rollback_executed": False,
+            "observed_backup_restored": False,
             "send_order": False,
             "broker_api_called": False,
             "actual_order_sent": False,
@@ -297,12 +308,26 @@ def _finish(result: dict[str, Any]) -> dict[str, Any]:
     result["summary"]["file_write"] = False
     result["summary"]["rollback"] = False
     result["summary"]["backup_restored"] = False
+    result["summary"]["observed_runtime_write"] = result["observed_runtime_write"]
+    result["summary"]["observed_queue_write"] = result["observed_queue_write"]
+    result["summary"]["observed_file_write"] = result["observed_file_write"]
+    result["summary"]["observed_rollback_executed"] = result["observed_rollback_executed"]
+    result["summary"]["observed_backup_restored"] = result["observed_backup_restored"]
     result["summary"]["send_order"] = False
     result["summary"]["broker_api_called"] = False
     result["summary"]["actual_order_sent"] = False
     result["summary"]["order_request_created"] = False
     result["summary"]["real_ready_state_changed"] = False
     return result
+
+
+def _apply_observed_effects(result: dict[str, Any], executor: dict[str, Any]) -> None:
+    restore_seen = _restore_executed(executor)
+    result["observed_runtime_write"] = executor.get("runtime_write") is True or restore_seen
+    result["observed_queue_write"] = executor.get("queue_write") is True or restore_seen
+    result["observed_file_write"] = executor.get("file_write") is True
+    result["observed_rollback_executed"] = executor.get("rollback_executed") is True or restore_seen
+    result["observed_backup_restored"] = executor.get("backup_restored") is True or restore_seen
 
 
 def _clean_text(value: Any) -> str:
