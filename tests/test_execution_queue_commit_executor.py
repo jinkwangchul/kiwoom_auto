@@ -184,18 +184,15 @@ class QueueCommitExecutorTest(unittest.TestCase):
         self.assertEqual("INVALID", result["status"])
         self.assertIn("queue_path must resolve to runtime/order_queue.json", result["issues"])
 
-    def test_post_write_verification_failure_rolls_back(self) -> None:
+    def test_legacy_executor_uses_canonical_writer_post_write_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             queue_path = self._queue_path(Path(temp_dir))
-            original_text = queue_path.read_text(encoding="utf-8")
-            with mock.patch("execution_queue_commit_executor._verify_queue_item", return_value=False):
+            with mock.patch("execution_queue_commit_executor._verify_queue_item") as verify_queue_item:
                 result = execute_queue_commit_from_dry_run(self._dry_run(), queue_path, manual_confirmation=True)
 
-            self.assertEqual("ERROR", result["status"])
-            self.assertIn("POST_WRITE_VERIFICATION_FAILED", result["issues"])
-            self.assertTrue(result["commit_report"]["rollback_attempted"])
-            self.assertTrue(result["commit_report"]["rollback_succeeded"])
-            self.assertEqual(original_text, queue_path.read_text(encoding="utf-8"))
+            self.assertEqual("COMMITTED", result["status"])
+            self.assertTrue(result["commit_report"]["writer_result"]["post_write_verified"])
+            verify_queue_item.assert_not_called()
 
     def test_send_order_not_called_and_protected_files_unchanged(self) -> None:
         before = {path: _sha256(path) for path in _protected_paths()}

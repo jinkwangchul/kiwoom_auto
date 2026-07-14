@@ -289,6 +289,19 @@ class SendOrderResultRecorderTest(unittest.TestCase):
         self.assertEqual(before_sha, result["before_sha256"])
         self.assertNotEqual(before_sha, result["after_sha256"])
         self.assertEqual([], result["blocked_reasons"])
+        self.assertEqual(1, self._read_json()["revision"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+
+    def test_stale_expected_revision_is_blocked_without_backup(self) -> None:
+        self._write_queue()
+
+        result = self._record_result(context={"manual_send_order_result_record_confirmed": True, "expected_revision": 9})
+
+        self.assertFalse(result["recorded"])
+        self.assertEqual("revision_cas", result["record_stage"])
+        self.assertEqual(0, self._read_json().get("revision", 0))
+        self.assertFalse(Path(str(self.queue_path) + ".bak").exists())
 
     def test_success_records_expected_fields(self) -> None:
         self._write_queue()

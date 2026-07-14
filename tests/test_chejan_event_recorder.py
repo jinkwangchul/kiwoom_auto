@@ -207,6 +207,7 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
             result = self._record_event(path)
             record = self._read_queue(path)["orders"][0]
+            data = self._read_queue(path)
             event = record["chejan_events"][0]
 
             self.assertTrue(result["recorded"])
@@ -215,6 +216,20 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertEqual("BRK_1", event["broker_order_no"])
             self.assertEqual("2026-07-04 09:30:00", event["received_at"])
             self.assertEqual(self._event(), event["normalized_event"])
+            self.assertEqual(1, data["revision"])
+            self.assertEqual(0, result["revision_before"])
+            self.assertEqual(1, result["revision_after"])
+
+    def test_stale_expected_revision_is_blocked_without_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+
+            result = self._record_event(path, context={"manual_chejan_event_record_confirmed": True, "expected_revision": 9})
+
+            self.assertFalse(result["recorded"])
+            self.assertEqual("revision_cas", result["record_stage"])
+            self.assertEqual(0, self._read_queue(path).get("revision", 0))
+            self.assertFalse(Path(str(path) + ".bak").exists())
 
     def test_metadata_is_updated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

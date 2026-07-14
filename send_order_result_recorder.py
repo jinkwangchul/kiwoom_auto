@@ -12,11 +12,10 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
 from typing import Any
-from uuid import uuid4
+
+from execution_queue_writer import mutate_order_queue
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -59,6 +58,11 @@ def _confirmed(context: Any) -> bool:
     return _as_dict(context).get("manual_send_order_result_record_confirmed") is True
 
 
+def _expected_revision(context: Any) -> int | None:
+    value = _as_dict(context).get("expected_revision")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _snapshot_sha256(snapshot: Any) -> str:
     return _clean_text(_as_dict(snapshot).get("sha256")).upper()
 
@@ -84,23 +88,6 @@ def _read_queue(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
             return {}, _blocked("read_queue", "order_queue orders must contain only objects")
 
     return data, None
-
-
-def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
 
 
 def _validate_entrypoint_result(entrypoint_result: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -211,57 +198,65 @@ def record_send_order_result(
                 "queue file changed after send order entrypoint; manual review required",
             )
 
-    data, read_blocked = _read_queue(target_path)
-    if read_blocked is not None:
-        return read_blocked
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        if snapshot_sha256 and _sha256_file(target_path) != snapshot_sha256:
+            return {
+                "blocked": _blocked(
+                    "stale_queue",
+                    "queue file changed after send order entrypoint; manual review required",
+                )
+            }
 
-    orders = data["orders"]
-    target_record, target_index = _find_target_order(orders, result)
-    if target_record is None or target_index < 0:
-        return _blocked("record", "target record not found")
+        orders = data["orders"]
+        target_record, target_index = _find_target_order(orders, result)
+        if target_record is None or target_index < 0:
+            return {"blocked": _blocked("record", "target record not found")}
 
-    record_blocked = _validate_target_record(target_record, result)
-    if record_blocked is not None:
-        return record_blocked
+        record_blocked = _validate_target_record(target_record, result)
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
 
-    backup_path = None
-    if backup:
-        backup_path = str(target_path) + ".bak"
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception as exc:
-            return _blocked("backup", f"failed to create backup: {exc}")
+        now = _now_text()
+        updated_data = deepcopy(data)
+        updated_record = deepcopy(updated_data["orders"][target_index])
+        updated_record["send_order_called"] = True
+        updated_record["send_order_called_at"] = now
+        updated_record["send_order_entrypoint_stage"] = _clean_text(result.get("entrypoint_stage"))
+        updated_record["send_order_result_status"] = RESULT_STATUS_CALLED
+        updated_record["send_order_result_recorded_at"] = now
+        updated_record["broker"] = _clean_text(result.get("broker"))
+        updated_record["broker_result"] = deepcopy(_as_dict(result.get("broker_result")))
+        updated_record["broker_order_no"] = _broker_order_no(result)
+        updated_record["send_order_record_source"] = "send_order_entrypoint"
+        updated_record["updated_at"] = now
+        updated_data["orders"][target_index] = updated_record
+        return {"data": updated_data}
 
-    now = _now_text()
-    updated_data = deepcopy(data)
-    updated_record = deepcopy(updated_data["orders"][target_index])
-    updated_record["send_order_called"] = True
-    updated_record["send_order_called_at"] = now
-    updated_record["send_order_entrypoint_stage"] = _clean_text(result.get("entrypoint_stage"))
-    updated_record["send_order_result_status"] = RESULT_STATUS_CALLED
-    updated_record["send_order_result_recorded_at"] = now
-    updated_record["broker"] = _clean_text(result.get("broker"))
-    updated_record["broker_result"] = deepcopy(_as_dict(result.get("broker_result")))
-    updated_record["broker_order_no"] = _broker_order_no(result)
-    updated_record["send_order_record_source"] = "send_order_entrypoint"
-    updated_record["updated_at"] = now
-    updated_data["orders"][target_index] = updated_record
-    updated_data["version"] = updated_data.get("version", 1)
-    updated_data["updated_at"] = now
-
-    try:
-        _write_json_atomic(target_path, updated_data)
-    except Exception as exc:
-        return _blocked("write_queue", f"failed to write order_queue json: {exc}")
+    mutation_result = mutate_order_queue(
+        target_path,
+        mutate,
+        operation_name="target_record_send_result_update",
+        success_stage="send_order_result_recorded",
+        next_stage=NEXT_STAGE_RESULT_REVIEW_REQUIRED,
+        backup=backup,
+        context=context,
+        expected_revision=_expected_revision(context),
+    )
+    if mutation_result.get("committed") is not True or mutation_result.get("post_write_verified") is not True:
+        stage = _clean_text(mutation_result.get("record_stage") or mutation_result.get("write_stage")) or "write_queue"
+        reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
+        blocked = _blocked(stage, reasons[0] if reasons else "queue mutation failed")
+        blocked.update({key: value for key, value in mutation_result.items() if key not in blocked})
+        return blocked
 
     after_sha256 = _sha256_file(target_path)
-    return {
+    response = {
         "recorded": True,
         "record_stage": "send_order_result_recorded",
         "next_stage": NEXT_STAGE_RESULT_REVIEW_REQUIRED,
         "changed": True,
         "order_queue_path": str(target_path),
-        "backup_path": backup_path,
+        "backup_path": mutation_result.get("backup_path"),
         "order_id": _clean_text(result.get("order_id")),
         "order_queued_id": _clean_text(result.get("order_queued_id")),
         "request_hash": _clean_text(result.get("request_hash")),
@@ -274,3 +269,5 @@ def record_send_order_result(
         "blocked_reasons": [],
         "warnings": [],
     }
+    response.update({key: value for key, value in mutation_result.items() if key not in response})
+    return response

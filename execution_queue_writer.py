@@ -324,6 +324,242 @@ def _write_json_atomic(queue_path: Path, data: dict[str, Any]) -> str:
     return str(tmp_path)
 
 
+def mutate_order_queue(
+    queue_path: str | Path,
+    mutator: Any,
+    *,
+    operation_name: str,
+    success_stage: str,
+    next_stage: str,
+    backup: bool = True,
+    context: Any = None,
+    expected_revision: int | None = None,
+    verify: Any = None,
+) -> dict[str, Any]:
+    """Run a canonical locked queue mutation.
+
+    ``mutator`` is called while both the in-process and process file locks are
+    held. It receives a normalized queue dict and must return either
+    ``{"data": updated_queue, "result": {...}}`` or ``{"blocked": {...}}``.
+    """
+    target_path = Path(queue_path)
+    try:
+        with _QUEUE_THREAD_LOCK:
+            with _QueueFileLock(target_path, _lock_timeout_sec(context)) as lock:
+                data, read_blocked = _read_queue_file(target_path)
+                if read_blocked is not None:
+                    return _with_queue_metadata(
+                        read_blocked,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                revision_before = _normalize_revision(data)
+                cas_blocked = _cas_blocked(revision_before, expected_revision)
+                if cas_blocked is not None:
+                    return _with_queue_metadata(
+                        cas_blocked,
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=True,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                mutation = mutator(deepcopy(data))
+                if not isinstance(mutation, dict):
+                    return _with_queue_metadata(
+                        _commit_blocked(operation_name, "queue mutation result must be a dict"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                blocked = mutation.get("blocked")
+                if isinstance(blocked, dict):
+                    return _with_queue_metadata(
+                        blocked,
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                updated_data = mutation.get("data")
+                if not isinstance(updated_data, dict):
+                    return _with_queue_metadata(
+                        _commit_blocked(operation_name, "queue mutation data must be a dict"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                orders = updated_data.get("orders")
+                if not isinstance(orders, list) or any(not isinstance(item, dict) for item in orders):
+                    return _with_queue_metadata(
+                        _commit_blocked(operation_name, "mutated order_queue orders must contain only objects"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                backup_path = None
+                if backup:
+                    backup_path = str(target_path) + ".bak"
+                    try:
+                        shutil.copy2(target_path, backup_path)
+                    except Exception as exc:
+                        return _with_queue_metadata(
+                            _commit_blocked("backup", f"failed to create backup: {exc}"),
+                            revision_before=revision_before,
+                            revision_after=revision_before,
+                            expected_revision=expected_revision,
+                            cas_checked=expected_revision is not None,
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+
+                revision_after = revision_before + 1
+                updated_data["version"] = updated_data.get("version", 1)
+                updated_data["revision"] = revision_after
+                updated_data["updated_at"] = _now_text()
+
+                try:
+                    temp_path = _write_json_atomic(target_path, updated_data)
+                except Exception as exc:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("write_queue", f"failed to write order_queue json: {exc}"),
+                            "order_queue_path": str(target_path),
+                            "backup_path": backup_path,
+                            "file_write": False,
+                            "post_write_verified": False,
+                            "queue_write": False,
+                            "queue_committed": False,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                after_data, after_blocked = _read_queue_file(target_path)
+                if after_blocked is not None:
+                    return _with_queue_metadata(
+                        {
+                            **_post_write_failed_result(
+                                after_blocked.get("write_stage", "post_write_verify"),
+                                after_blocked.get("blocked_reasons", ["post-write queue read failed"])[0],
+                                order_queue_path=str(target_path),
+                                backup_path=backup_path,
+                            ),
+                            "operation_name": operation_name,
+                            "temp_path": temp_path,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_after,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                if _normalize_revision(after_data) != revision_after:
+                    return _with_queue_metadata(
+                        {
+                            **_post_write_failed_result(
+                                "post_write_verify",
+                                "order_queue revision did not advance as expected",
+                                order_queue_path=str(target_path),
+                                backup_path=backup_path,
+                            ),
+                            "operation_name": operation_name,
+                            "temp_path": temp_path,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_after,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                if callable(verify):
+                    verify_blocked = verify(after_data, mutation)
+                    if isinstance(verify_blocked, dict):
+                        return _with_queue_metadata(
+                            {
+                                **_post_write_failed_result(
+                                    verify_blocked.get("write_stage", "post_write_verify"),
+                                    verify_blocked.get("blocked_reasons", ["post-write queue verification failed"])[0],
+                                    order_queue_path=str(target_path),
+                                    backup_path=backup_path,
+                                ),
+                                "operation_name": operation_name,
+                                "temp_path": temp_path,
+                            },
+                            revision_before=revision_before,
+                            revision_after=revision_after,
+                            expected_revision=expected_revision,
+                            cas_checked=expected_revision is not None,
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+
+                result = {
+                    "committed": True,
+                    "operation_name": operation_name,
+                    "write_stage": success_stage,
+                    "next_stage": next_stage,
+                    "changed": True,
+                    "order_queue_path": str(target_path),
+                    "backup_path": backup_path,
+                    "temp_path": temp_path,
+                    "file_write": True,
+                    "queue_write": True,
+                    "queue_committed": True,
+                    "post_write_verified": True,
+                    "blocked_reasons": [],
+                    "warnings": [],
+                }
+                extra = mutation.get("result")
+                if isinstance(extra, dict):
+                    result.update(deepcopy(extra))
+                return _with_queue_metadata(
+                    result,
+                    revision_before=revision_before,
+                    revision_after=revision_after,
+                    expected_revision=expected_revision,
+                    cas_checked=expected_revision is not None,
+                    lock_acquired=True,
+                    lock_wait_ms=lock.wait_ms,
+                )
+    except TimeoutError:
+        return _with_queue_metadata(
+            _commit_blocked("queue_lock", "queue lock timeout"),
+            expected_revision=expected_revision,
+            cas_checked=expected_revision is not None,
+            lock_acquired=False,
+        )
+
+    return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock failed"), expected_revision=expected_revision)
+
+
 def preview_execution_queue_write(
     queue_pending_result: Any,
     existing_orders: Any = None,
@@ -792,6 +1028,406 @@ def commit_execution_queue_write_batch(
             expected_revision=expected_revision,
             cas_checked=expected_revision is not None,
             lock_acquired=False,
+        )
+
+    return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock failed"), expected_revision=expected_revision)
+
+
+def commit_legacy_order_queued_record(
+    record: Any,
+    queue_path: str | Path,
+    *,
+    backup: bool = True,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Commit a legacy ORDER_QUEUED record through the canonical lock/CAS path."""
+    item = _as_dict(record)
+    if not item:
+        return _with_queue_metadata(_commit_blocked("legacy_record", "record must be a dict"), expected_revision=expected_revision)
+    if item.get("status") != "ORDER_QUEUED":
+        return _with_queue_metadata(_commit_blocked("legacy_record", "record.status is not ORDER_QUEUED"), expected_revision=expected_revision)
+    if item.get("send_order_called") is not False:
+        return _with_queue_metadata(_commit_blocked("legacy_record", "record.send_order_called is not false"), expected_revision=expected_revision)
+    if item.get("execution_enabled") is not False:
+        return _with_queue_metadata(_commit_blocked("legacy_record", "record.execution_enabled is not false"), expected_revision=expected_revision)
+    if not _clean_text(item.get("order_id")):
+        return _with_queue_metadata(_commit_blocked("legacy_record", "record.order_id is required"), expected_revision=expected_revision)
+
+    canonical_record = deepcopy(item)
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        duplicate_reason = _existing_duplicate_reason(
+            data.get("orders", []),
+            request_hash=_clean_text(canonical_record.get("request_hash")),
+            lock_id=_clean_text(canonical_record.get("lock_id")),
+            order_id=_clean_text(canonical_record.get("order_id")),
+        )
+        if duplicate_reason:
+            return {"blocked": _commit_blocked("duplicate", duplicate_reason)}
+        updated_data = deepcopy(data)
+        updated_data["orders"].append(deepcopy(canonical_record))
+        return {"data": updated_data}
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="legacy_order_queued_commit",
+        success_stage="order_queued_record_committed",
+        next_stage=NEXT_STAGE_QUEUE_COMMITTED_REVIEW_REQUIRED,
+        backup=backup,
+        context=context,
+        expected_revision=expected_revision,
+    )
+    if result.get("committed") is True:
+        result.setdefault("order_id", canonical_record.get("order_id"))
+        result.setdefault("order_queued_id", canonical_record.get("id"))
+        result.setdefault("request_hash", canonical_record.get("request_hash"))
+        result.setdefault("lock_id", canonical_record.get("lock_id"))
+        result.setdefault("status", canonical_record.get("status"))
+        result.setdefault("send_order_called", False)
+        result.setdefault("execution_enabled", False)
+    return result
+
+
+_RECOVERY_IDENTITY_FIELDS = (
+    "order_id",
+    "candidate_id",
+    "queue_pending_id",
+    "request_hash",
+    "lock_id",
+    "execution_id",
+)
+
+
+def _matching_identity_records(queue_data: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
+    fields = [field for field in _RECOVERY_IDENTITY_FIELDS if _clean_text(identity.get(field))]
+    return [
+        item
+        for item in _as_list(queue_data.get("orders"))
+        if isinstance(item, dict) and all(_clean_text(item.get(field)) == _clean_text(identity.get(field)) for field in fields)
+    ]
+
+
+def _recovery_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identities: list[dict[str, Any]]) -> dict[str, Any]:
+    queue_orders = [item for item in _as_list(queue_data.get("orders")) if isinstance(item, dict)]
+    backup_orders = [item for item in _as_list(backup_data.get("orders")) if isinstance(item, dict)]
+    queue_counts = [len(_matching_identity_records(queue_data, identity)) for identity in identities]
+    backup_counts = [len(_matching_identity_records(backup_data, identity)) for identity in identities]
+    return {
+        "queue_order_count": len(queue_orders),
+        "backup_order_count": len(backup_orders),
+        "queue_matching_record_count": sum(queue_counts),
+        "backup_matching_record_count": sum(backup_counts),
+        "queue_matching_counts": queue_counts,
+        "backup_matching_counts": backup_counts,
+        "queue_backup_changed": queue_orders != backup_orders,
+        "target_record_changed": queue_counts != backup_counts,
+    }
+
+
+def restore_order_queue_from_approved_backup(
+    queue_path: str | Path,
+    backup_path: str | Path,
+    target_identities: Any,
+    *,
+    expected_diff: Any = None,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Restore queue orders from an approved backup through the canonical lock."""
+    target_path = Path(queue_path)
+    source_backup_path = Path(backup_path)
+    identities = [item for item in _as_list(target_identities) if isinstance(item, dict)]
+    if not identities:
+        return _with_queue_metadata(_commit_blocked("recovery_identity", "target_identities must not be empty"), expected_revision=expected_revision)
+
+    try:
+        with _QUEUE_THREAD_LOCK:
+            with _QueueFileLock(target_path, _lock_timeout_sec(context)) as lock:
+                queue_data, queue_blocked = _read_queue_file(target_path)
+                if queue_blocked is not None:
+                    return _with_queue_metadata(
+                        queue_blocked,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                backup_data, backup_blocked = _read_queue_file(source_backup_path)
+                if backup_blocked is not None:
+                    return _with_queue_metadata(
+                        {
+                            **backup_blocked,
+                            "write_stage": "backup_read",
+                        },
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                revision_before = _normalize_revision(queue_data)
+                cas_blocked = _cas_blocked(revision_before, expected_revision)
+                if cas_blocked is not None:
+                    return _with_queue_metadata(
+                        cas_blocked,
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=True,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                current_diff = _recovery_diff(queue_data, backup_data, identities)
+                planned = _as_dict(expected_diff)
+                if planned:
+                    keys = (
+                        "queue_order_count",
+                        "backup_order_count",
+                        "queue_matching_record_count",
+                        "backup_matching_record_count",
+                        "queue_backup_changed",
+                        "target_record_changed",
+                    )
+                    if any(current_diff.get(key) != planned.get(key) for key in keys):
+                        return _with_queue_metadata(
+                            _commit_blocked("recovery_preflight", "current queue/backup state differs from approval action"),
+                            revision_before=revision_before,
+                            revision_after=revision_before,
+                            expected_revision=expected_revision,
+                            cas_checked=expected_revision is not None,
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+                if current_diff.get("queue_backup_changed") is not True or current_diff.get("target_record_changed") is not True:
+                    return _with_queue_metadata(
+                        _commit_blocked("recovery_preflight", "queue and backup must differ before recovery"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                if current_diff.get("queue_matching_record_count") != len(identities) or any(count != 1 for count in current_diff.get("queue_matching_counts", [])):
+                    return _with_queue_metadata(
+                        _commit_blocked("recovery_preflight", "current queue must contain exactly one record for each target identity"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                if current_diff.get("backup_matching_record_count") != 0:
+                    return _with_queue_metadata(
+                        _commit_blocked("recovery_preflight", "backup must not contain the target record"),
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                safety_backup_path = target_path.with_name(f"{target_path.name}.recovery_safety.{uuid4().hex}.bak")
+                temp_restore_path = target_path.with_name(f"{target_path.name}.recovery_restore.{uuid4().hex}.tmp")
+                shutil.copy2(target_path, safety_backup_path)
+
+                revision_after = revision_before + 1
+                restore_data = deepcopy(backup_data)
+                restore_data["version"] = restore_data.get("version", 1)
+                restore_data["revision"] = revision_after
+                restore_data["updated_at"] = _now_text()
+
+                try:
+                    with temp_restore_path.open("w", encoding="utf-8") as handle:
+                        json.dump(restore_data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                        handle.write("\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except Exception as exc:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("temp_restore", f"failed to write recovery temp json: {exc}"),
+                            "order_queue_path": str(target_path),
+                            "backup_path": str(source_backup_path),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": False,
+                            "file_write": True,
+                            "queue_write": False,
+                            "queue_committed": False,
+                            "post_write_verified": False,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                temp_data, temp_blocked = _read_queue_file(temp_restore_path)
+                if temp_blocked is not None or temp_data != restore_data:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("temp_restore", "temp restore json does not match backup data"),
+                            "order_queue_path": str(target_path),
+                            "backup_path": str(source_backup_path),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": True,
+                            "file_write": True,
+                            "queue_write": False,
+                            "queue_committed": False,
+                            "post_write_verified": False,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                try:
+                    os.replace(temp_restore_path, target_path)
+                except Exception as exc:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("restore_replace", f"failed to replace queue from recovery temp: {exc}"),
+                            "order_queue_path": str(target_path),
+                            "backup_path": str(source_backup_path),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": True,
+                            "file_write": True,
+                            "queue_write": False,
+                            "queue_committed": False,
+                            "post_write_verified": False,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_before,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                post_data, post_blocked = _read_queue_file(target_path)
+                if post_blocked is not None:
+                    return _with_queue_metadata(
+                        {
+                            **_post_write_failed_result(
+                                post_blocked.get("write_stage", "post_restore_verify"),
+                                post_blocked.get("blocked_reasons", ["restored queue json invalid"])[0],
+                                order_queue_path=str(target_path),
+                                backup_path=str(source_backup_path),
+                            ),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": True,
+                            "restore_executed": True,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_after,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                if post_data != restore_data:
+                    return _with_queue_metadata(
+                        {
+                            **_post_write_failed_result(
+                                "post_restore_verify",
+                                "restored queue json does not match expected recovery data",
+                                order_queue_path=str(target_path),
+                                backup_path=str(source_backup_path),
+                            ),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": True,
+                            "restore_executed": True,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_after,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                post_diff = _recovery_diff(post_data, restore_data, identities)
+                if post_diff.get("queue_matching_record_count") != 0:
+                    return _with_queue_metadata(
+                        {
+                            **_post_write_failed_result(
+                                "post_restore_verify",
+                                "target identity still exists after restore",
+                                order_queue_path=str(target_path),
+                                backup_path=str(source_backup_path),
+                            ),
+                            "safety_backup_path": str(safety_backup_path),
+                            "temp_restore_path": str(temp_restore_path),
+                            "safety_backup_created": True,
+                            "temp_restore_written": True,
+                            "restore_executed": True,
+                        },
+                        revision_before=revision_before,
+                        revision_after=revision_after,
+                        expected_revision=expected_revision,
+                        cas_checked=expected_revision is not None,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                return _with_queue_metadata(
+                    {
+                        "committed": True,
+                        "operation_name": "approved_backup_restore",
+                        "write_stage": "approved_backup_restored",
+                        "next_stage": NEXT_STAGE_QUEUE_COMMITTED_REVIEW_REQUIRED,
+                        "changed": True,
+                        "order_queue_path": str(target_path),
+                        "backup_path": str(source_backup_path),
+                        "safety_backup_path": str(safety_backup_path),
+                        "temp_restore_path": str(temp_restore_path),
+                        "safety_backup_created": True,
+                        "temp_restore_written": True,
+                        "restore_executed": True,
+                        "file_write": True,
+                        "queue_write": True,
+                        "queue_committed": True,
+                        "post_write_verified": True,
+                        "blocked_reasons": [],
+                        "warnings": [],
+                    },
+                    revision_before=revision_before,
+                    revision_after=revision_after,
+                    expected_revision=expected_revision,
+                    cas_checked=expected_revision is not None,
+                    lock_acquired=True,
+                    lock_wait_ms=lock.wait_ms,
+                )
+    except TimeoutError:
+        return _with_queue_metadata(
+            _commit_blocked("queue_lock", "queue lock timeout"),
+            expected_revision=expected_revision,
+            cas_checked=expected_revision is not None,
+            lock_acquired=False,
+        )
+    except Exception as exc:
+        return _with_queue_metadata(
+            _commit_blocked("approved_backup_restore", f"failed to restore approved backup: {exc}"),
+            expected_revision=expected_revision,
+            cas_checked=expected_revision is not None,
         )
 
     return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock failed"), expected_revision=expected_revision)

@@ -13,11 +13,11 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
 from typing import Any
 from uuid import uuid4
+
+from execution_queue_writer import commit_legacy_order_queued_record
 
 
 EXECUTOR_TYPE = "EXECUTION_QUEUE_COMMIT_EXECUTOR"
@@ -146,23 +146,6 @@ def _build_record(commit_contract: dict[str, Any], commit_plan: dict[str, Any], 
     return {key: value for key, value in record.items() if value not in ("", None)}
 
 
-def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-
-
 def _verify_queue_item(path: Path, record: dict[str, Any], after_hash: str) -> bool:
     if _sha256_path(path) != after_hash:
         return False
@@ -174,14 +157,6 @@ def _verify_queue_item(path: Path, record: dict[str, Any], after_hash: str) -> b
         if _text(current.get("order_id")) == _text(record.get("order_id")) and _text(current.get("commit_id")) == _text(record.get("commit_id")):
             return current.get("status") == "ORDER_QUEUED" and current.get("send_order_called") is False
     return False
-
-
-def _restore_backup(backup_path: Path, queue_path: Path) -> bool:
-    try:
-        shutil.copy2(backup_path, queue_path)
-        return True
-    except Exception:
-        return False
 
 
 def execute_queue_commit_from_dry_run(
@@ -214,25 +189,16 @@ def execute_queue_commit_from_dry_run(
     if path_issue is not None or target_path is None:
         return _result(status=STATUS_INVALID, issues=[path_issue or "queue_path is invalid"])
 
-    data, read_issue = _read_queue(target_path)
-    if read_issue is not None:
-        return _result(status=STATUS_INVALID, issues=[read_issue])
-
     commit_id = f"QUEUE_COMMIT_{uuid4().hex}"
     record = _build_record(commit_contract, commit_plan, commit_id)
     if not _text(record.get("order_id")):
         return _result(status=STATUS_INVALID, issues=["record.order_id is required"], commit_id=commit_id)
 
-    duplicate = _duplicate_reason(data["orders"], record)
-    if duplicate:
-        return _result(status=STATUS_BLOCKED, commit_id=commit_id, issues=[duplicate], warnings=_as_list(dry_result.get("warnings")))
-
     before_hash = _sha256_path(target_path)
-    backup_path = target_path.with_name(f"{target_path.name}.{commit_id}.bak")
     commit_report: dict[str, Any] = {
         "commit_id": commit_id,
         "queue_path": str(target_path),
-        "backup_path": str(backup_path),
+        "backup_path": None,
         "source_order_id": record.get("source_order_id"),
         "order_id": record.get("order_id"),
         "source_signal_id": record.get("source_signal_id"),
@@ -262,34 +228,16 @@ def execute_queue_commit_from_dry_run(
         "manual_restore_required": False,
     }
 
-    try:
-        shutil.copy2(target_path, backup_path)
-        updated = deepcopy(data)
-        updated["version"] = updated.get("version", 1)
-        updated["updated_at"] = _now_text()
-        updated["orders"].append(deepcopy(record))
-        _write_json_atomic(target_path, updated)
-        after_hash = _sha256_path(target_path)
-        commit_report["after_hash"] = after_hash
-        if not _verify_queue_item(target_path, record, after_hash):
-            commit_report["rollback_attempted"] = True
-            restored = _restore_backup(backup_path, target_path)
-            commit_report["rollback_succeeded"] = restored
-            commit_report["restored_from_backup"] = restored
-            commit_report["manual_restore_required"] = not restored
-            issues = ["POST_WRITE_VERIFICATION_FAILED"]
-            if not restored:
-                issues.append("MANUAL_RESTORE_REQUIRED")
-            return _result(
-                status=STATUS_ERROR,
-                commit_id=commit_id,
-                commit_report=commit_report,
-                issues=issues,
-                warnings=_as_list(dry_result.get("warnings")),
-                queue_write=False,
-                queue_commit_called=True,
-            )
-
+    writer_result = commit_legacy_order_queued_record(
+        record,
+        target_path,
+        backup=True,
+        context={"manual_queue_write_confirmed": True},
+    )
+    commit_report["backup_path"] = writer_result.get("backup_path")
+    commit_report["after_hash"] = _sha256_path(target_path) if target_path.exists() else None
+    commit_report["writer_result"] = deepcopy(writer_result)
+    if writer_result.get("committed") is True and writer_result.get("post_write_verified") is True:
         commit_report.update(
             {
                 "committed_at": _now_text(),
@@ -310,19 +258,22 @@ def execute_queue_commit_from_dry_run(
             queue_write=True,
             queue_commit_called=True,
         )
-    except Exception as exc:
-        commit_report["rollback_attempted"] = backup_path.exists()
-        if backup_path.exists():
-            restored = _restore_backup(backup_path, target_path)
-            commit_report["rollback_succeeded"] = restored
-            commit_report["restored_from_backup"] = restored
-            commit_report["manual_restore_required"] = not restored
-        return _result(
-            status=STATUS_ERROR,
-            commit_id=commit_id,
-            commit_report=commit_report,
-            issues=[f"QUEUE_COMMIT_WRITE_FAILED: {exc}"] + (["MANUAL_RESTORE_REQUIRED"] if commit_report["manual_restore_required"] else []),
-            warnings=_as_list(dry_result.get("warnings")),
-            queue_write=False,
-            queue_commit_called=True,
-        )
+
+    reasons = list(writer_result.get("blocked_reasons") or [])
+    stage = _text(writer_result.get("write_stage"))
+    status = STATUS_BLOCKED
+    if stage in {"read_queue", "legacy_record"}:
+        status = STATUS_INVALID
+    if writer_result.get("committed") is True:
+        status = STATUS_ERROR
+        reasons = reasons or ["POST_WRITE_VERIFICATION_FAILED"]
+        commit_report["manual_restore_required"] = True
+    return _result(
+        status=status,
+        commit_id=commit_id,
+        commit_report=commit_report,
+        issues=reasons or ["QUEUE_COMMIT_WRITE_FAILED"],
+        warnings=_as_list(dry_result.get("warnings")),
+        queue_write=bool(writer_result.get("queue_write")),
+        queue_commit_called=True,
+    )
