@@ -4,7 +4,9 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import msvcrt
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -81,6 +83,9 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             json.dumps({"version": 1, "updated_at": "before", "orders": orders or []}, indent=2),
             encoding="utf-8",
         )
+
+    def _read_queue(self, path: Path) -> dict:
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _commit_to_temp_queue(
         self,
@@ -513,7 +518,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
 
     def test_commit_success_appends_record_to_temp_queue(self) -> None:
         result, queue_path = self._commit_to_temp_queue()
-        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        data = self._read_queue(queue_path)
 
         self.assertTrue(result["committed"])
         self.assertEqual("order_queued_record_committed", result["write_stage"])
@@ -525,6 +530,82 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual("ORDER_QUEUED", result["status"])
         self.assertEqual(1, len(data["orders"]))
         self.assertEqual("ORDER_QUEUED_ORDER_1", data["orders"][0]["id"])
+        self.assertTrue(result["lock_acquired"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+        self.assertEqual(1, data["revision"])
+
+    def test_revisionless_queue_success_sets_revision_one(self) -> None:
+        result, queue_path = self._commit_to_temp_queue()
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+        self.assertEqual(1, self._read_queue(queue_path)["revision"])
+
+    def test_existing_revision_success_increments_once(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        queue_path.write_text(json.dumps({"version": 1, "revision": 5, "orders": []}), encoding="utf-8")
+
+        result = commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(5, result["revision_before"])
+        self.assertEqual(6, result["revision_after"])
+        self.assertEqual(6, self._read_queue(queue_path)["revision"])
+
+    def test_stale_expected_revision_blocks_without_backup_or_write(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        original = {"version": 1, "revision": 3, "updated_at": "before", "orders": []}
+        queue_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
+
+        result = commit_execution_queue_write(
+            self._write_preview_result(),
+            queue_path,
+            context=self._context(),
+            expected_revision=2,
+        )
+
+        self.assertFalse(result["committed"])
+        self.assertEqual("revision_cas", result["write_stage"])
+        self.assertTrue(result["cas_checked"])
+        self.assertTrue(result["lock_acquired"])
+        self.assertEqual(3, result["revision_before"])
+        self.assertEqual(3, result["revision_after"])
+        self.assertEqual(original, self._read_queue(queue_path))
+        self.assertFalse(Path(str(queue_path) + ".bak").exists())
+
+    def test_duplicate_keeps_revision_and_does_not_backup(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path, orders=[{"request_hash": "a" * 64, "lock_id": "OTHER", "order_id": "OTHER"}])
+
+        result = commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context())
+
+        self.assertFalse(result["committed"])
+        self.assertEqual("duplicate", result["write_stage"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(0, result["revision_after"])
+        self.assertNotIn("revision", self._read_queue(queue_path))
+        self.assertFalse(Path(str(queue_path) + ".bak").exists())
+
+    def test_backup_preserves_previous_revision(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        queue_path.write_text(json.dumps({"version": 1, "revision": 7, "orders": []}), encoding="utf-8")
+
+        result = commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        backup_data = self._read_queue(Path(result["backup_path"]))
+        self.assertEqual(7, backup_data["revision"])
+        self.assertEqual(8, self._read_queue(queue_path)["revision"])
 
     def test_commit_creates_backup_file(self) -> None:
         result, _ = self._commit_to_temp_queue()
@@ -616,6 +697,171 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertTrue(Path(result["backup_path"]).exists())
         data = json.loads(queue_path.read_text(encoding="utf-8"))
         self.assertEqual(["ORDER_1", "ORDER_2"], [record["order_id"] for record in data["orders"]])
+        self.assertEqual(1, data["revision"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+
+    def test_batch_three_records_increments_revision_once(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        previews = [
+            self._write_preview_for(
+                order_id=f"ORDER_{index}",
+                candidate_id=f"CANDIDATE_{index}",
+                queue_pending_id=f"PENDING_{index}",
+                request_hash=chr(96 + index) * 64,
+                lock_id=f"LOCK_{index}",
+                execution_id=f"EXEC_{index}",
+            )
+            for index in (1, 2, 3)
+        ]
+
+        result = commit_execution_queue_write_batch(previews, queue_path, context=self._context())
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(3, result["committed_count"])
+        self.assertEqual(1, self._read_queue(queue_path)["revision"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+
+    def test_same_request_hash_two_threads_only_one_commit(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        results: list[dict] = []
+
+        def worker() -> None:
+            results.append(commit_execution_queue_write(self._write_preview_result(), queue_path, context=self._context()))
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(1, sum(1 for item in results if item.get("committed") is True))
+        self.assertEqual(1, len(self._read_queue(queue_path)["orders"]))
+        self.assertEqual(1, self._read_queue(queue_path)["revision"])
+
+    def test_different_orders_two_threads_both_commit_without_loss(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        previews = [
+            self._write_preview_for(
+                order_id="ORDER_1",
+                candidate_id="CANDIDATE_1",
+                queue_pending_id="PENDING_1",
+                request_hash="a" * 64,
+                lock_id="LOCK_1",
+                execution_id="EXEC_1",
+            ),
+            self._write_preview_for(
+                order_id="ORDER_2",
+                candidate_id="CANDIDATE_2",
+                queue_pending_id="PENDING_2",
+                request_hash="b" * 64,
+                lock_id="LOCK_2",
+                execution_id="EXEC_2",
+            ),
+        ]
+        results: list[dict] = []
+
+        def worker(preview: dict) -> None:
+            results.append(commit_execution_queue_write(preview, queue_path, context=self._context()))
+
+        threads = [threading.Thread(target=worker, args=(preview,)) for preview in previews]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(2, sum(1 for item in results if item.get("committed") is True))
+        self.assertEqual(["ORDER_1", "ORDER_2"], sorted(record["order_id"] for record in data["orders"]))
+        self.assertEqual(2, data["revision"])
+
+    def test_batch_and_single_concurrent_commits_preserve_all_records(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        batch_previews = [
+            self._write_preview_for(
+                order_id="ORDER_1",
+                candidate_id="CANDIDATE_1",
+                queue_pending_id="PENDING_1",
+                request_hash="a" * 64,
+                lock_id="LOCK_1",
+                execution_id="EXEC_1",
+            ),
+            self._write_preview_for(
+                order_id="ORDER_2",
+                candidate_id="CANDIDATE_2",
+                queue_pending_id="PENDING_2",
+                request_hash="b" * 64,
+                lock_id="LOCK_2",
+                execution_id="EXEC_2",
+            ),
+        ]
+        single_preview = self._write_preview_for(
+            order_id="ORDER_3",
+            candidate_id="CANDIDATE_3",
+            queue_pending_id="PENDING_3",
+            request_hash="c" * 64,
+            lock_id="LOCK_3",
+            execution_id="EXEC_3",
+        )
+        results: list[dict] = []
+
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    commit_execution_queue_write_batch(batch_previews, queue_path, context=self._context())
+                )
+            ),
+            threading.Thread(
+                target=lambda: results.append(commit_execution_queue_write(single_preview, queue_path, context=self._context()))
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(2, sum(1 for item in results if item.get("committed") is True))
+        self.assertEqual(["ORDER_1", "ORDER_2", "ORDER_3"], sorted(record["order_id"] for record in data["orders"]))
+        self.assertEqual(2, data["revision"])
+
+    def test_lock_timeout_blocks_without_file_changes(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_queue(queue_path)
+        before = queue_path.read_text(encoding="utf-8")
+        lock_path = queue_path.with_name(f"{queue_path.name}.lock")
+        with lock_path.open("a+b") as handle:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                result = commit_execution_queue_write(
+                    self._write_preview_result(),
+                    queue_path,
+                    context={**self._context(), "queue_lock_timeout_sec": 0.05},
+                )
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+        self.assertFalse(result["committed"])
+        self.assertEqual("queue_lock", result["write_stage"])
+        self.assertFalse(result["lock_acquired"])
+        self.assertEqual(before, queue_path.read_text(encoding="utf-8"))
+        self.assertFalse(Path(str(queue_path) + ".bak").exists())
 
     def test_batch_commit_duplicate_identity_is_blocked_before_write(self) -> None:
         tmp = tempfile.TemporaryDirectory()
