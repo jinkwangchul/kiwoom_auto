@@ -1217,8 +1217,14 @@ def _dispatch_claim_source(context: Any) -> str:
     return _clean_text(ctx.get("dispatch_claim_source") or ctx.get("claim_source") or "final_guard")
 
 
-def _dispatch_final_guard_ready(final_guard_result: Any, identity: dict[str, str], context: Any) -> dict[str, Any] | None:
+def _dispatch_final_guard_ready(
+    final_guard_result: Any,
+    identity: dict[str, str],
+    context: Any,
+    expected_revision: int,
+) -> dict[str, Any] | None:
     guard = _as_dict(final_guard_result)
+    ctx = _as_dict(context)
     if not guard:
         return _commit_blocked("final_guard", "final guard result is required")
     if guard.get("guard_type") != "SELL_DISPATCH_FINAL_EXECUTION_GUARD":
@@ -1237,6 +1243,28 @@ def _dispatch_final_guard_ready(final_guard_result: Any, identity: dict[str, str
     queue_path = _clean_text(_as_dict(context).get("queue_path"))
     if queue_path and _clean_text(guard.get("queue_path")) and queue_path != _clean_text(guard.get("queue_path")):
         return _commit_blocked("final_guard", "final guard queue_path mismatch")
+
+    guard_revision = guard.get("queue_revision", guard.get("source_queue_revision"))
+    if guard_revision is None:
+        guard_revision = _as_dict(guard.get("summary")).get("queue_revision")
+    if guard_revision is None:
+        guard_revision = ctx.get("final_guard_queue_revision")
+    if guard_revision is not None:
+        try:
+            normalized_guard_revision = int(guard_revision)
+        except (TypeError, ValueError):
+            return _commit_blocked("final_guard", "final guard queue_revision must be an integer")
+        if normalized_guard_revision != expected_revision:
+            return _commit_blocked("final_guard", "final guard queue revision is stale")
+
+    guard_snapshot_hash = _clean_text(
+        guard.get("queue_snapshot_hash")
+        or guard.get("source_queue_snapshot_hash")
+        or _as_dict(guard.get("summary")).get("queue_snapshot_hash")
+    )
+    context_snapshot_hash = _clean_text(ctx.get("queue_snapshot_hash") or ctx.get("final_guard_queue_snapshot_hash"))
+    if guard_snapshot_hash and context_snapshot_hash and guard_snapshot_hash != context_snapshot_hash:
+        return _commit_blocked("final_guard", "final guard queue snapshot hash mismatch")
 
     guarded = _as_list(guard.get("guarded_candidates"))
     if guarded:
@@ -1315,7 +1343,7 @@ def claim_order_for_dispatch(
     if ttl_blocked is not None:
         return _with_queue_metadata(ttl_blocked, expected_revision=expected_revision)
 
-    guard_blocked = _dispatch_final_guard_ready(final_guard_result, normalized_identity, context)
+    guard_blocked = _dispatch_final_guard_ready(final_guard_result, normalized_identity, context, expected_revision)
     if guard_blocked is not None:
         return _with_queue_metadata(guard_blocked, expected_revision=expected_revision)
 
@@ -1337,6 +1365,7 @@ def claim_order_for_dispatch(
         for index, item in enumerate(updated_data["orders"]):
             if _dispatch_identity_matches(_as_dict(item), normalized_identity):
                 updated_record = deepcopy(item)
+                dispatch_generation = int(updated_record.get("dispatch_generation") or 0) + 1
                 updated_record.update(
                     {
                         "status": "DISPATCH_CLAIMED",
@@ -1349,6 +1378,7 @@ def claim_order_for_dispatch(
                         "dispatch_claim_source": source,
                         "dispatch_claim_revision": _normalize_revision(data),
                         "dispatch_claim_attempt": int(updated_record.get("dispatch_claim_attempt") or 0) + 1,
+                        "dispatch_generation": dispatch_generation,
                         "dispatch_claim_previous_status": "ORDER_QUEUED",
                         "updated_at": _time_text(claimed_at),
                     }
@@ -1366,6 +1396,7 @@ def claim_order_for_dispatch(
                         "dispatch_claim_expires_at": _time_text(expires_at),
                         "dispatch_claim_source": source,
                         "dispatch_claim_attempt": updated_record["dispatch_claim_attempt"],
+                        "dispatch_generation": dispatch_generation,
                         "claimed_identity": deepcopy(normalized_identity),
                         "send_order_called": False,
                         "actual_order_sent": False,
@@ -1490,6 +1521,8 @@ def release_dispatch_claim(
         return _with_queue_metadata(_commit_blocked("dispatch_claim_release", "dispatch claim token is required"), expected_revision=expected_revision)
 
     released_at = datetime.now()
+    release_reason = _clean_text(_as_dict(context).get("dispatch_release_reason") or _as_dict(context).get("release_reason") or "manual_release")
+    released_by = _clean_text(_as_dict(context).get("dispatch_released_by") or _as_dict(context).get("released_by") or "manual")
 
     def mutate(data: dict[str, Any]) -> dict[str, Any]:
         matches = _dispatch_matching_records(data, normalized_identity)
@@ -1508,12 +1541,19 @@ def release_dispatch_claim(
         for index, item in enumerate(updated_data["orders"]):
             if _dispatch_identity_matches(_as_dict(item), normalized_identity):
                 updated_record = deepcopy(item)
+                previous_claim_id = _clean_text(updated_record.get("dispatch_claim_id"))
+                dispatch_generation = int(updated_record.get("dispatch_generation") or 0) + 1
                 updated_record.update(
                     {
                         "status": "ORDER_QUEUED",
                         "dispatch_claimed": False,
+                        "dispatch_release_reason": release_reason,
+                        "dispatch_released_at": _time_text(released_at),
+                        "dispatch_released_by": released_by,
+                        "previous_dispatch_claim_id": previous_claim_id,
                         "dispatch_claim_released_at": _time_text(released_at),
                         "dispatch_claim_release_source": _clean_text(_as_dict(context).get("release_source") or "manual"),
+                        "dispatch_generation": dispatch_generation,
                         "updated_at": _time_text(released_at),
                     }
                 )
@@ -1524,6 +1564,11 @@ def release_dispatch_claim(
                         "released": True,
                         "status": "ORDER_QUEUED",
                         "dispatch_claim_id": release_claim_id,
+                        "dispatch_release_reason": release_reason,
+                        "dispatch_released_at": _time_text(released_at),
+                        "dispatch_released_by": released_by,
+                        "previous_dispatch_claim_id": previous_claim_id,
+                        "dispatch_generation": dispatch_generation,
                         "claimed_identity": deepcopy(normalized_identity),
                         "send_order_called": False,
                         "actual_order_sent": False,

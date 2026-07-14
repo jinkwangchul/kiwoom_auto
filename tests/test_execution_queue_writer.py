@@ -1362,6 +1362,8 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual("DISPATCH_CLAIMED", result["status"])
         self.assertEqual("DISPATCH_CLAIMED", claimed_record["status"])
         self.assertTrue(claimed_record["dispatch_claimed"])
+        self.assertEqual(1, claimed_record["dispatch_generation"])
+        self.assertEqual(1, result["dispatch_generation"])
         self.assertEqual(result["dispatch_claim_token_hash"], claimed_record["dispatch_claim_token_hash"])
         self.assertNotIn("CLAIM_TOKEN", json.dumps(data))
         self.assertNotIn("APPROVAL_TOKEN", json.dumps(result))
@@ -1457,6 +1459,44 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertFalse(token_mismatch["committed"])
         self.assertIn("approval token hash mismatch", token_mismatch["blocked_reasons"])
         self.assertEqual(0, self._read_queue(queue_path).get("revision", 0))
+
+    def test_dispatch_claim_blocks_stale_final_guard_revision_and_snapshot_hash(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimable_record()
+        queue_path.write_text(json.dumps({"version": 1, "revision": 3, "orders": [record]}), encoding="utf-8")
+        stale_guard = self._final_guard(record)
+        stale_guard["queue_revision"] = 2
+        hash_guard = self._final_guard(record)
+        hash_guard["queue_revision"] = 3
+        hash_guard["queue_snapshot_hash"] = "GUARD_HASH"
+
+        stale_revision = claim_order_for_dispatch(
+            queue_path,
+            self._identity(record),
+            stale_guard,
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context=self._claim_context(),
+            expected_revision=3,
+        )
+        stale_hash = claim_order_for_dispatch(
+            queue_path,
+            self._identity(record),
+            hash_guard,
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context={**self._claim_context(), "queue_snapshot_hash": "OTHER_HASH"},
+            expected_revision=3,
+        )
+
+        self.assertFalse(stale_revision["committed"])
+        self.assertIn("final guard queue revision is stale", stale_revision["blocked_reasons"])
+        self.assertFalse(stale_hash["committed"])
+        self.assertIn("final guard queue snapshot hash mismatch", stale_hash["blocked_reasons"])
+        self.assertEqual(3, self._read_queue(queue_path)["revision"])
+        self.assertFalse(Path(str(queue_path) + ".bak").exists())
 
     def test_dispatch_claim_requires_identity_match_exactly_once(self) -> None:
         cases = ["missing", "duplicate"]
@@ -1616,7 +1656,11 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             self._identity(record),
             claim_id=claim["dispatch_claim_id"],
             claim_token="CLAIM_TOKEN",
-            context={"manual_dispatch_claim_release_confirmed": True},
+            context={
+                "manual_dispatch_claim_release_confirmed": True,
+                "dispatch_release_reason": "operator_cancelled_before_send",
+                "dispatch_released_by": "GUI_MANUAL",
+            },
             expected_revision=1,
         )
 
@@ -1626,6 +1670,14 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual("dispatch_claim_released", released["write_stage"])
         self.assertEqual("ORDER_QUEUED", data["orders"][0]["status"])
         self.assertFalse(data["orders"][0]["dispatch_claimed"])
+        self.assertEqual("operator_cancelled_before_send", data["orders"][0]["dispatch_release_reason"])
+        self.assertEqual("GUI_MANUAL", data["orders"][0]["dispatch_released_by"])
+        self.assertEqual(claim["dispatch_claim_id"], data["orders"][0]["previous_dispatch_claim_id"])
+        self.assertEqual(2, data["orders"][0]["dispatch_generation"])
+        self.assertEqual("operator_cancelled_before_send", released["dispatch_release_reason"])
+        self.assertEqual("GUI_MANUAL", released["dispatch_released_by"])
+        self.assertEqual(claim["dispatch_claim_id"], released["previous_dispatch_claim_id"])
+        self.assertEqual(2, released["dispatch_generation"])
         self.assertEqual(2, data["revision"])
         self.assertFalse(released["send_order_called"])
         self.assertFalse(released["actual_order_sent"])
