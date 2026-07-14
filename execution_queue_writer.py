@@ -362,6 +362,7 @@ def mutate_order_queue(
     context: Any = None,
     expected_revision: int | None = None,
     verify: Any = None,
+    default_queue: Any = None,
 ) -> dict[str, Any]:
     """Run a canonical locked queue mutation.
 
@@ -374,6 +375,14 @@ def mutate_order_queue(
         with _QUEUE_THREAD_LOCK:
             with _QueueFileLock(target_path, _lock_timeout_sec(context)) as lock:
                 data, read_blocked = _read_queue_file(target_path)
+                if read_blocked is not None and not target_path.exists() and isinstance(default_queue, dict):
+                    data = deepcopy(default_queue)
+                    if not isinstance(data.get("orders"), list):
+                        data["orders"] = []
+                    data["version"] = data.get("version", 1)
+                    data["updated_at"] = data.get("updated_at", "")
+                    _normalize_revision(data)
+                    read_blocked = None
                 if read_blocked is not None:
                     return _with_queue_metadata(
                         read_blocked,
@@ -445,7 +454,7 @@ def mutate_order_queue(
                     )
 
                 backup_path = None
-                if backup:
+                if backup and target_path.exists():
                     backup_path = str(target_path) + ".bak"
                     try:
                         shutil.copy2(target_path, backup_path)

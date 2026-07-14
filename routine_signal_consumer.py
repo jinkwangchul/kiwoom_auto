@@ -24,8 +24,9 @@ from routine_signal_queue import (
 )
 
 try:
-    from order_queue import read_order_queue, signal_to_order_candidate, write_order_queue
+    from order_queue import append_order_candidates, read_order_queue, signal_to_order_candidate, write_order_queue
 except Exception:  # pragma: no cover
+    append_order_candidates = None
     read_order_queue = None
     signal_to_order_candidate = None
     write_order_queue = None
@@ -95,7 +96,7 @@ def _build_order_queue_candidates_for_signals(
     apply_approval: bool = False,
 ) -> dict[str, Any]:
     """Append order candidates for selected PENDING signals only."""
-    if not callable(read_order_queue) or not callable(write_order_queue) or not callable(signal_to_order_candidate):
+    if not callable(read_order_queue) or not callable(append_order_candidates) or not callable(signal_to_order_candidate):
         return {
             "ok": False,
             "orders_created": 0,
@@ -171,20 +172,45 @@ def _build_order_queue_candidates_for_signals(
                 }
             )
 
+    append_result: dict[str, Any] = {
+        "ok": True,
+        "orders_created": 0,
+        "duplicates": duplicates,
+        "ignored": ignored,
+        "order_queue_written": False,
+        "created_orders": [],
+        "duplicate_orders": [],
+    }
     if created_orders:
-        write_order_queue(order_data)
+        append_result = append_order_candidates(created_orders)
+        if not append_result.get("ok"):
+            return {
+                "ok": False,
+                "orders_created": 0,
+                "duplicates": duplicates + int(append_result.get("duplicates", 0) or 0),
+                "ignored": ignored,
+                "approval_checked": approval_checked,
+                "approved": approved,
+                "blocked": approval_blocked,
+                "order_queue_written": bool(append_result.get("order_queue_written")),
+                "execution_enabled_all_false": True,
+                "approval_results": approval_results,
+                "reason": append_result.get("reason", "order_queue append failed"),
+                "append_result": append_result,
+            }
 
     return {
         "ok": True,
-        "orders_created": len(created_orders),
-        "duplicates": duplicates,
+        "orders_created": int(append_result.get("orders_created", len(created_orders)) or 0),
+        "duplicates": duplicates + int(append_result.get("duplicates", 0) or 0),
         "ignored": ignored,
         "approval_checked": approval_checked,
         "approved": approved,
         "blocked": approval_blocked,
-        "order_queue_written": bool(created_orders),
+        "order_queue_written": bool(append_result.get("order_queue_written")),
         "execution_enabled_all_false": all(order.get("execution_enabled") is False for order in created_orders),
         "approval_results": approval_results,
+        "append_result": append_result,
     }
 
 
@@ -223,7 +249,7 @@ def consume_pending_routine_signals_dry_run(
         )
 
     status_update_results: list[dict[str, Any]] = []
-    if mark_previewed:
+    if mark_previewed and (not write_order_queue or order_queue_result.get("ok") is True):
         for signal, result in zip(signals, results):
             signal_id = str(signal.get("id", "") or "")
             next_status = _preview_status_for_result(result)
@@ -238,6 +264,14 @@ def consume_pending_routine_signals_dry_run(
                     "reason": f"status update failed: {exc}",
                 }
             status_update_results.append(update_result)
+    elif mark_previewed and write_order_queue and order_queue_result.get("ok") is not True:
+        status_update_results.append(
+            {
+                "ok": False,
+                "after_status": STATUS_ERROR,
+                "reason": "order_queue write failed; signal status update skipped",
+            }
+        )
 
     allowed = sum(1 for item in results if bool(item.get("order_manager_allowed")))
     blocked = sum(
