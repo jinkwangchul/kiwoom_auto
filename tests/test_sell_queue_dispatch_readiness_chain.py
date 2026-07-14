@@ -5,6 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from sell_queue_dispatch_readiness_chain import (
     build_sell_broker_request_preview,
@@ -41,14 +42,19 @@ def _record(index: int = 1, *, side: str = "SELL", quantity: int = 10, price: in
             "execution_id": execution_id,
             "request_hash": request_hash,
             "lock_id": lock_id,
-            "symbol": code,
-            "code": code,
-            "side": side,
-            "quantity": quantity,
-            "price": price,
-            "order_type": side,
-            "hoga": "LIMIT",
-            "original_order_no": "0",
+            "guard_snapshot": {"account_no": "12345678"},
+            "request_preview": {
+                "account_no": "12345678",
+                "symbol": code,
+                "code": code,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "order_type": side,
+                "hoga": "LIMIT",
+                "original_order_no": "",
+                "screen_no": "9001",
+            },
         },
         "queue_contract_version": "preview-1",
         "send_order_called": False,
@@ -242,7 +248,7 @@ class SellQueueDispatchReadinessChainTests(unittest.TestCase):
         self.assertEqual(payload["quantity"], 10)
         self.assertEqual(payload["price"], 70000)
         self.assertEqual(payload["hoga"], "LIMIT")
-        self.assertEqual(payload["original_order_no"], "0")
+        self.assertEqual(payload["original_order_no"], "")
         self.assert_no_dispatch_side_effects(preview)
 
     def test_missing_account_blocks_broker_preview_as_invalid(self):
@@ -350,6 +356,121 @@ class SellQueueDispatchReadinessChainTests(unittest.TestCase):
         build_sell_queue_committed_review(verifier)
 
         self.assertEqual(before, verifier)
+
+    def test_existing_modules_are_used_by_orchestration(self):
+        record = _record()
+        verifier = self._verifier([record])
+        existing_queue_review = {
+            "review_type": "EXECUTION_QUEUE_COMMITTED_REVIEW",
+            "status": "READY_FOR_FINAL_SEND_GATE",
+            "preview_only": True,
+            "queue_write": False,
+            "runtime_write": False,
+            "send_order_called": False,
+            "next_stage": "FINAL_SEND_GATE_REQUIRED",
+            "order_queued_record": deepcopy(record),
+            "identity": {
+                "order_id": "ORDER_1",
+                "source_signal_id": "SIG_1",
+                "execution_id": "EXEC_1",
+                "request_hash": "a" * 64,
+                "lock_id": "LOCK_1",
+            },
+            "issues": [],
+            "warnings": [],
+        }
+        existing_adapter = {
+            "adapter_type": "EXECUTION_QUEUE_REVIEW_TO_SEND_ORDER_PREVIEW_ADAPTER",
+            "status": "READY_FOR_FINAL_SEND_GATE",
+            "preview_only": True,
+            "queue_write": False,
+            "runtime_write": False,
+            "send_order_called": False,
+            "final_send_gate_called": False,
+            "adapter_preview_result": {
+                "send_order_request_preview": {
+                    "order_id": "ORDER_1",
+                    "source_signal_id": "SIG_1",
+                    "execution_id": "EXEC_1",
+                    "request_hash": "a" * 64,
+                    "lock_id": "LOCK_1",
+                    "account_no": "12345678",
+                    "side": "SELL",
+                    "code": "005931",
+                    "quantity": 10,
+                    "price": 70000,
+                    "hoga": "LIMIT",
+                    "original_order_no": "",
+                    "screen_no": "9001",
+                }
+            },
+            "order_queued_record": deepcopy(record),
+            "identity": {},
+            "issues": [],
+            "warnings": [],
+        }
+        existing_builder = {
+            "builder_type": "EXECUTION_ORDER_DISPATCH_BUILDER",
+            "status": "DISPATCH_READY",
+            "dispatch_contract": {
+                "account_no": "12345678",
+                "broker_type": "KIWOOM",
+                "order_id": "ORDER_1",
+                "source_order_id": "ORDER_1",
+                "source_signal_id": "SIG_1",
+                "code": "005931",
+                "side": "SELL",
+                "quantity": 10,
+                "price": 70000,
+                "hoga": "LIMIT",
+                "request_hash": "a" * 64,
+                "dispatch_id": "DISPATCH_1",
+            },
+            "issues": [],
+            "warnings": [],
+            "send_order_ready": True,
+            "send_order_called": False,
+            "broker_called": False,
+        }
+        existing_broker = {
+            "status": "BROKER_DISPATCH_READY",
+            "broker_dispatch_preview": {},
+            "send_order_params_preview": {
+                "account_no": "12345678",
+                "broker_type": "KIWOOM",
+                "order_id": "ORDER_1",
+                "source_order_id": "ORDER_1",
+                "source_signal_id": "SIG_1",
+                "code": "005931",
+                "side": "SELL",
+                "quantity": 10,
+                "price": 70000,
+                "hoga": "LIMIT",
+                "request_hash": "a" * 64,
+                "dispatch_id": "DISPATCH_1",
+            },
+            "issues": [],
+            "warnings": [],
+            "preview_only": True,
+            "broker_called": False,
+            "send_order_called": False,
+            "runtime_write": False,
+            "queue_write": False,
+        }
+
+        with mock.patch("sell_queue_dispatch_readiness_chain.review_execution_queue_committed", return_value=existing_queue_review) as review_mock:
+            review = build_sell_queue_committed_review(verifier)
+        with mock.patch("sell_queue_dispatch_readiness_chain.adapt_queue_review_to_send_order_preview", return_value=existing_adapter) as adapter_mock:
+            eligibility = build_sell_dispatch_eligibility(review, {"market_open": True, "lock_available": True, "holding_qty": 100})
+        with mock.patch("sell_queue_dispatch_readiness_chain.build_order_dispatch_contract", return_value=existing_builder) as builder_mock:
+            with mock.patch("sell_queue_dispatch_readiness_chain.preview_broker_dispatch", return_value=existing_broker) as broker_mock:
+                preview = build_sell_broker_request_preview(eligibility, {"account_no": "12345678", "screen_no": "9001"})
+
+        self.assertEqual(preview["status"], "READY")
+        self.assertTrue(review_mock.called)
+        self.assertTrue(adapter_mock.called)
+        self.assertTrue(builder_mock.called)
+        self.assertTrue(broker_mock.called)
 
 
 if __name__ == "__main__":
