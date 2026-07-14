@@ -103,7 +103,7 @@ class SellDispatchFinalGuardChainTests(unittest.TestCase):
             {"market_open": True, "lock_available": True, "holdings": {"005931": 100, "005932": 100, "005933": 100}},
         )
         broker_preview = build_sell_broker_request_preview(eligibility, {"account_no": "12345678", "screen_no": "9001"})
-        return build_sell_dispatch_approval_gate(
+        approval = build_sell_dispatch_approval_gate(
             broker_preview,
             {
                 "user_approved": True,
@@ -113,6 +113,8 @@ class SellDispatchFinalGuardChainTests(unittest.TestCase):
                 "queue_path": broker_preview["queue_path"],
             },
         )
+        approval["approval_token"] = "TOKEN_1"
+        return approval
 
     def _guard(self, records: list[dict] | None = None, *, context: dict | None = None) -> dict:
         guard_context = {
@@ -169,9 +171,32 @@ class SellDispatchFinalGuardChainTests(unittest.TestCase):
         self.assertEqual(["CANDIDATE_1", "CANDIDATE_2", "CANDIDATE_3"], result["candidate_ids"])
 
     def test_missing_approval_token_blocks(self):
-        result = self._guard(context={"approval_token": ""})
+        approval = self._approval()
+        approval["approval_token"] = ""
+        result = build_sell_dispatch_final_execution_guard(
+            approval,
+            {"account_no": "12345678", "market_open": True},
+        )
 
         self.assertEqual(result["status"], "BLOCKED")
+
+    def test_gate_token_and_matching_context_token_ready(self):
+        result = self._guard(context={"approval_token": "TOKEN_1"})
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["approval_token_present"])
+        self.assertNotIn("TOKEN_1", json.dumps(result, ensure_ascii=False))
+
+    def test_gate_token_and_mutated_context_token_invalid(self):
+        result = self._guard(context={"approval_token": "TOKEN_MUTATED"})
+
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_context_token_omitted_uses_gate_token(self):
+        result = self._guard(context={"approval_token": None})
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["approval_token_present"])
 
     def test_queue_record_missing_blocks(self):
         approval = self._approval()

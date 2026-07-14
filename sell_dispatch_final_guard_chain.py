@@ -54,7 +54,9 @@ def build_sell_dispatch_final_execution_guard(approval_gate: Any, guard_context:
             "guarded_candidates": [],
             "blocked_candidates": [],
             "candidate_ids": [],
-            "source_approval_snapshot": deepcopy(approval_gate) if isinstance(approval_gate, dict) else None,
+            "approval_token_present": False,
+            "approval_token_hash": "",
+            "source_approval_snapshot": _sanitize_token_snapshot(approval_gate) if isinstance(approval_gate, dict) else None,
         }
     )
     context = _as_dict(guard_context)
@@ -76,9 +78,12 @@ def build_sell_dispatch_final_execution_guard(approval_gate: Any, guard_context:
     if approval_gate.get("dispatch_execution_allowed") is not True:
         return _finish(result, BLOCKED, "dispatch_execution_allowed must be True")
 
-    approval_token = _text(context.get("approval_token") or approval_gate.get("approval_token"))
+    approval_token = _text(approval_gate.get("approval_token"))
+    context_token = _text(context.get("approval_token"))
     if not approval_token:
         return _finish(result, BLOCKED, "approval_token is required")
+    if context_token and context_token != approval_token:
+        return _finish(result, INVALID, "guard_context approval_token mismatch")
 
     previews = approval_gate.get("approved_broker_request_previews")
     if not isinstance(previews, list) or not previews:
@@ -135,6 +140,8 @@ def build_sell_dispatch_final_execution_guard(approval_gate: Any, guard_context:
     result["candidate_ids"] = list(expected_ids)
     result["guarded_candidates"] = deepcopy(guarded)
     result["blocked_candidates"] = deepcopy(blocked)
+    result["approval_token_present"] = True
+    result["approval_token_hash"] = _sha256_text(approval_token)
     result["summary"] = {
         "candidate_count": len(previews),
         "guard_ready_count": len(guarded),
@@ -315,6 +322,14 @@ def _queue_commit_result(record: dict[str, Any]) -> dict[str, Any]:
             "execution_enabled": False,
         },
     }
+
+
+def _sanitize_token_snapshot(value: dict[str, Any]) -> dict[str, Any]:
+    snapshot = deepcopy(value)
+    token = _text(snapshot.pop("approval_token", ""))
+    snapshot["approval_token_present"] = bool(token)
+    snapshot["approval_token_hash"] = _sha256_text(token) if token else ""
+    return snapshot
 
 
 def _sell_guard_reason(preview: dict[str, Any], context: dict[str, Any]) -> str | None:
