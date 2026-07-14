@@ -337,7 +337,8 @@ def _normalize_commit_result(action: dict[str, Any], commit_result: Any) -> dict
             "reasons": ["commit_execution_queue_write result must be a dict"],
         }
 
-    status = READY if commit_result.get("committed") is True else BLOCKED
+    committed = commit_result.get("committed") is True
+    status = READY if committed else BLOCKED
     reasons = deepcopy(commit_result.get("blocked_reasons")) if isinstance(commit_result.get("blocked_reasons"), list) else []
     if status == READY:
         mismatches = _commit_result_mismatches(action, commit_result)
@@ -357,16 +358,16 @@ def _normalize_commit_result(action: dict[str, Any], commit_result: Any) -> dict
         "lock_id": action["lock_id"],
         "commit_result": deepcopy(commit_result),
         "source_approved_action": deepcopy(action),
-        "runtime_write": status == READY,
-        "queue_write": status == READY,
-        "file_write": status == READY,
-        "queue_committed": status == READY,
+        "runtime_write": committed,
+        "queue_write": committed,
+        "file_write": committed,
+        "queue_committed": committed,
         "send_order": False,
         "broker_api_called": False,
         "actual_order_sent": False,
         "order_request_created": False,
         "real_ready_state_changed": False,
-        "runtime_commit_executed": status == READY,
+        "runtime_commit_executed": committed,
         "reasons": reasons,
         "warnings": deepcopy(commit_result.get("warnings")) if isinstance(commit_result.get("warnings"), list) else [],
     }
@@ -404,6 +405,13 @@ def _ready_summary_counts_match(summary: Any, approved_actions: list[Any]) -> bo
 def _finish(result: dict[str, Any]) -> dict[str, Any]:
     ready = result.get("status") == READY
     result["commit_allowed"] = ready
+    effect_flags = {
+        "runtime_write": any(item.get("runtime_write") is True for item in result["execution_results"]),
+        "queue_write": any(item.get("queue_write") is True for item in result["execution_results"]),
+        "file_write": any(item.get("file_write") is True for item in result["execution_results"]),
+        "queue_committed": any(item.get("queue_committed") is True for item in result["execution_results"]),
+        "runtime_commit_executed": any(item.get("runtime_commit_executed") is True for item in result["execution_results"]),
+    }
     result["execution_connected"] = False
     result["send_order"] = False
     result["broker_api_called"] = False
@@ -412,23 +420,23 @@ def _finish(result: dict[str, Any]) -> dict[str, Any]:
     result["real_ready_state_changed"] = False
     result["summary"]["execution_result_count"] = len(result["execution_results"])
     result["summary"]["blocked_execution_result_count"] = len(result["blocked_execution_results"])
-    result["summary"]["runtime_write"] = ready
-    result["summary"]["queue_write"] = ready
-    result["summary"]["file_write"] = ready
-    result["summary"]["queue_committed"] = ready
+    result["summary"]["runtime_write"] = effect_flags["runtime_write"]
+    result["summary"]["queue_write"] = effect_flags["queue_write"]
+    result["summary"]["file_write"] = effect_flags["file_write"]
+    result["summary"]["queue_committed"] = effect_flags["queue_committed"]
     result["summary"]["send_order"] = False
     result["summary"]["broker_api_called"] = False
     result["summary"]["actual_order_sent"] = False
     result["summary"]["order_request_created"] = False
     result["summary"]["real_ready_state_changed"] = False
-    result["summary"]["runtime_commit_executed"] = ready
+    result["summary"]["runtime_commit_executed"] = effect_flags["runtime_commit_executed"]
     result["summary"]["priority_selected"] = False
     result["summary"]["auto_selected"] = False
-    result["runtime_write"] = ready
-    result["queue_write"] = ready
-    result["file_write"] = ready
-    result["queue_committed"] = ready
-    result["runtime_commit_executed"] = ready
+    result["runtime_write"] = effect_flags["runtime_write"]
+    result["queue_write"] = effect_flags["queue_write"]
+    result["file_write"] = effect_flags["file_write"]
+    result["queue_committed"] = effect_flags["queue_committed"]
+    result["runtime_commit_executed"] = effect_flags["runtime_commit_executed"]
     return result
 
 

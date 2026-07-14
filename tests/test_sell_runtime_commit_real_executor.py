@@ -337,6 +337,44 @@ class SellRuntimeCommitRealExecutorTests(unittest.TestCase):
         self.assertFalse(result["actual_order_sent"])
         self.assertFalse(result["real_ready_state_changed"])
 
+    def test_committed_true_with_identity_mismatch_keeps_effect_flags_but_invalidates_status(self):
+        queue_path = self._queue_path()
+        commit_result = {
+            "committed": True,
+            "write_stage": "order_queued_record_committed",
+            "next_stage": "QUEUE_COMMITTED_REVIEW_REQUIRED",
+            "changed": True,
+            "order_queue_path": str(queue_path),
+            "backup_path": str(queue_path) + ".bak",
+            "order_id": "ORDER_1",
+            "order_queued_id": "ORDER_QUEUED_ORDER_1",
+            "request_hash": "mismatch",
+            "lock_id": "LOCK_1",
+            "status": "ORDER_QUEUED",
+            "send_order_called": False,
+            "execution_enabled": False,
+            "blocked_reasons": [],
+            "warnings": [],
+        }
+
+        with (
+            mock.patch("sell_runtime_commit_real_executor.commit_execution_queue_write", return_value=commit_result),
+            mock.patch("kiwoom_order_adapter.send_order_stub") as send_order_stub,
+        ):
+            result = execute_sell_runtime_commit(_approval(_approved_action(queue_path=str(queue_path))))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertTrue(result["queue_committed"])
+        self.assertTrue(result["runtime_write"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["runtime_commit_executed"])
+        self.assertTrue(result["execution_results"][0]["queue_committed"])
+        self.assertTrue(result["execution_results"][0]["runtime_write"])
+        self.assertFalse(result["send_order"])
+        self.assertFalse(result["broker_api_called"])
+        self.assertFalse(result["actual_order_sent"])
+        send_order_stub.assert_not_called()
+
     def test_project_runtime_order_queue_not_touched(self):
         runtime_queue = Path(__file__).resolve().parents[1] / "runtime" / "order_queue.json"
         before = hashlib.sha256(runtime_queue.read_bytes()).hexdigest()
