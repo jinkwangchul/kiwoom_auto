@@ -11,12 +11,23 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from execution_queue_writer import (
+    mark_send_order_attempted,
+    mark_send_order_call_in_progress,
+    record_broker_send_accepted,
+    record_broker_send_rejected,
+    record_broker_send_uncertain,
+)
+
 
 STATUS_SENT = "SEND_ORDER_SENT"
 STATUS_FAILED = "SEND_ORDER_FAILED"
 STATUS_BLOCKED = "BLOCKED"
 STATUS_INVALID = "INVALID"
 STATUS_ERROR = "ERROR"
+STATUS_SEND_CALL_ACCEPTED = "SEND_CALL_ACCEPTED"
+STATUS_SEND_CALL_REJECTED = "SEND_CALL_REJECTED"
+STATUS_SEND_UNCERTAIN = "SEND_UNCERTAIN"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -166,3 +177,231 @@ def execute_kiwoom_send_order(
         send_order_called=True,
         broker_called=True,
     )
+
+
+def _blocked_result(stage: str, reason: str, **extra: Any) -> dict[str, Any]:
+    result = {
+        "executor_type": "KIWOOM_CLAIMED_SEND_ORDER_EXECUTOR",
+        "status": STATUS_BLOCKED,
+        "executor_stage": stage,
+        "callable_executed": False,
+        "queue_result_recorded": False,
+        "send_order_called": False,
+        "broker_call_executed": False,
+        "broker_api_called": False,
+        "actual_order_sent": False,
+        "automatic_retry_allowed": False,
+        "manual_reconciliation_required": False,
+        "blocked_reasons": [reason],
+        "warnings": [],
+    }
+    result.update(extra)
+    return result
+
+
+def _uncertain_result(stage: str, reason: str, **extra: Any) -> dict[str, Any]:
+    result = {
+        "executor_type": "KIWOOM_CLAIMED_SEND_ORDER_EXECUTOR",
+        "status": STATUS_SEND_UNCERTAIN,
+        "executor_stage": stage,
+        "callable_executed": bool(extra.get("callable_executed", True)),
+        "queue_result_recorded": False,
+        "send_order_called": bool(extra.get("send_order_called", True)),
+        "broker_call_executed": bool(extra.get("broker_call_executed", True)),
+        "broker_api_called": bool(extra.get("broker_api_called", True)),
+        "actual_order_sent": False,
+        "automatic_retry_allowed": False,
+        "manual_reconciliation_required": True,
+        "uncertain_reason": reason,
+        "blocked_reasons": [],
+        "warnings": ["manual reconciliation required"],
+    }
+    result.update(extra)
+    return result
+
+
+def _merge_writer_result(prefix: str, writer_result: Any) -> dict[str, Any]:
+    data = deepcopy(writer_result) if isinstance(writer_result, dict) else {}
+    return {f"{prefix}_result": data}
+
+
+def execute_claimed_send_order(
+    queue_path: Any,
+    identity: Any,
+    dispatch_claim_id: str,
+    claim_token: str,
+    claim_owner: str,
+    expected_revision: int | None,
+    send_order_callable: Any,
+    send_order_args: Any,
+    context: Any = None,
+) -> dict[str, Any]:
+    """Execute one already-claimed SendOrder through the durable queue lifecycle."""
+    ctx = _as_dict(context)
+    if expected_revision is None:
+        return _blocked_result("revision_cas", "expected_revision is required")
+    if not callable(send_order_callable):
+        return _blocked_result("send_order_callable", "send_order_callable must be callable")
+    if not isinstance(send_order_args, list) or len(send_order_args) != 9:
+        return _blocked_result("send_order_args", "send_order_args must contain 9 values")
+
+    attempt = mark_send_order_attempted(
+        queue_path,
+        identity,
+        dispatch_claim_id=dispatch_claim_id,
+        claim_token=claim_token,
+        claim_owner=claim_owner,
+        attempt_owner=ctx.get("send_order_attempt_owner") or claim_owner,
+        attempt_source=ctx.get("send_order_attempt_source") or "claimed_send_order_executor",
+        context=ctx,
+        expected_revision=expected_revision,
+        attempt_id=ctx.get("send_order_attempt_id"),
+    )
+    if attempt.get("committed") is not True or attempt.get("post_write_verified") is not True:
+        return _blocked_result(
+            "send_order_attempt",
+            _first_reason(attempt, "send order attempt was not recorded"),
+            **_merge_writer_result("attempt", attempt),
+        )
+
+    attempt_id = _text(attempt.get("send_order_attempt_id"))
+    in_progress = mark_send_order_call_in_progress(
+        queue_path,
+        identity,
+        dispatch_claim_id=dispatch_claim_id,
+        send_order_attempt_id=attempt_id,
+        context=ctx,
+        expected_revision=attempt.get("revision_after"),
+    )
+    if in_progress.get("committed") is not True or in_progress.get("post_write_verified") is not True:
+        return _blocked_result(
+            "send_call_start",
+            _first_reason(in_progress, "send call in-progress marker was not recorded"),
+            **_merge_writer_result("attempt", attempt),
+            **_merge_writer_result("in_progress", in_progress),
+        )
+
+    args_for_callable = deepcopy(send_order_args)
+    raw_result: Any = None
+    callable_error = ""
+    try:
+        raw_result = send_order_callable(*args_for_callable)
+    except Exception as exc:  # pragma: no cover - covered by tests
+        callable_error = str(exc)
+
+    result_revision = in_progress.get("revision_after")
+    if callable_error:
+        recorded = record_broker_send_uncertain(
+            queue_path,
+            identity,
+            dispatch_claim_id=dispatch_claim_id,
+            send_order_attempt_id=attempt_id,
+            uncertain_reason=f"send_order_callable raised exception: {callable_error}",
+            context=ctx,
+            expected_revision=result_revision,
+        )
+        if recorded.get("committed") is not True or recorded.get("post_write_verified") is not True:
+            return _uncertain_result(
+                "send_call_result_record",
+                "callable executed but uncertain result record failed",
+                callable_executed=True,
+                callable_exception=callable_error,
+                raw_result=None,
+                **_merge_writer_result("attempt", attempt),
+                **_merge_writer_result("in_progress", in_progress),
+                **_merge_writer_result("record", recorded),
+            )
+        return _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=None, callable_exception=callable_error)
+
+    code = _return_code(raw_result)
+    if code == 0:
+        recorded = record_broker_send_accepted(
+            queue_path,
+            identity,
+            dispatch_claim_id=dispatch_claim_id,
+            send_order_attempt_id=attempt_id,
+            broker_return_code=code,
+            context=ctx,
+            expected_revision=result_revision,
+        )
+    elif code is None:
+        recorded = record_broker_send_uncertain(
+            queue_path,
+            identity,
+            dispatch_claim_id=dispatch_claim_id,
+            send_order_attempt_id=attempt_id,
+            uncertain_reason="send order return code is unknown",
+            context=ctx,
+            expected_revision=result_revision,
+        )
+    else:
+        recorded = record_broker_send_rejected(
+            queue_path,
+            identity,
+            dispatch_claim_id=dispatch_claim_id,
+            send_order_attempt_id=attempt_id,
+            broker_return_code=code,
+            broker_error_code=code,
+            broker_error_message="send order callable returned non-zero code",
+            context=ctx,
+            expected_revision=result_revision,
+        )
+
+    if recorded.get("committed") is not True or recorded.get("post_write_verified") is not True:
+        return _uncertain_result(
+            "send_call_result_record",
+            "callable executed but durable result record failed",
+            callable_executed=True,
+            raw_result=deepcopy(raw_result),
+            return_code=code,
+            **_merge_writer_result("attempt", attempt),
+            **_merge_writer_result("in_progress", in_progress),
+            **_merge_writer_result("record", recorded),
+        )
+    return _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=raw_result, return_code=code)
+
+
+def _first_reason(result: dict[str, Any], fallback: str) -> str:
+    reasons = result.get("blocked_reasons")
+    if isinstance(reasons, list) and reasons:
+        return _text(reasons[0]) or fallback
+    return fallback
+
+
+def _finish_claimed_call_result(
+    recorded: dict[str, Any],
+    attempt: dict[str, Any],
+    in_progress: dict[str, Any],
+    *,
+    raw_result: Any,
+    return_code: Any = None,
+    callable_exception: str = "",
+) -> dict[str, Any]:
+    status = _text(recorded.get("status")) or STATUS_SEND_UNCERTAIN
+    return {
+        "executor_type": "KIWOOM_CLAIMED_SEND_ORDER_EXECUTOR",
+        "status": status,
+        "executor_stage": "send_call_result_recorded",
+        "callable_executed": True,
+        "queue_result_recorded": True,
+        "send_order_called": True,
+        "broker_call_executed": True,
+        "broker_api_called": True,
+        "actual_order_sent": False,
+        "send_call_result_known": recorded.get("send_call_result_known") is True,
+        "send_call_accepted": recorded.get("send_call_accepted") is True,
+        "send_call_rejected": recorded.get("send_call_rejected") is True,
+        "send_uncertain": recorded.get("send_uncertain") is True,
+        "automatic_retry_allowed": False,
+        "manual_reconciliation_required": recorded.get("manual_reconciliation_required") is True,
+        "return_code": return_code if return_code is not None else recorded.get("broker_return_code"),
+        "raw_result": deepcopy(raw_result),
+        "callable_exception": callable_exception,
+        "send_order_attempt_id": attempt.get("send_order_attempt_id"),
+        "dispatch_claim_id": attempt.get("dispatch_claim_id"),
+        "attempt_result": deepcopy(attempt),
+        "in_progress_result": deepcopy(in_progress),
+        "record_result": deepcopy(recorded),
+        "blocked_reasons": [],
+        "warnings": list(recorded.get("warnings") or []),
+    }
