@@ -150,6 +150,16 @@ def _time_text(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_time_text(value: Any) -> datetime | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def _sha256_text(value: Any) -> str:
     return hashlib.sha256(_clean_text(value).encode("utf-8")).hexdigest()
 
@@ -1605,6 +1615,472 @@ def release_dispatch_claim(
     else:
         result.setdefault("released", False)
     return result
+
+
+def _send_attempt_record_blocked(
+    record: dict[str, Any],
+    *,
+    dispatch_claim_id: str,
+    claim_token_hash: str,
+    claim_owner: str,
+) -> dict[str, Any] | None:
+    if record.get("status") != "DISPATCH_CLAIMED":
+        return _commit_blocked("send_order_attempt", "target record status is not DISPATCH_CLAIMED")
+    if record.get("dispatch_claimed") is not True:
+        return _commit_blocked("send_order_attempt", "target record dispatch_claimed is not true")
+    if _clean_text(record.get("dispatch_claim_id")) != dispatch_claim_id:
+        return _commit_blocked("send_order_attempt", "dispatch claim id mismatch")
+    if _clean_text(record.get("dispatch_claim_token_hash")) != claim_token_hash:
+        return _commit_blocked("send_order_attempt", "dispatch claim token hash mismatch")
+    if _clean_text(record.get("dispatch_claim_owner")) != claim_owner:
+        return _commit_blocked("send_order_attempt", "dispatch claim owner mismatch")
+    expires_at = _parse_time_text(record.get("dispatch_claim_expires_at"))
+    if expires_at is None:
+        return _commit_blocked("send_order_attempt", "dispatch claim expiration is required")
+    if datetime.now() >= expires_at:
+        return _commit_blocked("stale_dispatch_claim", "dispatch claim expired; manual reconciliation required")
+    if record.get("send_order_called") is not False:
+        return _commit_blocked("send_order_attempt", "target record send_order_called is not false")
+    if _clean_text(record.get("broker_order_no")):
+        return _commit_blocked("send_order_attempt", "target record already has broker_order_no")
+    if _clean_text(record.get("send_order_attempt_id")):
+        return _commit_blocked("send_order_attempt", "send order attempt already recorded")
+    return None
+
+
+def mark_send_order_attempted(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    claim_token: str,
+    claim_owner: str,
+    attempt_owner: str | None = None,
+    attempt_source: str | None = None,
+    context: Any = None,
+    expected_revision: int | None = None,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
+    """Record a durable SEND_ATTEMPTED state without calling SendOrder."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked, expected_revision=expected_revision)
+    if expected_revision is None:
+        return _with_queue_metadata(_commit_blocked("revision_cas", "expected_revision is required for send order attempt"))
+
+    normalized_claim_id = _clean_text(dispatch_claim_id)
+    normalized_claim_token_hash = _sha256_text(claim_token)
+    normalized_claim_owner = _clean_text(claim_owner)
+    if not normalized_claim_id:
+        return _with_queue_metadata(_commit_blocked("send_order_attempt", "dispatch claim id is required"), expected_revision=expected_revision)
+    if not _clean_text(claim_token):
+        return _with_queue_metadata(_commit_blocked("send_order_attempt", "dispatch claim token is required"), expected_revision=expected_revision)
+    if not normalized_claim_owner:
+        return _with_queue_metadata(_commit_blocked("send_order_attempt", "dispatch claim owner is required"), expected_revision=expected_revision)
+
+    owner = _clean_text(attempt_owner or _as_dict(context).get("send_order_attempt_owner") or normalized_claim_owner)
+    source = _clean_text(attempt_source or _as_dict(context).get("send_order_attempt_source") or "dispatch_claim")
+    if not owner:
+        return _with_queue_metadata(_commit_blocked("send_order_attempt", "send order attempt owner is required"), expected_revision=expected_revision)
+    if not source:
+        return _with_queue_metadata(_commit_blocked("send_order_attempt", "send order attempt source is required"), expected_revision=expected_revision)
+
+    normalized_attempt_id = _clean_text(attempt_id) or f"SEND_ATTEMPT_{uuid4().hex}"
+    attempted_at = datetime.now()
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        matches = _dispatch_matching_records(data, normalized_identity)
+        if len(matches) != 1:
+            return {"blocked": _commit_blocked("send_order_attempt", f"send order target matching record count is {len(matches)}")}
+        target = matches[0]
+        record_blocked = _send_attempt_record_blocked(
+            target,
+            dispatch_claim_id=normalized_claim_id,
+            claim_token_hash=normalized_claim_token_hash,
+            claim_owner=normalized_claim_owner,
+        )
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
+
+        updated_data = deepcopy(data)
+        for index, item in enumerate(updated_data["orders"]):
+            if _dispatch_identity_matches(_as_dict(item), normalized_identity):
+                updated_record = deepcopy(item)
+                updated_record.update(
+                    {
+                        "status": "SEND_ATTEMPTED",
+                        "send_order_called": True,
+                        "send_order_attempted": True,
+                        "send_order_attempt_recorded": True,
+                        "send_order_attempt_id": normalized_attempt_id,
+                        "send_order_attempted_at": _time_text(attempted_at),
+                        "send_order_attempt_owner": owner,
+                        "send_order_attempt_source": source,
+                        "send_order_attempt_revision": _normalize_revision(data),
+                        "send_order_attempt_count": int(updated_record.get("send_order_attempt_count") or 0) + 1,
+                        "broker_call_executed": False,
+                        "actual_order_sent": False,
+                        "broker_api_called": False,
+                        "broker_result_known": False,
+                        "automatic_retry_allowed": False,
+                        "updated_at": _time_text(attempted_at),
+                    }
+                )
+                updated_data["orders"][index] = updated_record
+                return {
+                    "data": updated_data,
+                    "result": {
+                        "attempt_recorded": True,
+                        "status": "SEND_ATTEMPTED",
+                        "send_order_attempt_id": normalized_attempt_id,
+                        "send_order_attempted_at": _time_text(attempted_at),
+                        "send_order_attempt_owner": owner,
+                        "send_order_attempt_source": source,
+                        "send_order_attempt_count": updated_record["send_order_attempt_count"],
+                        "dispatch_claim_id": normalized_claim_id,
+                        "dispatch_generation": updated_record.get("dispatch_generation"),
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "send_order_called": True,
+                        "send_order_attempt_recorded": True,
+                        "broker_call_executed": False,
+                        "actual_order_sent": False,
+                        "broker_api_called": False,
+                        "broker_result_known": False,
+                        "automatic_retry_allowed": False,
+                    },
+                }
+        return {"blocked": _commit_blocked("send_order_attempt", "send order target disappeared before mutation")}
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = _dispatch_matching_records(after_data, normalized_identity)
+        if len(matches) != 1:
+            return _commit_blocked("post_send_order_attempt_verify", f"attempted record count is {len(matches)}")
+        record = matches[0]
+        if record.get("status") != "SEND_ATTEMPTED":
+            return _commit_blocked("post_send_order_attempt_verify", "send order attempt status was not persisted")
+        if _clean_text(record.get("send_order_attempt_id")) != normalized_attempt_id:
+            return _commit_blocked("post_send_order_attempt_verify", "send order attempt id mismatch after write")
+        if record.get("broker_call_executed") is not False or record.get("broker_api_called") is not False:
+            return _commit_blocked("post_send_order_attempt_verify", "send order attempt executed broker call")
+        return None
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="send_order_attempt",
+        success_stage="send_order_attempt_recorded",
+        next_stage="SEND_ORDER_RESULT_RECORD_REQUIRED",
+        backup=True,
+        context=context,
+        expected_revision=expected_revision,
+        verify=verify,
+    )
+    if result.get("committed") is True:
+        result.setdefault("attempt_recorded", True)
+        result.setdefault("status", "SEND_ATTEMPTED")
+    else:
+        result.setdefault("attempt_recorded", False)
+    return result
+
+
+def _broker_result_record_blocked(
+    record: dict[str, Any],
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+) -> dict[str, Any] | None:
+    if record.get("status") != "SEND_ATTEMPTED":
+        return _commit_blocked("broker_send_result", "target record status is not SEND_ATTEMPTED")
+    if _clean_text(record.get("dispatch_claim_id")) != dispatch_claim_id:
+        return _commit_blocked("broker_send_result", "dispatch claim id mismatch")
+    if _clean_text(record.get("send_order_attempt_id")) != send_order_attempt_id:
+        return _commit_blocked("broker_send_result", "send order attempt id mismatch")
+    if record.get("broker_result_known") is True or record.get("broker_accepted") is True or record.get("broker_rejected") is True or record.get("send_uncertain") is True:
+        return _commit_blocked("broker_send_result", "send order attempt already has broker result")
+    return None
+
+
+def _record_broker_send_result(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+    result_status: str,
+    context: Any = None,
+    expected_revision: int | None = None,
+    broker_return_code: Any = None,
+    broker_error_code: Any = None,
+    broker_error_message: Any = None,
+    broker_order_no: Any = None,
+    uncertain_reason: Any = None,
+) -> dict[str, Any]:
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked, expected_revision=expected_revision)
+    if expected_revision is None:
+        return _with_queue_metadata(_commit_blocked("revision_cas", "expected_revision is required for broker send result"))
+
+    normalized_claim_id = _clean_text(dispatch_claim_id)
+    normalized_attempt_id = _clean_text(send_order_attempt_id)
+    if not normalized_claim_id:
+        return _with_queue_metadata(_commit_blocked("broker_send_result", "dispatch claim id is required"), expected_revision=expected_revision)
+    if not normalized_attempt_id:
+        return _with_queue_metadata(_commit_blocked("broker_send_result", "send order attempt id is required"), expected_revision=expected_revision)
+    if result_status not in {"BROKER_ACCEPTED", "BROKER_REJECTED", "SEND_UNCERTAIN"}:
+        return _with_queue_metadata(_commit_blocked("broker_send_result", "broker send result status is invalid"), expected_revision=expected_revision)
+
+    recorded_at = datetime.now()
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        matches = _dispatch_matching_records(data, normalized_identity)
+        if len(matches) != 1:
+            return {"blocked": _commit_blocked("broker_send_result", f"broker result target matching record count is {len(matches)}")}
+        target = matches[0]
+        record_blocked = _broker_result_record_blocked(
+            target,
+            dispatch_claim_id=normalized_claim_id,
+            send_order_attempt_id=normalized_attempt_id,
+        )
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
+
+        updated_data = deepcopy(data)
+        for index, item in enumerate(updated_data["orders"]):
+            if _dispatch_identity_matches(_as_dict(item), normalized_identity):
+                updated_record = deepcopy(item)
+                common = {
+                    "status": result_status,
+                    "dispatch_claim_id": normalized_claim_id,
+                    "send_order_attempt_id": normalized_attempt_id,
+                    "broker_result_recorded_at": _time_text(recorded_at),
+                    "broker_return_code": broker_return_code,
+                    "updated_at": _time_text(recorded_at),
+                }
+                if result_status == "BROKER_ACCEPTED":
+                    common.update(
+                        {
+                            "broker_result_known": True,
+                            "broker_accepted": True,
+                            "broker_rejected": False,
+                            "send_uncertain": False,
+                            "broker_error_code": "",
+                            "broker_error_message": "",
+                            "actual_order_sent": False,
+                            "automatic_retry_allowed": False,
+                        }
+                    )
+                    if _clean_text(broker_order_no):
+                        common["broker_order_no"] = _clean_text(broker_order_no)
+                elif result_status == "BROKER_REJECTED":
+                    common.update(
+                        {
+                            "broker_result_known": True,
+                            "broker_accepted": False,
+                            "broker_rejected": True,
+                            "send_uncertain": False,
+                            "broker_error_code": _clean_text(broker_error_code),
+                            "broker_error_message": _clean_text(broker_error_message),
+                            "actual_order_sent": False,
+                            "automatic_retry_allowed": False,
+                        }
+                    )
+                else:
+                    common.update(
+                        {
+                            "broker_result_known": False,
+                            "broker_accepted": False,
+                            "broker_rejected": False,
+                            "send_uncertain": True,
+                            "uncertain_reason": _clean_text(uncertain_reason) or "send order result is uncertain",
+                            "uncertain_recorded_at": _time_text(recorded_at),
+                            "automatic_retry_allowed": False,
+                            "manual_reconciliation_required": True,
+                            "actual_order_sent": False,
+                        }
+                    )
+                updated_record.update(common)
+                updated_data["orders"][index] = updated_record
+                return {
+                    "data": updated_data,
+                    "result": {
+                        "broker_result_recorded": True,
+                        "status": result_status,
+                        "dispatch_claim_id": normalized_claim_id,
+                        "send_order_attempt_id": normalized_attempt_id,
+                        "broker_result_recorded_at": _time_text(recorded_at),
+                        "broker_result_known": common.get("broker_result_known"),
+                        "broker_accepted": common.get("broker_accepted"),
+                        "broker_rejected": common.get("broker_rejected"),
+                        "send_uncertain": common.get("send_uncertain"),
+                        "automatic_retry_allowed": common.get("automatic_retry_allowed"),
+                        "manual_reconciliation_required": common.get("manual_reconciliation_required", False),
+                        "claimed_identity": deepcopy(normalized_identity),
+                    },
+                }
+        return {"blocked": _commit_blocked("broker_send_result", "broker result target disappeared before mutation")}
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = _dispatch_matching_records(after_data, normalized_identity)
+        if len(matches) != 1:
+            return _commit_blocked("post_broker_send_result_verify", f"broker result record count is {len(matches)}")
+        record = matches[0]
+        if record.get("status") != result_status:
+            return _commit_blocked("post_broker_send_result_verify", "broker send result status was not persisted")
+        if _clean_text(record.get("send_order_attempt_id")) != normalized_attempt_id:
+            return _commit_blocked("post_broker_send_result_verify", "send order attempt id mismatch after result write")
+        return None
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="broker_send_result",
+        success_stage="broker_send_result_recorded",
+        next_stage="BROKER_SEND_RESULT_REVIEW_REQUIRED",
+        backup=True,
+        context=context,
+        expected_revision=expected_revision,
+        verify=verify,
+    )
+    if result.get("committed") is True:
+        result.setdefault("broker_result_recorded", True)
+        result.setdefault("status", result_status)
+    else:
+        result.setdefault("broker_result_recorded", False)
+    return result
+
+
+def record_broker_send_accepted(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+    broker_return_code: Any = 0,
+    broker_order_no: Any = None,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    return _record_broker_send_result(
+        queue_path,
+        identity,
+        dispatch_claim_id=dispatch_claim_id,
+        send_order_attempt_id=send_order_attempt_id,
+        result_status="BROKER_ACCEPTED",
+        broker_return_code=broker_return_code,
+        broker_order_no=broker_order_no,
+        context=context,
+        expected_revision=expected_revision,
+    )
+
+
+def record_broker_send_rejected(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+    broker_return_code: Any = None,
+    broker_error_code: Any = None,
+    broker_error_message: Any = None,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    return _record_broker_send_result(
+        queue_path,
+        identity,
+        dispatch_claim_id=dispatch_claim_id,
+        send_order_attempt_id=send_order_attempt_id,
+        result_status="BROKER_REJECTED",
+        broker_return_code=broker_return_code,
+        broker_error_code=broker_error_code,
+        broker_error_message=broker_error_message,
+        context=context,
+        expected_revision=expected_revision,
+    )
+
+
+def record_broker_send_uncertain(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+    uncertain_reason: Any,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    return _record_broker_send_result(
+        queue_path,
+        identity,
+        dispatch_claim_id=dispatch_claim_id,
+        send_order_attempt_id=send_order_attempt_id,
+        result_status="SEND_UNCERTAIN",
+        uncertain_reason=uncertain_reason,
+        context=context,
+        expected_revision=expected_revision,
+    )
+
+
+def inspect_send_order_lifecycle(queue_path: str | Path, identity: Any, *, context: Any = None) -> dict[str, Any]:
+    """Read the current SendOrder lifecycle state without mutating the queue."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked)
+    target_path = Path(queue_path)
+    try:
+        with _QUEUE_THREAD_LOCK:
+            with _QueueFileLock(target_path, _lock_timeout_sec(context)) as lock:
+                data, read_blocked = _read_queue_file(target_path)
+                if read_blocked is not None:
+                    return _with_queue_metadata(read_blocked, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+                revision = _normalize_revision(data)
+                matches = _dispatch_matching_records(data, normalized_identity)
+                if len(matches) != 1:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("send_order_lifecycle", f"send order lifecycle matching record count is {len(matches)}"),
+                            "lifecycle_inspected": False,
+                        },
+                        revision_before=revision,
+                        revision_after=revision,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                record = matches[0]
+                expires_at = _parse_time_text(record.get("dispatch_claim_expires_at"))
+                return _with_queue_metadata(
+                    {
+                        "committed": False,
+                        "changed": False,
+                        "write_stage": "send_order_lifecycle_inspected",
+                        "next_stage": NEXT_STAGE_BLOCKED,
+                        "lifecycle_inspected": True,
+                        "status": record.get("status"),
+                        "dispatch_claim_id": record.get("dispatch_claim_id"),
+                        "dispatch_generation": record.get("dispatch_generation"),
+                        "send_order_attempt_id": record.get("send_order_attempt_id"),
+                        "send_order_attempt_count": record.get("send_order_attempt_count", 0),
+                        "broker_result_known": record.get("broker_result_known", False),
+                        "broker_accepted": record.get("broker_accepted", False),
+                        "broker_rejected": record.get("broker_rejected", False),
+                        "send_uncertain": record.get("send_uncertain", False),
+                        "automatic_retry_allowed": record.get("automatic_retry_allowed", False),
+                        "manual_reconciliation_required": record.get("manual_reconciliation_required", False),
+                        "dispatch_claim_expired": expires_at is not None and datetime.now() >= expires_at,
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "blocked_reasons": [],
+                        "warnings": [],
+                    },
+                    revision_before=revision,
+                    revision_after=revision,
+                    lock_acquired=True,
+                    lock_wait_ms=lock.wait_ms,
+                )
+    except TimeoutError:
+        return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock timeout"), lock_acquired=False)
+
+    return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock failed"))
 
 
 _RECOVERY_IDENTITY_FIELDS = (
