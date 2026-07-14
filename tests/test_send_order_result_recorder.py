@@ -289,6 +289,49 @@ class SendOrderResultRecorderTest(unittest.TestCase):
         self.assertEqual(before_sha, result["before_sha256"])
         self.assertNotEqual(before_sha, result["after_sha256"])
         self.assertEqual([], result["blocked_reasons"])
+        self.assertEqual(1, self._read_json()["revision"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+
+    def test_stale_expected_revision_is_blocked_without_backup(self) -> None:
+        self._write_queue()
+
+        result = self._record_result(context={"manual_send_order_result_record_confirmed": True, "expected_revision": 9})
+
+        self.assertFalse(result["recorded"])
+        self.assertEqual("revision_cas", result["record_stage"])
+        self.assertEqual(0, self._read_json().get("revision", 0))
+        self.assertFalse(Path(str(self.queue_path) + ".bak").exists())
+
+    def test_post_write_failure_preserves_canonical_side_effects(self) -> None:
+        self._write_queue()
+        writer_result = {
+            "committed": True,
+            "changed": True,
+            "file_write": True,
+            "queue_write": True,
+            "queue_committed": True,
+            "post_write_verified": False,
+            "revision_before": 0,
+            "revision_after": 1,
+            "lock_acquired": True,
+            "cas_checked": True,
+            "write_stage": "post_write_verify",
+            "blocked_reasons": ["forced post-write failure"],
+            "warnings": [],
+        }
+
+        with mock.patch("send_order_result_recorder.mutate_order_queue", return_value=writer_result):
+            result = self._record_result(
+                context={"manual_send_order_result_record_confirmed": True, "expected_revision": 0}
+            )
+
+        self.assertFalse(result["recorded"])
+        for field in ("committed", "changed", "file_write", "queue_write", "queue_committed", "lock_acquired", "cas_checked"):
+            self.assertTrue(result[field], field)
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
 
     def test_success_records_expected_fields(self) -> None:
         self._write_queue()

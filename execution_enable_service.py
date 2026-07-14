@@ -11,11 +11,10 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
-import os
 from pathlib import Path
-import shutil
 from typing import Any
-from uuid import uuid4
+
+from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -80,6 +79,11 @@ def _commit_confirmed(context: Any) -> bool:
     )
 
 
+def _expected_revision(context: Any) -> int | None:
+    value = _as_dict(context).get("expected_revision")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
 
@@ -105,24 +109,6 @@ def _read_queue_file(queue_path: Path) -> tuple[dict[str, Any], dict[str, Any] |
             return {}, _commit_blocked("read_queue", "order_queue orders must contain only objects")
 
     return data, None
-
-
-def _write_json_atomic(queue_path: Path, data: dict[str, Any]) -> str:
-    tmp_path = queue_path.with_name(f".{queue_path.name}.{uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, queue_path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-    return str(tmp_path)
 
 
 def preview_execution_enable(order: Any, context: Any = None) -> dict[str, Any]:
@@ -225,75 +211,87 @@ def commit_execution_enable(
                 "queue file changed after execution enable preview; rerun preview",
             )
 
-    data, blocked = _read_queue_file(target_path)
-    if blocked is not None:
-        return blocked
-
     order_id = _clean_text(preview.get("order_id"))
     if not order_id:
         return _commit_blocked("order_id", "enable_preview_result.order_id is required")
 
-    orders = data["orders"]
-    target_order = None
-    for order in orders:
-        if _clean_text(order.get("id")) == order_id:
-            target_order = order
-            break
+    mutation_state: dict[str, Any] = {}
 
-    if target_order is None:
-        return _commit_blocked("order", "target order not found")
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        if snapshot:
+            current_sha256 = _sha256_file(target_path)
+            if current_sha256 != snapshot_sha256:
+                return {
+                    "blocked": _commit_blocked(
+                        "stale_preview",
+                        "queue file changed after execution enable preview; rerun preview",
+                    )
+                }
+        updated_data = deepcopy(data)
+        updated_order = None
+        for order in updated_data["orders"]:
+            if _clean_text(order.get("id")) == order_id:
+                updated_order = order
+                break
+        if updated_order is None:
+            return {"blocked": _commit_blocked("order", "target order not found")}
 
-    validation = preview_execution_enable(
-        target_order,
-        {"operator_confirmed_for_execution_enable": True},
+        validation = preview_execution_enable(
+            updated_order,
+            {"operator_confirmed_for_execution_enable": True},
+        )
+        if validation.get("enable_preview") is not True:
+            reasons = validation.get("blocked_reasons") if isinstance(validation.get("blocked_reasons"), list) else []
+            reason = reasons[0] if reasons else "target order is not eligible for execution enable"
+            return {"blocked": _commit_blocked(str(validation.get("enable_stage", "order")), reason)}
+
+        before_status = _clean_text(updated_order.get("status")).upper()
+        before_execution_enabled = updated_order.get("execution_enabled")
+        updated_order["execution_enabled"] = True
+        mutation_state.update(
+            {
+                "before_status": before_status,
+                "after_status": _clean_text(updated_order.get("status")).upper(),
+                "before_execution_enabled": before_execution_enabled,
+                "after_execution_enabled": updated_order.get("execution_enabled"),
+            }
+        )
+        return {"data": updated_data}
+
+    mutation_result = mutate_order_queue(
+        target_path,
+        mutate,
+        operation_name="target_record_patch",
+        success_stage="execution_enabled_committed",
+        next_stage=NEXT_STAGE_REAL_PREFLIGHT_REQUIRED,
+        backup=backup,
+        context=context,
+        expected_revision=_expected_revision(context),
     )
-    if validation.get("enable_preview") is not True:
-        reasons = validation.get("blocked_reasons") if isinstance(validation.get("blocked_reasons"), list) else []
-        reason = reasons[0] if reasons else "target order is not eligible for execution enable"
-        return _commit_blocked(str(validation.get("enable_stage", "order")), reason)
-
-    updated_data = deepcopy(data)
-    updated_order = None
-    for order in updated_data["orders"]:
-        if _clean_text(order.get("id")) == order_id:
-            updated_order = order
-            break
-
-    if updated_order is None:
-        return _commit_blocked("order", "target order not found")
-
-    before_status = _clean_text(updated_order.get("status")).upper()
-    before_execution_enabled = updated_order.get("execution_enabled")
-    updated_order["execution_enabled"] = True
-
-    backup_path = None
-    if backup:
-        backup_path = str(target_path) + ".bak"
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception as exc:
-            return _commit_blocked("backup", f"failed to create backup: {exc}")
-
-    try:
-        _write_json_atomic(target_path, updated_data)
-    except Exception as exc:
-        return _commit_blocked("write_queue", f"failed to write order_queue json: {exc}")
+    if mutation_result.get("committed") is not True or mutation_result.get("post_write_verified") is not True:
+        stage = _clean_text(mutation_result.get("enable_stage") or mutation_result.get("write_stage")) or "write_queue"
+        reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
+        blocked = _commit_blocked(stage, reasons[0] if reasons else "queue mutation failed")
+        blocked.update({key: value for key, value in mutation_result.items() if key not in blocked})
+        return preserve_queue_mutation_result(blocked, mutation_result)
 
     after_sha256 = _sha256_file(target_path)
-    return {
+    result = {
         "enabled": True,
         "enable_stage": "execution_enabled_committed",
         "next_stage": NEXT_STAGE_REAL_PREFLIGHT_REQUIRED,
         "changed": before_sha256 != after_sha256,
         "order_queue_path": str(target_path),
-        "backup_path": backup_path,
+        "backup_path": mutation_result.get("backup_path"),
         "order_id": order_id,
-        "before_status": before_status,
-        "after_status": _clean_text(updated_order.get("status")).upper(),
-        "before_execution_enabled": before_execution_enabled,
-        "after_execution_enabled": updated_order.get("execution_enabled"),
+        "before_status": mutation_state["before_status"],
+        "after_status": mutation_state["after_status"],
+        "before_execution_enabled": mutation_state["before_execution_enabled"],
+        "after_execution_enabled": mutation_state["after_execution_enabled"],
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
         "blocked_reasons": [],
         "warnings": [],
     }
+    result.update({key: value for key, value in mutation_result.items() if key not in result})
+    return preserve_queue_mutation_result(result, mutation_result)

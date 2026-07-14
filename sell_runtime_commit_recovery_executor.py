@@ -11,9 +11,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
-import shutil
 from typing import Any
-from uuid import uuid4
+
+from execution_queue_writer import preserve_queue_mutation_result, restore_order_queue_from_approved_backup
 
 
 READY = "READY"
@@ -60,16 +60,12 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
         return _finish(result)
 
     action = preflight["action"]
-    queue_path = Path(action["queue_path"])
-    backup_path = Path(action["backup_path"])
     identities = _target_identities(action)
-    expected_backup_data = preflight["backup_data"]
-    expected_diff = action["queue_backup_diff"]
 
     execution_result = {
         "status": BLOCKED,
-        "queue_path": str(queue_path),
-        "backup_path": str(backup_path),
+        "queue_path": str(action["queue_path"]),
+        "backup_path": str(action["backup_path"]),
         "safety_backup_path": None,
         "temp_restore_path": None,
         "safety_backup_created": False,
@@ -84,88 +80,46 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
         "warnings": [],
     }
 
-    try:
-        safety_backup_path = _safety_backup_path(queue_path)
-        shutil.copy2(queue_path, safety_backup_path)
-        execution_result["safety_backup_path"] = str(safety_backup_path)
-        execution_result["safety_backup_created"] = True
+    writer_result = restore_order_queue_from_approved_backup(
+        action["queue_path"],
+        action["backup_path"],
+        identities,
+        expected_diff=action["queue_backup_diff"],
+        context={"manual_queue_write_confirmed": True},
+        expected_revision=_expected_revision(action),
+    )
+    execution_result["safety_backup_path"] = writer_result.get("safety_backup_path")
+    execution_result["temp_restore_path"] = writer_result.get("temp_restore_path")
+    execution_result["safety_backup_created"] = writer_result.get("safety_backup_created") is True
+    execution_result["temp_restore_written"] = writer_result.get("temp_restore_written") is True
+    execution_result["restore_executed"] = writer_result.get("restore_executed") is True or writer_result.get("queue_committed") is True
+    execution_result["post_restore_verified"] = writer_result.get("post_write_verified") is True
+    execution_result["writer_result"] = deepcopy(writer_result)
+    _extend_list(execution_result["reasons"], writer_result.get("blocked_reasons"))
+    execution_result = preserve_queue_mutation_result(execution_result, writer_result)
+    result = preserve_queue_mutation_result(result, writer_result)
+
+    if writer_result.get("file_write") is True and writer_result.get("queue_write") is not True:
         _mark_pre_restore_file_effects(result)
-
-        temp_restore_path = _temp_restore_path(queue_path)
-        temp_restore_path.write_text(
-            json.dumps(expected_backup_data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        execution_result["temp_restore_path"] = str(temp_restore_path)
-        execution_result["temp_restore_written"] = True
-        _mark_pre_restore_file_effects(result)
-
-        temp_data, temp_error = _read_json_object(temp_restore_path)
-        if temp_error:
-            execution_result["status"] = BLOCKED
-            execution_result["reasons"].append("temp restore json invalid: " + temp_error)
-            result["status"] = BLOCKED
-            result["blocked_recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
-        if temp_data != expected_backup_data:
-            execution_result["status"] = BLOCKED
-            execution_result["reasons"].append("temp restore json does not match backup data")
-            result["status"] = BLOCKED
-            result["blocked_recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
-        temp_restore_path.replace(queue_path)
-        execution_result["restore_executed"] = True
+    if writer_result.get("queue_write") is True or writer_result.get("queue_committed") is True:
         _mark_restore_effects(result)
 
-        post_data, post_error = _read_json_object(queue_path)
-        if post_error:
-            execution_result["status"] = INVALID
-            execution_result["reasons"].append("restored queue json invalid: " + post_error)
-            result["status"] = INVALID
-            result["recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
-        if post_data != expected_backup_data:
-            execution_result["status"] = INVALID
-            execution_result["reasons"].append("restored queue json does not match backup data")
-            result["status"] = INVALID
-            result["recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
-        post_diff = _queue_backup_diff(post_data, expected_backup_data, identities)
-        if post_diff["queue_matching_record_count"] != 0:
-            execution_result["status"] = INVALID
-            execution_result["reasons"].append("target identity still exists after restore")
-            result["status"] = INVALID
-            result["recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
-        if post_diff["queue_backup_changed"] is not False:
-            execution_result["status"] = INVALID
-            execution_result["reasons"].append("restored queue differs from backup after restore")
-            result["status"] = INVALID
-            result["recovery_results"].append(deepcopy(execution_result))
-            return _finish(result)
-
+    if writer_result.get("committed") is True and writer_result.get("post_write_verified") is True:
         execution_result["status"] = READY
-        execution_result["post_restore_verified"] = True
         result["status"] = READY
         result["recovery_results"].append(deepcopy(execution_result))
         return _finish(result)
-    except Exception as exc:
-        execution_result["status"] = INVALID if execution_result["restore_executed"] else BLOCKED
-        execution_result["reasons"].append(f"recovery execution failed: {exc}")
-        result["status"] = execution_result["status"]
-        if execution_result["restore_executed"]:
-            _mark_restore_effects(result)
-            result["recovery_results"].append(deepcopy(execution_result))
-        else:
-            if execution_result["safety_backup_created"] or execution_result["temp_restore_written"]:
-                _mark_pre_restore_file_effects(result)
-            result["blocked_recovery_results"].append(deepcopy(execution_result))
+
+    if writer_result.get("committed") is True:
+        execution_result["status"] = INVALID
+        result["status"] = INVALID
+        result["recovery_results"].append(deepcopy(execution_result))
         return _finish(result)
+
+    execution_result["status"] = BLOCKED
+    result["status"] = BLOCKED
+    result["blocked_recovery_results"].append(deepcopy(execution_result))
+    return _finish(result)
 
 
 def _base_result(recovery_approval: Any) -> dict[str, Any]:
@@ -277,6 +231,11 @@ def _preflight(approval: dict[str, Any]) -> dict[str, Any]:
     result["queue_data"] = queue_data
     result["backup_data"] = backup_data
     return result
+
+
+def _expected_revision(action: dict[str, Any]) -> int | None:
+    value = action.get("expected_revision")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _action_contract_errors(action: dict[str, Any]) -> list[str]:
@@ -400,14 +359,6 @@ def _diff_matches(current: dict[str, Any], planned: dict[str, Any], target_count
         current.get("queue_matching_counts") == planned_queue_counts
         and current.get("backup_matching_counts") == planned_backup_counts
     )
-
-
-def _safety_backup_path(queue_path: Path) -> Path:
-    return queue_path.with_name(f"{queue_path.name}.recovery_safety.{uuid4().hex}.bak")
-
-
-def _temp_restore_path(queue_path: Path) -> Path:
-    return queue_path.with_name(f"{queue_path.name}.recovery_restore.{uuid4().hex}.tmp")
 
 
 def _mark_restore_effects(result: dict[str, Any]) -> None:

@@ -215,8 +215,8 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
     queue_counts = [len(_matching_records(queue_data, identity)) for identity in identities]
     safety_counts = [len(_matching_records(safety_data, identity)) for identity in identities]
     check_errors = []
-    if queue_data != backup_data:
-        check_errors.append("queue json must match backup json after recovery")
+    if queue_data.get("orders") != backup_data.get("orders"):
+        check_errors.append("queue orders must match backup orders after recovery")
     if sum(queue_counts) != 0:
         check_errors.append("target identity must be absent from queue after recovery")
     if sum(safety_counts) != len(identities) or any(count != 1 for count in safety_counts):
@@ -253,7 +253,7 @@ def _verify_files(execution_result: dict[str, Any]) -> dict[str, Any]:
             "safety_backup_matching_record_count": len(identities),
             "queue_matching_counts": queue_counts,
             "safety_backup_matching_counts": safety_counts,
-            "queue_matches_backup": True,
+            "queue_matches_backup": queue_data.get("orders") == backup_data.get("orders"),
         }
     )
     return result

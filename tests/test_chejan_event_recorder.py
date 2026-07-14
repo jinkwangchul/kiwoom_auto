@@ -6,7 +6,9 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import chejan_event_recorder
 from chejan_event_recorder import record_chejan_event
@@ -207,6 +209,7 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
             result = self._record_event(path)
             record = self._read_queue(path)["orders"][0]
+            data = self._read_queue(path)
             event = record["chejan_events"][0]
 
             self.assertTrue(result["recorded"])
@@ -215,6 +218,119 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertEqual("BRK_1", event["broker_order_no"])
             self.assertEqual("2026-07-04 09:30:00", event["received_at"])
             self.assertEqual(self._event(), event["normalized_event"])
+            self.assertEqual(1, data["revision"])
+            self.assertEqual(0, result["revision_before"])
+            self.assertEqual(1, result["revision_after"])
+
+    def test_broker_execution_number_is_preferred_for_event_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+            event = self._event(raw_event={"fid_values": {"909": "EXECUTION_909_1"}})
+
+            result = self._record_event(path, event=event)
+            stored = self._read_queue(path)["orders"][0]["chejan_events"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("broker_event_id", result["event_identity_source"])
+            self.assertEqual(result["event_identity"], stored["event_identity"])
+
+    def test_duplicate_event_is_idempotent_without_revision_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+
+            first = self._record_event(path)
+            second = self._record_event(path)
+            data = self._read_queue(path)
+
+            self.assertTrue(first["recorded"])
+            self.assertFalse(second["recorded"])
+            self.assertTrue(second["duplicate"])
+            self.assertTrue(second["idempotent"])
+            self.assertFalse(second["committed"])
+            self.assertFalse(second["file_write"])
+            self.assertEqual(1, data["revision"])
+            self.assertEqual(1, len(data["orders"][0]["chejan_events"]))
+
+    def test_distinct_event_identity_appends_normally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+
+            first = self._record_event(path)
+            second = self._record_event(
+                path,
+                event=self._event(filled_quantity=5, remaining_quantity=5),
+            )
+            data = self._read_queue(path)
+
+            self.assertTrue(first["recorded"])
+            self.assertTrue(second["recorded"])
+            self.assertNotEqual(first["event_identity"], second["event_identity"])
+            self.assertEqual(2, data["revision"])
+            self.assertEqual(2, len(data["orders"][0]["chejan_events"]))
+
+    def test_two_threads_record_same_event_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+            start = threading.Event()
+            results: list[dict[str, object]] = []
+
+            def worker() -> None:
+                start.wait()
+                results.append(self._record_event(path))
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(10)
+
+            data = self._read_queue(path)
+            self.assertEqual(2, len(results))
+            self.assertEqual(1, sum(result.get("recorded") is True for result in results))
+            self.assertEqual(1, sum(result.get("duplicate") is True for result in results))
+            self.assertEqual(1, data["revision"])
+            self.assertEqual(1, len(data["orders"][0]["chejan_events"]))
+
+    def test_post_write_failure_preserves_canonical_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+            writer_result = {
+                "committed": True,
+                "changed": True,
+                "file_write": True,
+                "queue_write": True,
+                "queue_committed": True,
+                "post_write_verified": False,
+                "revision_before": 0,
+                "revision_after": 1,
+                "lock_acquired": True,
+                "cas_checked": True,
+                "write_stage": "post_write_verify",
+                "blocked_reasons": ["forced post-write failure"],
+                "warnings": [],
+            }
+
+            with mock.patch("chejan_event_recorder.mutate_order_queue", return_value=writer_result):
+                result = self._record_event(path)
+
+            self.assertFalse(result["recorded"])
+            for field in ("committed", "changed", "file_write", "queue_write", "queue_committed", "lock_acquired", "cas_checked"):
+                self.assertTrue(result[field], field)
+            self.assertFalse(result["post_write_verified"])
+            self.assertEqual(0, result["revision_before"])
+            self.assertEqual(1, result["revision_after"])
+
+    def test_stale_expected_revision_is_blocked_without_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+
+            result = self._record_event(path, context={"manual_chejan_event_record_confirmed": True, "expected_revision": 9})
+
+            self.assertFalse(result["recorded"])
+            self.assertEqual("revision_cas", result["record_stage"])
+            self.assertEqual(0, self._read_queue(path).get("revision", 0))
+            self.assertFalse(Path(str(path) + ".bak").exists())
 
     def test_metadata_is_updated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

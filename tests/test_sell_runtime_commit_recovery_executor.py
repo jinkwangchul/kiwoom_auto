@@ -137,7 +137,8 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
         self.assertTrue(result["backup_restored"])
         self.assertTrue(result["recovery_results"][0]["safety_backup_created"])
         self.assertTrue(result["recovery_results"][0]["temp_restore_written"])
-        self.assertEqual(self._read_json(queue_path), self._read_json(backup_path))
+        self.assertEqual(self._read_json(queue_path)["orders"], self._read_json(backup_path)["orders"])
+        self.assertEqual(1, self._read_json(queue_path)["revision"])
         self.assertEqual(self._read_json(queue_path)["orders"], [])
 
     def test_safety_backup_created(self):
@@ -156,7 +157,7 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
 
         temp_restore = Path(result["recovery_results"][0]["temp_restore_path"])
         self.assertFalse(temp_restore.exists())
-        self.assertEqual(self._read_json(queue_path), self._read_json(backup_path))
+        self.assertEqual(self._read_json(queue_path)["orders"], self._read_json(backup_path)["orders"])
 
     def test_target_identity_removed_after_restore(self):
         queue_path, backup_path = self._queue_files()
@@ -275,21 +276,18 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
     def test_actual_restore_then_post_validation_failure_keeps_side_effect_flags(self):
         queue_path, backup_path = self._queue_files()
         approval = self._approval(queue_path, backup_path)
-        queue_data = self._read_json(queue_path)
-        backup_data = self._read_json(backup_path)
+        import execution_queue_writer
+
+        original_read = execution_queue_writer._read_queue_file
         call_count = {"count": 0}
 
         def fake_read(path):
             call_count["count"] += 1
-            if call_count["count"] == 1:
-                return deepcopy(queue_data), None
-            if call_count["count"] == 2:
-                return deepcopy(backup_data), None
-            if call_count["count"] == 3:
-                return deepcopy(backup_data), None
-            return {"version": 1, "orders": [_record()]}, None
+            if call_count["count"] <= 3:
+                return original_read(path)
+            return {"version": 1, "revision": 1, "orders": [_record()]}, None
 
-        with mock.patch("sell_runtime_commit_recovery_executor._read_json_object", side_effect=fake_read):
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=fake_read):
             result = execute_sell_runtime_commit_recovery(approval)
 
         self.assertEqual(result["status"], "INVALID")
@@ -304,22 +302,60 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
         self.assertFalse(result["order_request_created"])
         self.assertFalse(result["real_ready_state_changed"])
 
+    def test_writer_post_write_failure_preserves_canonical_side_effects(self):
+        queue_path, backup_path = self._queue_files()
+        writer_result = {
+            "committed": True,
+            "changed": True,
+            "file_write": True,
+            "queue_write": True,
+            "queue_committed": True,
+            "post_write_verified": False,
+            "revision_before": 0,
+            "revision_after": 1,
+            "lock_acquired": True,
+            "cas_checked": True,
+            "restore_executed": True,
+            "blocked_reasons": ["forced post-write failure"],
+            "warnings": [],
+        }
+
+        with mock.patch(
+            "sell_runtime_commit_recovery_executor.restore_order_queue_from_approved_backup",
+            return_value=writer_result,
+        ):
+            result = execute_sell_runtime_commit_recovery(self._approval(queue_path, backup_path))
+
+        self.assertEqual("INVALID", result["status"])
+        for field in ("committed", "changed", "file_write", "queue_write", "queue_committed", "lock_acquired", "cas_checked"):
+            self.assertTrue(result[field], field)
+            self.assertTrue(result["recovery_results"][0][field], field)
+        self.assertFalse(result["post_write_verified"])
+        self.assertTrue(result["runtime_write"])
+        self.assertTrue(result["backup_restored"])
+
     def test_temp_restore_validation_failure_keeps_file_write_only(self):
         queue_path, backup_path = self._queue_files()
         approval = self._approval(queue_path, backup_path)
-        queue_data = self._read_json(queue_path)
-        backup_data = self._read_json(backup_path)
+        import execution_queue_writer
+
+        original_read = execution_queue_writer._read_queue_file
         call_count = {"count": 0}
 
         def fake_read(path):
             call_count["count"] += 1
-            if call_count["count"] == 1:
-                return deepcopy(queue_data), None
-            if call_count["count"] == 2:
-                return deepcopy(backup_data), None
-            return {}, "forced temp validation failure"
+            if call_count["count"] <= 2:
+                return original_read(path)
+            return {}, {
+                "committed": False,
+                "write_stage": "read_queue",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "blocked_reasons": ["forced temp validation failure"],
+                "warnings": [],
+            }
 
-        with mock.patch("sell_runtime_commit_recovery_executor._read_json_object", side_effect=fake_read):
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=fake_read):
             result = execute_sell_runtime_commit_recovery(approval)
 
         self.assertEqual(result["status"], "BLOCKED")
@@ -336,7 +372,7 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
     def test_replace_before_restore_failure_keeps_file_write_only(self):
         queue_path, backup_path = self._queue_files()
 
-        with mock.patch("pathlib.Path.replace", side_effect=RuntimeError("replace failed")):
+        with mock.patch("execution_queue_writer.os.replace", side_effect=RuntimeError("replace failed")):
             result = execute_sell_runtime_commit_recovery(self._approval(queue_path, backup_path))
 
         self.assertEqual(result["status"], "BLOCKED")
@@ -474,7 +510,7 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
         self.assertEqual(approval["status"], "READY")
         self.assertEqual(execution["status"], "READY")
         self.assertEqual(post_check["status"], "READY")
-        self.assertEqual(self._read_json(queue_path), self._read_json(backup_path))
+        self.assertEqual(self._read_json(queue_path)["orders"], self._read_json(backup_path)["orders"])
         self.assertEqual(self._read_json(queue_path)["orders"], [])
         self.assertEqual(post_check["checked_records"][0]["target_count"], 2)
 
