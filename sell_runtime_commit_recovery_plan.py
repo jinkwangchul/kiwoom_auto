@@ -115,6 +115,29 @@ def build_sell_runtime_commit_recovery_plan(post_commit_verifier: dict[str, Any]
     queue_records = _matching_records(queue_data, source["identity"])
     backup_records = _matching_records(backup_data, source["identity"])
     diff = _queue_backup_diff(queue_data, backup_data, source["identity"])
+    recovery_block_reasons = _recovery_readiness_errors(diff)
+    if recovery_block_reasons:
+        result["status"] = BLOCKED
+        result["recovery_required"] = True
+        result["recovery_available"] = False
+        result["reasons"].extend(recovery_block_reasons)
+        result["blocked_recovery_plans"].append(
+            {
+                "status": BLOCKED,
+                "manual_only": True,
+                "automatic_restore_performed": False,
+                "queue_path": source["queue_path"],
+                "backup_path": backup_path,
+                "target_identity": deepcopy(source["identity"]),
+                "queue_matching_record_count": len(queue_records),
+                "backup_matching_record_count": len(backup_records),
+                "queue_backup_diff": diff,
+                "reasons": deepcopy(recovery_block_reasons),
+                "source_verification": deepcopy(source["source_verification"]),
+            }
+        )
+        result["summary"]["queue_backup_changed"] = diff["queue_backup_changed"]
+        return _finish(result)
 
     plan = {
         "status": RECOVERY_READY,
@@ -313,6 +336,19 @@ def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], 
         "queue_backup_changed": queue_orders != backup_orders,
         "target_record_changed": queue_target != backup_target,
     }
+
+
+def _recovery_readiness_errors(diff: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if diff["queue_backup_changed"] is not True:
+        errors.append("queue and backup are identical; restoring would not change target state")
+    if diff["target_record_changed"] is not True:
+        errors.append("target record does not differ between queue and backup")
+    if diff["queue_matching_record_count"] != 1:
+        errors.append("current queue must contain exactly one target record")
+    if diff["backup_matching_record_count"] != 0:
+        errors.append("backup must not contain the target record to prove a safe previous state")
+    return errors
 
 
 def _identity_errors(identity: dict[str, Any]) -> list[str]:

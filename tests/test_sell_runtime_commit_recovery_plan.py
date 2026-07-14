@@ -297,17 +297,54 @@ class SellRuntimeCommitRecoveryPlanTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "INVALID")
 
-    def test_backup_identity_comparison_is_reported(self):
+    def test_target_record_in_backup_is_blocked(self):
         backup_record = _record()
         queue_path, backup_path = self._queue_files(backup_orders=[backup_record])
 
         result = build_sell_runtime_commit_recovery_plan(self._verifier(queue_path, backup_path))
 
-        self.assertEqual(result["status"], "RECOVERY_READY")
-        diff = result["recovery_plans"][0]["queue_backup_diff"]
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["recovery_available"])
+        diff = result["blocked_recovery_plans"][0]["queue_backup_diff"]
         self.assertEqual(diff["queue_matching_record_count"], 1)
         self.assertEqual(diff["backup_matching_record_count"], 1)
         self.assertFalse(diff["target_record_changed"])
+
+    def test_identical_queue_and_backup_is_blocked(self):
+        record = _record()
+        queue_path, backup_path = self._queue_files(queue_orders=[record], backup_orders=[record])
+
+        result = build_sell_runtime_commit_recovery_plan(self._verifier(queue_path, backup_path))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["recovery_available"])
+        diff = result["blocked_recovery_plans"][0]["queue_backup_diff"]
+        self.assertFalse(diff["queue_backup_changed"])
+        self.assertFalse(diff["target_record_changed"])
+
+    def test_missing_target_record_in_queue_is_blocked(self):
+        queue_path, backup_path = self._queue_files(queue_orders=[])
+
+        result = build_sell_runtime_commit_recovery_plan(self._verifier(queue_path, backup_path))
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertFalse(result["recovery_available"])
+        diff = result["blocked_recovery_plans"][0]["queue_backup_diff"]
+        self.assertEqual(diff["queue_matching_record_count"], 0)
+        self.assertEqual(diff["backup_matching_record_count"], 0)
+
+    def test_single_queue_record_absent_from_changed_backup_is_recovery_ready(self):
+        queue_path, backup_path = self._queue_files(queue_orders=[_record()], backup_orders=[])
+
+        result = build_sell_runtime_commit_recovery_plan(self._verifier(queue_path, backup_path))
+
+        self.assertEqual(result["status"], "RECOVERY_READY")
+        self.assertTrue(result["recovery_available"])
+        diff = result["recovery_plans"][0]["queue_backup_diff"]
+        self.assertTrue(diff["queue_backup_changed"])
+        self.assertTrue(diff["target_record_changed"])
+        self.assertEqual(diff["queue_matching_record_count"], 1)
+        self.assertEqual(diff["backup_matching_record_count"], 0)
 
     def test_input_mutation_does_not_occur(self):
         queue_path, backup_path = self._queue_files()
