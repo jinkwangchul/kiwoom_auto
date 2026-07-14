@@ -109,8 +109,8 @@ def build_sell_runtime_commit_execution_plan(runtime_commit_approval: dict[str, 
         result["reasons"].append("runtime commit approval approved_commit_actions must be a list")
         return _finish(result)
     if not approved_actions:
-        result["status"] = BLOCKED
-        result["reasons"].append("runtime commit approval approved_commit_actions must not be empty")
+        result["status"] = INVALID
+        result["reasons"].append("READY runtime commit approval approved_commit_actions must not be empty")
         return _finish(result)
 
     blocked_actions = runtime_commit_approval.get("blocked_approval_actions")
@@ -149,7 +149,7 @@ def build_sell_runtime_commit_execution_plan(runtime_commit_approval: dict[str, 
     if invalid_count > 0:
         result["status"] = INVALID
     elif blocked_count > 0:
-        result["status"] = BLOCKED
+        result["status"] = INVALID
     elif ready_count == len(approved_actions) and ready_count > 0:
         result["status"] = READY
     else:

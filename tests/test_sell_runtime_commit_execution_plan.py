@@ -288,7 +288,7 @@ class SellRuntimeCommitExecutionPlanTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "INVALID")
 
-    def test_empty_approved_actions_blocked(self):
+    def test_ready_approval_with_empty_approved_actions_is_invalid(self):
         approval = _approval()
         approval["approved_commit_actions"] = []
         approval["summary"]["approval_ready_count"] = 0
@@ -296,7 +296,7 @@ class SellRuntimeCommitExecutionPlanTests(unittest.TestCase):
 
         result = build_sell_runtime_commit_execution_plan(approval)
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "INVALID")
 
     def test_blocked_approval_actions_must_be_list(self):
         approval = _approval()
@@ -352,6 +352,40 @@ class SellRuntimeCommitExecutionPlanTests(unittest.TestCase):
         self.assertEqual(result["status"], "INVALID")
         self.assertFalse(result["execution_plan_ready"])
         self.assertFalse(result["commit_allowed"])
+
+    def test_ready_approval_with_blocked_action_is_invalid(self):
+        blocked = _approved_action(_record(order_id="ORDER_2"), status="BLOCKED")
+
+        result = build_sell_runtime_commit_execution_plan(_approval(blocked))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["execution_plan_ready"])
+
+    def test_missing_plan_for_some_approved_action_is_invalid(self):
+        action = _approved_action()
+        action["dryrun_action_ready"] = False
+
+        result = build_sell_runtime_commit_execution_plan(_approval(_approved_action(), action))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertEqual(len(result["execution_actions"]), 1)
+        self.assertEqual(len(result["blocked_execution_actions"]), 1)
+
+    def test_blocked_execution_actions_make_overall_invalid(self):
+        action = _approved_action()
+        action["dryrun_action_ready"] = False
+
+        result = build_sell_runtime_commit_execution_plan(_approval(action))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertEqual(result["summary"]["blocked_execution_action_count"], 1)
+
+    def test_all_normal_actions_still_ready(self):
+        result = build_sell_runtime_commit_execution_plan(_approval(_approved_action(), _approved_action(_record(order_id="ORDER_2"))))
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["execution_plan_ready"])
+        self.assertEqual(len(result["execution_actions"]), 2)
 
     def test_warnings_reasons_and_summary_forwarded(self):
         result = build_sell_runtime_commit_execution_plan(_approval(warnings=["w1"], reasons=["r1"]))
