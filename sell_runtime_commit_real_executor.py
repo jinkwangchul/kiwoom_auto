@@ -12,7 +12,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from execution_queue_writer import commit_execution_queue_write
+from execution_queue_writer import commit_execution_queue_write, commit_execution_queue_write_batch
 
 
 READY = "READY"
@@ -25,6 +25,7 @@ OWNERSHIP = "MASTER_ENGINE"
 DOMAIN = "Execution / Runtime Commit Real Executor"
 ROUTINE_DEPENDENCY = None
 COMMIT_BOUNDARY_FUNCTION = "execution_queue_writer.commit_execution_queue_write"
+BATCH_COMMIT_BOUNDARY_FUNCTION = "execution_queue_writer.commit_execution_queue_write_batch"
 
 _SAFETY_FLAGS = (
     "execution_connected",
@@ -118,46 +119,61 @@ def execute_sell_runtime_commit(real_executor_approval: dict[str, Any]) -> dict[
         result["status"] = INVALID
         result["reasons"].append("approved_real_executor_actions must not be empty")
         return _finish(result)
-    if len(approved_actions) > 1:
-        result["status"] = BLOCKED
-        result["reasons"].append("multi-candidate real runtime commit requires atomic all-or-nothing support")
-        return _finish(result)
-
     if not _ready_summary_counts_match(real_executor_approval.get("summary"), approved_actions):
         result["status"] = INVALID
         result["reasons"].append("real executor approval summary count mismatch")
         return _finish(result)
 
-    action_check = _validate_approved_action(approved_actions[0])
-    if action_check["status"] != READY:
-        result["status"] = action_check["status"]
-        result["blocked_execution_results"].append(action_check)
-        _extend_list(result["reasons"], action_check.get("reasons"))
+    action_checks = [_validate_approved_action(action) for action in approved_actions]
+    failed_checks = [check for check in action_checks if check["status"] != READY]
+    if failed_checks:
+        result["status"] = INVALID if any(check["status"] == INVALID for check in failed_checks) else BLOCKED
+        result["blocked_execution_results"].extend(deepcopy(failed_checks))
+        for check in failed_checks:
+            _extend_list(result["reasons"], check.get("reasons"))
         return _finish(result)
 
-    action = action_check["normalized_action"]
-    payload = action["commit_payload"]
-    args = payload["args"]
-    kwargs = payload["kwargs"]
-    commit_result = commit_execution_queue_write(
-        deepcopy(args["queue_write_preview_result"]),
-        args["queue_path"],
-        backup=kwargs.get("backup", True),
-        context=deepcopy(kwargs.get("context")),
-    )
+    actions = [check["normalized_action"] for check in action_checks]
+    batch_error = _multi_action_batch_error(actions)
+    if batch_error:
+        result["status"] = INVALID if batch_error.startswith("duplicate") or "mismatch" in batch_error else BLOCKED
+        result["reasons"].append(batch_error)
+        return _finish(result)
 
-    execution_result = _normalize_commit_result(action, commit_result)
-    result["execution_results"].append(execution_result)
-    if execution_result["status"] == READY:
-        result["summary"]["execution_ready_count"] += 1
-        result["status"] = READY
-    elif execution_result["status"] == INVALID:
-        result["blocked_execution_results"].append(execution_result)
-        result["summary"]["execution_invalid_count"] += 1
-        result["status"] = INVALID
+    if len(actions) == 1:
+        action = actions[0]
+        payload = action["commit_payload"]
+        args = payload["args"]
+        kwargs = payload["kwargs"]
+        commit_result = commit_execution_queue_write(
+            deepcopy(args["queue_write_preview_result"]),
+            args["queue_path"],
+            backup=kwargs.get("backup", True),
+            context=deepcopy(kwargs.get("context")),
+        )
+        execution_results = [_normalize_commit_result(action, commit_result)]
     else:
-        result["blocked_execution_results"].append(execution_result)
-        result["summary"]["execution_blocked_count"] += 1
+        commit_result = _commit_actions_batch(actions)
+        execution_results = _normalize_batch_commit_result(actions, commit_result)
+
+    result["execution_results"].extend(execution_results)
+    for execution_result in execution_results:
+        if execution_result["status"] == READY:
+            result["summary"]["execution_ready_count"] += 1
+        elif execution_result["status"] == INVALID:
+            result["blocked_execution_results"].append(execution_result)
+            result["summary"]["execution_invalid_count"] += 1
+        else:
+            result["blocked_execution_results"].append(execution_result)
+            result["summary"]["execution_blocked_count"] += 1
+
+    if result["summary"]["execution_invalid_count"] > 0:
+        result["status"] = INVALID
+    elif result["summary"]["execution_blocked_count"] > 0:
+        result["status"] = BLOCKED
+    elif result["summary"]["execution_ready_count"] == len(actions) and actions:
+        result["status"] = READY
+    else:
         result["status"] = BLOCKED
 
     return _finish(result)
@@ -328,6 +344,44 @@ def _payload_errors(action: dict[str, Any], payload: dict[str, Any]) -> list[str
     return sorted(set(errors))
 
 
+def _multi_action_batch_error(actions: list[dict[str, Any]]) -> str | None:
+    queue_paths = {_clean_text(action.get("queue_path")) for action in actions}
+    if len(queue_paths) != 1:
+        return "queue_path mismatch across approved actions"
+
+    tokens = {_clean_text(action.get("approval_token")) for action in actions}
+    if len(tokens) != 1:
+        return "approval_token mismatch across approved actions"
+
+    for field in (
+        "order_id",
+        "candidate_id",
+        "queue_pending_id",
+        "execution_id",
+        "request_hash",
+        "lock_id",
+    ):
+        seen: set[str] = set()
+        for action in actions:
+            value = _clean_text(action.get(field))
+            if value in seen:
+                return f"duplicate {field}"
+            seen.add(value)
+    return None
+
+
+def _commit_actions_batch(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    first_payload = actions[0]["commit_payload"]
+    first_args = first_payload["args"]
+    first_kwargs = first_payload["kwargs"]
+    return commit_execution_queue_write_batch(
+        [deepcopy(action["commit_payload"]["args"]["queue_write_preview_result"]) for action in actions],
+        first_args["queue_path"],
+        backup=first_kwargs.get("backup", True),
+        context=deepcopy(first_kwargs.get("context")),
+    )
+
+
 def _normalize_commit_result(action: dict[str, Any], commit_result: Any) -> dict[str, Any]:
     if not isinstance(commit_result, dict):
         return {
@@ -371,6 +425,93 @@ def _normalize_commit_result(action: dict[str, Any], commit_result: Any) -> dict
         "reasons": reasons,
         "warnings": deepcopy(commit_result.get("warnings")) if isinstance(commit_result.get("warnings"), list) else [],
     }
+
+
+def _normalize_batch_commit_result(actions: list[dict[str, Any]], commit_result: Any) -> list[dict[str, Any]]:
+    if not isinstance(commit_result, dict):
+        return [_batch_action_result(action, {}, INVALID, ["commit_execution_queue_write_batch result must be a dict"]) for action in actions]
+
+    committed = commit_result.get("committed") is True
+    committed_records = commit_result.get("committed_records") if isinstance(commit_result.get("committed_records"), list) else []
+    records_by_order_id = {
+        _clean_text(record.get("order_id")): record
+        for record in committed_records
+        if isinstance(record, dict)
+    }
+
+    results: list[dict[str, Any]] = []
+    for action in actions:
+        reasons = deepcopy(commit_result.get("blocked_reasons")) if isinstance(commit_result.get("blocked_reasons"), list) else []
+        status = READY if committed else BLOCKED
+        record = records_by_order_id.get(_clean_text(action.get("order_id")))
+        if committed:
+            mismatches = _batch_commit_result_mismatches(action, commit_result, record)
+            if mismatches:
+                status = INVALID
+                reasons.append("batch commit result identity mismatch: " + ", ".join(mismatches))
+        results.append(_batch_action_result(action, commit_result, status, reasons))
+    return results
+
+
+def _batch_action_result(
+    action: dict[str, Any],
+    commit_result: dict[str, Any],
+    status: str,
+    reasons: list[str],
+) -> dict[str, Any]:
+    committed = commit_result.get("committed") is True
+    return {
+        "status": status,
+        "commit_boundary_function": BATCH_COMMIT_BOUNDARY_FUNCTION,
+        "source_signal_id": action["source_signal_id"],
+        "order_id": action["order_id"],
+        "candidate_id": action["candidate_id"],
+        "queue_pending_id": action["queue_pending_id"],
+        "execution_id": action["execution_id"],
+        "request_hash": action["request_hash"],
+        "lock_id": action["lock_id"],
+        "commit_result": deepcopy(commit_result),
+        "source_approved_action": deepcopy(action),
+        "runtime_write": committed,
+        "queue_write": committed,
+        "file_write": committed or commit_result.get("file_write") is True,
+        "queue_committed": committed,
+        "send_order": False,
+        "broker_api_called": False,
+        "actual_order_sent": False,
+        "order_request_created": False,
+        "real_ready_state_changed": False,
+        "runtime_commit_executed": committed,
+        "reasons": reasons,
+        "warnings": deepcopy(commit_result.get("warnings")) if isinstance(commit_result.get("warnings"), list) else [],
+    }
+
+
+def _batch_commit_result_mismatches(
+    action: dict[str, Any],
+    commit_result: dict[str, Any],
+    record: dict[str, Any] | None,
+) -> list[str]:
+    mismatches: list[str] = []
+    if commit_result.get("committed_count") != len(commit_result.get("committed_records", [])):
+        mismatches.append("committed_count")
+    if record is None:
+        mismatches.append("committed_record")
+        return mismatches
+    for field in _IDENTITY_FIELDS:
+        if record.get(field) != action.get(field):
+            mismatches.append(field)
+    if record.get("status") != "ORDER_QUEUED":
+        mismatches.append("status")
+    if record.get("send_order_called") is not False:
+        mismatches.append("send_order_called")
+    if record.get("execution_enabled") is not False:
+        mismatches.append("execution_enabled")
+    if commit_result.get("send_order_called") is not False:
+        mismatches.append("batch_send_order_called")
+    if commit_result.get("execution_enabled") is not False:
+        mismatches.append("batch_execution_enabled")
+    return sorted(set(mismatches))
 
 
 def _commit_result_mismatches(action: dict[str, Any], commit_result: dict[str, Any]) -> list[str]:
