@@ -9,6 +9,9 @@ import unittest
 from unittest import mock
 
 from sell_runtime_commit_recovery_executor import execute_sell_runtime_commit_recovery
+from sell_runtime_commit_recovery_approval_gate import approve_sell_runtime_commit_recovery
+from sell_runtime_commit_recovery_plan import build_sell_runtime_commit_recovery_plan
+from sell_runtime_commit_recovery_post_check import check_sell_runtime_commit_recovery_post_commit
 
 
 def _record(
@@ -32,6 +35,15 @@ def _record(
         "send_order_called": False,
         "execution_enabled": False,
     }
+
+
+def _multi_record(index: int) -> dict:
+    return _record(
+        order_id=f"ORDER_{index}",
+        request_hash=chr(96 + index) * 64,
+        lock_id=f"LOCK_{index}",
+        execution_id=f"EXEC_{index}",
+    )
 
 
 class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
@@ -370,6 +382,184 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
 
         after = hashlib.sha256(runtime_queue.read_bytes()).hexdigest()
         self.assertEqual(before, after)
+
+    def _multi_verifier(self, queue_path: Path, backup_path: Path, records: list[dict], *, status: str = "INVALID") -> dict:
+        execution_results = []
+        commit_result = {
+            "committed": True,
+            "committed_count": len(records),
+            "order_queue_path": str(queue_path),
+            "backup_path": str(backup_path),
+            "committed_records": deepcopy(records),
+            "order_ids": [record["order_id"] for record in records],
+            "request_hashes": [record["request_hash"] for record in records],
+            "lock_ids": [record["lock_id"] for record in records],
+            "execution_ids": [record["execution_id"] for record in records],
+        }
+        for record in records:
+            execution_results.append(
+                {
+                    "status": "READY",
+                    "source_signal_id": record["source_signal_id"],
+                    "order_id": record["order_id"],
+                    "candidate_id": record["candidate_id"],
+                    "queue_pending_id": record["queue_pending_id"],
+                    "execution_id": record["execution_id"],
+                    "request_hash": record["request_hash"],
+                    "lock_id": record["lock_id"],
+                    "commit_result": deepcopy(commit_result),
+                }
+            )
+        return {
+            "verifier_type": "SELL_RUNTIME_COMMIT_POST_COMMIT_VERIFIER",
+            "read_only": True,
+            "runtime_write": False,
+            "queue_write": False,
+            "file_write": False,
+            "rollback": False,
+            "send_order": False,
+            "broker_api_called": False,
+            "actual_order_sent": False,
+            "order_request_created": False,
+            "real_ready_state_changed": False,
+            "status": status,
+            "post_commit_verified": False,
+            "post_commit_file_verified": False,
+            "executor_snapshot": {
+                "executor_type": "SELL_RUNTIME_COMMIT_REAL_EXECUTOR",
+                "status": status,
+                "queue_committed": True,
+                "runtime_commit_executed": True,
+                "execution_results": execution_results,
+            },
+            "verified_records": [],
+            "blocked_verifications": [
+                {
+                    "status": "INVALID",
+                    "queue_path": str(queue_path),
+                    "backup_path": str(backup_path),
+                    "source_execution_result": deepcopy(execution_results[0]),
+                    "commit_result": deepcopy(commit_result),
+                }
+            ],
+            "warnings": [],
+            "reasons": [],
+            "summary": {"expected_record_count": len(records)},
+        }
+
+    def _approve_multi(self, queue_file: Path, backup_file: Path, records: list[dict], **context_overrides) -> dict:
+        verifier = self._multi_verifier(queue_file, backup_file, records)
+        plan = build_sell_runtime_commit_recovery_plan(verifier)
+        context = {
+            "user_approved": True,
+            "approval_token": "APPROVED-MULTI",
+            "queue_path": str(queue_file),
+            "backup_path": str(backup_file),
+            "approved_identities": [
+                {field: record[field] for field in ("order_id", "candidate_id", "queue_pending_id", "execution_id", "request_hash", "lock_id")}
+                for record in records
+            ],
+        }
+        context.update(context_overrides)
+        return approve_sell_runtime_commit_recovery(plan, context)
+
+    def test_multi_candidate_recovery_chain_success(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+
+        approval = self._approve_multi(queue_path, backup_path, records)
+        execution = execute_sell_runtime_commit_recovery(approval)
+        post_check = check_sell_runtime_commit_recovery_post_commit(execution)
+
+        self.assertEqual(approval["status"], "READY")
+        self.assertEqual(execution["status"], "READY")
+        self.assertEqual(post_check["status"], "READY")
+        self.assertEqual(self._read_json(queue_path), self._read_json(backup_path))
+        self.assertEqual(self._read_json(queue_path)["orders"], [])
+        self.assertEqual(post_check["checked_records"][0]["target_count"], 2)
+
+    def test_multi_candidate_three_preserves_target_order(self):
+        records = [_multi_record(1), _multi_record(2), _multi_record(3)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+
+        plan = build_sell_runtime_commit_recovery_plan(self._multi_verifier(queue_path, backup_path, records))
+
+        self.assertEqual(plan["status"], "RECOVERY_READY")
+        self.assertEqual(["ORDER_1", "ORDER_2", "ORDER_3"], [item["order_id"] for item in plan["recovery_plans"][0]["target_identities"]])
+
+    def test_multi_candidate_plan_blocks_when_one_queue_target_missing(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=[records[0]], backup_orders=[])
+
+        plan = build_sell_runtime_commit_recovery_plan(self._multi_verifier(queue_path, backup_path, records))
+
+        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertFalse(plan["recovery_available"])
+
+    def test_multi_candidate_plan_blocks_when_backup_contains_one_target(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[records[1]])
+
+        plan = build_sell_runtime_commit_recovery_plan(self._multi_verifier(queue_path, backup_path, records))
+
+        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertFalse(plan["recovery_available"])
+
+    def test_multi_candidate_approval_missing_identity_is_invalid(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+
+        approval = self._approve_multi(queue_path, backup_path, records, approved_identities=[{k: records[0][k] for k in ("order_id", "candidate_id", "queue_pending_id", "execution_id", "request_hash", "lock_id")}])
+
+        self.assertEqual(approval["status"], "INVALID")
+
+    def test_multi_candidate_approval_reordered_identity_is_invalid(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+        identities = [
+            {field: record[field] for field in ("order_id", "candidate_id", "queue_pending_id", "execution_id", "request_hash", "lock_id")}
+            for record in reversed(records)
+        ]
+
+        approval = self._approve_multi(queue_path, backup_path, records, approved_identities=identities)
+
+        self.assertEqual(approval["status"], "INVALID")
+
+    def test_multi_candidate_approval_path_or_token_mismatch(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+
+        path_result = self._approve_multi(queue_path, backup_path, records, queue_path=str(queue_path) + ".other")
+        token_result = self._approve_multi(queue_path, backup_path, records, approval_token="")
+
+        self.assertEqual(path_result["status"], "INVALID")
+        self.assertEqual(token_result["status"], "BLOCKED")
+
+    def test_multi_candidate_executor_blocks_after_queue_or_backup_mutation(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+        approval = self._approve_multi(queue_path, backup_path, records)
+        queue_path.write_text(json.dumps({"version": 1, "orders": [records[0]]}), encoding="utf-8")
+
+        queue_result = execute_sell_runtime_commit_recovery(approval)
+
+        queue_path.write_text(json.dumps({"version": 1, "orders": records}, indent=2), encoding="utf-8")
+        backup_path.write_text(json.dumps({"version": 1, "orders": [records[1]]}), encoding="utf-8")
+        backup_result = execute_sell_runtime_commit_recovery(approval)
+
+        self.assertEqual(queue_result["status"], "BLOCKED")
+        self.assertEqual(backup_result["status"], "BLOCKED")
+
+    def test_multi_candidate_post_check_invalid_when_safety_backup_missing_one_target(self):
+        records = [_multi_record(1), _multi_record(2)]
+        queue_path, backup_path = self._queue_files(queue_orders=records, backup_orders=[])
+        execution = execute_sell_runtime_commit_recovery(self._approve_multi(queue_path, backup_path, records))
+        safety_path = Path(execution["recovery_results"][0]["safety_backup_path"])
+        safety_path.write_text(json.dumps({"version": 1, "orders": [records[0]]}), encoding="utf-8")
+
+        post_check = check_sell_runtime_commit_recovery_post_commit(execution)
+
+        self.assertEqual(post_check["status"], "INVALID")
 
 
 if __name__ == "__main__":

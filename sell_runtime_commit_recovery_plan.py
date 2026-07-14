@@ -26,6 +26,8 @@ ROUTINE_DEPENDENCY = None
 
 _IDENTITY_FIELDS = (
     "order_id",
+    "candidate_id",
+    "queue_pending_id",
     "request_hash",
     "lock_id",
     "execution_id",
@@ -84,7 +86,8 @@ def build_sell_runtime_commit_recovery_plan(post_commit_verifier: dict[str, Any]
         return _finish(result)
 
     source = extraction["source"]
-    identity_errors = _identity_errors(source["identity"])
+    identities = source["identities"]
+    identity_errors = _identities_errors(identities)
     if identity_errors:
         result["status"] = INVALID
         result["reasons"].append("recovery identity is incomplete: " + ", ".join(identity_errors))
@@ -112,10 +115,8 @@ def build_sell_runtime_commit_recovery_plan(post_commit_verifier: dict[str, Any]
         result["blocked_recovery_plans"].append({"status": BLOCKED, "backup_path": backup_path, "reasons": deepcopy(result["reasons"])})
         return _finish(result)
 
-    queue_records = _matching_records(queue_data, source["identity"])
-    backup_records = _matching_records(backup_data, source["identity"])
-    diff = _queue_backup_diff(queue_data, backup_data, source["identity"])
-    recovery_block_reasons = _recovery_readiness_errors(diff)
+    diff = _queue_backup_diff(queue_data, backup_data, identities)
+    recovery_block_reasons = _recovery_readiness_errors(diff, len(identities))
     if recovery_block_reasons:
         result["status"] = BLOCKED
         result["recovery_required"] = True
@@ -128,9 +129,13 @@ def build_sell_runtime_commit_recovery_plan(post_commit_verifier: dict[str, Any]
                 "automatic_restore_performed": False,
                 "queue_path": source["queue_path"],
                 "backup_path": backup_path,
-                "target_identity": deepcopy(source["identity"]),
-                "queue_matching_record_count": len(queue_records),
-                "backup_matching_record_count": len(backup_records),
+                "target_identity": deepcopy(identities[0]),
+                "target_identities": deepcopy(identities),
+                "target_count": len(identities),
+                "queue_matching_record_count": diff["queue_matching_record_count"],
+                "backup_matching_record_count": diff["backup_matching_record_count"],
+                "queue_matching_counts": deepcopy(diff["queue_matching_counts"]),
+                "backup_matching_counts": deepcopy(diff["backup_matching_counts"]),
                 "queue_backup_diff": diff,
                 "reasons": deepcopy(recovery_block_reasons),
                 "source_verification": deepcopy(source["source_verification"]),
@@ -145,9 +150,13 @@ def build_sell_runtime_commit_recovery_plan(post_commit_verifier: dict[str, Any]
         "automatic_restore_performed": False,
         "queue_path": source["queue_path"],
         "backup_path": backup_path,
-        "target_identity": deepcopy(source["identity"]),
-        "queue_matching_record_count": len(queue_records),
-        "backup_matching_record_count": len(backup_records),
+        "target_identity": deepcopy(identities[0]),
+        "target_identities": deepcopy(identities),
+        "target_count": len(identities),
+        "queue_matching_record_count": diff["queue_matching_record_count"],
+        "backup_matching_record_count": diff["backup_matching_record_count"],
+        "queue_matching_counts": deepcopy(diff["queue_matching_counts"]),
+        "backup_matching_counts": deepcopy(diff["backup_matching_counts"]),
         "queue_backup_diff": diff,
         "manual_steps": [
             "Stop automated execution before recovery.",
@@ -232,6 +241,31 @@ def _actual_commit_happened(verifier: dict[str, Any]) -> bool:
 
 
 def _extract_recovery_source(verifier: dict[str, Any]) -> dict[str, Any]:
+    execution_results = _execution_results(verifier)
+    if len(execution_results) > 1:
+        commit_results = [item.get("commit_result") for item in execution_results if isinstance(item.get("commit_result"), dict)]
+        queue_paths = {_clean_text(item.get("order_queue_path")) for item in commit_results}
+        backup_paths = {_clean_text(item.get("backup_path")) for item in commit_results}
+        if len(commit_results) != len(execution_results) or len(queue_paths) != 1 or len(backup_paths) != 1:
+            return {
+                "status": INVALID,
+                "reasons": ["execution_results must share one queue_path and backup_path"],
+                "blocked_plan": {"status": INVALID, "reasons": ["execution_results must share one queue_path and backup_path"]},
+            }
+        identities = [{field: item.get(field) for field in _IDENTITY_FIELDS} for item in execution_results]
+        return {
+            "status": READY,
+            "source": {
+                "queue_path": next(iter(queue_paths)),
+                "backup_path": next(iter(backup_paths)) or None,
+                "identity": identities[0],
+                "identities": identities,
+                "source_verification": _first_dict(verifier.get("blocked_verifications")) or _first_dict(verifier.get("verified_records")) or {},
+                "source_execution_result": execution_results[0],
+                "commit_result": commit_results[0],
+            },
+        }
+
     verification = _first_dict(verifier.get("blocked_verifications")) or _first_dict(verifier.get("verified_records"))
     if verification is None:
         return {
@@ -277,11 +311,19 @@ def _extract_recovery_source(verifier: dict[str, Any]) -> dict[str, Any]:
             "queue_path": queue_path,
             "backup_path": _clean_text(commit_result.get("backup_path") or verification.get("backup_path")) or None,
             "identity": identity,
+            "identities": [identity],
             "source_verification": verification,
             "source_execution_result": source_execution,
             "commit_result": commit_result,
         },
     }
+
+
+def _execution_results(verifier: dict[str, Any]) -> list[dict[str, Any]]:
+    snapshot = verifier.get("executor_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("execution_results"), list):
+        return []
+    return [item for item in snapshot["execution_results"] if isinstance(item, dict)]
 
 
 def _first_execution_result(executor_snapshot: Any) -> dict[str, Any] | None:
@@ -315,47 +357,55 @@ def _read_json_object(path: Path) -> tuple[dict[str, Any], str | None]:
 
 def _matching_records(queue_data: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
     records = []
+    fields = [field for field in _IDENTITY_FIELDS if _clean_text(identity.get(field))]
     for item in queue_data.get("orders", []):
         if not isinstance(item, dict):
             continue
-        if all(item.get(field) == identity.get(field) for field in _IDENTITY_FIELDS):
+        if all(item.get(field) == identity.get(field) for field in fields):
             records.append(item)
     return records
 
 
-def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identities: list[dict[str, Any]]) -> dict[str, Any]:
     queue_orders = [item for item in queue_data.get("orders", []) if isinstance(item, dict)]
     backup_orders = [item for item in backup_data.get("orders", []) if isinstance(item, dict)]
-    queue_target = _matching_records(queue_data, identity)
-    backup_target = _matching_records(backup_data, identity)
+    queue_counts = [len(_matching_records(queue_data, identity)) for identity in identities]
+    backup_counts = [len(_matching_records(backup_data, identity)) for identity in identities]
     return {
         "queue_order_count": len(queue_orders),
         "backup_order_count": len(backup_orders),
-        "queue_matching_record_count": len(queue_target),
-        "backup_matching_record_count": len(backup_target),
+        "queue_matching_record_count": sum(queue_counts),
+        "backup_matching_record_count": sum(backup_counts),
+        "queue_matching_counts": queue_counts,
+        "backup_matching_counts": backup_counts,
         "queue_backup_changed": queue_orders != backup_orders,
-        "target_record_changed": queue_target != backup_target,
+        "target_record_changed": queue_counts != backup_counts,
     }
 
 
-def _recovery_readiness_errors(diff: dict[str, Any]) -> list[str]:
+def _recovery_readiness_errors(diff: dict[str, Any], target_count: int = 1) -> list[str]:
     errors: list[str] = []
     if diff["queue_backup_changed"] is not True:
         errors.append("queue and backup are identical; restoring would not change target state")
     if diff["target_record_changed"] is not True:
         errors.append("target record does not differ between queue and backup")
-    if diff["queue_matching_record_count"] != 1:
-        errors.append("current queue must contain exactly one target record")
+    if diff["queue_matching_record_count"] != target_count or any(count != 1 for count in diff.get("queue_matching_counts", [])):
+        errors.append("current queue must contain exactly one record for each target identity")
     if diff["backup_matching_record_count"] != 0:
-        errors.append("backup must not contain the target record to prove a safe previous state")
+        errors.append("backup must not contain target records to prove a safe previous state")
     return errors
 
 
-def _identity_errors(identity: dict[str, Any]) -> list[str]:
+def _identities_errors(identities: list[dict[str, Any]]) -> list[str]:
     errors = []
-    for field in _IDENTITY_FIELDS:
-        if not _clean_text(identity.get(field)):
-            errors.append(field)
+    if not identities:
+        return ["target_identities"]
+    for index, identity in enumerate(identities):
+        for field in _IDENTITY_FIELDS:
+            if len(identities) == 1 and field in {"candidate_id", "queue_pending_id"}:
+                continue
+            if not _clean_text(identity.get(field)):
+                errors.append(f"target_identities[{index}].{field}")
     return errors
 
 

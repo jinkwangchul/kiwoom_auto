@@ -28,6 +28,8 @@ ROUTINE_DEPENDENCY = None
 
 _IDENTITY_FIELDS = (
     "order_id",
+    "candidate_id",
+    "queue_pending_id",
     "request_hash",
     "lock_id",
     "execution_id",
@@ -60,7 +62,7 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
     action = preflight["action"]
     queue_path = Path(action["queue_path"])
     backup_path = Path(action["backup_path"])
-    identity = action["target_identity"]
+    identities = _target_identities(action)
     expected_backup_data = preflight["backup_data"]
     expected_diff = action["queue_backup_diff"]
 
@@ -72,7 +74,9 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
         "temp_restore_path": None,
         "safety_backup_created": False,
         "temp_restore_written": False,
-        "target_identity": deepcopy(identity),
+        "target_identity": deepcopy(identities[0]),
+        "target_identities": deepcopy(identities),
+        "target_count": len(identities),
         "approval_token": action["approval_token"],
         "restore_executed": False,
         "post_restore_verified": False,
@@ -130,7 +134,7 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
             result["recovery_results"].append(deepcopy(execution_result))
             return _finish(result)
 
-        post_diff = _queue_backup_diff(post_data, expected_backup_data, identity)
+        post_diff = _queue_backup_diff(post_data, expected_backup_data, identities)
         if post_diff["queue_matching_record_count"] != 0:
             execution_result["status"] = INVALID
             execution_result["reasons"].append("target identity still exists after restore")
@@ -256,13 +260,13 @@ def _preflight(approval: dict[str, Any]) -> dict[str, Any]:
         result["reasons"].append("backup json unavailable before recovery: " + backup_error)
         return result
 
-    current_diff = _queue_backup_diff(queue_data, backup_data, action["target_identity"])
-    if current_diff != action["queue_backup_diff"]:
+    current_diff = _queue_backup_diff(queue_data, backup_data, _target_identities(action))
+    if not _diff_matches(current_diff, action["queue_backup_diff"], len(_target_identities(action))):
         result["status"] = BLOCKED
         result["reasons"].append("current queue/backup state differs from approval action")
         return result
 
-    readiness_errors = _recovery_readiness_errors(current_diff)
+    readiness_errors = _recovery_readiness_errors(current_diff, len(_target_identities(action)))
     if readiness_errors:
         result["status"] = BLOCKED
         result["reasons"].extend(readiness_errors)
@@ -286,12 +290,17 @@ def _action_contract_errors(action: dict[str, Any]) -> list[str]:
     if not _clean_text(action.get("backup_path")):
         errors.append("backup_path is required")
     identity = action.get("target_identity")
-    if not isinstance(identity, dict):
-        errors.append("target_identity must be a dict")
-    else:
+    identities = _target_identities(action)
+    if not identities:
+        errors.append("target_identities must not be empty")
+    for index, identity in enumerate(identities):
         for field in _IDENTITY_FIELDS:
+            if len(identities) == 1 and field in {"candidate_id", "queue_pending_id"}:
+                continue
             if not _clean_text(identity.get(field)):
-                errors.append(f"target_identity.{field} is required")
+                errors.append(f"target_identities[{index}].{field} is required")
+    if action.get("target_count", len(identities)) != len(identities):
+        errors.append("target_count must match target_identities length")
     diff = action.get("queue_backup_diff")
     if not isinstance(diff, dict):
         errors.append("queue_backup_diff must be a dict")
@@ -300,8 +309,8 @@ def _action_contract_errors(action: dict[str, Any]) -> list[str]:
             errors.append("queue_backup_changed must be True")
         if diff.get("target_record_changed") is not True:
             errors.append("target_record_changed must be True")
-        if diff.get("queue_matching_record_count") != 1:
-            errors.append("queue_matching_record_count must be 1")
+        if diff.get("queue_matching_record_count") != len(identities):
+            errors.append("queue_matching_record_count must match target_count")
         if diff.get("backup_matching_record_count") != 0:
             errors.append("backup_matching_record_count must be 0")
     return errors
@@ -323,40 +332,74 @@ def _read_json_object(path: Path) -> tuple[dict[str, Any], str | None]:
 
 def _matching_records(queue_data: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
     records = []
+    fields = [field for field in _IDENTITY_FIELDS if _clean_text(identity.get(field))]
     for item in queue_data.get("orders", []):
         if not isinstance(item, dict):
             continue
-        if all(item.get(field) == identity.get(field) for field in _IDENTITY_FIELDS):
+        if all(item.get(field) == identity.get(field) for field in fields):
             records.append(item)
     return records
 
 
-def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+def _target_identities(action: dict[str, Any]) -> list[dict[str, Any]]:
+    identities = action.get("target_identities")
+    if isinstance(identities, list) and identities:
+        return [item for item in identities if isinstance(item, dict)]
+    identity = action.get("target_identity")
+    return [identity] if isinstance(identity, dict) else []
+
+
+def _queue_backup_diff(queue_data: dict[str, Any], backup_data: dict[str, Any], identities: list[dict[str, Any]]) -> dict[str, Any]:
     queue_orders = [item for item in queue_data.get("orders", []) if isinstance(item, dict)]
     backup_orders = [item for item in backup_data.get("orders", []) if isinstance(item, dict)]
-    queue_target = _matching_records(queue_data, identity)
-    backup_target = _matching_records(backup_data, identity)
+    queue_counts = [len(_matching_records(queue_data, identity)) for identity in identities]
+    backup_counts = [len(_matching_records(backup_data, identity)) for identity in identities]
     return {
         "queue_order_count": len(queue_orders),
         "backup_order_count": len(backup_orders),
-        "queue_matching_record_count": len(queue_target),
-        "backup_matching_record_count": len(backup_target),
+        "queue_matching_record_count": sum(queue_counts),
+        "backup_matching_record_count": sum(backup_counts),
+        "queue_matching_counts": queue_counts,
+        "backup_matching_counts": backup_counts,
         "queue_backup_changed": queue_orders != backup_orders,
-        "target_record_changed": queue_target != backup_target,
+        "target_record_changed": queue_counts != backup_counts,
     }
 
 
-def _recovery_readiness_errors(diff: dict[str, Any]) -> list[str]:
+def _recovery_readiness_errors(diff: dict[str, Any], target_count: int = 1) -> list[str]:
     errors: list[str] = []
     if diff.get("queue_backup_changed") is not True:
         errors.append("queue and backup must differ before recovery")
     if diff.get("target_record_changed") is not True:
         errors.append("target record must differ between queue and backup")
-    if diff.get("queue_matching_record_count") != 1:
-        errors.append("current queue must contain exactly one target record")
+    if diff.get("queue_matching_record_count") != target_count or any(count != 1 for count in diff.get("queue_matching_counts", [])):
+        errors.append("current queue must contain exactly one record for each target identity")
     if diff.get("backup_matching_record_count") != 0:
         errors.append("backup must not contain the target record")
     return errors
+
+
+def _diff_matches(current: dict[str, Any], planned: dict[str, Any], target_count: int) -> bool:
+    keys = (
+        "queue_order_count",
+        "backup_order_count",
+        "queue_matching_record_count",
+        "backup_matching_record_count",
+        "queue_backup_changed",
+        "target_record_changed",
+    )
+    if any(current.get(key) != planned.get(key) for key in keys):
+        return False
+    planned_queue_counts = planned.get("queue_matching_counts")
+    planned_backup_counts = planned.get("backup_matching_counts")
+    if planned_queue_counts is None and target_count == 1:
+        planned_queue_counts = [planned.get("queue_matching_record_count")]
+    if planned_backup_counts is None and target_count == 1:
+        planned_backup_counts = [planned.get("backup_matching_record_count")]
+    return (
+        current.get("queue_matching_counts") == planned_queue_counts
+        and current.get("backup_matching_counts") == planned_backup_counts
+    )
 
 
 def _safety_backup_path(queue_path: Path) -> Path:
