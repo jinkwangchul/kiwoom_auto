@@ -12,7 +12,12 @@ import unittest
 from unittest import mock
 
 import chejan_event_recorder
-from chejan_event_recorder import inspect_broker_chejan_lifecycle, record_chejan_event
+from chejan_event_recorder import (
+    build_order_reconciliation_preview,
+    inspect_broker_chejan_lifecycle,
+    inspect_incomplete_order_reconciliation,
+    record_chejan_event,
+)
 
 
 def _chejan_process_worker(queue_path: str, output: multiprocessing.Queue) -> None:
@@ -142,6 +147,38 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
     def _sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest().upper()
+
+    def _write_fills(self, directory: str, fills: list[dict[str, object]] | None = None, root: object | None = None) -> Path:
+        path = Path(directory) / "fills.json"
+        data = {"version": 1, "updated_at": "2026-07-04 09:10:00", "fills": fills or []}
+        if root is not None:
+            data = root
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def _fill(self, **overrides: object) -> dict[str, object]:
+        fill = {
+            "fill_id": "FILL_1",
+            "event_type": "PARTIAL_FILL",
+            "broker_order_no": "BRK_1",
+            "order_id": "ORDER_1",
+            "order_queued_id": "ORDER_QUEUED_ORDER_1",
+            "execution_id": "EXEC_1",
+            "request_hash": "HASH_1",
+            "lock_id": "LOCK_1",
+            "filled_quantity": 3,
+            "filled_price": 1000,
+            "remaining_quantity": 7,
+            "order_quantity": 10,
+            "received_at": "2026-07-04 09:30:00",
+            "normalized_event": {
+                "event_type": "PARTIAL_FILL",
+                "broker_order_no": "BRK_1",
+                "raw_event": {"fid_values": {"909": "EXECUTION_909_1"}},
+            },
+        }
+        fill.update(overrides)
+        return fill
 
     def _record_event(
         self,
@@ -899,6 +936,206 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertFalse(result["queue_write"])
             self.assertFalse(result["file_write"])
             self.assertEqual(before, self._sha256(path))
+
+    def test_restart_reconciliation_consistent_queue_and_fills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="FILLED",
+                    original_order_quantity=3,
+                    cumulative_filled_quantity=3,
+                    total_filled_quantity=3,
+                    remaining_quantity=0,
+                    fill_count=1,
+                    average_fill_price=1000,
+                ),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill()])
+            before_queue = self._sha256(path)
+            before_fills = self._sha256(fills_path)
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertTrue(result["inspection_ok"])
+            self.assertEqual("CONSISTENT", result["reconciliation_candidate_status"])
+            self.assertFalse(result["queue_fills_mismatch"])
+            self.assertFalse(result["write_performed"])
+            self.assertEqual(before_queue, self._sha256(path))
+            self.assertEqual(before_fills, self._sha256(fills_path))
+
+    def test_restart_reconciliation_partially_filled_clean_state_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=3,
+                    total_filled_quantity=3,
+                    remaining_quantity=7,
+                    fill_count=1,
+                    average_fill_price=1000,
+                ),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill()])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertFalse(result["queue_fills_mismatch"])
+
+    def test_restart_reconciliation_detects_quantity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=5,
+                    remaining_quantity=5,
+                    fill_count=1,
+                    average_fill_price=1000,
+                ),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill(filled_quantity=3, remaining_quantity=7)])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertTrue(result["queue_fills_mismatch"])
+            self.assertIn("queue cumulative filled quantity does not match fills ledger sum", result["blocked_reasons"])
+
+    def test_restart_reconciliation_detects_weighted_average_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=3,
+                    remaining_quantity=7,
+                    fill_count=1,
+                    average_fill_price=1200,
+                ),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill(filled_quantity=3, filled_price=1000)])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertIn("queue average_fill_price does not match fills weighted average", result["blocked_reasons"])
+
+    def test_restart_reconciliation_detects_duplicate_fill_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="PARTIALLY_FILLED", original_order_quantity=10, cumulative_filled_quantity=6, remaining_quantity=4, fill_count=2, average_fill_price=1000),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill(fill_id="FILL_1"), self._fill(fill_id="FILL_2")])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("BLOCKED", result["reconciliation_candidate_status"])
+            self.assertIn("execution_no:EXECUTION_909_1", result["duplicate_execution_identities"])
+
+    def test_restart_reconciliation_missing_fills_file_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=Path(tmpdir) / "missing_fills.json")
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertIn("fills file does not exist", result["warnings"])
+
+    def test_restart_reconciliation_invalid_fills_file_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+            fills_path = Path(tmpdir) / "fills.json"
+            fills_path.write_text("{bad json", encoding="utf-8")
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertTrue(any("failed to read fills json" in warning for warning in result["warnings"]))
+
+    def test_restart_reconciliation_send_call_in_progress_with_accept_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record = self._record(status="SEND_CALL_IN_PROGRESS", chejan_events=[{"event_type": "ORDER_ACCEPTED", "broker_order_no": "BRK_1"}])
+            path = self._write_queue(tmpdir, record=record)
+            fills_path = self._write_fills(tmpdir)
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("RECONCILIATION_CANDIDATE", result["reconciliation_candidate_status"])
+            self.assertTrue(result["manual_reconciliation_required"])
+            self.assertFalse(result["automatic_retry_allowed"])
+
+    def test_restart_reconciliation_send_uncertain_with_rejection_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record = self._record(status="SEND_UNCERTAIN", chejan_events=[{"event_type": "ORDER_REJECTED", "broker_order_no": "BRK_1"}])
+            path = self._write_queue(tmpdir, record=record)
+            fills_path = self._write_fills(tmpdir)
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+            preview = build_order_reconciliation_preview(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("RECONCILIATION_CANDIDATE", result["reconciliation_candidate_status"])
+            self.assertEqual("BROKER_REJECTED", preview["proposed_status"])
+            self.assertFalse(preview["write_performed"])
+
+    def test_restart_reconciliation_filled_remaining_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="FILLED", original_order_quantity=10, cumulative_filled_quantity=10, remaining_quantity=1, fill_count=1, average_fill_price=1000),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill(filled_quantity=10, remaining_quantity=0)])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertIn("queue FILLED still has remaining quantity", result["blocked_reasons"])
+
+    def test_restart_reconciliation_partially_filled_zero_remaining_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="PARTIALLY_FILLED", original_order_quantity=10, cumulative_filled_quantity=10, remaining_quantity=0, fill_count=1, average_fill_price=1000),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill(filled_quantity=10, remaining_quantity=0)])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("REVIEW_REQUIRED", result["reconciliation_candidate_status"])
+            self.assertIn("queue PARTIALLY_FILLED has zero remaining quantity", result["blocked_reasons"])
+
+    def test_restart_reconciliation_cancel_with_late_fill_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="CANCELLED", original_order_quantity=10, cumulative_filled_quantity=0, remaining_quantity=0, fill_count=1, average_fill_price=1000),
+            )
+            fills_path = self._write_fills(tmpdir, [self._fill()])
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("BLOCKED", result["reconciliation_candidate_status"])
+            self.assertIn("late fill evidence exists after cancelled state", result["blocked_reasons"])
+
+    def test_reconciliation_preview_uses_expected_revision_and_snapshot_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = {"version": 1, "revision": 7, "updated_at": "2026-07-04", "orders": [self._record(status="SEND_UNCERTAIN", chejan_events=[{"event_type": "ORDER_ACCEPTED"}])]}
+            path = self._write_queue(tmpdir, root=root)
+            fills_path = self._write_fills(tmpdir)
+
+            preview = build_order_reconciliation_preview(path, self._review(), fills_path=fills_path)
+
+            self.assertTrue(preview["preview_ready"])
+            self.assertEqual(7, preview["expected_revision"])
+            self.assertTrue(preview["snapshot_hash"])
+            self.assertTrue(preview["approval_required"])
+            self.assertFalse(preview["queue_write"])
 
 
 if __name__ == "__main__":
