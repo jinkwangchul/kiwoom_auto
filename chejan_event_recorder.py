@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from execution_queue_writer import mutate_order_queue
+from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -203,9 +203,79 @@ def _event_received_at(event: dict[str, Any], now: str) -> str:
     return _clean_text(event.get("received_at")) or _clean_text(raw_event.get("received_at")) or now
 
 
-def _event_id(order_queued_id: str, event_type: str, broker_order_no: str, sequence: int) -> str:
-    source = broker_order_no or order_queued_id
-    return f"CHEJAN_EVENT_{source}_{event_type}_{sequence}"
+_BROKER_EVENT_ID_FIELDS = (
+    "event_id",
+    "chejan_event_id",
+    "execution_no",
+    "fill_no",
+    "trade_no",
+)
+
+
+def _broker_event_identity_value(event: dict[str, Any]) -> str:
+    raw_event = _as_dict(event.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    for source in (event, raw_event):
+        for field in _BROKER_EVENT_ID_FIELDS:
+            value = _clean_text(source.get(field))
+            if value:
+                return value
+    return _clean_text(fid_values.get("909"))
+
+
+def _event_identity(event: dict[str, Any], event_type: str, broker_order_no: str) -> tuple[str, str]:
+    broker_event_id = _broker_event_identity_value(event)
+    if broker_event_id:
+        identity_source = "broker_event_id"
+        identity_payload: dict[str, Any] = {
+            "broker_order_no": broker_order_no,
+            "event_type": event_type,
+            "broker_event_id": broker_event_id,
+        }
+    else:
+        identity_source = "canonical_event_hash"
+        identity_payload = {
+            "broker": _clean_text(event.get("broker")),
+            "broker_order_no": broker_order_no,
+            "event_type": event_type,
+            "gubun": _clean_text(event.get("gubun")),
+            "account_no": _clean_text(event.get("account_no")),
+            "code": _clean_text(event.get("code")),
+            "side": _clean_text(event.get("side")),
+            "order_status": _clean_text(event.get("order_status")),
+            "order_quantity": event.get("order_quantity"),
+            "filled_quantity": event.get("filled_quantity"),
+            "remaining_quantity": event.get("remaining_quantity"),
+            "order_price": event.get("order_price"),
+            "filled_price": event.get("filled_price"),
+        }
+    encoded = json.dumps(
+        identity_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest().upper(), identity_source
+
+
+def _stored_event_identity(stored_event: Any) -> str:
+    stored = _as_dict(stored_event)
+    identity = _clean_text(stored.get("event_identity")).upper()
+    if identity:
+        return identity
+    normalized = _as_dict(stored.get("normalized_event"))
+    if not normalized:
+        return ""
+    derived, _ = _event_identity(
+        normalized,
+        _clean_text(stored.get("event_type") or normalized.get("event_type")),
+        _clean_text(stored.get("broker_order_no") or normalized.get("broker_order_no")),
+    )
+    return derived
+
+
+def _event_id(event_identity: str) -> str:
+    return f"CHEJAN_EVENT_{event_identity}"
 
 
 def _event_record(
@@ -213,12 +283,14 @@ def _event_record(
     event: dict[str, Any],
     event_type: str,
     broker_order_no: str,
-    order_queued_id: str,
-    sequence: int,
+    event_identity: str,
+    event_identity_source: str,
     now: str,
 ) -> dict[str, Any]:
     return {
-        "event_id": _event_id(order_queued_id, event_type, broker_order_no, sequence),
+        "event_id": _event_id(event_identity),
+        "event_identity": event_identity,
+        "event_identity_source": event_identity_source,
         "event_type": event_type,
         "broker": _clean_text(event.get("broker")),
         "broker_order_no": broker_order_no,
@@ -303,12 +375,24 @@ def record_chejan_event(
             existing_events = []
 
         order_queued_id = _clean_text(updated_record.get("id"))
+        event_identity, event_identity_source = _event_identity(event, event_type, broker_order_no)
+        if any(_stored_event_identity(existing_event) == event_identity for existing_event in existing_events):
+            duplicate = _blocked("duplicate_event", "duplicate Chejan event identity")
+            duplicate.update(
+                {
+                    "duplicate": True,
+                    "idempotent": True,
+                    "event_identity": event_identity,
+                    "event_identity_source": event_identity_source,
+                }
+            )
+            return {"blocked": duplicate}
         appended_event = _event_record(
             event=event,
             event_type=event_type,
             broker_order_no=broker_order_no,
-            order_queued_id=order_queued_id,
-            sequence=len(existing_events) + 1,
+            event_identity=event_identity,
+            event_identity_source=event_identity_source,
             now=now,
         )
 
@@ -328,6 +412,8 @@ def record_chejan_event(
                 "order_queued_id": order_queued_id,
                 "broker_order_no": broker_order_no,
                 "broker_order_no_enriched": broker_order_no_enriched,
+                "event_identity": event_identity,
+                "event_identity_source": event_identity_source,
             }
         )
         return {"data": updated_data}
@@ -347,7 +433,7 @@ def record_chejan_event(
         reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
         blocked = _blocked(stage, reasons[0] if reasons else "queue mutation failed")
         blocked.update({key: value for key, value in mutation_result.items() if key not in blocked})
-        return blocked
+        return preserve_queue_mutation_result(blocked, mutation_result)
 
     after_sha256 = _sha256_file(target_path)
     result = {
@@ -363,10 +449,12 @@ def record_chejan_event(
         "event_type": event_type,
         "matched_by": _clean_text(review_result.get("matched_by")),
         "broker_order_no_enriched": mutation_state["broker_order_no_enriched"],
+        "event_identity": mutation_state["event_identity"],
+        "event_identity_source": mutation_state["event_identity_source"],
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
         "blocked_reasons": [],
         "warnings": [],
     }
     result.update({key: value for key, value in mutation_result.items() if key not in result})
-    return result
+    return preserve_queue_mutation_result(result, mutation_result)

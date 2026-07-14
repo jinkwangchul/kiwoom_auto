@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from execution_queue_writer import restore_order_queue_from_approved_backup
+from execution_queue_writer import preserve_queue_mutation_result, restore_order_queue_from_approved_backup
 
 
 READY = "READY"
@@ -96,6 +96,8 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
     execution_result["post_restore_verified"] = writer_result.get("post_write_verified") is True
     execution_result["writer_result"] = deepcopy(writer_result)
     _extend_list(execution_result["reasons"], writer_result.get("blocked_reasons"))
+    execution_result = preserve_queue_mutation_result(execution_result, writer_result)
+    result = preserve_queue_mutation_result(result, writer_result)
 
     if writer_result.get("file_write") is True and writer_result.get("queue_write") is not True:
         _mark_pre_restore_file_effects(result)

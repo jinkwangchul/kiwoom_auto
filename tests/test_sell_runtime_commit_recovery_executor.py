@@ -302,6 +302,38 @@ class SellRuntimeCommitRecoveryExecutorTests(unittest.TestCase):
         self.assertFalse(result["order_request_created"])
         self.assertFalse(result["real_ready_state_changed"])
 
+    def test_writer_post_write_failure_preserves_canonical_side_effects(self):
+        queue_path, backup_path = self._queue_files()
+        writer_result = {
+            "committed": True,
+            "changed": True,
+            "file_write": True,
+            "queue_write": True,
+            "queue_committed": True,
+            "post_write_verified": False,
+            "revision_before": 0,
+            "revision_after": 1,
+            "lock_acquired": True,
+            "cas_checked": True,
+            "restore_executed": True,
+            "blocked_reasons": ["forced post-write failure"],
+            "warnings": [],
+        }
+
+        with mock.patch(
+            "sell_runtime_commit_recovery_executor.restore_order_queue_from_approved_backup",
+            return_value=writer_result,
+        ):
+            result = execute_sell_runtime_commit_recovery(self._approval(queue_path, backup_path))
+
+        self.assertEqual("INVALID", result["status"])
+        for field in ("committed", "changed", "file_write", "queue_write", "queue_committed", "lock_acquired", "cas_checked"):
+            self.assertTrue(result[field], field)
+            self.assertTrue(result["recovery_results"][0][field], field)
+        self.assertFalse(result["post_write_verified"])
+        self.assertTrue(result["runtime_write"])
+        self.assertTrue(result["backup_restored"])
+
     def test_temp_restore_validation_failure_keeps_file_write_only(self):
         queue_path, backup_path = self._queue_files()
         approval = self._approval(queue_path, backup_path)

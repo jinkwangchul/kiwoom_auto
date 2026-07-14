@@ -94,6 +94,8 @@ def _queue_metadata(
     lock_wait_ms: int = 0,
 ) -> dict[str, Any]:
     return {
+        "committed": False,
+        "changed": False,
         "revision_before": revision_before,
         "revision_after": revision_after,
         "expected_revision": expected_revision,
@@ -101,6 +103,8 @@ def _queue_metadata(
         "lock_acquired": lock_acquired,
         "lock_wait_ms": lock_wait_ms,
         "file_write": False,
+        "queue_write": False,
+        "queue_committed": False,
         "post_write_verified": False,
     }
 
@@ -109,6 +113,29 @@ def _with_queue_metadata(result: dict[str, Any], **metadata: Any) -> dict[str, A
     updated = _queue_metadata(**metadata)
     updated.update(result)
     return updated
+
+
+_QUEUE_MUTATION_RESULT_FIELDS = (
+    "committed",
+    "changed",
+    "file_write",
+    "queue_write",
+    "queue_committed",
+    "post_write_verified",
+    "revision_before",
+    "revision_after",
+    "lock_acquired",
+    "cas_checked",
+)
+
+
+def preserve_queue_mutation_result(result: dict[str, Any], mutation_result: Any) -> dict[str, Any]:
+    """Preserve canonical mutation facts when an adapter adds business status."""
+    merged = deepcopy(result)
+    canonical = _as_dict(mutation_result)
+    for field in _QUEUE_MUTATION_RESULT_FIELDS:
+        merged[field] = deepcopy(canonical.get(field))
+    return merged
 
 
 def _now_text() -> str:

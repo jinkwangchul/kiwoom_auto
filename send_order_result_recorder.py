@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from execution_queue_writer import mutate_order_queue
+from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -247,7 +247,7 @@ def record_send_order_result(
         reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
         blocked = _blocked(stage, reasons[0] if reasons else "queue mutation failed")
         blocked.update({key: value for key, value in mutation_result.items() if key not in blocked})
-        return blocked
+        return preserve_queue_mutation_result(blocked, mutation_result)
 
     after_sha256 = _sha256_file(target_path)
     response = {
@@ -270,4 +270,4 @@ def record_send_order_result(
         "warnings": [],
     }
     response.update({key: value for key, value in mutation_result.items() if key not in response})
-    return response
+    return preserve_queue_mutation_result(response, mutation_result)

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from execution_queue_writer import commit_legacy_order_queued_record
+from execution_queue_writer import commit_legacy_order_queued_record, preserve_queue_mutation_result
 
 
 EXECUTOR_TYPE = "EXECUTION_QUEUE_COMMIT_EXECUTOR"
@@ -237,6 +237,7 @@ def execute_queue_commit_from_dry_run(
     commit_report["backup_path"] = writer_result.get("backup_path")
     commit_report["after_hash"] = _sha256_path(target_path) if target_path.exists() else None
     commit_report["writer_result"] = deepcopy(writer_result)
+    commit_report = preserve_queue_mutation_result(commit_report, writer_result)
     if writer_result.get("committed") is True and writer_result.get("post_write_verified") is True:
         commit_report.update(
             {
@@ -249,7 +250,7 @@ def execute_queue_commit_from_dry_run(
                 "next_stage": NEXT_STAGE_REVIEW_REQUIRED,
             }
         )
-        return _result(
+        result = _result(
             status=STATUS_COMMITTED,
             commit_id=commit_id,
             commit_report=commit_report,
@@ -258,6 +259,7 @@ def execute_queue_commit_from_dry_run(
             queue_write=True,
             queue_commit_called=True,
         )
+        return preserve_queue_mutation_result(result, writer_result)
 
     reasons = list(writer_result.get("blocked_reasons") or [])
     stage = _text(writer_result.get("write_stage"))
@@ -268,7 +270,7 @@ def execute_queue_commit_from_dry_run(
         status = STATUS_ERROR
         reasons = reasons or ["POST_WRITE_VERIFICATION_FAILED"]
         commit_report["manual_restore_required"] = True
-    return _result(
+    result = _result(
         status=status,
         commit_id=commit_id,
         commit_report=commit_report,
@@ -277,3 +279,4 @@ def execute_queue_commit_from_dry_run(
         queue_write=bool(writer_result.get("queue_write")),
         queue_commit_called=True,
     )
+    return preserve_queue_mutation_result(result, writer_result)

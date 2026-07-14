@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from execution_queue_writer import mutate_order_queue
+from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -273,7 +273,7 @@ def commit_execution_enable(
         reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
         blocked = _commit_blocked(stage, reasons[0] if reasons else "queue mutation failed")
         blocked.update({key: value for key, value in mutation_result.items() if key not in blocked})
-        return blocked
+        return preserve_queue_mutation_result(blocked, mutation_result)
 
     after_sha256 = _sha256_file(target_path)
     result = {
@@ -294,4 +294,4 @@ def commit_execution_enable(
         "warnings": [],
     }
     result.update({key: value for key, value in mutation_result.items() if key not in result})
-    return result
+    return preserve_queue_mutation_result(result, mutation_result)

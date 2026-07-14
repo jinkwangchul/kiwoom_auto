@@ -374,6 +374,38 @@ class ExecutionEnableServiceTest(unittest.TestCase):
         self.assertEqual(0, self._read_queue().get("revision", 0))
         self.assertFalse(Path(str(self.queue_path) + ".bak").exists())
 
+    def test_post_write_failure_preserves_canonical_side_effects(self) -> None:
+        self._write_queue([self._order()])
+        writer_result = {
+            "committed": True,
+            "changed": True,
+            "file_write": True,
+            "queue_write": True,
+            "queue_committed": True,
+            "post_write_verified": False,
+            "revision_before": 0,
+            "revision_after": 1,
+            "lock_acquired": True,
+            "cas_checked": True,
+            "write_stage": "post_write_verify",
+            "blocked_reasons": ["forced post-write failure"],
+            "warnings": [],
+        }
+
+        with mock.patch("execution_enable_service.mutate_order_queue", return_value=writer_result):
+            result = commit_execution_enable(
+                self._enable_preview(),
+                self.queue_path,
+                context=self._commit_context(expected_revision=0),
+            )
+
+        self.assertFalse(result["enabled"])
+        for field in ("committed", "changed", "file_write", "queue_write", "queue_committed", "lock_acquired", "cas_checked"):
+            self.assertTrue(result[field], field)
+        self.assertFalse(result["post_write_verified"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+
     def test_commit_with_backup_false_does_not_create_backup(self) -> None:
         self._write_queue([self._order()])
 

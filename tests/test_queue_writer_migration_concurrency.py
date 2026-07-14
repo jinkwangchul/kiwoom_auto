@@ -164,6 +164,26 @@ class QueueWriterMigrationConcurrencyTest(unittest.TestCase):
         self.assertTrue(any(item.get("recorded") for item in results))
         self.assertTrue(any(item.get("committed") for item in results))
 
+    def test_same_chejan_event_concurrent_calls_append_once(self) -> None:
+        self._write_queue([_queued_record(1, send_order_called=True)])
+
+        def record() -> dict:
+            return record_chejan_event(
+                self._chejan_review(1),
+                self._chejan_event(1),
+                self.queue_path,
+                context={"manual_chejan_event_record_confirmed": True},
+            )
+
+        results = self._run_two(record, record)
+
+        data = self._read_queue()
+        events = data["orders"][0]["chejan_events"]
+        self.assertEqual(1, data["revision"])
+        self.assertEqual(1, len(events))
+        self.assertEqual(1, sum(item.get("recorded") is True for item in results))
+        self.assertEqual(1, sum(item.get("duplicate") is True for item in results))
+
     def test_send_result_update_and_new_commit_do_not_lose_records(self) -> None:
         self._write_queue([_queued_record(1)])
 
