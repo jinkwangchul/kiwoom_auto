@@ -868,6 +868,7 @@ _INCOMPLETE_RESTART_STATUSES = {
 }
 _FILL_LEDGER_EVENT_TYPES = {"PARTIAL_FILL", "FULL_FILL"}
 _CANCELLED_STATES = {"CANCELLED", "PARTIAL_CANCELLED"}
+_FILL_QUANTITY_SEMANTICS = "CUMULATIVE"
 
 
 def _canonical_json_hash(value: Any) -> str:
@@ -1229,6 +1230,7 @@ def inspect_incomplete_order_reconciliation(
         "queue_average_fill_price": _price_or_none(record.get("average_fill_price")),
         "fills_ledger_count": fill_summary["fills_ledger_count"],
         "fills_effective_count": fill_summary["fills_effective_count"],
+        "fill_quantity_semantics": _FILL_QUANTITY_SEMANTICS,
         "fills_summed_quantity": fill_summary["fills_summed_quantity"],
         "fills_delta_quantity": fill_summary["fills_delta_quantity"],
         "fills_weighted_average_price": fill_summary["fills_weighted_average_price"],

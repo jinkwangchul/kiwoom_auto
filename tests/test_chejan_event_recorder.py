@@ -1032,7 +1032,41 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
             self.assertEqual(5, result["fills_summed_quantity"])
             self.assertEqual(5, result["fills_delta_quantity"])
+            self.assertEqual("CUMULATIVE", result["fill_quantity_semantics"])
             self.assertEqual(1040, result["fills_weighted_average_price"])
+            self.assertFalse(result["queue_fills_mismatch"])
+
+    def test_restart_reconciliation_prefers_broker_cumulative_average_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="PARTIALLY_FILLED",
+                    original_order_quantity=10,
+                    cumulative_filled_quantity=5,
+                    remaining_quantity=5,
+                    fill_count=2,
+                    average_fill_price=1088,
+                ),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(fill_id="FILL_1", execution_no="1", filled_quantity=3, filled_price=1000, remaining_quantity=7),
+                    self._fill(
+                        fill_id="FILL_2",
+                        execution_no="2",
+                        filled_quantity=5,
+                        filled_price=1100,
+                        remaining_quantity=5,
+                        average_fill_price=1088,
+                    ),
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(1088, result["fills_weighted_average_price"])
             self.assertFalse(result["queue_fills_mismatch"])
 
     def test_restart_reconciliation_three_cumulative_events_use_deltas(self) -> None:
