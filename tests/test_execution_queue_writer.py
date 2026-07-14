@@ -19,7 +19,12 @@ from execution_queue_writer import (
     commit_execution_queue_write,
     commit_execution_queue_write_batch,
     inspect_dispatch_claim,
+    inspect_send_order_lifecycle,
+    mark_send_order_attempted,
     preview_execution_queue_write,
+    record_broker_send_accepted,
+    record_broker_send_rejected,
+    record_broker_send_uncertain,
     release_dispatch_claim,
 )
 
@@ -120,6 +125,23 @@ def _process_claim_worker(queue_path: str, start_event: Any, result_queue: Any, 
         claim_owner=owner,
         context={"approval_token": "APPROVAL_TOKEN"},
         expected_revision=0,
+    )
+    result_queue.put(result)
+
+
+def _process_attempt_worker(queue_path: str, start_event: Any, result_queue: Any, owner: str) -> None:
+    data = json.loads(Path(queue_path).read_text(encoding="utf-8"))
+    record = data["orders"][0]
+    start_event.wait()
+    result = mark_send_order_attempted(
+        queue_path,
+        _identity_from_record(record),
+        dispatch_claim_id=record["dispatch_claim_id"],
+        claim_token="CLAIM_TOKEN",
+        claim_owner=record["dispatch_claim_owner"],
+        attempt_owner=owner,
+        context={},
+        expected_revision=1,
     )
     result_queue.put(result)
 
@@ -243,6 +265,22 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             "dispatch_claim_source": "final_guard",
             "dispatch_claim_ttl_sec": 60,
         }
+
+    def _write_claimed_queue(self, queue_path: Path, record: dict | None = None) -> tuple[dict, dict]:
+        target_record = record or self._claimable_record()
+        self._write_queue(queue_path, orders=[target_record])
+        claim = claim_order_for_dispatch(
+            queue_path,
+            self._identity(target_record),
+            self._final_guard(target_record),
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context=self._claim_context(),
+            expected_revision=0,
+        )
+        self.assertTrue(claim["claimed"])
+        claimed_record = self._read_queue(queue_path)["orders"][0]
+        return claim, claimed_record
 
     def test_queue_pending_false_is_blocked(self) -> None:
         queue_pending = self._queue_pending_result()
@@ -1848,6 +1886,409 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertEqual(["DISPATCH_CLAIMED", "DISPATCH_CLAIMED"], [item["status"] for item in data["orders"]])
         self.assertEqual(2, data["revision"])
         self.assertFalse(any(item.get("send_order_called") for item in data["orders"]))
+
+    def test_mark_send_order_attempted_transitions_dispatch_claimed_to_send_attempted(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+
+        result = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            attempt_owner="TIMER",
+            attempt_source="dispatch_executor_boundary",
+            expected_revision=1,
+        )
+
+        data = self._read_queue(queue_path)
+        record = data["orders"][0]
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["attempt_recorded"])
+        self.assertEqual("SEND_ATTEMPTED", result["status"])
+        self.assertEqual("SEND_ATTEMPTED", record["status"])
+        self.assertFalse(record["send_order_called"])
+        self.assertTrue(record["send_order_attempted"])
+        self.assertTrue(record["send_order_attempt_recorded"])
+        self.assertEqual(result["send_order_attempt_id"], record["send_order_attempt_id"])
+        self.assertEqual("TIMER", record["send_order_attempt_owner"])
+        self.assertEqual("dispatch_executor_boundary", record["send_order_attempt_source"])
+        self.assertFalse(record["broker_call_executed"])
+        self.assertFalse(record["actual_order_sent"])
+        self.assertFalse(record["broker_api_called"])
+        self.assertFalse(record["send_call_result_known"])
+        self.assertFalse(record["broker_result_known"])
+        self.assertFalse(record["broker_accepted"])
+        self.assertFalse(record["broker_rejected"])
+        self.assertFalse(record["automatic_retry_allowed"])
+        self.assertEqual(2, data["revision"])
+        self.assertEqual(1, result["revision_before"])
+        self.assertEqual(2, result["revision_after"])
+        self.assertNotIn("CLAIM_TOKEN", json.dumps(data))
+        self.assertNotIn("CLAIM_TOKEN", json.dumps(result))
+
+    def test_mark_send_order_attempted_blocks_claim_mismatch_and_expired_claim(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+
+        wrong_claim = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id="WRONG",
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        wrong_token = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="WRONG",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        data = self._read_queue(queue_path)
+        data["orders"][0]["dispatch_claim_expires_at"] = "2000-01-01 00:00:00"
+        queue_path.write_text(json.dumps(data), encoding="utf-8")
+        expired = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+
+        self.assertFalse(wrong_claim["committed"])
+        self.assertIn("dispatch claim id mismatch", wrong_claim["blocked_reasons"])
+        self.assertFalse(wrong_token["committed"])
+        self.assertIn("dispatch claim token hash mismatch", wrong_token["blocked_reasons"])
+        self.assertFalse(expired["committed"])
+        self.assertEqual("stale_dispatch_claim", expired["write_stage"])
+
+    def test_mark_send_order_attempted_blocks_order_queued_direct_and_duplicate_attempt(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        order_queued = self._claimable_record()
+        self._write_queue(queue_path, orders=[order_queued])
+
+        direct = mark_send_order_attempted(
+            queue_path,
+            self._identity(order_queued),
+            dispatch_claim_id="CLAIM",
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=0,
+        )
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        first = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        duplicate = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=2,
+        )
+
+        self.assertFalse(direct["committed"])
+        self.assertIn("target record status is not DISPATCH_CLAIMED", direct["blocked_reasons"])
+        self.assertTrue(first["attempt_recorded"])
+        self.assertFalse(duplicate["committed"])
+        self.assertIn("target record status is not DISPATCH_CLAIMED", duplicate["blocked_reasons"])
+
+    def test_broker_send_result_records_accepted_rejected_and_uncertain(self) -> None:
+        for status in ("accepted", "rejected", "uncertain"):
+            with self.subTest(status=status):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                queue_path = Path(tmp.name) / "order_queue.json"
+                claim, claimed_record = self._write_claimed_queue(queue_path)
+                attempt = mark_send_order_attempted(
+                    queue_path,
+                    self._identity(claimed_record),
+                    dispatch_claim_id=claim["dispatch_claim_id"],
+                    claim_token="CLAIM_TOKEN",
+                    claim_owner="GUI_MANUAL",
+                    expected_revision=1,
+                )
+                if status == "accepted":
+                    result = record_broker_send_accepted(
+                        queue_path,
+                        self._identity(claimed_record),
+                        dispatch_claim_id=claim["dispatch_claim_id"],
+                        send_order_attempt_id=attempt["send_order_attempt_id"],
+                        broker_return_code=0,
+                        broker_order_no="BRK_1",
+                        expected_revision=2,
+                    )
+                    expected_status = "SEND_CALL_ACCEPTED"
+                    expected_flag = "send_call_accepted"
+                elif status == "rejected":
+                    result = record_broker_send_rejected(
+                        queue_path,
+                        self._identity(claimed_record),
+                        dispatch_claim_id=claim["dispatch_claim_id"],
+                        send_order_attempt_id=attempt["send_order_attempt_id"],
+                        broker_return_code=-1,
+                        broker_error_code="ERR",
+                        broker_error_message="rejected",
+                        expected_revision=2,
+                    )
+                    expected_status = "SEND_CALL_REJECTED"
+                    expected_flag = "send_call_rejected"
+                else:
+                    result = record_broker_send_uncertain(
+                        queue_path,
+                        self._identity(claimed_record),
+                        dispatch_claim_id=claim["dispatch_claim_id"],
+                        send_order_attempt_id=attempt["send_order_attempt_id"],
+                        uncertain_reason="timeout",
+                        expected_revision=2,
+                    )
+                    expected_status = "SEND_UNCERTAIN"
+                    expected_flag = "send_uncertain"
+
+                record = self._read_queue(queue_path)["orders"][0]
+                self.assertTrue(result["committed"])
+                self.assertTrue(result["send_call_result_recorded"])
+                self.assertFalse(result["broker_result_recorded"])
+                self.assertEqual(expected_status, result["status"])
+                self.assertEqual(expected_status, record["status"])
+                self.assertTrue(record[expected_flag])
+                if status != "uncertain":
+                    self.assertTrue(record["send_call_result_known"])
+                self.assertFalse(record["actual_order_sent"])
+                self.assertFalse(record["broker_result_known"])
+                self.assertFalse(record["broker_accepted"])
+                self.assertFalse(record["broker_rejected"])
+                self.assertFalse(record["automatic_retry_allowed"])
+                self.assertEqual(3, self._read_queue(queue_path)["revision"])
+                if status == "uncertain":
+                    self.assertTrue(record["manual_reconciliation_required"])
+                    self.assertEqual("timeout", record["uncertain_reason"])
+
+    def test_broker_send_result_blocks_overwrite_and_attempt_mismatch(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+
+        mismatch = record_broker_send_accepted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id="WRONG",
+            expected_revision=2,
+        )
+        accepted = record_broker_send_accepted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
+        overwrite = record_broker_send_rejected(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=3,
+        )
+
+        self.assertFalse(mismatch["committed"])
+        self.assertIn("send order attempt id mismatch", mismatch["blocked_reasons"])
+        self.assertTrue(accepted["committed"])
+        self.assertFalse(overwrite["committed"])
+        self.assertIn("target record status is not SEND_ATTEMPTED", overwrite["blocked_reasons"])
+
+    def test_same_order_two_threads_only_one_send_order_attempt(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        results: list[dict] = []
+
+        def worker(owner: str) -> None:
+            results.append(
+                mark_send_order_attempted(
+                    queue_path,
+                    self._identity(claimed_record),
+                    dispatch_claim_id=claim["dispatch_claim_id"],
+                    claim_token="CLAIM_TOKEN",
+                    claim_owner="GUI_MANUAL",
+                    attempt_owner=owner,
+                    expected_revision=1,
+                )
+            )
+
+        threads = [threading.Thread(target=worker, args=("GUI_MANUAL",)), threading.Thread(target=worker, args=("TIMER",))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(1, sum(1 for item in results if item.get("attempt_recorded") is True))
+        self.assertEqual("SEND_ATTEMPTED", data["orders"][0]["status"])
+        self.assertEqual(2, data["revision"])
+
+    def test_same_order_two_processes_only_one_send_order_attempt(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        self._write_claimed_queue(queue_path)
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(target=_process_attempt_worker, args=(str(queue_path), start_event, result_queue, "GUI_MANUAL")),
+            ctx.Process(target=_process_attempt_worker, args=(str(queue_path), start_event, result_queue, "TIMER")),
+        ]
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(10)
+            self.assertEqual(0, process.exitcode)
+        results = [result_queue.get(timeout=5) for _ in processes]
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(1, sum(1 for item in results if item.get("attempt_recorded") is True))
+        self.assertEqual("SEND_ATTEMPTED", data["orders"][0]["status"])
+        self.assertEqual(2, data["revision"])
+
+    def test_different_order_send_order_attempts_preserve_all_records(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        records = [self._claimable_record(1), self._claimable_record(2)]
+        self._write_queue(queue_path, orders=records)
+        first_claim = claim_order_for_dispatch(
+            queue_path,
+            self._identity(records[0]),
+            self._final_guard(records[0]),
+            claim_token="CLAIM_TOKEN_1",
+            claim_owner="GUI_MANUAL",
+            context=self._claim_context(),
+            expected_revision=0,
+        )
+        second_claim = claim_order_for_dispatch(
+            queue_path,
+            self._identity(records[1]),
+            self._final_guard(records[1]),
+            claim_token="CLAIM_TOKEN_2",
+            claim_owner="WORKER:2",
+            context=self._claim_context(owner="WORKER:2"),
+            expected_revision=1,
+        )
+
+        first_attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(records[0]),
+            dispatch_claim_id=first_claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN_1",
+            claim_owner="GUI_MANUAL",
+            expected_revision=2,
+        )
+        second_attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(records[1]),
+            dispatch_claim_id=second_claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN_2",
+            claim_owner="WORKER:2",
+            expected_revision=3,
+        )
+
+        data = self._read_queue(queue_path)
+        self.assertTrue(first_attempt["attempt_recorded"])
+        self.assertTrue(second_attempt["attempt_recorded"])
+        self.assertEqual(["SEND_ATTEMPTED", "SEND_ATTEMPTED"], [item["status"] for item in data["orders"]])
+        self.assertEqual(4, data["revision"])
+
+    def test_inspect_send_order_lifecycle_does_not_write(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+
+        inspected = inspect_send_order_lifecycle(queue_path, self._identity(claimed_record))
+
+        self.assertFalse(inspected["committed"])
+        self.assertFalse(inspected["changed"])
+        self.assertTrue(inspected["lifecycle_inspected"])
+        self.assertEqual("SEND_ATTEMPTED", inspected["status"])
+        self.assertEqual(attempt["send_order_attempt_id"], inspected["send_order_attempt_id"])
+        self.assertFalse(inspected["automatic_retry_allowed"])
+        self.assertEqual(2, self._read_queue(queue_path)["revision"])
+
+    def test_broker_result_post_write_verify_failure_preserves_side_effect_flags(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        original_read = queue_writer._read_queue_file
+        calls = {"count": 0}
+
+        def mismatched_after_read(path: Path):
+            calls["count"] += 1
+            data, blocked = original_read(path)
+            if calls["count"] > 1 and not blocked:
+                data["orders"][0]["status"] = "WRONG"
+            return data, blocked
+
+        with mock.patch("execution_queue_writer._read_queue_file", side_effect=mismatched_after_read):
+            result = record_broker_send_accepted(
+                queue_path,
+                self._identity(claimed_record),
+                dispatch_claim_id=claim["dispatch_claim_id"],
+                send_order_attempt_id=attempt["send_order_attempt_id"],
+                expected_revision=2,
+            )
+
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
 
 
 if __name__ == "__main__":
