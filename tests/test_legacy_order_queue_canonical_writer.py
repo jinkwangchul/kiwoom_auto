@@ -36,16 +36,47 @@ def _process_append_worker(queue_path: str, candidate: dict, start_event: object
     result_queue.put(child_order_queue.append_order_candidates([candidate], backup=True))
 
 
+def _signal(index: int, *, source_signal_id: str | None = None) -> dict:
+    return {
+        "id": source_signal_id or f"SIG_BUILD_{index}",
+        "status": "PENDING",
+        "routine": "routine",
+        "code": f"00{index:04d}",
+        "name": f"NAME_{index}",
+        "signal": "SELL",
+        "reason": "test",
+    }
+
+
+def _process_build_worker(signal_path: str, queue_path: str, signal: dict, start_event: object, result_queue: object) -> None:
+    import order_queue as child_order_queue
+
+    child_order_queue.SIGNAL_QUEUE_PATH = Path(signal_path)
+    child_order_queue.ORDER_QUEUE_PATH = Path(queue_path)
+    Path(signal_path).write_text(
+        json.dumps({"version": 1, "updated_at": "", "signals": [signal]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    start_event.wait()
+    result_queue.put(child_order_queue.build_order_queue_from_signals())
+
+
 class LegacyOrderQueueCanonicalWriterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.queue_path = self.root / "order_queue.json"
-        self.patcher = mock.patch.object(order_queue, "ORDER_QUEUE_PATH", self.queue_path)
-        self.patcher.start()
+        self.signal_path = self.root / "routine_signals.json"
+        self.patchers = [
+            mock.patch.object(order_queue, "ORDER_QUEUE_PATH", self.queue_path),
+            mock.patch.object(order_queue, "SIGNAL_QUEUE_PATH", self.signal_path),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
 
     def tearDown(self) -> None:
-        self.patcher.stop()
+        for patcher in reversed(self.patchers):
+            patcher.stop()
         self.tmp.cleanup()
 
     def _write_queue(self, *, revision: int | None = None, orders: list[dict] | None = None) -> None:
@@ -56,6 +87,12 @@ class LegacyOrderQueueCanonicalWriterTest(unittest.TestCase):
 
     def _read_queue(self) -> dict:
         return json.loads(self.queue_path.read_text(encoding="utf-8"))
+
+    def _write_signals(self, signals: list[dict]) -> None:
+        self.signal_path.write_text(
+            json.dumps({"version": 1, "updated_at": "", "signals": signals}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def test_append_uses_canonical_writer_and_adds_revision(self) -> None:
         result = order_queue.append_order_candidates([_candidate(1)])
@@ -209,6 +246,93 @@ class LegacyOrderQueueCanonicalWriterTest(unittest.TestCase):
         source = Path(order_queue.__file__).read_text(encoding="utf-8")
         self.assertNotIn("ORDER_QUEUE_PATH.write_text", source)
         self.assertNotIn("path.write_text", source)
+
+    def test_build_order_queue_from_signals_uses_append_not_replace(self) -> None:
+        self._write_signals([_signal(1)])
+        with (
+            mock.patch.object(order_queue, "append_order_candidates", return_value={"orders_created": 1, "duplicates": 0, "order_queue_written": True}) as append,
+            mock.patch.object(order_queue, "replace_order_queue") as replace,
+            mock.patch.object(order_queue, "write_order_queue") as write,
+        ):
+            result = order_queue.build_order_queue_from_signals()
+
+        append.assert_called_once()
+        replace.assert_not_called()
+        write.assert_not_called()
+        self.assertEqual(1, result["orders_created"])
+
+    def test_build_order_queue_from_signals_preserves_existing_record_patch(self) -> None:
+        existing = {
+            **_candidate(99, source_signal_id="SIG_EXISTING"),
+            "chejan_events": [{"event_identity": "CHEJAN_1"}],
+        }
+        self._write_queue(revision=4, orders=[existing])
+        self._write_signals([_signal(1, source_signal_id="SIG_NEW")])
+
+        result = order_queue.build_order_queue_from_signals()
+
+        data = self._read_queue()
+        self.assertEqual(1, result["orders_created"])
+        self.assertEqual(5, data["revision"])
+        self.assertEqual([{"event_identity": "CHEJAN_1"}], data["orders"][0]["chejan_events"])
+        self.assertEqual("SIG_NEW", data["orders"][1]["source_signal_id"])
+
+    def test_stale_full_replacement_is_blocked_without_expected_revision(self) -> None:
+        self._write_queue(revision=8, orders=[_candidate(1)])
+
+        result = order_queue.replace_order_queue({"orders": []})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("full_replace_blocked", result["write_stage"])
+        self.assertFalse(result["order_queue_written"])
+        self.assertEqual(1, len(self._read_queue()["orders"]))
+
+    def test_explicit_full_replacement_requires_matching_revision(self) -> None:
+        self._write_queue(revision=8, orders=[_candidate(1)])
+
+        stale = order_queue.replace_order_queue(
+            {"orders": []},
+            expected_revision=7,
+            context={"allow_full_queue_replace": True},
+        )
+        self.assertFalse(stale["ok"])
+        self.assertEqual(1, len(self._read_queue()["orders"]))
+
+        success = order_queue.replace_order_queue(
+            {"orders": []},
+            expected_revision=8,
+            context={"allow_full_queue_replace": True},
+        )
+
+        self.assertTrue(success["committed"])
+        self.assertEqual(0, len(self._read_queue()["orders"]))
+        self.assertEqual(9, self._read_queue()["revision"])
+
+    def test_two_processes_build_order_queue_from_same_signal_appends_once(self) -> None:
+        self._write_queue(revision=0)
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        workers = [
+            ctx.Process(
+                target=_process_build_worker,
+                args=(str(self.signal_path), str(self.queue_path), _signal(1, source_signal_id="SIG_BUILD_PROCESS"), start_event, result_queue),
+            )
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        start_event.set()
+        results = [result_queue.get(timeout=10) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertEqual(0, worker.exitcode)
+
+        data = self._read_queue()
+        self.assertEqual(1, len(data["orders"]))
+        self.assertEqual(1, data["revision"])
+        self.assertEqual(1, sum(1 for item in results if item.get("orders_created") == 1))
+        self.assertEqual(1, sum(1 for item in results if item.get("duplicates") == 1))
 
 
 class RoutineSignalConsumerCanonicalAppendTest(unittest.TestCase):

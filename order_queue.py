@@ -318,6 +318,13 @@ def replace_order_queue(
     """Replace the legacy order queue through the canonical writer boundary."""
     if not callable(mutate_order_queue):
         return _queue_result(ok=False, write_stage="canonical_writer", reason="execution_queue_writer.mutate_order_queue unavailable")
+    ctx = context if isinstance(context, dict) else {}
+    if expected_revision is None or ctx.get("allow_full_queue_replace") is not True:
+        return _queue_result(
+            ok=False,
+            write_stage="full_replace_blocked",
+            reason="full order_queue replace requires allow_full_queue_replace and expected_revision",
+        )
     replacement = deepcopy(data) if isinstance(data, dict) else _initial_order_queue()
     if not isinstance(replacement.get("orders"), list):
         replacement["orders"] = []
@@ -325,17 +332,19 @@ def replace_order_queue(
     def mutate(_: dict[str, Any]) -> dict[str, Any]:
         return {"data": deepcopy(replacement)}
 
-    return mutate_order_queue(
+    result = mutate_order_queue(
         ORDER_QUEUE_PATH,
         mutate,
         operation_name="legacy_order_queue_replace",
         success_stage="legacy_order_queue_replaced",
         next_stage="LEGACY_ORDER_QUEUE_REVIEW_REQUIRED",
         backup=backup,
-        context=context or {"manual_queue_write_confirmed": True},
+        context={**ctx, "manual_queue_write_confirmed": True},
         expected_revision=expected_revision,
         default_queue=_initial_order_queue(),
     )
+    result["ok"] = result.get("committed") is True and result.get("post_write_verified") is True
+    return result
 
 
 def _make_order_id(signal: dict[str, Any], index: int) -> str:
@@ -453,58 +462,53 @@ def signal_to_order_candidate(signal: dict[str, Any], index: int) -> dict[str, A
 
 def build_order_queue_from_signals() -> dict[str, Any]:
     signal_data = read_signal_queue()
-    order_data = read_order_queue()
 
     signals = signal_data.get("signals", [])
-    orders = order_data.get("orders", [])
 
     if not isinstance(signals, list):
         signals = []
-    if not isinstance(orders, list):
-        orders = []
-        order_data["orders"] = orders
 
-    existing_keys = {
-        _order_dedupe_key(order)
-        for order in orders
-        if isinstance(order, dict)
-    }
-
-    created = 0
-    duplicates = 0
     ignored = 0
+    new_candidates: list[dict[str, Any]] = []
 
     for signal in signals:
         if not isinstance(signal, dict):
             ignored += 1
             continue
 
-        order = signal_to_order_candidate(signal, len(orders) + 1)
+        order = signal_to_order_candidate(signal, len(new_candidates) + 1)
         if order is None:
             ignored += 1
             continue
 
-        key = _order_dedupe_key(order)
-        if key in existing_keys:
-            duplicates += 1
-            continue
+        new_candidates.append(order)
 
-        orders.append(order)
-        existing_keys.add(key)
-        created += 1
-
-    if created > 0:
-        write_order_queue(order_data)
-    else:
-        if not ORDER_QUEUE_PATH.exists():
-            write_order_queue(order_data)
+    append_result = append_order_candidates(new_candidates) if new_candidates else _queue_result(
+        ok=True,
+        write_stage="candidate_append_noop",
+        ignored=ignored,
+    )
 
     return {
         "signals_checked": len(signals),
-        "orders_created": created,
-        "duplicates": duplicates,
+        "orders_created": int(append_result.get("orders_created", 0) or 0),
+        "duplicates": int(append_result.get("duplicates", 0) or 0),
         "ignored": ignored,
         "order_queue_path": str(ORDER_QUEUE_PATH),
+        "order_queue_written": bool(append_result.get("order_queue_written")),
+        "append_result": append_result,
+        "committed": append_result.get("committed"),
+        "changed": append_result.get("changed"),
+        "file_write": append_result.get("file_write"),
+        "queue_write": append_result.get("queue_write"),
+        "queue_committed": append_result.get("queue_committed"),
+        "post_write_verified": append_result.get("post_write_verified"),
+        "revision_before": append_result.get("revision_before"),
+        "revision_after": append_result.get("revision_after"),
+        "expected_revision": append_result.get("expected_revision"),
+        "cas_checked": append_result.get("cas_checked"),
+        "lock_acquired": append_result.get("lock_acquired"),
+        "lock_wait_ms": append_result.get("lock_wait_ms"),
     }
 
 
