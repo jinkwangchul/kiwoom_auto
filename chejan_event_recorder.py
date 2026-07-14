@@ -937,20 +937,48 @@ def _fill_identity(record: dict[str, Any]) -> str:
     return f"canonical_event_hash:{_canonical_json_hash(record)}"
 
 
-def _strong_identity_matches(fill: dict[str, Any], record: dict[str, Any]) -> bool:
-    checks = (
-        ("order_id", "order_id"),
-        ("execution_id", "execution_id"),
-        ("order_queued_id", "id"),
-        ("request_hash", "request_hash"),
-        ("lock_id", "lock_id"),
-    )
-    for fill_field, record_field in checks:
+_FILL_STRONG_IDENTITY_FIELDS = (
+    ("order_id", "order_id"),
+    ("execution_id", "execution_id"),
+    ("order_queued_id", "id"),
+    ("request_hash", "request_hash"),
+    ("lock_id", "lock_id"),
+)
+
+
+def _strong_identity_compatible(fill: dict[str, Any], record: dict[str, Any]) -> tuple[bool, bool]:
+    has_match = False
+    for fill_field, record_field in _FILL_STRONG_IDENTITY_FIELDS:
         fill_value = _clean_text(fill.get(fill_field))
         record_value = _clean_text(record.get(record_field))
-        if fill_value and record_value and fill_value == record_value:
-            return True
-    return False
+        if not fill_value or not record_value:
+            continue
+        if fill_value != record_value:
+            return False, True
+        has_match = True
+    return has_match, False
+
+
+def _strong_identity_matches(fill: dict[str, Any], record: dict[str, Any]) -> bool:
+    fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
+    record_broker_order_no = _clean_text(record.get("broker_order_no"))
+    if fill_broker_order_no and record_broker_order_no and fill_broker_order_no != record_broker_order_no:
+        return False
+    has_match, has_conflict = _strong_identity_compatible(fill, record)
+    return has_match and not has_conflict
+
+
+def _broker_order_mismatch_fills(fills: list[dict[str, Any]], record: dict[str, Any]) -> list[str]:
+    expected_broker_order_no = _clean_text(record.get("broker_order_no"))
+    if not expected_broker_order_no:
+        return []
+    mismatches: list[str] = []
+    for fill in fills:
+        fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
+        has_match, has_conflict = _strong_identity_compatible(fill, record)
+        if has_match and not has_conflict and fill_broker_order_no and fill_broker_order_no != expected_broker_order_no:
+            mismatches.append(fill_broker_order_no)
+    return mismatches
 
 
 def _matching_fills(fills: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1007,6 +1035,7 @@ def _fill_broker_average(fill: dict[str, Any]) -> float | int | None:
 
 
 def _fill_ledger_summary(fills: list[dict[str, Any]], record: dict[str, Any]) -> dict[str, Any]:
+    broker_order_mismatches = _broker_order_mismatch_fills(fills, record)
     matches = [
         fill for _, fill in sorted(
             enumerate(_matching_fills(fills, record)),
@@ -1022,8 +1051,6 @@ def _fill_ledger_summary(fills: list[dict[str, Any]], record: dict[str, Any]) ->
     weighted_total = 0.0
     repeated_identities: list[str] = []
     out_of_order_identities: list[str] = []
-    broker_order_mismatches: list[str] = []
-    expected_broker_order_no = _clean_text(record.get("broker_order_no"))
     for fill in matches:
         identity = _fill_identity(fill)
         current_cumulative = _int_or_none(fill.get("filled_quantity") or fill.get("quantity")) or 0
@@ -1042,9 +1069,6 @@ def _fill_ledger_summary(fills: list[dict[str, Any]], record: dict[str, Any]) ->
         max_cumulative = max(max_cumulative, current_cumulative)
         previous_cumulative = current_cumulative
         weighted_total += float(fill_delta) * float(price)
-        fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
-        if expected_broker_order_no and fill_broker_order_no and fill_broker_order_no != expected_broker_order_no:
-            broker_order_mismatches.append(fill_broker_order_no)
     average = next((avg for avg in (_fill_broker_average(fill) for fill in reversed(matches)) if avg is not None), None)
     if average is None and delta_total > 0:
         value = weighted_total / delta_total

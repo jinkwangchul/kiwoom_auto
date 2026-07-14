@@ -1234,6 +1234,95 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertEqual(0, result["fills_ledger_count"])
             self.assertEqual(0, result["fills_summed_quantity"])
 
+    def test_restart_reconciliation_blocks_order_match_with_execution_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(
+                        order_id="ORDER_1",
+                        execution_id="OTHER_EXEC",
+                        request_hash="",
+                        lock_id="",
+                        order_queued_id="",
+                    )
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(0, result["fills_ledger_count"])
+            self.assertEqual(0, result["fills_summed_quantity"])
+
+    def test_restart_reconciliation_blocks_request_hash_match_with_lock_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(
+                        order_id="",
+                        execution_id="",
+                        order_queued_id="",
+                        request_hash="HASH_1",
+                        lock_id="OTHER_LOCK",
+                    )
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(0, result["fills_ledger_count"])
+            self.assertEqual(0, result["fills_summed_quantity"])
+
+    def test_restart_reconciliation_matches_single_strong_identity_when_no_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="BROKER_ACCEPTED", cumulative_filled_quantity=3, fill_count=1, average_fill_price=1000),
+            )
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(
+                        order_id="",
+                        execution_id="EXEC_1",
+                        order_queued_id="",
+                        request_hash="",
+                        lock_id="",
+                    )
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual(1, result["fills_ledger_count"])
+            self.assertEqual(3, result["fills_summed_quantity"])
+
+    def test_restart_reconciliation_reports_broker_order_mismatch_with_strong_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED", broker_order_no="BRK_1"))
+            fills_path = self._write_fills(
+                tmpdir,
+                [
+                    self._fill(
+                        order_id="ORDER_1",
+                        execution_id="",
+                        order_queued_id="",
+                        request_hash="",
+                        lock_id="",
+                        broker_order_no="OTHER_BRK",
+                    )
+                ],
+            )
+
+            result = inspect_incomplete_order_reconciliation(path, self._review(), fills_path=fills_path)
+
+            self.assertEqual("BLOCKED", result["reconciliation_candidate_status"])
+            self.assertEqual(0, result["fills_ledger_count"])
+            self.assertIn("broker_order_no mismatch between queue and fills ledger", result["blocked_reasons"])
+
     def test_restart_reconciliation_send_call_in_progress_with_accept_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             record = self._record(status="SEND_CALL_IN_PROGRESS", chejan_events=[{"event_type": "ORDER_ACCEPTED", "broker_order_no": "BRK_1"}])
