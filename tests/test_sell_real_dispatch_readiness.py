@@ -182,6 +182,27 @@ class SellRealDispatchReadinessTests(unittest.TestCase):
             **{k: v for k, v in overrides.items() if k == "recovery_post_check"},
         )
 
+    def _recovery_post_check(self, *, status: str = "READY", recovery_required: bool = False) -> dict:
+        return {
+            "post_check_type": "SELL_RUNTIME_COMMIT_RECOVERY_POST_CHECK",
+            "status": status,
+            "recovery_required": recovery_required,
+            "post_check_ready": status == "READY",
+            "preview_only": True,
+            "execution_connected": False,
+            "runtime_write": False,
+            "queue_write": False,
+            "file_write": False,
+            "send_order_called": False,
+            "send_order": False,
+            "broker_api_called": False,
+            "actual_order_sent": False,
+            "order_request_created": False,
+            "real_ready_state_changed": False,
+            "rollback_executed": False,
+            "backup_restored": False,
+        }
+
     def assert_no_side_effects(self, result):
         self.assertFalse(result["send_order_called"])
         self.assertFalse(result["broker_api_called"])
@@ -218,15 +239,39 @@ class SellRealDispatchReadinessTests(unittest.TestCase):
         self.assertEqual(result["status"], "INVALID")
 
     def test_recovery_required_blocks(self):
-        recovery = {
-            "post_check_type": "SELL_RUNTIME_COMMIT_RECOVERY_POST_CHECK",
-            "status": "READY",
-            "recovery_required": True,
-            "preview_only": True,
-        }
+        recovery = self._recovery_post_check(recovery_required=True)
         result = self._readiness(recovery_post_check=recovery)
 
         self.assertEqual(result["status"], "BLOCKED")
+
+    def test_recovery_blocked_blocks(self):
+        recovery = self._recovery_post_check(status="BLOCKED")
+        result = self._readiness(recovery_post_check=recovery)
+
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_recovery_invalid_invalidates(self):
+        recovery = self._recovery_post_check(status="INVALID")
+        result = self._readiness(recovery_post_check=recovery)
+
+        self.assertEqual(result["status"], "INVALID")
+
+    def test_recovery_ready_status_blocks(self):
+        recovery = self._recovery_post_check(status="RECOVERY_READY", recovery_required=True)
+        result = self._readiness(recovery_post_check=recovery)
+
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_recovery_ready_without_required_allows_ready(self):
+        recovery = self._recovery_post_check(status="READY", recovery_required=False)
+        result = self._readiness(recovery_post_check=recovery)
+
+        self.assertEqual(result["status"], "READY")
+
+    def test_recovery_omitted_with_normal_post_commit_allows_ready(self):
+        result = self._readiness()
+
+        self.assertEqual(result["status"], "READY")
 
     def test_queue_mutation_blocks(self):
         chain = self._chain()

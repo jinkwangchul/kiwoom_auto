@@ -189,14 +189,9 @@ def _validate_chain(chain: dict[str, dict[str, Any]]) -> tuple[str, str] | None:
         if item.get(ready_field) is not True:
             return INVALID, f"{label}.{ready_field} must be True"
 
-    recovery = chain.get("recovery_post_check") or {}
-    if recovery:
-        if recovery.get("post_check_type") != RECOVERY_POST_CHECK_TYPE:
-            return INVALID, "recovery_post_check.post_check_type mismatch"
-        if recovery.get("recovery_required") is True or recovery.get("status") == "RECOVERY_READY":
-            return BLOCKED, "recovery is required"
-        if recovery.get("status") == INVALID:
-            return INVALID, "recovery_post_check status is INVALID"
+    recovery_error = _recovery_post_check_error(chain.get("recovery_post_check") or {})
+    if recovery_error:
+        return recovery_error
 
     post_commit = chain["post_commit_verifier"]
     if post_commit.get("post_commit_file_verified") is not True:
@@ -204,6 +199,28 @@ def _validate_chain(chain: dict[str, dict[str, Any]]) -> tuple[str, str] | None:
     hash_error = _chain_hash_error(chain)
     if hash_error:
         return INVALID, hash_error
+    return None
+
+
+def _recovery_post_check_error(recovery: dict[str, Any]) -> tuple[str, str] | None:
+    if not recovery:
+        return None
+    if recovery.get("post_check_type") != RECOVERY_POST_CHECK_TYPE:
+        return INVALID, "recovery_post_check.post_check_type mismatch"
+    if _has_safety_violation(recovery):
+        return INVALID, "recovery_post_check safety flag violation"
+
+    status = _status(recovery.get("status"))
+    if status == INVALID:
+        return INVALID, "recovery_post_check status is INVALID"
+    if status in {BLOCKED, "RECOVERY_READY"}:
+        return BLOCKED, "recovery is required"
+    if status != READY:
+        return INVALID, "recovery_post_check status is unknown"
+    if recovery.get("recovery_required") is not False:
+        return BLOCKED, "recovery_required must be False"
+    if recovery.get("restore_required") is True or recovery.get("rollback_required") is True:
+        return BLOCKED, "restore or rollback is required"
     return None
 
 
