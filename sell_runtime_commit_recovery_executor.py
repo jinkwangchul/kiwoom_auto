@@ -70,6 +70,8 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
         "backup_path": str(backup_path),
         "safety_backup_path": None,
         "temp_restore_path": None,
+        "safety_backup_created": False,
+        "temp_restore_written": False,
         "target_identity": deepcopy(identity),
         "approval_token": action["approval_token"],
         "restore_executed": False,
@@ -82,6 +84,8 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
         safety_backup_path = _safety_backup_path(queue_path)
         shutil.copy2(queue_path, safety_backup_path)
         execution_result["safety_backup_path"] = str(safety_backup_path)
+        execution_result["safety_backup_created"] = True
+        _mark_pre_restore_file_effects(result)
 
         temp_restore_path = _temp_restore_path(queue_path)
         temp_restore_path.write_text(
@@ -89,6 +93,8 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
             encoding="utf-8",
         )
         execution_result["temp_restore_path"] = str(temp_restore_path)
+        execution_result["temp_restore_written"] = True
+        _mark_pre_restore_file_effects(result)
 
         temp_data, temp_error = _read_json_object(temp_restore_path)
         if temp_error:
@@ -152,6 +158,8 @@ def execute_sell_runtime_commit_recovery(recovery_approval: dict[str, Any]) -> d
             _mark_restore_effects(result)
             result["recovery_results"].append(deepcopy(execution_result))
         else:
+            if execution_result["safety_backup_created"] or execution_result["temp_restore_written"]:
+                _mark_pre_restore_file_effects(result)
             result["blocked_recovery_results"].append(deepcopy(execution_result))
         return _finish(result)
 
@@ -365,6 +373,14 @@ def _mark_restore_effects(result: dict[str, Any]) -> None:
     result["file_write"] = True
     result["rollback_executed"] = True
     result["backup_restored"] = True
+
+
+def _mark_pre_restore_file_effects(result: dict[str, Any]) -> None:
+    result["file_write"] = True
+    result["runtime_write"] = False
+    result["queue_write"] = False
+    result["rollback_executed"] = False
+    result["backup_restored"] = False
 
 
 def _finish(result: dict[str, Any]) -> dict[str, Any]:
