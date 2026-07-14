@@ -12,9 +12,12 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
+import msvcrt
 import os
 from pathlib import Path
 import shutil
+import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +26,9 @@ NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_POSITION_UPDATE_REQUIRED = "POSITION_UPDATE_REQUIRED"
 CHEJAN_EVENT_NEXT_STAGE_REQUIRED = "FILL_RECORD_REQUIRED"
 _FILL_EVENT_TYPES = {"PARTIAL_FILL", "FULL_FILL"}
+_FILL_THREAD_LOCK = threading.RLock()
+_LOCK_POLL_SECONDS = 0.02
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -49,6 +55,12 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
         "fill_stage": stage,
         "next_stage": NEXT_STAGE_BLOCKED,
         "changed": False,
+        "file_write": False,
+        "fill_write": False,
+        "fill_committed": False,
+        "post_write_verified": False,
+        "lock_acquired": False,
+        "lock_wait_ms": 0,
         "blocked_reasons": [reason],
         "warnings": [],
     }
@@ -62,21 +74,92 @@ def _snapshot_sha256(snapshot: Any) -> str:
     return _clean_text(_as_dict(snapshot).get("sha256")).upper()
 
 
-def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
+def _lock_timeout_sec(context: Any) -> float:
+    value = _as_dict(context).get("fill_lock_timeout_sec")
+    if isinstance(value, bool):
+        return _DEFAULT_LOCK_TIMEOUT_SECONDS
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    return _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+
+class _FillFileLock:
+    def __init__(self, fill_path: Path, timeout_sec: float) -> None:
+        self.lock_path = fill_path.with_name(f"{fill_path.name}.lock")
+        self.timeout_sec = timeout_sec
+        self.handle: Any = None
+        self.wait_ms = 0
+
+    def __enter__(self) -> "_FillFileLock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.lock_path.open("a+b")
+        started = time.monotonic()
+        while True:
             try:
-                tmp_path.unlink()
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                self.wait_ms = int((time.monotonic() - started) * 1000)
+                return self
             except OSError:
-                pass
+                if time.monotonic() - started >= self.timeout_sec:
+                    self.wait_ms = int((time.monotonic() - started) * 1000)
+                    self.handle.close()
+                    self.handle = None
+                    raise TimeoutError("fills lock timeout")
+                time.sleep(_LOCK_POLL_SECONDS)
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.handle is None:
+            return
+        try:
+            self.handle.seek(0)
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
+def _with_lock_metadata(result: dict[str, Any], *, lock_acquired: bool, lock_wait_ms: int = 0) -> dict[str, Any]:
+    updated = deepcopy(result)
+    updated["lock_acquired"] = lock_acquired
+    updated["lock_wait_ms"] = lock_wait_ms
+    updated.setdefault("file_write", False)
+    updated.setdefault("fill_write", False)
+    updated.setdefault("fill_committed", False)
+    updated.setdefault("post_write_verified", False)
+    return updated
+
+
+def _post_write_failed(stage: str, reason: str) -> dict[str, Any]:
+    result = _blocked(stage, reason)
+    result.update(
+        {
+            "changed": True,
+            "file_write": True,
+            "fill_write": True,
+            "fill_committed": True,
+            "post_write_verified": False,
+        }
+    )
+    return result
+
+
+def _write_json_temp(path: Path, data: dict[str, Any]) -> Path:
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return tmp_path
+
+
+def _cleanup_temp(path: Path | None) -> None:
+    if path is not None and path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _read_fills(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -180,6 +263,30 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest().upper()
 
 
+def _raw_event_identity(event: dict[str, Any]) -> tuple[str, str]:
+    raw_event = _as_dict(event.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    for source in (event, raw_event):
+        for field in ("execution_no", "broker_event_id", "event_id", "chejan_event_id", "fill_no", "trade_no"):
+            value = _clean_text(source.get(field))
+            if value:
+                source_name = "execution_no" if field == "execution_no" else "broker_event_id"
+                return source_name, value
+    fid_909 = _clean_text(fid_values.get("909"))
+    if fid_909:
+        return "fid_909", fid_909
+    return "", ""
+
+
+def _stored_execution_identity(record: dict[str, Any]) -> tuple[str, str]:
+    source = _clean_text(record.get("execution_identity_source"))
+    value = _clean_text(record.get("execution_identity"))
+    if source and value:
+        return source, value
+    normalized = _as_dict(record.get("normalized_event"))
+    return _raw_event_identity(normalized)
+
+
 def _fill_id(event: dict[str, Any], event_type: str, received_at: str) -> str:
     received_hash = hashlib.sha256(received_at.encode("utf-8")).hexdigest().upper()[:12]
     parts = [
@@ -206,6 +313,15 @@ def _composite_key(record: dict[str, Any]) -> tuple[str, str, str, str, str, str
 
 
 def _duplicate_reason(fills: list[Any], candidate: dict[str, Any]) -> str | None:
+    candidate_identity_source, candidate_identity = _stored_execution_identity(candidate)
+    if candidate_identity:
+        for fill in fills:
+            item = _as_dict(fill)
+            item_source, item_identity = _stored_execution_identity(item)
+            if item_identity and item_identity == candidate_identity:
+                return f"duplicate {candidate_identity_source or item_source or 'execution identity'}"
+        return None
+
     candidate_fill_id = _clean_text(candidate.get("fill_id"))
     candidate_key = _composite_key(candidate)
     candidate_event_hash = _stable_hash(candidate.get("normalized_event"))
@@ -237,8 +353,11 @@ def _fill_record(
     recorded_at: str,
 ) -> dict[str, Any]:
     fill_id = _fill_id(event, event_type, received_at)
+    execution_identity_source, execution_identity = _raw_event_identity(event)
     return {
         "fill_id": fill_id,
+        "execution_identity_source": execution_identity_source,
+        "execution_identity": execution_identity,
         "fill_source": "chejan_event",
         "event_type": event_type,
         "broker": _clean_text(event.get("broker")),
@@ -297,10 +416,6 @@ def record_execution_fill(
             "fills file changed after Chejan event record; manual review required",
         )
 
-    data, read_blocked = _read_fills(target_path)
-    if read_blocked is not None:
-        return read_blocked
-
     now = _now_text()
     received_at = _received_at(event)
     fill_record = _fill_record(
@@ -311,48 +426,120 @@ def record_execution_fill(
         recorded_at=now,
     )
 
-    duplicate_reason = _duplicate_reason(data["fills"], fill_record)
-    if duplicate_reason:
-        return _blocked("duplicate", duplicate_reason)
-
-    backup_path = None
-    if backup and target_path.exists():
-        backup_path = str(target_path) + ".bak"
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception as exc:
-            return _blocked("backup", f"failed to create backup: {exc}")
-
-    updated_data = deepcopy(data)
-    updated_data["version"] = updated_data.get("version", 1)
-    updated_data["updated_at"] = now
-    updated_data["fills"].append(fill_record)
-
     try:
-        _write_json_atomic(target_path, updated_data)
-    except Exception as exc:
-        return _blocked("write_fills", f"failed to write fills json: {exc}")
+        with _FILL_THREAD_LOCK:
+            with _FillFileLock(target_path, _lock_timeout_sec(context)) as lock:
+                current_sha256 = _sha256_file(target_path) if target_path.exists() else None
+                if snapshot_sha256 and current_sha256 != snapshot_sha256:
+                    return _with_lock_metadata(
+                        _blocked("stale_fills", "fills file changed after Chejan event record; manual review required"),
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
 
-    after_sha256 = _sha256_file(target_path)
-    return {
-        "fill_recorded": True,
-        "fill_stage": "execution_fill_recorded",
-        "next_stage": NEXT_STAGE_POSITION_UPDATE_REQUIRED,
-        "changed": True,
-        "fill_path": str(target_path),
-        "backup_path": backup_path,
-        "fill_id": fill_record["fill_id"],
-        "event_type": event_type,
-        "order_id": fill_record["order_id"],
-        "order_queued_id": fill_record["order_queued_id"],
-        "broker_order_no": fill_record["broker_order_no"],
-        "request_hash": fill_record["request_hash"],
-        "lock_id": fill_record["lock_id"],
-        "execution_id": fill_record["execution_id"],
-        "filled_quantity": fill_record["filled_quantity"],
-        "filled_price": fill_record["filled_price"],
-        "before_sha256": before_sha256,
-        "after_sha256": after_sha256,
-        "blocked_reasons": [],
-        "warnings": [],
-    }
+                data, read_blocked = _read_fills(target_path)
+                if read_blocked is not None:
+                    return _with_lock_metadata(read_blocked, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+
+                duplicate_reason = _duplicate_reason(data["fills"], fill_record)
+                if duplicate_reason:
+                    return _with_lock_metadata(
+                        _blocked("duplicate", duplicate_reason),
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                backup_path = None
+                if backup and target_path.exists():
+                    backup_path = str(target_path) + ".bak"
+                    try:
+                        shutil.copy2(target_path, backup_path)
+                    except Exception as exc:
+                        return _with_lock_metadata(
+                            _blocked("backup", f"failed to create backup: {exc}"),
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+
+                updated_data = deepcopy(data)
+                updated_data["version"] = updated_data.get("version", 1)
+                updated_data["updated_at"] = now
+                updated_data["fills"].append(fill_record)
+
+                tmp_path = None
+                try:
+                    tmp_path = _write_json_temp(target_path, updated_data)
+                    os.replace(tmp_path, target_path)
+                    tmp_path = None
+                except Exception as exc:
+                    _cleanup_temp(tmp_path)
+                    return _with_lock_metadata(
+                        _blocked("write_fills", f"failed to write fills json: {exc}"),
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+
+                after_sha256 = _sha256_file(target_path)
+                post_data, post_blocked = _read_fills(target_path)
+                if post_blocked is not None:
+                    failed = _post_write_failed(
+                        "post_write_verify",
+                        post_blocked.get("blocked_reasons", ["fills json invalid after write"])[0],
+                    )
+                    failed.update(
+                        {
+                            "fill_path": str(target_path),
+                            "backup_path": backup_path,
+                            "fill_id": fill_record["fill_id"],
+                            "before_sha256": before_sha256,
+                            "after_sha256": after_sha256,
+                        }
+                    )
+                    return _with_lock_metadata(failed, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+
+                if post_data != updated_data:
+                    failed = _post_write_failed("post_write_verify", "fills json did not match expected data after write")
+                    failed.update(
+                        {
+                            "fill_path": str(target_path),
+                            "backup_path": backup_path,
+                            "fill_id": fill_record["fill_id"],
+                            "before_sha256": before_sha256,
+                            "after_sha256": after_sha256,
+                        }
+                    )
+                    return _with_lock_metadata(failed, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+
+                result_payload = {
+                    "fill_recorded": True,
+                    "fill_stage": "execution_fill_recorded",
+                    "next_stage": NEXT_STAGE_POSITION_UPDATE_REQUIRED,
+                    "changed": True,
+                    "file_write": True,
+                    "fill_write": True,
+                    "fill_committed": True,
+                    "post_write_verified": True,
+                    "fill_path": str(target_path),
+                    "backup_path": backup_path,
+                    "fill_id": fill_record["fill_id"],
+                    "execution_identity_source": fill_record["execution_identity_source"],
+                    "execution_identity": fill_record["execution_identity"],
+                    "event_type": event_type,
+                    "order_id": fill_record["order_id"],
+                    "order_queued_id": fill_record["order_queued_id"],
+                    "broker_order_no": fill_record["broker_order_no"],
+                    "request_hash": fill_record["request_hash"],
+                    "lock_id": fill_record["lock_id"],
+                    "execution_id": fill_record["execution_id"],
+                    "filled_quantity": fill_record["filled_quantity"],
+                    "filled_price": fill_record["filled_price"],
+                    "before_sha256": before_sha256,
+                    "after_sha256": after_sha256,
+                    "blocked_reasons": [],
+                    "warnings": [],
+                }
+                return _with_lock_metadata(result_payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+    except TimeoutError:
+        return _with_lock_metadata(_blocked("fill_lock", "fills lock timeout"), lock_acquired=False)
+
+    return _with_lock_metadata(_blocked("fill_lock", "fills lock failed"), lock_acquired=False)

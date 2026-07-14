@@ -4,12 +4,88 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import execution_fill_recorder
 from execution_fill_recorder import record_execution_fill
+
+
+def _fill_process_result(**overrides: object) -> dict[str, object]:
+    result = {
+        "recorded": True,
+        "record_stage": "chejan_event_recorded",
+        "next_stage": "FILL_RECORD_REQUIRED",
+        "changed": True,
+        "order_id": "ORDER_1",
+        "order_queued_id": "ORDER_QUEUED_ORDER_1",
+        "broker_order_no": "BRK_1",
+        "event_type": "PARTIAL_FILL",
+        "matched_by": "broker_order_no",
+        "request_hash": "HASH_1",
+        "lock_id": "LOCK_1",
+        "execution_id": "EXEC_1",
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+    result.update(overrides)
+    return result
+
+
+def _fill_process_event(**overrides: object) -> dict[str, object]:
+    event = {
+        "normalized": True,
+        "event_stage": "chejan_event_normalized",
+        "event_type": "PARTIAL_FILL",
+        "broker": "KIWOOM",
+        "source": "kiwoom_chejan",
+        "gubun": "0",
+        "broker_order_no": "BRK_1",
+        "account_no": "12345678",
+        "code": "003550",
+        "name": "LG",
+        "side": "BUY",
+        "order_status": "FILLED",
+        "order_quantity": 10,
+        "filled_quantity": 3,
+        "remaining_quantity": 7,
+        "order_price": 1000,
+        "filled_price": 1000,
+        "received_at": "2026-07-04 09:30:00",
+        "request_hash": None,
+        "lock_id": None,
+        "execution_id": None,
+        "unresolved": False,
+        "blocked_reasons": [],
+        "warnings": [],
+        "raw_event": {},
+    }
+    event.update(overrides)
+    return event
+
+
+def _fill_process_worker(
+    fill_path: str,
+    start_event: multiprocessing.Event,
+    output: multiprocessing.Queue,
+    event_overrides: dict[str, object],
+) -> None:
+    try:
+        start_event.wait(10)
+        output.put(
+            record_execution_fill(
+                _fill_process_result(),
+                _fill_process_event(**event_overrides),
+                fill_path,
+                context={"manual_fill_record_confirmed": True},
+            )
+        )
+    except Exception as exc:  # pragma: no cover - returned to parent process
+        output.put({"fill_recorded": False, "error": repr(exc)})
 
 
 class ExecutionFillRecorderTest(unittest.TestCase):
@@ -296,6 +372,110 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertFalse(result["fill_recorded"])
             self.assertIn("duplicate fill composite key", result["blocked_reasons"])
 
+    def test_same_fill_two_threads_records_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            barrier = threading.Barrier(3)
+            results: list[dict[str, object]] = []
+
+            def worker() -> None:
+                barrier.wait()
+                results.append(
+                    self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_1"}}))
+                )
+
+            threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+            data = self._read_json(path)
+            self.assertEqual(1, len(data["fills"]))
+            self.assertEqual(1, sum(1 for result in results if result["fill_recorded"]))
+            self.assertEqual(1, sum(1 for result in results if not result["fill_recorded"]))
+
+    def test_same_fill_two_processes_records_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            start_event = multiprocessing.Event()
+            output: multiprocessing.Queue = multiprocessing.Queue()
+            processes = [
+                multiprocessing.Process(
+                    target=_fill_process_worker,
+                    args=(str(path), start_event, output, {"raw_event": {"fid_values": {"909": "EXEC_NO_1"}}}),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start_event.set()
+            results = [output.get(timeout=20) for _ in processes]
+            for process in processes:
+                process.join(20)
+
+            data = self._read_json(path)
+            self.assertEqual([0, 0], [process.exitcode for process in processes])
+            self.assertEqual(1, len(data["fills"]))
+            self.assertEqual(1, sum(1 for result in results if result["fill_recorded"]))
+
+    def test_different_fill_two_processes_preserves_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            start_event = multiprocessing.Event()
+            output: multiprocessing.Queue = multiprocessing.Queue()
+            process_args = [
+                {"raw_event": {"fid_values": {"909": "EXEC_NO_1"}}},
+                {"raw_event": {"fid_values": {"909": "EXEC_NO_2"}}},
+            ]
+            processes = [
+                multiprocessing.Process(target=_fill_process_worker, args=(str(path), start_event, output, overrides))
+                for overrides in process_args
+            ]
+            for process in processes:
+                process.start()
+            start_event.set()
+            results = [output.get(timeout=20) for _ in processes]
+            for process in processes:
+                process.join(20)
+
+            data = self._read_json(path)
+            self.assertEqual([0, 0], [process.exitcode for process in processes])
+            self.assertEqual(2, len(data["fills"]))
+            self.assertTrue(all(result["fill_recorded"] for result in results))
+
+    def test_same_price_quantity_different_execution_no_records_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            first = self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_1"}}))
+            second = self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_2"}}))
+
+            self.assertTrue(first["fill_recorded"])
+            self.assertTrue(second["fill_recorded"])
+            self.assertEqual(2, len(self._read_json(path)["fills"]))
+
+    def test_same_execution_no_duplicate_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_1"}}))
+            result = self._record_fill(path, event=self._event(filled_price=1100, raw_event={"fid_values": {"909": "EXEC_NO_1"}}))
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertIn("duplicate fid_909", result["blocked_reasons"])
+
+    def test_execution_no_field_duplicate_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            self._record_fill(path, event=self._event(execution_no="EXEC_NO_1"))
+            result = self._record_fill(path, event=self._event(execution_no="EXEC_NO_1", filled_price=1100))
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertIn("duplicate execution_no", result["blocked_reasons"])
+
     def test_backup_created_for_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_fills(tmpdir)
@@ -314,6 +494,18 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertIsNone(result["backup_path"])
             self.assertFalse(Path(str(path) + ".bak").exists())
 
+    def test_backup_contains_latest_pre_write_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_1"}}))
+
+            result = self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "EXEC_NO_2"}}))
+            backup = self._read_json(Path(result["backup_path"]))
+
+            self.assertTrue(result["fill_recorded"])
+            self.assertEqual(1, len(backup["fills"]))
+            self.assertEqual("EXEC_NO_1", backup["fills"][0]["execution_identity"])
+
     def test_stale_snapshot_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_fills(tmpdir)
@@ -326,6 +518,75 @@ class ExecutionFillRecorderTest(unittest.TestCase):
 
             self.assertFalse(result["fill_recorded"])
             self.assertIn("fills file changed after Chejan event record; manual review required", result["blocked_reasons"])
+
+    def test_stale_snapshot_has_no_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            snapshot = {"sha256": self._sha256(path)}
+            before = self._sha256(path)
+            data = self._read_json(path)
+            data["fills"].append({"fill_id": "OTHER"})
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            changed = self._sha256(path)
+
+            result = self._record_fill(path, fill_snapshot=snapshot)
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertFalse(result["file_write"])
+            self.assertEqual(changed, self._sha256(path))
+            self.assertNotEqual(before, changed)
+
+    def test_replace_before_failure_has_no_file_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            before = self._sha256(path)
+
+            with mock.patch.object(execution_fill_recorder.os, "replace", side_effect=OSError("replace failed")):
+                result = self._record_fill(path)
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertFalse(result["file_write"])
+            self.assertFalse(result["fill_write"])
+            self.assertFalse(result["fill_committed"])
+            self.assertEqual(before, self._sha256(path))
+
+    def test_post_write_read_failure_preserves_side_effect_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            initial_data = self._read_json(path)
+            blocked = execution_fill_recorder._blocked("read_fills", "post read failed")
+
+            with mock.patch.object(
+                execution_fill_recorder,
+                "_read_fills",
+                side_effect=[(initial_data, None), ({}, blocked)],
+            ):
+                result = self._record_fill(path)
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertTrue(result["changed"])
+            self.assertTrue(result["file_write"])
+            self.assertTrue(result["fill_write"])
+            self.assertTrue(result["fill_committed"])
+            self.assertFalse(result["post_write_verified"])
+
+    def test_post_write_content_mismatch_preserves_side_effect_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+            initial_data = self._read_json(path)
+            mismatched = deepcopy(initial_data)
+
+            with mock.patch.object(
+                execution_fill_recorder,
+                "_read_fills",
+                side_effect=[(initial_data, None), (mismatched, None)],
+            ):
+                result = self._record_fill(path)
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertTrue(result["file_write"])
+            self.assertTrue(result["fill_committed"])
+            self.assertFalse(result["post_write_verified"])
 
     def test_before_after_sha256_changed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
