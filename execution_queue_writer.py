@@ -9,7 +9,8 @@ SendOrder.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
+import hashlib
 import json
 import msvcrt
 import os
@@ -24,10 +25,13 @@ from uuid import uuid4
 NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_QUEUE_WRITE_REQUIRED = "QUEUE_WRITE_REQUIRED"
 NEXT_STAGE_QUEUE_COMMITTED_REVIEW_REQUIRED = "QUEUE_COMMITTED_REVIEW_REQUIRED"
+NEXT_STAGE_DISPATCH_CLAIM_REVIEW_REQUIRED = "DISPATCH_CLAIM_REVIEW_REQUIRED"
 
 _QUEUE_THREAD_LOCK = threading.RLock()
 _DEFAULT_LOCK_TIMEOUT_SEC = 5.0
 _LOCK_POLL_SEC = 0.025
+_DEFAULT_DISPATCH_CLAIM_TTL_SEC = 60
+_MAX_DISPATCH_CLAIM_TTL_SEC = 300
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -140,6 +144,14 @@ def preserve_queue_mutation_result(result: dict[str, Any], mutation_result: Any)
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _time_text(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sha256_text(value: Any) -> str:
+    return hashlib.sha256(_clean_text(value).encode("utf-8")).hexdigest()
 
 
 def _order_queued_id(order_id: str, request_hash: str) -> str:
@@ -1123,6 +1135,475 @@ def commit_legacy_order_queued_record(
         result.setdefault("status", canonical_record.get("status"))
         result.setdefault("send_order_called", False)
         result.setdefault("execution_enabled", False)
+    return result
+
+
+_DISPATCH_CLAIM_IDENTITY_FIELDS = (
+    "order_id",
+    "candidate_id",
+    "queue_pending_id",
+    "execution_id",
+    "request_hash",
+    "lock_id",
+    "source_signal_id",
+)
+
+
+_DISPATCH_CLAIM_BLOCKED_STATUSES = {
+    "DISPATCH_CLAIMED",
+    "SEND_ATTEMPTED",
+    "SEND_UNCERTAIN",
+    "BROKER_ACCEPTED",
+    "BROKER_REJECTED",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCELLED",
+    "BLOCKED",
+    "INVALID",
+}
+
+
+def _dispatch_identity(identity: Any) -> tuple[dict[str, str], dict[str, Any] | None]:
+    source = _as_dict(identity)
+    if not source:
+        return {}, _commit_blocked("dispatch_identity", "dispatch identity must be a dict")
+
+    normalized = {field: _clean_text(source.get(field)) for field in _DISPATCH_CLAIM_IDENTITY_FIELDS}
+    order_queued_id = _clean_text(source.get("order_queued_id") or source.get("id"))
+    if not order_queued_id:
+        return {}, _commit_blocked("dispatch_identity", "dispatch identity order_queued_id is required")
+    normalized["order_queued_id"] = order_queued_id
+
+    missing = [field for field, value in normalized.items() if not value]
+    if missing:
+        return normalized, _commit_blocked("dispatch_identity", f"dispatch identity {missing[0]} is required")
+    return normalized, None
+
+
+def _dispatch_identity_matches(record: dict[str, Any], identity: dict[str, str]) -> bool:
+    if _clean_text(record.get("id") or record.get("order_queued_id")) != identity.get("order_queued_id"):
+        return False
+    return all(_clean_text(record.get(field)) == identity.get(field) for field in _DISPATCH_CLAIM_IDENTITY_FIELDS)
+
+
+def _dispatch_identity_matches_without_queued_id(record: dict[str, Any], identity: dict[str, str]) -> bool:
+    return all(_clean_text(record.get(field)) == identity.get(field) for field in _DISPATCH_CLAIM_IDENTITY_FIELDS)
+
+
+def _dispatch_matching_records(queue_data: dict[str, Any], identity: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _as_list(queue_data.get("orders"))
+        if isinstance(item, dict) and _dispatch_identity_matches(item, identity)
+    ]
+
+
+def _dispatch_claim_ttl(context: Any) -> tuple[int, dict[str, Any] | None]:
+    ctx = _as_dict(context)
+    raw_value = ctx.get("dispatch_claim_ttl_sec", ctx.get("claim_ttl_sec", _DEFAULT_DISPATCH_CLAIM_TTL_SEC))
+    try:
+        ttl = int(raw_value)
+    except (TypeError, ValueError):
+        return 0, _commit_blocked("dispatch_claim_ttl", "dispatch claim ttl must be an integer")
+    if ttl <= 0:
+        return ttl, _commit_blocked("dispatch_claim_ttl", "dispatch claim ttl must be greater than zero")
+    if ttl > _MAX_DISPATCH_CLAIM_TTL_SEC:
+        return ttl, _commit_blocked("dispatch_claim_ttl", "dispatch claim ttl exceeds maximum")
+    return ttl, None
+
+
+def _dispatch_claim_source(context: Any) -> str:
+    ctx = _as_dict(context)
+    return _clean_text(ctx.get("dispatch_claim_source") or ctx.get("claim_source") or "final_guard")
+
+
+def _dispatch_final_guard_ready(
+    final_guard_result: Any,
+    identity: dict[str, str],
+    context: Any,
+    expected_revision: int,
+) -> dict[str, Any] | None:
+    guard = _as_dict(final_guard_result)
+    ctx = _as_dict(context)
+    if not guard:
+        return _commit_blocked("final_guard", "final guard result is required")
+    if guard.get("guard_type") != "SELL_DISPATCH_FINAL_EXECUTION_GUARD":
+        return _commit_blocked("final_guard", "final guard type mismatch")
+    if guard.get("status") != "READY" or guard.get("final_guard_ready") is not True:
+        return _commit_blocked("final_guard", "final guard must be READY")
+
+    token_hash = _clean_text(guard.get("approval_token_hash"))
+    approval_token = _clean_text(_as_dict(context).get("approval_token") or _as_dict(context).get("dispatch_approval_token"))
+    if token_hash:
+        if not approval_token:
+            return _commit_blocked("approval_token", "approval token is required for dispatch claim")
+        if _sha256_text(approval_token) != token_hash:
+            return _commit_blocked("approval_token", "approval token hash mismatch")
+
+    queue_path = _clean_text(_as_dict(context).get("queue_path"))
+    if queue_path and _clean_text(guard.get("queue_path")) and queue_path != _clean_text(guard.get("queue_path")):
+        return _commit_blocked("final_guard", "final guard queue_path mismatch")
+
+    guard_revision = guard.get("queue_revision", guard.get("source_queue_revision"))
+    if guard_revision is None:
+        guard_revision = _as_dict(guard.get("summary")).get("queue_revision")
+    if guard_revision is None:
+        guard_revision = ctx.get("final_guard_queue_revision")
+    if guard_revision is not None:
+        try:
+            normalized_guard_revision = int(guard_revision)
+        except (TypeError, ValueError):
+            return _commit_blocked("final_guard", "final guard queue_revision must be an integer")
+        if normalized_guard_revision != expected_revision:
+            return _commit_blocked("final_guard", "final guard queue revision is stale")
+
+    guard_snapshot_hash = _clean_text(
+        guard.get("queue_snapshot_hash")
+        or guard.get("source_queue_snapshot_hash")
+        or _as_dict(guard.get("summary")).get("queue_snapshot_hash")
+    )
+    context_snapshot_hash = _clean_text(ctx.get("queue_snapshot_hash") or ctx.get("final_guard_queue_snapshot_hash"))
+    if guard_snapshot_hash and context_snapshot_hash and guard_snapshot_hash != context_snapshot_hash:
+        return _commit_blocked("final_guard", "final guard queue snapshot hash mismatch")
+
+    guarded = _as_list(guard.get("guarded_candidates"))
+    if guarded:
+        for item in guarded:
+            candidate = _as_dict(_as_dict(item).get("candidate"))
+            queue_record = _as_dict(_as_dict(item).get("queue_record"))
+            if _dispatch_identity_matches_without_queued_id(candidate, identity) or _dispatch_identity_matches(queue_record, identity):
+                return None
+        return _commit_blocked("final_guard", "final guard does not contain target identity")
+    return None
+
+
+def _dispatch_claim_record_blocked(record: dict[str, Any], *, allow_release: bool = False) -> dict[str, Any] | None:
+    status = _clean_text(record.get("status"))
+    if allow_release:
+        if status != "DISPATCH_CLAIMED":
+            return _commit_blocked("dispatch_claim", "target record is not DISPATCH_CLAIMED")
+    elif status != "ORDER_QUEUED":
+        stage = "stale_dispatch_claim" if status == "DISPATCH_CLAIMED" else "dispatch_claim"
+        return _commit_blocked(stage, f"target record status is {status or 'missing'}")
+
+    if not allow_release:
+        if record.get("execution_enabled") is not True:
+            return _commit_blocked("dispatch_claim", "target record execution_enabled is not true")
+        if record.get("send_order_called") is not False:
+            return _commit_blocked("dispatch_claim", "target record send_order_called is not false")
+        if _clean_text(record.get("broker_order_no")):
+            return _commit_blocked("dispatch_claim", "target record already has broker_order_no")
+        if record.get("dispatch_claimed") is True or _clean_text(record.get("dispatch_claim_id")):
+            return _commit_blocked("stale_dispatch_claim", "target record already has dispatch claim")
+    else:
+        if record.get("send_order_called") is not False:
+            return _commit_blocked("dispatch_claim_release", "claimed record send_order_called is not false")
+        if _clean_text(record.get("broker_order_no")):
+            return _commit_blocked("dispatch_claim_release", "claimed record already has broker_order_no")
+    if status in _DISPATCH_CLAIM_BLOCKED_STATUSES and not (allow_release and status == "DISPATCH_CLAIMED"):
+        return _commit_blocked("dispatch_claim", f"target record status cannot be claimed: {status}")
+    return None
+
+
+def _manual_release_confirmed(context: Any) -> bool:
+    ctx = _as_dict(context)
+    return ctx.get("manual_dispatch_claim_release_confirmed") is True or ctx.get("manual_release_confirmed") is True
+
+
+def claim_order_for_dispatch(
+    queue_path: str | Path,
+    identity: Any,
+    final_guard_result: Any,
+    *,
+    claim_token: str | None = None,
+    claim_owner: str | None = None,
+    claim_source: str | None = None,
+    context: Any = None,
+    expected_revision: int | None = None,
+    claim_id: str | None = None,
+) -> dict[str, Any]:
+    """Atomically claim one ORDER_QUEUED record for dispatch without calling SendOrder."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked, expected_revision=expected_revision)
+    if expected_revision is None:
+        return _with_queue_metadata(_commit_blocked("revision_cas", "expected_revision is required for dispatch claim"))
+
+    token = _clean_text(claim_token or _as_dict(context).get("claim_token") or _as_dict(context).get("dispatch_claim_token"))
+    if not token:
+        return _with_queue_metadata(_commit_blocked("dispatch_claim_token", "dispatch claim token is required"), expected_revision=expected_revision)
+    owner = _clean_text(claim_owner or _as_dict(context).get("claim_owner") or _as_dict(context).get("dispatch_claim_owner"))
+    if not owner:
+        return _with_queue_metadata(_commit_blocked("dispatch_claim_owner", "dispatch claim owner is required"), expected_revision=expected_revision)
+    source = _clean_text(claim_source) or _dispatch_claim_source(context)
+    if not source:
+        return _with_queue_metadata(_commit_blocked("dispatch_claim_source", "dispatch claim source is required"), expected_revision=expected_revision)
+
+    ttl, ttl_blocked = _dispatch_claim_ttl(context)
+    if ttl_blocked is not None:
+        return _with_queue_metadata(ttl_blocked, expected_revision=expected_revision)
+
+    guard_blocked = _dispatch_final_guard_ready(final_guard_result, normalized_identity, context, expected_revision)
+    if guard_blocked is not None:
+        return _with_queue_metadata(guard_blocked, expected_revision=expected_revision)
+
+    dispatch_claim_id = _clean_text(claim_id) or f"DISPATCH_CLAIM_{uuid4().hex}"
+    token_hash = _sha256_text(token)
+    claimed_at = datetime.now()
+    expires_at = claimed_at + timedelta(seconds=ttl)
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        matches = _dispatch_matching_records(data, normalized_identity)
+        if len(matches) != 1:
+            return {"blocked": _commit_blocked("dispatch_identity", f"dispatch target matching record count is {len(matches)}")}
+        target = matches[0]
+        record_blocked = _dispatch_claim_record_blocked(target)
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
+
+        updated_data = deepcopy(data)
+        for index, item in enumerate(updated_data["orders"]):
+            if _dispatch_identity_matches(_as_dict(item), normalized_identity):
+                updated_record = deepcopy(item)
+                dispatch_generation = int(updated_record.get("dispatch_generation") or 0) + 1
+                updated_record.update(
+                    {
+                        "status": "DISPATCH_CLAIMED",
+                        "dispatch_claimed": True,
+                        "dispatch_claim_id": dispatch_claim_id,
+                        "dispatch_claim_token_hash": token_hash,
+                        "dispatch_claim_owner": owner,
+                        "dispatch_claimed_at": _time_text(claimed_at),
+                        "dispatch_claim_expires_at": _time_text(expires_at),
+                        "dispatch_claim_source": source,
+                        "dispatch_claim_revision": _normalize_revision(data),
+                        "dispatch_claim_attempt": int(updated_record.get("dispatch_claim_attempt") or 0) + 1,
+                        "dispatch_generation": dispatch_generation,
+                        "dispatch_claim_previous_status": "ORDER_QUEUED",
+                        "updated_at": _time_text(claimed_at),
+                    }
+                )
+                updated_data["orders"][index] = updated_record
+                return {
+                    "data": updated_data,
+                    "result": {
+                        "claimed": True,
+                        "status": "DISPATCH_CLAIMED",
+                        "dispatch_claim_id": dispatch_claim_id,
+                        "dispatch_claim_token_hash": token_hash,
+                        "dispatch_claim_owner": owner,
+                        "dispatch_claimed_at": _time_text(claimed_at),
+                        "dispatch_claim_expires_at": _time_text(expires_at),
+                        "dispatch_claim_source": source,
+                        "dispatch_claim_attempt": updated_record["dispatch_claim_attempt"],
+                        "dispatch_generation": dispatch_generation,
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "send_order_called": False,
+                        "actual_order_sent": False,
+                        "broker_api_called": False,
+                    },
+                }
+        return {"blocked": _commit_blocked("dispatch_identity", "dispatch target disappeared before mutation")}
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = _dispatch_matching_records(after_data, normalized_identity)
+        if len(matches) != 1:
+            return _commit_blocked("post_dispatch_claim_verify", f"claimed record count is {len(matches)}")
+        claimed = matches[0]
+        if claimed.get("status") != "DISPATCH_CLAIMED" or claimed.get("dispatch_claimed") is not True:
+            return _commit_blocked("post_dispatch_claim_verify", "claimed record status was not persisted")
+        if _clean_text(claimed.get("dispatch_claim_id")) != dispatch_claim_id:
+            return _commit_blocked("post_dispatch_claim_verify", "dispatch claim id mismatch after write")
+        if _clean_text(claimed.get("dispatch_claim_token_hash")) != token_hash:
+            return _commit_blocked("post_dispatch_claim_verify", "dispatch claim token hash mismatch after write")
+        if claimed.get("send_order_called") is not False:
+            return _commit_blocked("post_dispatch_claim_verify", "claimed record send_order_called changed")
+        return None
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="dispatch_claim",
+        success_stage="dispatch_claim_committed",
+        next_stage=NEXT_STAGE_DISPATCH_CLAIM_REVIEW_REQUIRED,
+        backup=True,
+        context=context,
+        expected_revision=expected_revision,
+        verify=verify,
+    )
+    if result.get("committed") is True:
+        result.setdefault("claimed", True)
+        result.setdefault("status", "DISPATCH_CLAIMED")
+        result.setdefault("send_order_called", False)
+        result.setdefault("actual_order_sent", False)
+        result.setdefault("broker_api_called", False)
+    else:
+        result.setdefault("claimed", False)
+    return result
+
+
+def inspect_dispatch_claim(queue_path: str | Path, identity: Any, *, context: Any = None) -> dict[str, Any]:
+    """Read the current dispatch claim state for one queue record."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked)
+    target_path = Path(queue_path)
+    try:
+        with _QUEUE_THREAD_LOCK:
+            with _QueueFileLock(target_path, _lock_timeout_sec(context)) as lock:
+                data, read_blocked = _read_queue_file(target_path)
+                if read_blocked is not None:
+                    return _with_queue_metadata(read_blocked, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+                revision = _normalize_revision(data)
+                matches = _dispatch_matching_records(data, normalized_identity)
+                if len(matches) != 1:
+                    return _with_queue_metadata(
+                        {
+                            **_commit_blocked("dispatch_identity", f"dispatch target matching record count is {len(matches)}"),
+                            "claimed": False,
+                        },
+                        revision_before=revision,
+                        revision_after=revision,
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                record = matches[0]
+                return _with_queue_metadata(
+                    {
+                        "committed": False,
+                        "changed": False,
+                        "write_stage": "dispatch_claim_inspected",
+                        "next_stage": NEXT_STAGE_BLOCKED,
+                        "claimed": record.get("status") == "DISPATCH_CLAIMED" and record.get("dispatch_claimed") is True,
+                        "status": record.get("status"),
+                        "dispatch_claim_id": record.get("dispatch_claim_id"),
+                        "dispatch_claim_token_hash": record.get("dispatch_claim_token_hash"),
+                        "dispatch_claim_owner": record.get("dispatch_claim_owner"),
+                        "dispatch_claimed_at": record.get("dispatch_claimed_at"),
+                        "dispatch_claim_expires_at": record.get("dispatch_claim_expires_at"),
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "blocked_reasons": [],
+                        "warnings": [],
+                    },
+                    revision_before=revision,
+                    revision_after=revision,
+                    lock_acquired=True,
+                    lock_wait_ms=lock.wait_ms,
+                )
+    except TimeoutError:
+        return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock timeout"), lock_acquired=False)
+
+    return _with_queue_metadata(_commit_blocked("queue_lock", "queue lock failed"))
+
+
+def release_dispatch_claim(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    claim_id: str,
+    claim_token: str,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Manually release a dispatch claim back to ORDER_QUEUED without SendOrder."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked, expected_revision=expected_revision)
+    if expected_revision is None:
+        return _with_queue_metadata(_commit_blocked("revision_cas", "expected_revision is required for dispatch claim release"))
+    if not _manual_release_confirmed(context):
+        return _with_queue_metadata(_commit_blocked("manual_confirm", "manual dispatch claim release confirmation is required"), expected_revision=expected_revision)
+    release_claim_id = _clean_text(claim_id)
+    release_token_hash = _sha256_text(claim_token)
+    if not release_claim_id:
+        return _with_queue_metadata(_commit_blocked("dispatch_claim_release", "dispatch claim id is required"), expected_revision=expected_revision)
+    if not _clean_text(claim_token):
+        return _with_queue_metadata(_commit_blocked("dispatch_claim_release", "dispatch claim token is required"), expected_revision=expected_revision)
+
+    released_at = datetime.now()
+    release_reason = _clean_text(_as_dict(context).get("dispatch_release_reason") or _as_dict(context).get("release_reason") or "manual_release")
+    released_by = _clean_text(_as_dict(context).get("dispatch_released_by") or _as_dict(context).get("released_by") or "manual")
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        matches = _dispatch_matching_records(data, normalized_identity)
+        if len(matches) != 1:
+            return {"blocked": _commit_blocked("dispatch_identity", f"dispatch target matching record count is {len(matches)}")}
+        target = matches[0]
+        record_blocked = _dispatch_claim_record_blocked(target, allow_release=True)
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
+        if _clean_text(target.get("dispatch_claim_id")) != release_claim_id:
+            return {"blocked": _commit_blocked("dispatch_claim_release", "dispatch claim id mismatch")}
+        if _clean_text(target.get("dispatch_claim_token_hash")) != release_token_hash:
+            return {"blocked": _commit_blocked("dispatch_claim_release", "dispatch claim token hash mismatch")}
+
+        updated_data = deepcopy(data)
+        for index, item in enumerate(updated_data["orders"]):
+            if _dispatch_identity_matches(_as_dict(item), normalized_identity):
+                updated_record = deepcopy(item)
+                previous_claim_id = _clean_text(updated_record.get("dispatch_claim_id"))
+                dispatch_generation = int(updated_record.get("dispatch_generation") or 0) + 1
+                updated_record.update(
+                    {
+                        "status": "ORDER_QUEUED",
+                        "dispatch_claimed": False,
+                        "dispatch_release_reason": release_reason,
+                        "dispatch_released_at": _time_text(released_at),
+                        "dispatch_released_by": released_by,
+                        "previous_dispatch_claim_id": previous_claim_id,
+                        "dispatch_claim_released_at": _time_text(released_at),
+                        "dispatch_claim_release_source": _clean_text(_as_dict(context).get("release_source") or "manual"),
+                        "dispatch_generation": dispatch_generation,
+                        "updated_at": _time_text(released_at),
+                    }
+                )
+                updated_data["orders"][index] = updated_record
+                return {
+                    "data": updated_data,
+                    "result": {
+                        "released": True,
+                        "status": "ORDER_QUEUED",
+                        "dispatch_claim_id": release_claim_id,
+                        "dispatch_release_reason": release_reason,
+                        "dispatch_released_at": _time_text(released_at),
+                        "dispatch_released_by": released_by,
+                        "previous_dispatch_claim_id": previous_claim_id,
+                        "dispatch_generation": dispatch_generation,
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "send_order_called": False,
+                        "actual_order_sent": False,
+                        "broker_api_called": False,
+                    },
+                }
+        return {"blocked": _commit_blocked("dispatch_identity", "dispatch target disappeared before release")}
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = _dispatch_matching_records(after_data, normalized_identity)
+        if len(matches) != 1:
+            return _commit_blocked("post_dispatch_claim_release_verify", f"released record count is {len(matches)}")
+        record = matches[0]
+        if record.get("status") != "ORDER_QUEUED" or record.get("dispatch_claimed") is not False:
+            return _commit_blocked("post_dispatch_claim_release_verify", "released record status was not persisted")
+        if record.get("send_order_called") is not False:
+            return _commit_blocked("post_dispatch_claim_release_verify", "released record send_order_called changed")
+        return None
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="dispatch_claim_release",
+        success_stage="dispatch_claim_released",
+        next_stage=NEXT_STAGE_QUEUE_COMMITTED_REVIEW_REQUIRED,
+        backup=True,
+        context=context,
+        expected_revision=expected_revision,
+        verify=verify,
+    )
+    if result.get("committed") is True:
+        result.setdefault("released", True)
+        result.setdefault("status", "ORDER_QUEUED")
+    else:
+        result.setdefault("released", False)
     return result
 
 
