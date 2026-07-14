@@ -409,12 +409,7 @@ def commit_execution_queue_write_batch(
         return read_blocked
 
     for record in records:
-        existing_duplicate_reason = _existing_duplicate_reason(
-            data["orders"],
-            request_hash=_clean_text(record.get("request_hash")),
-            lock_id=_clean_text(record.get("lock_id")),
-            order_id=_clean_text(record.get("order_id")),
-        )
+        existing_duplicate_reason = _existing_batch_duplicate_reason(data["orders"], record)
         if existing_duplicate_reason:
             return _commit_blocked("duplicate", existing_duplicate_reason)
 
@@ -482,4 +477,21 @@ def _duplicate_record_reason(records: list[dict[str, Any]]) -> str | None:
             if value in seen:
                 return reason
             seen.add(value)
+    return None
+
+
+def _existing_batch_duplicate_reason(existing_orders: Any, record: dict[str, Any]) -> str | None:
+    checks = (
+        ("order_id", "duplicate order_id"),
+        ("candidate_id", "duplicate candidate_id"),
+        ("queue_pending_id", "duplicate queue_pending_id"),
+        ("execution_id", "duplicate execution_id"),
+        ("request_hash", "duplicate request_hash"),
+        ("lock_id", "duplicate lock_id"),
+    )
+    for field, reason in checks:
+        value = _clean_text(record.get(field))
+        for order in _as_list(existing_orders):
+            if _clean_text(_as_dict(order).get(field)) == value:
+                return reason
     return None
