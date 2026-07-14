@@ -303,8 +303,50 @@ class SellRuntimeCommitRealExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("duplicate order_id", result["execution_results"][0]["reasons"])
 
-    def test_multi_candidate_execution_blocked(self):
+    def test_multi_candidate_atomic_commit_success(self):
         queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(queue_path))
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["queue_committed"])
+        self.assertEqual(2, len(result["execution_results"]))
+        self.assertEqual(["ORDER_1", "ORDER_2"], [item["order_id"] for item in result["execution_results"]])
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(["ORDER_1", "ORDER_2"], [item["order_id"] for item in data["orders"]])
+
+    def test_multi_candidate_creates_one_backup_for_atomic_commit(self):
+        queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(queue_path))
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        backup_paths = {item["commit_result"]["backup_path"] for item in result["execution_results"]}
+        self.assertEqual(1, len(backup_paths))
+        self.assertTrue(Path(next(iter(backup_paths))).exists())
+
+    def test_multi_candidate_duplicate_identity_blocks_without_partial_commit(self):
+        queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(
+            _record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="r" * 64, lock_id="LOCK_2", execution_id="EXEC_2"),
+            queue_path=str(queue_path),
+        )
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertFalse(result["queue_committed"])
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        self.assertEqual([], data["orders"])
+
+    def test_multi_candidate_existing_queue_duplicate_blocks_without_partial_commit(self):
+        queue_path = self._queue_path()
+        existing = _record(request_hash="x" * 64, order_id="ORDER_2", lock_id="OTHER")
+        queue_path.write_text(json.dumps({"version": 1, "updated_at": "before", "orders": [existing]}), encoding="utf-8")
         first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
         second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(queue_path))
 
@@ -312,7 +354,83 @@ class SellRuntimeCommitRealExecutorTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "BLOCKED")
         data = json.loads(queue_path.read_text(encoding="utf-8"))
-        self.assertEqual(data["orders"], [])
+        self.assertEqual(1, len(data["orders"]))
+        self.assertEqual("ORDER_2", data["orders"][0]["order_id"])
+
+    def test_multi_candidate_queue_path_mismatch_is_invalid_without_write(self):
+        queue_path = self._queue_path()
+        other_path = queue_path.with_name("other_order_queue.json")
+        other_path.write_text(json.dumps({"version": 1, "updated_at": "before", "orders": []}), encoding="utf-8")
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(other_path))
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "INVALID")
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        self.assertEqual([], data["orders"])
+
+    def test_multi_candidate_approval_token_mismatch_is_invalid_without_write(self):
+        queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path), token="TOKEN_1")
+        second = _approved_action(
+            _record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"),
+            queue_path=str(queue_path),
+            token="TOKEN_2",
+        )
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "INVALID")
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        self.assertEqual([], data["orders"])
+
+    def test_multi_candidate_payload_tamper_is_invalid_without_write(self):
+        queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(queue_path))
+        second["commit_payload"]["args"]["queue_write_preview_result"]["order_queued_record_preview"]["lock_id"] = "TAMPERED"
+
+        result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "INVALID")
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+        self.assertEqual([], data["orders"])
+
+    def test_multi_candidate_batch_identity_mismatch_keeps_effect_flags_but_invalidates_status(self):
+        queue_path = self._queue_path()
+        first = _approved_action(_record(order_id="ORDER_1", candidate_id="CANDIDATE_1"), queue_path=str(queue_path))
+        second = _approved_action(_record(order_id="ORDER_2", candidate_id="CANDIDATE_2", request_hash="s" * 64, lock_id="LOCK_2", execution_id="EXEC_2"), queue_path=str(queue_path))
+        commit_result = {
+            "committed": True,
+            "committed_count": 2,
+            "write_stage": "order_queued_records_committed",
+            "next_stage": "QUEUE_COMMITTED_REVIEW_REQUIRED",
+            "changed": True,
+            "order_queue_path": str(queue_path),
+            "backup_path": str(queue_path) + ".bak",
+            "committed_records": [
+                first["commit_payload"]["args"]["queue_write_preview_result"]["order_queued_record_preview"],
+                {**second["commit_payload"]["args"]["queue_write_preview_result"]["order_queued_record_preview"], "request_hash": "mismatch"},
+            ],
+            "order_ids": ["ORDER_1", "ORDER_2"],
+            "request_hashes": ["r" * 64, "mismatch"],
+            "lock_ids": ["LOCK_1", "LOCK_2"],
+            "execution_ids": ["EXEC_1", "EXEC_2"],
+            "send_order_called": False,
+            "execution_enabled": False,
+            "blocked_reasons": [],
+            "warnings": [],
+        }
+
+        with mock.patch("sell_runtime_commit_real_executor.commit_execution_queue_write_batch", return_value=commit_result):
+            result = execute_sell_runtime_commit(_approval(first, second))
+
+        self.assertEqual(result["status"], "INVALID")
+        self.assertTrue(result["queue_committed"])
+        self.assertTrue(result["runtime_write"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["runtime_commit_executed"])
 
     def test_input_mutation_does_not_occur(self):
         queue_path = self._queue_path()

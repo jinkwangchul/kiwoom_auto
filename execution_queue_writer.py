@@ -374,3 +374,124 @@ def commit_execution_queue_write(
         "blocked_reasons": [],
         "warnings": [],
     }
+
+
+def commit_execution_queue_write_batch(
+    queue_write_preview_results: Any,
+    queue_path: str | Path,
+    *,
+    backup: bool = True,
+    context: Any = None,
+) -> dict[str, Any]:
+    """Atomically commit multiple ORDER_QUEUED record previews to one queue file."""
+    if not _manual_write_confirmed(context):
+        return _commit_blocked("manual_confirm", "manual queue write confirmation is required")
+
+    if not isinstance(queue_write_preview_results, list) or not queue_write_preview_results:
+        return _commit_blocked("write_preview", "queue_write_preview_results must be a non-empty list")
+
+    previews: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for item in queue_write_preview_results:
+        preview, record, blocked = _validate_write_preview(item)
+        if blocked is not None:
+            return blocked
+        previews.append(preview)
+        records.append(deepcopy(record))
+
+    duplicate_reason = _duplicate_record_reason(records)
+    if duplicate_reason:
+        return _commit_blocked("duplicate", duplicate_reason)
+
+    target_path = Path(queue_path)
+    data, read_blocked = _read_queue_file(target_path)
+    if read_blocked is not None:
+        return read_blocked
+
+    for record in records:
+        existing_duplicate_reason = _existing_batch_duplicate_reason(data["orders"], record)
+        if existing_duplicate_reason:
+            return _commit_blocked("duplicate", existing_duplicate_reason)
+
+    backup_path = None
+    if backup:
+        backup_path = str(target_path) + ".bak"
+        try:
+            shutil.copy2(target_path, backup_path)
+        except Exception as exc:
+            return _commit_blocked("backup", f"failed to create backup: {exc}")
+
+    updated_data = deepcopy(data)
+    updated_data["version"] = updated_data.get("version", 1)
+    updated_data["updated_at"] = _now_text()
+    updated_data["orders"].extend(deepcopy(records))
+
+    try:
+        temp_path = _write_json_atomic(target_path, updated_data)
+    except Exception as exc:
+        return {
+            **_commit_blocked("write_queue", f"failed to write order_queue json: {exc}"),
+            "order_queue_path": str(target_path),
+            "backup_path": backup_path,
+            "file_write": backup_path is not None,
+            "queue_write": False,
+            "queue_committed": False,
+            "committed_count": 0,
+        }
+
+    return {
+        "committed": True,
+        "committed_count": len(records),
+        "write_stage": "order_queued_records_committed",
+        "next_stage": NEXT_STAGE_QUEUE_COMMITTED_REVIEW_REQUIRED,
+        "changed": True,
+        "order_queue_path": str(target_path),
+        "backup_path": backup_path,
+        "temp_path": temp_path,
+        "committed_records": deepcopy(records),
+        "order_ids": [record.get("order_id") for record in records],
+        "order_queued_ids": [record.get("id") for record in records],
+        "request_hashes": [record.get("request_hash") for record in records],
+        "lock_ids": [record.get("lock_id") for record in records],
+        "execution_ids": [record.get("execution_id") for record in records],
+        "send_order_called": False,
+        "execution_enabled": False,
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+
+
+def _duplicate_record_reason(records: list[dict[str, Any]]) -> str | None:
+    checks = (
+        ("order_id", "duplicate order_id"),
+        ("candidate_id", "duplicate candidate_id"),
+        ("queue_pending_id", "duplicate queue_pending_id"),
+        ("execution_id", "duplicate execution_id"),
+        ("request_hash", "duplicate request_hash"),
+        ("lock_id", "duplicate lock_id"),
+    )
+    for field, reason in checks:
+        seen: set[str] = set()
+        for record in records:
+            value = _clean_text(record.get(field))
+            if value in seen:
+                return reason
+            seen.add(value)
+    return None
+
+
+def _existing_batch_duplicate_reason(existing_orders: Any, record: dict[str, Any]) -> str | None:
+    checks = (
+        ("order_id", "duplicate order_id"),
+        ("candidate_id", "duplicate candidate_id"),
+        ("queue_pending_id", "duplicate queue_pending_id"),
+        ("execution_id", "duplicate execution_id"),
+        ("request_hash", "duplicate request_hash"),
+        ("lock_id", "duplicate lock_id"),
+    )
+    for field, reason in checks:
+        value = _clean_text(record.get(field))
+        for order in _as_list(existing_orders):
+            if _clean_text(_as_dict(order).get(field)) == value:
+                return reason
+    return None
