@@ -36,6 +36,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from execution_queue_writer import mutate_order_queue
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -53,11 +55,6 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _write_json(path: Path, data: Any) -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _norm(value: Any) -> str:
@@ -87,12 +84,6 @@ def read_order_queue() -> dict[str, Any]:
     if not isinstance(data.get("orders"), list):
         data["orders"] = []
     return data
-
-
-def write_order_queue(data: dict[str, Any]) -> None:
-    data["version"] = data.get("version", 1)
-    data["updated_at"] = now_text()
-    _write_json(ORDER_QUEUE_PATH, data)
 
 
 def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
@@ -149,54 +140,97 @@ def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_order_approval_to_queue() -> dict[str, Any]:
-    """Apply approval only to PENDING order candidates in order_queue.json."""
-    data = read_order_queue()
-    orders = data.get("orders", [])
-    if not isinstance(orders, list):
-        orders = []
-        data["orders"] = orders
+    """Apply approval metadata to PENDING candidates through the canonical writer."""
 
-    checked = 0
-    approved = 0
-    blocked = 0
-    ignored = 0
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders", [])
+        if not isinstance(orders, list):
+            return {"blocked": {"write_stage": "approval_read", "blocked_reasons": ["order_queue orders must be a list"]}}
 
-    for order in orders:
-        if not isinstance(order, dict):
-            ignored += 1
-            continue
-        if _norm(order.get("status")) != "PENDING":
-            ignored += 1
-            continue
+        checked = 0
+        approved = 0
+        blocked = 0
+        ignored = 0
+        checked_at = now_text()
 
-        checked += 1
-        result = evaluate_order_approval(order)
-        approval_status = result.get("approval_status", "BLOCKED")
+        for order in orders:
+            if not isinstance(order, dict):
+                ignored += 1
+                continue
+            if _norm(order.get("status")) != "PENDING":
+                ignored += 1
+                continue
 
-        order["approval_status"] = approval_status
-        order["approval_reason"] = result.get("approval_reason", "")
-        order["approval_checked_at"] = now_text()
+            checked += 1
+            result = evaluate_order_approval(order)
+            approval_status = result.get("approval_status", "BLOCKED")
 
-        # 실제 주문은 여전히 막는다.
-        order["execution_enabled"] = False
+            order["approval_status"] = approval_status
+            order["approval_reason"] = result.get("approval_reason", "")
+            order["approval_checked_at"] = checked_at
+            order["execution_enabled"] = False
 
-        if approval_status == "APPROVED":
-            order["status"] = "APPROVED"
-            approved += 1
-        elif approval_status == "BLOCKED":
-            order["status"] = "BLOCKED"
-            blocked += 1
-        else:
-            ignored += 1
+            if approval_status == "APPROVED":
+                order["status"] = "APPROVED"
+                approved += 1
+            elif approval_status == "BLOCKED":
+                order["status"] = "BLOCKED"
+                blocked += 1
+            else:
+                ignored += 1
 
-    write_order_queue(data)
+        if checked == 0:
+            return {
+                "blocked": {
+                    "write_stage": "approval_noop",
+                    "blocked_reasons": ["no PENDING orders to approve"],
+                    "checked": checked,
+                    "approved": approved,
+                    "blocked": blocked,
+                    "ignored": ignored,
+                }
+            }
+
+        return {
+            "data": data,
+            "result": {
+                "checked": checked,
+                "approved": approved,
+                "blocked": blocked,
+                "ignored": ignored,
+            },
+        }
+
+    result = mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutate,
+        operation_name="legacy_order_approval_apply",
+        success_stage="legacy_order_approval_applied",
+        next_stage="ORDER_APPROVAL_REVIEW_REQUIRED",
+        context={"manual_queue_write_confirmed": True},
+        default_queue={"version": 1, "updated_at": "", "orders": []},
+    )
 
     return {
-        "checked": checked,
-        "approved": approved,
-        "blocked": blocked,
-        "ignored": ignored,
+        "checked": int(result.get("checked", 0) or 0),
+        "approved": int(result.get("approved", 0) or 0),
+        "blocked": int(result.get("blocked", 0) or 0),
+        "ignored": int(result.get("ignored", 0) or 0),
         "order_queue_path": str(ORDER_QUEUE_PATH),
+        "approval_result": result,
+        "committed": result.get("committed"),
+        "changed": result.get("changed"),
+        "file_write": result.get("file_write"),
+        "queue_write": result.get("queue_write"),
+        "queue_committed": result.get("queue_committed"),
+        "post_write_verified": result.get("post_write_verified"),
+        "revision_before": result.get("revision_before"),
+        "revision_after": result.get("revision_after"),
+        "expected_revision": result.get("expected_revision"),
+        "cas_checked": result.get("cas_checked"),
+        "lock_acquired": result.get("lock_acquired"),
+        "lock_wait_ms": result.get("lock_wait_ms"),
+        "blocked_reasons": result.get("blocked_reasons", []),
     }
 
 
