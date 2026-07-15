@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import tempfile
 import threading
@@ -11,7 +12,55 @@ import unittest
 from unittest import mock
 
 import chejan_event_recorder
-from chejan_event_recorder import record_chejan_event
+from chejan_event_recorder import inspect_broker_chejan_lifecycle, record_chejan_event
+
+
+def _chejan_process_worker(queue_path: str, output: multiprocessing.Queue) -> None:
+    review = {
+        "chejan_review_ok": True,
+        "review_stage": "chejan_event_reviewed",
+        "next_stage": "FILL_RECORD_REQUIRED",
+        "event_type": "PARTIAL_FILL",
+        "order_id": "ORDER_1",
+        "order_queued_id": "ORDER_QUEUED_ORDER_1",
+        "broker_order_no": "BRK_1",
+        "request_hash": "HASH_1",
+        "lock_id": "LOCK_1",
+        "execution_id": "EXEC_1",
+        "matched_by": "broker_order_no",
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+    event = {
+        "normalized": True,
+        "event_stage": "chejan_event_normalized",
+        "event_type": "PARTIAL_FILL",
+        "broker": "KIWOOM",
+        "source": "kiwoom_chejan",
+        "gubun": "0",
+        "broker_order_no": "BRK_1",
+        "account_no": "12345678",
+        "code": "003550",
+        "name": "LG",
+        "side": "BUY",
+        "order_status": "FILLED",
+        "order_quantity": 10,
+        "filled_quantity": 3,
+        "remaining_quantity": 7,
+        "order_price": 1000,
+        "filled_price": 1000,
+        "request_hash": None,
+        "lock_id": None,
+        "execution_id": None,
+        "unresolved": False,
+        "blocked_reasons": [],
+        "warnings": [],
+        "raw_event": {"received_at": "2026-07-04 09:30:00", "fid_values": {"909": "EXECUTION_909_1"}},
+    }
+    try:
+        output.put(record_chejan_event(review, event, queue_path, context={"manual_chejan_event_record_confirmed": True}))
+    except Exception as exc:  # pragma: no cover - returned to parent process
+        output.put({"recorded": False, "error": repr(exc)})
 
 
 class ChejanEventRecorderTest(unittest.TestCase):
@@ -67,7 +116,7 @@ class ChejanEventRecorderTest(unittest.TestCase):
     def _record(self, **overrides: object) -> dict[str, object]:
         record = {
             "id": "ORDER_QUEUED_ORDER_1",
-            "status": "ORDER_QUEUED",
+            "status": "SEND_CALL_ACCEPTED",
             "order_id": "ORDER_1",
             "request_hash": "HASH_1",
             "lock_id": "LOCK_1",
@@ -292,6 +341,27 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertEqual(1, data["revision"])
             self.assertEqual(1, len(data["orders"][0]["chejan_events"]))
 
+    def test_two_processes_record_same_event_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+            ctx = multiprocessing.get_context("spawn")
+            output = ctx.Queue()
+            processes = [ctx.Process(target=_chejan_process_worker, args=(str(path), output)) for _ in range(2)]
+
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(20)
+
+            results = [output.get(timeout=5) for _ in processes]
+            data = self._read_queue(path)
+
+            self.assertTrue(all(process.exitcode == 0 for process in processes), [process.exitcode for process in processes])
+            self.assertEqual(1, sum(result.get("recorded") is True for result in results))
+            self.assertEqual(1, sum(result.get("duplicate") is True for result in results))
+            self.assertEqual(1, data["revision"])
+            self.assertEqual(1, len(data["orders"][0]["chejan_events"]))
+
     def test_post_write_failure_preserves_canonical_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_queue(tmpdir)
@@ -347,16 +417,21 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertTrue(record["chejan_event_recorded_at"])
             self.assertTrue(record["updated_at"])
 
-    def test_status_send_order_and_result_status_are_preserved(self) -> None:
+    def test_partial_fill_transitions_to_partially_filled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_queue(tmpdir)
 
-            self._record_event(path)
+            result = self._record_event(path)
             record = self._read_queue(path)["orders"][0]
 
-            self.assertEqual("ORDER_QUEUED", record["status"])
+            self.assertTrue(result["lifecycle_updated"])
+            self.assertEqual("PARTIALLY_FILLED", result["lifecycle_status"])
+            self.assertEqual("PARTIALLY_FILLED", record["status"])
             self.assertTrue(record["send_order_called"])
             self.assertEqual("SEND_ORDER_CALLED", record["send_order_result_status"])
+            self.assertTrue(record["broker_accepted"])
+            self.assertEqual(3, record["cumulative_filled_quantity"])
+            self.assertEqual(7, record["remaining_quantity"])
 
     def test_partial_fill_next_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -501,14 +576,329 @@ class ChejanEventRecorderTest(unittest.TestCase):
             self.assertFalse(result["recorded"])
             self.assertIn("normalized_event.event_type does not match chejan_review_result.event_type", result["blocked_reasons"])
 
-    def test_target_status_must_remain_order_queued(self) -> None:
+    def test_target_status_must_be_eligible_for_event_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_queue(tmpdir, record=self._record(status="OTHER"))
 
             result = self._record_event(path)
 
             self.assertFalse(result["recorded"])
-            self.assertIn("target record.status is not ORDER_QUEUED", result["blocked_reasons"])
+            self.assertIn("target record.status cannot accept FILL event", result["blocked_reasons"][0])
+
+    def test_order_queued_order_accepted_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="ORDER_QUEUED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_ACCEPTED"),
+                event=self._event(event_type="ORDER_ACCEPTED", filled_quantity=0, remaining_quantity=10),
+            )
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("target record.status cannot accept BROKER_ACCEPT event: ORDER_QUEUED", result["blocked_reasons"])
+
+    def test_order_queued_partial_fill_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="ORDER_QUEUED"))
+
+            result = self._record_event(path)
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("target record.status cannot accept FILL event: ORDER_QUEUED", result["blocked_reasons"])
+
+    def test_dispatch_claimed_full_fill_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="DISPATCH_CLAIMED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(event_type="FULL_FILL"),
+                event=self._event(event_type="FULL_FILL", filled_quantity=10, remaining_quantity=0),
+            )
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("target record.status cannot accept FILL event: DISPATCH_CLAIMED", result["blocked_reasons"])
+
+    def test_send_attempted_cancel_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="SEND_ATTEMPTED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_CANCELED"),
+                event=self._event(event_type="ORDER_CANCELED", filled_quantity=0, remaining_quantity=10),
+            )
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("target record.status cannot accept CANCEL event: SEND_ATTEMPTED", result["blocked_reasons"])
+
+    def test_send_call_in_progress_order_accepted_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="SEND_CALL_IN_PROGRESS"))
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_ACCEPTED"),
+                event=self._event(event_type="ORDER_ACCEPTED", filled_quantity=0, remaining_quantity=10),
+            )
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("target record.status cannot accept BROKER_ACCEPT event: SEND_CALL_IN_PROGRESS", result["blocked_reasons"])
+
+    def test_send_call_accepted_chejan_acceptance_transitions_broker_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="SEND_CALL_ACCEPTED",
+                    send_order_called=True,
+                    broker_call_executed=True,
+                    broker_api_called=True,
+                    actual_order_sent=False,
+                    broker_accepted=False,
+                    broker_rejected=False,
+                ),
+            )
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_ACCEPTED"),
+                event=self._event(event_type="ORDER_ACCEPTED", order_status="ACCEPTED", filled_quantity=0, remaining_quantity=10),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("BROKER_ACCEPTED", result["lifecycle_status"])
+            self.assertEqual("BROKER_ACCEPTED", record["status"])
+            self.assertTrue(record["broker_accepted"])
+            self.assertFalse(record["broker_rejected"])
+            self.assertTrue(record["actual_order_sent"])
+            self.assertFalse(record["manual_reconciliation_required"])
+
+    def test_send_uncertain_chejan_acceptance_clears_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(
+                    status="SEND_UNCERTAIN",
+                    send_order_called=True,
+                    send_uncertain=True,
+                    manual_reconciliation_required=True,
+                    actual_order_sent=False,
+                ),
+            )
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_OPEN"),
+                event=self._event(event_type="ORDER_OPEN", filled_quantity=0, remaining_quantity=10),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("BROKER_ACCEPTED", record["status"])
+            self.assertFalse(record["send_uncertain"])
+            self.assertFalse(record["manual_reconciliation_required"])
+            self.assertTrue(record["broker_accepted"])
+
+    def test_order_rejected_transitions_to_broker_rejected_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="SEND_CALL_ACCEPTED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_REJECTED"),
+                event=self._event(event_type="ORDER_REJECTED", order_status="REJECTED", filled_quantity=0, remaining_quantity=10),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("BROKER_REJECTED", record["status"])
+            self.assertTrue(record["broker_rejected"])
+            self.assertFalse(record["broker_accepted"])
+            self.assertFalse(record["automatic_retry_allowed"])
+            self.assertFalse(record["actual_order_sent"])
+
+    def test_full_fill_transitions_to_filled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(event_type="FULL_FILL"),
+                event=self._event(event_type="FULL_FILL", filled_quantity=10, remaining_quantity=0),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("FILLED", record["status"])
+            self.assertEqual(10, record["cumulative_filled_quantity"])
+            self.assertEqual(0, record["remaining_quantity"])
+            self.assertEqual("CHEJAN_EVENT_" + result["event_identity"], record["final_fill_event_id"])
+
+    def test_send_uncertain_full_fill_reconciliation_transitions_to_filled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="SEND_UNCERTAIN", send_uncertain=True, manual_reconciliation_required=True),
+            )
+
+            result = self._record_event(
+                path,
+                review=self._review(event_type="FULL_FILL"),
+                event=self._event(event_type="FULL_FILL", filled_quantity=10, remaining_quantity=0),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("FILLED", record["status"])
+            self.assertTrue(record["broker_accepted"])
+            self.assertFalse(record["manual_reconciliation_required"])
+
+    def test_two_partial_fills_compute_weighted_average(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="PARTIALLY_FILLED", cumulative_filled_quantity=1, total_filled_quantity=1, remaining_quantity=1, average_fill_price=10000),
+            )
+
+            result = self._record_event(
+                path,
+                event=self._event(order_quantity=2, filled_quantity=2, remaining_quantity=0, filled_price=11000, raw_event={"fid_values": {"909": "EXECUTION_909_2"}}),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("FILLED", record["status"])
+            self.assertEqual(10500, record["average_fill_price"])
+
+    def test_three_partial_fills_compute_weighted_average(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="PARTIALLY_FILLED", cumulative_filled_quantity=2, total_filled_quantity=2, remaining_quantity=3, average_fill_price=10000),
+            )
+
+            self._record_event(
+                path,
+                event=self._event(order_quantity=5, filled_quantity=4, remaining_quantity=1, filled_price=11500, raw_event={"fid_values": {"909": "EXECUTION_909_2"}}),
+            )
+            self._record_event(
+                path,
+                event=self._event(order_quantity=5, filled_quantity=5, remaining_quantity=0, filled_price=13000, raw_event={"fid_values": {"909": "EXECUTION_909_3"}}),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertEqual("FILLED", record["status"])
+            self.assertEqual(11200, record["average_fill_price"])
+
+    def test_late_partial_fill_does_not_overwrite_average_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="FILLED", cumulative_filled_quantity=10, total_filled_quantity=10, remaining_quantity=0, average_fill_price=12345),
+            )
+
+            result = self._record_event(
+                path,
+                event=self._event(filled_quantity=3, remaining_quantity=7, filled_price=99999, raw_event={"fid_values": {"909": "LATE_PARTIAL_AVG"}}),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual(12345, record["average_fill_price"])
+
+    def test_duplicate_fill_does_not_change_average_quantity_or_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+
+            first = self._record_event(path)
+            second = self._record_event(path)
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(first["recorded"])
+            self.assertFalse(second["recorded"])
+            self.assertTrue(second["duplicate"])
+            self.assertEqual(3, record["cumulative_filled_quantity"])
+            self.assertEqual(1000, record.get("average_fill_price"))
+            self.assertEqual(1, self._read_queue(path)["revision"])
+
+    def test_cancel_without_fill_transitions_to_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir, record=self._record(status="BROKER_ACCEPTED"))
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_CANCELED"),
+                event=self._event(event_type="ORDER_CANCELED", order_status="CANCELED", filled_quantity=0, remaining_quantity=10),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("CANCELLED", record["status"])
+            self.assertEqual(0, record["remaining_quantity"])
+
+    def test_cancel_after_partial_fill_transitions_to_partial_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="PARTIALLY_FILLED", cumulative_filled_quantity=3, remaining_quantity=7),
+            )
+
+            result = self._record_event(
+                path,
+                review=self._review(next_stage="CHEJAN_EVENT_RECORD_REQUIRED", event_type="ORDER_CANCELED"),
+                event=self._event(event_type="ORDER_CANCELED", order_status="CANCELED", filled_quantity=3, remaining_quantity=7),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("PARTIAL_CANCELLED", record["status"])
+            self.assertEqual(3, record["final_filled_quantity"])
+
+    def test_out_of_order_partial_after_full_does_not_regress_filled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(
+                tmpdir,
+                record=self._record(status="FILLED", cumulative_filled_quantity=10, total_filled_quantity=10, remaining_quantity=0),
+            )
+
+            result = self._record_event(
+                path,
+                event=self._event(filled_quantity=3, remaining_quantity=7, raw_event={"fid_values": {"909": "LATE_PARTIAL"}}),
+            )
+            record = self._read_queue(path)["orders"][0]
+
+            self.assertTrue(result["recorded"])
+            self.assertEqual("FILLED", record["status"])
+            self.assertTrue(record["out_of_order_detected"])
+
+    def test_broker_order_number_cannot_attach_to_different_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            other = self._record(id="OTHER", order_id="OTHER", request_hash="OTHER_HASH", lock_id="OTHER_LOCK", execution_id="OTHER_EXEC", broker_order_no="BRK_1")
+            target = self._record(broker_order_no=None)
+            path = self._write_queue(tmpdir, root={"version": 1, "orders": [other, target]})
+
+            result = self._record_event(path)
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("broker_order_no already belongs to another queue record", result["blocked_reasons"])
+
+    def test_inspect_broker_chejan_lifecycle_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_queue(tmpdir)
+            self._record_event(path)
+            before = self._sha256(path)
+
+            result = inspect_broker_chejan_lifecycle(path, self._review())
+
+            self.assertTrue(result["inspection_ok"])
+            self.assertEqual("PARTIALLY_FILLED", result["status"])
+            self.assertEqual(1, result["chejan_event_count"])
+            self.assertFalse(result["queue_write"])
+            self.assertFalse(result["file_write"])
+            self.assertEqual(before, self._sha256(path))
 
 
 if __name__ == "__main__":

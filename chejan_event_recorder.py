@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Record a reviewed normalized Chejan event to an explicit queue file.
 
-This module only appends event history to an existing ORDER_QUEUED record. It
-does not update fill ledgers, position ledgers, status transitions, GUI flows,
-timers, or broker order APIs.
+This module appends Chejan event history and reduces broker lifecycle state on
+one existing queue record. It does not update fill ledgers, position ledgers,
+GUI flows, timers, or broker order APIs.
 """
 
 from __future__ import annotations
@@ -33,6 +33,14 @@ _EVENT_RECORD_TYPES = {
     "ORDER_CANCELED",
 }
 _FILL_RECORD_TYPES = {"PARTIAL_FILL", "FULL_FILL"}
+_BROKER_ACCEPT_EVENT_TYPES = {"ORDER_ACCEPTED", "ORDER_OPEN"}
+_TERMINAL_STATES = {"FILLED", "CANCELLED", "PARTIAL_CANCELLED", "BROKER_REJECTED"}
+_LIFECYCLE_ALLOWED_SOURCE_STATUSES = {
+    "BROKER_ACCEPT": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN"},
+    "BROKER_REJECT": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN"},
+    "FILL": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED", "FILLED"},
+    "CANCEL": {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"},
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -163,13 +171,16 @@ def _find_target_order(orders: list[Any], review_result: dict[str, Any]) -> tupl
     return None, -1
 
 
-def _validate_target_record(record: dict[str, Any], review_result: dict[str, Any]) -> dict[str, Any] | None:
-    if record.get("status") != "ORDER_QUEUED":
-        return _blocked("record", "target record.status is not ORDER_QUEUED")
-
+def _validate_target_record(record: dict[str, Any], review_result: dict[str, Any], event_type: str) -> dict[str, Any] | None:
     for field in ("order_id", "request_hash", "lock_id", "execution_id"):
         if _clean_text(record.get(field)) != _clean_text(review_result.get(field)):
             return _blocked("record_consistency", f"target record.{field} does not match chejan_review_result.{field}")
+
+    status = _clean_text(record.get("status"))
+    transition_key = _transition_key(event_type)
+    allowed_statuses = _LIFECYCLE_ALLOWED_SOURCE_STATUSES.get(transition_key, set())
+    if status not in allowed_statuses:
+        return _blocked("record", f"target record.status cannot accept {transition_key} event: {status or 'missing'}")
 
     return None
 
@@ -190,6 +201,22 @@ def _broker_order_policy(record: dict[str, Any], event: dict[str, Any]) -> tuple
         return "", False, _blocked("broker_order_no", "normalized_event.broker_order_no is required")
 
     return "", False, _blocked("broker_order_no", "broker_order_no is required to record Chejan event")
+
+
+def _broker_order_conflict(
+    orders: list[Any],
+    target_index: int,
+    broker_order_no: str,
+) -> dict[str, Any] | None:
+    if not broker_order_no:
+        return None
+    for index, order in enumerate(orders):
+        if index == target_index:
+            continue
+        item = _as_dict(order)
+        if _clean_text(item.get("broker_order_no")) == broker_order_no:
+            return _blocked("broker_order_no", "broker_order_no already belongs to another queue record")
+    return None
 
 
 def _next_stage_for_event(event_type: str) -> str:
@@ -308,6 +335,303 @@ def _event_record(
     }
 
 
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        text = _clean_text(value).replace(",", "")
+        return int(text) if text else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_or_none(value: Any) -> float | int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        text = _clean_text(value).replace(",", "")
+        if not text:
+            return None
+        numeric = float(text)
+        return int(numeric) if numeric.is_integer() else numeric
+    except (TypeError, ValueError):
+        return None
+
+
+def _transition_key(event_type: str) -> str:
+    if event_type in _BROKER_ACCEPT_EVENT_TYPES:
+        return "BROKER_ACCEPT"
+    if event_type == "ORDER_REJECTED":
+        return "BROKER_REJECT"
+    if event_type in _FILL_RECORD_TYPES:
+        return "FILL"
+    if event_type == "ORDER_CANCELED":
+        return "CANCEL"
+    return "UNKNOWN"
+
+
+def _broker_average_fill_price(event: dict[str, Any]) -> float | int | None:
+    for field in (
+        "average_fill_price",
+        "avg_fill_price",
+        "average_price",
+        "cumulative_average_fill_price",
+        "broker_average_fill_price",
+    ):
+        value = _price_or_none(event.get(field))
+        if value is not None:
+            return value
+    raw_event = _as_dict(event.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    for fid in ("932", "930"):
+        value = _price_or_none(fid_values.get(fid))
+        if value is not None:
+            return value
+    return None
+
+
+def _weighted_average_fill_price(
+    *,
+    previous_average: Any,
+    previous_filled: int,
+    fill_delta: int,
+    last_fill_price: float | int | None,
+) -> float | int | None:
+    if fill_delta <= 0 or last_fill_price is None:
+        return _price_or_none(previous_average)
+    previous_average_value = _price_or_none(previous_average)
+    if previous_average_value is None or previous_filled <= 0:
+        return last_fill_price
+    total_filled = previous_filled + fill_delta
+    weighted = ((float(previous_average_value) * previous_filled) + (float(last_fill_price) * fill_delta)) / total_filled
+    return int(weighted) if weighted.is_integer() else weighted
+
+
+def _fill_blocked(record: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
+    order_quantity = _int_or_none(event.get("order_quantity") or record.get("original_order_quantity") or record.get("quantity"))
+    filled_quantity = _int_or_none(event.get("filled_quantity"))
+    remaining_quantity = _int_or_none(event.get("remaining_quantity"))
+    previous_filled = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+
+    if filled_quantity is None or filled_quantity < 0:
+        return _blocked("fill_quantity", "filled_quantity must be a non-negative integer")
+    if remaining_quantity is not None and remaining_quantity < 0:
+        return _blocked("fill_quantity", "remaining_quantity must be a non-negative integer")
+    if order_quantity is not None and order_quantity < 0:
+        return _blocked("fill_quantity", "order_quantity must be a non-negative integer")
+    if filled_quantity < previous_filled and _clean_text(record.get("status")) != "FILLED":
+        return _blocked("fill_quantity", "filled_quantity cannot decrease")
+    if order_quantity is not None and filled_quantity > order_quantity:
+        return _blocked("fill_quantity", "filled_quantity cannot exceed order_quantity")
+    if order_quantity is not None and remaining_quantity is not None and filled_quantity + remaining_quantity != order_quantity:
+        return _blocked("fill_quantity", "filled_quantity plus remaining_quantity must equal order_quantity")
+    return None
+
+
+def _apply_acceptance(
+    record: dict[str, Any],
+    *,
+    broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> None:
+    record.update(
+        {
+            "status": "BROKER_ACCEPTED",
+            "broker_order_no": broker_order_no,
+            "broker_result_known": True,
+            "broker_accepted": True,
+            "broker_rejected": False,
+            "broker_accepted_at": received_at,
+            "broker_accept_event_id": _event_id(event_identity),
+            "send_uncertain": False,
+            "manual_reconciliation_required": False,
+            "automatic_retry_allowed": False,
+            "actual_order_sent": True,
+        }
+    )
+
+
+def _apply_rejection(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> None:
+    record.update(
+        {
+            "status": "BROKER_REJECTED",
+            "broker_order_no": broker_order_no,
+            "broker_result_known": True,
+            "broker_accepted": False,
+            "broker_rejected": True,
+            "broker_rejected_at": received_at,
+            "broker_reject_event_id": _event_id(event_identity),
+            "broker_reject_reason": _clean_text(event.get("order_status")) or "broker rejected",
+            "broker_error_code": _clean_text(event.get("broker_error_code")),
+            "actual_order_sent": False,
+            "manual_reconciliation_required": False,
+            "automatic_retry_allowed": False,
+        }
+    )
+
+
+def _apply_fill(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    event_type: str,
+    broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> None:
+    previous_status = _clean_text(record.get("status"))
+    previous_filled = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+    previous_remaining = _int_or_none(record.get("remaining_quantity"))
+    previous_average = _price_or_none(record.get("average_fill_price"))
+    order_quantity = _int_or_none(event.get("order_quantity") or record.get("original_order_quantity") or record.get("quantity"))
+    remaining_quantity = _int_or_none(event.get("remaining_quantity"))
+    explicit_filled_quantity = _int_or_none(event.get("filled_quantity"))
+    implied_filled_quantity = None
+    if order_quantity is not None and remaining_quantity is not None:
+        implied_filled_quantity = order_quantity - remaining_quantity
+    filled_candidates = [value for value in (explicit_filled_quantity, implied_filled_quantity) if value is not None]
+    filled_quantity = max(filled_candidates) if filled_candidates else 0
+    filled_price = _price_or_none(event.get("filled_price"))
+    explicit_fill_delta = max(filled_quantity - previous_filled, 0)
+    remaining_fill_delta = 0
+    average_previous_filled = previous_filled
+    if previous_remaining is not None and remaining_quantity is not None:
+        remaining_fill_delta = max(previous_remaining - remaining_quantity, 0)
+        if order_quantity is not None:
+            average_previous_filled = max(order_quantity - previous_remaining, 0)
+    fill_delta = max(explicit_fill_delta, remaining_fill_delta)
+
+    if previous_status == "FILLED" and event_type == "PARTIAL_FILL":
+        record.update(
+            {
+                "out_of_order_detected": True,
+                "last_out_of_order_event_id": _event_id(event_identity),
+                "last_out_of_order_event_type": event_type,
+            }
+        )
+        return
+
+    average_fill_price = _broker_average_fill_price(event)
+    if average_fill_price is None:
+        if fill_delta > 0 and filled_price is not None:
+            if previous_average is not None and average_previous_filled > 0:
+                total_filled_for_average = average_previous_filled + fill_delta
+                weighted = ((float(previous_average) * average_previous_filled) + (float(filled_price) * fill_delta)) / total_filled_for_average
+                average_fill_price = int(weighted) if weighted.is_integer() else weighted
+            else:
+                average_fill_price = filled_price
+        else:
+            average_fill_price = previous_average
+
+    final_fill = event_type == "FULL_FILL" or (order_quantity is not None and filled_quantity == order_quantity) or remaining_quantity == 0
+    record.update(
+        {
+            "status": "FILLED" if final_fill else "PARTIALLY_FILLED",
+            "broker_order_no": broker_order_no,
+            "broker_result_known": True,
+            "broker_accepted": True,
+            "broker_rejected": False,
+            "actual_order_sent": True,
+            "original_order_quantity": order_quantity,
+            "cumulative_filled_quantity": filled_quantity,
+            "total_filled_quantity": filled_quantity,
+            "remaining_quantity": 0 if final_fill else remaining_quantity,
+            "last_fill_quantity": fill_delta,
+            "last_fill_price": filled_price,
+            "last_fill_event_id": _event_id(event_identity),
+            "last_fill_at": received_at,
+            "fill_count": int(record.get("fill_count") or 0) + 1,
+            "manual_reconciliation_required": False,
+            "automatic_retry_allowed": False,
+        }
+    )
+    if fill_delta > 0:
+        broker_average = _broker_average_fill_price(event)
+        if broker_average is not None:
+            record["average_fill_price"] = broker_average
+        elif filled_price is not None:
+            if previous_average is not None and average_previous_filled > 0:
+                total_filled_for_average = average_previous_filled + fill_delta
+                weighted = ((float(previous_average) * average_previous_filled) + (float(filled_price) * fill_delta)) / total_filled_for_average
+                record["average_fill_price"] = int(weighted) if weighted.is_integer() else weighted
+            else:
+                record["average_fill_price"] = filled_price
+    if final_fill:
+        record["filled_at"] = received_at
+        record["final_fill_event_id"] = _event_id(event_identity)
+
+
+def _apply_cancel(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> None:
+    cumulative = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+    status = "PARTIAL_CANCELLED" if cumulative > 0 else "CANCELLED"
+    record.update(
+        {
+            "status": status,
+            "broker_order_no": broker_order_no,
+            "cancelled_at": received_at,
+            "cancellation_event_id": _event_id(event_identity),
+            "cancellation_reason": _clean_text(event.get("order_status")) or "broker cancellation",
+            "final_filled_quantity": cumulative,
+            "remaining_quantity": 0,
+            "manual_reconciliation_required": False,
+            "automatic_retry_allowed": False,
+        }
+    )
+
+
+def _apply_lifecycle_transition(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    event_type: str,
+    broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> dict[str, Any] | None:
+    if event_type in _BROKER_ACCEPT_EVENT_TYPES:
+        _apply_acceptance(record, broker_order_no=broker_order_no, event_identity=event_identity, received_at=received_at)
+        return None
+    if event_type == "ORDER_REJECTED":
+        _apply_rejection(record, event, broker_order_no=broker_order_no, event_identity=event_identity, received_at=received_at)
+        return None
+    if event_type in _FILL_RECORD_TYPES:
+        fill_blocked = _fill_blocked(record, event)
+        if fill_blocked is not None:
+            return fill_blocked
+        _apply_fill(
+            record,
+            event,
+            event_type=event_type,
+            broker_order_no=broker_order_no,
+            event_identity=event_identity,
+            received_at=received_at,
+        )
+        return None
+    if event_type == "ORDER_CANCELED":
+        _apply_cancel(record, event, broker_order_no=broker_order_no, event_identity=event_identity, received_at=received_at)
+        return None
+    return _blocked("lifecycle", f"unsupported lifecycle event_type: {event_type}")
+
+
 def record_chejan_event(
     chejan_review_result: Any,
     normalized_event: Any,
@@ -359,13 +683,16 @@ def record_chejan_event(
         if target_record is None or target_index < 0:
             return {"blocked": _blocked("record", "target ORDER_QUEUED record not found")}
 
-        record_blocked = _validate_target_record(target_record, review_result)
+        record_blocked = _validate_target_record(target_record, review_result, event_type)
         if record_blocked is not None:
             return {"blocked": record_blocked}
 
         broker_order_no, broker_order_no_enriched, broker_blocked = _broker_order_policy(target_record, event)
         if broker_blocked is not None:
             return {"blocked": broker_blocked}
+        broker_conflict = _broker_order_conflict(orders, target_index, broker_order_no)
+        if broker_conflict is not None:
+            return {"blocked": broker_conflict}
 
         now = _now_text()
         updated_data = deepcopy(data)
@@ -395,6 +722,16 @@ def record_chejan_event(
             event_identity_source=event_identity_source,
             now=now,
         )
+        lifecycle_blocked = _apply_lifecycle_transition(
+            updated_record,
+            event,
+            event_type=event_type,
+            broker_order_no=broker_order_no,
+            event_identity=event_identity,
+            received_at=appended_event["received_at"],
+        )
+        if lifecycle_blocked is not None:
+            return {"blocked": lifecycle_blocked}
 
         updated_record["chejan_event_recorded"] = True
         updated_record["chejan_event_recorded_at"] = now
@@ -414,6 +751,8 @@ def record_chejan_event(
                 "broker_order_no_enriched": broker_order_no_enriched,
                 "event_identity": event_identity,
                 "event_identity_source": event_identity_source,
+                "lifecycle_status": _clean_text(updated_record.get("status")),
+                "lifecycle_updated": True,
             }
         )
         return {"data": updated_data}
@@ -451,6 +790,8 @@ def record_chejan_event(
         "broker_order_no_enriched": mutation_state["broker_order_no_enriched"],
         "event_identity": mutation_state["event_identity"],
         "event_identity_source": mutation_state["event_identity_source"],
+        "lifecycle_status": mutation_state["lifecycle_status"],
+        "lifecycle_updated": mutation_state["lifecycle_updated"],
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
         "blocked_reasons": [],
@@ -458,3 +799,62 @@ def record_chejan_event(
     }
     result.update({key: value for key, value in mutation_result.items() if key not in result})
     return preserve_queue_mutation_result(result, mutation_result)
+
+
+def inspect_broker_chejan_lifecycle(
+    queue_path: str | Path,
+    identity: Any,
+) -> dict[str, Any]:
+    """Read one queue record's broker/Chejan lifecycle without mutating files."""
+    target_path = Path(queue_path)
+    data, read_blocked = _read_queue(target_path)
+    if read_blocked is not None:
+        result = {"inspection_ok": False, "inspection_type": "BROKER_CHEJAN_LIFECYCLE_INSPECTION"}
+        result.update(read_blocked)
+        return result
+
+    review_like = _as_dict(identity)
+    record, index = _find_target_order(data["orders"], review_like)
+    if record is None or index < 0:
+        return {
+            "inspection_ok": False,
+            "inspection_type": "BROKER_CHEJAN_LIFECYCLE_INSPECTION",
+            "record_stage": "record",
+            "blocked_reasons": ["target queue record not found"],
+            "warnings": [],
+        }
+
+    events = record.get("chejan_events")
+    if not isinstance(events, list):
+        events = []
+    identities = [_stored_event_identity(event) for event in events]
+    return {
+        "inspection_ok": True,
+        "inspection_type": "BROKER_CHEJAN_LIFECYCLE_INSPECTION",
+        "queue_path": str(target_path),
+        "order_queued_id": _clean_text(record.get("id")),
+        "order_id": _clean_text(record.get("order_id")),
+        "request_hash": _clean_text(record.get("request_hash")),
+        "lock_id": _clean_text(record.get("lock_id")),
+        "execution_id": _clean_text(record.get("execution_id")),
+        "status": _clean_text(record.get("status")),
+        "broker_order_no": _clean_text(record.get("broker_order_no")),
+        "broker_accepted": record.get("broker_accepted") is True,
+        "broker_rejected": record.get("broker_rejected") is True,
+        "original_order_quantity": record.get("original_order_quantity"),
+        "cumulative_filled_quantity": record.get("cumulative_filled_quantity"),
+        "remaining_quantity": record.get("remaining_quantity"),
+        "fill_count": record.get("fill_count", 0),
+        "chejan_event_count": len(events),
+        "duplicate_event_count": len(identities) - len(set(identities)),
+        "last_chejan_event_type": _clean_text(record.get("last_chejan_event_type")),
+        "out_of_order_detected": record.get("out_of_order_detected") is True,
+        "manual_reconciliation_required": record.get("manual_reconciliation_required") is True,
+        "automatic_retry_allowed": record.get("automatic_retry_allowed") is True,
+        "final_state": _clean_text(record.get("status")) in _TERMINAL_STATES,
+        "runtime_write": False,
+        "queue_write": False,
+        "file_write": False,
+        "send_order_called": False,
+        "broker_api_called": False,
+    }
