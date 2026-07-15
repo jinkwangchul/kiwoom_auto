@@ -4,16 +4,33 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import execution_queue_writer
 import real_order_preflight_service
 from real_order_preflight_service import (
     commit_real_order_preflight,
     preview_real_order_preflight,
 )
+
+
+def _real_ready_process_worker(
+    queue_path: str,
+    preview: dict[str, object],
+    expected_revision: int | None,
+    start: object,
+    output: object,
+) -> None:
+    start.wait()
+    context: dict[str, object] = {"manual_real_preflight_commit_confirmed": True}
+    if expected_revision is not None:
+        context["expected_revision"] = expected_revision
+    output.put(commit_real_order_preflight(preview, queue_path, context=context))
 
 
 class RealOrderPreflightServiceTest(unittest.TestCase):
@@ -86,6 +103,30 @@ class RealOrderPreflightServiceTest(unittest.TestCase):
 
     def _queue_sha256(self) -> str:
         return hashlib.sha256(self.queue_path.read_bytes()).hexdigest().upper()
+
+    def _run_process_commits(
+        self,
+        previews: list[dict[str, object]],
+        expected_revision: int | None = None,
+    ) -> list[dict[str, object]]:
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        output = context.Queue()
+        processes = [
+            context.Process(
+                target=_real_ready_process_worker,
+                args=(str(self.queue_path), preview, expected_revision, start, output),
+            )
+            for preview in previews
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        results = [output.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(15)
+            self.assertEqual(0, process.exitcode)
+        return results
 
     def test_preview_status_not_executable_is_blocked(self) -> None:
         result = preview_real_order_preflight(self._order(status="APPROVED"), self._guard(), self._context())
@@ -305,6 +346,228 @@ class RealOrderPreflightServiceTest(unittest.TestCase):
         self.assertEqual("실주문 사전검사 통과", order["real_preflight_reason"])
         self.assertIn("real_preflight_checked_at", order)
         self.assertTrue(Path(result["backup_path"]).exists())
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertTrue(result["post_write_verified"])
+        self.assertEqual(1, data["revision"])
+
+    def test_commit_with_stale_expected_revision_is_blocked_without_write(self) -> None:
+        self._write_queue([self._order()])
+        data = self._read_queue()
+        data["revision"] = 5
+        self.queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        before = self.queue_path.read_bytes()
+
+        result = commit_real_order_preflight(
+            self._preview(),
+            self.queue_path,
+            context=self._commit_context(expected_revision=4),
+        )
+
+        self.assertFalse(result["real_preflight_committed"])
+        self.assertEqual("revision_cas", result["preflight_stage"])
+        self.assertFalse(result["queue_write"])
+        self.assertEqual(before, self.queue_path.read_bytes())
+
+    def test_commit_blocks_duplicate_target_identity(self) -> None:
+        self._write_queue([self._order(), self._order(source_signal_id="SIG_2")])
+
+        result = commit_real_order_preflight(
+            self._preview(),
+            self.queue_path,
+            context=self._commit_context(),
+        )
+
+        self.assertFalse(result["real_preflight_committed"])
+        self.assertEqual("order", result["preflight_stage"])
+        self.assertFalse(result["queue_write"])
+
+    def test_commit_revalidates_preview_identity_inside_lock(self) -> None:
+        preview = self._preview()
+        self._write_queue([self._order(source_signal_id="SIG_CHANGED")])
+
+        result = commit_real_order_preflight(preview, self.queue_path, context=self._commit_context())
+
+        self.assertFalse(result["real_preflight_committed"])
+        self.assertEqual("preview_binding", result["preflight_stage"])
+        self.assertFalse(result["queue_write"])
+
+    def test_canonical_post_write_failure_preserves_side_effect_facts(self) -> None:
+        self._write_queue([self._order()])
+        canonical_result = {
+            "committed": True,
+            "changed": True,
+            "write_stage": "post_write_verify",
+            "next_stage": "BLOCKED",
+            "file_write": True,
+            "queue_write": True,
+            "queue_committed": True,
+            "post_write_verified": False,
+            "revision_before": 0,
+            "revision_after": 1,
+            "lock_acquired": True,
+            "cas_checked": False,
+            "blocked_reasons": ["forced verification failure"],
+        }
+
+        with mock.patch.object(real_order_preflight_service, "mutate_order_queue", return_value=canonical_result):
+            result = commit_real_order_preflight(
+                self._preview(),
+                self.queue_path,
+                context=self._commit_context(),
+            )
+
+        self.assertFalse(result["real_preflight_committed"])
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["file_write"])
+        self.assertTrue(result["queue_write"])
+        self.assertTrue(result["queue_committed"])
+        self.assertFalse(result["post_write_verified"])
+
+    def test_same_record_two_threads_only_one_commit_succeeds(self) -> None:
+        self._write_queue([self._order()])
+        preview = self._preview()
+        barrier = threading.Barrier(3)
+        results: list[dict[str, object]] = []
+
+        def worker() -> None:
+            barrier.wait()
+            results.append(commit_real_order_preflight(preview, self.queue_path, context=self._commit_context()))
+
+        threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(10)
+
+        data = self._read_queue()
+        self.assertEqual(1, sum(item.get("real_preflight_committed") is True for item in results))
+        self.assertEqual("REAL_READY", data["orders"][0]["status"])
+        self.assertEqual(1, data["revision"])
+
+    def test_same_record_two_processes_only_one_commit_succeeds(self) -> None:
+        self._write_queue([self._order()])
+        results = self._run_process_commits([self._preview(), self._preview()])
+
+        data = self._read_queue()
+        self.assertEqual(1, sum(item.get("real_preflight_committed") is True for item in results))
+        self.assertEqual("REAL_READY", data["orders"][0]["status"])
+        self.assertEqual(1, data["revision"])
+
+    def test_different_records_two_processes_preserve_both_and_hash_chain(self) -> None:
+        orders = [
+            self._order(id="ORDER_1", source_signal_id="SIG_1"),
+            self._order(id="ORDER_2", source_signal_id="SIG_2", code="005930"),
+        ]
+        self._write_queue(orders)
+        previews = [
+            preview_real_order_preflight(order, self._guard(), self._context())
+            for order in orders
+        ]
+        results = self._run_process_commits(previews)
+
+        data = self._read_queue()
+        self.assertEqual(2, sum(item.get("real_preflight_committed") is True for item in results))
+        self.assertEqual(["REAL_READY", "REAL_READY"], [item["status"] for item in data["orders"]])
+        self.assertEqual(2, data["revision"])
+        self.assertTrue(
+            results[0]["after_sha256"] == results[1]["before_sha256"]
+            or results[1]["after_sha256"] == results[0]["before_sha256"]
+        )
+
+    def test_candidate_append_race_preserves_append_and_real_ready(self) -> None:
+        self._write_queue([self._order()])
+        preview = self._preview()
+        candidate = self._order(
+            id="ORDER_NEW",
+            source_signal_id="SIG_NEW",
+            status="PENDING",
+            execution_enabled=False,
+            approval_status="PENDING",
+            policy_status="PENDING",
+        )
+        barrier = threading.Barrier(3)
+        results: list[dict[str, object]] = []
+
+        def commit_ready() -> None:
+            barrier.wait()
+            results.append(commit_real_order_preflight(preview, self.queue_path, context=self._commit_context()))
+
+        def append_candidate() -> None:
+            barrier.wait()
+
+            def mutate(data: dict[str, object]) -> dict[str, object]:
+                updated = deepcopy(data)
+                updated["orders"].append(deepcopy(candidate))
+                return {"data": updated}
+
+            results.append(
+                execution_queue_writer.mutate_order_queue(
+                    self.queue_path,
+                    mutate,
+                    operation_name="test_candidate_append",
+                    success_stage="candidate_appended",
+                    next_stage="TEST_DONE",
+                )
+            )
+
+        threads = [threading.Thread(target=commit_ready), threading.Thread(target=append_candidate)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(10)
+
+        data = self._read_queue()
+        by_id = {item["id"]: item for item in data["orders"]}
+        self.assertEqual("REAL_READY", by_id["ORDER_1"]["status"])
+        self.assertEqual("PENDING", by_id["ORDER_NEW"]["status"])
+        self.assertEqual(2, data["revision"])
+
+    def test_other_canonical_mutation_race_preserves_both_records(self) -> None:
+        orders = [self._order(), self._order(id="ORDER_2", source_signal_id="SIG_2")]
+        self._write_queue(orders)
+        preview = self._preview()
+        barrier = threading.Barrier(3)
+
+        def commit_ready() -> None:
+            barrier.wait()
+            commit_real_order_preflight(preview, self.queue_path, context=self._commit_context())
+
+        def patch_other() -> None:
+            barrier.wait()
+
+            def mutate(data: dict[str, object]) -> dict[str, object]:
+                updated = deepcopy(data)
+                for item in updated["orders"]:
+                    if item["id"] == "ORDER_2":
+                        item["audit_marker"] = "PRESERVED"
+                return {"data": updated}
+
+            execution_queue_writer.mutate_order_queue(
+                self.queue_path,
+                mutate,
+                operation_name="test_other_record_patch",
+                success_stage="other_record_patched",
+                next_stage="TEST_DONE",
+            )
+
+        threads = [threading.Thread(target=commit_ready), threading.Thread(target=patch_other)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(10)
+
+        data = self._read_queue()
+        by_id = {item["id"]: item for item in data["orders"]}
+        self.assertEqual("REAL_READY", by_id["ORDER_1"]["status"])
+        self.assertEqual("PRESERVED", by_id["ORDER_2"]["audit_marker"])
+        self.assertEqual(2, data["revision"])
 
     def test_commit_with_backup_false_does_not_create_backup(self) -> None:
         self._write_queue([self._order()])
@@ -357,6 +620,10 @@ class RealOrderPreflightServiceTest(unittest.TestCase):
         self.assertNotIn("QPushButton", module_text)
         self.assertNotIn("ORDER_QUEUED", module_text)
         self.assertNotIn("apply_real_order_preflight_for_order", module_text)
+        self.assertNotIn("write_text", module_text)
+        self.assertNotIn("os.replace", module_text)
+        self.assertNotIn("shutil.copy2", module_text)
+        self.assertNotIn("_write_json_atomic", module_text)
 
     def test_input_dicts_are_not_mutated(self) -> None:
         self._write_queue([self._order()])
