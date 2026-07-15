@@ -10,13 +10,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
-import json
-import os
 from pathlib import Path
-import shutil
 from typing import Any
-from uuid import uuid4
 from datetime import datetime
+
+from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -95,48 +93,13 @@ def _commit_confirmed(context: Any) -> bool:
     )
 
 
+def _expected_revision(context: Any) -> int | None:
+    value = _as_dict(context).get("expected_revision")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
-
-
-def _read_queue_file(queue_path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    if not queue_path.exists():
-        return {}, _commit_blocked("read_queue", "queue file does not exist")
-
-    try:
-        data = json.loads(queue_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {}, _commit_blocked("read_queue", f"failed to read order_queue json: {exc}")
-
-    if not isinstance(data, dict):
-        return {}, _commit_blocked("read_queue", "order_queue root must be an object")
-
-    orders = data.get("orders")
-    if not isinstance(orders, list):
-        return {}, _commit_blocked("read_queue", "order_queue orders must be a list")
-
-    for item in orders:
-        if not isinstance(item, dict):
-            return {}, _commit_blocked("read_queue", "order_queue orders must contain only objects")
-
-    return data, None
-
-
-def _write_json_atomic(queue_path: Path, data: dict[str, Any]) -> None:
-    tmp_path = queue_path.with_name(f".{queue_path.name}.{uuid4().hex}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, queue_path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
 
 
 def preview_real_order_preflight(order: Any, guard: Any, context: Any = None) -> dict[str, Any]:
@@ -223,7 +186,7 @@ def commit_real_order_preflight(
     context: Any = None,
     backup: bool = True,
 ) -> dict[str, Any]:
-    """Commit one explicit queue file order from EXECUTABLE to REAL_READY."""
+    """Commit EXECUTABLE to REAL_READY through the canonical queue writer."""
     preview = _as_dict(preflight_preview_result)
     if preview.get("real_preflight_preview") is not True:
         return _commit_blocked("preflight_preview", "preflight_preview_result.real_preflight_preview is not true")
@@ -237,105 +200,168 @@ def commit_real_order_preflight(
     if not _commit_confirmed(context):
         return _commit_blocked("operator_confirmation", "manual real preflight commit confirmation is required")
 
-    target_path = Path(queue_path)
-    before_sha256 = None
-    if target_path.exists():
-        before_sha256 = _sha256_file(target_path)
-
     snapshot = _as_dict(preview_queue_snapshot)
+    snapshot_sha256 = ""
     if snapshot:
         snapshot_sha256 = _clean_text(snapshot.get("sha256")).upper()
         if not snapshot_sha256:
             return _commit_blocked("stale_preview", "preview_queue_snapshot.sha256 is required")
-        if before_sha256 != snapshot_sha256:
-            return _commit_blocked(
-                "stale_preview",
-                "queue file changed after real preflight preview; rerun REAL Preflight",
-            )
-
-    data, blocked = _read_queue_file(target_path)
-    if blocked is not None:
-        return blocked
 
     order_id = _clean_text(preview.get("order_id"))
     if not order_id:
         return _commit_blocked("order_id", "preflight_preview_result.order_id is required")
 
-    target_order = None
-    for order in data["orders"]:
-        if _clean_text(order.get("id")) == order_id:
-            target_order = order
-            break
+    target_path = Path(queue_path)
+    audit: dict[str, Any] = {"before_sha256": None, "after_sha256": None}
 
-    if target_order is None:
-        return _commit_blocked("order", "target order not found")
+    def blocked(stage: str, reason: str) -> dict[str, Any]:
+        return {"blocked": _commit_blocked(stage, reason)}
 
-    validation = preview_real_order_preflight(
-        target_order,
-        {
-            "real_trade_enabled": True,
-            "kiwoom_logged_in": True,
-            "account_selected": True,
-            "account_no": "COMMIT_REVALIDATION",
-            "operator_confirmed": True,
-        },
-        {"manual_real_preflight_confirmed": True},
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        current_sha256 = _sha256_file(target_path)
+        audit["before_sha256"] = current_sha256
+        if snapshot and current_sha256 != snapshot_sha256:
+            return blocked(
+                "stale_preview",
+                "queue file changed after real preflight preview; rerun REAL Preflight",
+            )
+
+        matches = [
+            order
+            for order in data["orders"]
+            if _clean_text(order.get("id")) == order_id
+        ]
+        if len(matches) != 1:
+            reason = "target order not found" if not matches else "target order identity matched multiple records"
+            return blocked("order", reason)
+
+        target_order = matches[0]
+        bindings = (
+            ("source_signal_id", _clean_text),
+            ("code", _clean_text),
+            ("side", lambda value: _clean_text(value).upper()),
+            ("quantity", _quantity),
+            ("order_type", _clean_text),
+        )
+        for field, normalize in bindings:
+            if normalize(target_order.get(field)) != normalize(preview.get(field)):
+                return blocked("preview_binding", f"preflight preview {field} does not match target order")
+
+        validation = preview_real_order_preflight(
+            target_order,
+            {
+                "real_trade_enabled": True,
+                "kiwoom_logged_in": True,
+                "account_selected": True,
+                "account_no": "COMMIT_REVALIDATION",
+                "operator_confirmed": True,
+            },
+            {"manual_real_preflight_confirmed": True},
+        )
+        if validation.get("real_preflight_preview") is not True:
+            reasons = validation.get("blocked_reasons") if isinstance(validation.get("blocked_reasons"), list) else []
+            reason = reasons[0] if reasons else "target order is not eligible for REAL preflight"
+            return blocked(str(validation.get("preflight_stage", "order")), reason)
+
+        updated_data = deepcopy(data)
+        updated_matches = [
+            order
+            for order in updated_data["orders"]
+            if _clean_text(order.get("id")) == order_id
+        ]
+        if len(updated_matches) != 1:
+            return blocked("order", "target order identity changed during mutation")
+
+        updated_order = updated_matches[0]
+        before_status = _clean_text(updated_order.get("status")).upper()
+        now = _now_text()
+        updated_order["status"] = "REAL_READY"
+        updated_order["real_preflight_status"] = "REAL_READY"
+        updated_order["real_preflight_reason"] = REAL_PREFLIGHT_REASON_READY
+        updated_order["real_preflight_checked_at"] = now
+        updated_order["updated_at"] = now
+        return {
+            "data": updated_data,
+            "result": {
+                "order_id": order_id,
+                "before_status": before_status,
+                "after_status": "REAL_READY",
+                "execution_enabled": updated_order.get("execution_enabled"),
+                "real_preflight_status": updated_order.get("real_preflight_status"),
+                "real_preflight_reason": updated_order.get("real_preflight_reason"),
+                "before_sha256": current_sha256,
+            },
+        }
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = [
+            order
+            for order in after_data.get("orders", [])
+            if isinstance(order, dict) and _clean_text(order.get("id")) == order_id
+        ]
+        if len(matches) != 1:
+            return {"write_stage": "real_ready_verify", "blocked_reasons": ["REAL_READY target must exist exactly once"]}
+        order = matches[0]
+        if _clean_text(order.get("status")).upper() != "REAL_READY":
+            return {"write_stage": "real_ready_verify", "blocked_reasons": ["target status is not REAL_READY"]}
+        if _clean_text(order.get("real_preflight_status")).upper() != "REAL_READY":
+            return {"write_stage": "real_ready_verify", "blocked_reasons": ["real_preflight_status is not REAL_READY"]}
+        audit["after_sha256"] = _sha256_file(target_path)
+        result = mutation.get("result")
+        if isinstance(result, dict):
+            result["after_sha256"] = audit["after_sha256"]
+        return None
+
+    mutation_result = mutate_order_queue(
+        target_path,
+        mutate,
+        operation_name="real_order_preflight",
+        success_stage="real_ready_committed",
+        next_stage=NEXT_STAGE_EXECUTION_PREVIEW_REQUIRED,
+        backup=backup,
+        context=context,
+        expected_revision=_expected_revision(context),
+        verify=verify,
     )
-    if validation.get("real_preflight_preview") is not True:
-        reasons = validation.get("blocked_reasons") if isinstance(validation.get("blocked_reasons"), list) else []
-        reason = reasons[0] if reasons else "target order is not eligible for REAL preflight"
-        return _commit_blocked(str(validation.get("preflight_stage", "order")), reason)
 
-    updated_data = deepcopy(data)
-    updated_order = None
-    for order in updated_data["orders"]:
-        if _clean_text(order.get("id")) == order_id:
-            updated_order = order
-            break
+    if audit["after_sha256"] is None and target_path.exists():
+        audit["after_sha256"] = _sha256_file(target_path)
 
-    if updated_order is None:
-        return _commit_blocked("order", "target order not found")
+    if mutation_result.get("committed") is not True or mutation_result.get("post_write_verified") is not True:
+        stage = _clean_text(mutation_result.get("preflight_stage") or mutation_result.get("write_stage")) or "write_queue"
+        reasons = mutation_result.get("blocked_reasons") if isinstance(mutation_result.get("blocked_reasons"), list) else []
+        result = _commit_blocked(stage, reasons[0] if reasons else "queue mutation failed")
+        result.update({key: value for key, value in mutation_result.items() if key not in result})
+        result.update(
+            {
+                "order_id": order_id,
+                "order_queue_path": str(target_path),
+                "guard_path": str(guard_path) if guard_path is not None else None,
+                "before_sha256": audit["before_sha256"],
+                "after_sha256": audit["after_sha256"],
+            }
+        )
+        return preserve_queue_mutation_result(result, mutation_result)
 
-    before_status = _clean_text(updated_order.get("status")).upper()
-    now = _now_text()
-    updated_order["status"] = "REAL_READY"
-    updated_order["real_preflight_status"] = "REAL_READY"
-    updated_order["real_preflight_reason"] = REAL_PREFLIGHT_REASON_READY
-    updated_order["real_preflight_checked_at"] = now
-    updated_order["updated_at"] = now
-    updated_data["updated_at"] = now
-
-    backup_path = None
-    if backup:
-        backup_path = str(target_path) + ".bak"
-        try:
-            shutil.copy2(target_path, backup_path)
-        except Exception as exc:
-            return _commit_blocked("backup", f"failed to create backup: {exc}")
-
-    try:
-        _write_json_atomic(target_path, updated_data)
-    except Exception as exc:
-        return _commit_blocked("write_queue", f"failed to write order_queue json: {exc}")
-
-    after_sha256 = _sha256_file(target_path)
-    return {
+    result = {
         "real_preflight_committed": True,
         "preflight_stage": "real_ready_committed",
         "next_stage": NEXT_STAGE_EXECUTION_PREVIEW_REQUIRED,
-        "changed": before_sha256 != after_sha256,
+        "changed": mutation_result.get("changed") is True,
         "order_id": order_id,
-        "before_status": before_status,
-        "after_status": _clean_text(updated_order.get("status")).upper(),
-        "execution_enabled": updated_order.get("execution_enabled"),
-        "real_preflight_status": updated_order.get("real_preflight_status"),
-        "real_preflight_reason": updated_order.get("real_preflight_reason"),
+        "before_status": mutation_result.get("before_status"),
+        "after_status": mutation_result.get("after_status"),
+        "execution_enabled": mutation_result.get("execution_enabled"),
+        "real_preflight_status": mutation_result.get("real_preflight_status"),
+        "real_preflight_reason": mutation_result.get("real_preflight_reason"),
         "order_queue_path": str(target_path),
         "guard_path": str(guard_path) if guard_path is not None else None,
-        "backup_path": backup_path,
-        "before_sha256": before_sha256,
-        "after_sha256": after_sha256,
+        "backup_path": mutation_result.get("backup_path"),
+        "before_sha256": audit["before_sha256"],
+        "after_sha256": audit["after_sha256"],
         "send_order_called": False,
         "blocked_reasons": [],
         "warnings": [],
     }
+    result.update({key: value for key, value in mutation_result.items() if key not in result})
+    return preserve_queue_mutation_result(result, mutation_result)
