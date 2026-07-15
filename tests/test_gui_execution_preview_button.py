@@ -126,6 +126,7 @@ def _install_pyqt5_import_stubs() -> None:
 _install_pyqt5_import_stubs()
 
 import gui_auto_trade_setting_window as gui
+import gui_windows as main_gui
 
 
 class _FakeWindow:
@@ -192,6 +193,52 @@ class _FakeButton:
 
     def setEnabled(self, value: bool) -> None:
         self.enabled = value
+
+
+class _FakeApi:
+    def __init__(self, *, connected: bool = True, accounts: list[str] | None = None) -> None:
+        self.connected = connected
+        self.accounts = list(accounts or [])
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def account_numbers(self) -> list[str]:
+        if not self.connected:
+            return []
+        return list(self.accounts)
+
+
+class _FakeAccountCombo:
+    def __init__(self) -> None:
+        self.items: list[str] = []
+        self.enabled = False
+        self.current_index = -1
+        self.signals_blocked = False
+
+    def blockSignals(self, value: bool) -> None:
+        self.signals_blocked = value
+
+    def clear(self) -> None:
+        self.items = []
+        self.current_index = -1
+
+    def addItems(self, items: list[str]) -> None:
+        self.items.extend(items)
+
+    def setEnabled(self, value: bool) -> None:
+        self.enabled = value
+
+    def isEnabled(self) -> bool:
+        return self.enabled
+
+    def setCurrentIndex(self, value: int) -> None:
+        self.current_index = value
+
+    def currentText(self) -> str:
+        if 0 <= self.current_index < len(self.items):
+            return self.items[self.current_index]
+        return ""
 
 
 class _FakeTextEdit:
@@ -274,6 +321,17 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window._last_execution_preview_result = None
         window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
         window.show_manual_queue_commit_result = lambda result: window.commit_reports.append(result)
+        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"])
+        parent.account_combo = _FakeAccountCombo()
+        main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+        window.parent = lambda: parent
+        window.real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
+        window.read_order_from_queue_by_id = lambda order_id, queue_path: {
+            "ok": True,
+            "order": {"id": str(order_id), "code": "005930"},
+            "blocked_reasons": [],
+        }
         return window
 
     def _window_for_execution_enable(self):
@@ -290,6 +348,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window.real_preflight_reports = []
         window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
         window.show_real_preflight_result = lambda result: window.real_preflight_reports.append(result)
+        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"])
+        parent.account_combo = _FakeAccountCombo()
+        main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+        window.parent = lambda: parent
+        window.real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
         return window
 
     def _queue_write_preview_result(self) -> dict[str, object]:
@@ -311,6 +375,18 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "lock_id": "LOCK_1",
                 "execution_id": "EXEC_1",
             },
+        }
+
+    def _runtime_commit_result(self) -> dict[str, object]:
+        return {
+            "status": "COMMITTED",
+            "committed": True,
+            "runtime_write": True,
+            "read_back_verified": True,
+            "execution_id": "EXEC_1",
+            "order_id": "ORDER_1",
+            "request_hash": "HASH_1",
+            "lock_id": "LOCK_1",
         }
 
     def _queue_snapshot(self, sha256: str = "HASH_BEFORE") -> dict[str, object]:
@@ -385,6 +461,40 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "warnings": [],
             "send_order_called": False,
         }
+
+    def test_main_window_refresh_accounts_auto_selects_single_real_account(self) -> None:
+        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window.kiwoom_api = _FakeApi(connected=True, accounts=["12345678", "", "12345678"])
+        window.account_combo = _FakeAccountCombo()
+
+        accounts = main_gui.MainWindow.refresh_kiwoom_accounts(window)
+
+        self.assertEqual(["12345678"], accounts)
+        self.assertEqual("12345678", main_gui.MainWindow.selected_account_no(window))
+        self.assertTrue(window.account_combo.enabled)
+
+    def test_main_window_refresh_accounts_preserves_valid_multi_account_selection(self) -> None:
+        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window.kiwoom_api = _FakeApi(connected=True, accounts=["11111111", "22222222"])
+        window.account_combo = _FakeAccountCombo()
+        main_gui.MainWindow.refresh_kiwoom_accounts(window)
+        window.account_combo.setCurrentIndex(1)
+
+        accounts = main_gui.MainWindow.refresh_kiwoom_accounts(window)
+
+        self.assertEqual(["11111111", "22222222"], accounts)
+        self.assertEqual("22222222", main_gui.MainWindow.selected_account_no(window))
+
+    def test_main_window_refresh_accounts_clears_disconnected_selection(self) -> None:
+        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window.kiwoom_api = _FakeApi(connected=False, accounts=["12345678"])
+        window.account_combo = _FakeAccountCombo()
+
+        accounts = main_gui.MainWindow.refresh_kiwoom_accounts(window)
+
+        self.assertEqual([], accounts)
+        self.assertEqual("", main_gui.MainWindow.selected_account_no(window))
+        self.assertFalse(window.account_combo.enabled)
 
     def test_execution_enable_button_is_registered_separately(self) -> None:
         module_text = gui.__loader__.get_source(gui.__name__)
@@ -630,8 +740,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         qtimer.assert_not_called()
         self.assertEqual([], window.real_preflight_reports)
 
-    def test_real_preflight_missing_guard_is_blocked(self) -> None:
+    def test_real_preflight_disconnected_login_is_blocked(self) -> None:
         window = self._window_for_real_preflight()
+        window.parent().kiwoom_api.connected = False
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_EXEC_1", True)),
@@ -641,7 +752,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "read_order_from_queue_by_id",
                 return_value={"ok": True, "order": self._real_preflight_order(), "blocked_reasons": []},
             ),
-            mock.patch.object(gui, "read_json_dict", return_value={}),
             mock.patch.object(gui, "commit_real_order_preflight") as commit_service,
         ):
             gui.AutoTradeSettingWindow.run_real_ready_preflight_manually(window)
@@ -649,9 +759,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         commit_service.assert_not_called()
         self.assertEqual("guard", window.real_preflight_reports[0]["preflight_stage"])
         self.assertEqual("BLOCKED", window.real_preflight_reports[0]["next_stage"])
+        self.assertIn("kiwoom api is not connected", window.real_preflight_reports[0]["blocked_reasons"])
 
     def test_real_preflight_preview_failure_does_not_commit(self) -> None:
         window = self._window_for_real_preflight()
+        window.confirm_real_preflight_commit = lambda order, guard, preview, queue_path, snapshot: True
         preview_result = {
             "real_preflight_preview": False,
             "preflight_stage": "execution_enabled",
@@ -668,15 +780,24 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "read_order_from_queue_by_id",
                 return_value={"ok": True, "order": self._real_preflight_order(), "blocked_reasons": []},
             ),
-            mock.patch.object(gui, "read_json_dict", return_value=self._real_preflight_guard()),
             mock.patch.object(gui, "preview_real_order_preflight", return_value=preview_result) as preview_service,
             mock.patch.object(gui, "commit_real_order_preflight") as commit_service,
         ):
             gui.AutoTradeSettingWindow.run_real_ready_preflight_manually(window)
 
+        expected_guard = self._real_preflight_guard()
+        expected_guard.update(
+            {
+                "account_numbers": ["12345678"],
+                "selected_account_valid": True,
+                "real_trade_source": "test_config",
+                "real_trade_config_found": True,
+                "real_trade_guard_source": "gui_session",
+            }
+        )
         preview_service.assert_called_once_with(
             self._real_preflight_order(),
-            self._real_preflight_guard(),
+            expected_guard,
             {"manual_real_preflight_confirmed": True},
         )
         commit_service.assert_not_called()
@@ -702,7 +823,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             gui.AutoTradeSettingWindow.run_real_ready_preflight_manually(window)
 
         commit_service.assert_not_called()
-        self.assertTrue(any("취소" in message for message in window.messages))
+        self.assertTrue(window.messages)
+        self.assertEqual([], window.real_preflight_reports)
 
     def test_real_preflight_confirmed_passes_manual_commit_context(self) -> None:
         window = self._window_for_real_preflight()
@@ -737,7 +859,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "read_order_from_queue_by_id",
                 return_value={"ok": True, "order": self._real_preflight_order(), "blocked_reasons": []},
             ),
-            mock.patch.object(gui, "read_json_dict", return_value=self._real_preflight_guard()),
             mock.patch.object(gui, "preview_real_order_preflight", return_value=preview_result),
             mock.patch.object(gui, "commit_real_order_preflight", return_value=commit_result) as commit_service,
             mock.patch.object(gui, "preview_execution_for_real_ready_order") as execution_preview,
@@ -749,7 +870,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         commit_service.assert_called_once_with(
             preview_result,
             gui.ORDER_QUEUE_PATH,
-            guard_path=gui.REAL_TRADE_GUARD_PATH,
+            guard_path=None,
             preview_queue_snapshot=self._queue_snapshot(),
             context={"manual_real_preflight_commit_confirmed": True},
         )
@@ -875,7 +996,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=(" ORDER_1 ", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard) as read_guard,
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=preview_result) as service,
             mock.patch.object(gui, "build_execution_preview_report", return_value=report) as reporter,
             mock.patch.object(gui.AutoTradeSettingWindow, "queue_file_snapshot", return_value=queue_snapshot),
@@ -885,8 +1005,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         ):
             gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
 
-        read_guard.assert_called_once_with(gui.REAL_TRADE_GUARD_PATH)
-        service.assert_called_once_with("ORDER_1", guard)
+        service.assert_called_once()
+        self.assertEqual("ORDER_1", service.call_args.args[0])
+        service_guard = service.call_args.args[1]
+        self.assertEqual("gui_session", service_guard["real_trade_guard_source"])
+        self.assertEqual("12345678", service_guard["account_no"])
         reporter.assert_called_once_with(preview_result)
         self.assertEqual([report], window.reports)
         self.assertIn("[Approval]", window.reports[0]["text"])
@@ -920,7 +1043,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard),
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=preview_result),
             mock.patch.object(gui, "build_execution_preview_report", return_value=report),
             mock.patch.object(
@@ -938,11 +1060,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertEqual(
             {
                 "source": "gui_execution_preview_button",
-                "guard": guard,
+                "guard": mock.ANY,
                 "legacy_execution_preview_result": preview_result,
             },
             kwargs["preview_context"],
         )
+        self.assertEqual("gui_session", kwargs["preview_context"]["guard"]["real_trade_guard_source"])
         self.assertEqual("Execution Readiness Preview\nREADY", window.reports[0]["text"])
         self.assertEqual(controller_result, window.reports[0]["readiness_controller_result"])
         self.assertNotIn("gate_result", kwargs["preview_context"])
@@ -968,7 +1091,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard),
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=preview_result),
             mock.patch.object(gui, "build_execution_preview_report", return_value=report),
             mock.patch.object(
@@ -999,7 +1121,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertTrue(window.messages)
 
     def test_non_real_ready_order_is_reported_as_blocked(self) -> None:
-        window = _FakeWindow()
+        window = self._window_for_queue_commit()
+        window.reports = []
+        window.show_execution_preview_report = lambda report: window.reports.append(report)
         guard = {"operator_confirmed": True, "real_trade_enabled": True}
         blocked_preview = {
             "ok": False,
@@ -1019,19 +1143,22 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard),
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=blocked_preview) as service,
             mock.patch.object(gui, "build_execution_preview_report", return_value=blocked_report) as reporter,
         ):
             gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
 
-        service.assert_called_once_with("ORDER_1", guard)
+        service.assert_called_once()
+        self.assertEqual("ORDER_1", service.call_args.args[0])
+        self.assertEqual("gui_session", service.call_args.args[1]["real_trade_guard_source"])
         reporter.assert_called_once_with(blocked_preview)
         self.assertEqual([blocked_report], window.reports)
         self.assertTrue(any("Execution Preview" in message for message in window.messages))
 
     def test_missing_order_id_lookup_is_reported_without_runtime_write_or_timer(self) -> None:
-        window = _FakeWindow()
+        window = self._window_for_queue_commit()
+        window.reports = []
+        window.show_execution_preview_report = lambda report: window.reports.append(report)
         guard = {"operator_confirmed": True, "real_trade_enabled": True}
         blocked_preview = {
             "ok": False,
@@ -1051,7 +1178,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("MISSING_ORDER", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard),
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=blocked_preview) as service,
             mock.patch.object(gui, "build_execution_preview_report", return_value=blocked_report) as reporter,
             mock.patch.object(gui, "QTimer") as qtimer,
@@ -1061,7 +1187,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         ):
             gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
 
-        service.assert_called_once_with("MISSING_ORDER", guard)
+        service.assert_called_once()
+        self.assertEqual("MISSING_ORDER", service.call_args.args[0])
+        self.assertEqual("gui_session", service.call_args.args[1]["real_trade_guard_source"])
         reporter.assert_called_once_with(blocked_preview)
         self.assertEqual([blocked_report], window.reports)
         qtimer.assert_not_called()
@@ -1110,13 +1238,13 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertEqual(_FakeTextEdit.NoWrap, text_edit.line_wrap_mode)
 
     def test_runtime_forbidden_files_are_not_created_by_mocked_button_flow(self) -> None:
-        window = _FakeWindow()
-        guard = {"operator_confirmed": True, "real_trade_enabled": True}
+        window = self._window_for_queue_commit()
+        window.reports = []
+        window.show_execution_preview_report = lambda report: window.reports.append(report)
         report = {"ok": True, "text": "Execution Preview Report: OK"}
 
         with (
             mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
-            mock.patch.object(gui, "read_json_dict", return_value=guard),
             mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value={"ok": True}),
             mock.patch.object(gui, "build_execution_preview_report", return_value=report),
             mock.patch.object(gui, "commit_execution_queue_manually") as commit_service,
@@ -1152,6 +1280,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window._last_execution_preview_result = {
             "preview_result": {
                 "queue_write_preview_result": self._queue_write_preview_result(),
+                "runtime_commit_result": self._runtime_commit_result(),
             }
         }
         window._last_execution_preview_queue_snapshot = self._queue_snapshot()
@@ -1172,6 +1301,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window._last_execution_preview_result = {
             "preview_result": {
                 "queue_write_preview_result": queue_write_preview,
+                "runtime_commit_result": self._runtime_commit_result(),
             }
         }
         window._last_execution_preview_queue_snapshot = self._queue_snapshot()
@@ -1206,6 +1336,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "manual_queue_write_confirmed": True,
                 "manual_runtime_queue_write_confirmed": True,
             },
+            queue_commit_readiness_policy_result=mock.ANY,
+            manual_queue_commit_after_runtime_confirmed=True,
         )
         self.assertEqual([commit_result], window.commit_reports)
         self.assertEqual("HASH_BEFORE", window.commit_reports[0]["before_sha256"])
@@ -1218,6 +1350,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window._last_execution_preview_result = {
             "preview_result": {
                 "queue_write_preview_result": self._queue_write_preview_result(),
+                "runtime_commit_result": self._runtime_commit_result(),
             }
         }
         window._last_execution_preview_queue_snapshot = self._queue_snapshot()

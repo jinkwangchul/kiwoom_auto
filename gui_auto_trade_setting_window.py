@@ -318,6 +318,7 @@ from gui_routine_registry import (
 )
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_queue_commit_service import commit_execution_queue_manually
+from execution_queue_commit_readiness_policy import evaluate_execution_queue_commit_readiness
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
@@ -1903,6 +1904,128 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         dialog.exec_()
 
+    def real_preflight_stock_config_for_order(self, order: dict[str, object]) -> tuple[dict[str, object], str]:
+        code = str(order.get("code", "") or "").strip()
+        if not code:
+            return {}, "missing_order_code"
+
+        selected_getter = getattr(self, "selected_stock_info", None)
+        if callable(selected_getter):
+            try:
+                selected = selected_getter()
+            except Exception:
+                selected = None
+            if selected is not None:
+                stock_dir, selected_code, _selected_name = selected
+                if str(selected_code or "").strip() == code:
+                    config = read_json_dict(Path(stock_dir) / "config.json")
+                    return (config if isinstance(config, dict) else {}, str(stock_dir))
+
+        for routine_dir in get_routine_dirs():
+            for stock_dir in get_stock_dirs_in_routine(routine_dir):
+                stock_code, _stock_name = parse_stock_folder_name(Path(stock_dir).name)
+                if stock_code != code:
+                    continue
+                config = read_json_dict(Path(stock_dir) / "config.json")
+                return (config if isinstance(config, dict) else {}, str(stock_dir))
+
+        return {}, "stock_config_not_found"
+
+    def build_real_preflight_guard_from_gui(
+        self,
+        order: dict[str, object],
+        *,
+        operator_confirmed: bool = False,
+    ) -> dict[str, object]:
+        parent = self.parent()
+        api = getattr(parent, "kiwoom_api", None)
+        connected = False
+        if api is not None:
+            try:
+                connected = bool(api.is_connected())
+            except Exception:
+                connected = False
+
+        account_getter = getattr(parent, "selected_account_no", None)
+        account_no = ""
+        if callable(account_getter):
+            try:
+                account_no = str(account_getter() or "").strip()
+            except Exception:
+                account_no = ""
+
+        account_list_getter = getattr(parent, "kiwoom_account_numbers", None)
+        accounts: list[str] = []
+        if callable(account_list_getter):
+            try:
+                raw_accounts = account_list_getter()
+            except Exception:
+                raw_accounts = []
+            accounts = [
+                str(value or "").strip()
+                for value in raw_accounts
+                if str(value or "").strip()
+            ] if isinstance(raw_accounts, list) else []
+
+        stock_config, stock_config_source = self.real_preflight_stock_config_for_order(order)
+        stock_config_found = stock_config_source not in {"missing_order_code", "stock_config_not_found"}
+        real_enabled = bool(stock_config_found and real_trade_enabled(stock_config))
+        account_selected = bool(account_no and account_no in accounts)
+
+        return {
+            "real_trade_enabled": real_enabled,
+            "kiwoom_logged_in": connected,
+            "account_selected": account_selected,
+            "account_no": account_no if account_selected else "",
+            "operator_confirmed": bool(operator_confirmed),
+            "account_numbers": accounts,
+            "selected_account_valid": account_selected,
+            "real_trade_source": stock_config_source,
+            "real_trade_config_found": stock_config_found,
+            "real_trade_guard_source": "gui_session",
+        }
+
+    def real_preflight_guard_block_reasons(
+        self,
+        guard: dict[str, object],
+        *,
+        include_operator: bool,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if guard.get("kiwoom_logged_in") is not True:
+            reasons.append("kiwoom api is not connected")
+        accounts = guard.get("account_numbers")
+        if not isinstance(accounts, list) or not accounts:
+            reasons.append("kiwoom account list is empty")
+        if guard.get("account_selected") is not True:
+            reasons.append("selected account is missing or stale")
+        if guard.get("real_trade_config_found") is not True:
+            reasons.append("real trade config for order is not found")
+        elif guard.get("real_trade_enabled") is not True:
+            reasons.append("real trade is disabled for order stock")
+        if include_operator and guard.get("operator_confirmed") is not True:
+            reasons.append("operator confirmation is required")
+        return reasons
+
+    def real_preflight_confirmation_preview(self, order: dict[str, object]) -> dict[str, object]:
+        try:
+            quantity = int(order.get("quantity", 0) or 0)
+        except Exception:
+            quantity = order.get("quantity", "-")
+        return {
+            "real_preflight_preview": False,
+            "preflight_stage": "operator_confirmation_pending",
+            "next_stage": "REAL_PREFLIGHT_COMMIT_REQUIRED",
+            "order_id": str(order.get("id", "") or "").strip(),
+            "source_signal_id": str(order.get("source_signal_id", "") or "").strip(),
+            "code": str(order.get("code", "") or "").strip(),
+            "side": str(order.get("side", "") or "").strip().upper(),
+            "quantity": quantity,
+            "order_type": str(order.get("order_type", "") or "").strip(),
+            "blocked_reasons": [],
+            "send_order_called": False,
+        }
+
     def run_real_ready_preflight_manually(self) -> None:
         order_id, accepted = QInputDialog.getText(
             self,
@@ -1918,7 +2041,6 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         queue_path = ORDER_QUEUE_PATH
-        guard_path = REAL_TRADE_GUARD_PATH
         snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
         read_result = self.read_order_from_queue_by_id(order_id, queue_path)
         if read_result.get("ok") is not True:
@@ -1936,8 +2058,11 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("REAL_READY 수동 점검 차단")
             return
 
-        guard = read_json_dict(guard_path)
-        if not guard:
+        order = read_result.get("order")
+        order_dict = order if isinstance(order, dict) else {}
+        guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=False)
+        guard_reasons = self.real_preflight_guard_block_reasons(guard, include_operator=False)
+        if guard_reasons:
             result = {
                 "real_preflight_committed": False,
                 "preflight_stage": "guard",
@@ -1945,15 +2070,35 @@ class AutoTradeSettingWindow(QDialog):
                 "changed": False,
                 "order_id": order_id,
                 "before_sha256": snapshot.get("sha256"),
-                "blocked_reasons": ["real trade guard not found or empty"],
+                "blocked_reasons": guard_reasons,
                 "send_order_called": False,
             }
             self.show_real_preflight_result(result)
             self.statusBarMessage("REAL_READY 수동 점검 차단")
             return
 
-        order = read_result.get("order")
-        order_dict = order if isinstance(order, dict) else {}
+        confirmation_preview = self.real_preflight_confirmation_preview(order_dict)
+        if not self.confirm_real_preflight_commit(order_dict, guard, confirmation_preview, queue_path, snapshot):
+            self.statusBarMessage("REAL_READY manual preflight cancelled")
+            return
+
+        guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=True)
+        guard_reasons = self.real_preflight_guard_block_reasons(guard, include_operator=True)
+        if guard_reasons:
+            result = {
+                "real_preflight_committed": False,
+                "preflight_stage": "guard",
+                "next_stage": "BLOCKED",
+                "changed": False,
+                "order_id": order_id,
+                "before_sha256": snapshot.get("sha256"),
+                "blocked_reasons": guard_reasons,
+                "send_order_called": False,
+            }
+            self.show_real_preflight_result(result)
+            self.statusBarMessage("REAL_READY manual preflight blocked")
+            return
+
         preflight_preview = preview_real_order_preflight(
             order_dict,
             guard,
@@ -1977,10 +2122,6 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("REAL_READY 수동 점검 차단")
             return
 
-        if not self.confirm_real_preflight_commit(order_dict, guard, preflight_preview, queue_path, snapshot):
-            self.statusBarMessage("REAL_READY 수동 점검 취소")
-            return
-
         current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
         if snapshot.get("sha256") != current_snapshot.get("sha256"):
             result = {
@@ -2001,7 +2142,7 @@ class AutoTradeSettingWindow(QDialog):
         result = commit_real_order_preflight(
             preflight_preview,
             queue_path,
-            guard_path=guard_path,
+            guard_path=None,
             preview_queue_snapshot=snapshot,
             context={"manual_real_preflight_commit_confirmed": True},
         )
@@ -2024,7 +2165,10 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         try:
-            guard = read_json_dict(REAL_TRADE_GUARD_PATH)
+            read_result = self.read_order_from_queue_by_id(order_id, ORDER_QUEUE_PATH)
+            order = read_result.get("order") if isinstance(read_result, dict) else {}
+            order_dict = order if isinstance(order, dict) else {"id": order_id}
+            guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=True)
             result = preview_execution_for_real_ready_order(order_id, guard)
             self._last_execution_preview_result = result
             self._last_execution_preview_queue_snapshot = AutoTradeSettingWindow.queue_file_snapshot(ORDER_QUEUE_PATH)
@@ -2107,6 +2251,17 @@ class AutoTradeSettingWindow(QDialog):
         preview_result = result.get("preview_result")
         if isinstance(preview_result, dict) and isinstance(preview_result.get("queue_write_preview_result"), dict):
             return preview_result["queue_write_preview_result"]
+
+        return {}
+
+    def runtime_commit_result_from_last_execution_preview(self) -> dict[str, object]:
+        result = AutoTradeSettingWindow.execution_preview_result_dict(self)
+        if isinstance(result.get("runtime_commit_result"), dict):
+            return result["runtime_commit_result"]
+
+        preview_result = result.get("preview_result")
+        if isinstance(preview_result, dict) and isinstance(preview_result.get("runtime_commit_result"), dict):
+            return preview_result["runtime_commit_result"]
 
         return {}
 
@@ -2310,8 +2465,49 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("수동 Queue 저장 차단: Execution Preview를 다시 실행하세요.")
             return
 
+        runtime_commit_result = self.runtime_commit_result_from_last_execution_preview()
+        if not runtime_commit_result:
+            result = {
+                "manual_commit": False,
+                "commit_stage": "runtime_commit_result",
+                "next_stage": "BLOCKED",
+                "commit_result": None,
+                "before_sha256": current_snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "changed": False,
+                "blocked_reasons": ["runtime commit result is required before runtime queue commit"],
+            }
+            self.show_manual_queue_commit_result(result)
+            self.statusBarMessage("Manual Queue commit blocked: runtime commit result is required")
+            return
+
         if not self.confirm_manual_queue_commit(queue_write_preview, queue_path, current_snapshot):
             self.statusBarMessage("수동 Queue 저장: 취소됨")
+            return
+
+        queue_commit_readiness = evaluate_execution_queue_commit_readiness(
+            runtime_commit_result=runtime_commit_result,
+            queue_write_preview_result=queue_write_preview,
+            queue_path=queue_path,
+            confirmations={
+                "manual_queue_write_confirmed": True,
+                "manual_runtime_queue_write_confirmed": True,
+            },
+        )
+        if queue_commit_readiness.get("status") != "READY_TO_COMMIT_QUEUE":
+            result = {
+                "manual_commit": False,
+                "commit_stage": "queue_commit_readiness_policy",
+                "next_stage": "BLOCKED",
+                "commit_result": None,
+                "before_sha256": current_snapshot.get("sha256"),
+                "after_sha256": current_snapshot.get("sha256"),
+                "changed": False,
+                "blocked_reasons": list(queue_commit_readiness.get("issues") or ["queue commit readiness policy is not ready"]),
+                "queue_commit_readiness_policy_result": queue_commit_readiness,
+            }
+            self.show_manual_queue_commit_result(result)
+            self.statusBarMessage("Manual Queue commit blocked: readiness policy failed")
             return
 
         result = commit_execution_queue_manually(
@@ -2321,6 +2517,8 @@ class AutoTradeSettingWindow(QDialog):
                 "manual_queue_write_confirmed": True,
                 "manual_runtime_queue_write_confirmed": True,
             },
+            queue_commit_readiness_policy_result=queue_commit_readiness,
+            manual_queue_commit_after_runtime_confirmed=True,
         )
         after_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
         result["before_sha256"] = current_snapshot.get("sha256")

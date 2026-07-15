@@ -131,6 +131,26 @@ class KiwoomApi(QObject):
         except Exception:
             return bool(self._connected)
 
+    def account_numbers(self) -> list[str]:
+        """Return Kiwoom login account numbers from the active OpenAPI session."""
+        if not self.is_available() or not self.is_connected():
+            return []
+
+        try:
+            raw_value = self._control.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+        except Exception:
+            return []
+
+        accounts: list[str] = []
+        seen: set[str] = set()
+        for item in str(raw_value or "").split(";"):
+            account = item.strip()
+            if not account or account in seen:
+                continue
+            accounts.append(account)
+            seen.add(account)
+        return accounts
+
     def request_minute_candles(
         self,
         code: str,
