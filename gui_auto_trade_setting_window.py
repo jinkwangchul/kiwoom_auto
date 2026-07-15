@@ -2297,6 +2297,16 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         return dialog.exec_() == QDialog.Accepted
 
+    def execution_runtime_environment_flags(self) -> dict[str, object]:
+        return {
+            "real_runtime_file_init_enabled": False,
+            "allow_project_runtime_file_init": False,
+            "real_runtime_commit_enabled": False,
+            "allow_project_runtime_commit": False,
+            "source": "missing_production_runtime_environment_source",
+            "issues": ["runtime file-init/commit environment source is not configured"],
+        }
+
     def ensure_execution_runtime_files_ready(
         self,
         *,
@@ -2322,10 +2332,12 @@ class AutoTradeSettingWindow(QDialog):
                 "blocked_reasons": list(read_result.get("issues") or ["runtime files are invalid"]),
             }
 
+        environment_flags = self.execution_runtime_environment_flags()
+        allow_project_runtime_path = environment_flags.get("allow_project_runtime_file_init") is True
         file_init_preview = build_execution_runtime_file_init_preview(
             order_executions_path,
             order_locks_path,
-            allow_project_runtime_path=True,
+            allow_project_runtime_path=allow_project_runtime_path,
         )
         if file_init_preview.get("status") != "READY":
             return {
@@ -2333,6 +2345,7 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_file_init_required": file_init_preview.get("status") == "READY",
                 "runtime_file_init_preview": file_init_preview,
                 "runtime_file_init_result": None,
+                "runtime_environment_flags": environment_flags,
                 "blocked_reasons": list(file_init_preview.get("issues") or ["runtime file init preview is not ready"]),
             }
 
@@ -2345,6 +2358,7 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_file_init_required": True,
                 "runtime_file_init_preview": file_init_preview,
                 "runtime_file_init_result": None,
+                "runtime_environment_flags": environment_flags,
                 "blocked_reasons": ["runtime file initialization cancelled by operator"],
             }
 
@@ -2363,11 +2377,20 @@ class AutoTradeSettingWindow(QDialog):
                 "manual_runtime_file_init_commit_confirmed": True,
                 "manual_project_runtime_path_confirmed": True,
             },
-            environment_flags={
-                "real_runtime_file_init_enabled": True,
-                "allow_project_runtime_file_init": True,
-            },
+            environment_flags=environment_flags,
         )
+        if open_policy.get("status") != "READY_TO_OPEN_FILE_INIT" or open_policy.get("file_init_allowed") is not True:
+            return {
+                "runtime_files_ready": False,
+                "runtime_file_init_required": True,
+                "runtime_file_init_preview": file_init_preview,
+                "runtime_file_init_approval_gate_result": approval,
+                "runtime_file_init_commit_plan_orchestrator_result": orchestrator,
+                "runtime_file_init_open_policy_result": open_policy,
+                "runtime_file_init_result": None,
+                "runtime_environment_flags": environment_flags,
+                "blocked_reasons": list(open_policy.get("issues") or ["runtime file init open policy is not ready"]),
+            }
         result = commit_execution_runtime_file_init_plan(
             orchestrator,
             manual_runtime_file_init_commit_confirmed=True,
@@ -2388,6 +2411,7 @@ class AutoTradeSettingWindow(QDialog):
             "runtime_file_init_commit_plan_orchestrator_result": orchestrator,
             "runtime_file_init_open_policy_result": open_policy,
             "runtime_file_init_result": result,
+            "runtime_environment_flags": environment_flags,
             "blocked_reasons": [] if ready else list(result.get("issues") or ["runtime file initialization failed"]),
         }
 
@@ -2418,6 +2442,7 @@ class AutoTradeSettingWindow(QDialog):
             "manual_execution_runtime_commit_confirmed": True,
             "manual_runtime_file_write_confirmed": True,
         }
+        environment_flags = self.execution_runtime_environment_flags()
         storage = ExecutionRuntimeStorage(order_executions_path, order_locks_path)
         runtime_dry_run = run_execution_runtime_dry_run(
             order,
@@ -2445,10 +2470,7 @@ class AutoTradeSettingWindow(QDialog):
             order_executions_path=order_executions_path,
             order_locks_path=order_locks_path,
             confirmations=confirmations,
-            environment_flags={
-                "real_runtime_commit_enabled": True,
-                "allow_project_runtime_commit": True,
-            },
+            environment_flags=environment_flags,
         )
         if real_commit_readiness.get("status") != "READY_TO_OPEN_RUNTIME_COMMIT":
             return {
@@ -2459,6 +2481,7 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_dry_run_result": runtime_dry_run,
                 "commit_plan_orchestrator_result": commit_plan,
                 "runtime_commit_readiness_policy_result": real_commit_readiness,
+                "runtime_environment_flags": environment_flags,
                 "blocked_reasons": list(real_commit_readiness.get("issues") or ["runtime real commit readiness is not ready"]),
             }
 
@@ -2493,6 +2516,7 @@ class AutoTradeSettingWindow(QDialog):
             "runtime_dry_run_result": runtime_dry_run,
             "commit_plan_orchestrator_result": commit_plan,
             "runtime_commit_readiness_policy_result": real_commit_readiness,
+            "runtime_environment_flags": environment_flags,
             "blocked_reasons": invalid_reasons,
         }
 
