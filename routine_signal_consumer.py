@@ -432,7 +432,7 @@ def consume_pending_routine_signals_dry_run(
             {
                 "ok": False,
                 "after_status": STATUS_ERROR,
-                "reason": "order_queue write failed; signal status update skipped",
+                "reason": order_queue_result.get("reason") or "order_queue write failed; signal status update skipped",
             }
         )
 

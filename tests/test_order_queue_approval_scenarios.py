@@ -293,7 +293,7 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertFalse(order.get("execution_enabled"))
         self.assertEqual("PENDING", signal.get("status"))
         self.assertEqual(
-            "order_queue write failed; signal status update skipped",
+            "operation policy gate failed; signal status update skipped",
             result["status_updates"][0]["reason"],
         )
 
