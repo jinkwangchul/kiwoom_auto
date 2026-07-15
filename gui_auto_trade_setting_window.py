@@ -322,6 +322,10 @@ from execution_queue_commit_readiness_policy import evaluate_execution_queue_com
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
+from execution_runtime_commit_service import commit_execution_runtime_plan
+from execution_runtime_controller import run_execution_runtime_dry_run
+from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
+from execution_runtime_storage import ExecutionRuntimeStorage
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -333,6 +337,8 @@ BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 REAL_TRADE_GUARD_PATH = PROJECT_ROOT / "runtime" / "real_trade_guard.json"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
+ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 PROGRAM_START_RESET_APPLIED = False
 
 
@@ -2150,6 +2156,170 @@ class AutoTradeSettingWindow(QDialog):
         status_text = "완료" if result.get("real_preflight_committed") else "차단"
         self.statusBarMessage(f"REAL_READY 수동 점검 {status_text}")
 
+    def execution_runtime_commit_confirmation_text(
+        self,
+        order: dict[str, object],
+        guard: dict[str, object],
+        *,
+        order_executions_path: Path,
+        order_locks_path: Path,
+        queue_path: Path,
+    ) -> str:
+        return "\n".join(
+            [
+                "Execution Runtime Commit / Queue Commit confirmation",
+                "",
+                "This action will run Execution Preview, commit runtime records, then allow Queue commit.",
+                "SendOrder is not called.",
+                "Broker API is not called.",
+                "OrderRequest is not created.",
+                "DISPATCH_CLAIMED is not entered.",
+                "",
+                f"account_no: {guard.get('account_no', '-')}",
+                f"order_id: {order.get('id', order.get('order_id', '-'))}",
+                f"code: {order.get('code', '-')}",
+                f"side: {order.get('side', order.get('order_side', '-'))}",
+                f"quantity: {order.get('quantity', order.get('order_quantity', '-'))}",
+                f"order_executions_path: {order_executions_path}",
+                f"order_locks_path: {order_locks_path}",
+                f"queue_path: {queue_path}",
+                "",
+                "Continue only if the selected account, runtime targets, and queue write intent are correct.",
+            ]
+        )
+
+    def confirm_execution_runtime_commit(
+        self,
+        order: dict[str, object],
+        guard: dict[str, object],
+        *,
+        order_executions_path: Path,
+        order_locks_path: Path,
+        queue_path: Path,
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Execution Runtime Commit Confirmation")
+        dialog.resize(760, 460)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(
+            self.execution_runtime_commit_confirmation_text(
+                order,
+                guard,
+                order_executions_path=order_executions_path,
+                order_locks_path=order_locks_path,
+                queue_path=queue_path,
+            )
+        )
+        body.setMinimumHeight(330)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("Confirm runtime and queue preview")
+        cancel_button = QPushButton("Cancel")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def commit_execution_runtime_for_preview(
+        self,
+        order: dict[str, object],
+        guard: dict[str, object],
+        execution_preview_result: dict[str, object],
+        *,
+        order_executions_path: Path = ORDER_EXECUTIONS_PATH,
+        order_locks_path: Path = ORDER_LOCKS_PATH,
+    ) -> dict[str, object]:
+        del execution_preview_result
+        confirmations = {
+            "manual_execution_runtime_commit_confirmed": True,
+            "manual_runtime_file_write_confirmed": True,
+        }
+        storage = ExecutionRuntimeStorage(order_executions_path, order_locks_path)
+        runtime_dry_run = run_execution_runtime_dry_run(
+            order,
+            guard,
+            storage,
+            confirmations=confirmations,
+        )
+        commit_plan = runtime_dry_run.get("commit_plan") if isinstance(runtime_dry_run, dict) else None
+        if not isinstance(commit_plan, dict) or runtime_dry_run.get("status") != "READY":
+            return {
+                "runtime_commit_ready": False,
+                "runtime_commit_stage": "runtime_commit_plan",
+                "runtime_commit_result": None,
+                "runtime_dry_run_result": runtime_dry_run,
+                "commit_plan_orchestrator_result": commit_plan,
+                "blocked_reasons": list(runtime_dry_run.get("issues") or ["runtime commit plan is not ready"])
+                if isinstance(runtime_dry_run, dict)
+                else ["runtime commit plan is malformed"],
+            }
+
+        real_commit_readiness = evaluate_execution_runtime_real_commit_readiness(
+            runtime_api_result=runtime_dry_run,
+            commit_plan_orchestrator_result=commit_plan,
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+            confirmations=confirmations,
+            environment_flags={
+                "real_runtime_commit_enabled": True,
+                "allow_project_runtime_commit": True,
+            },
+        )
+        if real_commit_readiness.get("status") != "READY_TO_OPEN_RUNTIME_COMMIT":
+            return {
+                "runtime_commit_ready": False,
+                "runtime_commit_stage": "runtime_real_commit_readiness",
+                "runtime_commit_result": None,
+                "runtime_dry_run_result": runtime_dry_run,
+                "commit_plan_orchestrator_result": commit_plan,
+                "runtime_commit_readiness_policy_result": real_commit_readiness,
+                "blocked_reasons": list(real_commit_readiness.get("issues") or ["runtime real commit readiness is not ready"]),
+            }
+
+        runtime_commit_result = commit_execution_runtime_plan(
+            commit_plan,
+            order_executions_path,
+            order_locks_path,
+            context=confirmations,
+            real_commit_readiness_policy_result=real_commit_readiness,
+            manual_project_runtime_commit_confirmed=True,
+        )
+        required_identity = ("execution_id", "order_id", "request_hash", "lock_id")
+        missing_identity = [
+            field for field in required_identity if not str(runtime_commit_result.get(field) or "").strip()
+        ]
+        invalid_reasons: list[str] = []
+        if runtime_commit_result.get("status") != "COMMITTED":
+            invalid_reasons.append("runtime commit status is not COMMITTED")
+        if runtime_commit_result.get("committed") is not True:
+            invalid_reasons.append("runtime committed flag is not true")
+        if runtime_commit_result.get("runtime_write") is not True:
+            invalid_reasons.append("runtime_write flag is not true")
+        if runtime_commit_result.get("read_back_verified") is not True:
+            invalid_reasons.append("runtime read-back is not verified")
+        invalid_reasons.extend(f"missing runtime commit identity: {field}" for field in missing_identity)
+
+        return {
+            "runtime_commit_ready": not invalid_reasons,
+            "runtime_commit_stage": "runtime_committed" if not invalid_reasons else "runtime_commit_validation",
+            "runtime_commit_result": runtime_commit_result,
+            "runtime_dry_run_result": runtime_dry_run,
+            "commit_plan_orchestrator_result": commit_plan,
+            "runtime_commit_readiness_policy_result": real_commit_readiness,
+            "blocked_reasons": invalid_reasons,
+        }
+
     def preview_execution_for_real_ready_order_manual(self) -> None:
         order_id, accepted = QInputDialog.getText(
             self,
@@ -2168,8 +2338,43 @@ class AutoTradeSettingWindow(QDialog):
             read_result = self.read_order_from_queue_by_id(order_id, ORDER_QUEUE_PATH)
             order = read_result.get("order") if isinstance(read_result, dict) else {}
             order_dict = order if isinstance(order, dict) else {"id": order_id}
+            guard_preview = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=False)
+            guard_reasons = self.real_preflight_guard_block_reasons(guard_preview, include_operator=False)
+            if guard_reasons:
+                self.statusBarMessage("Execution Preview blocked: real trade guard is not ready")
+                QMessageBox.warning(
+                    self,
+                    "Execution Preview blocked",
+                    "\n".join(str(reason) for reason in guard_reasons),
+                )
+                return
+            if not self.confirm_execution_runtime_commit(
+                order_dict,
+                guard_preview,
+                order_executions_path=ORDER_EXECUTIONS_PATH,
+                order_locks_path=ORDER_LOCKS_PATH,
+                queue_path=ORDER_QUEUE_PATH,
+            ):
+                self.statusBarMessage("Execution Preview cancelled before runtime commit confirmation")
+                return
+
             guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=True)
             result = preview_execution_for_real_ready_order(order_id, guard)
+            runtime_commit = {}
+            if result.get("ok") is True:
+                runtime_commit = self.commit_execution_runtime_for_preview(order_dict, guard, result)
+                result["runtime_dry_run_result"] = runtime_commit.get("runtime_dry_run_result")
+                result["commit_plan_orchestrator_result"] = runtime_commit.get("commit_plan_orchestrator_result")
+                result["runtime_commit_readiness_policy_result"] = runtime_commit.get("runtime_commit_readiness_policy_result")
+                result["runtime_commit_result"] = runtime_commit.get("runtime_commit_result")
+                result["runtime_commit_blocked_reasons"] = list(runtime_commit.get("blocked_reasons") or [])
+                preview_result = result.get("preview_result")
+                if isinstance(preview_result, dict):
+                    preview_result["runtime_dry_run_result"] = runtime_commit.get("runtime_dry_run_result")
+                    preview_result["commit_plan_orchestrator_result"] = runtime_commit.get("commit_plan_orchestrator_result")
+                    preview_result["runtime_commit_readiness_policy_result"] = runtime_commit.get("runtime_commit_readiness_policy_result")
+                    preview_result["runtime_commit_result"] = runtime_commit.get("runtime_commit_result")
+                    preview_result["runtime_commit_blocked_reasons"] = list(runtime_commit.get("blocked_reasons") or [])
             self._last_execution_preview_result = result
             self._last_execution_preview_queue_snapshot = AutoTradeSettingWindow.queue_file_snapshot(ORDER_QUEUE_PATH)
             AutoTradeSettingWindow.update_manual_queue_commit_button_state(self)
@@ -2196,6 +2401,14 @@ class AutoTradeSettingWindow(QDialog):
                 readiness_report["text"] = readiness_text
                 readiness_report["readiness_controller_result"] = controller_result
                 report = readiness_report
+            if result.get("ok") is True and runtime_commit and runtime_commit.get("runtime_commit_ready") is not True:
+                blocked = "\n".join(str(reason) for reason in runtime_commit.get("blocked_reasons") or [])
+                runtime_report = dict(report)
+                runtime_report["ok"] = False
+                runtime_report["runtime_commit_result"] = runtime_commit.get("runtime_commit_result")
+                runtime_report["runtime_commit_blocked_reasons"] = list(runtime_commit.get("blocked_reasons") or [])
+                runtime_report["text"] = f"{runtime_report.get('text', '')}\n\n[Runtime Commit]\nBLOCKED\n{blocked}"
+                report = runtime_report
             self.show_execution_preview_report(report)
             status_text = "통과" if report.get("ok") else "차단"
             self.statusBarMessage(f"Execution Preview {status_text}: {order_id}")
@@ -2302,7 +2515,12 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         queue_write_preview = AutoTradeSettingWindow.queue_write_preview_from_last_execution_preview(self)
-        button.setEnabled(queue_write_preview.get("write_preview") is True)
+        runtime_commit_result = AutoTradeSettingWindow.runtime_commit_result_from_last_execution_preview(self)
+        button.setEnabled(
+            queue_write_preview.get("write_preview") is True
+            and runtime_commit_result.get("status") == "COMMITTED"
+            and runtime_commit_result.get("committed") is True
+        )
 
     def manual_queue_commit_confirmation_text(
         self,

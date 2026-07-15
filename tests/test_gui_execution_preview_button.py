@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -127,6 +129,7 @@ _install_pyqt5_import_stubs()
 
 import gui_auto_trade_setting_window as gui
 import gui_windows as main_gui
+from execution_runtime_file_schema import default_order_executions_data, default_order_locks_data
 
 
 class _FakeWindow:
@@ -330,6 +333,16 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window.read_order_from_queue_by_id = lambda order_id, queue_path: {
             "ok": True,
             "order": {"id": str(order_id), "code": "005930"},
+            "blocked_reasons": [],
+        }
+        window.confirm_execution_runtime_commit = lambda order, guard, **kwargs: True
+        window.commit_execution_runtime_for_preview = lambda order, guard, result: {
+            "runtime_commit_ready": True,
+            "runtime_commit_stage": "runtime_committed",
+            "runtime_commit_result": self._runtime_commit_result(),
+            "runtime_dry_run_result": {"status": "READY"},
+            "commit_plan_orchestrator_result": {"status": "READY", "commit_ready": True},
+            "runtime_commit_readiness_policy_result": {"status": "READY_TO_OPEN_RUNTIME_COMMIT"},
             "blocked_reasons": [],
         }
         return window
@@ -1023,6 +1036,104 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         commit_service.assert_not_called()
         write_text.assert_not_called()
         send_order_stub.assert_not_called()
+
+    def test_execution_preview_confirmation_cancel_stops_before_preview_runtime_and_queue(self) -> None:
+        window = self._window_for_queue_commit()
+        window.confirm_execution_runtime_commit = lambda order, guard, **kwargs: False
+        window.commit_execution_runtime_for_preview = mock.Mock()
+
+        with (
+            mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
+            mock.patch.object(gui, "preview_execution_for_real_ready_order") as service,
+            mock.patch.object(gui, "commit_execution_queue_manually") as commit_service,
+        ):
+            gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
+
+        service.assert_not_called()
+        window.commit_execution_runtime_for_preview.assert_not_called()
+        commit_service.assert_not_called()
+        self.assertTrue(any("cancelled" in message for message in window.messages))
+
+    def test_execution_preview_confirmation_is_only_source_of_operator_confirmed(self) -> None:
+        window = self._window_for_queue_commit()
+        window.reports = []
+        window.show_execution_preview_report = lambda report: window.reports.append(report)
+        guards: list[dict[str, object]] = []
+
+        def capture_confirmation(order, guard, **kwargs):
+            guards.append(dict(guard))
+            return True
+
+        window.confirm_execution_runtime_commit = capture_confirmation
+        preview_result = {
+            "ok": True,
+            "read_result": {"ok": True, "order": {"id": "ORDER_1"}},
+            "preview_result": {"queue_write_preview_result": self._queue_write_preview_result()},
+        }
+
+        with (
+            mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_1", True)),
+            mock.patch.object(gui, "preview_execution_for_real_ready_order", return_value=preview_result) as service,
+            mock.patch.object(gui, "build_execution_preview_report", return_value={"ok": True, "text": "ok"}),
+            mock.patch.object(gui.AutoTradeSettingWindow, "queue_file_snapshot", return_value=self._queue_snapshot()),
+        ):
+            gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
+
+        self.assertEqual(False, guards[0]["operator_confirmed"])
+        self.assertEqual(True, service.call_args.args[1]["operator_confirmed"])
+        self.assertEqual("COMMITTED", window._last_execution_preview_result["runtime_commit_result"]["status"])
+
+    def test_runtime_commit_helper_writes_existing_runtime_files_and_returns_identity(self) -> None:
+        window = self._window_for_queue_commit()
+        order = {
+            "id": "ORDER_1",
+            "status": "REAL_READY",
+            "source_signal_id": "SIG_1",
+            "code": "003550",
+            "side": "BUY",
+            "quantity": 10,
+            "price": 85000,
+            "execution_enabled": True,
+            "order_intent": {"side": "BUY", "hoga": "MARKET"},
+        }
+        guard = {
+            "operator_confirmed": True,
+            "real_trade_enabled": True,
+            "account_no": "12345678",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+            executions_path.write_text(
+                json.dumps(default_order_executions_data(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            locks_path.write_text(
+                json.dumps(default_order_locks_data(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = gui.AutoTradeSettingWindow.commit_execution_runtime_for_preview(
+                window,
+                order,
+                guard,
+                {"ok": True},
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            runtime_commit = result["runtime_commit_result"]
+            self.assertTrue(result["runtime_commit_ready"])
+            self.assertEqual("COMMITTED", runtime_commit["status"])
+            self.assertTrue(runtime_commit["committed"])
+            self.assertTrue(runtime_commit["runtime_write"])
+            self.assertTrue(runtime_commit["read_back_verified"])
+            self.assertEqual("ORDER_1", runtime_commit["order_id"])
+            self.assertTrue(runtime_commit["execution_id"])
+            self.assertTrue(runtime_commit["request_hash"])
+            self.assertTrue(runtime_commit["lock_id"])
+            self.assertEqual(1, len(json.loads(executions_path.read_text(encoding="utf-8"))["executions"]))
+            self.assertEqual(1, len(json.loads(locks_path.read_text(encoding="utf-8"))["locks"]))
 
     def test_execution_preview_button_displays_readiness_controller_text_when_available(self) -> None:
         window = self._window_for_queue_commit()
