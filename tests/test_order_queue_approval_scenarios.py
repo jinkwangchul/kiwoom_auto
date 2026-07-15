@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -126,6 +127,32 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual(1, len(signals))
         return signals[0]
 
+    def _write_pending_order_queue(self) -> None:
+        self._write_json(
+            self.order_queue_path,
+            {
+                "version": 1,
+                "revision": 0,
+                "updated_at": "",
+                "orders": [
+                    {
+                        "id": "ORDER_APPROVAL_1",
+                        "status": "PENDING",
+                        "source_signal_id": "SIG_APPROVAL_1",
+                        "code": "003550",
+                        "name": "LG",
+                        "side": "BUY",
+                        "order_type": "BUY_SIGNAL_CANDIDATE",
+                        "quantity": 10,
+                        "amount": 1000,
+                        "price": 100,
+                        "candidate_status": "CANDIDATE_READY",
+                        "execution_enabled": False,
+                    }
+                ],
+            },
+        )
+
     def test_sell_without_holding_creates_blocked_candidate(self) -> None:
         self._setup_stock(holding_qty=0)
         self._write_signal(signal="SELL", signal_id="SIG_SELL_ZERO")
@@ -222,6 +249,56 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("SIG_BUY", provenance.get("source_signal_id"))
         self.assertEqual("BUY", provenance.get("signal"))
         self.assertTrue(provenance.get("unresolved"))
+
+    def test_apply_order_approval_uses_canonical_writer_metadata(self) -> None:
+        self._write_pending_order_queue()
+
+        result = order_approval_engine.apply_order_approval_to_queue()
+        order = self._single_order()
+        queue = json.loads(self.order_queue_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(1, result["checked"])
+        self.assertEqual(1, result["approved"])
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["queue_committed"])
+        self.assertTrue(result["post_write_verified"])
+        self.assertEqual(0, result["revision_before"])
+        self.assertEqual(1, result["revision_after"])
+        self.assertEqual(1, queue["revision"])
+        self.assertEqual("legacy_order_approval_apply", result["approval_result"]["operation_name"])
+        self.assertEqual("APPROVED", order["status"])
+        self.assertEqual("APPROVED", order["approval_status"])
+        self.assertFalse(order["execution_enabled"])
+        self.assertNotIn(order["status"], {"EXECUTABLE", "REAL_READY"})
+
+    def test_apply_order_approval_has_no_direct_write_text_path(self) -> None:
+        source = Path(order_approval_engine.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("write_text(", source)
+
+    def test_two_threads_apply_approval_once_with_canonical_noop_second(self) -> None:
+        self._write_pending_order_queue()
+        start = threading.Event()
+        results: list[dict] = []
+
+        def worker() -> None:
+            start.wait(5)
+            results.append(order_approval_engine.apply_order_approval_to_queue())
+
+        threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual(2, len(results))
+        queue = json.loads(self.order_queue_path.read_text(encoding="utf-8"))
+        order = self._single_order()
+        self.assertEqual("APPROVED", order["status"])
+        self.assertEqual("APPROVED", order["approval_status"])
+        self.assertEqual(1, queue["revision"])
+        self.assertEqual(1, sum(1 for item in results if item.get("approved") == 1 and item.get("committed") is True))
+        self.assertEqual(1, sum(1 for item in results if item.get("checked") == 0 and item.get("committed") is False))
 
 
 if __name__ == "__main__":

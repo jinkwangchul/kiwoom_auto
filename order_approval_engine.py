@@ -31,10 +31,13 @@ STEP 10: 주문후보 승인/차단 정책 엔진.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from execution_queue_writer import mutate_order_queue
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -53,11 +56,6 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _write_json(path: Path, data: Any) -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _norm(value: Any) -> str:
@@ -89,10 +87,24 @@ def read_order_queue() -> dict[str, Any]:
     return data
 
 
-def write_order_queue(data: dict[str, Any]) -> None:
-    data["version"] = data.get("version", 1)
-    data["updated_at"] = now_text()
-    _write_json(ORDER_QUEUE_PATH, data)
+def write_order_queue(data: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible queue replacement through the canonical writer."""
+    replacement = deepcopy(data) if isinstance(data, dict) else {"version": 1, "updated_at": "", "orders": []}
+    if not isinstance(replacement.get("orders"), list):
+        replacement["orders"] = []
+
+    def mutate(_: dict[str, Any]) -> dict[str, Any]:
+        return {"data": deepcopy(replacement)}
+
+    return mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutate,
+        operation_name="legacy_order_approval_queue_replace",
+        success_stage="legacy_order_approval_queue_replaced",
+        next_stage="ORDER_APPROVAL_REVIEW_REQUIRED",
+        context={"manual_queue_write_confirmed": True},
+        default_queue={"version": 1, "updated_at": "", "orders": []},
+    )
 
 
 def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
@@ -148,7 +160,7 @@ def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def apply_order_approval_to_queue() -> dict[str, Any]:
+def _apply_order_approval_to_queue_legacy_snapshot_replace() -> dict[str, Any]:
     """Apply approval only to PENDING order candidates in order_queue.json."""
     data = read_order_queue()
     orders = data.get("orders", [])
@@ -197,6 +209,101 @@ def apply_order_approval_to_queue() -> dict[str, Any]:
         "blocked": blocked,
         "ignored": ignored,
         "order_queue_path": str(ORDER_QUEUE_PATH),
+    }
+
+
+def apply_order_approval_to_queue() -> dict[str, Any]:
+    """Apply approval metadata to PENDING candidates through the canonical writer."""
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders", [])
+        if not isinstance(orders, list):
+            return {"blocked": {"write_stage": "approval_read", "blocked_reasons": ["order_queue orders must be a list"]}}
+
+        checked = 0
+        approved = 0
+        blocked = 0
+        ignored = 0
+        checked_at = now_text()
+
+        for order in orders:
+            if not isinstance(order, dict):
+                ignored += 1
+                continue
+            if _norm(order.get("status")) != "PENDING":
+                ignored += 1
+                continue
+
+            checked += 1
+            result = evaluate_order_approval(order)
+            approval_status = result.get("approval_status", "BLOCKED")
+
+            order["approval_status"] = approval_status
+            order["approval_reason"] = result.get("approval_reason", "")
+            order["approval_checked_at"] = checked_at
+            order["execution_enabled"] = False
+
+            if approval_status == "APPROVED":
+                order["status"] = "APPROVED"
+                approved += 1
+            elif approval_status == "BLOCKED":
+                order["status"] = "BLOCKED"
+                blocked += 1
+            else:
+                ignored += 1
+
+        if checked == 0:
+            return {
+                "blocked": {
+                    "write_stage": "approval_noop",
+                    "blocked_reasons": ["no PENDING orders to approve"],
+                    "checked": checked,
+                    "approved": approved,
+                    "blocked": blocked,
+                    "ignored": ignored,
+                }
+            }
+
+        return {
+            "data": data,
+            "result": {
+                "checked": checked,
+                "approved": approved,
+                "blocked": blocked,
+                "ignored": ignored,
+            },
+        }
+
+    result = mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutate,
+        operation_name="legacy_order_approval_apply",
+        success_stage="legacy_order_approval_applied",
+        next_stage="ORDER_APPROVAL_REVIEW_REQUIRED",
+        context={"manual_queue_write_confirmed": True},
+        default_queue={"version": 1, "updated_at": "", "orders": []},
+    )
+
+    return {
+        "checked": int(result.get("checked", 0) or 0),
+        "approved": int(result.get("approved", 0) or 0),
+        "blocked": int(result.get("blocked", 0) or 0),
+        "ignored": int(result.get("ignored", 0) or 0),
+        "order_queue_path": str(ORDER_QUEUE_PATH),
+        "approval_result": result,
+        "committed": result.get("committed"),
+        "changed": result.get("changed"),
+        "file_write": result.get("file_write"),
+        "queue_write": result.get("queue_write"),
+        "queue_committed": result.get("queue_committed"),
+        "post_write_verified": result.get("post_write_verified"),
+        "revision_before": result.get("revision_before"),
+        "revision_after": result.get("revision_after"),
+        "expected_revision": result.get("expected_revision"),
+        "cas_checked": result.get("cas_checked"),
+        "lock_acquired": result.get("lock_acquired"),
+        "lock_wait_ms": result.get("lock_wait_ms"),
+        "blocked_reasons": result.get("blocked_reasons", []),
     }
 
 
