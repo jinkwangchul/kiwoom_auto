@@ -488,7 +488,7 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertFalse(result["position_updated"])
             self.assertEqual("duplicate_fill", result["position_stage"])
 
-    def test_duplicate_fill_id_across_positions_noop(self) -> None:
+    def test_same_fill_id_on_other_position_does_not_block(self) -> None:
         other = self._position(
             position_id="POSITION_KIWOOM_12345678_000000",
             code="000000",
@@ -502,11 +502,101 @@ class PositionUpdateServiceTest(unittest.TestCase):
             })
 
             result = self._update(path)
+            positions = self._read_json(path)["positions"]
 
-            self.assertFalse(result["position_updated"])
-            self.assertEqual("duplicate_fill", result["position_stage"])
-            self.assertFalse(result["changed"])
-            self.assertIn("fill already applied to position", result["warnings"])
+            self.assertTrue(result["position_updated"])
+            self.assertEqual(2, len(positions))
+            self.assertEqual("POSITION_KIWOOM_12345678_003550", result["position_id"])
+
+    def test_same_execution_identity_on_other_code_does_not_block(self) -> None:
+        other = self._position(
+            position_id="POSITION_KIWOOM_12345678_000000",
+            code="000000",
+            applied_fill_identities=["execution_no:EXEC_NO_1"],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir, root={
+                "version": 1,
+                "updated_at": "old",
+                "positions": [other],
+            })
+
+            result = self._update(path, fill=self._fill(execution_identity="EXEC_NO_1"))
+            positions = self._read_json(path)["positions"]
+
+            self.assertTrue(result["position_updated"])
+            self.assertEqual(2, len(positions))
+            self.assertEqual("003550", positions[1]["code"])
+
+    def test_same_execution_identity_on_other_account_does_not_block(self) -> None:
+        other = self._position(
+            position_id="POSITION_KIWOOM_99999999_003550",
+            account_no="99999999",
+            applied_fill_identities=["execution_no:EXEC_NO_1"],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir, root={
+                "version": 1,
+                "updated_at": "old",
+                "positions": [other],
+            })
+
+            result = self._update(path, fill=self._fill(execution_identity="EXEC_NO_1"))
+            positions = self._read_json(path)["positions"]
+
+            self.assertTrue(result["position_updated"])
+            self.assertEqual(2, len(positions))
+            self.assertEqual("12345678", positions[1]["account_no"])
+
+    def test_same_position_different_orders_keep_cumulative_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            first = self._update(
+                path,
+                fill=self._fill(
+                    fill_id="FILL_A1",
+                    execution_identity="EXEC_A1",
+                    order_id="ORDER_A",
+                    order_queued_id="QUEUE_A",
+                    execution_id="EXECUTION_A",
+                    request_hash="HASH_A",
+                    lock_id="LOCK_A",
+                    filled_quantity=3,
+                    remaining_quantity=7,
+                ),
+            )
+            second = self._update(
+                path,
+                fill=self._fill(
+                    fill_id="FILL_B1",
+                    execution_identity="EXEC_B1",
+                    order_id="ORDER_B",
+                    order_queued_id="QUEUE_B",
+                    execution_id="EXECUTION_B",
+                    request_hash="HASH_B",
+                    lock_id="LOCK_B",
+                    filled_quantity=2,
+                    remaining_quantity=8,
+                ),
+            )
+            position = self._read_json(path)["positions"][0]
+
+            self.assertEqual(3, first["fill_delta_applied"])
+            self.assertEqual(2, second["fill_delta_applied"])
+            self.assertEqual(5, position["quantity"])
+            self.assertEqual(3, position["last_applied_cumulative_by_order"]["order_queued_id:QUEUE_A"])
+            self.assertEqual(2, position["last_applied_cumulative_by_order"]["order_queued_id:QUEUE_B"])
+
+    def test_same_position_same_order_cumulative_three_to_five_applies_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            first = self._update(path, fill=self._fill(fill_id="FILL_A1", execution_identity="EXEC_A1", filled_quantity=3))
+            second = self._update(path, fill=self._fill(fill_id="FILL_A2", execution_identity="EXEC_A2", filled_quantity=5))
+
+            self.assertEqual(3, first["fill_delta_applied"])
+            self.assertEqual(2, second["fill_delta_applied"])
 
     def test_backup_created_for_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -614,8 +704,28 @@ class PositionUpdateServiceTest(unittest.TestCase):
             start_event = multiprocessing.Event()
             output: multiprocessing.Queue = multiprocessing.Queue()
             overrides = [
-                {"fill_id": "FILL_1", "execution_identity": "EXEC_NO_1", "filled_quantity": 3, "remaining_quantity": 7},
-                {"fill_id": "FILL_2", "execution_identity": "EXEC_NO_2", "filled_quantity": 5, "remaining_quantity": 5},
+                {
+                    "fill_id": "FILL_1",
+                    "execution_identity": "EXEC_NO_1",
+                    "order_id": "ORDER_A",
+                    "order_queued_id": "QUEUE_A",
+                    "execution_id": "EXECUTION_A",
+                    "request_hash": "HASH_A",
+                    "lock_id": "LOCK_A",
+                    "filled_quantity": 3,
+                    "remaining_quantity": 7,
+                },
+                {
+                    "fill_id": "FILL_2",
+                    "execution_identity": "EXEC_NO_2",
+                    "order_id": "ORDER_B",
+                    "order_queued_id": "QUEUE_B",
+                    "execution_id": "EXECUTION_B",
+                    "request_hash": "HASH_B",
+                    "lock_id": "LOCK_B",
+                    "filled_quantity": 2,
+                    "remaining_quantity": 8,
+                },
             ]
             processes = [
                 multiprocessing.Process(target=_position_process_worker, args=(str(path), start_event, output, item))
@@ -632,6 +742,8 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual([0, 0], [process.exitcode for process in processes])
             self.assertTrue(all(result["position_updated"] for result in results))
             self.assertEqual(5, position["quantity"])
+            self.assertEqual(3, position["last_applied_cumulative_by_order"]["order_queued_id:QUEUE_A"])
+            self.assertEqual(2, position["last_applied_cumulative_by_order"]["order_queued_id:QUEUE_B"])
 
     def test_replace_before_failure_has_no_position_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

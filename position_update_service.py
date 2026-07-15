@@ -315,15 +315,13 @@ def _find_position(positions: list[Any], position_id: str) -> tuple[dict[str, An
     return None, -1
 
 
-def _fill_already_applied(positions: list[Any], fill_id: str, identity_key: str) -> bool:
-    for position in positions:
-        item = _as_dict(position)
-        applied_identities = item.get("applied_fill_identities")
-        if identity_key and isinstance(applied_identities, list) and identity_key in applied_identities:
-            return True
-        applied = item.get("applied_fill_ids")
-        if isinstance(applied, list) and fill_id in applied:
-            return True
+def _fill_already_applied(position: dict[str, Any], fill_id: str, identity_key: str) -> bool:
+    applied_identities = position.get("applied_fill_identities")
+    if identity_key and isinstance(applied_identities, list) and identity_key in applied_identities:
+        return True
+    applied = position.get("applied_fill_ids")
+    if isinstance(applied, list) and fill_id in applied:
+        return True
     return False
 
 
@@ -475,14 +473,9 @@ def update_position_from_fill(
                         lock_wait_ms=lock.wait_ms,
                     )
 
-                positions = data["positions"]
-                if _fill_already_applied(positions, fill_id, fill_identity_key):
-                    payload = _noop("duplicate_fill", "fill already applied to position")
-                    payload.update({"fill_id": fill_id, "positions_path": str(target_path), "before_sha256": before_sha256})
-                    return _with_lock_metadata(payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
-
                 now = _now_text()
                 position_id = _position_id(fill)
+                positions = data["positions"]
                 existing_position, position_index = _find_position(positions, position_id)
                 if existing_position is None:
                     if _clean_text(fill.get("side")) == "SELL":
@@ -494,6 +487,18 @@ def update_position_from_fill(
                     working_position = _base_position(fill, position_id, now)
                 else:
                     working_position = deepcopy(existing_position)
+
+                if _fill_already_applied(working_position, fill_id, fill_identity_key):
+                    payload = _noop("duplicate_fill", "fill already applied to position")
+                    payload.update(
+                        {
+                            "fill_id": fill_id,
+                            "positions_path": str(target_path),
+                            "position_id": position_id,
+                            "before_sha256": before_sha256,
+                        }
+                    )
+                    return _with_lock_metadata(payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
 
                 previous_cumulative, fill_delta, delta_blocked = _fill_delta(working_position, fill)
                 if delta_blocked is not None:
