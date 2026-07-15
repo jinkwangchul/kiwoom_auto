@@ -38,6 +38,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from execution_queue_writer import mutate_order_queue
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -57,11 +59,6 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _write_json(path: Path, data: Any) -> None:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _norm(value: Any) -> str:
@@ -89,28 +86,6 @@ def read_order_queue() -> dict[str, Any]:
     if not isinstance(data.get("orders"), list):
         data["orders"] = []
     return data
-
-
-def write_order_queue(data: dict[str, Any]) -> None:
-    data["version"] = data.get("version", 1)
-    data["updated_at"] = now_text()
-    _write_json(ORDER_QUEUE_PATH, data)
-
-
-def _read_order_queue_from_path(path: Path) -> dict[str, Any]:
-    data = _read_json(path, {"version": 1, "updated_at": "", "orders": []})
-    if not isinstance(data, dict):
-        data = {"version": 1, "updated_at": "", "orders": []}
-    if not isinstance(data.get("orders"), list):
-        data["orders"] = []
-    return data
-
-
-def _write_order_queue_to_path(path: Path, data: dict[str, Any]) -> None:
-    data["version"] = data.get("version", 1)
-    data["updated_at"] = now_text()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_operation_state() -> dict[str, Any]:
@@ -249,60 +224,13 @@ def evaluate_operation_policy(order: dict[str, Any]) -> dict[str, Any]:
 
 def apply_operation_policy_gate() -> dict[str, Any]:
     """order_queue.json에 운영정책 차단 결과를 반영한다."""
-    data = read_order_queue()
-    orders = data.get("orders", [])
-    if not isinstance(orders, list):
-        orders = []
-        data["orders"] = orders
-
-    checked = 0
-    executable = 0
-    blocked_policy = 0
-    ignored = 0
-
-    for order in orders:
-        if not isinstance(order, dict):
-            ignored += 1
-            continue
-
-        result = evaluate_operation_policy(order)
-        policy_status = result.get("policy_status", "BLOCKED_POLICY")
-
-        if policy_status == "IGNORED":
-            ignored += 1
-            continue
-
-        checked += 1
-        order["policy_status"] = policy_status
-        order["policy_reason"] = result.get("policy_reason", "")
-        order["policy_checked_at"] = now_text()
-
-        # 실제 주문은 아직 차단 유지
-        order["execution_enabled"] = False
-
-        if policy_status == "EXECUTABLE":
-            order["status"] = "EXECUTABLE"
-            executable += 1
-        elif policy_status == "BLOCKED_POLICY":
-            order["status"] = "BLOCKED_POLICY"
-            blocked_policy += 1
-        else:
-            ignored += 1
-
-    write_order_queue(data)
-
-    return {
-        "checked": checked,
-        "executable": executable,
-        "blocked_policy": blocked_policy,
-        "ignored": ignored,
-        "order_queue_path": str(ORDER_QUEUE_PATH),
-    }
+    return _apply_operation_policy_gate_canonical()
 
 
 def apply_operation_policy_gate_for_order(
     order_id: str,
     queue_path: str | Path | None = None,
+    expected_revision: int | None = None,
 ) -> dict[str, Any]:
     """Apply operation policy gate to one APPROVED order candidate only."""
     clean_order_id = str(order_id or "").strip()
@@ -318,82 +246,226 @@ def apply_operation_policy_gate_for_order(
             "changed": False,
         }
 
-    data = _read_order_queue_from_path(target_path)
-    orders = data.get("orders", [])
-    if not isinstance(orders, list):
-        return {
-            "ok": False,
-            "status": "skipped",
-            "reason": "orders must be a list",
-            "order_id": clean_order_id,
-            "order_queue_path": str(target_path),
-            "changed": False,
+    return _apply_operation_policy_gate_for_order_canonical(
+        clean_order_id,
+        target_path,
+        expected_revision=expected_revision,
+    )
+
+
+def _apply_operation_policy_gate_canonical() -> dict[str, Any]:
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders", [])
+        if not isinstance(orders, list):
+            return {
+                "blocked": {
+                    "checked": 0,
+                    "executable": 0,
+                    "blocked_policy": 0,
+                    "ignored": 0,
+                    "reason": "orders must be a list",
+                    "order_queue_path": str(ORDER_QUEUE_PATH),
+                }
+            }
+
+        checked = 0
+        executable = 0
+        blocked_policy = 0
+        ignored = 0
+
+        for order in orders:
+            if not isinstance(order, dict):
+                ignored += 1
+                continue
+
+            result = evaluate_operation_policy(order)
+            policy_status = result.get("policy_status", "BLOCKED_POLICY")
+            if policy_status == "IGNORED":
+                ignored += 1
+                continue
+
+            checked += 1
+            order["policy_status"] = policy_status
+            order["policy_reason"] = result.get("policy_reason", "")
+            order["policy_checked_at"] = now_text()
+            order["execution_enabled"] = False
+
+            if policy_status == "EXECUTABLE":
+                order["status"] = "EXECUTABLE"
+                executable += 1
+            elif policy_status == "BLOCKED_POLICY":
+                order["status"] = "BLOCKED_POLICY"
+                blocked_policy += 1
+            else:
+                ignored += 1
+
+        result = {
+            "checked": checked,
+            "executable": executable,
+            "blocked_policy": blocked_policy,
+            "ignored": ignored,
+            "order_queue_path": str(ORDER_QUEUE_PATH),
         }
+        if checked <= 0:
+            return {"blocked": result}
+        return {"data": data, "result": result}
 
-    for order in orders:
-        if not isinstance(order, dict):
-            continue
-        if str(order.get("id", "") or "").strip() != clean_order_id:
-            continue
+    mutation = mutate_order_queue(
+        ORDER_QUEUE_PATH,
+        mutator,
+        operation_name="operation_policy_gate",
+        success_stage="operation_policy_gate_applied",
+        next_stage="EXECUTION_ENABLE_PREVIEW_REQUIRED",
+        default_queue={"version": 1, "updated_at": "", "orders": []},
+    )
+    return {
+        "checked": int(mutation.get("checked", 0) or 0),
+        "executable": int(mutation.get("executable", 0) or 0),
+        "blocked_policy": int(mutation.get("blocked_policy", 0) or 0),
+        "ignored": int(mutation.get("ignored", 0) or 0),
+        "order_queue_path": str(ORDER_QUEUE_PATH),
+        **mutation,
+    }
 
+
+def _apply_operation_policy_gate_for_order_canonical(
+    clean_order_id: str,
+    target_path: Path,
+    *,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders", [])
+        if not isinstance(orders, list):
+            return {
+                "blocked": {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "orders must be a list",
+                    "order_id": clean_order_id,
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
+            }
+
+        matches = [
+            order
+            for order in orders
+            if isinstance(order, dict)
+            and str(order.get("id", "") or "").strip() == clean_order_id
+        ]
+        if not matches:
+            return {
+                "blocked": {
+                    "ok": False,
+                    "status": "not_found",
+                    "reason": "order id not found",
+                    "order_id": clean_order_id,
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
+            }
+        if len(matches) > 1:
+            return {
+                "blocked": {
+                    "ok": False,
+                    "status": "duplicate_identity",
+                    "reason": "duplicate order id found",
+                    "order_id": clean_order_id,
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
+            }
+
+        order = matches[0]
         before_status = _norm(order.get("status"))
+        before_policy_status = _norm(order.get("policy_status"))
+
+        if before_status in {"EXECUTABLE", "BLOCKED_POLICY"} and before_policy_status == before_status:
+            return {
+                "blocked": {
+                    "ok": True,
+                    "status": "noop",
+                    "reason": f"target order already {before_status}",
+                    "order_id": clean_order_id,
+                    "before_status": before_status,
+                    "after_status": before_status,
+                    "policy_status": before_policy_status,
+                    "execution_enabled": bool(order.get("execution_enabled", False)),
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
+            }
+
         if before_status != "APPROVED":
             return {
-                "ok": True,
-                "status": "skipped",
-                "reason": f"target order status is not APPROVED: {before_status}",
-                "order_id": clean_order_id,
-                "before_status": before_status,
-                "after_status": before_status,
-                "order_queue_path": str(target_path),
-                "changed": False,
+                "blocked": {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": f"target order status is not APPROVED: {before_status}",
+                    "order_id": clean_order_id,
+                    "before_status": before_status,
+                    "after_status": before_status,
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
             }
 
         result = evaluate_operation_policy(order)
         policy_status = str(result.get("policy_status", "") or "").upper()
+        if policy_status not in {"EXECUTABLE", "BLOCKED_POLICY"}:
+            return {
+                "blocked": {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": f"operation policy ignored order: {policy_status}",
+                    "order_id": clean_order_id,
+                    "before_status": before_status,
+                    "after_status": before_status,
+                    "policy_status": policy_status,
+                    "order_queue_path": str(target_path),
+                    "changed": False,
+                }
+            }
+
         order["policy_status"] = policy_status
         order["policy_reason"] = result.get("policy_reason", "")
         order["policy_checked_at"] = now_text()
         order["execution_enabled"] = False
+        order["status"] = policy_status
 
-        if policy_status == "EXECUTABLE":
-            order["status"] = "EXECUTABLE"
-        elif policy_status == "BLOCKED_POLICY":
-            order["status"] = "BLOCKED_POLICY"
-        else:
-            return {
+        return {
+            "data": data,
+            "result": {
                 "ok": True,
-                "status": "skipped",
-                "reason": f"operation policy ignored order: {policy_status}",
+                "status": "updated",
+                "reason": order.get("policy_reason", ""),
                 "order_id": clean_order_id,
                 "before_status": before_status,
-                "after_status": before_status,
+                "after_status": order.get("status", ""),
                 "policy_status": policy_status,
+                "execution_enabled": bool(order.get("execution_enabled", False)),
                 "order_queue_path": str(target_path),
-                "changed": False,
-            }
-
-        _write_order_queue_to_path(target_path, data)
-        return {
-            "ok": True,
-            "status": "updated",
-            "reason": order.get("policy_reason", ""),
-            "order_id": clean_order_id,
-            "before_status": before_status,
-            "after_status": order.get("status", ""),
-            "policy_status": policy_status,
-            "execution_enabled": bool(order.get("execution_enabled", False)),
-            "order_queue_path": str(target_path),
-            "changed": True,
+                "changed": True,
+            },
         }
 
+    mutation = mutate_order_queue(
+        target_path,
+        mutator,
+        operation_name="operation_policy_gate_for_order",
+        success_stage="operation_policy_gate_applied",
+        next_stage="EXECUTION_ENABLE_PREVIEW_REQUIRED",
+        expected_revision=expected_revision,
+    )
     return {
-        "ok": False,
-        "status": "not_found",
-        "reason": "order id not found",
+        "ok": bool(mutation.get("ok", False)),
+        "status": str(mutation.get("status", "blocked")),
+        "reason": str(mutation.get("reason", "")),
         "order_id": clean_order_id,
         "order_queue_path": str(target_path),
-        "changed": False,
+        "changed": bool(mutation.get("changed", False)),
+        **mutation,
     }
 
 
