@@ -274,6 +274,9 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
     def test_apply_order_approval_has_no_direct_write_text_path(self) -> None:
         source = Path(order_approval_engine.__file__).read_text(encoding="utf-8")
         self.assertNotIn("write_text(", source)
+        self.assertNotIn("json.dump(", source)
+        self.assertNotIn("def write_order_queue", source)
+        self.assertNotIn("_apply_order_approval_to_queue_legacy_snapshot_replace", source)
 
     def test_two_threads_apply_approval_once_with_canonical_noop_second(self) -> None:
         self._write_pending_order_queue()

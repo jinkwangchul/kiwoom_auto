@@ -31,7 +31,6 @@ STEP 10: 주문후보 승인/차단 정책 엔진.
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -87,26 +86,6 @@ def read_order_queue() -> dict[str, Any]:
     return data
 
 
-def write_order_queue(data: dict[str, Any]) -> dict[str, Any]:
-    """Backward-compatible queue replacement through the canonical writer."""
-    replacement = deepcopy(data) if isinstance(data, dict) else {"version": 1, "updated_at": "", "orders": []}
-    if not isinstance(replacement.get("orders"), list):
-        replacement["orders"] = []
-
-    def mutate(_: dict[str, Any]) -> dict[str, Any]:
-        return {"data": deepcopy(replacement)}
-
-    return mutate_order_queue(
-        ORDER_QUEUE_PATH,
-        mutate,
-        operation_name="legacy_order_approval_queue_replace",
-        success_stage="legacy_order_approval_queue_replaced",
-        next_stage="ORDER_APPROVAL_REVIEW_REQUIRED",
-        context={"manual_queue_write_confirmed": True},
-        default_queue={"version": 1, "updated_at": "", "orders": []},
-    )
-
-
 def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
     """주문후보 1건 승인/차단 판정."""
     status = _norm(order.get("status"))
@@ -157,58 +136,6 @@ def evaluate_order_approval(order: dict[str, Any]) -> dict[str, Any]:
     return {
         "approval_status": "APPROVED",
         "approval_reason": "주문 승인 가능 후보",
-    }
-
-
-def _apply_order_approval_to_queue_legacy_snapshot_replace() -> dict[str, Any]:
-    """Apply approval only to PENDING order candidates in order_queue.json."""
-    data = read_order_queue()
-    orders = data.get("orders", [])
-    if not isinstance(orders, list):
-        orders = []
-        data["orders"] = orders
-
-    checked = 0
-    approved = 0
-    blocked = 0
-    ignored = 0
-
-    for order in orders:
-        if not isinstance(order, dict):
-            ignored += 1
-            continue
-        if _norm(order.get("status")) != "PENDING":
-            ignored += 1
-            continue
-
-        checked += 1
-        result = evaluate_order_approval(order)
-        approval_status = result.get("approval_status", "BLOCKED")
-
-        order["approval_status"] = approval_status
-        order["approval_reason"] = result.get("approval_reason", "")
-        order["approval_checked_at"] = now_text()
-
-        # 실제 주문은 여전히 막는다.
-        order["execution_enabled"] = False
-
-        if approval_status == "APPROVED":
-            order["status"] = "APPROVED"
-            approved += 1
-        elif approval_status == "BLOCKED":
-            order["status"] = "BLOCKED"
-            blocked += 1
-        else:
-            ignored += 1
-
-    write_order_queue(data)
-
-    return {
-        "checked": checked,
-        "approved": approved,
-        "blocked": blocked,
-        "ignored": ignored,
-        "order_queue_path": str(ORDER_QUEUE_PATH),
     }
 
 
