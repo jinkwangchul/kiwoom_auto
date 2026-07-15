@@ -1162,6 +1162,7 @@ _DISPATCH_CLAIM_IDENTITY_FIELDS = (
 _DISPATCH_CLAIM_BLOCKED_STATUSES = {
     "DISPATCH_CLAIMED",
     "SEND_ATTEMPTED",
+    "SEND_CALL_IN_PROGRESS",
     "SEND_CALL_ACCEPTED",
     "SEND_CALL_REJECTED",
     "SEND_UNCERTAIN",
@@ -1797,8 +1798,8 @@ def _broker_result_record_blocked(
     dispatch_claim_id: str,
     send_order_attempt_id: str,
 ) -> dict[str, Any] | None:
-    if record.get("status") != "SEND_ATTEMPTED":
-        return _commit_blocked("broker_send_result", "target record status is not SEND_ATTEMPTED")
+    if record.get("status") != "SEND_CALL_IN_PROGRESS":
+        return _commit_blocked("broker_send_result", "target record status is not SEND_CALL_IN_PROGRESS")
     if _clean_text(record.get("dispatch_claim_id")) != dispatch_claim_id:
         return _commit_blocked("broker_send_result", "dispatch claim id mismatch")
     if _clean_text(record.get("send_order_attempt_id")) != send_order_attempt_id:
@@ -1808,6 +1809,145 @@ def _broker_result_record_blocked(
     if record.get("broker_result_known") is True or record.get("broker_accepted") is True or record.get("broker_rejected") is True:
         return _commit_blocked("broker_send_result", "send order attempt already has broker lifecycle result")
     return None
+
+
+def _send_call_start_blocked(
+    record: dict[str, Any],
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+) -> dict[str, Any] | None:
+    if record.get("status") != "SEND_ATTEMPTED":
+        return _commit_blocked("send_call_start", "target record status is not SEND_ATTEMPTED")
+    if _clean_text(record.get("dispatch_claim_id")) != dispatch_claim_id:
+        return _commit_blocked("send_call_start", "dispatch claim id mismatch")
+    if _clean_text(record.get("send_order_attempt_id")) != send_order_attempt_id:
+        return _commit_blocked("send_call_start", "send order attempt id mismatch")
+    if record.get("send_order_called") is not False:
+        return _commit_blocked("send_call_start", "target record send_order_called is not false")
+    if record.get("broker_call_executed") is not False or record.get("broker_api_called") is not False:
+        return _commit_blocked("send_call_start", "target record broker call already executed")
+    if record.get("send_call_result_known") is True or record.get("send_uncertain") is True:
+        return _commit_blocked("send_call_start", "target record already has send call result")
+    return None
+
+
+def mark_send_order_call_in_progress(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    dispatch_claim_id: str,
+    send_order_attempt_id: str,
+    context: Any = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Record that the real SendOrder callable boundary has been entered."""
+    normalized_identity, identity_blocked = _dispatch_identity(identity)
+    if identity_blocked is not None:
+        return _with_queue_metadata(identity_blocked, expected_revision=expected_revision)
+    if expected_revision is None:
+        return _with_queue_metadata(_commit_blocked("revision_cas", "expected_revision is required for send call start"))
+
+    normalized_claim_id = _clean_text(dispatch_claim_id)
+    normalized_attempt_id = _clean_text(send_order_attempt_id)
+    if not normalized_claim_id:
+        return _with_queue_metadata(_commit_blocked("send_call_start", "dispatch claim id is required"), expected_revision=expected_revision)
+    if not normalized_attempt_id:
+        return _with_queue_metadata(_commit_blocked("send_call_start", "send order attempt id is required"), expected_revision=expected_revision)
+
+    started_at = datetime.now()
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        matches = _dispatch_matching_records(data, normalized_identity)
+        if len(matches) != 1:
+            return {"blocked": _commit_blocked("send_call_start", f"send call target matching record count is {len(matches)}")}
+        target = matches[0]
+        record_blocked = _send_call_start_blocked(
+            target,
+            dispatch_claim_id=normalized_claim_id,
+            send_order_attempt_id=normalized_attempt_id,
+        )
+        if record_blocked is not None:
+            return {"blocked": record_blocked}
+
+        updated_data = deepcopy(data)
+        for index, item in enumerate(updated_data["orders"]):
+            if _dispatch_identity_matches(_as_dict(item), normalized_identity):
+                updated_record = deepcopy(item)
+                updated_record.update(
+                    {
+                        "status": "SEND_CALL_IN_PROGRESS",
+                        "send_order_called": False,
+                        "send_order_call_started": True,
+                        "send_order_call_started_at": _time_text(started_at),
+                        "send_order_call_revision": _normalize_revision(data),
+                        "broker_call_executed": False,
+                        "broker_api_called": False,
+                        "actual_order_sent": False,
+                        "call_execution_uncertain": True,
+                        "send_call_result_known": False,
+                        "send_call_accepted": False,
+                        "send_call_rejected": False,
+                        "send_uncertain": False,
+                        "automatic_retry_allowed": False,
+                        "manual_reconciliation_required": True,
+                        "updated_at": _time_text(started_at),
+                    }
+                )
+                updated_data["orders"][index] = updated_record
+                return {
+                    "data": updated_data,
+                    "result": {
+                        "send_call_started": True,
+                        "status": "SEND_CALL_IN_PROGRESS",
+                        "dispatch_claim_id": normalized_claim_id,
+                        "send_order_attempt_id": normalized_attempt_id,
+                        "send_order_call_started_at": _time_text(started_at),
+                        "claimed_identity": deepcopy(normalized_identity),
+                        "send_order_called": False,
+                        "broker_call_executed": False,
+                        "broker_api_called": False,
+                        "actual_order_sent": False,
+                        "call_execution_uncertain": True,
+                        "send_call_result_known": False,
+                        "automatic_retry_allowed": False,
+                        "manual_reconciliation_required": True,
+                    },
+                }
+        return {"blocked": _commit_blocked("send_call_start", "send call target disappeared before mutation")}
+
+    def verify(after_data: dict[str, Any], mutation: dict[str, Any]) -> dict[str, Any] | None:
+        matches = _dispatch_matching_records(after_data, normalized_identity)
+        if len(matches) != 1:
+            return _commit_blocked("post_send_call_start_verify", f"send call started record count is {len(matches)}")
+        record = matches[0]
+        if record.get("status") != "SEND_CALL_IN_PROGRESS":
+            return _commit_blocked("post_send_call_start_verify", "send call in-progress status was not persisted")
+        if _clean_text(record.get("send_order_attempt_id")) != normalized_attempt_id:
+            return _commit_blocked("post_send_call_start_verify", "send order attempt id mismatch after call start")
+        if record.get("send_order_called") is not False or record.get("broker_api_called") is not False:
+            return _commit_blocked("post_send_call_start_verify", "send call execution flags were set before callable execution")
+        if record.get("call_execution_uncertain") is not True:
+            return _commit_blocked("post_send_call_start_verify", "call execution uncertainty marker was not persisted")
+        return None
+
+    result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="send_call_start",
+        success_stage="send_call_in_progress_recorded",
+        next_stage="SEND_CALL_RESULT_RECORD_REQUIRED",
+        backup=True,
+        context=context,
+        expected_revision=expected_revision,
+        verify=verify,
+    )
+    if result.get("committed") is True:
+        result.setdefault("send_call_started", True)
+        result.setdefault("status", "SEND_CALL_IN_PROGRESS")
+    else:
+        result.setdefault("send_call_started", False)
+    return result
 
 
 def _record_broker_send_result(
@@ -1864,6 +2004,10 @@ def _record_broker_send_result(
                     "dispatch_claim_id": normalized_claim_id,
                     "send_order_attempt_id": normalized_attempt_id,
                     "send_call_result_recorded_at": _time_text(recorded_at),
+                    "send_order_called": True,
+                    "broker_call_executed": True,
+                    "broker_api_called": True,
+                    "call_execution_uncertain": False,
                     "broker_return_code": broker_return_code,
                     "broker_result_known": False,
                     "broker_accepted": False,
@@ -1923,6 +2067,10 @@ def _record_broker_send_result(
                         "dispatch_claim_id": normalized_claim_id,
                         "send_order_attempt_id": normalized_attempt_id,
                         "send_call_result_recorded_at": _time_text(recorded_at),
+                        "send_order_called": True,
+                        "broker_call_executed": True,
+                        "broker_api_called": True,
+                        "call_execution_uncertain": False,
                         "send_call_result_known": common.get("send_call_result_known"),
                         "send_call_accepted": common.get("send_call_accepted"),
                         "send_call_rejected": common.get("send_call_rejected"),
@@ -2080,6 +2228,9 @@ def inspect_send_order_lifecycle(queue_path: str | Path, identity: Any, *, conte
                         "dispatch_generation": record.get("dispatch_generation"),
                         "send_order_attempt_id": record.get("send_order_attempt_id"),
                         "send_order_attempt_count": record.get("send_order_attempt_count", 0),
+                        "send_order_call_started": record.get("send_order_call_started", False),
+                        "send_order_call_started_at": record.get("send_order_call_started_at"),
+                        "call_execution_uncertain": record.get("call_execution_uncertain", False),
                         "send_call_result_known": record.get("send_call_result_known", False),
                         "send_call_accepted": record.get("send_call_accepted", False),
                         "send_call_rejected": record.get("send_call_rejected", False),

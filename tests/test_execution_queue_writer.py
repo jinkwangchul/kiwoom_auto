@@ -20,6 +20,7 @@ from execution_queue_writer import (
     commit_execution_queue_write_batch,
     inspect_dispatch_claim,
     inspect_send_order_lifecycle,
+    mark_send_order_call_in_progress,
     mark_send_order_attempted,
     preview_execution_queue_write,
     record_broker_send_accepted,
@@ -142,6 +143,21 @@ def _process_attempt_worker(queue_path: str, start_event: Any, result_queue: Any
         attempt_owner=owner,
         context={},
         expected_revision=1,
+    )
+    result_queue.put(result)
+
+
+def _process_call_start_worker(queue_path: str, start_event: Any, result_queue: Any) -> None:
+    data = json.loads(Path(queue_path).read_text(encoding="utf-8"))
+    record = data["orders"][0]
+    start_event.wait()
+    result = mark_send_order_call_in_progress(
+        queue_path,
+        _identity_from_record(record),
+        dispatch_claim_id=record["dispatch_claim_id"],
+        send_order_attempt_id=record["send_order_attempt_id"],
+        context={},
+        expected_revision=2,
     )
     result_queue.put(result)
 
@@ -2025,6 +2041,14 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                     claim_owner="GUI_MANUAL",
                     expected_revision=1,
                 )
+                started = mark_send_order_call_in_progress(
+                    queue_path,
+                    self._identity(claimed_record),
+                    dispatch_claim_id=claim["dispatch_claim_id"],
+                    send_order_attempt_id=attempt["send_order_attempt_id"],
+                    expected_revision=2,
+                )
+                self.assertTrue(started["send_call_started"])
                 if status == "accepted":
                     result = record_broker_send_accepted(
                         queue_path,
@@ -2033,7 +2057,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                         send_order_attempt_id=attempt["send_order_attempt_id"],
                         broker_return_code=0,
                         broker_order_no="BRK_1",
-                        expected_revision=2,
+                        expected_revision=3,
                     )
                     expected_status = "SEND_CALL_ACCEPTED"
                     expected_flag = "send_call_accepted"
@@ -2046,7 +2070,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                         broker_return_code=-1,
                         broker_error_code="ERR",
                         broker_error_message="rejected",
-                        expected_revision=2,
+                        expected_revision=3,
                     )
                     expected_status = "SEND_CALL_REJECTED"
                     expected_flag = "send_call_rejected"
@@ -2057,7 +2081,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                         dispatch_claim_id=claim["dispatch_claim_id"],
                         send_order_attempt_id=attempt["send_order_attempt_id"],
                         uncertain_reason="timeout",
-                        expected_revision=2,
+                        expected_revision=3,
                     )
                     expected_status = "SEND_UNCERTAIN"
                     expected_flag = "send_uncertain"
@@ -2072,11 +2096,15 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                 if status != "uncertain":
                     self.assertTrue(record["send_call_result_known"])
                 self.assertFalse(record["actual_order_sent"])
+                self.assertTrue(record["send_order_called"])
+                self.assertTrue(record["broker_call_executed"])
+                self.assertTrue(record["broker_api_called"])
+                self.assertFalse(record["call_execution_uncertain"])
                 self.assertFalse(record["broker_result_known"])
                 self.assertFalse(record["broker_accepted"])
                 self.assertFalse(record["broker_rejected"])
                 self.assertFalse(record["automatic_retry_allowed"])
-                self.assertEqual(3, self._read_queue(queue_path)["revision"])
+                self.assertEqual(4, self._read_queue(queue_path)["revision"])
                 if status == "uncertain":
                     self.assertTrue(record["manual_reconciliation_required"])
                     self.assertEqual("timeout", record["uncertain_reason"])
@@ -2094,34 +2122,151 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             claim_owner="GUI_MANUAL",
             expected_revision=1,
         )
+        started = mark_send_order_call_in_progress(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
 
         mismatch = record_broker_send_accepted(
             queue_path,
             self._identity(claimed_record),
             dispatch_claim_id=claim["dispatch_claim_id"],
             send_order_attempt_id="WRONG",
-            expected_revision=2,
+            expected_revision=3,
         )
         accepted = record_broker_send_accepted(
             queue_path,
             self._identity(claimed_record),
             dispatch_claim_id=claim["dispatch_claim_id"],
             send_order_attempt_id=attempt["send_order_attempt_id"],
-            expected_revision=2,
+            expected_revision=3,
         )
         overwrite = record_broker_send_rejected(
             queue_path,
             self._identity(claimed_record),
             dispatch_claim_id=claim["dispatch_claim_id"],
             send_order_attempt_id=attempt["send_order_attempt_id"],
-            expected_revision=3,
+            expected_revision=4,
         )
 
+        self.assertTrue(started["committed"])
         self.assertFalse(mismatch["committed"])
         self.assertIn("send order attempt id mismatch", mismatch["blocked_reasons"])
         self.assertTrue(accepted["committed"])
         self.assertFalse(overwrite["committed"])
-        self.assertIn("target record status is not SEND_ATTEMPTED", overwrite["blocked_reasons"])
+        self.assertIn("target record status is not SEND_CALL_IN_PROGRESS", overwrite["blocked_reasons"])
+
+    def test_mark_send_order_call_in_progress_records_callable_boundary(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+
+        result = mark_send_order_call_in_progress(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
+
+        data = self._read_queue(queue_path)
+        record = data["orders"][0]
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["send_call_started"])
+        self.assertEqual("SEND_CALL_IN_PROGRESS", result["status"])
+        self.assertEqual("SEND_CALL_IN_PROGRESS", record["status"])
+        self.assertFalse(record["send_order_called"])
+        self.assertTrue(record["send_order_call_started"])
+        self.assertFalse(record["broker_call_executed"])
+        self.assertFalse(record["broker_api_called"])
+        self.assertFalse(record["actual_order_sent"])
+        self.assertTrue(record["call_execution_uncertain"])
+        self.assertFalse(record["send_call_result_known"])
+        self.assertFalse(record["automatic_retry_allowed"])
+        self.assertTrue(record["manual_reconciliation_required"])
+        self.assertEqual(3, data["revision"])
+
+    def test_same_order_two_threads_only_one_send_call_start(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        attempt = mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        results: list[dict] = []
+
+        def worker() -> None:
+            results.append(
+                mark_send_order_call_in_progress(
+                    queue_path,
+                    self._identity(claimed_record),
+                    dispatch_claim_id=claim["dispatch_claim_id"],
+                    send_order_attempt_id=attempt["send_order_attempt_id"],
+                    expected_revision=2,
+                )
+            )
+
+        threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(1, sum(1 for item in results if item.get("send_call_started") is True))
+        self.assertEqual("SEND_CALL_IN_PROGRESS", data["orders"][0]["status"])
+        self.assertEqual(3, data["revision"])
+
+    def test_same_order_two_processes_only_one_send_call_start(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        claim, claimed_record = self._write_claimed_queue(queue_path)
+        mark_send_order_attempted(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            expected_revision=1,
+        )
+        ctx = multiprocessing.get_context("spawn")
+        start_event = ctx.Event()
+        result_queue = ctx.Queue()
+        processes = [
+            ctx.Process(target=_process_call_start_worker, args=(str(queue_path), start_event, result_queue)),
+            ctx.Process(target=_process_call_start_worker, args=(str(queue_path), start_event, result_queue)),
+        ]
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(10)
+            self.assertEqual(0, process.exitcode)
+        results = [result_queue.get(timeout=5) for _ in processes]
+
+        data = self._read_queue(queue_path)
+        self.assertEqual(1, sum(1 for item in results if item.get("send_call_started") is True))
+        self.assertEqual("SEND_CALL_IN_PROGRESS", data["orders"][0]["status"])
+        self.assertEqual(3, data["revision"])
 
     def test_same_order_two_threads_only_one_send_order_attempt(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -2240,16 +2385,26 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             claim_owner="GUI_MANUAL",
             expected_revision=1,
         )
+        started = mark_send_order_call_in_progress(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
 
         inspected = inspect_send_order_lifecycle(queue_path, self._identity(claimed_record))
 
         self.assertFalse(inspected["committed"])
         self.assertFalse(inspected["changed"])
         self.assertTrue(inspected["lifecycle_inspected"])
-        self.assertEqual("SEND_ATTEMPTED", inspected["status"])
+        self.assertTrue(started["send_call_started"])
+        self.assertEqual("SEND_CALL_IN_PROGRESS", inspected["status"])
         self.assertEqual(attempt["send_order_attempt_id"], inspected["send_order_attempt_id"])
+        self.assertTrue(inspected["send_order_call_started"])
+        self.assertTrue(inspected["call_execution_uncertain"])
         self.assertFalse(inspected["automatic_retry_allowed"])
-        self.assertEqual(2, self._read_queue(queue_path)["revision"])
+        self.assertEqual(3, self._read_queue(queue_path)["revision"])
 
     def test_broker_result_post_write_verify_failure_preserves_side_effect_flags(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -2264,6 +2419,14 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             claim_owner="GUI_MANUAL",
             expected_revision=1,
         )
+        started = mark_send_order_call_in_progress(
+            queue_path,
+            self._identity(claimed_record),
+            dispatch_claim_id=claim["dispatch_claim_id"],
+            send_order_attempt_id=attempt["send_order_attempt_id"],
+            expected_revision=2,
+        )
+        self.assertTrue(started["send_call_started"])
         original_read = queue_writer._read_queue_file
         calls = {"count": 0}
 
@@ -2280,7 +2443,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
                 self._identity(claimed_record),
                 dispatch_claim_id=claim["dispatch_claim_id"],
                 send_order_attempt_id=attempt["send_order_attempt_id"],
-                expected_revision=2,
+                expected_revision=3,
             )
 
         self.assertTrue(result["committed"])
