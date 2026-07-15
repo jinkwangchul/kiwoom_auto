@@ -4,12 +4,88 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import position_update_service
 from position_update_service import update_position_from_fill
+
+
+def _position_process_result(**overrides: object) -> dict[str, object]:
+    result = {
+        "fill_recorded": True,
+        "fill_stage": "execution_fill_recorded",
+        "next_stage": "POSITION_UPDATE_REQUIRED",
+        "changed": True,
+        "fill_id": "FILL_1",
+        "event_type": "PARTIAL_FILL",
+        "order_id": "ORDER_1",
+        "order_queued_id": "ORDER_QUEUED_ORDER_1",
+        "broker_order_no": "BRK_1",
+        "request_hash": "HASH_1",
+        "lock_id": "LOCK_1",
+        "execution_id": "EXEC_1",
+        "filled_quantity": 3,
+        "filled_price": 1000,
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+    result.update(overrides)
+    return result
+
+
+def _position_process_fill(**overrides: object) -> dict[str, object]:
+    fill = {
+        "fill_id": "FILL_1",
+        "execution_identity_source": "execution_no",
+        "execution_identity": "EXEC_NO_1",
+        "fill_source": "chejan_event",
+        "event_type": "PARTIAL_FILL",
+        "broker": "KIWOOM",
+        "broker_order_no": "BRK_1",
+        "order_id": "ORDER_1",
+        "order_queued_id": "ORDER_QUEUED_ORDER_1",
+        "execution_id": "EXEC_1",
+        "request_hash": "HASH_1",
+        "lock_id": "LOCK_1",
+        "account_no": "12345678",
+        "code": "003550",
+        "side": "BUY",
+        "filled_quantity": 3,
+        "filled_price": 1000,
+        "remaining_quantity": 7,
+        "order_quantity": 10,
+        "order_price": 1000,
+        "received_at": "2026-07-04 09:30:00",
+        "recorded_at": "2026-07-04 09:30:01",
+        "normalized_event": {},
+    }
+    fill.update(overrides)
+    return fill
+
+
+def _position_process_worker(
+    positions_path: str,
+    start_event: multiprocessing.Event,
+    output: multiprocessing.Queue,
+    fill_overrides: dict[str, object],
+) -> None:
+    try:
+        start_event.wait(10)
+        output.put(
+            update_position_from_fill(
+                _position_process_result(),
+                _position_process_fill(**fill_overrides),
+                positions_path,
+                context={"manual_position_update_confirmed": True},
+            )
+        )
+    except Exception as exc:  # pragma: no cover - returned to parent process
+        output.put({"position_updated": False, "error": repr(exc)})
 
 
 class PositionUpdateServiceTest(unittest.TestCase):
@@ -38,6 +114,8 @@ class PositionUpdateServiceTest(unittest.TestCase):
     def _fill(self, **overrides: object) -> dict[str, object]:
         fill = {
             "fill_id": "FILL_1",
+            "execution_identity_source": "execution_no",
+            "execution_identity": "EXEC_NO_1",
             "fill_source": "chejan_event",
             "event_type": "PARTIAL_FILL",
             "broker": "KIWOOM",
@@ -266,6 +344,71 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual(10, result["before_quantity"])
             self.assertEqual(13, result["after_quantity"])
 
+    def test_buy_cumulative_partial_fill_applies_delta_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            first = self._update(path, fill=self._fill(fill_id="FILL_1", execution_identity="EXEC_NO_1", filled_quantity=3, remaining_quantity=7))
+            second = self._update(path, fill=self._fill(fill_id="FILL_2", execution_identity="EXEC_NO_2", filled_quantity=5, remaining_quantity=5, filled_price=1100))
+            position = self._read_json(path)["positions"][0]
+
+            self.assertTrue(first["position_updated"])
+            self.assertTrue(second["position_updated"])
+            self.assertEqual(3, first["fill_delta_applied"])
+            self.assertEqual(2, second["fill_delta_applied"])
+            self.assertEqual(5, position["quantity"])
+            self.assertEqual(1040, position["average_price"])
+            self.assertEqual(5200, position["cost_basis"])
+
+    def test_same_cumulative_quantity_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            self._update(path, fill=self._fill(fill_id="FILL_1", execution_identity="EXEC_NO_1", filled_quantity=3, remaining_quantity=7))
+            result = self._update(path, fill=self._fill(fill_id="FILL_2", execution_identity="EXEC_NO_2", filled_quantity=3, remaining_quantity=7))
+            position = self._read_json(path)["positions"][0]
+
+            self.assertFalse(result["position_updated"])
+            self.assertEqual("fill_delta_noop", result["position_stage"])
+            self.assertFalse(result["changed"])
+            self.assertEqual(0, result["fill_delta_applied"])
+            self.assertEqual(3, position["quantity"])
+
+    def test_same_execution_identity_redelivery_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            self._update(path, fill=self._fill(fill_id="FILL_1", execution_identity="EXEC_NO_1", filled_quantity=3))
+            result = self._update(path, fill=self._fill(fill_id="FILL_2", execution_identity="EXEC_NO_1", filled_quantity=5))
+            position = self._read_json(path)["positions"][0]
+
+            self.assertFalse(result["position_updated"])
+            self.assertEqual("duplicate_fill", result["position_stage"])
+            self.assertEqual(3, position["quantity"])
+
+    def test_same_identity_value_different_source_applies_as_separate_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            first = self._update(path, fill=self._fill(fill_id="FILL_1", execution_identity_source="execution_no", execution_identity="123", filled_quantity=3))
+            second = self._update(path, fill=self._fill(fill_id="FILL_2", execution_identity_source="fid_909", execution_identity="123", filled_quantity=5))
+
+            self.assertTrue(first["position_updated"])
+            self.assertTrue(second["position_updated"])
+            self.assertEqual(2, second["fill_delta_applied"])
+            self.assertEqual(5, self._read_json(path)["positions"][0]["quantity"])
+
+    def test_out_of_order_cumulative_quantity_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            self._update(path, fill=self._fill(fill_id="FILL_1", execution_identity="EXEC_NO_1", filled_quantity=5, remaining_quantity=5))
+            result = self._update(path, fill=self._fill(fill_id="FILL_2", execution_identity="EXEC_NO_2", filled_quantity=3, remaining_quantity=7))
+
+            self.assertFalse(result["position_updated"])
+            self.assertEqual("out_of_order_fill", result["position_stage"])
+            self.assertIn("filled_quantity is less than last applied cumulative quantity", result["blocked_reasons"])
+
     def test_sell_decreases_existing_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_positions(tmpdir, root={
@@ -283,6 +426,21 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual(1000, position["average_price"])
             self.assertEqual(7000, position["cost_basis"])
             self.assertEqual("OPEN", position["position_status"])
+
+    def test_sell_cumulative_partial_fill_applies_delta_only(self) -> None:
+        position = self._position(quantity=10, average_price=1000, cost_basis=10000)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir, root={"version": 1, "updated_at": "old", "positions": [position]})
+
+            first = self._update(path, fill=self._fill(fill_id="SELL_1", execution_identity="SELL_EXEC_1", side="SELL", filled_quantity=3, remaining_quantity=7))
+            second = self._update(path, fill=self._fill(fill_id="SELL_2", execution_identity="SELL_EXEC_2", side="SELL", filled_quantity=5, remaining_quantity=5))
+            updated = self._read_json(path)["positions"][0]
+
+            self.assertEqual(3, first["fill_delta_applied"])
+            self.assertEqual(2, second["fill_delta_applied"])
+            self.assertEqual(5, updated["quantity"])
+            self.assertEqual(1000, updated["average_price"])
+            self.assertEqual(5000, updated["cost_basis"])
 
     def test_sell_excess_quantity_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -330,7 +488,7 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertFalse(result["position_updated"])
             self.assertEqual("duplicate_fill", result["position_stage"])
 
-    def test_duplicate_fill_id_across_positions_blocked(self) -> None:
+    def test_duplicate_fill_id_across_positions_noop(self) -> None:
         other = self._position(
             position_id="POSITION_KIWOOM_12345678_000000",
             code="000000",
@@ -346,7 +504,9 @@ class PositionUpdateServiceTest(unittest.TestCase):
             result = self._update(path)
 
             self.assertFalse(result["position_updated"])
-            self.assertIn("fill_id already applied to position", result["blocked_reasons"])
+            self.assertEqual("duplicate_fill", result["position_stage"])
+            self.assertFalse(result["changed"])
+            self.assertIn("fill already applied to position", result["warnings"])
 
     def test_backup_created_for_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -379,6 +539,21 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertFalse(result["position_updated"])
             self.assertIn("positions file changed after fill record; manual review required", result["blocked_reasons"])
 
+    def test_stale_snapshot_has_no_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            snapshot = {"sha256": self._sha256(path)}
+            data = self._read_json(path)
+            data["updated_at"] = "changed"
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            changed = self._sha256(path)
+
+            result = self._update(path, positions_snapshot=snapshot)
+
+            self.assertFalse(result["position_updated"])
+            self.assertFalse(result["position_write"])
+            self.assertEqual(changed, self._sha256(path))
+
     def test_before_after_sha256_changed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_positions(tmpdir)
@@ -389,6 +564,124 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual(before, result["before_sha256"])
             self.assertEqual(self._sha256(path), result["after_sha256"])
             self.assertNotEqual(result["before_sha256"], result["after_sha256"])
+
+    def test_same_fill_two_threads_updates_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            barrier = threading.Barrier(3)
+            results: list[dict[str, object]] = []
+
+            def worker() -> None:
+                barrier.wait()
+                results.append(self._update(path))
+
+            threads = [threading.Thread(target=worker), threading.Thread(target=worker)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+            position = self._read_json(path)["positions"][0]
+            self.assertEqual(1, sum(1 for result in results if result["position_updated"]))
+            self.assertEqual(1, sum(1 for result in results if not result["position_updated"]))
+            self.assertEqual(3, position["quantity"])
+
+    def test_same_fill_two_processes_updates_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            start_event = multiprocessing.Event()
+            output: multiprocessing.Queue = multiprocessing.Queue()
+            processes = [
+                multiprocessing.Process(target=_position_process_worker, args=(str(path), start_event, output, {}))
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start_event.set()
+            results = [output.get(timeout=20) for _ in processes]
+            for process in processes:
+                process.join(20)
+
+            position = self._read_json(path)["positions"][0]
+            self.assertEqual([0, 0], [process.exitcode for process in processes])
+            self.assertEqual(1, sum(1 for result in results if result["position_updated"]))
+            self.assertEqual(3, position["quantity"])
+
+    def test_different_fill_two_processes_preserves_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            start_event = multiprocessing.Event()
+            output: multiprocessing.Queue = multiprocessing.Queue()
+            overrides = [
+                {"fill_id": "FILL_1", "execution_identity": "EXEC_NO_1", "filled_quantity": 3, "remaining_quantity": 7},
+                {"fill_id": "FILL_2", "execution_identity": "EXEC_NO_2", "filled_quantity": 5, "remaining_quantity": 5},
+            ]
+            processes = [
+                multiprocessing.Process(target=_position_process_worker, args=(str(path), start_event, output, item))
+                for item in overrides
+            ]
+            for process in processes:
+                process.start()
+            start_event.set()
+            results = [output.get(timeout=20) for _ in processes]
+            for process in processes:
+                process.join(20)
+
+            position = self._read_json(path)["positions"][0]
+            self.assertEqual([0, 0], [process.exitcode for process in processes])
+            self.assertTrue(all(result["position_updated"] for result in results))
+            self.assertEqual(5, position["quantity"])
+
+    def test_replace_before_failure_has_no_position_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            before = self._sha256(path)
+
+            with mock.patch.object(position_update_service.os, "replace", side_effect=OSError("replace failed")):
+                result = self._update(path)
+
+            self.assertFalse(result["position_updated"])
+            self.assertFalse(result["position_write"])
+            self.assertFalse(result["position_committed"])
+            self.assertEqual(before, self._sha256(path))
+
+    def test_post_write_read_failure_preserves_side_effect_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            initial_data = self._read_json(path)
+            blocked = position_update_service._blocked("read_positions", "post read failed")
+
+            with mock.patch.object(
+                position_update_service,
+                "_read_positions",
+                side_effect=[(initial_data, None), ({}, blocked)],
+            ):
+                result = self._update(path)
+
+            self.assertFalse(result["position_updated"])
+            self.assertTrue(result["changed"])
+            self.assertTrue(result["position_write"])
+            self.assertTrue(result["position_committed"])
+            self.assertFalse(result["post_write_verified"])
+
+    def test_post_write_content_mismatch_preserves_side_effect_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+            initial_data = self._read_json(path)
+            mismatched = deepcopy(initial_data)
+
+            with mock.patch.object(
+                position_update_service,
+                "_read_positions",
+                side_effect=[(initial_data, None), (mismatched, None)],
+            ):
+                result = self._update(path)
+
+            self.assertFalse(result["position_updated"])
+            self.assertTrue(result["position_write"])
+            self.assertTrue(result["position_committed"])
+            self.assertFalse(result["post_write_verified"])
 
     def test_fills_json_not_modified(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
