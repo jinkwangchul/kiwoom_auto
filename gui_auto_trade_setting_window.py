@@ -324,6 +324,13 @@ from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
 from execution_runtime_commit_service import commit_execution_runtime_plan
 from execution_runtime_controller import run_execution_runtime_dry_run
+from execution_runtime_file_init_approval_gate import approve_execution_runtime_file_init
+from execution_runtime_file_init_commit_plan_orchestrator import (
+    run_execution_runtime_file_init_commit_plan_orchestrator,
+)
+from execution_runtime_file_init_commit_service import commit_execution_runtime_file_init_plan
+from execution_runtime_file_init_open_policy import evaluate_execution_runtime_file_init_open_policy
+from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
 from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
 from execution_runtime_storage import ExecutionRuntimeStorage
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
@@ -2231,6 +2238,159 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         return dialog.exec_() == QDialog.Accepted
 
+    def runtime_file_init_confirmation_text(
+        self,
+        *,
+        order_executions_path: Path,
+        order_locks_path: Path,
+    ) -> str:
+        return "\n".join(
+            [
+                "Execution Runtime File Initialization",
+                "",
+                "Both runtime execution files are missing.",
+                "The existing runtime file-init service will create the initial files.",
+                "No queue commit is performed by this step.",
+                "SendOrder is not called.",
+                "",
+                f"order_executions_path: {order_executions_path}",
+                f"order_locks_path: {order_locks_path}",
+                "",
+                "Continue only if these project runtime files should be initialized now.",
+            ]
+        )
+
+    def confirm_execution_runtime_file_init(
+        self,
+        *,
+        order_executions_path: Path,
+        order_locks_path: Path,
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Execution Runtime File Initialization")
+        dialog.resize(760, 380)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(
+            self.runtime_file_init_confirmation_text(
+                order_executions_path=order_executions_path,
+                order_locks_path=order_locks_path,
+            )
+        )
+        body.setMinimumHeight(260)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("Initialize runtime files")
+        cancel_button = QPushButton("Cancel")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def ensure_execution_runtime_files_ready(
+        self,
+        *,
+        order_executions_path: Path = ORDER_EXECUTIONS_PATH,
+        order_locks_path: Path = ORDER_LOCKS_PATH,
+    ) -> dict[str, object]:
+        executions_exists = order_executions_path.exists()
+        locks_exists = order_locks_path.exists()
+        if executions_exists and locks_exists:
+            storage = ExecutionRuntimeStorage(order_executions_path, order_locks_path)
+            read_result = storage.read()
+            if read_result.get("ok") is True:
+                return {
+                    "runtime_files_ready": True,
+                    "runtime_file_init_required": False,
+                    "runtime_file_init_result": None,
+                    "blocked_reasons": [],
+                }
+            return {
+                "runtime_files_ready": False,
+                "runtime_file_init_required": False,
+                "runtime_file_init_result": None,
+                "blocked_reasons": list(read_result.get("issues") or ["runtime files are invalid"]),
+            }
+
+        file_init_preview = build_execution_runtime_file_init_preview(
+            order_executions_path,
+            order_locks_path,
+            allow_project_runtime_path=True,
+        )
+        if file_init_preview.get("status") != "READY":
+            return {
+                "runtime_files_ready": False,
+                "runtime_file_init_required": file_init_preview.get("status") == "READY",
+                "runtime_file_init_preview": file_init_preview,
+                "runtime_file_init_result": None,
+                "blocked_reasons": list(file_init_preview.get("issues") or ["runtime file init preview is not ready"]),
+            }
+
+        if not self.confirm_execution_runtime_file_init(
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+        ):
+            return {
+                "runtime_files_ready": False,
+                "runtime_file_init_required": True,
+                "runtime_file_init_preview": file_init_preview,
+                "runtime_file_init_result": None,
+                "blocked_reasons": ["runtime file initialization cancelled by operator"],
+            }
+
+        approval = approve_execution_runtime_file_init(
+            file_init_preview,
+            manual_runtime_file_init_confirmed=True,
+            manual_project_runtime_path_confirmed=True,
+        )
+        orchestrator = run_execution_runtime_file_init_commit_plan_orchestrator(
+            file_init_preview,
+            approval,
+        )
+        open_policy = evaluate_execution_runtime_file_init_open_policy(
+            file_init_commit_plan_orchestrator_result=orchestrator,
+            confirmations={
+                "manual_runtime_file_init_commit_confirmed": True,
+                "manual_project_runtime_path_confirmed": True,
+            },
+            environment_flags={
+                "real_runtime_file_init_enabled": True,
+                "allow_project_runtime_file_init": True,
+            },
+        )
+        result = commit_execution_runtime_file_init_plan(
+            orchestrator,
+            manual_runtime_file_init_commit_confirmed=True,
+            manual_temp_file_init_confirmed=True,
+            file_init_open_policy_result=open_policy,
+            manual_project_runtime_file_init_commit_confirmed=True,
+        )
+        ready = (
+            result.get("status") == "COMMITTED"
+            and result.get("committed") is True
+            and result.get("read_back_verified") is True
+        )
+        return {
+            "runtime_files_ready": ready,
+            "runtime_file_init_required": True,
+            "runtime_file_init_preview": file_init_preview,
+            "runtime_file_init_approval_gate_result": approval,
+            "runtime_file_init_commit_plan_orchestrator_result": orchestrator,
+            "runtime_file_init_open_policy_result": open_policy,
+            "runtime_file_init_result": result,
+            "blocked_reasons": [] if ready else list(result.get("issues") or ["runtime file initialization failed"]),
+        }
+
     def commit_execution_runtime_for_preview(
         self,
         order: dict[str, object],
@@ -2241,6 +2401,19 @@ class AutoTradeSettingWindow(QDialog):
         order_locks_path: Path = ORDER_LOCKS_PATH,
     ) -> dict[str, object]:
         del execution_preview_result
+        runtime_files = self.ensure_execution_runtime_files_ready(
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+        )
+        if runtime_files.get("runtime_files_ready") is not True:
+            return {
+                "runtime_commit_ready": False,
+                "runtime_commit_stage": "runtime_file_init",
+                "runtime_commit_result": None,
+                "runtime_file_init": runtime_files,
+                "blocked_reasons": list(runtime_files.get("blocked_reasons") or ["runtime files are not ready"]),
+            }
+
         confirmations = {
             "manual_execution_runtime_commit_confirmed": True,
             "manual_runtime_file_write_confirmed": True,
@@ -2258,6 +2431,7 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_commit_ready": False,
                 "runtime_commit_stage": "runtime_commit_plan",
                 "runtime_commit_result": None,
+                "runtime_file_init": runtime_files,
                 "runtime_dry_run_result": runtime_dry_run,
                 "commit_plan_orchestrator_result": commit_plan,
                 "blocked_reasons": list(runtime_dry_run.get("issues") or ["runtime commit plan is not ready"])
@@ -2281,6 +2455,7 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_commit_ready": False,
                 "runtime_commit_stage": "runtime_real_commit_readiness",
                 "runtime_commit_result": None,
+                "runtime_file_init": runtime_files,
                 "runtime_dry_run_result": runtime_dry_run,
                 "commit_plan_orchestrator_result": commit_plan,
                 "runtime_commit_readiness_policy_result": real_commit_readiness,
@@ -2314,6 +2489,7 @@ class AutoTradeSettingWindow(QDialog):
             "runtime_commit_ready": not invalid_reasons,
             "runtime_commit_stage": "runtime_committed" if not invalid_reasons else "runtime_commit_validation",
             "runtime_commit_result": runtime_commit_result,
+            "runtime_file_init": runtime_files,
             "runtime_dry_run_result": runtime_dry_run,
             "commit_plan_orchestrator_result": commit_plan,
             "runtime_commit_readiness_policy_result": real_commit_readiness,

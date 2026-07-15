@@ -1135,6 +1135,110 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertEqual(1, len(json.loads(executions_path.read_text(encoding="utf-8"))["executions"]))
             self.assertEqual(1, len(json.loads(locks_path.read_text(encoding="utf-8"))["locks"]))
 
+    def test_runtime_commit_helper_initializes_missing_runtime_files_after_confirmation(self) -> None:
+        window = self._window_for_queue_commit()
+        window.confirm_execution_runtime_file_init = lambda **kwargs: True
+        order = {
+            "id": "ORDER_1",
+            "status": "REAL_READY",
+            "source_signal_id": "SIG_1",
+            "code": "003550",
+            "side": "BUY",
+            "quantity": 10,
+            "price": 85000,
+            "execution_enabled": True,
+            "order_intent": {"side": "BUY", "hoga": "MARKET"},
+        }
+        guard = {
+            "operator_confirmed": True,
+            "real_trade_enabled": True,
+            "account_no": "12345678",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+
+            result = gui.AutoTradeSettingWindow.commit_execution_runtime_for_preview(
+                window,
+                order,
+                guard,
+                {"ok": True},
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            self.assertTrue(result["runtime_commit_ready"])
+            self.assertTrue(result["runtime_file_init"]["runtime_file_init_required"])
+            self.assertEqual("COMMITTED", result["runtime_file_init"]["runtime_file_init_result"]["status"])
+            self.assertEqual("COMMITTED", result["runtime_commit_result"]["status"])
+            self.assertTrue(executions_path.exists())
+            self.assertTrue(locks_path.exists())
+            self.assertEqual(1, len(json.loads(executions_path.read_text(encoding="utf-8"))["executions"]))
+
+    def test_runtime_file_init_cancel_blocks_without_creating_files(self) -> None:
+        window = self._window_for_queue_commit()
+        window.confirm_execution_runtime_file_init = lambda **kwargs: False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            self.assertFalse(result["runtime_files_ready"])
+            self.assertIn("runtime file initialization cancelled by operator", result["blocked_reasons"])
+            self.assertFalse(executions_path.exists())
+            self.assertFalse(locks_path.exists())
+
+    def test_partial_runtime_files_block_without_auto_repair(self) -> None:
+        window = self._window_for_queue_commit()
+        window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+            executions_path.write_text(
+                json.dumps(default_order_executions_data(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            self.assertFalse(result["runtime_files_ready"])
+            self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["blocked_reasons"])
+            self.assertTrue(executions_path.exists())
+            self.assertFalse(locks_path.exists())
+            window.confirm_execution_runtime_file_init.assert_not_called()
+
+    def test_invalid_existing_runtime_files_block_without_overwrite(self) -> None:
+        window = self._window_for_queue_commit()
+        window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+            executions_path.write_text("not-json", encoding="utf-8")
+            locks_path.write_text(
+                json.dumps(default_order_locks_data(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            self.assertFalse(result["runtime_files_ready"])
+            self.assertTrue(result["blocked_reasons"])
+            self.assertEqual("not-json", executions_path.read_text(encoding="utf-8"))
+            window.confirm_execution_runtime_file_init.assert_not_called()
+
     def test_execution_preview_button_displays_readiness_controller_text_when_available(self) -> None:
         window = self._window_for_queue_commit()
         window.reports = []

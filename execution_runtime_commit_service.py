@@ -416,7 +416,7 @@ def commit_execution_runtime_plan(
         return _result(
             status=STATUS_ERROR,
             runtime_write=True,
-            committed=True,
+            committed=False,
             execution_id=_text(execution_record.get("execution_id")),
             order_id=_text(execution_record.get("order_id")),
             request_hash=_text(execution_record.get("request_hash")),
