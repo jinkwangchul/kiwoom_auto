@@ -283,6 +283,13 @@ def _stored_execution_identity(record: dict[str, Any]) -> tuple[str, str]:
     value = _clean_text(record.get("execution_identity"))
     if source and value:
         return source, value
+    return "", ""
+
+
+def _legacy_execution_identity(record: dict[str, Any]) -> tuple[str, str]:
+    source, value = _stored_execution_identity(record)
+    if source and value:
+        return source, value
     normalized = _as_dict(record.get("normalized_event"))
     return _raw_event_identity(normalized)
 
@@ -314,12 +321,18 @@ def _composite_key(record: dict[str, Any]) -> tuple[str, str, str, str, str, str
 
 def _duplicate_reason(fills: list[Any], candidate: dict[str, Any]) -> str | None:
     candidate_identity_source, candidate_identity = _stored_execution_identity(candidate)
-    if candidate_identity:
+    if candidate_identity_source and candidate_identity:
         for fill in fills:
             item = _as_dict(fill)
             item_source, item_identity = _stored_execution_identity(item)
-            if item_identity and item_identity == candidate_identity:
-                return f"duplicate {candidate_identity_source or item_source or 'execution identity'}"
+            if item_source and item_identity:
+                if item_source == candidate_identity_source and item_identity == candidate_identity:
+                    return f"duplicate {candidate_identity_source}"
+                continue
+
+            legacy_source, legacy_identity = _legacy_execution_identity(item)
+            if legacy_source == candidate_identity_source and legacy_identity == candidate_identity:
+                return f"duplicate {candidate_identity_source}"
         return None
 
     candidate_fill_id = _clean_text(candidate.get("fill_id"))
@@ -430,6 +443,7 @@ def record_execution_fill(
         with _FILL_THREAD_LOCK:
             with _FillFileLock(target_path, _lock_timeout_sec(context)) as lock:
                 current_sha256 = _sha256_file(target_path) if target_path.exists() else None
+                before_sha256 = current_sha256
                 if snapshot_sha256 and current_sha256 != snapshot_sha256:
                     return _with_lock_metadata(
                         _blocked("stale_fills", "fills file changed after Chejan event record; manual review required"),

@@ -423,6 +423,7 @@ class ExecutionFillRecorderTest(unittest.TestCase):
     def test_different_fill_two_processes_preserves_both(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_fills(tmpdir)
+            initial_sha256 = self._sha256(path)
             start_event = multiprocessing.Event()
             output: multiprocessing.Queue = multiprocessing.Queue()
             process_args = [
@@ -444,6 +445,11 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertEqual([0, 0], [process.exitcode for process in processes])
             self.assertEqual(2, len(data["fills"]))
             self.assertTrue(all(result["fill_recorded"] for result in results))
+            before_hashes = {result["before_sha256"] for result in results}
+            after_hashes = {result["after_sha256"] for result in results}
+            self.assertIn(initial_sha256, before_hashes)
+            self.assertEqual(1, len(before_hashes & after_hashes))
+            self.assertIn(self._sha256(path), after_hashes)
 
     def test_same_price_quantity_different_execution_no_records_two(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -455,6 +461,19 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertTrue(first["fill_recorded"])
             self.assertTrue(second["fill_recorded"])
             self.assertEqual(2, len(self._read_json(path)["fills"]))
+
+    def test_same_identity_value_different_source_records_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            first = self._record_fill(path, event=self._event(execution_no="123"))
+            second = self._record_fill(path, event=self._event(raw_event={"fid_values": {"909": "123"}}))
+
+            self.assertTrue(first["fill_recorded"])
+            self.assertTrue(second["fill_recorded"])
+            fills = self._read_json(path)["fills"]
+            self.assertEqual(2, len(fills))
+            self.assertEqual(["execution_no", "fid_909"], [fill["execution_identity_source"] for fill in fills])
 
     def test_same_execution_no_duplicate_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -472,6 +491,16 @@ class ExecutionFillRecorderTest(unittest.TestCase):
 
             self._record_fill(path, event=self._event(execution_no="EXEC_NO_1"))
             result = self._record_fill(path, event=self._event(execution_no="EXEC_NO_1", filled_price=1100))
+
+            self.assertFalse(result["fill_recorded"])
+            self.assertIn("duplicate execution_no", result["blocked_reasons"])
+
+    def test_same_identity_source_and_value_duplicate_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            self._record_fill(path, event=self._event(execution_no="123"))
+            result = self._record_fill(path, event=self._event(execution_no="123", filled_price=1100))
 
             self.assertFalse(result["fill_recorded"])
             self.assertIn("duplicate execution_no", result["blocked_reasons"])
