@@ -200,7 +200,7 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertIsNone(provenance.get("setting_set"))
         self.assertTrue(provenance.get("unresolved"))
 
-    def test_sell_with_holding_keeps_execution_disabled(self) -> None:
+    def test_sell_with_holding_reaches_order_queued_without_send_order(self) -> None:
         self._setup_stock(holding_qty=10)
         self._write_signal(signal="SELL", signal_id="SIG_SELL_HOLDING")
 
@@ -210,18 +210,34 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
 
         self.assertEqual("CANDIDATE_READY", order.get("candidate_status"))
         self.assertGreater(order.get("quantity"), 0)
-        self.assertEqual("EXECUTABLE", order.get("status"))
+        self.assertEqual("ORDER_QUEUED", order.get("status"))
         self.assertEqual("APPROVED", order.get("approval_status"))
         self.assertEqual("EXECUTABLE", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
+        self.assertFalse(order.get("send_order_called"))
+        self.assertFalse(order.get("broker_api_called"))
+        self.assertFalse(order.get("actual_order_sent"))
+        self.assertFalse(order.get("order_request_created"))
+        self.assertEqual(order.get("id"), order.get("order_id"))
+        self.assertEqual("REAL_READY", order.get("real_preflight_status"))
+        self.assertTrue(order.get("request_hash"))
+        self.assertTrue(order.get("lock_id"))
+        self.assertTrue(order.get("execution_id"))
         self.assertEqual(1, result["summary"]["approval_checked"])
         self.assertEqual(1, result["summary"]["approved"])
         self.assertEqual(1, result["summary"]["policy_checked"])
         self.assertEqual(1, result["summary"]["policy_executable"])
         self.assertEqual(0, result["summary"]["policy_blocked"])
         self.assertEqual(0, result["summary"]["policy_errors"])
+        self.assertEqual(1, result["summary"]["execution_enable_checked"])
+        self.assertEqual(1, result["summary"]["execution_enable_enabled"])
+        self.assertEqual(1, result["summary"]["real_ready_checked"])
+        self.assertEqual(1, result["summary"]["real_ready"])
+        self.assertEqual(1, result["summary"]["queue_commit_checked"])
+        self.assertEqual(1, result["summary"]["order_queued"])
+        self.assertEqual(0, result["summary"]["production_errors"])
         self.assertEqual("BLOCKED", signal.get("status"))
-        self.assertNotIn(order.get("status"), {"REAL_READY"})
+        self.assertNotIn(order.get("status"), {"REAL_READY", "DISPATCH_CLAIMED"})
         intent = order.get("order_intent", {})
         self.assertEqual("SELL", intent.get("side"))
         self.assertEqual("order_candidate_engine", intent.get("source"))
@@ -234,7 +250,7 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("SELL", provenance.get("signal"))
         self.assertTrue(provenance.get("unresolved"))
 
-    def test_buy_candidate_keeps_execution_disabled(self) -> None:
+    def test_buy_candidate_reaches_order_queued_without_send_order(self) -> None:
         self._setup_stock(holding_qty=0, entry_amount=1000)
         self._write_signal(signal="BUY", signal_id="SIG_BUY")
 
@@ -245,18 +261,31 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("BUY", order.get("side"))
         self.assertEqual("CANDIDATE_READY", order.get("candidate_status"))
         self.assertGreater(order.get("quantity"), 0)
-        self.assertEqual("EXECUTABLE", order.get("status"))
+        self.assertEqual("ORDER_QUEUED", order.get("status"))
         self.assertEqual("APPROVED", order.get("approval_status"))
         self.assertEqual("EXECUTABLE", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
+        self.assertFalse(order.get("send_order_called"))
+        self.assertFalse(order.get("broker_api_called"))
+        self.assertFalse(order.get("actual_order_sent"))
+        self.assertFalse(order.get("order_request_created"))
+        self.assertEqual(order.get("id"), order.get("order_id"))
+        self.assertEqual("REAL_READY", order.get("real_preflight_status"))
         self.assertEqual(1, result["summary"]["approval_checked"])
         self.assertEqual(1, result["summary"]["approved"])
         self.assertEqual(1, result["summary"]["policy_checked"])
         self.assertEqual(1, result["summary"]["policy_executable"])
         self.assertEqual(0, result["summary"]["policy_blocked"])
         self.assertEqual(0, result["summary"]["policy_errors"])
+        self.assertEqual(1, result["summary"]["execution_enable_checked"])
+        self.assertEqual(1, result["summary"]["execution_enable_enabled"])
+        self.assertEqual(1, result["summary"]["real_ready_checked"])
+        self.assertEqual(1, result["summary"]["real_ready"])
+        self.assertEqual(1, result["summary"]["queue_commit_checked"])
+        self.assertEqual(1, result["summary"]["order_queued"])
+        self.assertEqual(0, result["summary"]["production_errors"])
         self.assertEqual("BLOCKED", signal.get("status"))
-        self.assertNotIn(order.get("status"), {"REAL_READY"})
+        self.assertNotIn(order.get("status"), {"REAL_READY", "DISPATCH_CLAIMED"})
         intent = order.get("order_intent", {})
         self.assertEqual("BUY", intent.get("side"))
         self.assertEqual("order_candidate_engine", intent.get("source"))
@@ -297,6 +326,43 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
             result["status_updates"][0]["reason"],
         )
 
+    def test_execution_chain_failure_blocks_signal_status_update(self) -> None:
+        self._setup_stock(holding_qty=10)
+        self._write_signal(signal="SELL", signal_id="SIG_EXECUTION_CHAIN_ERROR")
+
+        with patch.object(
+            routine_signal_consumer.execution_enable_service,
+            "commit_execution_enable",
+            return_value={
+                "enabled": False,
+                "enable_stage": "write_queue",
+                "blocked_reasons": ["execution enable write failed"],
+            },
+        ):
+            result = self._consume()
+
+        order = self._single_order()
+        signal = self._single_signal()
+
+        self.assertFalse(result["order_queue"]["ok"])
+        self.assertEqual(1, result["summary"]["orders_created"])
+        self.assertEqual(1, result["summary"]["policy_checked"])
+        self.assertEqual(1, result["summary"]["policy_executable"])
+        self.assertEqual(1, result["summary"]["execution_enable_checked"])
+        self.assertEqual(0, result["summary"]["execution_enable_enabled"])
+        self.assertEqual(0, result["summary"]["real_ready"])
+        self.assertEqual(0, result["summary"]["order_queued"])
+        self.assertEqual(1, result["summary"]["production_errors"])
+        self.assertEqual("EXECUTABLE", order.get("status"))
+        self.assertEqual("APPROVED", order.get("approval_status"))
+        self.assertEqual("EXECUTABLE", order.get("policy_status"))
+        self.assertFalse(order.get("execution_enabled"))
+        self.assertEqual("PENDING", signal.get("status"))
+        self.assertEqual(
+            "execution production chain failed; signal status update skipped",
+            result["status_updates"][0]["reason"],
+        )
+
     def test_duplicate_candidate_does_not_call_policy_gate(self) -> None:
         self._setup_stock(holding_qty=10)
         self._write_signal(signal="SELL", signal_id="SIG_DUPLICATE")
@@ -318,6 +384,9 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual(0, result["summary"]["orders_created"])
         self.assertEqual(0, result["summary"]["policy_checked"])
         self.assertEqual(0, result["summary"]["policy_errors"])
+        self.assertEqual(0, result["summary"]["execution_enable_checked"])
+        self.assertEqual(0, result["summary"]["order_queued"])
+        self.assertEqual(0, result["summary"]["production_errors"])
         policy_gate.assert_not_called()
 
     def test_apply_order_approval_uses_canonical_writer_metadata(self) -> None:
