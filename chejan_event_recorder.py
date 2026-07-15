@@ -858,3 +858,517 @@ def inspect_broker_chejan_lifecycle(
         "send_order_called": False,
         "broker_api_called": False,
     }
+
+
+_INCOMPLETE_RESTART_STATUSES = {
+    "SEND_CALL_IN_PROGRESS",
+    "SEND_UNCERTAIN",
+    "BROKER_ACCEPTED",
+    "PARTIALLY_FILLED",
+}
+_FILL_LEDGER_EVENT_TYPES = {"PARTIAL_FILL", "FULL_FILL"}
+_CANCELLED_STATES = {"CANCELLED", "PARTIAL_CANCELLED"}
+_FILL_QUANTITY_SEMANTICS = "CUMULATIVE"
+
+
+def _canonical_json_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest().upper()
+
+
+def _read_fills_ledger(path: Path | None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    if path is None:
+        return [], ["fills_path not provided"], []
+    if not path.exists():
+        return [], ["fills file does not exist"], []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], [f"failed to read fills json: {exc}"], []
+    if not isinstance(data, dict):
+        return [], ["fills root must be an object"], []
+    fills = data.get("fills")
+    if not isinstance(fills, list):
+        return [], ["fills must be a list"], []
+    records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for item in fills:
+        if isinstance(item, dict):
+            records.append(item)
+        else:
+            warnings.append("fills must contain only objects")
+    return records, warnings, []
+
+
+def _identity_from_input(identity: Any) -> dict[str, Any]:
+    item = _as_dict(identity)
+    return {
+        "order_queued_id": _clean_text(item.get("order_queued_id") or item.get("id")),
+        "order_id": _clean_text(item.get("order_id")),
+        "request_hash": _clean_text(item.get("request_hash")),
+        "lock_id": _clean_text(item.get("lock_id")),
+        "execution_id": _clean_text(item.get("execution_id")),
+        "broker_order_no": _clean_text(item.get("broker_order_no")),
+    }
+
+
+def _record_identity(record: dict[str, Any]) -> dict[str, str]:
+    return {
+        "order_queued_id": _clean_text(record.get("id")),
+        "order_id": _clean_text(record.get("order_id")),
+        "request_hash": _clean_text(record.get("request_hash")),
+        "lock_id": _clean_text(record.get("lock_id")),
+        "execution_id": _clean_text(record.get("execution_id")),
+        "broker_order_no": _clean_text(record.get("broker_order_no")),
+    }
+
+
+def _fill_identity(record: dict[str, Any]) -> str:
+    normalized = _as_dict(record.get("normalized_event"))
+    raw_event = _as_dict(normalized.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    for field in ("execution_no", "broker_event_id", "event_id", "chejan_event_id", "fill_no", "trade_no"):
+        value = _clean_text(record.get(field)) or _clean_text(normalized.get(field))
+        if value:
+            return f"{field}:{value}"
+    fid_execution_no = _clean_text(fid_values.get("909"))
+    if fid_execution_no:
+        return f"execution_no:{fid_execution_no}"
+    return f"canonical_event_hash:{_canonical_json_hash(record)}"
+
+
+_FILL_STRONG_IDENTITY_FIELDS = (
+    ("order_id", "order_id"),
+    ("execution_id", "execution_id"),
+    ("order_queued_id", "id"),
+    ("request_hash", "request_hash"),
+    ("lock_id", "lock_id"),
+)
+
+
+def _strong_identity_compatible(fill: dict[str, Any], record: dict[str, Any]) -> tuple[bool, bool]:
+    has_match = False
+    for fill_field, record_field in _FILL_STRONG_IDENTITY_FIELDS:
+        fill_value = _clean_text(fill.get(fill_field))
+        record_value = _clean_text(record.get(record_field))
+        if not fill_value or not record_value:
+            continue
+        if fill_value != record_value:
+            return False, True
+        has_match = True
+    return has_match, False
+
+
+def _strong_identity_matches(fill: dict[str, Any], record: dict[str, Any]) -> bool:
+    fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
+    record_broker_order_no = _clean_text(record.get("broker_order_no"))
+    if fill_broker_order_no and record_broker_order_no and fill_broker_order_no != record_broker_order_no:
+        return False
+    has_match, has_conflict = _strong_identity_compatible(fill, record)
+    return has_match and not has_conflict
+
+
+def _broker_order_mismatch_fills(fills: list[dict[str, Any]], record: dict[str, Any]) -> list[str]:
+    expected_broker_order_no = _clean_text(record.get("broker_order_no"))
+    if not expected_broker_order_no:
+        return []
+    mismatches: list[str] = []
+    for fill in fills:
+        fill_broker_order_no = _clean_text(fill.get("broker_order_no"))
+        has_match, has_conflict = _strong_identity_compatible(fill, record)
+        if has_match and not has_conflict and fill_broker_order_no and fill_broker_order_no != expected_broker_order_no:
+            mismatches.append(fill_broker_order_no)
+    return mismatches
+
+
+def _matching_fills(fills: list[dict[str, Any]], record: dict[str, Any]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for fill in fills:
+        if _strong_identity_matches(fill, record):
+            matches.append(fill)
+    return matches
+
+
+def _fill_sort_key(indexed_fill: tuple[int, dict[str, Any]]) -> tuple[int, int, Any, str, str, int]:
+    index, fill = indexed_fill
+    normalized = _as_dict(fill.get("normalized_event"))
+    raw_event = _as_dict(normalized.get("raw_event"))
+    fid_values = _as_dict(raw_event.get("fid_values"))
+    sequence = (
+        _clean_text(fill.get("execution_no"))
+        or _clean_text(fill.get("broker_event_id"))
+        or _clean_text(fill.get("event_id"))
+        or _clean_text(fill.get("chejan_event_id"))
+        or _clean_text(fill.get("fill_no"))
+        or _clean_text(fill.get("trade_no"))
+        or _clean_text(normalized.get("execution_no"))
+        or _clean_text(fid_values.get("909"))
+    )
+    if sequence:
+        try:
+            sequence_key: Any = int(sequence)
+            sequence_kind = 0
+        except ValueError:
+            sequence_key = sequence
+            sequence_kind = 1
+        has_no_sequence = 0
+    else:
+        sequence_key = ""
+        sequence_kind = 1
+        has_no_sequence = 1
+    return (
+        has_no_sequence,
+        sequence_kind,
+        sequence_key,
+        _clean_text(fill.get("received_at")),
+        _clean_text(fill.get("recorded_at")),
+        index,
+    )
+
+
+def _fill_broker_average(fill: dict[str, Any]) -> float | int | None:
+    average = _broker_average_fill_price(fill)
+    if average is not None:
+        return average
+    normalized = _as_dict(fill.get("normalized_event"))
+    return _broker_average_fill_price(normalized)
+
+
+def _fill_ledger_summary(fills: list[dict[str, Any]], record: dict[str, Any]) -> dict[str, Any]:
+    broker_order_mismatches = _broker_order_mismatch_fills(fills, record)
+    matches = [
+        fill for _, fill in sorted(
+            enumerate(_matching_fills(fills, record)),
+            key=_fill_sort_key,
+        )
+    ]
+    identities = [_fill_identity(fill) for fill in matches]
+    duplicate_identities = sorted({identity for identity in identities if identities.count(identity) > 1})
+    previous_cumulative = 0
+    max_cumulative = 0
+    delta_total = 0
+    effective_count = 0
+    weighted_total = 0.0
+    repeated_identities: list[str] = []
+    out_of_order_identities: list[str] = []
+    for fill in matches:
+        identity = _fill_identity(fill)
+        current_cumulative = _int_or_none(fill.get("filled_quantity") or fill.get("quantity")) or 0
+        price = _price_or_none(fill.get("filled_price") or fill.get("price")) or 0
+        fill_delta = current_cumulative - previous_cumulative
+        if fill_delta < 0:
+            out_of_order_identities.append(identity)
+            max_cumulative = max(max_cumulative, current_cumulative)
+            continue
+        if fill_delta == 0:
+            repeated_identities.append(identity)
+            max_cumulative = max(max_cumulative, current_cumulative)
+            continue
+        effective_count += 1
+        delta_total += fill_delta
+        max_cumulative = max(max_cumulative, current_cumulative)
+        previous_cumulative = current_cumulative
+        weighted_total += float(fill_delta) * float(price)
+    average = next((avg for avg in (_fill_broker_average(fill) for fill in reversed(matches)) if avg is not None), None)
+    if average is None and delta_total > 0:
+        value = weighted_total / delta_total
+        average = int(value) if value.is_integer() else value
+    return {
+        "fills": matches,
+        "fills_ledger_count": len(matches),
+        "fills_unique_count": len(set(identities)),
+        "fills_effective_count": effective_count,
+        "fills_summed_quantity": max_cumulative,
+        "fills_delta_quantity": delta_total,
+        "fills_weighted_average_price": average,
+        "duplicate_execution_identities": duplicate_identities,
+        "repeated_fill_identities": repeated_identities,
+        "out_of_order_fill_identities": out_of_order_identities,
+        "broker_order_mismatches": broker_order_mismatches,
+        "source_event_identities": identities,
+    }
+
+
+def _chejan_evidence(record: dict[str, Any]) -> dict[str, Any]:
+    events = record.get("chejan_events")
+    if not isinstance(events, list):
+        events = []
+    accepted = []
+    rejected = []
+    cancelled = []
+    fills = []
+    for event in events:
+        item = _as_dict(event)
+        event_type = _clean_text(item.get("event_type"))
+        if event_type in _BROKER_ACCEPT_EVENT_TYPES:
+            accepted.append(item)
+        elif event_type == "ORDER_REJECTED":
+            rejected.append(item)
+        elif event_type == "ORDER_CANCELED":
+            cancelled.append(item)
+        elif event_type in _FILL_LEDGER_EVENT_TYPES:
+            fills.append(item)
+    return {
+        "chejan_event_count": len(events),
+        "accepted_event_count": len(accepted),
+        "rejected_event_count": len(rejected),
+        "cancel_event_count": len(cancelled),
+        "fill_event_count": len(fills),
+        "accepted_evidence": bool(accepted),
+        "rejected_evidence": bool(rejected),
+        "cancel_evidence": bool(cancelled),
+        "fill_evidence": bool(fills),
+    }
+
+
+def _queue_fill_mismatches(record: dict[str, Any], fill_summary: dict[str, Any], evidence: dict[str, Any]) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    warnings: list[str] = []
+    status = _clean_text(record.get("status"))
+    original_quantity = _int_or_none(record.get("original_order_quantity") or record.get("quantity"))
+    queue_cumulative = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+    queue_remaining = _int_or_none(record.get("remaining_quantity"))
+    queue_fill_count = _int_or_none(record.get("fill_count")) or 0
+    queue_average = _price_or_none(record.get("average_fill_price"))
+    fills_count = fill_summary["fills_ledger_count"]
+    fills_effective = fill_summary["fills_effective_count"]
+    fills_quantity = fill_summary["fills_summed_quantity"]
+    fills_average = fill_summary["fills_weighted_average_price"]
+
+    if fill_summary["duplicate_execution_identities"]:
+        reasons.append("duplicate execution identities in fills ledger")
+    if fill_summary["out_of_order_fill_identities"]:
+        reasons.append("out-of-order cumulative fill quantity in fills ledger")
+    if fill_summary["broker_order_mismatches"]:
+        reasons.append("broker_order_no mismatch between queue and fills ledger")
+    if queue_cumulative != fills_quantity:
+        reasons.append("queue cumulative filled quantity does not match fills ledger sum")
+    if queue_fill_count != fills_effective:
+        reasons.append("queue fill_count does not match effective fills ledger count")
+    if queue_average is not None and fills_average is not None and float(queue_average) != float(fills_average):
+        reasons.append("queue average_fill_price does not match fills weighted average")
+    if original_quantity is not None and queue_remaining is not None and queue_cumulative + queue_remaining != original_quantity:
+        reasons.append("queue remaining plus cumulative filled does not match original quantity")
+    if fills_quantity > 0 and status == "BROKER_ACCEPTED":
+        reasons.append("fills ledger has fill but queue is still BROKER_ACCEPTED")
+    if status in {"PARTIALLY_FILLED", "FILLED"} and fills_count == 0:
+        reasons.append("queue fill status has no fills ledger detail")
+    if status == "FILLED" and (queue_remaining or 0) > 0:
+        reasons.append("queue FILLED still has remaining quantity")
+    if status == "PARTIALLY_FILLED" and queue_remaining == 0:
+        reasons.append("queue PARTIALLY_FILLED has zero remaining quantity")
+    if status == "SEND_CALL_IN_PROGRESS" and (evidence["accepted_evidence"] or evidence["fill_evidence"]):
+        warnings.append("SEND_CALL_IN_PROGRESS has broker Chejan evidence")
+    if status == "SEND_UNCERTAIN" and (evidence["accepted_evidence"] or evidence["rejected_evidence"] or evidence["fill_evidence"]):
+        warnings.append("SEND_UNCERTAIN has clear broker Chejan evidence")
+    if status in _CANCELLED_STATES and (evidence["fill_evidence"] or fills_quantity > 0):
+        reasons.append("late fill evidence exists after cancelled state")
+    return reasons, warnings
+
+
+def _classify_reconciliation(status: str, reasons: list[str], warnings: list[str], read_warnings: list[str]) -> str:
+    if any("duplicate execution identities" in reason or "broker_order_no mismatch" in reason for reason in reasons):
+        return "BLOCKED"
+    if read_warnings:
+        return "REVIEW_REQUIRED"
+    if status in _CANCELLED_STATES and reasons:
+        return "BLOCKED"
+    if reasons:
+        return "REVIEW_REQUIRED"
+    if status in _INCOMPLETE_RESTART_STATUSES and warnings:
+        return "RECONCILIATION_CANDIDATE"
+    if status in _INCOMPLETE_RESTART_STATUSES:
+        return "REVIEW_REQUIRED"
+    return "CONSISTENT"
+
+
+def inspect_incomplete_order_reconciliation(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    fills_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Inspect Queue/Chejan/fills evidence for restart reconciliation without writes."""
+    target_path = Path(queue_path)
+    before_hash = _sha256_file(target_path) if target_path.exists() else ""
+    data, read_blocked = _read_queue(target_path)
+    if read_blocked is not None:
+        result = {
+            "inspection_ok": False,
+            "inspection_type": "CHEJAN_RESTART_RECONCILIATION_INSPECTION",
+            "write_performed": False,
+            "runtime_write": False,
+            "queue_write": False,
+            "file_write": False,
+            "send_order_called": False,
+            "broker_api_called": False,
+        }
+        result.update(read_blocked)
+        return result
+
+    review_like = _identity_from_input(identity)
+    record, index = _find_target_order(data["orders"], review_like)
+    if record is None or index < 0:
+        return {
+            "inspection_ok": False,
+            "inspection_type": "CHEJAN_RESTART_RECONCILIATION_INSPECTION",
+            "record_stage": "record",
+            "blocked_reasons": ["target queue record not found"],
+            "warnings": [],
+            "write_performed": False,
+            "runtime_write": False,
+            "queue_write": False,
+            "file_write": False,
+            "send_order_called": False,
+            "broker_api_called": False,
+        }
+
+    fills, fill_warnings, _ = _read_fills_ledger(Path(fills_path) if fills_path is not None else None)
+    fill_summary = _fill_ledger_summary(fills, record)
+    evidence = _chejan_evidence(record)
+    mismatch_reasons, mismatch_warnings = _queue_fill_mismatches(record, fill_summary, evidence)
+    warnings = fill_warnings + mismatch_warnings
+    classification = _classify_reconciliation(_clean_text(record.get("status")), mismatch_reasons, mismatch_warnings, fill_warnings)
+    original_quantity = _int_or_none(record.get("original_order_quantity") or record.get("quantity"))
+    queue_cumulative = _int_or_none(record.get("cumulative_filled_quantity") or record.get("total_filled_quantity")) or 0
+    queue_remaining = _int_or_none(record.get("remaining_quantity"))
+    after_hash = _sha256_file(target_path) if target_path.exists() else ""
+    return {
+        "inspection_ok": True,
+        "inspection_type": "CHEJAN_RESTART_RECONCILIATION_INSPECTION",
+        "queue_path": str(target_path),
+        "fills_path": str(fills_path) if fills_path is not None else None,
+        "queue_revision": data.get("revision", 0),
+        "queue_snapshot_hash": before_hash,
+        "queue_snapshot_unchanged": before_hash == after_hash,
+        "order_index": index,
+        "current_queue_status": _clean_text(record.get("status")),
+        "broker_order_no": _clean_text(record.get("broker_order_no")),
+        "dispatch_claim_id": _clean_text(record.get("dispatch_claim_id")),
+        "send_order_attempt_id": _clean_text(record.get("send_order_attempt_id")),
+        "identity": _record_identity(record),
+        "original_quantity": original_quantity,
+        "queue_cumulative_filled": queue_cumulative,
+        "queue_remaining": queue_remaining,
+        "queue_fill_count": _int_or_none(record.get("fill_count")) or 0,
+        "queue_average_fill_price": _price_or_none(record.get("average_fill_price")),
+        "fills_ledger_count": fill_summary["fills_ledger_count"],
+        "fills_effective_count": fill_summary["fills_effective_count"],
+        "fill_quantity_semantics": _FILL_QUANTITY_SEMANTICS,
+        "fills_summed_quantity": fill_summary["fills_summed_quantity"],
+        "fills_delta_quantity": fill_summary["fills_delta_quantity"],
+        "fills_weighted_average_price": fill_summary["fills_weighted_average_price"],
+        "duplicate_execution_identities": fill_summary["duplicate_execution_identities"],
+        "repeated_fill_identities": fill_summary["repeated_fill_identities"],
+        "out_of_order_fill_identities": fill_summary["out_of_order_fill_identities"],
+        "missing_identities": [
+            field for field, value in _record_identity(record).items()
+            if field != "broker_order_no" and not value
+        ],
+        "queue_fills_mismatch": bool(mismatch_reasons),
+        "chejan_evidence": evidence,
+        "reconciliation_candidate_status": classification,
+        "manual_reconciliation_required": classification != "CONSISTENT",
+        "automatic_retry_allowed": False,
+        "blocked_reasons": mismatch_reasons,
+        "warnings": warnings,
+        "source_event_identities": fill_summary["source_event_identities"],
+        "write_performed": False,
+        "runtime_write": False,
+        "queue_write": False,
+        "file_write": False,
+        "send_order_called": False,
+        "broker_api_called": False,
+        "actual_order_sent": False,
+        "order_request_created": False,
+        "real_ready_state_changed": False,
+    }
+
+
+def build_order_reconciliation_preview(
+    queue_path: str | Path,
+    identity: Any,
+    *,
+    fills_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a manual reconciliation proposal from read-only inspection evidence."""
+    inspection = inspect_incomplete_order_reconciliation(queue_path, identity, fills_path=fills_path)
+    if inspection.get("inspection_ok") is not True:
+        return {
+            "preview_type": "ORDER_RECONCILIATION_PREVIEW",
+            "preview_ready": False,
+            "status": "BLOCKED",
+            "inspection": inspection,
+            "approval_required": True,
+            "write_performed": False,
+            "runtime_write": False,
+            "queue_write": False,
+            "file_write": False,
+            "send_order_called": False,
+            "broker_api_called": False,
+            "blocked_reasons": inspection.get("blocked_reasons", []),
+            "warnings": inspection.get("warnings", []),
+        }
+
+    status = _clean_text(inspection.get("current_queue_status"))
+    proposed_status = status
+    evidence = _as_dict(inspection.get("chejan_evidence"))
+    remaining = inspection.get("queue_remaining")
+    filled_quantity = inspection.get("fills_summed_quantity")
+    if evidence.get("rejected_evidence"):
+        proposed_status = "BROKER_REJECTED"
+    elif evidence.get("cancel_evidence"):
+        proposed_status = "PARTIAL_CANCELLED" if (filled_quantity or 0) > 0 else "CANCELLED"
+    elif isinstance(remaining, int) and remaining == 0 and (filled_quantity or 0) > 0:
+        proposed_status = "FILLED"
+    elif (filled_quantity or 0) > 0:
+        proposed_status = "PARTIALLY_FILLED"
+    elif evidence.get("accepted_evidence"):
+        proposed_status = "BROKER_ACCEPTED"
+
+    snapshot = {
+        "queue_path": inspection.get("queue_path"),
+        "fills_path": inspection.get("fills_path"),
+        "queue_revision": inspection.get("queue_revision"),
+        "identity": inspection.get("identity"),
+        "current_queue_status": status,
+        "fills_summed_quantity": filled_quantity,
+        "fills_weighted_average_price": inspection.get("fills_weighted_average_price"),
+        "chejan_evidence": evidence,
+        "blocked_reasons": inspection.get("blocked_reasons", []),
+        "warnings": inspection.get("warnings", []),
+    }
+    preview_ready = inspection.get("reconciliation_candidate_status") in {
+        "RECONCILIATION_CANDIDATE",
+        "REVIEW_REQUIRED",
+    }
+    return {
+        "preview_type": "ORDER_RECONCILIATION_PREVIEW",
+        "preview_ready": preview_ready,
+        "status": "READY" if preview_ready else "BLOCKED",
+        "current_queue_snapshot": inspection,
+        "evidence_snapshot": snapshot,
+        "proposed_status": proposed_status,
+        "proposed_cumulative_quantity": filled_quantity,
+        "proposed_remaining_quantity": inspection.get("original_quantity") - filled_quantity
+        if isinstance(inspection.get("original_quantity"), int) and isinstance(filled_quantity, int)
+        else inspection.get("queue_remaining"),
+        "proposed_average_fill_price": inspection.get("fills_weighted_average_price"),
+        "proposed_broker_order_no": inspection.get("broker_order_no"),
+        "proposed_reconciliation_reason": inspection.get("warnings") or inspection.get("blocked_reasons"),
+        "source_event_identities": inspection.get("source_event_identities", []),
+        "expected_revision": inspection.get("queue_revision"),
+        "snapshot_hash": _canonical_json_hash(snapshot),
+        "approval_required": True,
+        "write_performed": False,
+        "runtime_write": False,
+        "queue_write": False,
+        "file_write": False,
+        "send_order_called": False,
+        "broker_api_called": False,
+        "actual_order_sent": False,
+        "order_request_created": False,
+        "real_ready_state_changed": False,
+        "blocked_reasons": inspection.get("blocked_reasons", []),
+        "warnings": inspection.get("warnings", []),
+    }
