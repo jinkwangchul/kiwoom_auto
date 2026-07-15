@@ -24,17 +24,21 @@ from routine_signal_queue import (
 )
 
 try:
-    from order_queue import append_order_candidates, read_order_queue, signal_to_order_candidate, write_order_queue
+    from order_queue import append_order_candidates, read_order_queue, signal_to_order_candidate
 except Exception:  # pragma: no cover
     append_order_candidates = None
     read_order_queue = None
     signal_to_order_candidate = None
-    write_order_queue = None
 
 try:
     from order_approval_engine import evaluate_order_approval
 except Exception:  # pragma: no cover
     evaluate_order_approval = None
+
+try:
+    import operation_policy_gate
+except Exception:  # pragma: no cover
+    operation_policy_gate = None
 
 
 def _clean_limit(limit: Any) -> int | None:
@@ -90,6 +94,114 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
     )
 
 
+def _apply_operation_policy_to_created_orders(append_result: dict[str, Any]) -> dict[str, Any]:
+    created_orders = append_result.get("created_orders", [])
+    if not isinstance(created_orders, list):
+        created_orders = []
+
+    policy_results: list[dict[str, Any]] = []
+    policy_checked = 0
+    policy_executable = 0
+    policy_blocked = 0
+    policy_errors = 0
+
+    approved_orders = [
+        order
+        for order in created_orders
+        if isinstance(order, dict)
+        and str(order.get("status", "") or "").upper() == "APPROVED"
+        and str(order.get("approval_status", "") or "").upper() == "APPROVED"
+    ]
+    if not approved_orders:
+        return {
+            "ok": True,
+            "reason": "",
+            "policy_checked": 0,
+            "policy_executable": 0,
+            "policy_blocked": 0,
+            "policy_errors": 0,
+            "policy_results": [],
+        }
+
+    if operation_policy_gate is None or not callable(getattr(operation_policy_gate, "apply_operation_policy_gate_for_order", None)):
+        return {
+            "ok": False,
+            "reason": "operation policy gate unavailable",
+            "policy_checked": 0,
+            "policy_executable": 0,
+            "policy_blocked": 0,
+            "policy_errors": len(approved_orders),
+            "policy_results": [],
+        }
+
+    queue_path = append_result.get("order_queue_path") or append_result.get("path")
+    for order in approved_orders:
+        order_id = str(order.get("id", "") or "").strip()
+        if not order_id:
+            policy_errors += 1
+            policy_results.append(
+                {
+                    "ok": False,
+                    "order_id": order_id,
+                    "source_signal_id": order.get("source_signal_id", ""),
+                    "status": "error",
+                    "reason": "created APPROVED order has no id",
+                }
+            )
+            continue
+
+        policy_checked += 1
+        try:
+            if queue_path:
+                result = operation_policy_gate.apply_operation_policy_gate_for_order(order_id, queue_path=queue_path)
+            else:
+                result = operation_policy_gate.apply_operation_policy_gate_for_order(order_id)
+        except Exception as exc:
+            policy_errors += 1
+            policy_results.append(
+                {
+                    "ok": False,
+                    "order_id": order_id,
+                    "source_signal_id": order.get("source_signal_id", ""),
+                    "status": "error",
+                    "reason": f"operation policy gate failed: {exc}",
+                }
+            )
+            continue
+
+        after_status = str(result.get("after_status") or result.get("policy_status") or "").upper()
+        item = {
+            "ok": bool(result.get("ok")),
+            "order_id": order_id,
+            "source_signal_id": order.get("source_signal_id", ""),
+            "status": result.get("status", ""),
+            "after_status": after_status,
+            "policy_status": result.get("policy_status", ""),
+            "reason": result.get("reason", ""),
+        }
+        policy_results.append(item)
+        if result.get("ok") is not True:
+            policy_errors += 1
+        elif after_status == "EXECUTABLE":
+            policy_executable += 1
+        elif after_status == "BLOCKED_POLICY":
+            policy_blocked += 1
+        else:
+            policy_errors += 1
+
+    ok = policy_errors == 0
+    reason = "" if ok else "operation policy gate failed; signal status update skipped"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "policy_checked": policy_checked,
+        "policy_executable": policy_executable,
+        "policy_blocked": policy_blocked,
+        "policy_errors": policy_errors,
+        "policy_results": policy_results,
+    }
+
+
 def _build_order_queue_candidates_for_signals(
     signals: list[dict[str, Any]],
     *,
@@ -105,6 +217,11 @@ def _build_order_queue_candidates_for_signals(
             "approval_checked": 0,
             "approved": 0,
             "blocked": 0,
+            "policy_checked": 0,
+            "policy_executable": 0,
+            "policy_blocked": 0,
+            "policy_errors": 0,
+            "policy_results": [],
             "reason": "order_queue helpers unavailable",
         }
 
@@ -180,6 +297,11 @@ def _build_order_queue_candidates_for_signals(
         "order_queue_written": False,
         "created_orders": [],
         "duplicate_orders": [],
+        "policy_checked": 0,
+        "policy_executable": 0,
+        "policy_blocked": 0,
+        "policy_errors": 0,
+        "policy_results": [],
     }
     if created_orders:
         append_result = append_order_candidates(created_orders)
@@ -195,7 +317,38 @@ def _build_order_queue_candidates_for_signals(
                 "order_queue_written": bool(append_result.get("order_queue_written")),
                 "execution_enabled_all_false": True,
                 "approval_results": approval_results,
+                "policy_checked": 0,
+                "policy_executable": 0,
+                "policy_blocked": 0,
+                "policy_errors": 0,
+                "policy_results": [],
                 "reason": append_result.get("reason", "order_queue append failed"),
+                "append_result": append_result,
+            }
+        policy_result = _apply_operation_policy_to_created_orders(append_result)
+        append_result["policy_checked"] = policy_result["policy_checked"]
+        append_result["policy_executable"] = policy_result["policy_executable"]
+        append_result["policy_blocked"] = policy_result["policy_blocked"]
+        append_result["policy_errors"] = policy_result["policy_errors"]
+        append_result["policy_results"] = policy_result["policy_results"]
+        if policy_result["ok"] is not True:
+            return {
+                "ok": False,
+                "orders_created": int(append_result.get("orders_created", 0) or 0),
+                "duplicates": duplicates + int(append_result.get("duplicates", 0) or 0),
+                "ignored": ignored,
+                "approval_checked": approval_checked,
+                "approved": approved,
+                "blocked": approval_blocked,
+                "order_queue_written": bool(append_result.get("order_queue_written")),
+                "execution_enabled_all_false": True,
+                "approval_results": approval_results,
+                "policy_checked": policy_result["policy_checked"],
+                "policy_executable": policy_result["policy_executable"],
+                "policy_blocked": policy_result["policy_blocked"],
+                "policy_errors": policy_result["policy_errors"],
+                "policy_results": policy_result["policy_results"],
+                "reason": policy_result["reason"],
                 "append_result": append_result,
             }
 
@@ -210,6 +363,11 @@ def _build_order_queue_candidates_for_signals(
         "order_queue_written": bool(append_result.get("order_queue_written")),
         "execution_enabled_all_false": all(order.get("execution_enabled") is False for order in created_orders),
         "approval_results": approval_results,
+        "policy_checked": int(append_result.get("policy_checked", 0) or 0),
+        "policy_executable": int(append_result.get("policy_executable", 0) or 0),
+        "policy_blocked": int(append_result.get("policy_blocked", 0) or 0),
+        "policy_errors": int(append_result.get("policy_errors", 0) or 0),
+        "policy_results": append_result.get("policy_results", []),
         "append_result": append_result,
     }
 
@@ -235,13 +393,18 @@ def consume_pending_routine_signals_dry_run(
         "orders_created": 0,
         "duplicates": 0,
         "ignored": 0,
-        "approval_checked": 0,
-        "approved": 0,
-        "blocked": 0,
-        "order_queue_written": False,
-        "execution_enabled_all_false": True,
-        "approval_results": [],
-    }
+            "approval_checked": 0,
+            "approved": 0,
+            "blocked": 0,
+            "policy_checked": 0,
+            "policy_executable": 0,
+            "policy_blocked": 0,
+            "policy_errors": 0,
+            "order_queue_written": False,
+            "execution_enabled_all_false": True,
+            "approval_results": [],
+            "policy_results": [],
+        }
     if write_order_queue:
         order_queue_result = _build_order_queue_candidates_for_signals(
             signals,
@@ -323,6 +486,10 @@ def consume_pending_routine_signals_dry_run(
             "approval_checked": int(order_queue_result.get("approval_checked", 0) or 0),
             "approved": int(order_queue_result.get("approved", 0) or 0),
             "approval_blocked": int(order_queue_result.get("blocked", 0) or 0),
+            "policy_checked": int(order_queue_result.get("policy_checked", 0) or 0),
+            "policy_executable": int(order_queue_result.get("policy_executable", 0) or 0),
+            "policy_blocked": int(order_queue_result.get("policy_blocked", 0) or 0),
+            "policy_errors": int(order_queue_result.get("policy_errors", 0) or 0),
         },
         "order_queue": order_queue_result,
         "status_updates": status_update_results,
