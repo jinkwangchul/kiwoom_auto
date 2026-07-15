@@ -150,6 +150,45 @@ class QueueCommitExecutorTest(unittest.TestCase):
         self.assertEqual("INVALID", result["status"])
         self.assertIn("dry_run_result.status is INVALID", result["issues"])
 
+    def test_non_real_ready_order_contract_is_invalid_before_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_path = self._queue_path(Path(temp_dir))
+            dry_run = self._dry_run()
+            dry_run["dry_run"]["commit_plan"]["order_contract"]["status"] = "EXECUTABLE"
+            with mock.patch("execution_queue_commit_executor.commit_legacy_order_queued_record") as writer:
+                result = execute_queue_commit_from_dry_run(dry_run, queue_path, manual_confirmation=True)
+
+        self.assertEqual("INVALID", result["status"])
+        self.assertIn("commit_plan.order_contract.status is not REAL_READY", result["issues"])
+        writer.assert_not_called()
+
+    def test_real_ready_execution_disabled_is_invalid_before_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_path = self._queue_path(Path(temp_dir))
+            dry_run = self._dry_run()
+            dry_run["dry_run"]["commit_plan"]["order_contract"]["execution_enabled"] = False
+            with mock.patch("execution_queue_commit_executor.commit_legacy_order_queued_record") as writer:
+                result = execute_queue_commit_from_dry_run(dry_run, queue_path, manual_confirmation=True)
+
+        self.assertEqual("INVALID", result["status"])
+        self.assertIn("commit_plan.order_contract.execution_enabled is not true", result["issues"])
+        writer.assert_not_called()
+
+    def test_real_ready_identity_mismatch_is_invalid_before_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_path = self._queue_path(Path(temp_dir))
+            dry_run = self._dry_run()
+            dry_run["dry_run"]["commit_plan"]["order_contract"]["source_signal_id"] = "OTHER_SIGNAL"
+            with mock.patch("execution_queue_commit_executor.commit_legacy_order_queued_record") as writer:
+                result = execute_queue_commit_from_dry_run(dry_run, queue_path, manual_confirmation=True)
+
+        self.assertEqual("INVALID", result["status"])
+        self.assertIn(
+            "commit_contract.source_signal_id does not match REAL_READY order contract",
+            result["issues"],
+        )
+        writer.assert_not_called()
+
     def test_duplicate_order_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             queue_path = self._queue_path(Path(temp_dir))

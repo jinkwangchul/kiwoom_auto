@@ -62,7 +62,13 @@ class QueueCommitResultReviewTest(unittest.TestCase):
                 },
                 "commit_plan": {
                     "target": "runtime/order_queue.json",
-                    "order_contract": {"order_id": "ORDER_REVIEW_1"},
+                    "order_contract": {
+                        "status": "REAL_READY",
+                        "order_id": "ORDER_REVIEW_1",
+                        "source_signal_id": "SIGNAL_REVIEW_1",
+                        "execution_enabled": True,
+                        "preview_only": True,
+                    },
                 },
             },
             "preview_only": True,

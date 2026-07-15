@@ -146,6 +146,32 @@ def _build_record(commit_contract: dict[str, Any], commit_plan: dict[str, Any], 
     return {key: value for key, value in record.items() if value not in ("", None)}
 
 
+def _real_ready_contract_issues(
+    commit_contract: dict[str, Any],
+    commit_plan: dict[str, Any],
+) -> list[str]:
+    order_contract = _as_dict(commit_plan.get("order_contract"))
+    if not order_contract:
+        return ["commit_plan.order_contract is required"]
+
+    issues: list[str] = []
+    if _text(order_contract.get("status")).upper() != "REAL_READY":
+        issues.append("commit_plan.order_contract.status is not REAL_READY")
+    if order_contract.get("execution_enabled") is not True:
+        issues.append("commit_plan.order_contract.execution_enabled is not true")
+    if order_contract.get("preview_only") is not True:
+        issues.append("commit_plan.order_contract.preview_only is not true")
+
+    for field in ("order_id", "source_signal_id"):
+        commit_value = _text(commit_contract.get(field))
+        order_value = _text(order_contract.get(field))
+        if not commit_value or not order_value:
+            issues.append(f"{field} is required in commit and REAL_READY order contracts")
+        elif commit_value != order_value:
+            issues.append(f"commit_contract.{field} does not match REAL_READY order contract")
+    return issues
+
+
 def _verify_queue_item(path: Path, record: dict[str, Any], after_hash: str) -> bool:
     if _sha256_path(path) != after_hash:
         return False
@@ -184,6 +210,14 @@ def execute_queue_commit_from_dry_run(
         return _result(status=STATUS_INVALID, issues=["commit_contract is required"])
     if not commit_plan:
         return _result(status=STATUS_INVALID, issues=["commit_plan is required"])
+
+    real_ready_issues = _real_ready_contract_issues(commit_contract, commit_plan)
+    if real_ready_issues:
+        return _result(
+            status=STATUS_INVALID,
+            issues=real_ready_issues,
+            warnings=_as_list(dry_result.get("warnings")),
+        )
 
     target_path, path_issue = _safe_queue_path(queue_path)
     if path_issue is not None or target_path is None:
