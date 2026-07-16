@@ -118,6 +118,7 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
     warnings: list[str] = []
     account_no = _clean_text(_fid(fid_values, "9201")) or None
     broker_order_no = _clean_text(_fid(fid_values, "9203")) or None
+    original_order_no = _clean_text(_fid(fid_values, "904")) or None
     code = _normalize_code(_fid(fid_values, "9001"))
     name = _clean_text(_fid(fid_values, "302")) or None
     order_status = _clean_text(_fid(fid_values, "913")) or None
@@ -141,6 +142,7 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
         "source": _clean_text(raw_event.get("source")) or "kiwoom_chejan",
         "gubun": _clean_text(raw_event.get("gubun")),
         "broker_order_no": broker_order_no,
+        "original_order_no": original_order_no,
         "account_no": account_no,
         "code": code,
         "name": name,

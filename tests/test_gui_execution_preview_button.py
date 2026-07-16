@@ -2187,7 +2187,73 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 gui.AutoTradeSettingWindow.cancel_pending_order_manually(window)
 
             self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
-            self.assertIn("active cancel request already exists", window.send_order_reports[-1]["blocked_reasons"][0])
+            self.assertIn("active cancel/modify request already exists", window.send_order_reports[-1]["blocked_reasons"][0])
+
+    def test_manual_modify_blocks_when_active_cancel_exists_for_same_original_order_no(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            source = self._order_queued_record_for_send_order(side="BUY")
+            source.update({"status": "BROKER_ACCEPTED", "broker_order_no": "987654", "remaining_quantity": 4})
+            cancel = self._order_queued_record_for_send_order(side="BUY")
+            cancel["id"] = "ORDER_QUEUED_CANCEL_EXISTING"
+            cancel["order_id"] = "ORDER_CANCEL_EXISTING"
+            cancel["execution_request"]["order_id"] = "ORDER_CANCEL_EXISTING"
+            cancel["execution_request"]["request_preview"].update(
+                {"order_action": "CANCEL", "original_order_no": "987654", "quantity": 4, "price": 0}
+            )
+            self._write_queue_for_send_order(queue_path, source)
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            data["orders"].append(cancel)
+            queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            window = self._window_for_queue_commit()
+            parent = window.parent()
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", side_effect=[("ORDER_QUEUED_ORDER_1", True), ("3,1200", True)]),
+            ):
+                gui.AutoTradeSettingWindow.modify_pending_order_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            self.assertIn("active cancel/modify request already exists", window.send_order_reports[-1]["blocked_reasons"][0])
+
+    def test_manual_cancel_blocks_when_modify_request_already_broker_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            source = self._order_queued_record_for_send_order(side="SELL")
+            source.update({"status": "PARTIALLY_FILLED", "broker_order_no": "222333", "remaining_quantity": 6})
+            modify = self._order_queued_record_for_send_order(side="SELL")
+            modify["id"] = "ORDER_QUEUED_MODIFY_EXISTING"
+            modify["order_id"] = "ORDER_MODIFY_EXISTING"
+            modify["status"] = "BROKER_ACCEPTED"
+            modify["broker_order_no"] = "MODIFY_BRK_1"
+            modify["execution_request"]["order_id"] = "ORDER_MODIFY_EXISTING"
+            modify["execution_request"]["request_preview"].update(
+                {"order_action": "MODIFY", "original_order_no": "222333", "quantity": 5, "price": 1200}
+            )
+            self._write_queue_for_send_order(queue_path, source)
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            data["orders"].append(modify)
+            queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            window = self._window_for_queue_commit()
+            parent = window.parent()
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+            ):
+                gui.AutoTradeSettingWindow.cancel_pending_order_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            self.assertIn("active cancel/modify request already exists", window.send_order_reports[-1]["blocked_reasons"][0])
 
     def test_manual_modify_open_order_creates_queued_modify_and_sends_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -196,6 +196,47 @@ class ChejanEventReviewServiceTest(unittest.TestCase):
             result["warnings"],
         )
 
+    def test_cancel_modify_request_requires_matching_original_order_no(self) -> None:
+        request_record = self._record(
+            status="SEND_CALL_ACCEPTED",
+            broker_order_no="CANCEL_BRK_1",
+            execution_request={"request_preview": {"order_action": "CANCEL", "original_order_no": "ORIGINAL_BRK_1"}},
+        )
+        result = self._review(
+            normalized_event=self._event(
+                event_type="ORDER_CANCELED",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                filled_quantity=0,
+                remaining_quantity=0,
+            ),
+            order_record=request_record,
+        )
+
+        self.assertTrue(result["chejan_review_ok"])
+        self.assertEqual("ORIGINAL_BRK_1", result["original_order_no"])
+        self.assertEqual("broker_order_no+original_order_no", result["matched_by"])
+
+    def test_cancel_modify_request_original_order_no_mismatch_is_blocked(self) -> None:
+        request_record = self._record(
+            status="SEND_CALL_ACCEPTED",
+            broker_order_no="MODIFY_BRK_1",
+            execution_request={"request_preview": {"order_action": "MODIFY", "original_order_no": "ORIGINAL_BRK_1"}},
+        )
+        result = self._review(
+            normalized_event=self._event(
+                event_type="ORDER_OPEN",
+                broker_order_no="MODIFY_BRK_1",
+                original_order_no="OTHER_ORIGINAL",
+                filled_quantity=0,
+                remaining_quantity=10,
+            ),
+            order_record=request_record,
+        )
+
+        self.assertFalse(result["chejan_review_ok"])
+        self.assertIn("normalized_event.original_order_no does not match order_record original_order_no", result["blocked_reasons"])
+
     def test_record_broker_order_no_with_event_missing_is_blocked(self) -> None:
         result = self._review(normalized_event=self._event(broker_order_no=None))
 

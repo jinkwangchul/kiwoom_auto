@@ -3744,6 +3744,7 @@ class AutoTradeSettingWindow(QDialog):
             "SEND_CALL_IN_PROGRESS",
             "SEND_CALL_ACCEPTED",
             "SEND_UNCERTAIN",
+            "BROKER_ACCEPTED",
         }
         for item in orders:
             record = item if isinstance(item, dict) else {}
@@ -3751,12 +3752,12 @@ class AutoTradeSettingWindow(QDialog):
             request_preview = execution_request.get("request_preview") if isinstance(execution_request, dict) else {}
             if not isinstance(request_preview, dict):
                 continue
-            if str(request_preview.get("order_action") or "").strip().upper() != "CANCEL":
+            if str(request_preview.get("order_action") or "").strip().upper() not in {"CANCEL", "MODIFY"}:
                 continue
             if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
                 continue
             if str(record.get("status") or "").strip().upper() in active_statuses:
-                return "active cancel request already exists for original_order_no"
+                return "active cancel/modify request already exists for original_order_no"
         return ""
 
     def _pending_modify_duplicate_reason(self, orders: list[object], original_order_no: str) -> str:
@@ -3767,6 +3768,7 @@ class AutoTradeSettingWindow(QDialog):
             "SEND_CALL_IN_PROGRESS",
             "SEND_CALL_ACCEPTED",
             "SEND_UNCERTAIN",
+            "BROKER_ACCEPTED",
         }
         for item in orders:
             record = item if isinstance(item, dict) else {}
@@ -3774,12 +3776,12 @@ class AutoTradeSettingWindow(QDialog):
             request_preview = execution_request.get("request_preview") if isinstance(execution_request, dict) else {}
             if not isinstance(request_preview, dict):
                 continue
-            if str(request_preview.get("order_action") or "").strip().upper() != "MODIFY":
+            if str(request_preview.get("order_action") or "").strip().upper() not in {"CANCEL", "MODIFY"}:
                 continue
             if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
                 continue
             if str(record.get("status") or "").strip().upper() in active_statuses:
-                return "active modify request already exists for original_order_no"
+                return "active cancel/modify request already exists for original_order_no"
         return ""
 
     def _build_manual_cancel_order_queued_preview(
