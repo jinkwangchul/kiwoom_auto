@@ -113,6 +113,9 @@ class MainWindow(QMainWindow):
             login_state_changed = getattr(self.kiwoom_api, "login_state_changed", None)
             if login_state_changed is not None:
                 login_state_changed.connect(self.on_kiwoom_login_state_changed)
+            raw_chejan_received = getattr(self.kiwoom_api, "raw_chejan_received", None)
+            if raw_chejan_received is not None:
+                raw_chejan_received.connect(self.on_kiwoom_raw_chejan_received)
 
         self.login_status_label = QLabel("로그인 상태: 미연결")
         self.btn_kiwoom_login = QPushButton("키움 로그인")
@@ -671,6 +674,17 @@ class MainWindow(QMainWindow):
     def open_auto_trade_setting_window(self) -> None:
         self.auto_trade_setting_window = AutoTradeSettingWindow(self)
         self.auto_trade_setting_window.show()
+
+    def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
+        window = getattr(self, "auto_trade_setting_window", None)
+        handler = getattr(window, "handle_raw_chejan_event", None)
+        if callable(handler):
+            self.last_chejan_record_result = handler(raw_event)
+        else:
+            self.last_chejan_record_result = {
+                "recorded": False,
+                "stage": "auto_trade_setting_window_unavailable",
+            }
 
     def open_review_required_window(self) -> None:
         self.review_required_window = GlobalReviewRequiredWindow(self)

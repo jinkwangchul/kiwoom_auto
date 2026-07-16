@@ -32,6 +32,7 @@ class KiwoomApi(QObject):
     """Minimal Kiwoom API wrapper for opt10080 candle lookup."""
 
     login_state_changed = pyqtSignal(dict)
+    raw_chejan_received = pyqtSignal(dict)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -62,6 +63,9 @@ class KiwoomApi(QObject):
                 return
             control.OnEventConnect.connect(self._on_event_connect)
             control.OnReceiveTrData.connect(self._on_receive_tr_data)
+            chejan_signal = getattr(control, "OnReceiveChejanData", None)
+            if chejan_signal is not None:
+                chejan_signal.connect(self._on_receive_chejan_data)
             self._control = control
             self._available = True
         except Exception as exc:  # pragma: no cover - depends on Kiwoom OCX.
@@ -150,6 +154,36 @@ class KiwoomApi(QObject):
             accounts.append(account)
             seen.add(account)
         return accounts
+
+    def send_order(
+        self,
+        screen_no: str,
+        order_name: str,
+        account_no: str,
+        order_type: int,
+        code: str,
+        quantity: int,
+        price: int,
+        hoga: str,
+        original_order_no: str,
+    ) -> Any:
+        """Call Kiwoom OpenAPI SendOrder once with the official 9 arguments."""
+        if not self.is_available():
+            raise RuntimeError(self._unavailable_reason or "kiwoom api unavailable")
+        if not self.is_connected():
+            raise RuntimeError("kiwoom api is not connected")
+        return self._control.dynamicCall(
+            "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
+            str(screen_no or ""),
+            str(order_name or ""),
+            str(account_no or ""),
+            int(order_type),
+            str(code or ""),
+            int(quantity),
+            int(price),
+            str(hoga or ""),
+            str(original_order_no or ""),
+        )
 
     def request_minute_candles(
         self,
@@ -256,6 +290,39 @@ class KiwoomApi(QObject):
                 "connected": False,
                 "err_code": code,
                 "message": self.last_login_message,
+            }
+        )
+
+    def _on_receive_chejan_data(self, gubun: Any, item_cnt: Any, fid_list: Any) -> None:
+        if not self.is_available():
+            return
+        fids: list[str] = []
+        for item in str(fid_list or "").split(";"):
+            fid = item.strip()
+            if fid:
+                fids.append(fid)
+
+        fid_values: dict[str, str] = {}
+        for fid in fids:
+            try:
+                value = self._control.dynamicCall("GetChejanData(int)", int(fid))
+            except Exception:
+                value = ""
+            fid_values[fid] = str(value or "").strip()
+
+        try:
+            count = int(item_cnt)
+        except (TypeError, ValueError):
+            count = len(fids)
+
+        self.raw_chejan_received.emit(
+            {
+                "source": "kiwoom_chejan",
+                "gubun": str(gubun or "").strip(),
+                "item_count": count,
+                "fid_list": fids,
+                "fid_values": fid_values,
+                "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
 

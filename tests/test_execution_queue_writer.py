@@ -261,7 +261,6 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
             execution_id=f"EXEC_{index}",
         )
         record = deepcopy(preview["order_queued_record_preview"])
-        record["execution_enabled"] = True
         return record
 
     def _identity(self, record: dict) -> dict:
@@ -1431,12 +1430,12 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertFalse(result["actual_order_sent"])
         self.assertFalse(result["broker_api_called"])
 
-    def test_dispatch_claim_requires_execution_enabled_true(self) -> None:
+    def test_dispatch_claim_requires_execution_enabled_false(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         queue_path = Path(tmp.name) / "order_queue.json"
         record = self._claimable_record()
-        record["execution_enabled"] = False
+        record["execution_enabled"] = True
         self._write_queue(queue_path, orders=[record])
 
         result = claim_order_for_dispatch(
@@ -1451,7 +1450,7 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
 
         self.assertFalse(result["committed"])
         self.assertFalse(result["claimed"])
-        self.assertIn("target record execution_enabled is not true", result["blocked_reasons"])
+        self.assertIn("target record execution_enabled is not false", result["blocked_reasons"])
         self.assertEqual(0, self._read_queue(queue_path).get("revision", 0))
         self.assertFalse(Path(str(queue_path) + ".bak").exists())
 

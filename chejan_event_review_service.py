@@ -15,6 +15,13 @@ NEXT_STAGE_MANUAL_REVIEW = "MANUAL_CHEJAN_REVIEW_REQUIRED"
 NEXT_STAGE_EVENT_RECORD_REQUIRED = "CHEJAN_EVENT_RECORD_REQUIRED"
 NEXT_STAGE_FILL_RECORD_REQUIRED = "FILL_RECORD_REQUIRED"
 RESULT_STATUS_CALLED = "SEND_ORDER_CALLED"
+CALL_RESULT_STATUSES = {
+    "SEND_CALL_ACCEPTED",
+    "SEND_UNCERTAIN",
+    "BROKER_ACCEPTED",
+    "PARTIALLY_FILLED",
+    "FILLED",
+}
 
 _EVENT_RECORD_TYPES = {
     "ORDER_ACCEPTED",
@@ -164,8 +171,14 @@ def review_chejan_event(
     if order_record.get("send_order_called") is not True:
         return _blocked("order_record", "order_record.send_order_called is not true", event_type)
 
-    if order_record.get("send_order_result_status") != RESULT_STATUS_CALLED:
-        return _blocked("order_record", "order_record.send_order_result_status is not SEND_ORDER_CALLED", event_type)
+    lifecycle_status = _clean_text(order_record.get("status"))
+    legacy_result_status = _clean_text(order_record.get("send_order_result_status"))
+    if legacy_result_status != RESULT_STATUS_CALLED and lifecycle_status not in CALL_RESULT_STATUSES:
+        return _blocked(
+            "order_record",
+            "order_record send result is not SEND_ORDER_CALLED, SEND_CALL_ACCEPTED, or SEND_UNCERTAIN",
+            event_type,
+        )
 
     for key in ("account_no", "code", "side"):
         event_value = _clean_text(normalized_event.get(key))

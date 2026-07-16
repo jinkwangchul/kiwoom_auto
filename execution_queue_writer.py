@@ -1300,8 +1300,8 @@ def _dispatch_claim_record_blocked(record: dict[str, Any], *, allow_release: boo
         return _commit_blocked(stage, f"target record status is {status or 'missing'}")
 
     if not allow_release:
-        if record.get("execution_enabled") is not True:
-            return _commit_blocked("dispatch_claim", "target record execution_enabled is not true")
+        if record.get("execution_enabled") is not False:
+            return _commit_blocked("dispatch_claim", "target record execution_enabled is not false")
         if record.get("send_order_called") is not False:
             return _commit_blocked("dispatch_claim", "target record send_order_called is not false")
         if _clean_text(record.get("broker_order_no")):

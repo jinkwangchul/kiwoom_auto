@@ -142,7 +142,26 @@ class ChejanEventReviewServiceTest(unittest.TestCase):
         result = self._review(order_record=self._record(send_order_result_status="OTHER"))
 
         self.assertFalse(result["chejan_review_ok"])
-        self.assertIn("order_record.send_order_result_status is not SEND_ORDER_CALLED", result["blocked_reasons"])
+        self.assertIn(
+            "order_record send result is not SEND_ORDER_CALLED, SEND_CALL_ACCEPTED, or SEND_UNCERTAIN",
+            result["blocked_reasons"],
+        )
+
+    def test_latest_send_call_accepted_status_can_link_chejan_event(self) -> None:
+        result = self._review(
+            order_record=self._record(status="SEND_CALL_ACCEPTED", send_order_result_status=None)
+        )
+
+        self.assertTrue(result["chejan_review_ok"])
+        self.assertEqual("broker_order_no", result["matched_by"])
+
+    def test_latest_send_uncertain_status_can_link_reconciliation_event(self) -> None:
+        result = self._review(
+            order_record=self._record(status="SEND_UNCERTAIN", send_order_result_status=None)
+        )
+
+        self.assertTrue(result["chejan_review_ok"])
+        self.assertEqual("broker_order_no", result["matched_by"])
 
     def test_account_code_side_mismatch_is_blocked(self) -> None:
         cases = [

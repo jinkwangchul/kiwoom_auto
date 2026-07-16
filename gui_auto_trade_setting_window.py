@@ -18,6 +18,7 @@ import json
 import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect
 from PyQt5.QtGui import QColor, QFont
@@ -319,6 +320,7 @@ from gui_routine_registry import (
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_queue_commit_service import commit_execution_queue_manually
 from execution_queue_commit_readiness_policy import evaluate_execution_queue_commit_readiness
+from execution_queue_writer import claim_order_for_dispatch
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
@@ -333,6 +335,13 @@ from execution_runtime_file_init_open_policy import evaluate_execution_runtime_f
 from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
 from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
 from execution_runtime_storage import ExecutionRuntimeStorage
+from kiwoom_send_order_adapter_contract import build_kiwoom_send_order_adapter_contract
+from kiwoom_send_order_call_preview import preview_kiwoom_send_order_call
+from kiwoom_send_order_executor import execute_claimed_send_order
+from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
+from chejan_event_normalizer import normalize_kiwoom_chejan_event
+from chejan_event_recorder import record_chejan_event
+from chejan_event_review_service import review_chejan_event
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -723,6 +732,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_execution_enable = QPushButton("수동 실주문 후보 활성화")
         self.btn_real_ready_preflight = QPushButton("REAL_READY 수동 점검")
         self.btn_execution_preview = QPushButton("Execution Preview")
+        self.btn_manual_send_order = QPushButton("Manual SendOrder")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
         self.btn_early_close.setMinimumHeight(28)
@@ -731,6 +741,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_execution_enable.setMinimumHeight(28)
         self.btn_real_ready_preflight.setMinimumHeight(28)
         self.btn_execution_preview.setMinimumHeight(28)
+        self.btn_manual_send_order.setMinimumHeight(28)
         self.btn_manual_queue_commit.setMinimumHeight(28)
         self.btn_manual_queue_commit.setEnabled(False)
         self.btn_fetch_minute_candles.setMinimumHeight(28)
@@ -810,6 +821,7 @@ class AutoTradeSettingWindow(QDialog):
         selected_routine_header_layout.addWidget(self.btn_execution_preview)
         selected_routine_header_layout.addSpacing(16)
         selected_routine_header_layout.addWidget(self.btn_manual_queue_commit)
+        selected_routine_header_layout.addWidget(self.btn_manual_send_order)
         selected_routine_header_layout.addWidget(self.btn_early_close)
         selected_routine_header_layout.addWidget(self.btn_stop)
 
@@ -951,6 +963,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_real_ready_preflight.clicked.connect(self.run_real_ready_preflight_manually)
         self.btn_execution_preview.clicked.connect(self.preview_execution_for_real_ready_order_manual)
         self.btn_manual_queue_commit.clicked.connect(self.commit_last_execution_preview_queue_manually)
+        self.btn_manual_send_order.clicked.connect(self.send_order_for_order_queued_manually)
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
         self.btn_delete.clicked.connect(self.unregister_selected_auto_trade_stocks)
@@ -2751,6 +2764,7 @@ class AutoTradeSettingWindow(QDialog):
                 decoded = json.loads(data.decode("utf-8"))
                 orders = decoded.get("orders") if isinstance(decoded, dict) else None
                 snapshot["orders_count"] = len(orders) if isinstance(orders, list) else None
+                snapshot["revision"] = decoded.get("revision") if isinstance(decoded, dict) else None
             except Exception as exc:
                 snapshot["error"] = f"orders_count unavailable: {exc}"
         except Exception as exc:
@@ -3094,6 +3108,469 @@ class AutoTradeSettingWindow(QDialog):
         self.show_manual_queue_commit_result(result)
         status_text = "완료" if result.get("manual_commit") and result.get("queue_commit_read_back_verified") else "차단"
         self.statusBarMessage(f"수동 Queue 저장 {status_text}")
+
+    def manual_send_order_confirmation_text(
+        self,
+        order: dict[str, object],
+        call_preview: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> str:
+        preview = call_preview.get("send_order_call_preview")
+        preview_dict = preview if isinstance(preview, dict) else {}
+        params = preview_dict.get("send_order_params")
+        params_dict = params if isinstance(params, dict) else {}
+        return "\n".join(
+            [
+                "Manual Kiwoom SendOrder confirmation",
+                "",
+                "This action will call Kiwoom SendOrder exactly once.",
+                "Queue claim and SendOrder result are recorded before/after the callable boundary.",
+                "Broker acceptance is not assumed from SEND_CALL_ACCEPTED.",
+                "",
+                f"account_no: {params_dict.get('account_no', '-')}",
+                f"order_id: {order.get('order_id', order.get('id', '-'))}",
+                f"code: {params_dict.get('code', order.get('code', '-'))}",
+                f"side/order_name: {params_dict.get('order_name', order.get('side', '-'))}",
+                f"quantity: {params_dict.get('quantity', order.get('quantity', '-'))}",
+                f"price: {params_dict.get('price', order.get('price', '-'))}",
+                f"hoga: {params_dict.get('hoga', '-')}",
+                f"queue_path: {queue_path}",
+                f"queue_revision: {queue_snapshot.get('revision', '-')}",
+                f"queue_sha256: {queue_snapshot.get('sha256', '-')}",
+                "",
+                "Continue only if this real order should be submitted now.",
+            ]
+        )
+
+    def confirm_manual_send_order(
+        self,
+        order: dict[str, object],
+        call_preview: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+    ) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual Kiwoom SendOrder Confirmation")
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText(self.manual_send_order_confirmation_text(order, call_preview, queue_path, queue_snapshot))
+        body.setMinimumHeight(380)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        proceed_button = QPushButton("Call SendOrder once")
+        cancel_button = QPushButton("Cancel")
+        proceed_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(proceed_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        return dialog.exec_() == QDialog.Accepted
+
+    def build_manual_send_order_environment(self, order: dict[str, object], queue_path: Path) -> dict[str, object]:
+        parent = self.parent()
+        api = getattr(parent, "kiwoom_api", None)
+        selected_account_getter = getattr(parent, "selected_account_no", None)
+        selected_account = str(selected_account_getter() or "").strip() if callable(selected_account_getter) else ""
+        connected = bool(api is not None and callable(getattr(api, "is_connected", None)) and api.is_connected())
+        accounts: list[str] = []
+        if api is not None and callable(getattr(api, "account_numbers", None)):
+            accounts = [str(item or "").strip() for item in api.account_numbers() if str(item or "").strip()]
+
+        execution_request = order.get("execution_request")
+        execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
+        request_preview = execution_request_dict.get("request_preview")
+        request_preview_dict = request_preview if isinstance(request_preview, dict) else {}
+        request_account = str(request_preview_dict.get("account_no") or order.get("account_no") or "").strip()
+
+        config, _source = self.real_preflight_stock_config_for_order(order)
+        real_trade_enabled = bool(isinstance(config, dict) and config.get("real_trade_enabled") is True)
+        try:
+            canonical_queue = queue_path.resolve() == ORDER_QUEUE_PATH.resolve()
+        except Exception:
+            canonical_queue = False
+
+        issues: list[str] = []
+        if api is None or not callable(getattr(api, "send_order", None)):
+            issues.append("kiwoom api SendOrder callable is unavailable")
+        if not connected:
+            issues.append("kiwoom api is not connected")
+        if not selected_account:
+            issues.append("selected account is missing")
+        if selected_account and accounts and selected_account not in accounts:
+            issues.append("selected account is not in current Kiwoom account list")
+        if request_account and selected_account and request_account != selected_account:
+            issues.append("selected account does not match order account")
+        if not real_trade_enabled:
+            issues.append("real trade is disabled for order stock")
+        if not canonical_queue:
+            issues.append("queue path is not canonical runtime/order_queue.json")
+
+        return {
+            "send_order_environment_ready": not issues,
+            "issues": issues,
+            "kiwoom_connected": connected,
+            "selected_account_no": selected_account,
+            "request_account_no": request_account,
+            "real_trade_enabled": real_trade_enabled,
+            "canonical_queue_path": canonical_queue,
+            "send_order_callable": getattr(api, "send_order", None) if api is not None else None,
+        }
+
+    def send_order_identity_from_record(self, record: dict[str, object]) -> dict[str, object]:
+        return {
+            "order_queued_id": str(record.get("id") or record.get("order_queued_id") or "").strip(),
+            "source_signal_id": str(record.get("source_signal_id") or "").strip(),
+            "order_id": str(record.get("order_id") or "").strip(),
+            "candidate_id": str(record.get("candidate_id") or "").strip(),
+            "queue_pending_id": str(record.get("queue_pending_id") or "").strip(),
+            "execution_id": str(record.get("execution_id") or "").strip(),
+            "request_hash": str(record.get("request_hash") or "").strip(),
+            "lock_id": str(record.get("lock_id") or "").strip(),
+        }
+
+    def build_manual_send_order_call_preview(
+        self,
+        order: dict[str, object],
+        environment: dict[str, object],
+    ) -> dict[str, object]:
+        execution_request = order.get("execution_request")
+        execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
+        request_preview = execution_request_dict.get("request_preview")
+        request_preview_dict = request_preview if isinstance(request_preview, dict) else {}
+        side = str(request_preview_dict.get("side") or order.get("side") or "").strip().upper()
+        hoga = str(
+            request_preview_dict.get("hoga")
+            or request_preview_dict.get("order_type")
+            or order.get("hoga")
+            or order.get("order_type")
+            or ""
+        ).strip().upper()
+        price = request_preview_dict.get("price", order.get("price", 0))
+        quantity = request_preview_dict.get("quantity", order.get("quantity", 0))
+        account_no = str(request_preview_dict.get("account_no") or environment.get("selected_account_no") or "").strip()
+        screen_no = str(request_preview_dict.get("screen_no") or "0101").strip()
+
+        broker_dispatch_preview = {
+            "status": "BROKER_DISPATCH_READY",
+            "send_order_called": False,
+            "broker_called": False,
+            "send_order_params_preview": {
+                "broker_type": "KIWOOM",
+                "dispatch_id": str(order.get("id") or "").strip(),
+                "order_id": str(order.get("order_id") or order.get("id") or "").strip(),
+                "account_no": account_no,
+                "screen_no": screen_no,
+                "side": side,
+                "code": str(request_preview_dict.get("code") or order.get("code") or "").strip(),
+                "quantity": quantity,
+                "price": price,
+                "hoga": hoga,
+                "original_order_no": str(request_preview_dict.get("original_order_no") or "").strip(),
+            },
+        }
+        adapter_contract = build_kiwoom_send_order_adapter_contract(
+            broker_dispatch_preview,
+            {"account_no": account_no},
+            {"screen_no": screen_no},
+        )
+        safety = evaluate_kiwoom_send_order_safety(
+            adapter_contract,
+            {},
+            {"connected": environment.get("kiwoom_connected"), "account_no": account_no},
+            {"manual_kiwoom_send_order_confirmed": True, "emergency_stop": False},
+        )
+        call_preview = preview_kiwoom_send_order_call(
+            safety,
+            adapter_contract,
+            {"final_call_token": f"GUI_SEND_{uuid4().hex}"},
+        )
+        call_preview["adapter_contract_result"] = adapter_contract
+        call_preview["safety_gate_result"] = safety
+        return call_preview
+
+    def show_manual_send_order_result(self, result: dict[str, object]) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manual SendOrder Result")
+        dialog.resize(760, 520)
+
+        lines = [
+            "Manual SendOrder Result",
+            "",
+            f"status: {result.get('status', '-')}",
+            f"stage: {result.get('stage', result.get('executor_stage', '-'))}",
+            f"order_id: {result.get('order_id', '-')}",
+            f"callable_executed: {result.get('callable_executed', False)}",
+            f"send_order_called: {result.get('send_order_called', False)}",
+            f"broker_api_called: {result.get('broker_api_called', False)}",
+            f"actual_order_sent: {result.get('actual_order_sent', False)}",
+            f"queue_result_recorded: {result.get('queue_result_recorded', False)}",
+            "",
+            "blocked_reasons/issues:",
+        ]
+        reasons = result.get("blocked_reasons") or result.get("issues") or []
+        if isinstance(reasons, list) and reasons:
+            lines.extend(f"- {reason}" for reason in reasons)
+        else:
+            lines.append("-")
+
+        layout = QVBoxLayout()
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas", 10))
+        body.setPlainText("\n".join(str(line) for line in lines))
+        body.setMinimumHeight(380)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(body)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("?뺤씤")
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def send_order_for_order_queued_manually(self) -> None:
+        order_id, accepted = QInputDialog.getText(self, "Manual SendOrder", "ORDER_QUEUED record id:")
+        if not accepted:
+            return
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            self.statusBarMessage("Manual SendOrder: ORDER_QUEUED record id is required")
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        read_result = self.read_order_from_queue_by_id(order_id, queue_path)
+        if read_result.get("ok") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "read_order",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": read_result.get("blocked_reasons", []),
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        order = read_result.get("order")
+        order_dict = order if isinstance(order, dict) else {}
+        if order_dict.get("status") != "ORDER_QUEUED":
+            result = {
+                "status": "BLOCKED",
+                "stage": "order_status",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": ["target record status is not ORDER_QUEUED"],
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        environment = self.build_manual_send_order_environment(order_dict, queue_path)
+        if environment.get("send_order_environment_ready") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "send_order_environment",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(environment.get("issues") or []),
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        call_preview = self.build_manual_send_order_call_preview(order_dict, environment)
+        if call_preview.get("status") != "SEND_ORDER_CALL_READY":
+            result = {
+                "status": "BLOCKED",
+                "stage": "send_order_call_preview",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(call_preview.get("issues") or ["send order call preview is not ready"]),
+                "send_order_call_preview_result": call_preview,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        if not self.confirm_manual_send_order(order_dict, call_preview, queue_path, snapshot):
+            self.statusBarMessage("Manual SendOrder cancelled")
+            return
+
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            result = {
+                "status": "BLOCKED",
+                "stage": "stale_queue_snapshot",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": ["queue file changed after SendOrder preview; retry from latest queue"],
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        identity = self.send_order_identity_from_record(order_dict)
+        claim_token = f"GUI_CLAIM_{uuid4().hex}"
+        final_guard = {
+            "guard_type": "SELL_DISPATCH_FINAL_EXECUTION_GUARD",
+            "status": "READY",
+            "final_guard_ready": True,
+            "queue_path": str(queue_path),
+            "queue_revision": current_snapshot.get("revision"),
+            "queue_snapshot_hash": current_snapshot.get("sha256"),
+            "guarded_identity": identity,
+            "send_order_called": False,
+            "broker_api_called": False,
+            "actual_order_sent": False,
+        }
+        claim = claim_order_for_dispatch(
+            queue_path,
+            identity,
+            final_guard,
+            claim_token=claim_token,
+            claim_owner="GUI_MANUAL_SEND_ORDER",
+            claim_source="gui_manual_send_order",
+            context={
+                "dispatch_claim_owner": "GUI_MANUAL_SEND_ORDER",
+                "dispatch_claim_source": "gui_manual_send_order",
+                "dispatch_claim_ttl_sec": 60,
+            },
+            expected_revision=current_snapshot.get("revision"),
+        )
+        if claim.get("claimed") is not True or claim.get("post_write_verified") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "dispatch_claim",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(claim.get("blocked_reasons") or ["dispatch claim failed"]),
+                "dispatch_claim_result": claim,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        result = execute_claimed_send_order(
+            queue_path,
+            identity,
+            str(claim.get("dispatch_claim_id") or ""),
+            claim_token,
+            "GUI_MANUAL_SEND_ORDER",
+            claim.get("revision_after"),
+            environment.get("send_order_callable"),
+            call_preview.get("send_order_args"),
+            context={
+                "send_order_attempt_owner": "GUI_MANUAL_SEND_ORDER",
+                "send_order_attempt_source": "gui_manual_send_order",
+            },
+        )
+        result["order_id"] = order_id
+        result["dispatch_claim_result"] = claim
+        result["send_order_call_preview_result"] = call_preview
+        self.show_manual_send_order_result(result)
+        status_text = "completed" if result.get("queue_result_recorded") else "blocked"
+        self.statusBarMessage(f"Manual SendOrder {status_text}")
+
+    def handle_raw_chejan_event(self, raw_event: dict[str, object]) -> dict[str, object]:
+        normalized = normalize_kiwoom_chejan_event(raw_event)
+        if normalized.get("normalized") is not True:
+            return {"recorded": False, "stage": "normalize", "normalized_event": normalized}
+
+        queue_path = ORDER_QUEUE_PATH
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {"recorded": False, "stage": "queue_read", "blocked_reasons": [str(exc)]}
+        orders = data.get("orders") if isinstance(data, dict) else None
+        if not isinstance(orders, list):
+            return {"recorded": False, "stage": "queue_structure", "blocked_reasons": ["queue orders must be a list"]}
+
+        broker_order_no = str(normalized.get("broker_order_no") or "").strip()
+        account_no = str(normalized.get("account_no") or "").strip()
+        code = str(normalized.get("code") or "").strip()
+        side = str(normalized.get("side") or "").strip().upper()
+        candidates: list[dict[str, object]] = []
+        for item in orders:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip()
+            if status not in {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+                continue
+            if str(item.get("account_no") or "").strip() not in {"", account_no}:
+                continue
+            if str(item.get("code") or "").strip() != code:
+                continue
+            if str(item.get("side") or "").strip().upper() != side:
+                continue
+            item_broker_order_no = str(item.get("broker_order_no") or "").strip()
+            if item_broker_order_no and broker_order_no and item_broker_order_no != broker_order_no:
+                continue
+            candidates.append(dict(item))
+
+        if len(candidates) != 1:
+            return {
+                "recorded": False,
+                "stage": "chejan_target_match",
+                "normalized_event": normalized,
+                "blocked_reasons": [f"matching send order record count is {len(candidates)}"],
+            }
+
+        review = review_chejan_event(normalized, order_record=candidates[0])
+        if review.get("chejan_review_ok") is not True:
+            return {
+                "recorded": False,
+                "stage": "chejan_review",
+                "normalized_event": normalized,
+                "review_result": review,
+                "blocked_reasons": list(review.get("blocked_reasons") or []),
+            }
+        recorded = record_chejan_event(
+            review,
+            normalized,
+            queue_path,
+            context={"manual_chejan_event_record_confirmed": True},
+        )
+        return {
+            "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,
+            "stage": "chejan_record",
+            "normalized_event": normalized,
+            "review_result": review,
+            "record_result": recorded,
+            "blocked_reasons": list(recorded.get("blocked_reasons") or []),
+        }
 
     def int_state_value(self, state: dict[str, object], key: str) -> int:
         try:
