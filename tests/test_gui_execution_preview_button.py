@@ -325,6 +325,40 @@ class _FakeDialog:
 
 
 class GuiExecutionPreviewButtonTest(unittest.TestCase):
+    def test_startup_recovery_approval_is_bound_to_runtime_snapshot(self) -> None:
+        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window._startup_recovery_approved = True
+        window._startup_recovery_approved_snapshot = "SNAPSHOT_A"
+        window._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
+
+        self.assertTrue(
+            main_gui.MainWindow.startup_recovery_session_ready(
+                window,
+                refresh=False,
+            )
+        )
+
+        window._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_B"}
+
+        self.assertFalse(
+            main_gui.MainWindow.startup_recovery_session_ready(
+                window,
+                refresh=False,
+            )
+        )
+
+    def test_startup_recovery_gate_applies_to_initialized_production_parent(self) -> None:
+        window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
+        window.parent = lambda: parent
+        window.require_startup_recovery_session = mock.Mock(return_value=False)
+
+        allowed = gui.startup_recovery_action_allowed(window, "Manual SendOrder")
+
+        self.assertFalse(allowed)
+        window.require_startup_recovery_session.assert_called_once_with("Manual SendOrder")
+
     def _window_for_queue_commit(self):
         window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
         window.messages = []

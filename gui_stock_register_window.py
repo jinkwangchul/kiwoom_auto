@@ -257,7 +257,6 @@ from gui_auto_trade_setting_window import (
     read_operation_policy,
     reset_runtime_orders_for_force_unregister,
     reset_runtime_state_for_force_unregister,
-    reset_runtime_statuses_for_program_start,
     restart_initial_review_reason_for_stock,
     routine_display_name,
     short_close_method_text,
@@ -277,7 +276,6 @@ INVALID_ITEMS_LOG_PATH = PROJECT_ROOT / "invalid_items.log"
 GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
 BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
-PROGRAM_START_RESET_APPLIED = False
 
 
 

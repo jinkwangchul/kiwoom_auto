@@ -166,6 +166,10 @@ def stop_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
 
 
 def auto_trade_start_selected_auto_trades(window) -> None:
+    recovery_check = getattr(type(window), "require_startup_recovery_session", None)
+    if callable(recovery_check) and recovery_check(window, "매매시작") is not True:
+        return
+
     selected = window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
 
