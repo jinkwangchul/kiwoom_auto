@@ -3756,6 +3756,8 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
                 continue
+            if record.get("original_order_effect_confirmed") is True:
+                continue
             if str(record.get("status") or "").strip().upper() in active_statuses:
                 return "active cancel/modify request already exists for original_order_no"
         return ""
@@ -3779,6 +3781,8 @@ class AutoTradeSettingWindow(QDialog):
             if str(request_preview.get("order_action") or "").strip().upper() not in {"CANCEL", "MODIFY"}:
                 continue
             if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
+                continue
+            if record.get("original_order_effect_confirmed") is True:
                 continue
             if str(record.get("status") or "").strip().upper() in active_statuses:
                 return "active cancel/modify request already exists for original_order_no"

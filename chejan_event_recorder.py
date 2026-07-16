@@ -257,7 +257,7 @@ def _validate_original_order_for_cancel_modify(record: dict[str, Any], event_typ
     status = _clean_text(record.get("status"))
     if status not in {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
         return _blocked("original_order", f"original order.status cannot accept {action} Chejan: {status or 'missing'}")
-    if action == "CANCEL" and event_type != "ORDER_CANCELED":
+    if action == "CANCEL" and event_type not in _BROKER_ACCEPT_EVENT_TYPES and event_type != "ORDER_CANCELED":
         return _blocked("original_order", "cancel request must be confirmed by ORDER_CANCELED Chejan")
     if action == "MODIFY" and event_type not in _BROKER_ACCEPT_EVENT_TYPES:
         return _blocked("original_order", "modify request must be confirmed by ORDER_OPEN/ORDER_ACCEPTED Chejan")
@@ -314,8 +314,8 @@ def _apply_modify_to_original_order(
     record["latest_modify_request_order_id"] = _clean_text(request_record.get("order_id"))
     record["latest_modify_event_id"] = _event_id(event_identity)
     record["latest_modify_at"] = received_at
-    record["manual_reconciliation_required"] = False
     record["automatic_retry_allowed"] = False
+    _preserve_manual_reconciliation_after_chejan_effect(record)
 
 
 def _broker_order_policy(record: dict[str, Any], event: dict[str, Any]) -> tuple[str, bool, dict[str, Any] | None]:
@@ -509,6 +509,14 @@ def _other_manual_reconciliation_required(record: dict[str, Any]) -> bool:
         if value and value not in {"chejan", "chejan_event", "chejan_reconciliation"}:
             return True
     return False
+
+
+def _chejan_reconciliation_required(record: dict[str, Any]) -> bool:
+    return any(item.get("required") is True for item in _reconciliation_items(record))
+
+
+def _preserve_manual_reconciliation_after_chejan_effect(record: dict[str, Any]) -> None:
+    record["manual_reconciliation_required"] = _chejan_reconciliation_required(record) or _other_manual_reconciliation_required(record)
 
 
 def mark_chejan_reconciliation_state(
@@ -922,10 +930,10 @@ def _apply_cancel(
             "cancellation_reason": _clean_text(event.get("order_status")) or "broker cancellation",
             "final_filled_quantity": cumulative,
             "remaining_quantity": 0,
-            "manual_reconciliation_required": False,
             "automatic_retry_allowed": False,
         }
     )
+    _preserve_manual_reconciliation_after_chejan_effect(record)
 
 
 def _apply_lifecycle_transition(
@@ -1105,7 +1113,7 @@ def record_chejan_event(
             original_event["linked_cancel_modify_request_order_queued_id"] = order_queued_id
             original_event["linked_cancel_modify_request_order_id"] = _clean_text(updated_record.get("order_id"))
             original_event["linked_cancel_modify_action"] = request_action
-            if request_action == "CANCEL":
+            if request_action == "CANCEL" and event_type == "ORDER_CANCELED":
                 _apply_cancel(
                     linked_original_record,
                     event,
@@ -1124,6 +1132,38 @@ def record_chejan_event(
                     event_identity=event_identity,
                     received_at=appended_event["received_at"],
                 )
+                updated_record["original_order_effect_confirmed"] = True
+                updated_record["confirmed_original_order_no"] = original_broker_order_no
+                updated_record["confirmed_original_order_queued_id"] = _clean_text(linked_original_record.get("id"))
+                updated_record["confirmed_original_order_id"] = _clean_text(linked_original_record.get("order_id"))
+                updated_record["original_order_effect_confirmed_at"] = appended_event["received_at"]
+                updated_record["original_order_effect_event_identity"] = event_identity
+                updated_record["original_order_effect_event_id"] = _event_id(event_identity)
+                updated_record["updated_at"] = now
+                updated_data["orders"][target_index] = updated_record
+            else:
+                linked_original_order_queued_id = _clean_text(linked_original_record.get("id"))
+                linked_original_status = _clean_text(linked_original_record.get("status"))
+                mutation_state["original_order_link_verified"] = True
+                mutation_state["original_order_effect_confirmed"] = False
+                mutation_state["linked_original_order_queued_id"] = linked_original_order_queued_id
+                mutation_state["linked_original_status"] = linked_original_status
+                mutation_state["linked_original_action"] = request_action
+                mutation_state.update(
+                    {
+                        "order_queued_id": order_queued_id,
+                        "broker_order_no": broker_order_no,
+                        "broker_order_no_enriched": broker_order_no_enriched,
+                        "event_identity": event_identity,
+                        "event_identity_source": event_identity_source,
+                        "execution_id": _clean_text(updated_record.get("execution_id")),
+                        "request_hash": _clean_text(updated_record.get("request_hash")),
+                        "lock_id": _clean_text(updated_record.get("lock_id")),
+                        "lifecycle_status": _clean_text(updated_record.get("status")),
+                        "lifecycle_updated": True,
+                    }
+                )
+                return {"data": updated_data}
             _append_chejan_event_fields(
                 linked_original_record,
                 now=now,
