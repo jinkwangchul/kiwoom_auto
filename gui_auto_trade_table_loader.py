@@ -95,6 +95,20 @@ from gui_ats_utils import (
 
 
 
+def auto_trade_setting_current_session_trade_started(window, persisted_trade_started: bool) -> bool:
+    if not persisted_trade_started:
+        return False
+
+    checker = getattr(window, "startup_recovery_session_ready", None)
+    if not callable(checker):
+        return True
+
+    try:
+        return bool(checker(refresh=False))
+    except Exception:
+        return False
+
+
 def auto_trade_load_selected_routine_stocks(window) -> None:
     routine_dir = window.current_selected_routine_dir()
     routine_name = window.current_selected_routine_name()
@@ -352,6 +366,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 operation_display_tooltip = operation_tooltip
 
             trade_started = auto_trade_setting_trade_started(state)
+            current_session_trade_started = auto_trade_setting_current_session_trade_started(
+                window,
+                trade_started,
+            )
             method_text = auto_trade_setting_method_text(display_status, config, state)
             liquidation_text = auto_trade_setting_liquidation_text(config, display_status, state)
 
@@ -393,7 +411,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             # - 현황 녹색/주황/시작 ON + 매수/매도/자동마감/조기마감: 방식 활성
             # - 청산은 기존 청산 규칙 + 운영중 + 보유수량 조건을 모두 만족할 때만 활성
             status_cell_active = (
-                trade_started
+                current_session_trade_started
                 and display_status not in ("긴급정지", "검토종목")
             )
             method_cell_active = (
@@ -403,7 +421,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             liquidation_has_policy = str(liquidation_text).strip() not in ("", "-")
             _liquidation_policy_for_style, liquidation_is_individual = effective_liquidation_policy_for_config(config)
             liquidation_cell_active = (
-                trade_started
+                current_session_trade_started
                 and has_holding
                 and liquidation_active
                 and liquidation_has_policy
@@ -433,7 +451,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 situation_rank = 3
             elif auto_trade_setting_no_next_step_notice(state):
                 situation_rank = 2
-            elif trade_started:
+            elif current_session_trade_started:
                 situation_rank = 1
             else:
                 situation_rank = 0
@@ -455,7 +473,11 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
             for col, value in enumerate(values):
                 if col == 3:
-                    item = create_auto_trade_situation_item(state, trade_started, display_status)
+                    item = create_auto_trade_situation_item(
+                        state,
+                        current_session_trade_started,
+                        display_status,
+                    )
                 elif col == 4:
                     item = create_auto_trade_setting_status_item(display_status)
                 else:
@@ -522,4 +544,3 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
 
     window.update_action_buttons()
-
