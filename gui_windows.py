@@ -679,7 +679,13 @@ class MainWindow(QMainWindow):
         window = getattr(self, "auto_trade_setting_window", None)
         handler = getattr(window, "handle_raw_chejan_event", None)
         if callable(handler):
-            self.last_chejan_record_result = handler(raw_event)
+            self.last_chejan_record_result = handler(
+                raw_event,
+                {
+                    "kiwoom_api_live_event": True,
+                    "live_event_source": "KiwoomApi.raw_chejan_received",
+                },
+            )
         else:
             self.last_chejan_record_result = {
                 "recorded": False,

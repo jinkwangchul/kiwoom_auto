@@ -1990,7 +1990,16 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             main_gui.MainWindow.refresh_kiwoom_accounts(parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
-            window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
+            confirmation_previews = []
+
+            def confirm(order, call_preview, queue_path, queue_snapshot):
+                confirmation_previews.append(call_preview)
+                self.assertNotEqual("SEND_ORDER_CALL_READY", call_preview.get("status"))
+                self.assertIn("operator final send confirmation is required", call_preview.get("issues", []))
+                self.assertEqual("SEND_ORDER_CONTRACT_READY", call_preview["adapter_contract_result"]["status"])
+                return True
+
+            window.confirm_manual_send_order = confirm
             window.read_order_from_queue_by_id = (
                 lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
                     window,
@@ -2008,6 +2017,15 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
             self.assertEqual(["0101", "BUY", "12345678", 1, "003550", 10, 1000, "00", ""], list(parent.kiwoom_api.send_order_calls[0]))
             self.assertEqual("SEND_CALL_ACCEPTED", window.send_order_reports[-1]["status"])
+            self.assertEqual(1, len(confirmation_previews))
+            self.assertEqual(
+                "FINAL_SEND_GATE_SERVICE",
+                window.send_order_reports[-1]["final_send_gate_result"]["final_send_gate_result_type"],
+            )
+            self.assertNotEqual(
+                "SELL_DISPATCH_FINAL_EXECUTION_GUARD",
+                window.send_order_reports[-1]["final_send_gate_result"].get("guard_type"),
+            )
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             actual = data["orders"][0]
             self.assertEqual("SEND_CALL_ACCEPTED", actual["status"])
@@ -2073,6 +2091,69 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
             self.assertEqual("send_order_environment", window.send_order_reports[-1]["stage"])
             self.assertIn("kiwoom api is not connected", window.send_order_reports[-1]["blocked_reasons"])
+
+    def test_manual_send_order_missing_order_account_blocks_without_selected_account_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order()
+            record.pop("account_no", None)
+            self._write_queue_for_send_order(queue_path, record)
+            window = self._window_for_queue_commit()
+            parent = window.parent()
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+            ):
+                gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            self.assertEqual("send_order_environment", window.send_order_reports[-1]["stage"])
+            self.assertIn("ORDER_QUEUED account_no is required", window.send_order_reports[-1]["blocked_reasons"])
+
+    def test_manual_send_order_request_account_mismatch_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order()
+            record["execution_request"]["request_preview"]["account_no"] = "87654321"
+            self._write_queue_for_send_order(queue_path, record)
+            window = self._window_for_queue_commit()
+            parent = window.parent()
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678", "87654321"], send_order_result=0)
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+            ):
+                gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            self.assertEqual("send_order_environment", window.send_order_reports[-1]["stage"])
+            self.assertIn(
+                "ORDER_QUEUED account_no does not match execution request account_no",
+                window.send_order_reports[-1]["blocked_reasons"],
+            )
 
     def test_manual_send_order_nonzero_records_send_call_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2173,8 +2254,22 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             }
 
             with mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path):
-                result = gui.AutoTradeSettingWindow.handle_raw_chejan_event(window, raw_event)
-                duplicate = gui.AutoTradeSettingWindow.handle_raw_chejan_event(window, raw_event)
+                result = gui.AutoTradeSettingWindow.handle_raw_chejan_event(
+                    window,
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+                duplicate = gui.AutoTradeSettingWindow.handle_raw_chejan_event(
+                    window,
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
 
             self.assertTrue(result["recorded"], result)
             data = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -2182,6 +2277,50 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertEqual("BRK_1", actual["broker_order_no"])
             self.assertFalse(duplicate["recorded"])
             self.assertTrue(duplicate.get("blocked_reasons"))
+
+    def test_raw_chejan_source_string_without_live_context_is_not_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order()
+            record.update(
+                {
+                    "status": "SEND_CALL_ACCEPTED",
+                    "send_order_called": True,
+                    "broker_api_called": True,
+                    "broker_call_executed": True,
+                    "send_call_result_known": True,
+                    "send_call_accepted": True,
+                }
+            )
+            self._write_queue_for_send_order(queue_path, record)
+            window = self._window_for_queue_commit()
+            raw_event = {
+                "source": "KiwoomApi.raw_chejan_received",
+                "gubun": "0",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9203": "BRK_1",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "907": "2",
+                    "913": "ACCEPT",
+                    "900": "10",
+                    "911": "0",
+                    "902": "10",
+                    "910": "0",
+                    "901": "1000",
+                },
+                "received_at": "2026-07-16 10:00:00",
+            }
+
+            with mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path):
+                result = gui.AutoTradeSettingWindow.handle_raw_chejan_event(window, raw_event)
+
+            self.assertFalse(result["recorded"], result)
+            self.assertEqual("chejan_record", result["stage"])
+            self.assertIn("Chejan event record confirmation is required", result["blocked_reasons"])
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertFalse(data["orders"][0].get("chejan_events"))
 
 
 if __name__ == "__main__":

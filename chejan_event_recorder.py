@@ -73,7 +73,13 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
 
 
 def _confirmed(context: Any) -> bool:
-    return _as_dict(context).get("manual_chejan_event_record_confirmed") is True
+    ctx = _as_dict(context)
+    if ctx.get("manual_chejan_event_record_confirmed") is True:
+        return True
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+    )
 
 
 def _expected_revision(context: Any) -> int | None:
@@ -653,7 +659,7 @@ def record_chejan_event(
         return _blocked("queue_path", "queue_path is required")
 
     if not _confirmed(context):
-        return _blocked("operator_confirmation", "manual Chejan event record confirmation is required")
+        return _blocked("operator_confirmation", "Chejan event record confirmation is required")
 
     target_path = Path(queue_path)
     before_sha256 = None

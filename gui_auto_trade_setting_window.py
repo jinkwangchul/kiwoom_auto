@@ -318,8 +318,12 @@ from gui_routine_registry import (
     read_routine_budget,
 )
 from execution_enable_service import commit_execution_enable, preview_execution_enable
+from execution_final_send_gate_input_adapter import adapt_final_send_gate_readiness_to_input
+from execution_final_send_gate_orchestrator import orchestrate_final_send_gate_preview
+from execution_final_send_gate_readiness_policy import evaluate_execution_final_send_gate_readiness
 from execution_queue_commit_service import commit_execution_queue_manually
 from execution_queue_commit_readiness_policy import evaluate_execution_queue_commit_readiness
+from execution_queue_review_to_send_order_preview_adapter import adapt_queue_review_to_send_order_preview
 from execution_queue_writer import claim_order_for_dispatch
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
@@ -342,6 +346,8 @@ from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
 from chejan_event_normalizer import normalize_kiwoom_chejan_event
 from chejan_event_recorder import record_chejan_event
 from chejan_event_review_service import review_chejan_event
+from final_send_gate_service import evaluate_final_send_gate
+from order_queued_review_service import review_order_queued_record
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -3120,6 +3126,11 @@ class AutoTradeSettingWindow(QDialog):
         preview_dict = preview if isinstance(preview, dict) else {}
         params = preview_dict.get("send_order_params")
         params_dict = params if isinstance(params, dict) else {}
+        if not params_dict:
+            adapter_contract = call_preview.get("adapter_contract_result")
+            adapter_contract_dict = adapter_contract if isinstance(adapter_contract, dict) else {}
+            params = adapter_contract_dict.get("send_order_params")
+            params_dict = params if isinstance(params, dict) else {}
         return "\n".join(
             [
                 "Manual Kiwoom SendOrder confirmation",
@@ -3190,7 +3201,8 @@ class AutoTradeSettingWindow(QDialog):
         execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
         request_preview = execution_request_dict.get("request_preview")
         request_preview_dict = request_preview if isinstance(request_preview, dict) else {}
-        request_account = str(request_preview_dict.get("account_no") or order.get("account_no") or "").strip()
+        order_account = str(order.get("account_no") or "").strip()
+        request_account = str(request_preview_dict.get("account_no") or "").strip()
 
         config, _source = self.real_preflight_stock_config_for_order(order)
         real_trade_enabled = bool(isinstance(config, dict) and config.get("real_trade_enabled") is True)
@@ -3208,8 +3220,16 @@ class AutoTradeSettingWindow(QDialog):
             issues.append("selected account is missing")
         if selected_account and accounts and selected_account not in accounts:
             issues.append("selected account is not in current Kiwoom account list")
+        if not order_account:
+            issues.append("ORDER_QUEUED account_no is required")
+        if not request_account:
+            issues.append("execution_request.request_preview.account_no is required")
+        if order_account and request_account and order_account != request_account:
+            issues.append("ORDER_QUEUED account_no does not match execution request account_no")
         if request_account and selected_account and request_account != selected_account:
-            issues.append("selected account does not match order account")
+            issues.append("selected account does not match execution request account")
+        if order_account and selected_account and order_account != selected_account:
+            issues.append("selected account does not match ORDER_QUEUED account")
         if not real_trade_enabled:
             issues.append("real trade is disabled for order stock")
         if not canonical_queue:
@@ -3220,6 +3240,7 @@ class AutoTradeSettingWindow(QDialog):
             "issues": issues,
             "kiwoom_connected": connected,
             "selected_account_no": selected_account,
+            "order_account_no": order_account,
             "request_account_no": request_account,
             "real_trade_enabled": real_trade_enabled,
             "canonical_queue_path": canonical_queue,
@@ -3242,6 +3263,8 @@ class AutoTradeSettingWindow(QDialog):
         self,
         order: dict[str, object],
         environment: dict[str, object],
+        *,
+        operator_confirmed: bool,
     ) -> dict[str, object]:
         execution_request = order.get("execution_request")
         execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
@@ -3257,7 +3280,7 @@ class AutoTradeSettingWindow(QDialog):
         ).strip().upper()
         price = request_preview_dict.get("price", order.get("price", 0))
         quantity = request_preview_dict.get("quantity", order.get("quantity", 0))
-        account_no = str(request_preview_dict.get("account_no") or environment.get("selected_account_no") or "").strip()
+        account_no = str(request_preview_dict.get("account_no") or "").strip()
         screen_no = str(request_preview_dict.get("screen_no") or "0101").strip()
 
         broker_dispatch_preview = {
@@ -3287,7 +3310,7 @@ class AutoTradeSettingWindow(QDialog):
             adapter_contract,
             {},
             {"connected": environment.get("kiwoom_connected"), "account_no": account_no},
-            {"manual_kiwoom_send_order_confirmed": True, "emergency_stop": False},
+            {"manual_kiwoom_send_order_confirmed": operator_confirmed is True, "emergency_stop": False},
         )
         call_preview = preview_kiwoom_send_order_call(
             safety,
@@ -3297,6 +3320,98 @@ class AutoTradeSettingWindow(QDialog):
         call_preview["adapter_contract_result"] = adapter_contract
         call_preview["safety_gate_result"] = safety
         return call_preview
+
+    def build_manual_final_send_gate_result(
+        self,
+        order: dict[str, object],
+        environment: dict[str, object],
+        queue_path: Path,
+        queue_snapshot: dict[str, object],
+        current_queue_snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        record_review = review_order_queued_record(order)
+        if record_review.get("review_ok") is not True:
+            return {
+                "final_send_gate_ok": False,
+                "send_gate_stage": "order_queued_record_review",
+                "blocked_reasons": list(record_review.get("blocked_reasons") or ["ORDER_QUEUED review failed"]),
+                "order_queued_record_review_result": record_review,
+            }
+
+        identity = self.send_order_identity_from_record(order)
+        queue_committed_review = {
+            "review_type": "EXECUTION_QUEUE_COMMITTED_REVIEW",
+            "status": "READY_FOR_FINAL_SEND_GATE",
+            "next_stage": "FINAL_SEND_GATE_REQUIRED",
+            "preview_only": True,
+            "queue_write": False,
+            "runtime_write": False,
+            "send_order_called": False,
+            "order_queued_record": order,
+            "identity": {
+                "order_id": identity.get("order_id"),
+                "source_signal_id": identity.get("source_signal_id"),
+                "execution_id": identity.get("execution_id"),
+                "request_hash": identity.get("request_hash"),
+                "lock_id": identity.get("lock_id"),
+            },
+            "issues": [],
+            "warnings": [],
+        }
+        adapter_result = adapt_queue_review_to_send_order_preview(queue_committed_review)
+        if adapter_result.get("status") != "READY_FOR_FINAL_SEND_GATE":
+            return {
+                "final_send_gate_ok": False,
+                "send_gate_stage": "send_order_preview_adapter",
+                "blocked_reasons": list(adapter_result.get("issues") or ["SendOrder preview adapter blocked"]),
+                "send_order_preview_adapter_result": adapter_result,
+            }
+
+        guard = {
+            "real_trade_enabled": environment.get("real_trade_enabled") is True,
+            "kiwoom_logged_in": environment.get("kiwoom_connected") is True,
+            "account_selected": bool(str(environment.get("selected_account_no") or "").strip()),
+            "account_no": str(environment.get("selected_account_no") or "").strip(),
+            "operator_confirmed": True,
+        }
+        final_context = {
+            "manual_final_send_confirmed": True,
+            "queue_path": str(queue_path),
+            "queue_snapshot_hash": queue_snapshot.get("sha256"),
+        }
+        readiness = evaluate_execution_final_send_gate_readiness(adapter_result, guard, context=final_context)
+        input_adapter = adapt_final_send_gate_readiness_to_input(readiness, guard, context=final_context)
+        orchestrator = orchestrate_final_send_gate_preview(input_adapter)
+        if orchestrator.get("status") != "READY_FOR_FINAL_SEND_GATE" or orchestrator.get("final_send_gate_ready") is not True:
+            return {
+                "final_send_gate_ok": False,
+                "send_gate_stage": "final_send_gate_orchestrator",
+                "blocked_reasons": list(orchestrator.get("issues") or ["Final Send Gate orchestrator blocked"]),
+                "final_send_gate_readiness_result": readiness,
+                "final_send_gate_input_adapter_result": input_adapter,
+                "final_send_gate_orchestrator_result": orchestrator,
+            }
+
+        final_input = orchestrator.get("final_send_gate_input")
+        final_input_dict = final_input if isinstance(final_input, dict) else {}
+        final_gate = evaluate_final_send_gate(
+            final_input_dict.get("adapter_preview_result"),
+            final_input_dict.get("order_queued_record"),
+            final_input_dict.get("current_guard"),
+            queue_snapshot=queue_snapshot,
+            current_queue_snapshot=current_queue_snapshot,
+            context=final_input_dict.get("context"),
+        )
+        final_gate["final_send_gate_result_type"] = "FINAL_SEND_GATE_SERVICE"
+        final_gate["queue_path"] = str(queue_path)
+        final_gate["queue_revision"] = current_queue_snapshot.get("revision")
+        final_gate["queue_snapshot_hash"] = current_queue_snapshot.get("sha256")
+        final_gate["identity"] = identity
+        final_gate["order_queued_id"] = identity.get("order_queued_id")
+        final_gate["final_send_gate_readiness_result"] = readiness
+        final_gate["final_send_gate_input_adapter_result"] = input_adapter
+        final_gate["final_send_gate_orchestrator_result"] = orchestrator
+        return final_gate
 
     def show_manual_send_order_result(self, result: dict[str, object]) -> None:
         dialog = QDialog(self)
@@ -3402,24 +3517,26 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("Manual SendOrder blocked")
             return
 
-        call_preview = self.build_manual_send_order_call_preview(order_dict, environment)
-        if call_preview.get("status") != "SEND_ORDER_CALL_READY":
+        display_preview = self.build_manual_send_order_call_preview(order_dict, environment, operator_confirmed=False)
+        adapter_contract_result = display_preview.get("adapter_contract_result")
+        adapter_contract_dict = adapter_contract_result if isinstance(adapter_contract_result, dict) else {}
+        if adapter_contract_dict.get("status") != "SEND_ORDER_CONTRACT_READY":
             result = {
                 "status": "BLOCKED",
-                "stage": "send_order_call_preview",
+                "stage": "send_order_display_preview",
                 "order_id": order_id,
                 "callable_executed": False,
                 "send_order_called": False,
                 "broker_api_called": False,
                 "actual_order_sent": False,
-                "blocked_reasons": list(call_preview.get("issues") or ["send order call preview is not ready"]),
-                "send_order_call_preview_result": call_preview,
+                "blocked_reasons": list(adapter_contract_dict.get("issues") or ["send order adapter contract is not ready"]),
+                "send_order_call_preview_result": display_preview,
             }
             self.show_manual_send_order_result(result)
             self.statusBarMessage("Manual SendOrder blocked")
             return
 
-        if not self.confirm_manual_send_order(order_dict, call_preview, queue_path, snapshot):
+        if not self.confirm_manual_send_order(order_dict, display_preview, queue_path, snapshot):
             self.statusBarMessage("Manual SendOrder cancelled")
             return
 
@@ -3440,23 +3557,52 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         identity = self.send_order_identity_from_record(order_dict)
+        final_gate = self.build_manual_final_send_gate_result(
+            order_dict,
+            environment,
+            queue_path,
+            snapshot,
+            current_snapshot,
+        )
+        if final_gate.get("final_send_gate_ok") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "final_send_gate",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(final_gate.get("blocked_reasons") or ["final send gate blocked"]),
+                "final_send_gate_result": final_gate,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        call_preview = self.build_manual_send_order_call_preview(order_dict, environment, operator_confirmed=True)
+        if call_preview.get("status") != "SEND_ORDER_CALL_READY":
+            result = {
+                "status": "BLOCKED",
+                "stage": "send_order_call_preview",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(call_preview.get("issues") or ["send order call preview is not ready"]),
+                "send_order_call_preview_result": call_preview,
+                "final_send_gate_result": final_gate,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
         claim_token = f"GUI_CLAIM_{uuid4().hex}"
-        final_guard = {
-            "guard_type": "SELL_DISPATCH_FINAL_EXECUTION_GUARD",
-            "status": "READY",
-            "final_guard_ready": True,
-            "queue_path": str(queue_path),
-            "queue_revision": current_snapshot.get("revision"),
-            "queue_snapshot_hash": current_snapshot.get("sha256"),
-            "guarded_identity": identity,
-            "send_order_called": False,
-            "broker_api_called": False,
-            "actual_order_sent": False,
-        }
         claim = claim_order_for_dispatch(
             queue_path,
             identity,
-            final_guard,
+            final_gate,
             claim_token=claim_token,
             claim_owner="GUI_MANUAL_SEND_ORDER",
             claim_source="gui_manual_send_order",
@@ -3464,6 +3610,8 @@ class AutoTradeSettingWindow(QDialog):
                 "dispatch_claim_owner": "GUI_MANUAL_SEND_ORDER",
                 "dispatch_claim_source": "gui_manual_send_order",
                 "dispatch_claim_ttl_sec": 60,
+                "queue_path": str(queue_path),
+                "queue_snapshot_hash": current_snapshot.get("sha256"),
             },
             expected_revision=current_snapshot.get("revision"),
         )
@@ -3478,6 +3626,7 @@ class AutoTradeSettingWindow(QDialog):
                 "actual_order_sent": False,
                 "blocked_reasons": list(claim.get("blocked_reasons") or ["dispatch claim failed"]),
                 "dispatch_claim_result": claim,
+                "final_send_gate_result": final_gate,
             }
             self.show_manual_send_order_result(result)
             self.statusBarMessage("Manual SendOrder blocked")
@@ -3499,12 +3648,17 @@ class AutoTradeSettingWindow(QDialog):
         )
         result["order_id"] = order_id
         result["dispatch_claim_result"] = claim
+        result["final_send_gate_result"] = final_gate
         result["send_order_call_preview_result"] = call_preview
         self.show_manual_send_order_result(result)
         status_text = "completed" if result.get("queue_result_recorded") else "blocked"
         self.statusBarMessage(f"Manual SendOrder {status_text}")
 
-    def handle_raw_chejan_event(self, raw_event: dict[str, object]) -> dict[str, object]:
+    def handle_raw_chejan_event(
+        self,
+        raw_event: dict[str, object],
+        live_context: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         normalized = normalize_kiwoom_chejan_event(raw_event)
         if normalized.get("normalized") is not True:
             return {"recorded": False, "stage": "normalize", "normalized_event": normalized}
@@ -3561,7 +3715,7 @@ class AutoTradeSettingWindow(QDialog):
             review,
             normalized,
             queue_path,
-            context={"manual_chejan_event_record_confirmed": True},
+            context=live_context or {},
         )
         return {
             "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,

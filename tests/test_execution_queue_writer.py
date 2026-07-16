@@ -1430,6 +1430,67 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertFalse(result["actual_order_sent"])
         self.assertFalse(result["broker_api_called"])
 
+    def test_dispatch_claim_accepts_common_final_send_gate_for_buy(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimable_record()
+        record["side"] = "BUY"
+        self._write_queue(queue_path, orders=[record])
+        identity = self._identity(record)
+        final_send_gate = {
+            "final_send_gate_result_type": "FINAL_SEND_GATE_SERVICE",
+            "final_send_gate_ok": True,
+            "next_stage": "SEND_ORDER_ENTRYPOINT_REQUIRED",
+            "no_send": True,
+            "send_order_called": False,
+            "queue_path": str(queue_path),
+            "queue_revision": 0,
+            "queue_snapshot_hash": "QUEUE_HASH",
+            "identity": identity,
+        }
+
+        result = claim_order_for_dispatch(
+            queue_path,
+            identity,
+            final_send_gate,
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context={
+                "dispatch_claim_owner": "GUI_MANUAL",
+                "dispatch_claim_source": "final_send_gate",
+                "dispatch_claim_ttl_sec": 60,
+                "queue_path": str(queue_path),
+                "queue_snapshot_hash": "QUEUE_HASH",
+            },
+            expected_revision=0,
+        )
+
+        self.assertTrue(result["claimed"], result)
+        self.assertEqual("DISPATCH_CLAIMED", self._read_queue(queue_path)["orders"][0]["status"])
+
+    def test_dispatch_claim_rejects_sell_guard_for_buy_record(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimable_record()
+        record["side"] = "BUY"
+        self._write_queue(queue_path, orders=[record])
+
+        result = claim_order_for_dispatch(
+            queue_path,
+            self._identity(record),
+            self._final_guard(record),
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context=self._claim_context(),
+            expected_revision=0,
+        )
+
+        self.assertFalse(result["committed"])
+        self.assertIn("SELL final guard cannot claim non-SELL order", result["blocked_reasons"])
+        self.assertEqual("ORDER_QUEUED", self._read_queue(queue_path)["orders"][0]["status"])
+
     def test_dispatch_claim_requires_execution_enabled_false(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
