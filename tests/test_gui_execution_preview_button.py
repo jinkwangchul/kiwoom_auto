@@ -2412,11 +2412,217 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertEqual("PARTIALLY_FILLED", queue["orders"][0]["status"])
             self.assertEqual(3, queue["orders"][0]["cumulative_filled_quantity"])
             self.assertEqual(7, queue["orders"][0]["remaining_quantity"])
+            self.assertFalse(queue["orders"][0]["manual_reconciliation_required"])
             self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
             self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
             self.assertFalse(duplicate["recorded"], duplicate)
             self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
             self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
+
+    def test_live_fill_failure_is_persisted_and_same_event_reprocesses_missing_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            fills_path = Path(tmp) / "fills.json"
+            positions_path = Path(tmp) / "positions.json"
+            record = self._order_queued_record_for_send_order()
+            record.update(
+                {
+                    "status": "SEND_CALL_ACCEPTED",
+                    "send_order_called": True,
+                    "broker_api_called": True,
+                    "broker_call_executed": True,
+                    "send_call_result_known": True,
+                    "send_call_accepted": True,
+                }
+            )
+            self._write_queue_for_send_order(queue_path, record)
+            fills_path.write_text("{bad json", encoding="utf-8")
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "0",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9203": "BRK_1",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "907": "2",
+                    "913": "체결",
+                    "900": "10",
+                    "911": "3",
+                    "902": "7",
+                    "910": "1000",
+                    "901": "1000",
+                    "909": "EXEC_NO_RETRY_FILL",
+                },
+                "received_at": "2026-07-16 10:03:00",
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "FILLS_PATH", fills_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                first = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+                queue_after_failure = json.loads(queue_path.read_text(encoding="utf-8"))
+                fills_path.write_text(json.dumps({"version": 1, "updated_at": None, "fills": []}), encoding="utf-8")
+                second = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+
+            self.assertTrue(first["manual_reconciliation_required"], first)
+            failed_order = queue_after_failure["orders"][0]
+            self.assertTrue(failed_order["manual_reconciliation_required"])
+            self.assertEqual("FILL_RECORD", failed_order["chejan_reconciliation_failed_stage"])
+            self.assertEqual(["QUEUE_LIFECYCLE"], failed_order["chejan_reconciliation_completed_steps"])
+            self.assertTrue(second["duplicate_reprocess"], second)
+            self.assertTrue(second["fill_result"]["fill_recorded"], second)
+            self.assertTrue(second["position_result"]["position_updated"], second)
+            final_order = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+            self.assertFalse(final_order["manual_reconciliation_required"])
+            self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
+            self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
+
+    def test_live_position_failure_is_persisted_and_same_event_reprocesses_position_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            fills_path = Path(tmp) / "fills.json"
+            positions_path = Path(tmp) / "positions.json"
+            record = self._order_queued_record_for_send_order()
+            record.update(
+                {
+                    "status": "SEND_CALL_ACCEPTED",
+                    "send_order_called": True,
+                    "broker_api_called": True,
+                    "broker_call_executed": True,
+                    "send_call_result_known": True,
+                    "send_call_accepted": True,
+                }
+            )
+            self._write_queue_for_send_order(queue_path, record)
+            positions_path.write_text("{bad json", encoding="utf-8")
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "0",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9203": "BRK_2",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "907": "2",
+                    "913": "체결",
+                    "900": "10",
+                    "911": "3",
+                    "902": "7",
+                    "910": "1000",
+                    "901": "1000",
+                    "909": "EXEC_NO_RETRY_POSITION",
+                },
+                "received_at": "2026-07-16 10:04:00",
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "FILLS_PATH", fills_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                first = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+                queue_after_failure = json.loads(queue_path.read_text(encoding="utf-8"))
+                positions_path.write_text(json.dumps({"version": 1, "updated_at": None, "positions": []}), encoding="utf-8")
+                second = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+
+            self.assertTrue(first["manual_reconciliation_required"], first)
+            self.assertTrue(first["fill_result"]["fill_recorded"], first)
+            failed_order = queue_after_failure["orders"][0]
+            self.assertTrue(failed_order["manual_reconciliation_required"])
+            self.assertEqual("POSITION_UPDATE", failed_order["chejan_reconciliation_failed_stage"])
+            self.assertEqual(["QUEUE_LIFECYCLE", "FILL_RECORD"], failed_order["chejan_reconciliation_completed_steps"])
+            self.assertTrue(second["duplicate_reprocess"], second)
+            self.assertFalse(second["fill_result"]["fill_recorded"], second)
+            self.assertTrue(second["position_result"]["position_updated"], second)
+            final_order = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+            self.assertFalse(final_order["manual_reconciliation_required"])
+            self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
+            self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
+
+    def test_sell_fill_without_existing_position_persists_reconciliation_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            fills_path = Path(tmp) / "fills.json"
+            positions_path = Path(tmp) / "positions.json"
+            record = self._order_queued_record_for_send_order(side="SELL")
+            record.update(
+                {
+                    "status": "SEND_CALL_ACCEPTED",
+                    "send_order_called": True,
+                    "broker_api_called": True,
+                    "broker_call_executed": True,
+                    "send_call_result_known": True,
+                    "send_call_accepted": True,
+                }
+            )
+            self._write_queue_for_send_order(queue_path, record)
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "0",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9203": "BRK_SELL_1",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "907": "1",
+                    "913": "체결",
+                    "900": "10",
+                    "911": "3",
+                    "902": "7",
+                    "910": "1000",
+                    "901": "1000",
+                    "909": "EXEC_NO_SELL_NO_POSITION",
+                },
+                "received_at": "2026-07-16 10:05:00",
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "FILLS_PATH", fills_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                result = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+
+            self.assertTrue(result["manual_reconciliation_required"], result)
+            self.assertTrue(result["fill_result"]["fill_recorded"], result)
+            self.assertFalse(result["position_result"]["position_updated"], result)
+            order = json.loads(queue_path.read_text(encoding="utf-8"))["orders"][0]
+            self.assertTrue(order["manual_reconciliation_required"])
+            self.assertEqual("POSITION_UPDATE", order["chejan_reconciliation_failed_stage"])
+            self.assertIn("SELL requires an existing open position", order["chejan_reconciliation_blocked_reasons"])
 
     def test_raw_chejan_source_string_without_live_context_is_not_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

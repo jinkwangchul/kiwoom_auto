@@ -13,6 +13,7 @@ gui_auto_trade_setting_window.py
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import shutil
@@ -324,7 +325,7 @@ from execution_final_send_gate_readiness_policy import evaluate_execution_final_
 from execution_queue_commit_service import commit_execution_queue_manually
 from execution_queue_commit_readiness_policy import evaluate_execution_queue_commit_readiness
 from execution_queue_review_to_send_order_preview_adapter import adapt_queue_review_to_send_order_preview
-from execution_queue_writer import claim_order_for_dispatch
+from execution_queue_writer import claim_order_for_dispatch, mutate_order_queue
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
@@ -442,31 +443,6 @@ def handle_kiwoom_raw_chejan_event(
         queue_path,
         context=live_context or {},
     )
-    fill_result: dict[str, object] | None = None
-    position_result: dict[str, object] | None = None
-    if (
-        recorded.get("recorded") is True
-        and recorded.get("next_stage") == "FILL_RECORD_REQUIRED"
-    ):
-        fill_result = record_execution_fill(
-            recorded,
-            normalized,
-            FILLS_PATH,
-            context=live_context or {},
-        )
-        fill_record = fill_result.get("fill_record") if isinstance(fill_result, dict) else None
-        if (
-            isinstance(fill_result, dict)
-            and fill_result.get("fill_recorded") is True
-            and isinstance(fill_record, dict)
-        ):
-            position_result = update_position_from_fill(
-                fill_result,
-                fill_record,
-                POSITIONS_PATH,
-                context=live_context or {},
-            )
-
     response = {
         "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,
         "stage": "chejan_record",
@@ -475,6 +451,18 @@ def handle_kiwoom_raw_chejan_event(
         "record_result": recorded,
         "blocked_reasons": list(recorded.get("blocked_reasons") or []),
     }
+    downstream_source = recorded
+    if response["recorded"] is not True and _chejan_record_duplicate(recorded):
+        reconstructed = _existing_chejan_record_result(candidates[0], normalized, recorded)
+        if reconstructed is not None:
+            downstream_source = reconstructed
+            response["duplicate_reprocess"] = True
+
+    fill_result, position_result, reconciliation_result = _record_fill_and_position_from_chejan(
+        downstream_source,
+        normalized,
+        live_context or {},
+    )
     if fill_result is not None:
         response["fill_result"] = fill_result
         if fill_result.get("fill_recorded") is not True:
@@ -485,7 +473,302 @@ def handle_kiwoom_raw_chejan_event(
         if position_result.get("position_updated") is not True:
             response["manual_reconciliation_required"] = True
             response["position_blocked_reasons"] = list(position_result.get("blocked_reasons") or [])
+    if reconciliation_result is not None:
+        response["reconciliation_result"] = reconciliation_result
     return response
+
+
+def _clean_runtime_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _chejan_record_duplicate(result: dict[str, object]) -> bool:
+    return result.get("duplicate") is True or result.get("idempotent") is True or _clean_runtime_text(result.get("record_stage")) == "duplicate_event"
+
+
+def _existing_chejan_record_result(
+    order_record: dict[str, object],
+    normalized_event: dict[str, object],
+    duplicate_result: dict[str, object],
+) -> dict[str, object] | None:
+    event_type = _clean_runtime_text(normalized_event.get("event_type"))
+    if event_type not in {"PARTIAL_FILL", "FULL_FILL"}:
+        return None
+    duplicate_identity = _clean_runtime_text(duplicate_result.get("event_identity")).upper()
+    events = order_record.get("chejan_events")
+    if not isinstance(events, list):
+        return None
+    matched_event: dict[str, object] | None = None
+    for event in events:
+        item = event if isinstance(event, dict) else {}
+        event_identity = _clean_runtime_text(item.get("event_identity")).upper()
+        if duplicate_identity and event_identity == duplicate_identity:
+            matched_event = item
+            break
+    if matched_event is None:
+        return None
+    return {
+        "recorded": True,
+        "record_stage": "chejan_event_already_recorded",
+        "next_stage": "FILL_RECORD_REQUIRED",
+        "changed": False,
+        "order_id": _clean_runtime_text(order_record.get("order_id")),
+        "order_queued_id": _clean_runtime_text(order_record.get("id")),
+        "broker_order_no": _clean_runtime_text(order_record.get("broker_order_no") or matched_event.get("broker_order_no")),
+        "event_type": event_type,
+        "matched_by": "existing_chejan_event",
+        "request_hash": _clean_runtime_text(order_record.get("request_hash")),
+        "lock_id": _clean_runtime_text(order_record.get("lock_id")),
+        "execution_id": _clean_runtime_text(order_record.get("execution_id")),
+        "event_identity": _clean_runtime_text(matched_event.get("event_identity")),
+        "event_identity_source": _clean_runtime_text(matched_event.get("event_identity_source")),
+        "lifecycle_status": _clean_runtime_text(order_record.get("status")),
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+
+
+def _read_runtime_json(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalized_execution_identity(normalized_event: dict[str, object]) -> tuple[str, str]:
+    raw_event = normalized_event.get("raw_event")
+    raw = raw_event if isinstance(raw_event, dict) else {}
+    fid_values = raw.get("fid_values")
+    fids = fid_values if isinstance(fid_values, dict) else {}
+    for source in (normalized_event, raw):
+        for field in ("execution_no", "broker_event_id", "event_id", "chejan_event_id", "fill_no", "trade_no"):
+            value = _clean_runtime_text(source.get(field))
+            if value:
+                return ("execution_no" if field == "execution_no" else "broker_event_id", value)
+    fid_909 = _clean_runtime_text(fids.get("909"))
+    if fid_909:
+        return "fid_909", fid_909
+    return "", ""
+
+
+def _matching_existing_fill_record(
+    fill: dict[str, object],
+    chejan_result: dict[str, object],
+    normalized_event: dict[str, object],
+) -> bool:
+    for field in ("order_id", "order_queued_id", "request_hash", "lock_id", "execution_id"):
+        expected = _clean_runtime_text(chejan_result.get(field))
+        actual = _clean_runtime_text(fill.get(field))
+        if expected and actual and expected != actual:
+            return False
+    for field in ("broker_order_no", "event_type"):
+        expected = _clean_runtime_text(chejan_result.get(field) or normalized_event.get(field))
+        actual = _clean_runtime_text(fill.get(field))
+        if expected and actual != expected:
+            return False
+    source, identity = _normalized_execution_identity(normalized_event)
+    if source and identity:
+        return (
+            _clean_runtime_text(fill.get("execution_identity_source")) == source
+            and _clean_runtime_text(fill.get("execution_identity")) == identity
+        )
+    return (
+        fill.get("filled_quantity") == normalized_event.get("filled_quantity")
+        and fill.get("remaining_quantity") == normalized_event.get("remaining_quantity")
+        and fill.get("filled_price") == normalized_event.get("filled_price")
+    )
+
+
+def _existing_fill_record(
+    fills_path: Path,
+    chejan_result: dict[str, object],
+    normalized_event: dict[str, object],
+) -> dict[str, object] | None:
+    data = _read_runtime_json(fills_path)
+    fills = data.get("fills") if isinstance(data, dict) else None
+    if not isinstance(fills, list):
+        return None
+    for fill in fills:
+        item = fill if isinstance(fill, dict) else {}
+        if _matching_existing_fill_record(item, chejan_result, normalized_event):
+            return dict(item)
+    return None
+
+
+def _position_result_ok(result: dict[str, object] | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("position_updated") is True:
+        return True
+    return _clean_runtime_text(result.get("position_stage")) in {"duplicate_fill", "fill_delta_noop"}
+
+
+def _set_queue_chejan_reconciliation_state(
+    queue_path: Path,
+    chejan_result: dict[str, object],
+    *,
+    required: bool,
+    failed_stage: str = "",
+    completed_steps: list[str] | None = None,
+    reasons: list[object] | None = None,
+    context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    event_identity = _clean_runtime_text(chejan_result.get("event_identity"))
+    order_queued_id = _clean_runtime_text(chejan_result.get("order_queued_id"))
+    order_id = _clean_runtime_text(chejan_result.get("order_id"))
+    request_hash = _clean_runtime_text(chejan_result.get("request_hash"))
+    lock_id = _clean_runtime_text(chejan_result.get("lock_id"))
+    execution_id = _clean_runtime_text(chejan_result.get("execution_id"))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def mutate(data: dict[str, object]) -> dict[str, object]:
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            return {"blocked": {"write_stage": "queue_structure", "blocked_reasons": ["queue orders must be a list"]}}
+        matches: list[tuple[int, dict[str, object]]] = []
+        for index, order in enumerate(orders):
+            item = order if isinstance(order, dict) else {}
+            if order_queued_id and _clean_runtime_text(item.get("id")) == order_queued_id:
+                matches.append((index, item))
+                continue
+            if (
+                order_id
+                and request_hash
+                and lock_id
+                and execution_id
+                and _clean_runtime_text(item.get("order_id")) == order_id
+                and _clean_runtime_text(item.get("request_hash")) == request_hash
+                and _clean_runtime_text(item.get("lock_id")) == lock_id
+                and _clean_runtime_text(item.get("execution_id")) == execution_id
+            ):
+                matches.append((index, item))
+        if len(matches) != 1:
+            return {"blocked": {"write_stage": "reconciliation_record", "blocked_reasons": [f"reconciliation target count is {len(matches)}"]}}
+        index, item = matches[0]
+        updated = deepcopy(data)
+        updated_order = deepcopy(item)
+        if required:
+            updated_order.update(
+                {
+                    "manual_reconciliation_required": True,
+                    "chejan_reconciliation_required": True,
+                    "chejan_reconciliation_failed_stage": failed_stage,
+                    "chejan_reconciliation_event_identity": event_identity,
+                    "chejan_reconciliation_completed_steps": list(completed_steps or []),
+                    "chejan_reconciliation_blocked_reasons": [str(reason) for reason in reasons or []],
+                    "chejan_reconciliation_updated_at": now,
+                    "automatic_retry_allowed": False,
+                }
+            )
+        else:
+            updated_order["manual_reconciliation_required"] = False
+            updated_order["chejan_reconciliation_required"] = False
+            updated_order["chejan_reconciliation_failed_stage"] = ""
+            updated_order["chejan_reconciliation_event_identity"] = event_identity
+            updated_order["chejan_reconciliation_completed_steps"] = list(completed_steps or [])
+            updated_order["chejan_reconciliation_blocked_reasons"] = []
+            updated_order["chejan_reconciliation_resolved_at"] = now
+            updated_order["automatic_retry_allowed"] = False
+        updated["orders"][index] = updated_order
+        return {
+            "data": updated,
+            "result": {
+                "reconciliation_state_recorded": True,
+                "manual_reconciliation_required": required,
+                "failed_stage": failed_stage,
+                "event_identity": event_identity,
+                "completed_steps": list(completed_steps or []),
+            },
+        }
+
+    return mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="chejan_reconciliation_state",
+        success_stage="chejan_reconciliation_state_recorded",
+        next_stage="CHEJAN_RECONCILIATION_REVIEW_REQUIRED" if required else "CHEJAN_RECONCILIATION_RESOLVED",
+        context=context or {},
+        backup=True,
+    )
+
+
+def _record_fill_and_position_from_chejan(
+    chejan_result: dict[str, object],
+    normalized_event: dict[str, object],
+    live_context: dict[str, object],
+) -> tuple[dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
+    if chejan_result.get("recorded") is not True or chejan_result.get("next_stage") != "FILL_RECORD_REQUIRED":
+        return None, None, None
+
+    completed_steps = ["QUEUE_LIFECYCLE"]
+    fill_result = record_execution_fill(
+        chejan_result,
+        normalized_event,
+        FILLS_PATH,
+        context=live_context,
+    )
+    fill_record = fill_result.get("fill_record") if isinstance(fill_result, dict) else None
+    if not isinstance(fill_record, dict):
+        fill_record = _existing_fill_record(FILLS_PATH, chejan_result, normalized_event)
+    if not isinstance(fill_record, dict):
+        reconciliation = _set_queue_chejan_reconciliation_state(
+            ORDER_QUEUE_PATH,
+            chejan_result,
+            required=True,
+            failed_stage="FILL_RECORD",
+            completed_steps=completed_steps,
+            reasons=list(fill_result.get("blocked_reasons") or []) if isinstance(fill_result, dict) else ["fill record failed"],
+            context=live_context,
+        )
+        return fill_result, None, reconciliation
+
+    completed_steps.append("FILL_RECORD")
+    position_result = update_position_from_fill(
+        fill_result if isinstance(fill_result, dict) and fill_result.get("fill_recorded") is True else {
+            "fill_recorded": True,
+            "fill_stage": "execution_fill_already_recorded",
+            "next_stage": "POSITION_UPDATE_REQUIRED",
+            "fill_id": fill_record.get("fill_id"),
+            "event_type": fill_record.get("event_type"),
+            "order_id": fill_record.get("order_id"),
+            "order_queued_id": fill_record.get("order_queued_id"),
+            "broker_order_no": fill_record.get("broker_order_no"),
+            "request_hash": fill_record.get("request_hash"),
+            "lock_id": fill_record.get("lock_id"),
+            "execution_id": fill_record.get("execution_id"),
+            "filled_quantity": fill_record.get("filled_quantity"),
+            "filled_price": fill_record.get("filled_price"),
+            "blocked_reasons": [],
+            "warnings": [],
+        },
+        fill_record,
+        POSITIONS_PATH,
+        context=live_context,
+    )
+    if not _position_result_ok(position_result):
+        reconciliation = _set_queue_chejan_reconciliation_state(
+            ORDER_QUEUE_PATH,
+            chejan_result,
+            required=True,
+            failed_stage="POSITION_UPDATE",
+            completed_steps=completed_steps,
+            reasons=list(position_result.get("blocked_reasons") or []) if isinstance(position_result, dict) else ["position update failed"],
+            context=live_context,
+        )
+        return fill_result, position_result, reconciliation
+
+    completed_steps.append("POSITION_UPDATE")
+    reconciliation = _set_queue_chejan_reconciliation_state(
+        ORDER_QUEUE_PATH,
+        chejan_result,
+        required=False,
+        completed_steps=completed_steps,
+        context=live_context,
+    )
+    return fill_result, position_result, reconciliation
 
 
 def get_routine_dirs() -> list[Path]:
