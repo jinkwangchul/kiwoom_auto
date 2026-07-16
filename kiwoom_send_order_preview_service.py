@@ -18,6 +18,8 @@ REVIEW_NEXT_STAGE_REQUIRED = "SEND_ORDER_REQUEST_PREVIEW_REQUIRED"
 
 _INTERNAL_SIDES = {"BUY", "SELL"}
 _INTERNAL_HOGAS = {"MARKET", "LIMIT"}
+_CANCEL_ACTIONS = {"CANCEL", "CANCEL_ORDER", "ORDER_CANCEL", "CANCEL_PENDING_ORDER"}
+_MODIFY_ACTIONS = {"MODIFY", "AMEND", "CORRECT", "CHANGE", "MODIFY_ORDER", "ORDER_MODIFY"}
 _CANCEL_MODIFY_TOKENS = {
     "CANCEL",
     "CANCEL_ORDER",
@@ -119,6 +121,16 @@ def _cancel_or_modify_candidate(request_preview: dict[str, Any]) -> bool:
     return False
 
 
+def _request_action(request_preview: dict[str, Any]) -> str:
+    for field in ("action", "order_action", "request_type", "order_kind", "trade_type", "order_category"):
+        value = _norm(request_preview.get(field))
+        if value in _CANCEL_ACTIONS:
+            return "CANCEL"
+        if value in _MODIFY_ACTIONS:
+            return "MODIFY"
+    return ""
+
+
 def _require_consistent_field(
     record: dict[str, Any],
     execution_request: dict[str, Any],
@@ -189,8 +201,13 @@ def preview_kiwoom_send_order_request(
     if side not in _INTERNAL_SIDES:
         return _blocked("request_preview", "side/order_type must be BUY or SELL")
 
+    order_action = _request_action(request_preview)
+    original_order_no = _clean_text(request_preview.get("original_order_no") or request_preview.get("org_order_no"))
     if _cancel_or_modify_candidate(request_preview):
-        return _blocked("request_preview", "cancel/modify orders are not supported in adapter preview phase 1")
+        if not order_action:
+            return _blocked("request_preview", "cancel/modify action is required")
+        if not original_order_no:
+            return _blocked("request_preview", "original_order_no is required for cancel/modify")
 
     code = _clean_text(request_preview.get("code"))
     if not code:
@@ -210,10 +227,13 @@ def preview_kiwoom_send_order_request(
     if hoga not in _INTERNAL_HOGAS:
         return _blocked("request_preview", "hoga must be MARKET or LIMIT")
 
-    if hoga == "LIMIT" and not _positive_number(price):
+    if order_action == "CANCEL" and not _zero_or_positive_number(price):
+        return _blocked("request_preview", "cancel price must be zero or greater")
+
+    if order_action != "CANCEL" and hoga == "LIMIT" and not _positive_number(price):
         return _blocked("request_preview", "LIMIT price must be greater than 0")
 
-    if hoga == "MARKET" and not _zero_or_positive_number(price):
+    if order_action != "CANCEL" and hoga == "MARKET" and not _zero_or_positive_number(price):
         return _blocked("request_preview", "MARKET price must be zero or greater")
 
     order_id = _first_text(order_queued_record.get("order_id"), execution_request.get("order_id"))
@@ -224,7 +244,6 @@ def preview_kiwoom_send_order_request(
     execution_id = _first_text(order_queued_record.get("execution_id"), execution_request.get("execution_id"))
     request_hash = _first_text(order_queued_record.get("request_hash"), execution_request.get("request_hash"))
     lock_id = _first_text(order_queued_record.get("lock_id"), execution_request.get("lock_id"))
-    original_order_no = _clean_text(request_preview.get("original_order_no"))
     screen_no = _clean_text(request_preview.get("screen_no")) or "9000"
     rqname = _clean_text(request_preview.get("rqname")) or f"SEND_ORDER_PREVIEW_{order_id}"
 
@@ -243,6 +262,7 @@ def preview_kiwoom_send_order_request(
             "lock_id": lock_id,
             "account_no": account_no,
             "side": side,
+            "order_action": order_action or "NEW",
             "code": code,
             "quantity": _number_for_preview(quantity),
             "price": _number_for_preview(price),

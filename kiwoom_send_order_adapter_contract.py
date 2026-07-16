@@ -25,6 +25,22 @@ ORDER_NAME_MAP = {
     "BUY": "BUY",
     "SELL": "SELL",
 }
+ACTION_ORDER_TYPE_MAP = {
+    ("BUY", "NEW"): 1,
+    ("SELL", "NEW"): 2,
+    ("BUY", "CANCEL"): 3,
+    ("SELL", "CANCEL"): 4,
+    ("BUY", "MODIFY"): 5,
+    ("SELL", "MODIFY"): 6,
+}
+ACTION_ORDER_NAME_MAP = {
+    ("BUY", "NEW"): "BUY",
+    ("SELL", "NEW"): "SELL",
+    ("BUY", "CANCEL"): "BUY_CANCEL",
+    ("SELL", "CANCEL"): "SELL_CANCEL",
+    ("BUY", "MODIFY"): "BUY_MODIFY",
+    ("SELL", "MODIFY"): "SELL_MODIFY",
+}
 HOGA_MAP = {
     "LIMIT": "00",
     "LMT": "00",
@@ -168,6 +184,9 @@ def build_kiwoom_send_order_adapter_contract(
     side = _upper(params.get("side") or params.get("order_type"))
     if side not in ORDER_TYPE_MAP:
         return _result(status=STATUS_INVALID, issues=["order_type mapping failed"])
+    action = _upper(params.get("order_action") or params.get("action") or "NEW")
+    if action not in {"NEW", "CANCEL", "MODIFY"}:
+        return _result(status=STATUS_INVALID, issues=["order_action mapping failed"])
 
     hoga_key = _upper(params.get("hoga"))
     hoga_code = HOGA_MAP.get(hoga_key, "")
@@ -177,13 +196,18 @@ def build_kiwoom_send_order_adapter_contract(
     code = _text(params.get("code"))
     quantity = params.get("quantity")
     price = params.get("price")
+    original_order_no = _text(params.get("original_order_no") or params.get("org_order_no"))
     if not code:
         return _result(status=STATUS_INVALID, issues=["code is required"])
     if not _positive_number(quantity):
         return _result(status=STATUS_INVALID, issues=["quantity must be greater than 0"])
-    if hoga_code == "00" and not _positive_number(price):
+    if action in {"CANCEL", "MODIFY"} and not original_order_no:
+        return _result(status=STATUS_INVALID, issues=["original_order_no is required for cancel/modify"])
+    if action == "CANCEL" and not _zero_or_positive_number(price):
+        return _result(status=STATUS_INVALID, issues=["cancel price must be zero or greater"])
+    if action != "CANCEL" and hoga_code == "00" and not _positive_number(price):
         return _result(status=STATUS_INVALID, issues=["LIMIT price must be greater than 0"])
-    if hoga_code == "03" and not _zero_or_positive_number(price):
+    if action != "CANCEL" and hoga_code == "03" and not _zero_or_positive_number(price):
         return _result(status=STATUS_INVALID, issues=["MARKET price must be zero or greater"])
 
     required_text = {
@@ -196,14 +220,14 @@ def build_kiwoom_send_order_adapter_contract(
 
     send_order_params = {
         "screen_no": screen_no,
-        "order_name": ORDER_NAME_MAP[side],
+        "order_name": ACTION_ORDER_NAME_MAP[(side, action)],
         "account_no": account_no,
-        "order_type": ORDER_TYPE_MAP[side],
+        "order_type": ACTION_ORDER_TYPE_MAP[(side, action)],
         "code": code,
         "quantity": _number(quantity),
         "price": _number(price),
         "hoga": hoga_code,
-        "original_order_no": _text(params.get("original_order_no") or params.get("org_order_no")),
+        "original_order_no": original_order_no,
     }
     contract = {
         "dispatch_id": _text(params.get("dispatch_id")),

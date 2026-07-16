@@ -215,6 +215,68 @@ class KiwoomSendOrderAdapterContractTest(unittest.TestCase):
         self.assertEqual(2, result["send_order_params"]["order_type"])
         self.assertEqual("00", result["send_order_params"]["hoga"])
 
+    def test_buy_cancel_maps_to_kiwoom_cancel_type_with_original_order_no(self) -> None:
+        preview = self._broker_preview()
+        preview["send_order_params_preview"].update(
+            {
+                "side": "BUY",
+                "order_action": "CANCEL",
+                "quantity": 3,
+                "price": 0,
+                "hoga": "LIMIT",
+                "original_order_no": "12345",
+            }
+        )
+
+        result = build_kiwoom_send_order_adapter_contract(
+            preview,
+            self._account_context(),
+            self._screen_context(),
+        )
+
+        self.assertEqual("SEND_ORDER_CONTRACT_READY", result["status"], result)
+        self.assertEqual("BUY_CANCEL", result["send_order_params"]["order_name"])
+        self.assertEqual(3, result["send_order_params"]["order_type"])
+        self.assertEqual(0, result["send_order_params"]["price"])
+        self.assertEqual("12345", result["send_order_params"]["original_order_no"])
+
+    def test_sell_modify_maps_to_kiwoom_modify_type(self) -> None:
+        preview = self._broker_preview()
+        preview["send_order_params_preview"].update(
+            {
+                "side": "SELL",
+                "order_action": "MODIFY",
+                "quantity": 2,
+                "price": 1200,
+                "hoga": "LIMIT",
+                "original_order_no": "67890",
+            }
+        )
+
+        result = build_kiwoom_send_order_adapter_contract(
+            preview,
+            self._account_context(),
+            self._screen_context(),
+        )
+
+        self.assertEqual("SEND_ORDER_CONTRACT_READY", result["status"], result)
+        self.assertEqual("SELL_MODIFY", result["send_order_params"]["order_name"])
+        self.assertEqual(6, result["send_order_params"]["order_type"])
+        self.assertEqual("67890", result["send_order_params"]["original_order_no"])
+
+    def test_cancel_modify_requires_original_order_no(self) -> None:
+        preview = self._broker_preview()
+        preview["send_order_params_preview"].update({"order_action": "CANCEL", "price": 0, "hoga": "LIMIT"})
+
+        result = build_kiwoom_send_order_adapter_contract(
+            preview,
+            self._account_context(),
+            self._screen_context(),
+        )
+
+        self.assertEqual("INVALID", result["status"])
+        self.assertIn("original_order_no is required for cancel/modify", result["issues"])
+
     def test_inputs_are_not_mutated(self) -> None:
         preview = self._broker_preview()
         account_context = self._account_context()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -324,7 +325,7 @@ from execution_final_send_gate_readiness_policy import evaluate_execution_final_
 from execution_queue_commit_service import commit_execution_queue_manually
 from execution_queue_commit_readiness_policy import evaluate_execution_queue_commit_readiness
 from execution_queue_review_to_send_order_preview_adapter import adapt_queue_review_to_send_order_preview
-from execution_queue_writer import claim_order_for_dispatch
+from execution_queue_writer import claim_order_for_dispatch, commit_execution_queue_write
 from execution_preview_order_service import preview_execution_for_real_ready_order
 from execution_preview_reporter import build_execution_preview_report
 from execution_readiness_preview_controller import build_execution_readiness_preview_from_context
@@ -996,6 +997,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_real_ready_preflight = QPushButton("REAL_READY 수동 점검")
         self.btn_execution_preview = QPushButton("Execution Preview")
         self.btn_manual_send_order = QPushButton("Manual SendOrder")
+        self.btn_manual_cancel_pending_order = QPushButton("Manual Cancel")
+        self.btn_manual_modify_pending_order = QPushButton("Manual Modify")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
         self.btn_early_close.setMinimumHeight(28)
@@ -1005,6 +1008,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_real_ready_preflight.setMinimumHeight(28)
         self.btn_execution_preview.setMinimumHeight(28)
         self.btn_manual_send_order.setMinimumHeight(28)
+        self.btn_manual_cancel_pending_order.setMinimumHeight(28)
+        self.btn_manual_modify_pending_order.setMinimumHeight(28)
         self.btn_manual_queue_commit.setMinimumHeight(28)
         self.btn_manual_queue_commit.setEnabled(False)
         self.btn_fetch_minute_candles.setMinimumHeight(28)
@@ -1085,6 +1090,8 @@ class AutoTradeSettingWindow(QDialog):
         selected_routine_header_layout.addSpacing(16)
         selected_routine_header_layout.addWidget(self.btn_manual_queue_commit)
         selected_routine_header_layout.addWidget(self.btn_manual_send_order)
+        selected_routine_header_layout.addWidget(self.btn_manual_cancel_pending_order)
+        selected_routine_header_layout.addWidget(self.btn_manual_modify_pending_order)
         selected_routine_header_layout.addWidget(self.btn_early_close)
         selected_routine_header_layout.addWidget(self.btn_stop)
 
@@ -1227,6 +1234,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_execution_preview.clicked.connect(self.preview_execution_for_real_ready_order_manual)
         self.btn_manual_queue_commit.clicked.connect(self.commit_last_execution_preview_queue_manually)
         self.btn_manual_send_order.clicked.connect(self.send_order_for_order_queued_manually)
+        self.btn_manual_cancel_pending_order.clicked.connect(self.cancel_pending_order_manually)
+        self.btn_manual_modify_pending_order.clicked.connect(self.modify_pending_order_manually)
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
         self.btn_delete.clicked.connect(self.unregister_selected_auto_trade_stocks)
@@ -3551,6 +3560,7 @@ class AutoTradeSettingWindow(QDialog):
                 "account_no": account_no,
                 "screen_no": screen_no,
                 "side": side,
+                "order_action": str(request_preview_dict.get("order_action") or request_preview_dict.get("action") or "NEW").strip().upper(),
                 "code": str(request_preview_dict.get("code") or order.get("code") or "").strip(),
                 "quantity": quantity,
                 "price": price,
@@ -3714,11 +3724,471 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         dialog.exec_()
 
-    def send_order_for_order_queued_manually(self) -> None:
-        order_id, accepted = QInputDialog.getText(self, "Manual SendOrder", "ORDER_QUEUED record id:")
+    def _queue_data_for_manual_order_action(self, queue_path: Path) -> tuple[dict[str, object], list[object], list[str]]:
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {}, [], [f"failed to read order_queue json: {exc}"]
+        if not isinstance(data, dict):
+            return {}, [], ["order_queue root must be an object"]
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            return data, [], ["order_queue orders must be a list"]
+        return data, orders, []
+
+    def _pending_cancel_duplicate_reason(self, orders: list[object], original_order_no: str) -> str:
+        active_statuses = {
+            "ORDER_QUEUED",
+            "DISPATCH_CLAIMED",
+            "SEND_ATTEMPTED",
+            "SEND_CALL_IN_PROGRESS",
+            "SEND_CALL_ACCEPTED",
+            "SEND_UNCERTAIN",
+        }
+        for item in orders:
+            record = item if isinstance(item, dict) else {}
+            execution_request = record.get("execution_request")
+            request_preview = execution_request.get("request_preview") if isinstance(execution_request, dict) else {}
+            if not isinstance(request_preview, dict):
+                continue
+            if str(request_preview.get("order_action") or "").strip().upper() != "CANCEL":
+                continue
+            if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
+                continue
+            if str(record.get("status") or "").strip().upper() in active_statuses:
+                return "active cancel request already exists for original_order_no"
+        return ""
+
+    def _pending_modify_duplicate_reason(self, orders: list[object], original_order_no: str) -> str:
+        active_statuses = {
+            "ORDER_QUEUED",
+            "DISPATCH_CLAIMED",
+            "SEND_ATTEMPTED",
+            "SEND_CALL_IN_PROGRESS",
+            "SEND_CALL_ACCEPTED",
+            "SEND_UNCERTAIN",
+        }
+        for item in orders:
+            record = item if isinstance(item, dict) else {}
+            execution_request = record.get("execution_request")
+            request_preview = execution_request.get("request_preview") if isinstance(execution_request, dict) else {}
+            if not isinstance(request_preview, dict):
+                continue
+            if str(request_preview.get("order_action") or "").strip().upper() != "MODIFY":
+                continue
+            if str(request_preview.get("original_order_no") or "").strip() != original_order_no:
+                continue
+            if str(record.get("status") or "").strip().upper() in active_statuses:
+                return "active modify request already exists for original_order_no"
+        return ""
+
+    def _build_manual_cancel_order_queued_preview(
+        self,
+        source_order: dict[str, object],
+        *,
+        queue_revision: object,
+    ) -> dict[str, object]:
+        source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
+        source_signal_id = str(source_order.get("source_signal_id") or "").strip()
+        broker_order_no = str(source_order.get("broker_order_no") or "").strip()
+        account_no = str(source_order.get("account_no") or "").strip()
+        code = str(source_order.get("code") or "").strip()
+        side = str(source_order.get("side") or "").strip().upper()
+        remaining_quantity = int(source_order.get("remaining_quantity") or 0)
+        suffix = uuid4().hex[:12]
+        order_id = f"{source_order_id}_CANCEL_{suffix}"
+        execution_id = f"EXEC_CANCEL_{suffix}"
+        lock_id = f"LOCK_CANCEL_{suffix}"
+        candidate_id = f"CANCEL_CANDIDATE_{suffix}"
+        queue_pending_id = f"QUEUE_PENDING_{candidate_id}"
+        hash_payload = {
+            "action": "CANCEL",
+            "source_order_id": source_order_id,
+            "broker_order_no": broker_order_no,
+            "account_no": account_no,
+            "code": code,
+            "side": side,
+            "quantity": remaining_quantity,
+            "lock_id": lock_id,
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(hash_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        execution_request = {
+            "execution_id": execution_id,
+            "order_id": order_id,
+            "source_signal_id": source_signal_id,
+            "lock_id": lock_id,
+            "request_hash": request_hash,
+            "guard_snapshot": {"account_no": account_no, "source_queue_revision": queue_revision},
+            "request_preview": {
+                "account_no": account_no,
+                "screen_no": "0101",
+                "side": side,
+                "order_action": "CANCEL",
+                "code": code,
+                "quantity": remaining_quantity,
+                "price": 0,
+                "hoga": "LIMIT",
+                "original_order_no": broker_order_no,
+                "source_order_id": source_order_id,
+            },
+        }
+        return {
+            "write_preview": True,
+            "write_stage": "order_queued_record_preview_created",
+            "next_stage": "QUEUE_WRITE_REQUIRED",
+            "preview_only": True,
+            "no_write": True,
+            "blocked_reasons": [],
+            "order_queued_record_preview": {
+                "id": f"ORDER_QUEUED_{order_id}",
+                "status": "ORDER_QUEUED",
+                "source": "execution_queue_pending",
+                "source_signal_id": source_signal_id,
+                "order_id": order_id,
+                "candidate_id": candidate_id,
+                "queue_pending_id": queue_pending_id,
+                "request_hash": request_hash,
+                "lock_id": lock_id,
+                "execution_id": execution_id,
+                "execution_request": execution_request,
+                "queue_contract_version": "manual-cancel-1",
+                "send_order_called": False,
+                "execution_enabled": False,
+                "blocked_reasons": [],
+                "account_no": account_no,
+                "code": code,
+                "side": side,
+                "quantity": remaining_quantity,
+                "price": 0,
+                "order_type": "LIMIT",
+                "order_action": "CANCEL",
+                "cancel_source_order_id": source_order_id,
+            },
+        }
+
+    def _build_manual_modify_order_queued_preview(
+        self,
+        source_order: dict[str, object],
+        *,
+        queue_revision: object,
+        modify_quantity: int,
+        modify_price: int,
+    ) -> dict[str, object]:
+        source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
+        source_signal_id = str(source_order.get("source_signal_id") or "").strip()
+        broker_order_no = str(source_order.get("broker_order_no") or "").strip()
+        account_no = str(source_order.get("account_no") or "").strip()
+        code = str(source_order.get("code") or "").strip()
+        side = str(source_order.get("side") or "").strip().upper()
+        suffix = uuid4().hex[:12]
+        order_id = f"{source_order_id}_MODIFY_{suffix}"
+        execution_id = f"EXEC_MODIFY_{suffix}"
+        lock_id = f"LOCK_MODIFY_{suffix}"
+        candidate_id = f"MODIFY_CANDIDATE_{suffix}"
+        queue_pending_id = f"QUEUE_PENDING_{candidate_id}"
+        hash_payload = {
+            "action": "MODIFY",
+            "source_order_id": source_order_id,
+            "broker_order_no": broker_order_no,
+            "account_no": account_no,
+            "code": code,
+            "side": side,
+            "quantity": modify_quantity,
+            "price": modify_price,
+            "lock_id": lock_id,
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(hash_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        execution_request = {
+            "execution_id": execution_id,
+            "order_id": order_id,
+            "source_signal_id": source_signal_id,
+            "lock_id": lock_id,
+            "request_hash": request_hash,
+            "guard_snapshot": {"account_no": account_no, "source_queue_revision": queue_revision},
+            "request_preview": {
+                "account_no": account_no,
+                "screen_no": "0101",
+                "side": side,
+                "order_action": "MODIFY",
+                "code": code,
+                "quantity": modify_quantity,
+                "price": modify_price,
+                "hoga": "LIMIT",
+                "original_order_no": broker_order_no,
+                "source_order_id": source_order_id,
+            },
+        }
+        return {
+            "write_preview": True,
+            "write_stage": "order_queued_record_preview_created",
+            "next_stage": "QUEUE_WRITE_REQUIRED",
+            "preview_only": True,
+            "no_write": True,
+            "blocked_reasons": [],
+            "order_queued_record_preview": {
+                "id": f"ORDER_QUEUED_{order_id}",
+                "status": "ORDER_QUEUED",
+                "source": "execution_queue_pending",
+                "source_signal_id": source_signal_id,
+                "order_id": order_id,
+                "candidate_id": candidate_id,
+                "queue_pending_id": queue_pending_id,
+                "request_hash": request_hash,
+                "lock_id": lock_id,
+                "execution_id": execution_id,
+                "execution_request": execution_request,
+                "queue_contract_version": "manual-modify-1",
+                "send_order_called": False,
+                "execution_enabled": False,
+                "blocked_reasons": [],
+                "account_no": account_no,
+                "code": code,
+                "side": side,
+                "quantity": modify_quantity,
+                "price": modify_price,
+                "order_type": "LIMIT",
+                "order_action": "MODIFY",
+                "modify_source_order_id": source_order_id,
+            },
+        }
+
+    def confirm_manual_cancel_pending_order(self, source_order: dict[str, object], preview: dict[str, object]) -> bool:
+        message = "\n".join(
+            [
+                "Manual pending order cancel",
+                "",
+                "This creates an ORDER_QUEUED cancel request and then uses the existing Manual SendOrder flow.",
+                "The original open order is not marked cancelled until Kiwoom Chejan confirms it.",
+                "",
+                f"source_order_id: {source_order.get('order_id', source_order.get('id', '-'))}",
+                f"broker_order_no: {source_order.get('broker_order_no', '-')}",
+                f"remaining_quantity: {source_order.get('remaining_quantity', '-')}",
+                f"account_no: {source_order.get('account_no', '-')}",
+                f"code: {source_order.get('code', '-')}",
+            ]
+        )
+        return QMessageBox.question(self, "Manual Cancel", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+
+    def confirm_manual_modify_pending_order(self, source_order: dict[str, object], preview: dict[str, object]) -> bool:
+        request_preview = preview["order_queued_record_preview"]["execution_request"]["request_preview"]
+        message = "\n".join(
+            [
+                "Manual pending order modify",
+                "",
+                "This creates an ORDER_QUEUED modify request and then uses the existing Manual SendOrder flow.",
+                "The original open order is not changed until Kiwoom Chejan confirms it.",
+                "",
+                f"source_order_id: {source_order.get('order_id', source_order.get('id', '-'))}",
+                f"broker_order_no: {source_order.get('broker_order_no', '-')}",
+                f"remaining_quantity: {source_order.get('remaining_quantity', '-')}",
+                f"modify_quantity: {request_preview.get('quantity', '-')}",
+                f"modify_price: {request_preview.get('price', '-')}",
+            ]
+        )
+        return QMessageBox.question(self, "Manual Modify", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+
+    def cancel_pending_order_manually(self) -> None:
+        source_id, accepted = QInputDialog.getText(self, "Manual Cancel", "BROKER_ACCEPTED/PARTIALLY_FILLED order id:")
         if not accepted:
             return
-        order_id = str(order_id or "").strip()
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            self.statusBarMessage("Manual Cancel: source order id is required")
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        data, orders, issues = self._queue_data_for_manual_order_action(queue_path)
+        if issues:
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "cancel_read_queue", "blocked_reasons": issues})
+            return
+        source_order = None
+        for item in orders:
+            record = item if isinstance(item, dict) else {}
+            if str(record.get("id") or "").strip() == source_id or str(record.get("order_id") or "").strip() == source_id:
+                source_order = deepcopy(record)
+                break
+        if not isinstance(source_order, dict):
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "cancel_source_order", "blocked_reasons": ["source order not found"]})
+            return
+
+        status = str(source_order.get("status") or "").strip().upper()
+        broker_order_no = str(source_order.get("broker_order_no") or "").strip()
+        try:
+            remaining_quantity = int(source_order.get("remaining_quantity") or 0)
+        except Exception:
+            remaining_quantity = 0
+        blocked: list[str] = []
+        if status not in {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+            blocked.append("source order status is not cancelable")
+        if not broker_order_no:
+            blocked.append("source order broker_order_no is required")
+        if remaining_quantity <= 0:
+            blocked.append("source order remaining_quantity must be greater than 0")
+        duplicate_reason = self._pending_cancel_duplicate_reason(orders, broker_order_no)
+        if duplicate_reason:
+            blocked.append(duplicate_reason)
+        environment = self.build_manual_send_order_environment(source_order, queue_path)
+        if environment.get("send_order_environment_ready") is not True:
+            blocked.extend(list(environment.get("issues") or []))
+        if blocked:
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "cancel_source_order", "blocked_reasons": blocked})
+            return
+
+        preview = self._build_manual_cancel_order_queued_preview(source_order, queue_revision=snapshot.get("revision"))
+        if not self.confirm_manual_cancel_pending_order(source_order, preview):
+            self.statusBarMessage("Manual Cancel cancelled")
+            return
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            self.show_manual_send_order_result(
+                {
+                    "status": "BLOCKED",
+                    "stage": "cancel_stale_queue_snapshot",
+                    "blocked_reasons": ["queue file changed after cancel preview; retry from latest queue"],
+                }
+            )
+            return
+        commit_result = commit_execution_queue_write(
+            preview,
+            queue_path,
+            context={"manual_queue_write_confirmed": True, "manual_pending_cancel_confirmed": True},
+            expected_revision=current_snapshot.get("revision"),
+        )
+        if commit_result.get("committed") is not True or commit_result.get("post_write_verified") is not True:
+            self.show_manual_send_order_result(
+                {
+                    "status": "BLOCKED",
+                    "stage": "cancel_queue_commit",
+                    "blocked_reasons": list(commit_result.get("blocked_reasons") or ["cancel queue commit failed"]),
+                    "cancel_queue_commit_result": commit_result,
+                }
+            )
+            return
+
+        cancel_record = preview["order_queued_record_preview"]
+        self.send_order_for_order_queued_manually(str(cancel_record.get("id") or ""))
+
+    def modify_pending_order_manually(self) -> None:
+        source_id, accepted = QInputDialog.getText(self, "Manual Modify", "BROKER_ACCEPTED/PARTIALLY_FILLED order id:")
+        if not accepted:
+            return
+        source_id = str(source_id or "").strip()
+        if not source_id:
+            self.statusBarMessage("Manual Modify: source order id is required")
+            return
+        raw_details, accepted = QInputDialog.getText(self, "Manual Modify", "modify quantity,price:")
+        if not accepted:
+            return
+        parts = [part.strip() for part in str(raw_details or "").split(",")]
+        if len(parts) != 2:
+            self.show_manual_send_order_result(
+                {"status": "BLOCKED", "stage": "modify_input", "blocked_reasons": ["modify input must be quantity,price"]}
+            )
+            return
+        try:
+            modify_quantity = int(parts[0])
+            modify_price = int(parts[1])
+        except Exception:
+            self.show_manual_send_order_result(
+                {"status": "BLOCKED", "stage": "modify_input", "blocked_reasons": ["modify quantity and price must be integers"]}
+            )
+            return
+
+        queue_path = ORDER_QUEUE_PATH
+        snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        data, orders, issues = self._queue_data_for_manual_order_action(queue_path)
+        if issues:
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "modify_read_queue", "blocked_reasons": issues})
+            return
+        source_order = None
+        for item in orders:
+            record = item if isinstance(item, dict) else {}
+            if str(record.get("id") or "").strip() == source_id or str(record.get("order_id") or "").strip() == source_id:
+                source_order = deepcopy(record)
+                break
+        if not isinstance(source_order, dict):
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "modify_source_order", "blocked_reasons": ["source order not found"]})
+            return
+
+        status = str(source_order.get("status") or "").strip().upper()
+        broker_order_no = str(source_order.get("broker_order_no") or "").strip()
+        try:
+            remaining_quantity = int(source_order.get("remaining_quantity") or 0)
+        except Exception:
+            remaining_quantity = 0
+        blocked: list[str] = []
+        if status not in {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+            blocked.append("source order status is not modifiable")
+        if not broker_order_no:
+            blocked.append("source order broker_order_no is required")
+        if remaining_quantity <= 0:
+            blocked.append("source order remaining_quantity must be greater than 0")
+        if modify_quantity <= 0 or modify_quantity > remaining_quantity:
+            blocked.append("modify quantity must be between 1 and remaining_quantity")
+        if modify_price <= 0:
+            blocked.append("modify price must be greater than 0")
+        duplicate_reason = self._pending_modify_duplicate_reason(orders, broker_order_no)
+        if duplicate_reason:
+            blocked.append(duplicate_reason)
+        environment = self.build_manual_send_order_environment(source_order, queue_path)
+        if environment.get("send_order_environment_ready") is not True:
+            blocked.extend(list(environment.get("issues") or []))
+        if blocked:
+            self.show_manual_send_order_result({"status": "BLOCKED", "stage": "modify_source_order", "blocked_reasons": blocked})
+            return
+
+        preview = self._build_manual_modify_order_queued_preview(
+            source_order,
+            queue_revision=snapshot.get("revision"),
+            modify_quantity=modify_quantity,
+            modify_price=modify_price,
+        )
+        if not self.confirm_manual_modify_pending_order(source_order, preview):
+            self.statusBarMessage("Manual Modify cancelled")
+            return
+        current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+        if snapshot.get("sha256") != current_snapshot.get("sha256"):
+            self.show_manual_send_order_result(
+                {
+                    "status": "BLOCKED",
+                    "stage": "modify_stale_queue_snapshot",
+                    "blocked_reasons": ["queue file changed after modify preview; retry from latest queue"],
+                }
+            )
+            return
+        commit_result = commit_execution_queue_write(
+            preview,
+            queue_path,
+            context={"manual_queue_write_confirmed": True, "manual_pending_modify_confirmed": True},
+            expected_revision=current_snapshot.get("revision"),
+        )
+        if commit_result.get("committed") is not True or commit_result.get("post_write_verified") is not True:
+            self.show_manual_send_order_result(
+                {
+                    "status": "BLOCKED",
+                    "stage": "modify_queue_commit",
+                    "blocked_reasons": list(commit_result.get("blocked_reasons") or ["modify queue commit failed"]),
+                    "modify_queue_commit_result": commit_result,
+                }
+            )
+            return
+
+        modify_record = preview["order_queued_record_preview"]
+        self.send_order_for_order_queued_manually(str(modify_record.get("id") or ""))
+
+    def send_order_for_order_queued_manually(self, order_id_override: str | None = None) -> None:
+        if order_id_override is None:
+            order_id, accepted = QInputDialog.getText(self, "Manual SendOrder", "ORDER_QUEUED record id:")
+            if not accepted:
+                return
+            order_id = str(order_id or "").strip()
+        else:
+            order_id = str(order_id_override or "").strip()
         if not order_id:
             self.statusBarMessage("Manual SendOrder: ORDER_QUEUED record id is required")
             return
