@@ -307,6 +307,202 @@ def _stored_event_identity(stored_event: Any) -> str:
     return derived
 
 
+def chejan_event_identity(normalized_event: Any, *, event_type: str | None = None, broker_order_no: str | None = None) -> tuple[str, str]:
+    event = _as_dict(normalized_event)
+    return _event_identity(
+        event,
+        _clean_text(event_type or event.get("event_type")),
+        _clean_text(broker_order_no or event.get("broker_order_no")),
+    )
+
+
+def existing_chejan_record_result(
+    order_record: Any,
+    normalized_event: Any,
+    duplicate_result: Any = None,
+) -> dict[str, Any] | None:
+    record = _as_dict(order_record)
+    event = _as_dict(normalized_event)
+    event_type = _clean_text(event.get("event_type"))
+    if event_type not in _FILL_RECORD_TYPES:
+        return None
+    duplicate = _as_dict(duplicate_result)
+    duplicate_identity = _clean_text(duplicate.get("event_identity")).upper()
+    broker_order_no = _clean_text(record.get("broker_order_no") or event.get("broker_order_no"))
+    if not duplicate_identity:
+        duplicate_identity, _ = _event_identity(event, event_type, broker_order_no)
+    events = record.get("chejan_events")
+    if not isinstance(events, list):
+        return None
+    matched_event: dict[str, Any] | None = None
+    for stored_event in events:
+        item = _as_dict(stored_event)
+        if duplicate_identity and _stored_event_identity(item) == duplicate_identity:
+            matched_event = item
+            break
+    if matched_event is None:
+        return None
+    return {
+        "recorded": True,
+        "record_stage": "chejan_event_already_recorded",
+        "next_stage": NEXT_STAGE_FILL_RECORD_REQUIRED,
+        "changed": False,
+        "order_id": _clean_text(record.get("order_id")),
+        "order_queued_id": _clean_text(record.get("id")),
+        "broker_order_no": _clean_text(record.get("broker_order_no") or matched_event.get("broker_order_no")),
+        "event_type": event_type,
+        "matched_by": "existing_chejan_event",
+        "request_hash": _clean_text(record.get("request_hash")),
+        "lock_id": _clean_text(record.get("lock_id")),
+        "execution_id": _clean_text(record.get("execution_id")),
+        "event_identity": _clean_text(matched_event.get("event_identity")),
+        "event_identity_source": _clean_text(matched_event.get("event_identity_source")),
+        "lifecycle_status": _clean_text(record.get("status")),
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+
+
+def _reconciliation_items(record: dict[str, Any]) -> list[dict[str, Any]]:
+    items = record.get("chejan_reconciliation_items")
+    if not isinstance(items, list):
+        return []
+    return [deepcopy(item) for item in items if isinstance(item, dict)]
+
+
+def _other_manual_reconciliation_required(record: dict[str, Any]) -> bool:
+    if record.get("send_uncertain") is True or record.get("call_execution_uncertain") is True:
+        return True
+    for field in (
+        "manual_reconciliation_reason",
+        "manual_reconciliation_stage",
+        "manual_reconciliation_source",
+    ):
+        value = _clean_text(record.get(field))
+        if value and value not in {"chejan", "chejan_event", "chejan_reconciliation"}:
+            return True
+    return False
+
+
+def mark_chejan_reconciliation_state(
+    queue_path: str | Path,
+    chejan_event_record_result: Any,
+    *,
+    required: bool,
+    failed_stage: str = "",
+    completed_steps: list[str] | None = None,
+    reasons: list[Any] | None = None,
+    context: Any = None,
+) -> dict[str, Any]:
+    chejan_result = _as_dict(chejan_event_record_result)
+    event_identity = _clean_text(chejan_result.get("event_identity"))
+    order_queued_id = _clean_text(chejan_result.get("order_queued_id"))
+    order_id = _clean_text(chejan_result.get("order_id"))
+    request_hash = _clean_text(chejan_result.get("request_hash"))
+    lock_id = _clean_text(chejan_result.get("lock_id"))
+    execution_id = _clean_text(chejan_result.get("execution_id"))
+    now = _now_text()
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            return {"blocked": _blocked("queue_structure", "queue orders must be a list")}
+        matches: list[tuple[int, dict[str, Any]]] = []
+        for index, order in enumerate(orders):
+            item = _as_dict(order)
+            if order_queued_id and _clean_text(item.get("id")) == order_queued_id:
+                matches.append((index, item))
+                continue
+            if (
+                order_id
+                and request_hash
+                and lock_id
+                and execution_id
+                and _clean_text(item.get("order_id")) == order_id
+                and _clean_text(item.get("request_hash")) == request_hash
+                and _clean_text(item.get("lock_id")) == lock_id
+                and _clean_text(item.get("execution_id")) == execution_id
+            ):
+                matches.append((index, item))
+        if len(matches) != 1:
+            return {"blocked": _blocked("reconciliation_record", f"reconciliation target count is {len(matches)}")}
+
+        index, item = matches[0]
+        updated = deepcopy(data)
+        updated_order = deepcopy(item)
+        items = _reconciliation_items(updated_order)
+        item_index = next(
+            (
+                idx for idx, existing in enumerate(items)
+                if _clean_text(existing.get("event_identity")) == event_identity
+            ),
+            -1,
+        )
+        reconciliation_item = items[item_index] if item_index >= 0 else {"event_identity": event_identity}
+        reconciliation_item.update(
+            {
+                "event_identity": event_identity,
+                "event_identity_source": _clean_text(chejan_result.get("event_identity_source")),
+                "required": bool(required),
+                "failed_stage": failed_stage if required else "",
+                "completed_steps": list(completed_steps or []),
+                "blocked_reasons": [str(reason) for reason in reasons or []] if required else [],
+                "updated_at": now,
+            }
+        )
+        if required:
+            reconciliation_item.pop("resolved_at", None)
+        else:
+            reconciliation_item["resolved_at"] = now
+        if item_index >= 0:
+            items[item_index] = reconciliation_item
+        else:
+            items.append(reconciliation_item)
+
+        pending_items = [existing for existing in items if existing.get("required") is True]
+        updated_order["chejan_reconciliation_items"] = items
+        updated_order["chejan_reconciliation_required"] = bool(pending_items)
+        updated_order["chejan_reconciliation_failed_stage"] = _clean_text(pending_items[-1].get("failed_stage")) if pending_items else ""
+        updated_order["chejan_reconciliation_event_identity"] = _clean_text(pending_items[-1].get("event_identity")) if pending_items else event_identity
+        updated_order["chejan_reconciliation_completed_steps"] = list(reconciliation_item.get("completed_steps") or [])
+        updated_order["chejan_reconciliation_blocked_reasons"] = list(pending_items[-1].get("blocked_reasons") or []) if pending_items else []
+        if required:
+            updated_order["chejan_reconciliation_updated_at"] = now
+        else:
+            updated_order["chejan_reconciliation_resolved_at"] = now
+        updated_order["manual_reconciliation_required"] = bool(pending_items) or _other_manual_reconciliation_required(updated_order)
+        updated_order["automatic_retry_allowed"] = False
+        updated["orders"][index] = updated_order
+        return {
+            "data": updated,
+            "result": {
+                "reconciliation_state_recorded": True,
+                "manual_reconciliation_required": updated_order["manual_reconciliation_required"],
+                "chejan_reconciliation_required": bool(pending_items),
+                "failed_stage": failed_stage,
+                "event_identity": event_identity,
+                "completed_steps": list(completed_steps or []),
+                "pending_event_identities": [_clean_text(existing.get("event_identity")) for existing in pending_items],
+            },
+        }
+
+    mutation_result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="chejan_reconciliation_state",
+        success_stage="chejan_reconciliation_state_recorded",
+        next_stage="CHEJAN_RECONCILIATION_REVIEW_REQUIRED" if required else "CHEJAN_RECONCILIATION_RESOLVED",
+        context=context,
+        backup=True,
+    )
+    persisted = mutation_result.get("committed") is True and mutation_result.get("post_write_verified") is True
+    mutation_result["reconciliation_persisted"] = persisted
+    if not persisted:
+        reasons = mutation_result.get("blocked_reasons")
+        mutation_result["reconciliation_persist_failed_reasons"] = list(reasons) if isinstance(reasons, list) else ["chejan reconciliation queue mutation failed"]
+    return mutation_result
+
+
 def _event_id(event_identity: str) -> str:
     return f"CHEJAN_EVENT_{event_identity}"
 
