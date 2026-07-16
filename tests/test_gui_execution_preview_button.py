@@ -336,7 +336,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "blocked_reasons": [],
         }
         window.confirm_execution_runtime_commit = lambda order, guard, **kwargs: True
-        window.commit_execution_runtime_for_preview = lambda order, guard, result: {
+        window.commit_execution_runtime_for_preview = lambda order, guard, result, **kwargs: {
             "runtime_commit_ready": True,
             "runtime_commit_stage": "runtime_committed",
             "runtime_commit_result": self._runtime_commit_result(),
@@ -402,7 +402,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "lock_id": "LOCK_1",
         }
 
-    def _runtime_environment_flags(self) -> dict[str, object]:
+    def _runtime_environment_flags(self, *args, **kwargs) -> dict[str, object]:
         return {
             "real_runtime_file_init_enabled": True,
             "allow_project_runtime_file_init": True,
@@ -411,6 +411,55 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "source": "test_runtime_environment_source",
             "issues": [],
         }
+
+    def test_runtime_environment_flags_use_real_guard_and_canonical_paths(self) -> None:
+        window = self._window_for_queue_commit()
+        order = {"id": "ORDER_1"}
+        guard = {
+            "kiwoom_logged_in": True,
+            "account_selected": True,
+            "account_no": "12345678",
+            "real_trade_enabled": True,
+        }
+
+        flags = gui.AutoTradeSettingWindow.execution_runtime_environment_flags(
+            window,
+            order,
+            guard,
+            order_executions_path=gui.ORDER_EXECUTIONS_PATH,
+            order_locks_path=gui.ORDER_LOCKS_PATH,
+        )
+
+        self.assertTrue(flags["real_runtime_file_init_enabled"])
+        self.assertTrue(flags["allow_project_runtime_file_init"])
+        self.assertTrue(flags["real_runtime_commit_enabled"])
+        self.assertTrue(flags["allow_project_runtime_commit"])
+        self.assertEqual([], flags["issues"])
+
+    def test_runtime_environment_flags_fail_closed_for_noncanonical_or_invalid_guard(self) -> None:
+        window = self._window_for_queue_commit()
+        order = {"id": "ORDER_1"}
+        guard = {
+            "kiwoom_logged_in": False,
+            "account_selected": True,
+            "account_no": "12345678",
+            "real_trade_enabled": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            flags = gui.AutoTradeSettingWindow.execution_runtime_environment_flags(
+                window,
+                order,
+                guard,
+                order_executions_path=gui.Path(temp_dir) / "order_executions.json",
+                order_locks_path=gui.Path(temp_dir) / "order_locks.json",
+            )
+
+        self.assertFalse(flags["real_runtime_file_init_enabled"])
+        self.assertFalse(flags["allow_project_runtime_file_init"])
+        self.assertFalse(flags["real_runtime_commit_enabled"])
+        self.assertFalse(flags["allow_project_runtime_commit"])
+        self.assertIn("kiwoom api is not connected", flags["issues"])
+        self.assertIn("runtime target is not the canonical project runtime path", flags["issues"])
 
     def _queue_snapshot(self, sha256: str = "HASH_BEFORE") -> dict[str, object]:
         return {
@@ -1632,6 +1681,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "queue_file_snapshot",
                 side_effect=[self._queue_snapshot(), self._queue_snapshot("HASH_AFTER")],
             ),
+            mock.patch.object(
+                gui.AutoTradeSettingWindow,
+                "verify_manual_queue_commit_read_back",
+                return_value={"verified": True, "stage": "verified", "record": {}, "issues": []},
+            ) as read_back,
             mock.patch.object(gui, "commit_execution_queue_manually", return_value=commit_result) as commit_service,
             mock.patch("kiwoom_order_adapter.send_order_stub") as send_order_stub,
         ):
@@ -1651,7 +1705,136 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertEqual("HASH_BEFORE", window.commit_reports[0]["before_sha256"])
         self.assertEqual("HASH_AFTER", window.commit_reports[0]["after_sha256"])
         self.assertTrue(window.commit_reports[0]["changed"])
+        self.assertTrue(window.commit_reports[0]["queue_commit_read_back_verified"])
+        read_back.assert_called_once()
         send_order_stub.assert_not_called()
+
+    def test_manual_queue_commit_read_back_verifies_order_queued_identity(self) -> None:
+        window = self._window_for_queue_commit()
+        queue_write_preview = self._queue_write_preview_result()
+        record = dict(queue_write_preview["order_queued_record_preview"])
+        record.update(
+            {
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_path = gui.Path(temp_dir) / "order_queue.json"
+            queue_path.write_text(json.dumps({"orders": [record]}, ensure_ascii=False), encoding="utf-8")
+
+            result = gui.AutoTradeSettingWindow.verify_manual_queue_commit_read_back(
+                window,
+                queue_path=queue_path,
+                queue_write_preview_result=queue_write_preview,
+                runtime_commit_result=self._runtime_commit_result(),
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual("ORDER_QUEUED", result["record"]["status"])
+
+    def test_manual_queue_commit_read_back_blocks_identity_mismatch(self) -> None:
+        window = self._window_for_queue_commit()
+        queue_write_preview = self._queue_write_preview_result()
+        runtime_result = dict(self._runtime_commit_result())
+        runtime_result["lock_id"] = "OTHER_LOCK"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue_path = gui.Path(temp_dir) / "order_queue.json"
+            queue_path.write_text(json.dumps({"orders": []}, ensure_ascii=False), encoding="utf-8")
+
+            result = gui.AutoTradeSettingWindow.verify_manual_queue_commit_read_back(
+                window,
+                queue_path=queue_path,
+                queue_write_preview_result=queue_write_preview,
+                runtime_commit_result=runtime_result,
+            )
+
+        self.assertFalse(result["verified"])
+        self.assertIn("runtime/queue identity mismatch before read-back: lock_id", result["issues"])
+
+    def test_gui_production_caller_reaches_order_queued_for_buy_and_sell(self) -> None:
+        for side in ("BUY", "SELL"):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as temp_dir:
+                runtime_dir = gui.Path(temp_dir) / "runtime"
+                runtime_dir.mkdir()
+                queue_path = runtime_dir / "order_queue.json"
+                executions_path = runtime_dir / "order_executions.json"
+                locks_path = runtime_dir / "order_locks.json"
+                order_id = f"ORDER_{side}_1"
+                queue_path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "revision": 0,
+                            "updated_at": "",
+                            "orders": [
+                                {
+                                    "id": order_id,
+                                    "status": "REAL_READY",
+                                    "source_signal_id": f"SIG_{side}_1",
+                                    "code": "003550",
+                                    "side": side,
+                                    "quantity": 3,
+                                    "price": 85000,
+                                    "execution_enabled": True,
+                                    "order_intent": {"side": side, "hoga": "MARKET"},
+                                    "send_order_called": False,
+                                    "broker_api_called": False,
+                                    "actual_order_sent": False,
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                window = self._window_for_queue_commit()
+                window.reports = []
+                window.show_execution_preview_report = lambda report: window.reports.append(report)
+                window.read_order_from_queue_by_id = (
+                    lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                        window,
+                        current_order_id,
+                        current_queue_path,
+                    )
+                )
+                window.commit_execution_runtime_for_preview = (
+                    lambda order, guard, result, **kwargs: gui.AutoTradeSettingWindow.commit_execution_runtime_for_preview(
+                        window,
+                        order,
+                        guard,
+                        result,
+                        **kwargs,
+                    )
+                )
+                window.confirm_execution_runtime_commit = lambda order, guard, **kwargs: True
+                window.confirm_execution_runtime_file_init = lambda **kwargs: True
+                window.confirm_manual_queue_commit = lambda queue_write_preview, queue_path, queue_snapshot=None: True
+
+                with (
+                    mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                    mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
+                    mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
+                    mock.patch.object(gui.QInputDialog, "getText", return_value=(order_id, True)),
+                    mock.patch("kiwoom_order_adapter.send_order_stub") as send_order_stub,
+                ):
+                    gui.AutoTradeSettingWindow.preview_execution_for_real_ready_order_manual(window)
+                    gui.AutoTradeSettingWindow.commit_last_execution_preview_queue_manually(window)
+
+                data = json.loads(queue_path.read_text(encoding="utf-8"))
+                queued = [
+                    item for item in data["orders"]
+                    if isinstance(item, dict)
+                    and item.get("status") == "ORDER_QUEUED"
+                    and item.get("order_id") == order_id
+                ]
+                self.assertEqual(1, len(queued))
+                self.assertTrue(window.commit_reports[-1]["manual_commit"])
+                self.assertTrue(window.commit_reports[-1]["queue_commit_read_back_verified"])
+                self.assertTrue(executions_path.exists())
+                self.assertTrue(locks_path.exists())
+                send_order_stub.assert_not_called()
 
     def test_manual_queue_commit_failure_result_is_displayed(self) -> None:
         window = self._window_for_queue_commit()

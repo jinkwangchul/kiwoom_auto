@@ -2297,19 +2297,54 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         return dialog.exec_() == QDialog.Accepted
 
-    def execution_runtime_environment_flags(self) -> dict[str, object]:
+    def execution_runtime_environment_flags(
+        self,
+        order: dict[str, object] | None = None,
+        guard: dict[str, object] | None = None,
+        *,
+        order_executions_path: Path = ORDER_EXECUTIONS_PATH,
+        order_locks_path: Path = ORDER_LOCKS_PATH,
+    ) -> dict[str, object]:
+        order_dict = order if isinstance(order, dict) else {}
+        guard_dict = guard if isinstance(guard, dict) else {}
+        try:
+            canonical_executions = order_executions_path.resolve() == ORDER_EXECUTIONS_PATH.resolve()
+            canonical_locks = order_locks_path.resolve() == ORDER_LOCKS_PATH.resolve()
+        except Exception:
+            canonical_executions = False
+            canonical_locks = False
+
+        issues: list[str] = []
+        if guard_dict.get("kiwoom_logged_in") is not True:
+            issues.append("kiwoom api is not connected")
+        if guard_dict.get("account_selected") is not True or not str(guard_dict.get("account_no") or "").strip():
+            issues.append("selected account is missing or stale")
+        if guard_dict.get("real_trade_enabled") is not True:
+            issues.append("real trade is disabled for order stock")
+        if not canonical_executions or not canonical_locks:
+            issues.append("runtime target is not the canonical project runtime path")
+        if not str(order_dict.get("id") or "").strip():
+            issues.append("order id is missing")
+
+        allowed = not issues
         return {
-            "real_runtime_file_init_enabled": False,
-            "allow_project_runtime_file_init": False,
-            "real_runtime_commit_enabled": False,
-            "allow_project_runtime_commit": False,
-            "source": "missing_production_runtime_environment_source",
-            "issues": ["runtime file-init/commit environment source is not configured"],
+            "real_runtime_file_init_enabled": allowed,
+            "allow_project_runtime_file_init": allowed,
+            "real_runtime_commit_enabled": allowed,
+            "allow_project_runtime_commit": allowed,
+            "source": "gui_real_preflight_guard",
+            "order_id": str(order_dict.get("id") or "").strip(),
+            "account_no": str(guard_dict.get("account_no") or "").strip(),
+            "canonical_order_executions_path": canonical_executions,
+            "canonical_order_locks_path": canonical_locks,
+            "issues": issues,
         }
 
     def ensure_execution_runtime_files_ready(
         self,
         *,
+        order: dict[str, object] | None = None,
+        guard: dict[str, object] | None = None,
         order_executions_path: Path = ORDER_EXECUTIONS_PATH,
         order_locks_path: Path = ORDER_LOCKS_PATH,
     ) -> dict[str, object]:
@@ -2332,7 +2367,12 @@ class AutoTradeSettingWindow(QDialog):
                 "blocked_reasons": list(read_result.get("issues") or ["runtime files are invalid"]),
             }
 
-        environment_flags = self.execution_runtime_environment_flags()
+        environment_flags = self.execution_runtime_environment_flags(
+            order,
+            guard,
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+        )
         allow_project_runtime_path = environment_flags.get("allow_project_runtime_file_init") is True
         file_init_preview = build_execution_runtime_file_init_preview(
             order_executions_path,
@@ -2426,6 +2466,8 @@ class AutoTradeSettingWindow(QDialog):
     ) -> dict[str, object]:
         del execution_preview_result
         runtime_files = self.ensure_execution_runtime_files_ready(
+            order=order,
+            guard=guard,
             order_executions_path=order_executions_path,
             order_locks_path=order_locks_path,
         )
@@ -2442,7 +2484,12 @@ class AutoTradeSettingWindow(QDialog):
             "manual_execution_runtime_commit_confirmed": True,
             "manual_runtime_file_write_confirmed": True,
         }
-        environment_flags = self.execution_runtime_environment_flags()
+        environment_flags = self.execution_runtime_environment_flags(
+            order,
+            guard,
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+        )
         storage = ExecutionRuntimeStorage(order_executions_path, order_locks_path)
         runtime_dry_run = run_execution_runtime_dry_run(
             order,
@@ -2559,10 +2606,16 @@ class AutoTradeSettingWindow(QDialog):
                 return
 
             guard = self.build_real_preflight_guard_from_gui(order_dict, operator_confirmed=True)
-            result = preview_execution_for_real_ready_order(order_id, guard)
+            result = preview_execution_for_real_ready_order(order_id, guard, ORDER_QUEUE_PATH)
             runtime_commit = {}
             if result.get("ok") is True:
-                runtime_commit = self.commit_execution_runtime_for_preview(order_dict, guard, result)
+                runtime_commit = self.commit_execution_runtime_for_preview(
+                    order_dict,
+                    guard,
+                    result,
+                    order_executions_path=ORDER_EXECUTIONS_PATH,
+                    order_locks_path=ORDER_LOCKS_PATH,
+                )
                 result["runtime_dry_run_result"] = runtime_commit.get("runtime_dry_run_result")
                 result["commit_plan_orchestrator_result"] = runtime_commit.get("commit_plan_orchestrator_result")
                 result["runtime_commit_readiness_policy_result"] = runtime_commit.get("runtime_commit_readiness_policy_result")
@@ -2789,6 +2842,88 @@ class AutoTradeSettingWindow(QDialog):
         dialog.setLayout(layout)
         return dialog.exec_() == QDialog.Accepted
 
+    def verify_manual_queue_commit_read_back(
+        self,
+        *,
+        queue_path: Path,
+        queue_write_preview_result: dict[str, object],
+        runtime_commit_result: dict[str, object],
+    ) -> dict[str, object]:
+        record = queue_write_preview_result.get("order_queued_record_preview")
+        record_dict = record if isinstance(record, dict) else {}
+        expected = {
+            "id": str(record_dict.get("id") or "").strip(),
+            "order_id": str(record_dict.get("order_id") or "").strip(),
+            "execution_id": str(record_dict.get("execution_id") or "").strip(),
+            "request_hash": str(record_dict.get("request_hash") or "").strip(),
+            "lock_id": str(record_dict.get("lock_id") or "").strip(),
+        }
+        runtime_expected = {
+            "order_id": str(runtime_commit_result.get("order_id") or "").strip(),
+            "execution_id": str(runtime_commit_result.get("execution_id") or "").strip(),
+            "request_hash": str(runtime_commit_result.get("request_hash") or "").strip(),
+            "lock_id": str(runtime_commit_result.get("lock_id") or "").strip(),
+        }
+
+        issues: list[str] = []
+        for field in ("order_id", "execution_id", "request_hash", "lock_id"):
+            if not expected[field] or expected[field] != runtime_expected[field]:
+                issues.append(f"runtime/queue identity mismatch before read-back: {field}")
+        if not expected["id"]:
+            issues.append("order queued record id is missing")
+        if issues:
+            return {"verified": False, "stage": "identity_precheck", "record": None, "issues": issues}
+
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "verified": False,
+                "stage": "queue_read",
+                "record": None,
+                "issues": [f"failed to read queue after commit: {exc}"],
+            }
+        orders = data.get("orders") if isinstance(data, dict) else None
+        if not isinstance(orders, list):
+            return {
+                "verified": False,
+                "stage": "queue_structure",
+                "record": None,
+                "issues": ["queue orders must be a list after commit"],
+            }
+
+        matches = [
+            item for item in orders
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == expected["id"]
+        ]
+        if len(matches) != 1:
+            return {
+                "verified": False,
+                "stage": "record_count",
+                "record": None,
+                "issues": [f"expected exactly one ORDER_QUEUED record after commit, found {len(matches)}"],
+            }
+
+        actual = dict(matches[0])
+        for field in ("order_id", "execution_id", "request_hash", "lock_id"):
+            if str(actual.get(field) or "").strip() != expected[field]:
+                issues.append(f"read-back identity mismatch: {field}")
+        if actual.get("status") != "ORDER_QUEUED":
+            issues.append("read-back status is not ORDER_QUEUED")
+        if actual.get("send_order_called") is True:
+            issues.append("read-back send_order_called is true")
+        if actual.get("broker_api_called") is True:
+            issues.append("read-back broker_api_called is true")
+        if actual.get("actual_order_sent") is True:
+            issues.append("read-back actual_order_sent is true")
+
+        return {
+            "verified": not issues,
+            "stage": "verified" if not issues else "record_validation",
+            "record": actual,
+            "issues": issues,
+        }
+
     def show_manual_queue_commit_result(self, result: dict[str, object]) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Manual Queue Commit Result")
@@ -2942,8 +3077,22 @@ class AutoTradeSettingWindow(QDialog):
         result["before_sha256"] = current_snapshot.get("sha256")
         result["after_sha256"] = after_snapshot.get("sha256")
         result["changed"] = current_snapshot.get("sha256") != after_snapshot.get("sha256")
+        if result.get("manual_commit") is True:
+            read_back = self.verify_manual_queue_commit_read_back(
+                queue_path=queue_path,
+                queue_write_preview_result=queue_write_preview,
+                runtime_commit_result=runtime_commit_result,
+            )
+            result["queue_commit_read_back"] = read_back
+            result["queue_commit_read_back_verified"] = read_back.get("verified") is True
+            if read_back.get("verified") is not True:
+                blocked = result.get("blocked_reasons")
+                if not isinstance(blocked, list):
+                    blocked = []
+                blocked.extend(str(reason) for reason in read_back.get("issues") or [])
+                result["blocked_reasons"] = blocked
         self.show_manual_queue_commit_result(result)
-        status_text = "완료" if result.get("manual_commit") else "차단"
+        status_text = "완료" if result.get("manual_commit") and result.get("queue_commit_read_back_verified") else "차단"
         self.statusBarMessage(f"수동 Queue 저장 {status_text}")
 
     def int_state_value(self, state: dict[str, object], key: str) -> int:
