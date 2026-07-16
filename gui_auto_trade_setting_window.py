@@ -339,6 +339,7 @@ from execution_runtime_file_init_open_policy import evaluate_execution_runtime_f
 from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
 from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
 from execution_runtime_storage import ExecutionRuntimeStorage
+from execution_fill_recorder import record_execution_fill
 from kiwoom_send_order_adapter_contract import build_kiwoom_send_order_adapter_contract
 from kiwoom_send_order_call_preview import preview_kiwoom_send_order_call
 from kiwoom_send_order_executor import execute_claimed_send_order
@@ -348,6 +349,7 @@ from chejan_event_recorder import record_chejan_event
 from chejan_event_review_service import review_chejan_event
 from final_send_gate_service import evaluate_final_send_gate
 from order_queued_review_service import review_order_queued_record
+from position_update_service import update_position_from_fill
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -361,6 +363,8 @@ REAL_TRADE_GUARD_PATH = PROJECT_ROOT / "runtime" / "real_trade_guard.json"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
+FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
+POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 PROGRAM_START_RESET_APPLIED = False
 
 
@@ -368,6 +372,18 @@ def handle_kiwoom_raw_chejan_event(
     raw_event: dict[str, object],
     live_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    if str(raw_event.get("gubun") or "").strip() == "1":
+        return {
+            "recorded": False,
+            "stage": "broker_balance_snapshot",
+            "balance_event_received": True,
+            "manual_reconciliation_required": True,
+            "blocked_reasons": [
+                "broker balance Chejan received, but no canonical balance Source of Truth writer is defined",
+            ],
+            "raw_event": dict(raw_event),
+        }
+
     normalized = normalize_kiwoom_chejan_event(raw_event)
     if normalized.get("normalized") is not True:
         return {"recorded": False, "stage": "normalize", "normalized_event": normalized}
@@ -426,7 +442,32 @@ def handle_kiwoom_raw_chejan_event(
         queue_path,
         context=live_context or {},
     )
-    return {
+    fill_result: dict[str, object] | None = None
+    position_result: dict[str, object] | None = None
+    if (
+        recorded.get("recorded") is True
+        and recorded.get("next_stage") == "FILL_RECORD_REQUIRED"
+    ):
+        fill_result = record_execution_fill(
+            recorded,
+            normalized,
+            FILLS_PATH,
+            context=live_context or {},
+        )
+        fill_record = fill_result.get("fill_record") if isinstance(fill_result, dict) else None
+        if (
+            isinstance(fill_result, dict)
+            and fill_result.get("fill_recorded") is True
+            and isinstance(fill_record, dict)
+        ):
+            position_result = update_position_from_fill(
+                fill_result,
+                fill_record,
+                POSITIONS_PATH,
+                context=live_context or {},
+            )
+
+    response = {
         "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,
         "stage": "chejan_record",
         "normalized_event": normalized,
@@ -434,6 +475,17 @@ def handle_kiwoom_raw_chejan_event(
         "record_result": recorded,
         "blocked_reasons": list(recorded.get("blocked_reasons") or []),
     }
+    if fill_result is not None:
+        response["fill_result"] = fill_result
+        if fill_result.get("fill_recorded") is not True:
+            response["manual_reconciliation_required"] = True
+            response["fill_blocked_reasons"] = list(fill_result.get("blocked_reasons") or [])
+    if position_result is not None:
+        response["position_result"] = position_result
+        if position_result.get("position_updated") is not True:
+            response["manual_reconciliation_required"] = True
+            response["position_blocked_reasons"] = list(position_result.get("blocked_reasons") or [])
+    return response
 
 
 def get_routine_dirs() -> list[Path]:

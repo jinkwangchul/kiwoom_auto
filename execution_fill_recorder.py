@@ -67,7 +67,13 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
 
 
 def _confirmed(context: Any) -> bool:
-    return _as_dict(context).get("manual_fill_record_confirmed") is True
+    ctx = _as_dict(context)
+    if ctx.get("manual_fill_record_confirmed") is True:
+        return True
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+    )
 
 
 def _snapshot_sha256(snapshot: Any) -> str:
@@ -547,6 +553,7 @@ def record_execution_fill(
                     "execution_id": fill_record["execution_id"],
                     "filled_quantity": fill_record["filled_quantity"],
                     "filled_price": fill_record["filled_price"],
+                    "fill_record": deepcopy(fill_record),
                     "before_sha256": before_sha256,
                     "after_sha256": after_sha256,
                     "blocked_reasons": [],

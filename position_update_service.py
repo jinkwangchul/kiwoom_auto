@@ -102,7 +102,13 @@ def _with_lock_metadata(result: dict[str, Any], *, lock_acquired: bool, lock_wai
 
 
 def _confirmed(context: Any) -> bool:
-    return _as_dict(context).get("manual_position_update_confirmed") is True
+    ctx = _as_dict(context)
+    if ctx.get("manual_position_update_confirmed") is True:
+        return True
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+    )
 
 
 def _snapshot_sha256(snapshot: Any) -> str:

@@ -326,6 +326,21 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual("OPEN", position["position_status"])
             self.assertEqual(["FILL_1"], position["applied_fill_ids"])
 
+    def test_live_chejan_context_updates_without_manual_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            result = self._update(
+                path,
+                context={
+                    "kiwoom_api_live_event": True,
+                    "live_event_source": "KiwoomApi.raw_chejan_received",
+                },
+            )
+
+            self.assertTrue(result["position_updated"], result)
+            self.assertEqual(3, self._read_json(path)["positions"][0]["quantity"])
+
     def test_buy_updates_existing_average_price(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_positions(tmpdir, root={

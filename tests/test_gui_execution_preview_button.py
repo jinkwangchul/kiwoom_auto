@@ -2357,6 +2357,67 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertEqual("BRK_1", data["orders"][0]["broker_order_no"])
 
+    def test_main_window_live_partial_fill_updates_queue_fills_and_position_without_setting_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            fills_path = Path(tmp) / "fills.json"
+            positions_path = Path(tmp) / "positions.json"
+            record = self._order_queued_record_for_send_order()
+            record.update(
+                {
+                    "status": "SEND_CALL_ACCEPTED",
+                    "send_order_called": True,
+                    "broker_api_called": True,
+                    "broker_call_executed": True,
+                    "send_call_result_known": True,
+                    "send_call_accepted": True,
+                }
+            )
+            self._write_queue_for_send_order(queue_path, record)
+            main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "0",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9203": "BRK_1",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "907": "2",
+                    "913": "체결",
+                    "900": "10",
+                    "911": "3",
+                    "902": "7",
+                    "910": "1000",
+                    "901": "1000",
+                    "909": "EXEC_NO_1",
+                },
+                "received_at": "2026-07-16 10:01:00",
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "FILLS_PATH", fills_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                main_gui.MainWindow.on_kiwoom_raw_chejan_received(main, raw_event)
+                first = main.last_chejan_record_result
+                main_gui.MainWindow.on_kiwoom_raw_chejan_received(main, raw_event)
+                duplicate = main.last_chejan_record_result
+
+            self.assertTrue(first["recorded"], first)
+            self.assertTrue(first["fill_result"]["fill_recorded"], first)
+            self.assertTrue(first["position_result"]["position_updated"], first)
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual("PARTIALLY_FILLED", queue["orders"][0]["status"])
+            self.assertEqual(3, queue["orders"][0]["cumulative_filled_quantity"])
+            self.assertEqual(7, queue["orders"][0]["remaining_quantity"])
+            self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
+            self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
+            self.assertFalse(duplicate["recorded"], duplicate)
+            self.assertEqual(1, len(json.loads(fills_path.read_text(encoding="utf-8"))["fills"]))
+            self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
+
     def test_raw_chejan_source_string_without_live_context_is_not_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             queue_path = Path(tmp) / "order_queue.json"
@@ -2398,6 +2459,46 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertFalse(result["recorded"], result)
             self.assertEqual("chejan_record", result["stage"])
             self.assertIn("Chejan event record confirmation is required", result["blocked_reasons"])
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertFalse(data["orders"][0].get("chejan_events"))
+
+    def test_balance_chejan_reports_reconciliation_without_queue_fill_or_position_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            fills_path = Path(tmp) / "fills.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_queue_for_send_order(queue_path, self._order_queued_record_for_send_order())
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "1",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9001": "A003550",
+                    "930": "3",
+                    "933": "3",
+                    "931": "1000",
+                },
+                "received_at": "2026-07-16 10:02:00",
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "FILLS_PATH", fills_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                result = gui.handle_kiwoom_raw_chejan_event(
+                    raw_event,
+                    {
+                        "kiwoom_api_live_event": True,
+                        "live_event_source": "KiwoomApi.raw_chejan_received",
+                    },
+                )
+
+            self.assertFalse(result["recorded"], result)
+            self.assertTrue(result["balance_event_received"])
+            self.assertTrue(result["manual_reconciliation_required"])
+            self.assertFalse(fills_path.exists())
+            self.assertFalse(positions_path.exists())
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertFalse(data["orders"][0].get("chejan_events"))
 
