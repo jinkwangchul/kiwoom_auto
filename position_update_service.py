@@ -351,11 +351,17 @@ def _fill_delta(position: dict[str, Any], fill: dict[str, Any]) -> tuple[int, in
 
 def _allow_later_cumulative_reconciliation(context: Any) -> bool:
     ctx = _as_dict(context)
-    return (
+    live_reprocess = (
         ctx.get("kiwoom_api_live_event") is True
         and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
         and ctx.get("chejan_reconciliation_reprocess") is True
     )
+    operator_reprocess = (
+        ctx.get("manual_position_update_confirmed") is True
+        and ctx.get("operator_reconciliation_action") is True
+        and ctx.get("chejan_reconciliation_reprocess") is True
+    )
+    return live_reprocess or operator_reprocess
 
 
 def _decimal(value: Any) -> Decimal:

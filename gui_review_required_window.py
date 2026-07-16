@@ -47,6 +47,10 @@ from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
 from gui_auto_trade_runtime import write_state_json
 from state_policy import auto_trade_status_display
+from operator_reconciliation_service import (
+    collect_operator_reconciliation_items,
+    retry_operator_chejan_reconciliation,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -438,9 +442,12 @@ class GlobalReviewRequiredWindow(QDialog):
 
         self.summary_label = QLabel("검토종목: 0개")
         self.table = QTableWidget()
+        self.runtime_summary_label = QLabel("운영 Reconciliation: 0개")
+        self.runtime_table = QTableWidget()
         self.btn_return = QPushButton("복귀")
         self.btn_unassign = QPushButton("미지정")
         self.btn_delete = QPushButton("삭제")
+        self.btn_runtime_retry = QPushButton("안전 재처리")
         self.btn_refresh = QPushButton("새로고침")
         self.btn_close = QPushButton("닫기")
         self._review_sort_column = -1
@@ -491,16 +498,58 @@ class GlobalReviewRequiredWindow(QDialog):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         layout.addWidget(self.table)
 
+        layout.addWidget(self.runtime_summary_label)
+        runtime_headers = [
+            "상태",
+            "유형",
+            "계좌",
+            "코드",
+            "주문ID",
+            "Broker No",
+            "Event",
+            "Queue",
+            "Fill",
+            "Position",
+            "사유",
+            "확인시각",
+        ]
+        self.runtime_table.setColumnCount(len(runtime_headers))
+        self.runtime_table.setHorizontalHeaderLabels(runtime_headers)
+        apply_plain_table_header(self.runtime_table)
+        runtime_header = self.runtime_table.horizontalHeader()
+        runtime_header.setSectionResizeMode(QHeaderView.Interactive)
+        runtime_header.setStretchLastSection(False)
+        runtime_header.setSectionsClickable(True)
+        self.runtime_table.setColumnWidth(0, 120)
+        self.runtime_table.setColumnWidth(1, 180)
+        self.runtime_table.setColumnWidth(2, 100)
+        self.runtime_table.setColumnWidth(3, 80)
+        self.runtime_table.setColumnWidth(4, 130)
+        self.runtime_table.setColumnWidth(5, 120)
+        self.runtime_table.setColumnWidth(6, 180)
+        self.runtime_table.setColumnWidth(7, 110)
+        self.runtime_table.setColumnWidth(8, 70)
+        self.runtime_table.setColumnWidth(9, 80)
+        self.runtime_table.setColumnWidth(10, 300)
+        self.runtime_table.setColumnWidth(11, 160)
+        self.runtime_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.runtime_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.runtime_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.runtime_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        layout.addWidget(self.runtime_table)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         self.btn_return.setMinimumWidth(90)
         self.btn_unassign.setMinimumWidth(90)
         self.btn_delete.setMinimumWidth(90)
+        self.btn_runtime_retry.setMinimumWidth(110)
         self.btn_refresh.setMinimumWidth(100)
         self.btn_close.setMinimumWidth(100)
         buttons.addWidget(self.btn_return)
         buttons.addWidget(self.btn_unassign)
         buttons.addWidget(self.btn_delete)
+        buttons.addWidget(self.btn_runtime_retry)
         buttons.addWidget(self.btn_refresh)
         buttons.addWidget(self.btn_close)
         layout.addLayout(buttons)
@@ -510,6 +559,7 @@ class GlobalReviewRequiredWindow(QDialog):
         self.btn_return.clicked.connect(self.return_selected_items_to_auto_list)
         self.btn_unassign.clicked.connect(self.unassign_selected_review_items)
         self.btn_delete.clicked.connect(self.delete_selected_review_items)
+        self.btn_runtime_retry.clicked.connect(self.retry_selected_runtime_reconciliation_items)
         self.btn_refresh.clicked.connect(self.load_review_items)
         self.btn_close.clicked.connect(self.close)
         self.table.horizontalHeader().sectionClicked.connect(self.sort_review_table_by_column)
@@ -708,6 +758,139 @@ class GlobalReviewRequiredWindow(QDialog):
 
         self._apply_saved_review_sort()
         self.summary_label.setText(f"검토종목: {len(rows)}개")
+        self.load_runtime_reconciliation_items()
+
+    def _runtime_row_tooltip(self, row: dict[str, object]) -> str:
+        return (
+            f"유형: {row.get('occurrence_type', '-')}\n"
+            f"상태: {row.get('status', '-')}\n"
+            f"계좌: {row.get('account_no', '-')}\n"
+            f"종목: {row.get('code', '-')}\n"
+            f"주문ID: {row.get('order_id', '-')}\n"
+            f"Broker No: {row.get('broker_order_no', '-')}\n"
+            f"Event: {row.get('event_identity', '-')}\n"
+            f"Queue: {row.get('queue_status', '-')}\n"
+            f"Fill 반영: {row.get('fill_applied', '-')}\n"
+            f"Position 반영: {row.get('position_applied', '-')}\n"
+            f"Broker 비교: {row.get('broker_reconciliation_status', '-')}\n"
+            f"사유: {row.get('reason', '-')}\n"
+            f"권장 조치: {row.get('recommended_action', '-')}"
+        )
+
+    def load_runtime_reconciliation_items(self) -> None:
+        result = collect_operator_reconciliation_items()
+        rows = list(result.get("items") or [])
+        self.runtime_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            tooltip = self._runtime_row_tooltip(row)
+            self._set_runtime_item(row_index, 0, row.get("status", "-"), tooltip=tooltip)
+            self._set_runtime_item(row_index, 1, row.get("occurrence_type", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_runtime_item(row_index, 2, row.get("account_no", "-"), tooltip=tooltip)
+            self._set_runtime_item(row_index, 3, row.get("code", "-"), tooltip=tooltip)
+            self._set_runtime_item(row_index, 4, row.get("order_id", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_runtime_item(row_index, 5, row.get("broker_order_no", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_runtime_item(row_index, 6, row.get("event_identity", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_runtime_item(row_index, 7, row.get("queue_status", "-"), tooltip=tooltip)
+            self._set_runtime_item(row_index, 8, "Y" if row.get("fill_applied") else "N", tooltip=tooltip)
+            self._set_runtime_item(row_index, 9, "Y" if row.get("position_applied") else "N", tooltip=tooltip)
+            self._set_runtime_item(row_index, 10, row.get("reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_runtime_item(row_index, 11, row.get("last_checked_at", "-"), tooltip=tooltip)
+            first_item = self.runtime_table.item(row_index, 0)
+            if first_item is not None:
+                first_item.setData(Qt.UserRole, dict(row))
+        summary = result.get("summary") if isinstance(result, dict) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        self.runtime_summary_label.setText(
+            "운영 Reconciliation: "
+            f"{summary.get('total', len(rows))}개 / "
+            f"재처리 가능 {summary.get('retryable', 0)}개 / "
+            f"수동 확인 {summary.get('manual_review_required', 0)}개"
+        )
+
+    def _set_runtime_item(
+        self,
+        row: int,
+        col: int,
+        text: object,
+        align=Qt.AlignCenter,
+        tooltip: str = "",
+    ) -> None:
+        item = QTableWidgetItem(str(text if text not in (None, "") else "-"))
+        item.setTextAlignment(align)
+        if tooltip:
+            item.setToolTip(tooltip)
+        self.runtime_table.setItem(row, col, item)
+
+    def selected_runtime_reconciliation_rows(self) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for index in self.runtime_table.selectionModel().selectedRows():
+            item = self.runtime_table.item(index.row(), 0)
+            if item is None:
+                continue
+            row = item.data(Qt.UserRole)
+            if not isinstance(row, dict):
+                continue
+            item_id = str(row.get("item_id") or "")
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            result.append(row)
+        return result
+
+    def retry_selected_runtime_reconciliation_items(self) -> None:
+        rows = self.selected_runtime_reconciliation_rows()
+        if not rows:
+            QMessageBox.information(self, "운영 Reconciliation", "재처리할 항목을 선택하세요.")
+            return
+        retryable = [row for row in rows if row.get("source_type") == "CHEJAN_RECONCILIATION" and row.get("retryable") is True]
+        if not retryable:
+            QMessageBox.information(self, "운영 Reconciliation", "선택 항목은 자동 재처리 대상이 아닙니다.")
+            return
+        preview = "\n".join(
+            f"- {row.get('code', '-')} {row.get('order_id', '-')} {row.get('event_identity', '-')}"
+            for row in retryable[:8]
+        )
+        if len(retryable) > 8:
+            preview += f"\n- 외 {len(retryable) - 8}개"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("운영 Reconciliation 재처리")
+        box.setText(
+            "저장된 Chejan evidence 기준으로 누락된 Fill/Position 후속 단계만 재처리합니다.\n"
+            "SendOrder, Broker API, 주문 재시도는 수행하지 않습니다.\n\n"
+            f"{preview}"
+        )
+        proceed_button = box.addButton("재처리", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(proceed_button)
+        box.exec_()
+        if box.clickedButton() != proceed_button:
+            return
+        resolved = 0
+        blocked: list[str] = []
+        for row in retryable:
+            result = retry_operator_chejan_reconciliation(
+                order_queued_id=str(row.get("order_queued_id") or ""),
+                event_identity=str(row.get("event_identity") or ""),
+            )
+            if result.get("retried") is True:
+                resolved += 1
+            else:
+                reasons = result.get("blocked_reasons")
+                if not isinstance(reasons, list):
+                    reasons = list(result.get("reconciliation_result", {}).get("blocked_reasons", [])) if isinstance(result.get("reconciliation_result"), dict) else []
+                blocked.append(f"{row.get('code', '-')} {row.get('order_id', '-')}: {', '.join(str(reason) for reason in reasons) or result.get('stage', 'blocked')}")
+        self.load_review_items()
+        message = f"해결 {resolved}건"
+        if blocked:
+            message += "\n\n차단:\n" + "\n".join(f"- {line}" for line in blocked[:10])
+            if len(blocked) > 10:
+                message += f"\n- 외 {len(blocked) - 10}건"
+        QMessageBox.information(self, "운영 Reconciliation", message)
 
     def selected_stock_dirs(self) -> list[tuple[Path, str, str]]:
         """검토관리창에서 선택된 종목의 runtime 폴더를 반환한다."""
@@ -982,4 +1165,3 @@ class GlobalReviewRequiredWindow(QDialog):
         if failed:
             message += f" / 실패 {failed}개"
         QMessageBox.information(self, "삭제 완료", message)
-
