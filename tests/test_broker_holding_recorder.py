@@ -541,6 +541,24 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertEqual("broker_holdings_source_integrity", result["holding_stage"])
             self.assertEqual(before, holdings_path.read_text(encoding="utf-8"))
 
+    def test_duplicate_account_code_records_block_even_when_one_has_incoming_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            event = self._raw_event()
+            first = record_broker_holding_snapshot(event, holdings_path, positions_path, context=self._context())
+            data = json.loads(holdings_path.read_text(encoding="utf-8"))
+            data["holdings"].append(dict(data["holdings"][0], event_identities=["OTHER_IDENTITY"]))
+            holdings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            before = holdings_path.read_text(encoding="utf-8")
+
+            result = record_broker_holding_snapshot(event, holdings_path, positions_path, context=self._context())
+
+            self.assertTrue(first["holding_recorded"], first)
+            self.assertFalse(result["holding_recorded"], result)
+            self.assertEqual("broker_holdings_source_integrity", result["holding_stage"])
+            self.assertEqual(before, holdings_path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

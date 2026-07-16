@@ -542,22 +542,6 @@ def record_broker_holding_snapshot(
                         and _clean_text(item.get("code")) == snapshot["code"]
                     ):
                         matching_indexes.append(index)
-                        existing_index = index
-                        existing_identities = item.get("event_identities")
-                        if isinstance(existing_identities, list) and snapshot["event_identity"] in existing_identities:
-                            result = _noop("duplicate_broker_holding_event", "broker holding event already recorded")
-                            result.update(
-                                {
-                                    "account_no": snapshot["account_no"],
-                                    "code": snapshot["code"],
-                                    "event_identity": snapshot["event_identity"],
-                                    "reconciliation_status": _clean_text(item.get("reconciliation_status")),
-                                    "manual_reconciliation_required": item.get("manual_reconciliation_required") is True,
-                                    "mismatch_fields": list(item.get("mismatch_fields") or []) if isinstance(item.get("mismatch_fields"), list) else [],
-                                    "before_sha256": before_sha256,
-                                }
-                            )
-                            return _with_lock_metadata(result, lock_acquired=True, lock_wait_ms=lock.wait_ms)
                 if len(matching_indexes) > 1:
                     return _with_lock_metadata(
                         _blocked("broker_holdings_source_integrity", "duplicate broker holding records for account_no + code"),
@@ -566,6 +550,22 @@ def record_broker_holding_snapshot(
                     )
                 if matching_indexes:
                     existing_index = matching_indexes[0]
+                    item = _as_dict(holdings[existing_index])
+                    existing_identities = item.get("event_identities")
+                    if isinstance(existing_identities, list) and snapshot["event_identity"] in existing_identities:
+                        result = _noop("duplicate_broker_holding_event", "broker holding event already recorded")
+                        result.update(
+                            {
+                                "account_no": snapshot["account_no"],
+                                "code": snapshot["code"],
+                                "event_identity": snapshot["event_identity"],
+                                "reconciliation_status": _clean_text(item.get("reconciliation_status")),
+                                "manual_reconciliation_required": item.get("manual_reconciliation_required") is True,
+                                "mismatch_fields": list(item.get("mismatch_fields") or []) if isinstance(item.get("mismatch_fields"), list) else [],
+                                "before_sha256": before_sha256,
+                            }
+                        )
+                        return _with_lock_metadata(result, lock_acquired=True, lock_wait_ms=lock.wait_ms)
 
                 if existing_index >= 0:
                     existing = _as_dict(holdings[existing_index])
