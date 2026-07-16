@@ -8,7 +8,7 @@ positions, fills, order queues, broker APIs, GUI state, or cash balances.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -48,15 +48,45 @@ def _parse_received_at(value: Any) -> datetime | None:
     text = _clean_text(value)
     if not text:
         return None
+    parsed: datetime | None = None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return datetime.strptime(text, fmt)
+            parsed = datetime.strptime(text, fmt)
+            break
         except ValueError:
             pass
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _received_at_has_timezone(value: Any) -> bool:
+    text = _clean_text(value)
+    if not text:
+        return False
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _decimal_from_text(value: Any) -> Decimal | None:
+    text = _clean_text(value).replace(",", "")
+    if not text:
         return None
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    return number
 
 
 def _sha256_file(path: Path) -> str:
@@ -197,44 +227,51 @@ def _cleanup_temp(path: Path | None) -> None:
 
 
 def _parse_int(value: Any, field: str, errors: list[str]) -> int | None:
-    text = _clean_text(value).replace(",", "")
-    if not text:
+    number = _decimal_from_text(value)
+    if number is None:
         errors.append(f"{field} is required")
         return None
-    try:
-        parsed = int(float(text))
-    except (TypeError, ValueError):
-        errors.append(f"{field} must be numeric")
+    if number != number.to_integral_value():
+        errors.append(f"{field} must be an integer")
         return None
-    if parsed < 0:
+    if number < 0:
         errors.append(f"{field} must not be negative")
         return None
-    return parsed
+    return int(number)
 
 
 def _parse_optional_number(value: Any, field: str, warnings: list[str]) -> int | float | None:
-    text = _clean_text(value).replace(",", "")
-    if not text:
+    if not _clean_text(value):
         warnings.append(f"{field} is missing")
         return None
-    try:
-        number = float(text)
-    except (TypeError, ValueError):
-        warnings.append(f"{field} is not numeric")
+    number = _decimal_from_text(value)
+    if number is None:
+        warnings.append(f"{field} is not finite numeric")
         return None
-    if number == int(number):
+    if number == number.to_integral_value():
         return int(number)
-    return number
+    return float(number)
+
+
+def _parse_required_number(value: Any, field: str, errors: list[str]) -> int | float | None:
+    number = _decimal_from_text(value)
+    if number is None:
+        errors.append(f"{field} is required")
+        return None
+    if number < 0:
+        errors.append(f"{field} must not be negative")
+        return None
+    if number == number.to_integral_value():
+        return int(number)
+    return float(number)
 
 
 def _decimal_value(value: Any, field: str) -> tuple[Decimal | None, str]:
-    text = _clean_text(value).replace(",", "")
-    if not text:
+    if not _clean_text(value):
         return None, f"{field} is missing"
-    try:
-        number = Decimal(text)
-    except (InvalidOperation, ValueError):
-        return None, f"{field} must be numeric"
+    number = _decimal_from_text(value)
+    if number is None:
+        return None, f"{field} must be finite numeric"
     if number < 0:
         return None, f"{field} must not be negative"
     return number, ""
@@ -264,7 +301,7 @@ def normalize_broker_holding_chejan_event(raw_event: Any, context: Any = None) -
         errors.append("code is required")
     holding_quantity = _parse_int(fids.get("930"), "holding_quantity", errors)
     available_quantity = _parse_int(fids.get("933"), "available_quantity", errors)
-    average_price = _parse_int(fids.get("931"), "average_price", errors)
+    average_price = _parse_required_number(fids.get("931"), "average_price", errors)
     total_purchase_amount = _parse_optional_number(fids.get("932"), "total_purchase_amount", warnings)
     current_price = _parse_optional_number(fids.get("10"), "current_price", warnings)
     if isinstance(current_price, (int, float)):
@@ -498,11 +535,13 @@ def record_broker_holding_snapshot(
 
                 holdings = data["holdings"]
                 existing_index = -1
+                matching_indexes: list[int] = []
                 for index, item in enumerate(holdings):
                     if (
                         _clean_text(item.get("account_no")) == snapshot["account_no"]
                         and _clean_text(item.get("code")) == snapshot["code"]
                     ):
+                        matching_indexes.append(index)
                         existing_index = index
                         existing_identities = item.get("event_identities")
                         if isinstance(existing_identities, list) and snapshot["event_identity"] in existing_identities:
@@ -519,7 +558,14 @@ def record_broker_holding_snapshot(
                                 }
                             )
                             return _with_lock_metadata(result, lock_acquired=True, lock_wait_ms=lock.wait_ms)
-                        break
+                if len(matching_indexes) > 1:
+                    return _with_lock_metadata(
+                        _blocked("broker_holdings_source_integrity", "duplicate broker holding records for account_no + code"),
+                        lock_acquired=True,
+                        lock_wait_ms=lock.wait_ms,
+                    )
+                if matching_indexes:
+                    existing_index = matching_indexes[0]
 
                 if existing_index >= 0:
                     existing = _as_dict(holdings[existing_index])
@@ -528,6 +574,12 @@ def record_broker_holding_snapshot(
                     if existing_received_at is None or incoming_received_at is None:
                         return _with_lock_metadata(
                             _blocked("broker_holding_received_at", "existing or incoming received_at is not comparable"),
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+                    if _received_at_has_timezone(existing.get("received_at")) != _received_at_has_timezone(snapshot.get("received_at")):
+                        return _with_lock_metadata(
+                            _blocked("broker_holding_received_at", "mixed timezone-aware and timezone-naive received_at cannot be compared"),
                             lock_acquired=True,
                             lock_wait_ms=lock.wait_ms,
                         )

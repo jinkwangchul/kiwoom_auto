@@ -239,6 +239,24 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             holding = self._read_holdings(holdings_path)[0]
             self.assertEqual(1000.9, holding["internal_average_price"])
 
+    def test_fractional_broker_average_price_is_preserved_for_compare(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_positions(positions_path, quantity=3, average_price=1000)
+
+            result = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"931": "1000.9"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertEqual("AVERAGE_PRICE_MISMATCH", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertEqual(1000.9, holding["average_price"])
+            self.assertEqual(1000.9, holding["broker_average_price"])
+
     def test_corrupt_broker_holdings_json_blocks_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             holdings_path = Path(tmp) / "broker_holdings.json"
@@ -344,6 +362,28 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertEqual("ambiguous_broker_holding_event", ambiguous["holding_stage"])
             self.assertEqual(after_first, holdings_path.read_text(encoding="utf-8"))
 
+    def test_timezone_mixed_received_at_is_blocked_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            first = record_broker_holding_snapshot(
+                self._raw_event(received_at="2026-07-16T02:00:00+00:00"),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+            stale = record_broker_holding_snapshot(
+                self._raw_event(received_at="2026-07-16 10:59:59", fid_values={"933": "1"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertTrue(first["holding_recorded"], first)
+            self.assertFalse(stale["holding_recorded"], stale)
+            self.assertEqual("broker_holding_received_at", stale["holding_stage"])
+
     def test_event_identity_history_is_bounded_and_recent_duplicates_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             holdings_path = Path(tmp) / "broker_holdings.json"
@@ -419,6 +459,87 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertFalse(result["holding_recorded"])
             self.assertIn("holding_quantity must not be negative", result["blocked_reasons"][0])
             self.assertFalse(holdings_path.exists())
+
+    def test_fractional_nan_and_infinite_broker_quantities_are_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            fractional = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"930": "3.5"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+            nan_value = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"930": "NaN"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+            infinite = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"933": "Infinity"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertFalse(fractional["holding_recorded"])
+            self.assertIn("holding_quantity must be an integer", fractional["blocked_reasons"][0])
+            self.assertFalse(nan_value["holding_recorded"])
+            self.assertIn("holding_quantity is required", nan_value["blocked_reasons"][0])
+            self.assertFalse(infinite["holding_recorded"])
+            self.assertIn("available_quantity is required", infinite["blocked_reasons"][0])
+            self.assertFalse(holdings_path.exists())
+
+    def test_nan_and_infinite_internal_position_values_are_invalid_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_positions_root(
+                positions_path,
+                [
+                    {
+                        "position_id": "POSITION_KIWOOM_12345678_003550",
+                        "broker": "KIWOOM",
+                        "account_no": "12345678",
+                        "code": "003550",
+                        "quantity": "NaN",
+                        "average_price": "Infinity",
+                    }
+                ],
+            )
+
+            result = record_broker_holding_snapshot(self._raw_event(), holdings_path, positions_path, context=self._context())
+
+            self.assertTrue(result["holding_recorded"], result)
+            self.assertEqual("POSITION_SOURCE_INVALID", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertIn("finite numeric", holding["position_read_failure_reason"])
+
+    def test_duplicate_account_code_holding_records_block_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            duplicate = {
+                "account_no": "12345678",
+                "code": "003550",
+                "received_at": "2026-07-16 10:00:00",
+                "event_identities": ["OLD"],
+                "reconciliation_status": "BROKER_ONLY",
+                "manual_reconciliation_required": True,
+            }
+            holdings_path.write_text(
+                json.dumps({"version": 1, "updated_at": "before", "holdings": [duplicate, dict(duplicate, event_identities=["OLD2"])]}, indent=2),
+                encoding="utf-8",
+            )
+            before = holdings_path.read_text(encoding="utf-8")
+
+            result = record_broker_holding_snapshot(self._raw_event(received_at="2026-07-16 11:00:00"), holdings_path, positions_path, context=self._context())
+
+            self.assertFalse(result["holding_recorded"])
+            self.assertEqual("broker_holdings_source_integrity", result["holding_stage"])
+            self.assertEqual(before, holdings_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
