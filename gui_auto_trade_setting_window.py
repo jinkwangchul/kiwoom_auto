@@ -344,6 +344,7 @@ from kiwoom_send_order_adapter_contract import build_kiwoom_send_order_adapter_c
 from kiwoom_send_order_call_preview import preview_kiwoom_send_order_call
 from kiwoom_send_order_executor import execute_claimed_send_order
 from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
+from broker_holding_recorder import record_broker_holding_snapshot
 from chejan_event_normalizer import normalize_kiwoom_chejan_event
 from chejan_event_recorder import (
     chejan_event_identity,
@@ -370,6 +371,7 @@ ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
+BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
 PROGRAM_START_RESET_APPLIED = False
 
 
@@ -378,16 +380,16 @@ def handle_kiwoom_raw_chejan_event(
     live_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if str(raw_event.get("gubun") or "").strip() == "1":
-        return {
-            "recorded": False,
-            "stage": "broker_balance_snapshot",
-            "balance_event_received": True,
-            "manual_reconciliation_required": True,
-            "blocked_reasons": [
-                "broker balance Chejan received, but no canonical balance Source of Truth writer is defined",
-            ],
-            "raw_event": dict(raw_event),
-        }
+        result = record_broker_holding_snapshot(
+            raw_event,
+            BROKER_HOLDINGS_PATH,
+            POSITIONS_PATH,
+            context=live_context or {},
+        )
+        result["recorded"] = result.get("holding_recorded") is True
+        result["stage"] = result.get("holding_stage", "broker_holding_snapshot")
+        result["balance_event_received"] = True
+        return result
 
     normalized = normalize_kiwoom_chejan_event(raw_event)
     if normalized.get("normalized") is not True:

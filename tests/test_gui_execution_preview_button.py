@@ -3378,12 +3378,14 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertFalse(data["orders"][0].get("chejan_events"))
 
-    def test_balance_chejan_reports_reconciliation_without_queue_fill_or_position_write(self) -> None:
+    def test_balance_chejan_records_broker_holding_without_queue_fill_or_position_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             queue_path = Path(tmp) / "order_queue.json"
             fills_path = Path(tmp) / "fills.json"
             positions_path = Path(tmp) / "positions.json"
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
             self._write_queue_for_send_order(queue_path, self._order_queued_record_for_send_order())
+            self._write_open_position(positions_path, quantity=3, average_price=1000)
             raw_event = {
                 "source": "kiwoom_chejan",
                 "gubun": "1",
@@ -3393,6 +3395,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                     "930": "3",
                     "933": "3",
                     "931": "1000",
+                    "932": "3000",
+                    "10": "1000",
+                    "8019": "0",
                 },
                 "received_at": "2026-07-16 10:02:00",
             }
@@ -3401,6 +3406,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "FILLS_PATH", fills_path),
                 mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+                mock.patch.object(gui, "BROKER_HOLDINGS_PATH", broker_holdings_path),
             ):
                 result = gui.handle_kiwoom_raw_chejan_event(
                     raw_event,
@@ -3410,13 +3416,51 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                     },
                 )
 
-            self.assertFalse(result["recorded"], result)
+            self.assertTrue(result["recorded"], result)
             self.assertTrue(result["balance_event_received"])
-            self.assertTrue(result["manual_reconciliation_required"])
+            self.assertFalse(result["manual_reconciliation_required"])
+            self.assertEqual("CONSISTENT", result["reconciliation_status"])
+            holdings = json.loads(broker_holdings_path.read_text(encoding="utf-8"))["holdings"]
+            self.assertEqual(1, len(holdings))
+            self.assertEqual(3, holdings[0]["holding_quantity"])
             self.assertFalse(fills_path.exists())
-            self.assertFalse(positions_path.exists())
+            self.assertEqual(3, json.loads(positions_path.read_text(encoding="utf-8"))["positions"][0]["quantity"])
             data = json.loads(queue_path.read_text(encoding="utf-8"))
             self.assertFalse(data["orders"][0].get("chejan_events"))
+
+    def test_main_window_balance_chejan_records_without_auto_trade_setting_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_open_position(positions_path, quantity=3, average_price=1000)
+            main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            raw_event = {
+                "source": "kiwoom_chejan",
+                "gubun": "1",
+                "fid_values": {
+                    "9201": "12345678",
+                    "9001": "A003550",
+                    "302": "LG",
+                    "930": "3",
+                    "933": "3",
+                    "931": "1000",
+                    "932": "3000",
+                    "10": "1000",
+                    "8019": "0",
+                },
+                "received_at": "2026-07-16 10:03:00",
+            }
+
+            with (
+                mock.patch.object(gui, "BROKER_HOLDINGS_PATH", broker_holdings_path),
+                mock.patch.object(gui, "POSITIONS_PATH", positions_path),
+            ):
+                main_gui.MainWindow.on_kiwoom_raw_chejan_received(main, raw_event)
+
+            result = main.last_chejan_record_result
+            self.assertTrue(result["recorded"], result)
+            self.assertEqual("CONSISTENT", result["reconciliation_status"])
+            self.assertEqual(1, len(json.loads(broker_holdings_path.read_text(encoding="utf-8"))["holdings"]))
 
 
 if __name__ == "__main__":
