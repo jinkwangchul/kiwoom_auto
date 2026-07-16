@@ -516,16 +516,31 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 "pending_order_side_quantities",
                 return_value=(0, 0),
             ),
+            patch.object(
+                gui_main_table_loader,
+                "create_auto_trade_situation_item",
+                side_effect=lambda _state, trade_started, _status: {
+                    "trade_started": trade_started
+                },
+            ),
         )
 
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
             blocked = Window(ready=False)
             gui_main_table_loader.main_load_running_stock_table(blocked)
-            self.assertEqual(0, blocked.running_stock_table.row_count)
+            self.assertEqual(1, blocked.running_stock_table.row_count)
+            self.assertEqual(
+                {"trade_started": False},
+                blocked.running_stock_table.items[(0, 4)],
+            )
 
             approved = Window(ready=True)
             gui_main_table_loader.main_load_running_stock_table(approved)
             self.assertEqual(1, approved.running_stock_table.row_count)
+            self.assertEqual(
+                {"trade_started": True},
+                approved.running_stock_table.items[(0, 4)],
+            )
 
 
 if __name__ == "__main__":

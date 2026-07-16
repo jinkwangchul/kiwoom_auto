@@ -238,8 +238,6 @@ def main_load_running_stock_table(window) -> None:
             window,
             trade_started,
         )
-        if not current_session_trade_started:
-            continue
 
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
         avg_price = safe_float_value(state.get("avg_price"), 0.0)
