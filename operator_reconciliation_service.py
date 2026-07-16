@@ -9,12 +9,17 @@ and Queue reconciliation boundaries.
 from __future__ import annotations
 
 import json
+import hashlib
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from chejan_event_recorder import existing_chejan_record_result, mark_chejan_reconciliation_state
+from chejan_event_recorder import (
+    existing_chejan_record_result,
+    inspect_incomplete_order_reconciliation,
+    mark_chejan_reconciliation_state,
+)
 from execution_fill_recorder import find_existing_execution_fill_record, record_execution_fill
 from position_update_service import update_position_from_fill
 
@@ -24,6 +29,41 @@ DEFAULT_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 DEFAULT_FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
 DEFAULT_POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 DEFAULT_BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
+DEFAULT_ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
+DEFAULT_ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
+DEFAULT_ROUTINE_SIGNALS_PATH = PROJECT_ROOT / "runtime" / "routine_signals.json"
+
+STARTUP_RESUME_READY = "RESUME_READY"
+STARTUP_REVIEW_REQUIRED = "REVIEW_REQUIRED"
+STARTUP_BLOCKED_RECOVERY = "BLOCKED_RECOVERY"
+STARTUP_INVALID_RUNTIME = "INVALID_RUNTIME"
+
+_STARTUP_TERMINAL_QUEUE_STATUSES = {
+    "FILLED",
+    "CANCELLED",
+    "PARTIAL_CANCELLED",
+    "BROKER_REJECTED",
+    "SEND_CALL_REJECTED",
+    "BLOCKED",
+    "BLOCKED_POLICY",
+}
+_STARTUP_BLOCKED_QUEUE_STATUSES = {
+    "DISPATCH_CLAIMED",
+    "SEND_ATTEMPTED",
+    "SEND_CALL_IN_PROGRESS",
+    "SEND_UNCERTAIN",
+    "STALE_DISPATCH_CLAIM",
+}
+_STARTUP_REVIEW_QUEUE_STATUSES = {
+    "PENDING",
+    "APPROVED",
+    "EXECUTABLE",
+    "REAL_READY",
+    "ORDER_QUEUED",
+    "SEND_CALL_ACCEPTED",
+    "BROKER_ACCEPTED",
+    "PARTIALLY_FILLED",
+}
 
 
 def _now_text() -> str:
@@ -40,6 +80,13 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
 def _read_json(path: str | Path) -> tuple[dict[str, Any] | None, str]:
     target = Path(path)
     try:
@@ -51,6 +98,109 @@ def _read_json(path: str | Path) -> tuple[dict[str, Any] | None, str]:
         return data, ""
     except Exception as exc:
         return None, str(exc)
+
+
+def _strict_runtime_list(path: str | Path, list_field: str) -> dict[str, Any]:
+    target = Path(path)
+    if not target.exists():
+        return {
+            "status": "MISSING",
+            "path": str(target),
+            "data": None,
+            "items": [],
+            "reason": f"{target.name} missing",
+        }
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "status": "INVALID",
+            "path": str(target),
+            "data": None,
+            "items": [],
+            "reason": f"{target.name} read failed: {exc}",
+        }
+    if not isinstance(data, dict):
+        return {
+            "status": "INVALID",
+            "path": str(target),
+            "data": None,
+            "items": [],
+            "reason": f"{target.name} root must be an object",
+        }
+    items = data.get(list_field)
+    if not isinstance(items, list):
+        return {
+            "status": "INVALID",
+            "path": str(target),
+            "data": data,
+            "items": [],
+            "reason": f"{target.name}.{list_field} must be a list",
+        }
+    if any(not isinstance(item, dict) for item in items):
+        return {
+            "status": "INVALID",
+            "path": str(target),
+            "data": data,
+            "items": [],
+            "reason": f"{target.name}.{list_field} entries must be objects",
+        }
+    return {
+        "status": "READY",
+        "path": str(target),
+        "data": data,
+        "items": [dict(item) for item in items],
+        "reason": "",
+    }
+
+
+def _snapshot_hash(paths: list[Path]) -> tuple[str, dict[str, str]]:
+    evidence: dict[str, str] = {}
+    for path in sorted({Path(item) for item in paths}, key=lambda item: str(item)):
+        key = str(path)
+        if not path.exists():
+            evidence[key] = "MISSING"
+            continue
+        try:
+            evidence[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except Exception as exc:
+            evidence[key] = f"ERROR:{exc}"
+    payload = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), evidence
+
+
+def _startup_stock_state_summary(stock_state_paths: list[str | Path]) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    review_items: list[str] = []
+    blocked_items: list[str] = []
+    invalid_items: list[str] = []
+    for raw_path in stock_state_paths:
+        path = Path(raw_path)
+        if not path.exists():
+            invalid_items.append(f"{path}: missing")
+            continue
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            invalid_items.append(f"{path}: {exc}")
+            continue
+        if not isinstance(state, dict):
+            invalid_items.append(f"{path}: root must be an object")
+            continue
+        status = _clean_text(state.get("status") or "STOPPED").upper()
+        statuses[status] = statuses.get(status, 0) + 1
+        if status in {"EMERGENCY_STOP", "EMERGENCY_STOPPED", "EMERGENCY"}:
+            blocked_items.append(f"{path.parent.name}: {status}")
+        elif status in {"REVIEW_REQUIRED", "REVIEW"} or state.get("review_required") is True:
+            review_items.append(f"{path.parent.name}: REVIEW_REQUIRED")
+        elif status not in {"STOPPED", "STOP", "IDLE"}:
+            review_items.append(f"{path.parent.name}: previous session status {status}")
+    return {
+        "status_counts": statuses,
+        "review_items": review_items,
+        "blocked_items": blocked_items,
+        "invalid_items": invalid_items,
+    }
 
 
 def _identity_key(source: Any, identity: Any) -> str:
@@ -99,6 +249,20 @@ def _position_applied(position: dict[str, Any] | None, fill: dict[str, Any] | No
     cumulative_by_order = _as_dict(position.get("last_applied_cumulative_by_order"))
     last_cumulative = cumulative_by_order.get(_order_apply_key(fill))
     return isinstance(last_cumulative, int) and isinstance(fill.get("filled_quantity"), int) and last_cumulative >= fill["filled_quantity"]
+
+
+def _identity_conflicts(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    fields: tuple[str, ...],
+) -> list[str]:
+    conflicts: list[str] = []
+    for field in fields:
+        left_value = _clean_text(left.get(field))
+        right_value = _clean_text(right.get(field))
+        if left_value and right_value and left_value != right_value:
+            conflicts.append(field)
+    return conflicts
 
 
 def _pending_chejan_items(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -283,6 +447,250 @@ def collect_operator_reconciliation_items(
         "fills_path": str(fills_path),
         "positions_path": str(positions_path),
         "broker_holdings_path": str(broker_holdings_path),
+    }
+
+
+def assess_startup_recovery(
+    *,
+    queue_path: str | Path = DEFAULT_QUEUE_PATH,
+    fills_path: str | Path = DEFAULT_FILLS_PATH,
+    positions_path: str | Path = DEFAULT_POSITIONS_PATH,
+    broker_holdings_path: str | Path = DEFAULT_BROKER_HOLDINGS_PATH,
+    order_executions_path: str | Path = DEFAULT_ORDER_EXECUTIONS_PATH,
+    order_locks_path: str | Path = DEFAULT_ORDER_LOCKS_PATH,
+    routine_signals_path: str | Path = DEFAULT_ROUTINE_SIGNALS_PATH,
+    stock_state_paths: list[str | Path] | None = None,
+) -> dict[str, Any]:
+    """Assess whether the current process may resume automatic trading.
+
+    The assessment is read-only. It preserves every runtime file and reports
+    the current evidence snapshot that an operator approval must bind to.
+    """
+    paths_by_name = {
+        "order_queue": (Path(queue_path), "orders"),
+        "fills": (Path(fills_path), "fills"),
+        "positions": (Path(positions_path), "positions"),
+        "broker_holdings": (Path(broker_holdings_path), "holdings"),
+        "order_executions": (Path(order_executions_path), "executions"),
+        "order_locks": (Path(order_locks_path), "locks"),
+        "routine_signals": (Path(routine_signals_path), "signals"),
+    }
+    reads = {
+        name: _strict_runtime_list(path, field)
+        for name, (path, field) in paths_by_name.items()
+    }
+    stock_paths = [Path(path) for path in (stock_state_paths or [])]
+    snapshot_paths = [path for path, _field in paths_by_name.values()] + stock_paths
+    snapshot_hash, snapshot_evidence = _snapshot_hash(snapshot_paths)
+
+    invalid_reasons = [
+        read["reason"]
+        for read in reads.values()
+        if read.get("status") == "INVALID"
+    ]
+    missing_files = [
+        read["path"]
+        for read in reads.values()
+        if read.get("status") == "MISSING"
+    ]
+
+    executions_present = reads["order_executions"]["status"] != "MISSING"
+    locks_present = reads["order_locks"]["status"] != "MISSING"
+    if executions_present != locks_present:
+        invalid_reasons.append(
+            "order_executions.json and order_locks.json must both exist or both be absent"
+        )
+
+    queue_orders = reads["order_queue"].get("items") or []
+    queue_status_counts: dict[str, int] = {}
+    blocked_reasons: list[str] = []
+    review_reasons: list[str] = []
+    reconciliation_details: list[dict[str, Any]] = []
+    seen_order_ids: set[str] = set()
+
+    for order in queue_orders:
+        order_id = _clean_text(order.get("id") or order.get("order_id"))
+        if order_id:
+            if order_id in seen_order_ids:
+                invalid_reasons.append(f"duplicate queue order identity: {order_id}")
+            seen_order_ids.add(order_id)
+        status = _clean_text(order.get("status") or "UNKNOWN").upper()
+        queue_status_counts[status] = queue_status_counts.get(status, 0) + 1
+        label = order_id or _clean_text(order.get("code")) or "unknown order"
+
+        if status in _STARTUP_BLOCKED_QUEUE_STATUSES:
+            blocked_reasons.append(f"{label}: unresolved {status}")
+        elif status in _STARTUP_REVIEW_QUEUE_STATUSES:
+            review_reasons.append(f"{label}: unfinished queue status {status}")
+        elif status not in _STARTUP_TERMINAL_QUEUE_STATUSES:
+            review_reasons.append(f"{label}: unclassified queue status {status}")
+
+        if order.get("manual_reconciliation_required") is True:
+            review_reasons.append(f"{label}: manual reconciliation required")
+
+        if status in {"SEND_CALL_IN_PROGRESS", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+            inspection = inspect_incomplete_order_reconciliation(
+                queue_path,
+                order,
+                fills_path=fills_path,
+            )
+            reconciliation_details.append(inspection)
+            classification = _clean_text(
+                inspection.get("reconciliation_candidate_status")
+            ).upper()
+            reasons = [
+                _clean_text(reason)
+                for reason in inspection.get("blocked_reasons", [])
+                if _clean_text(reason)
+            ]
+            if classification == "BLOCKED":
+                blocked_reasons.extend(f"{label}: {reason}" for reason in reasons)
+            elif classification in {"REVIEW_REQUIRED", "RECONCILIATION_CANDIDATE"}:
+                review_reasons.extend(f"{label}: {reason}" for reason in reasons)
+
+    fills = reads["fills"].get("items") or []
+    positions = reads["positions"].get("items") or []
+    holdings = reads["broker_holdings"].get("items") or []
+    executions = reads["order_executions"].get("items") or []
+    locks = reads["order_locks"].get("items") or []
+    signals = reads["routine_signals"].get("items") or []
+
+    if reads["fills"]["status"] == "MISSING" and any(
+        _clean_text(order.get("status")).upper() in {"PARTIALLY_FILLED", "FILLED", "PARTIAL_CANCELLED"}
+        or _safe_int(order.get("cumulative_filled_quantity")) > 0
+        for order in queue_orders
+    ):
+        invalid_reasons.append("fills.json is missing while Queue contains fill evidence")
+    if reads["positions"]["status"] == "MISSING" and fills:
+        invalid_reasons.append("positions.json is missing while fills.json contains records")
+    if reads["broker_holdings"]["status"] == "MISSING":
+        review_reasons.append("broker_holdings.json is not available for broker/internal position comparison")
+
+    queue_by_order_id: dict[str, dict[str, Any]] = {}
+    for order in queue_orders:
+        order_id = _clean_text(order.get("order_id"))
+        if order_id and order_id not in queue_by_order_id:
+            queue_by_order_id[order_id] = order
+
+    seen_execution_ids: set[str] = set()
+    for execution in executions:
+        execution_id = _clean_text(execution.get("execution_id"))
+        if execution_id:
+            if execution_id in seen_execution_ids:
+                invalid_reasons.append(f"duplicate runtime execution identity: {execution_id}")
+            seen_execution_ids.add(execution_id)
+        order_id = _clean_text(execution.get("order_id"))
+        queue_order = queue_by_order_id.get(order_id)
+        label = execution_id or order_id or "unknown execution"
+        if queue_order is None:
+            blocked_reasons.append(f"{label}: runtime execution has no matching Queue order")
+            continue
+        conflicts = _identity_conflicts(
+            execution,
+            queue_order,
+            ("order_id", "execution_id", "request_hash", "lock_id"),
+        )
+        if conflicts:
+            invalid_reasons.append(
+                f"{label}: runtime execution/Queue identity mismatch ({', '.join(conflicts)})"
+            )
+
+    for fill in fills:
+        fill_id = _clean_text(fill.get("fill_id")) or _identity_key(
+            fill.get("execution_identity_source"),
+            fill.get("execution_identity"),
+        ) or "unknown fill"
+        position = _find_position(
+            reads["positions"].get("data"),
+            fill,
+        )
+        if not _position_applied(position, fill):
+            review_reasons.append(f"{fill_id}: Fill is not applied to internal Position")
+
+    for lock in locks:
+        lock_id = _clean_text(lock.get("lock_id") or lock.get("id") or "unknown lock")
+        blocked_reasons.append(f"{lock_id}: runtime order lock remains")
+
+    for holding in holdings:
+        if holding.get("manual_reconciliation_required") is True:
+            review_reasons.append(
+                f"{_clean_text(holding.get('account_no'))}/{_clean_text(holding.get('code'))}: "
+                f"broker holding reconciliation {_clean_text(holding.get('reconciliation_status')) or 'required'}"
+            )
+
+    for signal in signals:
+        signal_id = _clean_text(signal.get("id")) or "unknown signal"
+        signal_status = _clean_text(signal.get("status")).upper()
+        if signal_status in {"PENDING", "PREVIEWED", "READY", "ORDER_QUEUED", "ERROR"}:
+            review_reasons.append(
+                f"{signal_id}: unfinished routine signal status {signal_status or 'UNKNOWN'}"
+            )
+
+    stock_summary = _startup_stock_state_summary(stock_paths)
+    invalid_reasons.extend(stock_summary["invalid_items"])
+    blocked_reasons.extend(stock_summary["blocked_items"])
+    review_reasons.extend(stock_summary["review_items"])
+
+    operator_items = collect_operator_reconciliation_items(
+        queue_path=queue_path,
+        fills_path=fills_path,
+        positions_path=positions_path,
+        broker_holdings_path=broker_holdings_path,
+    )
+    if operator_items["summary"]["total"]:
+        review_reasons.append(
+            f"operator reconciliation items: {operator_items['summary']['total']}"
+        )
+
+    invalid_reasons = list(dict.fromkeys(reason for reason in invalid_reasons if reason))
+    blocked_reasons = list(dict.fromkeys(reason for reason in blocked_reasons if reason))
+    review_reasons = list(dict.fromkeys(reason for reason in review_reasons if reason))
+
+    if invalid_reasons:
+        status = STARTUP_INVALID_RUNTIME
+    elif blocked_reasons:
+        status = STARTUP_BLOCKED_RECOVERY
+    elif review_reasons:
+        status = STARTUP_REVIEW_REQUIRED
+    else:
+        status = STARTUP_RESUME_READY
+
+    return {
+        "assessment_type": "STARTUP_RECOVERY_SESSION_RESUME",
+        "status": status,
+        "operator_approval_allowed": status in {
+            STARTUP_RESUME_READY,
+            STARTUP_REVIEW_REQUIRED,
+        },
+        "automatic_trading_allowed": False,
+        "requires_operator_confirmation": True,
+        "snapshot_hash": snapshot_hash,
+        "snapshot_evidence": snapshot_evidence,
+        "invalid_reasons": invalid_reasons,
+        "blocked_reasons": blocked_reasons,
+        "review_reasons": review_reasons,
+        "missing_files": missing_files,
+        "queue_status_counts": queue_status_counts,
+        "runtime_counts": {
+            "orders": len(queue_orders),
+            "fills": len(fills),
+            "positions": len(positions),
+            "broker_holdings": len(holdings),
+            "executions": len(executions),
+            "locks": len(locks),
+            "routine_signals": len(signals),
+            "stock_states": len(stock_paths),
+        },
+        "stock_state_summary": stock_summary,
+        "operator_reconciliation": operator_items,
+        "reconciliation_details": reconciliation_details,
+        "read_results": reads,
+        "checked_at": _now_text(),
+        "runtime_write": False,
+        "queue_write": False,
+        "file_write": False,
+        "send_order_called": False,
+        "broker_api_called": False,
     }
 
 

@@ -119,6 +119,13 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     if not window.isVisible():
         return
 
+    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
+    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
+        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
+        if callable(update_controls):
+            update_controls(window)
+        return
+
     minute_key = window.current_time_policy_minute_key()
     if minute_key == window._last_time_policy_minute_key:
         return

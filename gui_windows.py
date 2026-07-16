@@ -65,11 +65,11 @@ from gui_auto_trade_setting_window import (
     handle_kiwoom_raw_chejan_event,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
-    reset_runtime_statuses_for_program_start,
     routine_display_name,
 )
 from gui_routine_registry import routine_record_by_name
 from kiwoom_api import KiwoomApi
+from operator_reconciliation_service import assess_startup_recovery
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -143,11 +143,14 @@ class MainWindow(QMainWindow):
         self._main_routine_sort_order = Qt.AscendingOrder
         self._main_running_sort_column = -1
         self._main_running_sort_order = Qt.AscendingOrder
+        self._startup_recovery_result: dict[str, object] = {}
+        self._startup_recovery_approved = False
+        self._startup_recovery_approved_snapshot = ""
 
         self.btn_stock_register = QPushButton("종목등록설정")
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
         self.btn_stop_all = QPushButton("전체 자동매매 정지")
-        self.btn_restart = QPushButton("재시작")
+        self.btn_restart = QPushButton("운영 재개")
         self.btn_initialize = QPushButton("초기화")
         self.btn_log_view = QPushButton("로그 보기")
         self.btn_review_required = QPushButton("검토관리종목")
@@ -157,7 +160,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._connect_events()
         normalize_base_stock_single_routine_file()
-        reset_runtime_statuses_for_program_start("프로그램재시작")
+        self.refresh_startup_recovery_status()
         self.refresh_all()
 
     def _setup_ui(self) -> None:
@@ -352,13 +355,125 @@ class MainWindow(QMainWindow):
         self.btn_stop_all.clicked.connect(self.on_stop_all_clicked)
         self.btn_stock_register.clicked.connect(self.open_stock_register_window)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
-        self.btn_restart.clicked.connect(self.not_implemented)
+        self.btn_restart.clicked.connect(self.review_startup_recovery)
         self.btn_initialize.clicked.connect(self.not_implemented)
         self.btn_log_view.clicked.connect(self.not_implemented)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
         self.routine_table.itemDoubleClicked.connect(self.open_routine_settings_from_main_table)
         self.running_stock_table.horizontalHeader().sectionClicked.connect(self.sort_main_running_table_by_column)
+
+    def startup_recovery_stock_state_paths(self) -> list[Path]:
+        return [stock_dir / "state.json" for stock_dir in self.all_runtime_stock_dirs()]
+
+    def refresh_startup_recovery_status(self) -> dict[str, object]:
+        result = assess_startup_recovery(
+            stock_state_paths=self.startup_recovery_stock_state_paths(),
+        )
+        self._startup_recovery_result = result
+        status = str(result.get("status") or "INVALID_RUNTIME")
+        if (
+            self._startup_recovery_approved
+            and self._startup_recovery_approved_snapshot != result.get("snapshot_hash")
+        ):
+            self._startup_recovery_approved = False
+            self._startup_recovery_approved_snapshot = ""
+
+        if self._startup_recovery_approved:
+            self.auto_status_label.setText("전체 자동매매 상태: 운영 재개 승인")
+            self.btn_restart.setText("운영 재개 확인 완료")
+        else:
+            labels = {
+                "RESUME_READY": "재개 가능",
+                "REVIEW_REQUIRED": "검토 필요",
+                "BLOCKED_RECOVERY": "복구 차단",
+                "INVALID_RUNTIME": "Runtime 손상",
+            }
+            self.auto_status_label.setText(
+                f"전체 자동매매 상태: {labels.get(status, status)}"
+            )
+            self.btn_restart.setText("운영 재개")
+        return result
+
+    def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+        if refresh:
+            self.refresh_startup_recovery_status()
+        return bool(
+            self._startup_recovery_approved
+            and self._startup_recovery_approved_snapshot
+            and self._startup_recovery_approved_snapshot
+            == self._startup_recovery_result.get("snapshot_hash")
+        )
+
+    def startup_recovery_block_reason(self) -> str:
+        result = self._startup_recovery_result
+        status = str(result.get("status") or "INVALID_RUNTIME")
+        for key in ("invalid_reasons", "blocked_reasons", "review_reasons"):
+            reasons = result.get(key)
+            if isinstance(reasons, list) and reasons:
+                return f"{status}: {reasons[0]}"
+        return f"{status}: 운영 재개 확인이 필요합니다."
+
+    def _startup_recovery_detail_text(self, result: dict[str, object]) -> str:
+        counts = result.get("runtime_counts")
+        counts = counts if isinstance(counts, dict) else {}
+        lines = [
+            f"판정: {result.get('status', 'INVALID_RUNTIME')}",
+            f"Queue 주문: {counts.get('orders', 0)}",
+            f"Fill: {counts.get('fills', 0)}",
+            f"Position: {counts.get('positions', 0)}",
+            f"Broker Holdings: {counts.get('broker_holdings', 0)}",
+            f"Runtime Lock: {counts.get('locks', 0)}",
+            f"Reconciliation: "
+            f"{result.get('operator_reconciliation', {}).get('summary', {}).get('total', 0)}",
+        ]
+        for title, key in (
+            ("손상", "invalid_reasons"),
+            ("차단", "blocked_reasons"),
+            ("검토", "review_reasons"),
+        ):
+            reasons = result.get(key)
+            if isinstance(reasons, list) and reasons:
+                lines.append("")
+                lines.append(f"{title}:")
+                lines.extend(f"- {reason}" for reason in reasons[:12])
+                if len(reasons) > 12:
+                    lines.append(f"- 외 {len(reasons) - 12}개")
+        return "\n".join(lines)
+
+    def review_startup_recovery(self) -> None:
+        result = self.refresh_startup_recovery_status()
+        status = str(result.get("status") or "INVALID_RUNTIME")
+        detail = self._startup_recovery_detail_text(result)
+
+        if result.get("operator_approval_allowed") is not True:
+            QMessageBox.warning(
+                self,
+                "운영 재개 차단",
+                detail + "\n\nRuntime evidence를 먼저 검토·복구해야 합니다.",
+            )
+            if result.get("operator_reconciliation", {}).get("summary", {}).get("total", 0):
+                self.open_review_required_window()
+            return
+
+        message = detail + "\n\n현재 evidence를 기준으로 자동매매 운영을 재개하시겠습니까?"
+        if QMessageBox.question(
+            self,
+            "Startup Recovery",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            self.statusBar().showMessage("운영 재개 승인이 취소되었습니다.")
+            return
+
+        self._startup_recovery_approved = True
+        self._startup_recovery_approved_snapshot = str(result.get("snapshot_hash") or "")
+        self.refresh_startup_recovery_status()
+        window = getattr(self, "auto_trade_setting_window", None)
+        refresh_controls = getattr(window, "update_startup_recovery_controls", None)
+        if callable(refresh_controls):
+            refresh_controls()
+        self.statusBar().showMessage(f"운영 재개 승인 완료: {status}")
 
     def login_kiwoom_manually(self) -> None:
         api = getattr(self, "kiwoom_api", None)

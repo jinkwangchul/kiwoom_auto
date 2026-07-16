@@ -373,7 +373,24 @@ ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
-PROGRAM_START_RESET_APPLIED = False
+
+
+def startup_recovery_action_allowed(window, action: str) -> bool:
+    """Enforce session recovery only for the real MainWindow production caller."""
+    if not isinstance(window, AutoTradeSettingWindow):
+        return True
+    try:
+        parent = window.parent()
+    except Exception:
+        return True
+    if "_startup_recovery_result" not in getattr(parent, "__dict__", {}):
+        return True
+    if not callable(getattr(type(parent), "startup_recovery_session_ready", None)):
+        return True
+    checker = getattr(window, "require_startup_recovery_session", None)
+    if callable(checker):
+        return checker(action) is True
+    return True
 
 
 def handle_kiwoom_raw_chejan_event(
@@ -682,116 +699,6 @@ def append_stock_log(stock_dir: Path, event_type: str, message: str) -> Path | N
         return None
 
 
-def reset_runtime_statuses_for_program_start(context_label: str = "프로그램재시작") -> tuple[int, int]:
-    """프로그램 시작/재시작 시 전체 runtime 종목을 안전 초기화한다.
-
-    - 정상 종목: 종료상태 + 시작 OFF
-    - 이상 종목: 검토관리 이동
-    - 운영 중 발생한 서버/형식 불일치의 적색 표시는 이 함수가 아니라 런타임 표시 로직에서 처리한다.
-    - 같은 프로세스에서 창을 다시 열 때마다 운영상태를 날리지 않도록 1회만 수행한다.
-    """
-    global PROGRAM_START_RESET_APPLIED
-    if PROGRAM_START_RESET_APPLIED:
-        return 0, 0
-    PROGRAM_START_RESET_APPLIED = True
-
-    protected_statuses = {
-        "REVIEW_REQUIRED",
-        "REVIEW",
-        "EMERGENCY_STOP",
-        "EMERGENCY_STOPPED",
-        "EMERGENCY",
-    }
-
-    stopped_count = 0
-    review_count = 0
-    checked_at = now_text()
-
-    for routine_dir in get_routine_dirs():
-        routine_name = routine_display_name(routine_dir)
-        for stock_dir in get_stock_dirs_in_routine(routine_dir):
-            state_path = stock_dir / "state.json"
-            state = read_json_dict(state_path)
-            if not isinstance(state, dict) or not state:
-                continue
-
-            code, name = parse_stock_folder_name(stock_dir.name)
-            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-            if status in protected_statuses:
-                continue
-
-            has_problem, reason, details = restart_initial_review_reason_for_stock(stock_dir, state)
-            holding_qty = details.get("holding_qty", 0)
-            avg_price = details.get("avg_price", 0.0)
-            holding_amount = details.get("holding_amount", 0.0)
-            buy_pending_qty = details.get("buy_pending_qty", 0)
-            sell_pending_qty = details.get("sell_pending_qty", 0)
-
-            if has_problem:
-                state["status"] = "REVIEW_REQUIRED"
-                state["review_required"] = True
-                state["review_status"] = "PENDING"
-                state["review_location"] = context_label
-                state["review_reason"] = reason
-                state["review_detail"] = (
-                    f"{reason}: 보유 {holding_qty}주 / 평단 {format_number_value(avg_price)} / "
-                    f"보유금액 {format_number_value(holding_amount)} / 미수 {buy_pending_qty} / 미도 {sell_pending_qty}"
-                )
-                state["review_routine"] = routine_name
-                state["review_entered_at"] = checked_at
-                state["review_checked_at"] = checked_at
-                review_count += 1
-            else:
-                state["status"] = "STOPPED"
-                state["review_required"] = False
-                state["review_status"] = ""
-                state["review_location"] = ""
-                state["review_reason"] = ""
-                state["review_detail"] = ""
-                stopped_count += 1
-
-            state["trade_enabled"] = False
-            state["buy_enabled"] = False
-            state["sell_enabled"] = False
-            state["real_trade_enabled"] = False
-            state["trade_started_at"] = ""
-            state["start_policy_status"] = ""
-            state["start_policy_checked_at"] = ""
-            state["resumed_at"] = ""
-            state["ignore_signals_before"] = ""
-            state["liquidation_policy_forced"] = False
-            state["liquidation_policy_reason"] = ""
-            state["early_close_requested_at"] = ""
-            state["early_close_source"] = ""
-            state["early_close_method"] = ""
-            state["early_close_policy"] = {}
-            state["operation_notice"] = ""
-            state["operation_notice_reason"] = ""
-            state["operation_notice_at"] = ""
-            state["auto_close_requested_at"] = ""
-            state["auto_close_source"] = ""
-            state["auto_close_method"] = ""
-            state["auto_close_policy"] = {}
-            state["updated_at"] = checked_at
-            state["startup_reset_at"] = checked_at
-            state["startup_reset_reason"] = "PROGRAM_RESTART_FORCE_STOP"
-            state["trade_stopped_at"] = checked_at
-
-            if not write_state_json(stock_dir, state):
-                continue
-
-    if stopped_count or review_count:
-        append_changelog(
-            "UPDATE",
-            "state.json",
-            f"{context_label} 안전초기화: 중지 {stopped_count}개 / 검토관리 {review_count}개",
-        )
-
-    return stopped_count, review_count
-
-
-
-
 def default_operation_policy() -> dict[str, object]:
     """운영환경설정 기본값.
 
@@ -1050,11 +957,8 @@ class AutoTradeSettingWindow(QDialog):
         self._setup_ui()
         self._connect_events()
 
-        # 자동매매설정 창 시작 시 직전 실행 상태를 이어받지 않는다.
-        # 매매시작 버튼을 눌렀을 때만 현재 시간/운영방식 기준으로 재판정한다.
-        self.reset_runtime_statuses_on_window_start()
-
         self.refresh_all()
+        self.update_startup_recovery_controls()
         self._runtime_file_snapshot = self.current_runtime_file_signature()
         self._time_policy_timer.start()
         self._runtime_file_timer.start()
@@ -1362,6 +1266,51 @@ class AutoTradeSettingWindow(QDialog):
     def on_time_policy_timer_tick(self) -> None:
         auto_trade_on_time_policy_timer_tick(self)
 
+    def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+        parent = self.parent()
+        checker = getattr(parent, "startup_recovery_session_ready", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(refresh=refresh))
+        except Exception:
+            return False
+
+    def require_startup_recovery_session(self, action: str) -> bool:
+        if self.startup_recovery_session_ready(refresh=True):
+            return True
+        parent = self.parent()
+        reason_getter = getattr(parent, "startup_recovery_block_reason", None)
+        reason = ""
+        if callable(reason_getter):
+            try:
+                reason = str(reason_getter() or "").strip()
+            except Exception:
+                reason = ""
+        message = f"{action} 차단: Startup Recovery 운영 재개 확인이 필요합니다."
+        if reason:
+            message += f" ({reason})"
+        self.statusBarMessage(message)
+        self.update_startup_recovery_controls()
+        return False
+
+    def update_startup_recovery_controls(self) -> None:
+        ready = self.startup_recovery_session_ready(refresh=False)
+        for button in (
+            self.btn_execution_enable,
+            self.btn_real_ready_preflight,
+            self.btn_execution_preview,
+            self.btn_manual_send_order,
+            self.btn_manual_cancel_pending_order,
+            self.btn_manual_modify_pending_order,
+        ):
+            button.setEnabled(ready)
+        if ready:
+            self.update_manual_queue_commit_button_state()
+        else:
+            self.btn_manual_queue_commit.setEnabled(False)
+            self.btn_start.setEnabled(False)
+
     def closeEvent(self, event) -> None:
         """창을 닫을 때 시간정책 타이머를 정리한다."""
         try:
@@ -1419,10 +1368,6 @@ class AutoTradeSettingWindow(QDialog):
         except Exception:
             pass
 
-    def reset_runtime_statuses_on_window_start(self) -> None:
-        """자동매매설정 창 시작 시 프로그램 재시작 안전초기화를 재적용한다."""
-        reset_runtime_statuses_for_program_start("프로그램재시작")
-
     def selected_stock_rows(self) -> list[int]:
         return selected_stock_rows(self)
 
@@ -1436,7 +1381,8 @@ class AutoTradeSettingWindow(QDialog):
         has_stock = self.has_selected_stock()
         single_stock = self.has_single_selected_stock()
 
-        self.btn_start.setEnabled(has_stock)
+        recovery_ready = self.startup_recovery_session_ready(refresh=False)
+        self.btn_start.setEnabled(has_stock and recovery_ready)
         self.btn_stop.setEnabled(has_stock)
         self.btn_early_close.setEnabled(has_stock)
         self.btn_set_schedule.setEnabled(True)
@@ -1444,6 +1390,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_order_view.setEnabled(single_stock)
         self.btn_log_view.setEnabled(single_stock)
         self.btn_review_view.setEnabled(True)
+        self.update_startup_recovery_controls()
 
     def on_stock_selection_changed(self) -> None:
         self.update_action_buttons()
@@ -1970,6 +1917,8 @@ class AutoTradeSettingWindow(QDialog):
         dialog.exec_()
 
     def enable_execution_candidate_manually(self) -> None:
+        if not startup_recovery_action_allowed(self, "Execution Enable"):
+            return
         order_id, accepted = QInputDialog.getText(
             self,
             "수동 실주문 후보 활성화",
@@ -2325,6 +2274,8 @@ class AutoTradeSettingWindow(QDialog):
         }
 
     def run_real_ready_preflight_manually(self) -> None:
+        if not startup_recovery_action_allowed(self, "REAL_READY 수동 점검"):
+            return
         order_id, accepted = QInputDialog.getText(
             self,
             "REAL_READY 수동 점검",
@@ -2853,6 +2804,8 @@ class AutoTradeSettingWindow(QDialog):
         }
 
     def preview_execution_for_real_ready_order_manual(self) -> None:
+        if not startup_recovery_action_allowed(self, "Execution Preview"):
+            return
         order_id, accepted = QInputDialog.getText(
             self,
             "Execution Preview",
@@ -3265,6 +3218,8 @@ class AutoTradeSettingWindow(QDialog):
         dialog.exec_()
 
     def commit_last_execution_preview_queue_manually(self) -> None:
+        if not startup_recovery_action_allowed(self, "수동 Queue 저장"):
+            return
         queue_write_preview = self.queue_write_preview_from_last_execution_preview()
         if queue_write_preview.get("write_preview") is not True:
             self.statusBarMessage("수동 Queue 저장: 먼저 유효한 Execution Preview를 실행하세요.")
@@ -3998,6 +3953,8 @@ class AutoTradeSettingWindow(QDialog):
         return QMessageBox.question(self, "Manual Modify", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
     def cancel_pending_order_manually(self) -> None:
+        if not startup_recovery_action_allowed(self, "Manual Cancel"):
+            return
         source_id, accepted = QInputDialog.getText(self, "Manual Cancel", "BROKER_ACCEPTED/PARTIALLY_FILLED order id:")
         if not accepted:
             return
@@ -4080,6 +4037,8 @@ class AutoTradeSettingWindow(QDialog):
         self.send_order_for_order_queued_manually(str(cancel_record.get("id") or ""))
 
     def modify_pending_order_manually(self) -> None:
+        if not startup_recovery_action_allowed(self, "Manual Modify"):
+            return
         source_id, accepted = QInputDialog.getText(self, "Manual Modify", "BROKER_ACCEPTED/PARTIALLY_FILLED order id:")
         if not accepted:
             return
@@ -4188,6 +4147,8 @@ class AutoTradeSettingWindow(QDialog):
         self.send_order_for_order_queued_manually(str(modify_record.get("id") or ""))
 
     def send_order_for_order_queued_manually(self, order_id_override: str | None = None) -> None:
+        if not startup_recovery_action_allowed(self, "Manual SendOrder"):
+            return
         if order_id_override is None:
             order_id, accepted = QInputDialog.getText(self, "Manual SendOrder", "ORDER_QUEUED record id:")
             if not accepted:
