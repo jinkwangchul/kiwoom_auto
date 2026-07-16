@@ -134,6 +134,52 @@ class ChejanEventRecorderTest(unittest.TestCase):
         record.update(overrides)
         return record
 
+    def _cancel_modify_request_record(self, *, action: str, broker_order_no: str, original_order_no: str, **overrides: object) -> dict[str, object]:
+        record = self._record(
+            id=f"ORDER_QUEUED_{action}_1",
+            status="SEND_CALL_ACCEPTED",
+            order_id=f"ORDER_{action}_1",
+            request_hash=f"HASH_{action}_1",
+            lock_id=f"LOCK_{action}_1",
+            execution_id=f"EXEC_{action}_1",
+            broker_order_no=broker_order_no,
+            account_no="12345678",
+            code="003550",
+            side="BUY",
+            execution_request={
+                "request_preview": {
+                    "order_action": action,
+                    "original_order_no": original_order_no,
+                    "account_no": "12345678",
+                    "code": "003550",
+                    "side": "BUY",
+                }
+            },
+        )
+        record.update(overrides)
+        return record
+
+    def _original_open_record(self, **overrides: object) -> dict[str, object]:
+        record = self._record(
+            id="ORDER_QUEUED_ORIGINAL_1",
+            status="BROKER_ACCEPTED",
+            order_id="ORDER_ORIGINAL_1",
+            request_hash="HASH_ORIGINAL_1",
+            lock_id="LOCK_ORIGINAL_1",
+            execution_id="EXEC_ORIGINAL_1",
+            broker_order_no="ORIGINAL_BRK_1",
+            account_no="12345678",
+            code="003550",
+            side="BUY",
+            quantity=10,
+            original_order_quantity=10,
+            remaining_quantity=10,
+            cumulative_filled_quantity=0,
+            total_filled_quantity=0,
+        )
+        record.update(overrides)
+        return record
+
     def _write_queue(self, directory: str, record: dict[str, object] | None = None, root: object | None = None) -> Path:
         path = Path(directory) / "order_queue.json"
         data = {"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [record or self._record()]}
@@ -251,6 +297,271 @@ class ChejanEventRecorderTest(unittest.TestCase):
 
             self.assertFalse(result["recorded"])
             self.assertIn("target ORDER_QUEUED record not found", result["blocked_reasons"])
+
+    def test_cancel_chejan_updates_request_and_original_order_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="CANCEL",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original = self._original_open_record()
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original, request]},
+            )
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_CANCELED",
+                order_id="ORDER_CANCEL_1",
+                order_queued_id="ORDER_QUEUED_CANCEL_1",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_CANCEL_1",
+                lock_id="LOCK_CANCEL_1",
+                execution_id="EXEC_CANCEL_1",
+            )
+            event = self._event(
+                event_type="ORDER_CANCELED",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                order_status="CANCEL",
+                filled_quantity=0,
+                remaining_quantity=0,
+                raw_event={"received_at": "2026-07-04 09:31:00", "fid_values": {"904": "ORIGINAL_BRK_1"}},
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertTrue(result["recorded"], result)
+            self.assertEqual("CANCELLED", result["linked_original_status"])
+            data = self._read_queue(path)
+            original_after, request_after = data["orders"]
+            self.assertEqual("CANCELLED", original_after["status"])
+            self.assertEqual("ORDER_CANCELED", original_after["last_chejan_event_type"])
+            self.assertEqual("CANCELLED", request_after["status"])
+            self.assertEqual("ORIGINAL_BRK_1", original_after["broker_order_no"])
+            self.assertEqual("CANCEL_BRK_1", request_after["broker_order_no"])
+
+    def test_cancel_acceptance_records_request_only_and_leaves_original_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="CANCEL",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original = self._original_open_record(remaining_quantity=10)
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original, request]},
+            )
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_OPEN",
+                order_id="ORDER_CANCEL_1",
+                order_queued_id="ORDER_QUEUED_CANCEL_1",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_CANCEL_1",
+                lock_id="LOCK_CANCEL_1",
+                execution_id="EXEC_CANCEL_1",
+            )
+            event = self._event(
+                event_type="ORDER_OPEN",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                order_status="ACCEPTED",
+                filled_quantity=0,
+                remaining_quantity=10,
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertTrue(result["recorded"], result)
+            data = self._read_queue(path)
+            original_after, request_after = data["orders"]
+            self.assertEqual("BROKER_ACCEPTED", request_after["status"])
+            self.assertEqual("BROKER_ACCEPTED", original_after["status"])
+            self.assertEqual(10, original_after["remaining_quantity"])
+            self.assertNotIn("last_chejan_event_type", original_after)
+            self.assertFalse(request_after.get("original_order_effect_confirmed") is True)
+
+    def test_partial_cancel_chejan_preserves_original_partial_cancelled_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="CANCEL",
+                broker_order_no="CANCEL_BRK_2",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original = self._original_open_record(
+                status="PARTIALLY_FILLED",
+                remaining_quantity=7,
+                cumulative_filled_quantity=3,
+                total_filled_quantity=3,
+            )
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original, request]},
+            )
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_CANCELED",
+                order_id="ORDER_CANCEL_1",
+                order_queued_id="ORDER_QUEUED_CANCEL_1",
+                broker_order_no="CANCEL_BRK_2",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_CANCEL_1",
+                lock_id="LOCK_CANCEL_1",
+                execution_id="EXEC_CANCEL_1",
+            )
+            event = self._event(
+                event_type="ORDER_CANCELED",
+                broker_order_no="CANCEL_BRK_2",
+                original_order_no="ORIGINAL_BRK_1",
+                order_status="CANCEL",
+                filled_quantity=3,
+                remaining_quantity=0,
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertTrue(result["recorded"], result)
+            original_after = self._read_queue(path)["orders"][0]
+            self.assertEqual("PARTIAL_CANCELLED", original_after["status"])
+            self.assertEqual(3, original_after["final_filled_quantity"])
+
+    def test_modify_chejan_updates_request_and_original_relationship_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="MODIFY",
+                broker_order_no="MODIFY_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original = self._original_open_record()
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original, request]},
+            )
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_OPEN",
+                order_id="ORDER_MODIFY_1",
+                order_queued_id="ORDER_QUEUED_MODIFY_1",
+                broker_order_no="MODIFY_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_MODIFY_1",
+                lock_id="LOCK_MODIFY_1",
+                execution_id="EXEC_MODIFY_1",
+            )
+            event = self._event(
+                event_type="ORDER_OPEN",
+                broker_order_no="MODIFY_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                order_status="ACCEPTED",
+                filled_quantity=0,
+                remaining_quantity=5,
+                order_quantity=5,
+                order_price=1200,
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertTrue(result["recorded"], result)
+            data = self._read_queue(path)
+            original_after, request_after = data["orders"]
+            self.assertEqual("BROKER_ACCEPTED", request_after["status"])
+            self.assertEqual("BROKER_ACCEPTED", original_after["status"])
+            self.assertEqual("ORIGINAL_BRK_1", original_after["broker_order_no"])
+            self.assertEqual("MODIFY_BRK_1", original_after["latest_modify_broker_order_no"])
+            self.assertEqual("ORDER_QUEUED_MODIFY_1", original_after["latest_modify_request_order_queued_id"])
+            self.assertTrue(request_after["original_order_effect_confirmed"])
+            self.assertEqual("ORIGINAL_BRK_1", request_after["confirmed_original_order_no"])
+            self.assertEqual("ORDER_QUEUED_ORIGINAL_1", request_after["confirmed_original_order_queued_id"])
+            self.assertEqual(result["event_identity"], request_after["original_order_effect_event_identity"])
+            self.assertEqual(5, original_after["remaining_quantity"])
+            self.assertEqual(1200, original_after["order_price"])
+
+    def test_original_order_other_reconciliation_state_is_preserved_after_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="CANCEL",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original = self._original_open_record(
+                manual_reconciliation_required=True,
+                manual_reconciliation_reason="position_mismatch",
+            )
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original, request]},
+            )
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_CANCELED",
+                order_id="ORDER_CANCEL_1",
+                order_queued_id="ORDER_QUEUED_CANCEL_1",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_CANCEL_1",
+                lock_id="LOCK_CANCEL_1",
+                execution_id="EXEC_CANCEL_1",
+            )
+            event = self._event(
+                event_type="ORDER_CANCELED",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                order_status="CANCEL",
+                filled_quantity=0,
+                remaining_quantity=0,
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertTrue(result["recorded"], result)
+            original_after = self._read_queue(path)["orders"][0]
+            self.assertEqual("CANCELLED", original_after["status"])
+            self.assertTrue(original_after["manual_reconciliation_required"])
+            self.assertEqual("position_mismatch", original_after["manual_reconciliation_reason"])
+
+    def test_cancel_modify_chejan_ambiguous_original_order_is_blocked_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._cancel_modify_request_record(
+                action="CANCEL",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+            )
+            original_a = self._original_open_record(id="ORIGINAL_A")
+            original_b = self._original_open_record(id="ORIGINAL_B")
+            path = self._write_queue(
+                tmpdir,
+                root={"version": 1, "updated_at": "2026-07-04 09:00:00", "orders": [original_a, original_b, request]},
+            )
+            before = self._sha256(path)
+            review = self._review(
+                next_stage="CHEJAN_EVENT_RECORD_REQUIRED",
+                event_type="ORDER_CANCELED",
+                order_id="ORDER_CANCEL_1",
+                order_queued_id="ORDER_QUEUED_CANCEL_1",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                request_hash="HASH_CANCEL_1",
+                lock_id="LOCK_CANCEL_1",
+                execution_id="EXEC_CANCEL_1",
+            )
+            event = self._event(
+                event_type="ORDER_CANCELED",
+                broker_order_no="CANCEL_BRK_1",
+                original_order_no="ORIGINAL_BRK_1",
+                filled_quantity=0,
+                remaining_quantity=0,
+            )
+
+            result = record_chejan_event(review, event, path, context={"manual_chejan_event_record_confirmed": True})
+
+            self.assertFalse(result["recorded"])
+            self.assertIn("original order link is missing or ambiguous", result["blocked_reasons"][0])
+            self.assertEqual(before, self._sha256(path))
 
     def test_identity_mismatch_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

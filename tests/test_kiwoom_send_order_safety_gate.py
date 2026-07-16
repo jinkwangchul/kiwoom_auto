@@ -247,6 +247,60 @@ class KiwoomSendOrderSafetyGateTest(unittest.TestCase):
         self.assertEqual("INVALID", result["status"])
         self.assertIn("send_order_params.quantity must be greater than 0", result["issues"])
 
+    def test_cancel_order_type_allows_zero_price_and_requires_original_order_no(self) -> None:
+        contract = self._contract_result()
+        contract["send_order_params"].update(
+            {
+                "order_name": "BUY_CANCEL",
+                "order_type": 3,
+                "price": 0,
+                "hoga": "00",
+                "original_order_no": "12345",
+            }
+        )
+        contract["send_order_adapter_contract"].update(
+            {
+                "order_name": "BUY_CANCEL",
+                "order_type": 3,
+                "price": 0,
+                "hoga": "00",
+                "original_order_no": "12345",
+                "send_order_params": deepcopy(contract["send_order_params"]),
+            }
+        )
+
+        result = evaluate_kiwoom_send_order_safety(
+            contract,
+            self._runtime_snapshot(),
+            self._connection_state(),
+            self._operator_context(),
+        )
+
+        self.assertEqual("SEND_ORDER_SAFE", result["status"], result)
+        self.assertTrue(result["send_order_allowed"])
+
+    def test_cancel_modify_order_type_without_original_order_no_is_invalid(self) -> None:
+        contract = self._contract_result()
+        contract["send_order_params"].update({"order_name": "SELL_MODIFY", "order_type": 6, "original_order_no": ""})
+        contract["send_order_adapter_contract"].update(
+            {
+                "order_name": "SELL_MODIFY",
+                "order_type": 6,
+                "original_order_no": "",
+                "send_order_params": deepcopy(contract["send_order_params"]),
+            }
+        )
+
+        result = evaluate_kiwoom_send_order_safety(
+            contract,
+            self._runtime_snapshot(),
+            self._connection_state(),
+            self._operator_context(),
+        )
+
+        self.assertEqual("INVALID", result["status"])
+        self.assertIn("send_order_params.original_order_no is required for cancel/modify", result["issues"])
+
     def test_inputs_are_not_mutated(self) -> None:
         contract = self._contract_result()
         runtime_snapshot = self._runtime_snapshot()

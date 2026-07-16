@@ -326,6 +326,21 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertEqual("OPEN", position["position_status"])
             self.assertEqual(["FILL_1"], position["applied_fill_ids"])
 
+    def test_live_chejan_context_updates_without_manual_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            result = self._update(
+                path,
+                context={
+                    "kiwoom_api_live_event": True,
+                    "live_event_source": "KiwoomApi.raw_chejan_received",
+                },
+            )
+
+            self.assertTrue(result["position_updated"], result)
+            self.assertEqual(3, self._read_json(path)["positions"][0]["quantity"])
+
     def test_buy_updates_existing_average_price(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = self._write_positions(tmpdir, root={
@@ -408,6 +423,28 @@ class PositionUpdateServiceTest(unittest.TestCase):
             self.assertFalse(result["position_updated"])
             self.assertEqual("out_of_order_fill", result["position_stage"])
             self.assertIn("filled_quantity is less than last applied cumulative quantity", result["blocked_reasons"])
+
+    def test_later_cumulative_reconciliation_noops_without_changing_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_positions(tmpdir)
+
+            self._update(path, fill=self._fill(fill_id="FILL_5", execution_identity="EXEC_NO_5", filled_quantity=5, remaining_quantity=5))
+            before = path.read_text(encoding="utf-8")
+            result = self._update(
+                path,
+                fill=self._fill(fill_id="FILL_3", execution_identity="EXEC_NO_3", filled_quantity=3, remaining_quantity=7),
+                context={
+                    "kiwoom_api_live_event": True,
+                    "live_event_source": "KiwoomApi.raw_chejan_received",
+                    "chejan_reconciliation_reprocess": True,
+                },
+            )
+
+            self.assertFalse(result["position_updated"])
+            self.assertEqual("later_cumulative_fill_already_applied", result["position_stage"])
+            self.assertTrue(result["later_cumulative_already_applied"])
+            self.assertEqual(0, result["fill_delta_applied"])
+            self.assertEqual(before, path.read_text(encoding="utf-8"))
 
     def test_sell_decreases_existing_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

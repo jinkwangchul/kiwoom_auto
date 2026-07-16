@@ -73,7 +73,13 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
 
 
 def _confirmed(context: Any) -> bool:
-    return _as_dict(context).get("manual_chejan_event_record_confirmed") is True
+    ctx = _as_dict(context)
+    if ctx.get("manual_chejan_event_record_confirmed") is True:
+        return True
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+    )
 
 
 def _expected_revision(context: Any) -> int | None:
@@ -183,6 +189,133 @@ def _validate_target_record(record: dict[str, Any], review_result: dict[str, Any
         return _blocked("record", f"target record.status cannot accept {transition_key} event: {status or 'missing'}")
 
     return None
+
+
+def _request_preview(record: dict[str, Any]) -> dict[str, Any]:
+    execution_request = record.get("execution_request")
+    if not isinstance(execution_request, dict):
+        return {}
+    request_preview = execution_request.get("request_preview")
+    return request_preview if isinstance(request_preview, dict) else {}
+
+
+def _cancel_modify_action(record: dict[str, Any]) -> str:
+    action = _clean_text(_request_preview(record).get("order_action")).upper()
+    return action if action in {"CANCEL", "MODIFY"} else ""
+
+
+def _request_original_order_no(record: dict[str, Any]) -> str:
+    return _clean_text(_request_preview(record).get("original_order_no"))
+
+
+def _same_order_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    for field in ("account_no", "code", "side"):
+        left_value = _clean_text(left.get(field))
+        right_value = _clean_text(right.get(field))
+        if left_value and right_value and left_value != right_value:
+            return False
+    return True
+
+
+def _find_original_order_for_cancel_modify(
+    orders: list[Any],
+    *,
+    target_index: int,
+    target_record: dict[str, Any],
+    event: dict[str, Any],
+) -> tuple[dict[str, Any] | None, int, dict[str, Any] | None]:
+    action = _cancel_modify_action(target_record)
+    if not action:
+        return None, -1, None
+
+    original_order_no = _clean_text(event.get("original_order_no")) or _request_original_order_no(target_record)
+    if not original_order_no:
+        return None, -1, _blocked("original_order_link", "original_order_no is required for cancel/modify Chejan")
+    if _request_original_order_no(target_record) and _request_original_order_no(target_record) != original_order_no:
+        return None, -1, _blocked("original_order_link", "target request original_order_no does not match Chejan original_order_no")
+
+    matches: list[tuple[dict[str, Any], int]] = []
+    for index, order in enumerate(orders):
+        if index == target_index:
+            continue
+        item = _as_dict(order)
+        if _clean_text(item.get("broker_order_no")) != original_order_no:
+            continue
+        if not _same_order_identity(item, event):
+            continue
+        matches.append((item, index))
+
+    if len(matches) != 1:
+        return None, -1, _blocked(
+            "original_order_link",
+            "original order link is missing or ambiguous for cancel/modify Chejan",
+        )
+    return matches[0][0], matches[0][1], None
+
+
+def _validate_original_order_for_cancel_modify(record: dict[str, Any], event_type: str, action: str) -> dict[str, Any] | None:
+    status = _clean_text(record.get("status"))
+    if status not in {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+        return _blocked("original_order", f"original order.status cannot accept {action} Chejan: {status or 'missing'}")
+    if action == "CANCEL" and event_type not in _BROKER_ACCEPT_EVENT_TYPES and event_type != "ORDER_CANCELED":
+        return _blocked("original_order", "cancel request must be confirmed by ORDER_CANCELED Chejan")
+    if action == "MODIFY" and event_type not in _BROKER_ACCEPT_EVENT_TYPES:
+        return _blocked("original_order", "modify request must be confirmed by ORDER_OPEN/ORDER_ACCEPTED Chejan")
+    return None
+
+
+def _append_chejan_event_fields(
+    record: dict[str, Any],
+    *,
+    now: str,
+    event_type: str,
+    appended_event: dict[str, Any],
+    event_identity: str,
+    broker_order_no: str,
+    review_stage: str,
+) -> None:
+    existing_events = record.get("chejan_events")
+    if not isinstance(existing_events, list):
+        existing_events = []
+    record["chejan_event_recorded"] = True
+    record["chejan_event_recorded_at"] = now
+    record["chejan_event_record_source"] = "chejan_event_review"
+    record["last_chejan_event_type"] = event_type
+    record["last_chejan_event_at"] = appended_event["received_at"]
+    record["last_chejan_review_stage"] = review_stage
+    record["updated_at"] = now
+    if not any(_stored_event_identity(existing_event) == event_identity for existing_event in existing_events):
+        record["chejan_events"] = existing_events + [appended_event]
+    else:
+        record["chejan_events"] = existing_events
+
+
+def _apply_modify_to_original_order(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    request_record: dict[str, Any],
+    modify_broker_order_no: str,
+    event_identity: str,
+    received_at: str,
+) -> None:
+    remaining_quantity = _int_or_none(event.get("remaining_quantity"))
+    order_quantity = _int_or_none(event.get("order_quantity"))
+    order_price = _price_or_none(event.get("order_price"))
+    if remaining_quantity is not None:
+        record["remaining_quantity"] = remaining_quantity
+    if order_quantity is not None:
+        record["modified_order_quantity"] = order_quantity
+    if order_price is not None:
+        record["order_price"] = order_price
+        record["modified_order_price"] = order_price
+    record["latest_modify_broker_order_no"] = modify_broker_order_no
+    record["latest_modify_request_order_queued_id"] = _clean_text(request_record.get("id"))
+    record["latest_modify_request_order_id"] = _clean_text(request_record.get("order_id"))
+    record["latest_modify_event_id"] = _event_id(event_identity)
+    record["latest_modify_at"] = received_at
+    record["automatic_retry_allowed"] = False
+    _preserve_manual_reconciliation_after_chejan_effect(record)
 
 
 def _broker_order_policy(record: dict[str, Any], event: dict[str, Any]) -> tuple[str, bool, dict[str, Any] | None]:
@@ -301,6 +434,210 @@ def _stored_event_identity(stored_event: Any) -> str:
     return derived
 
 
+def chejan_event_identity(normalized_event: Any, *, event_type: str | None = None, broker_order_no: str | None = None) -> tuple[str, str]:
+    event = _as_dict(normalized_event)
+    return _event_identity(
+        event,
+        _clean_text(event_type or event.get("event_type")),
+        _clean_text(broker_order_no or event.get("broker_order_no")),
+    )
+
+
+def existing_chejan_record_result(
+    order_record: Any,
+    normalized_event: Any,
+    duplicate_result: Any = None,
+) -> dict[str, Any] | None:
+    record = _as_dict(order_record)
+    event = _as_dict(normalized_event)
+    event_type = _clean_text(event.get("event_type"))
+    if event_type not in _FILL_RECORD_TYPES:
+        return None
+    duplicate = _as_dict(duplicate_result)
+    duplicate_identity = _clean_text(duplicate.get("event_identity")).upper()
+    broker_order_no = _clean_text(record.get("broker_order_no") or event.get("broker_order_no"))
+    if not duplicate_identity:
+        duplicate_identity, _ = _event_identity(event, event_type, broker_order_no)
+    events = record.get("chejan_events")
+    if not isinstance(events, list):
+        return None
+    matched_event: dict[str, Any] | None = None
+    for stored_event in events:
+        item = _as_dict(stored_event)
+        if duplicate_identity and _stored_event_identity(item) == duplicate_identity:
+            matched_event = item
+            break
+    if matched_event is None:
+        return None
+    return {
+        "recorded": True,
+        "record_stage": "chejan_event_already_recorded",
+        "next_stage": NEXT_STAGE_FILL_RECORD_REQUIRED,
+        "changed": False,
+        "order_id": _clean_text(record.get("order_id")),
+        "order_queued_id": _clean_text(record.get("id")),
+        "broker_order_no": _clean_text(record.get("broker_order_no") or matched_event.get("broker_order_no")),
+        "event_type": event_type,
+        "matched_by": "existing_chejan_event",
+        "request_hash": _clean_text(record.get("request_hash")),
+        "lock_id": _clean_text(record.get("lock_id")),
+        "execution_id": _clean_text(record.get("execution_id")),
+        "event_identity": _clean_text(matched_event.get("event_identity")),
+        "event_identity_source": _clean_text(matched_event.get("event_identity_source")),
+        "lifecycle_status": _clean_text(record.get("status")),
+        "blocked_reasons": [],
+        "warnings": [],
+    }
+
+
+def _reconciliation_items(record: dict[str, Any]) -> list[dict[str, Any]]:
+    items = record.get("chejan_reconciliation_items")
+    if not isinstance(items, list):
+        return []
+    return [deepcopy(item) for item in items if isinstance(item, dict)]
+
+
+def _other_manual_reconciliation_required(record: dict[str, Any]) -> bool:
+    if record.get("send_uncertain") is True or record.get("call_execution_uncertain") is True:
+        return True
+    for field in (
+        "manual_reconciliation_reason",
+        "manual_reconciliation_stage",
+        "manual_reconciliation_source",
+    ):
+        value = _clean_text(record.get(field))
+        if value and value not in {"chejan", "chejan_event", "chejan_reconciliation"}:
+            return True
+    return False
+
+
+def _chejan_reconciliation_required(record: dict[str, Any]) -> bool:
+    return any(item.get("required") is True for item in _reconciliation_items(record))
+
+
+def _preserve_manual_reconciliation_after_chejan_effect(record: dict[str, Any]) -> None:
+    record["manual_reconciliation_required"] = _chejan_reconciliation_required(record) or _other_manual_reconciliation_required(record)
+
+
+def mark_chejan_reconciliation_state(
+    queue_path: str | Path,
+    chejan_event_record_result: Any,
+    *,
+    required: bool,
+    failed_stage: str = "",
+    completed_steps: list[str] | None = None,
+    reasons: list[Any] | None = None,
+    context: Any = None,
+) -> dict[str, Any]:
+    chejan_result = _as_dict(chejan_event_record_result)
+    event_identity = _clean_text(chejan_result.get("event_identity"))
+    order_queued_id = _clean_text(chejan_result.get("order_queued_id"))
+    order_id = _clean_text(chejan_result.get("order_id"))
+    request_hash = _clean_text(chejan_result.get("request_hash"))
+    lock_id = _clean_text(chejan_result.get("lock_id"))
+    execution_id = _clean_text(chejan_result.get("execution_id"))
+    now = _now_text()
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any]:
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            return {"blocked": _blocked("queue_structure", "queue orders must be a list")}
+        matches: list[tuple[int, dict[str, Any]]] = []
+        for index, order in enumerate(orders):
+            item = _as_dict(order)
+            if order_queued_id and _clean_text(item.get("id")) == order_queued_id:
+                matches.append((index, item))
+                continue
+            if (
+                order_id
+                and request_hash
+                and lock_id
+                and execution_id
+                and _clean_text(item.get("order_id")) == order_id
+                and _clean_text(item.get("request_hash")) == request_hash
+                and _clean_text(item.get("lock_id")) == lock_id
+                and _clean_text(item.get("execution_id")) == execution_id
+            ):
+                matches.append((index, item))
+        if len(matches) != 1:
+            return {"blocked": _blocked("reconciliation_record", f"reconciliation target count is {len(matches)}")}
+
+        index, item = matches[0]
+        updated = deepcopy(data)
+        updated_order = deepcopy(item)
+        items = _reconciliation_items(updated_order)
+        item_index = next(
+            (
+                idx for idx, existing in enumerate(items)
+                if _clean_text(existing.get("event_identity")) == event_identity
+            ),
+            -1,
+        )
+        reconciliation_item = items[item_index] if item_index >= 0 else {"event_identity": event_identity}
+        reconciliation_item.update(
+            {
+                "event_identity": event_identity,
+                "event_identity_source": _clean_text(chejan_result.get("event_identity_source")),
+                "required": bool(required),
+                "failed_stage": failed_stage if required else "",
+                "completed_steps": list(completed_steps or []),
+                "blocked_reasons": [str(reason) for reason in reasons or []] if required else [],
+                "updated_at": now,
+            }
+        )
+        if required:
+            reconciliation_item.pop("resolved_at", None)
+        else:
+            reconciliation_item["resolved_at"] = now
+        if item_index >= 0:
+            items[item_index] = reconciliation_item
+        else:
+            items.append(reconciliation_item)
+
+        pending_items = [existing for existing in items if existing.get("required") is True]
+        updated_order["chejan_reconciliation_items"] = items
+        updated_order["chejan_reconciliation_required"] = bool(pending_items)
+        updated_order["chejan_reconciliation_failed_stage"] = _clean_text(pending_items[-1].get("failed_stage")) if pending_items else ""
+        updated_order["chejan_reconciliation_event_identity"] = _clean_text(pending_items[-1].get("event_identity")) if pending_items else event_identity
+        updated_order["chejan_reconciliation_completed_steps"] = list(reconciliation_item.get("completed_steps") or [])
+        updated_order["chejan_reconciliation_blocked_reasons"] = list(pending_items[-1].get("blocked_reasons") or []) if pending_items else []
+        if required:
+            updated_order["chejan_reconciliation_updated_at"] = now
+        else:
+            updated_order["chejan_reconciliation_resolved_at"] = now
+        updated_order["manual_reconciliation_required"] = bool(pending_items) or _other_manual_reconciliation_required(updated_order)
+        updated_order["automatic_retry_allowed"] = False
+        updated["orders"][index] = updated_order
+        return {
+            "data": updated,
+            "result": {
+                "reconciliation_state_recorded": True,
+                "manual_reconciliation_required": updated_order["manual_reconciliation_required"],
+                "chejan_reconciliation_required": bool(pending_items),
+                "failed_stage": failed_stage,
+                "event_identity": event_identity,
+                "completed_steps": list(completed_steps or []),
+                "pending_event_identities": [_clean_text(existing.get("event_identity")) for existing in pending_items],
+            },
+        }
+
+    mutation_result = mutate_order_queue(
+        queue_path,
+        mutate,
+        operation_name="chejan_reconciliation_state",
+        success_stage="chejan_reconciliation_state_recorded",
+        next_stage="CHEJAN_RECONCILIATION_REVIEW_REQUIRED" if required else "CHEJAN_RECONCILIATION_RESOLVED",
+        context=context,
+        backup=True,
+    )
+    persisted = mutation_result.get("committed") is True and mutation_result.get("post_write_verified") is True
+    mutation_result["reconciliation_persisted"] = persisted
+    if not persisted:
+        reasons = mutation_result.get("blocked_reasons")
+        mutation_result["reconciliation_persist_failed_reasons"] = list(reasons) if isinstance(reasons, list) else ["chejan reconciliation queue mutation failed"]
+    return mutation_result
+
+
 def _event_id(event_identity: str) -> str:
     return f"CHEJAN_EVENT_{event_identity}"
 
@@ -321,6 +658,7 @@ def _event_record(
         "event_type": event_type,
         "broker": _clean_text(event.get("broker")),
         "broker_order_no": broker_order_no,
+        "original_order_no": _clean_text(event.get("original_order_no")),
         "account_no": _clean_text(event.get("account_no")),
         "code": _clean_text(event.get("code")),
         "side": _clean_text(event.get("side")),
@@ -592,10 +930,10 @@ def _apply_cancel(
             "cancellation_reason": _clean_text(event.get("order_status")) or "broker cancellation",
             "final_filled_quantity": cumulative,
             "remaining_quantity": 0,
-            "manual_reconciliation_required": False,
             "automatic_retry_allowed": False,
         }
     )
+    _preserve_manual_reconciliation_after_chejan_effect(record)
 
 
 def _apply_lifecycle_transition(
@@ -653,7 +991,7 @@ def record_chejan_event(
         return _blocked("queue_path", "queue_path is required")
 
     if not _confirmed(context):
-        return _blocked("operator_confirmation", "manual Chejan event record confirmation is required")
+        return _blocked("operator_confirmation", "Chejan event record confirmation is required")
 
     target_path = Path(queue_path)
     before_sha256 = None
@@ -722,6 +1060,27 @@ def record_chejan_event(
             event_identity_source=event_identity_source,
             now=now,
         )
+
+        linked_original_record: dict[str, Any] | None = None
+        linked_original_index = -1
+        request_action = _cancel_modify_action(updated_record)
+        if request_action:
+            original_record, original_index, original_link_blocked = _find_original_order_for_cancel_modify(
+                orders,
+                target_index=target_index,
+                target_record=target_record,
+                event=event,
+            )
+            if original_link_blocked is not None:
+                return {"blocked": original_link_blocked}
+            if original_record is None or original_index < 0:
+                return {"blocked": _blocked("original_order_link", "original order link is required for cancel/modify Chejan")}
+            original_validate_blocked = _validate_original_order_for_cancel_modify(original_record, event_type, request_action)
+            if original_validate_blocked is not None:
+                return {"blocked": original_validate_blocked}
+            linked_original_record = deepcopy(updated_data["orders"][original_index])
+            linked_original_index = original_index
+
         lifecycle_blocked = _apply_lifecycle_transition(
             updated_record,
             event,
@@ -733,17 +1092,92 @@ def record_chejan_event(
         if lifecycle_blocked is not None:
             return {"blocked": lifecycle_blocked}
 
-        updated_record["chejan_event_recorded"] = True
-        updated_record["chejan_event_recorded_at"] = now
-        updated_record["chejan_event_record_source"] = "chejan_event_review"
-        updated_record["last_chejan_event_type"] = event_type
-        updated_record["last_chejan_event_at"] = appended_event["received_at"]
-        updated_record["last_chejan_review_stage"] = _clean_text(review_result.get("review_stage"))
         updated_record["broker_order_no"] = broker_order_no
-        updated_record["updated_at"] = now
-        updated_record["chejan_events"] = existing_events + [appended_event]
+        _append_chejan_event_fields(
+            updated_record,
+            now=now,
+            event_type=event_type,
+            appended_event=appended_event,
+            event_identity=event_identity,
+            broker_order_no=broker_order_no,
+            review_stage=_clean_text(review_result.get("review_stage")),
+        )
 
         updated_data["orders"][target_index] = updated_record
+
+        linked_original_order_queued_id = ""
+        linked_original_status = ""
+        if linked_original_record is not None and linked_original_index >= 0:
+            original_broker_order_no = _clean_text(event.get("original_order_no")) or _request_original_order_no(updated_record)
+            original_event = deepcopy(appended_event)
+            original_event["linked_cancel_modify_request_order_queued_id"] = order_queued_id
+            original_event["linked_cancel_modify_request_order_id"] = _clean_text(updated_record.get("order_id"))
+            original_event["linked_cancel_modify_action"] = request_action
+            if request_action == "CANCEL" and event_type == "ORDER_CANCELED":
+                _apply_cancel(
+                    linked_original_record,
+                    event,
+                    broker_order_no=original_broker_order_no,
+                    event_identity=event_identity,
+                    received_at=appended_event["received_at"],
+                )
+                linked_original_record["cancel_request_order_queued_id"] = order_queued_id
+                linked_original_record["cancel_request_broker_order_no"] = broker_order_no
+            elif request_action == "MODIFY":
+                _apply_modify_to_original_order(
+                    linked_original_record,
+                    event,
+                    request_record=updated_record,
+                    modify_broker_order_no=broker_order_no,
+                    event_identity=event_identity,
+                    received_at=appended_event["received_at"],
+                )
+                updated_record["original_order_effect_confirmed"] = True
+                updated_record["confirmed_original_order_no"] = original_broker_order_no
+                updated_record["confirmed_original_order_queued_id"] = _clean_text(linked_original_record.get("id"))
+                updated_record["confirmed_original_order_id"] = _clean_text(linked_original_record.get("order_id"))
+                updated_record["original_order_effect_confirmed_at"] = appended_event["received_at"]
+                updated_record["original_order_effect_event_identity"] = event_identity
+                updated_record["original_order_effect_event_id"] = _event_id(event_identity)
+                updated_record["updated_at"] = now
+                updated_data["orders"][target_index] = updated_record
+            else:
+                linked_original_order_queued_id = _clean_text(linked_original_record.get("id"))
+                linked_original_status = _clean_text(linked_original_record.get("status"))
+                mutation_state["original_order_link_verified"] = True
+                mutation_state["original_order_effect_confirmed"] = False
+                mutation_state["linked_original_order_queued_id"] = linked_original_order_queued_id
+                mutation_state["linked_original_status"] = linked_original_status
+                mutation_state["linked_original_action"] = request_action
+                mutation_state.update(
+                    {
+                        "order_queued_id": order_queued_id,
+                        "broker_order_no": broker_order_no,
+                        "broker_order_no_enriched": broker_order_no_enriched,
+                        "event_identity": event_identity,
+                        "event_identity_source": event_identity_source,
+                        "execution_id": _clean_text(updated_record.get("execution_id")),
+                        "request_hash": _clean_text(updated_record.get("request_hash")),
+                        "lock_id": _clean_text(updated_record.get("lock_id")),
+                        "lifecycle_status": _clean_text(updated_record.get("status")),
+                        "lifecycle_updated": True,
+                    }
+                )
+                return {"data": updated_data}
+            _append_chejan_event_fields(
+                linked_original_record,
+                now=now,
+                event_type=event_type,
+                appended_event=original_event,
+                event_identity=event_identity,
+                broker_order_no=original_broker_order_no,
+                review_stage=_clean_text(review_result.get("review_stage")),
+            )
+            linked_original_record["updated_at"] = now
+            updated_data["orders"][linked_original_index] = linked_original_record
+            linked_original_order_queued_id = _clean_text(linked_original_record.get("id"))
+            linked_original_status = _clean_text(linked_original_record.get("status"))
+
         mutation_state.update(
             {
                 "order_queued_id": order_queued_id,
@@ -751,8 +1185,14 @@ def record_chejan_event(
                 "broker_order_no_enriched": broker_order_no_enriched,
                 "event_identity": event_identity,
                 "event_identity_source": event_identity_source,
+                "execution_id": _clean_text(updated_record.get("execution_id")),
+                "request_hash": _clean_text(updated_record.get("request_hash")),
+                "lock_id": _clean_text(updated_record.get("lock_id")),
                 "lifecycle_status": _clean_text(updated_record.get("status")),
                 "lifecycle_updated": True,
+                "linked_original_order_queued_id": linked_original_order_queued_id,
+                "linked_original_status": linked_original_status,
+                "linked_original_action": request_action,
             }
         )
         return {"data": updated_data}
@@ -790,8 +1230,14 @@ def record_chejan_event(
         "broker_order_no_enriched": mutation_state["broker_order_no_enriched"],
         "event_identity": mutation_state["event_identity"],
         "event_identity_source": mutation_state["event_identity_source"],
+        "execution_id": mutation_state["execution_id"],
+        "request_hash": mutation_state["request_hash"],
+        "lock_id": mutation_state["lock_id"],
         "lifecycle_status": mutation_state["lifecycle_status"],
         "lifecycle_updated": mutation_state["lifecycle_updated"],
+        "linked_original_order_queued_id": mutation_state.get("linked_original_order_queued_id", ""),
+        "linked_original_status": mutation_state.get("linked_original_status", ""),
+        "linked_original_action": mutation_state.get("linked_original_action", ""),
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
         "blocked_reasons": [],

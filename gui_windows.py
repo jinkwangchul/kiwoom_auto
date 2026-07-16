@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QTableWidget,
     QVBoxLayout,
     QWidget,
@@ -61,6 +62,7 @@ from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
     get_routine_dirs,
     get_stock_dirs_in_routine,
+    handle_kiwoom_raw_chejan_event,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
     reset_runtime_statuses_for_program_start,
@@ -112,10 +114,15 @@ class MainWindow(QMainWindow):
             login_state_changed = getattr(self.kiwoom_api, "login_state_changed", None)
             if login_state_changed is not None:
                 login_state_changed.connect(self.on_kiwoom_login_state_changed)
+            raw_chejan_received = getattr(self.kiwoom_api, "raw_chejan_received", None)
+            if raw_chejan_received is not None:
+                raw_chejan_received.connect(self.on_kiwoom_raw_chejan_received)
 
         self.login_status_label = QLabel("로그인 상태: 미연결")
         self.btn_kiwoom_login = QPushButton("키움 로그인")
         self.account_label = QLabel("계좌번호: -")
+        self.account_combo = QComboBox()
+        self.account_combo.setEnabled(False)
         self.account_type_label = QLabel("계좌 구분: -")
         self.auto_status_label = QLabel("전체 자동매매 상태: 정지")
         self.buy_time_status_label = QLabel("매수 가능 상태: 확인 전")
@@ -179,7 +186,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.login_status_label, 0, 0)
         layout.addWidget(self.btn_kiwoom_login, 0, 1)
         layout.addWidget(self.account_label, 0, 2)
-        layout.addWidget(self.account_type_label, 0, 3)
+        layout.addWidget(self.account_combo, 0, 3)
+        layout.addWidget(self.account_type_label, 0, 4)
 
         layout.addWidget(self.auto_status_label, 1, 0)
         layout.addWidget(self.buy_time_status_label, 1, 1)
@@ -391,6 +399,7 @@ class MainWindow(QMainWindow):
             message = f"키움 로그인 요청 실패: {reason}"
 
         self.login_status_label.setText(message)
+        self.refresh_kiwoom_accounts()
         self.statusBar().showMessage(message)
 
     def on_kiwoom_login_state_changed(self, state) -> None:
@@ -405,7 +414,57 @@ class MainWindow(QMainWindow):
             status_message = message or label_text
 
         self.login_status_label.setText(label_text)
+        self.refresh_kiwoom_accounts()
         self.statusBar().showMessage(status_message)
+
+    def kiwoom_account_numbers(self) -> list[str]:
+        api = getattr(self, "kiwoom_api", None)
+        getter = getattr(api, "account_numbers", None)
+        if not callable(getter):
+            return []
+        try:
+            raw_accounts = getter()
+        except Exception:
+            return []
+
+        accounts: list[str] = []
+        seen: set[str] = set()
+        for value in raw_accounts if isinstance(raw_accounts, list) else []:
+            account = str(value or "").strip()
+            if not account or account in seen:
+                continue
+            accounts.append(account)
+            seen.add(account)
+        return accounts
+
+    def refresh_kiwoom_accounts(self) -> list[str]:
+        combo = getattr(self, "account_combo", None)
+        if combo is None:
+            return []
+
+        current = self.selected_account_no()
+        accounts = self.kiwoom_account_numbers()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems(accounts)
+            combo.setEnabled(bool(accounts))
+            if len(accounts) == 1:
+                combo.setCurrentIndex(0)
+            elif current and current in accounts:
+                combo.setCurrentIndex(accounts.index(current))
+            else:
+                combo.setCurrentIndex(-1)
+        finally:
+            combo.blockSignals(False)
+        return accounts
+
+    def selected_account_no(self) -> str:
+        combo = getattr(self, "account_combo", None)
+        if combo is None or not combo.isEnabled():
+            return ""
+        account = str(combo.currentText() or "").strip()
+        return account if account in self.kiwoom_account_numbers() else ""
 
     def refresh_all(self) -> None:
         self.load_routine_table()
@@ -616,6 +675,18 @@ class MainWindow(QMainWindow):
     def open_auto_trade_setting_window(self) -> None:
         self.auto_trade_setting_window = AutoTradeSettingWindow(self)
         self.auto_trade_setting_window.show()
+
+    def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
+        self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(
+            raw_event,
+            {
+                "kiwoom_api_live_event": True,
+                "live_event_source": "KiwoomApi.raw_chejan_received",
+            },
+        )
+        window = getattr(self, "auto_trade_setting_window", None)
+        if window is not None:
+            setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
 
     def open_review_required_window(self) -> None:
         self.review_required_window = GlobalReviewRequiredWindow(self)

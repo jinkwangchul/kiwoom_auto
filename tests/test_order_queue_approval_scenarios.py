@@ -12,6 +12,7 @@ from unittest.mock import patch
 import order_candidate_engine
 import order_approval_engine
 import order_queue
+import operation_policy_gate
 import routine_signal_consumer
 import routine_signal_order_bridge
 import routine_signal_queue
@@ -43,6 +44,10 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
             patch.object(order_queue, "ORDER_QUEUE_PATH", self.order_queue_path),
             patch.object(order_approval_engine, "RUNTIME_DIR", self.runtime_dir),
             patch.object(order_approval_engine, "ORDER_QUEUE_PATH", self.order_queue_path),
+            patch.object(operation_policy_gate, "RUNTIME_DIR", self.runtime_dir),
+            patch.object(operation_policy_gate, "STOCKS_DIR", self.stocks_dir),
+            patch.object(operation_policy_gate, "ORDER_QUEUE_PATH", self.order_queue_path),
+            patch.object(operation_policy_gate, "OPERATION_STATE_PATH", self.runtime_dir / "operation_state.json"),
             patch.object(routine_signal_queue, "RUNTIME_DIR", self.runtime_dir),
             patch.object(routine_signal_queue, "QUEUE_PATH", self.queue_path),
             patch.object(routine_signal_order_bridge, "RUNTIME_DIR", self.runtime_dir),
@@ -84,6 +89,7 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self._write_json(self.stock_dir / "state.json", state)
         self._write_json(self.stock_dir / "candles.json", candles)
         self._write_json(self.stock_dir / "orders.json", {"orders": []})
+        self._write_json(self.runtime_dir / "operation_state.json", {})
 
     def _write_signal(self, *, signal: str, signal_id: str) -> None:
         self._write_json(
@@ -157,7 +163,8 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self._setup_stock(holding_qty=0)
         self._write_signal(signal="SELL", signal_id="SIG_SELL_ZERO")
 
-        result = self._consume()
+        with patch.object(operation_policy_gate, "apply_operation_policy_gate_for_order", wraps=operation_policy_gate.apply_operation_policy_gate_for_order) as policy_gate:
+            result = self._consume()
         order = self._single_order()
         signal = self._single_signal()
 
@@ -168,6 +175,8 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertFalse(order.get("execution_enabled"))
         self.assertEqual(1, result["summary"]["approval_checked"])
         self.assertEqual(0, result["summary"]["approved"])
+        self.assertEqual(0, result["summary"]["policy_checked"])
+        policy_gate.assert_not_called()
         self.assertEqual("BLOCKED", signal.get("status"))
         self.assertEqual("NO_HOLDING_QTY", signal.get("payload_candidate_status"))
         intent = order.get("order_intent", {})
@@ -201,13 +210,18 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
 
         self.assertEqual("CANDIDATE_READY", order.get("candidate_status"))
         self.assertGreater(order.get("quantity"), 0)
-        self.assertEqual("APPROVED", order.get("status"))
+        self.assertEqual("EXECUTABLE", order.get("status"))
         self.assertEqual("APPROVED", order.get("approval_status"))
+        self.assertEqual("EXECUTABLE", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
         self.assertEqual(1, result["summary"]["approval_checked"])
         self.assertEqual(1, result["summary"]["approved"])
+        self.assertEqual(1, result["summary"]["policy_checked"])
+        self.assertEqual(1, result["summary"]["policy_executable"])
+        self.assertEqual(0, result["summary"]["policy_blocked"])
+        self.assertEqual(0, result["summary"]["policy_errors"])
         self.assertEqual("BLOCKED", signal.get("status"))
-        self.assertNotIn(order.get("status"), {"EXECUTABLE", "REAL_READY"})
+        self.assertNotIn(order.get("status"), {"REAL_READY"})
         intent = order.get("order_intent", {})
         self.assertEqual("SELL", intent.get("side"))
         self.assertEqual("order_candidate_engine", intent.get("source"))
@@ -231,13 +245,18 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("BUY", order.get("side"))
         self.assertEqual("CANDIDATE_READY", order.get("candidate_status"))
         self.assertGreater(order.get("quantity"), 0)
-        self.assertEqual("APPROVED", order.get("status"))
+        self.assertEqual("EXECUTABLE", order.get("status"))
         self.assertEqual("APPROVED", order.get("approval_status"))
+        self.assertEqual("EXECUTABLE", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
         self.assertEqual(1, result["summary"]["approval_checked"])
         self.assertEqual(1, result["summary"]["approved"])
+        self.assertEqual(1, result["summary"]["policy_checked"])
+        self.assertEqual(1, result["summary"]["policy_executable"])
+        self.assertEqual(0, result["summary"]["policy_blocked"])
+        self.assertEqual(0, result["summary"]["policy_errors"])
         self.assertEqual("BLOCKED", signal.get("status"))
-        self.assertNotIn(order.get("status"), {"EXECUTABLE", "REAL_READY"})
+        self.assertNotIn(order.get("status"), {"REAL_READY"})
         intent = order.get("order_intent", {})
         self.assertEqual("BUY", intent.get("side"))
         self.assertEqual("order_candidate_engine", intent.get("source"))
@@ -249,6 +268,57 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("SIG_BUY", provenance.get("source_signal_id"))
         self.assertEqual("BUY", provenance.get("signal"))
         self.assertTrue(provenance.get("unresolved"))
+
+    def test_policy_gate_failure_blocks_signal_status_update(self) -> None:
+        self._setup_stock(holding_qty=10)
+        self._write_signal(signal="SELL", signal_id="SIG_POLICY_ERROR")
+
+        with patch.object(
+            operation_policy_gate,
+            "apply_operation_policy_gate_for_order",
+            side_effect=RuntimeError("policy gate failed"),
+        ):
+            result = self._consume()
+
+        order = self._single_order()
+        signal = self._single_signal()
+
+        self.assertFalse(result["order_queue"]["ok"])
+        self.assertEqual(1, result["summary"]["orders_created"])
+        self.assertEqual(1, result["summary"]["policy_checked"])
+        self.assertEqual(1, result["summary"]["policy_errors"])
+        self.assertEqual(1, result["summary"]["marked_error"])
+        self.assertEqual("APPROVED", order.get("status"))
+        self.assertEqual("APPROVED", order.get("approval_status"))
+        self.assertFalse(order.get("execution_enabled"))
+        self.assertEqual("PENDING", signal.get("status"))
+        self.assertEqual(
+            "operation policy gate failed; signal status update skipped",
+            result["status_updates"][0]["reason"],
+        )
+
+    def test_duplicate_candidate_does_not_call_policy_gate(self) -> None:
+        self._setup_stock(holding_qty=10)
+        self._write_signal(signal="SELL", signal_id="SIG_DUPLICATE")
+        existing = order_queue.signal_to_order_candidate(self._single_signal(), 1)
+        self.assertIsNotNone(existing)
+        if existing is not None:
+            existing["status"] = "APPROVED"
+            existing["approval_status"] = "APPROVED"
+            self._write_json(
+                self.order_queue_path,
+                {"version": 1, "revision": 0, "updated_at": "", "orders": [existing]},
+            )
+
+        with patch.object(operation_policy_gate, "apply_operation_policy_gate_for_order") as policy_gate:
+            result = self._consume()
+
+        queue = json.loads(self.order_queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(queue.get("orders", [])))
+        self.assertEqual(0, result["summary"]["orders_created"])
+        self.assertEqual(0, result["summary"]["policy_checked"])
+        self.assertEqual(0, result["summary"]["policy_errors"])
+        policy_gate.assert_not_called()
 
     def test_apply_order_approval_uses_canonical_writer_metadata(self) -> None:
         self._write_pending_order_queue()

@@ -1230,6 +1230,50 @@ def _dispatch_claim_source(context: Any) -> str:
     return _clean_text(ctx.get("dispatch_claim_source") or ctx.get("claim_source") or "final_guard")
 
 
+def _dispatch_common_final_send_gate_ready(
+    guard: dict[str, Any],
+    identity: dict[str, str],
+    context: Any,
+    expected_revision: int,
+) -> dict[str, Any] | None:
+    ctx = _as_dict(context)
+    if guard.get("final_send_gate_ok") is not True:
+        return _commit_blocked("final_send_gate", "final send gate must be approved")
+    if guard.get("next_stage") != "SEND_ORDER_ENTRYPOINT_REQUIRED":
+        return _commit_blocked("final_send_gate", "final send gate next_stage mismatch")
+    if guard.get("send_order_called") is not False:
+        return _commit_blocked("final_send_gate", "final send gate send_order_called must be false")
+    if guard.get("no_send") is not True:
+        return _commit_blocked("final_send_gate", "final send gate no_send must be true")
+
+    queue_path = _clean_text(ctx.get("queue_path"))
+    if queue_path and _clean_text(guard.get("queue_path")) and queue_path != _clean_text(guard.get("queue_path")):
+        return _commit_blocked("final_send_gate", "final send gate queue_path mismatch")
+
+    guard_revision = guard.get("queue_revision")
+    if guard_revision is None:
+        return _commit_blocked("final_send_gate", "final send gate queue_revision is required")
+    try:
+        normalized_guard_revision = int(guard_revision)
+    except (TypeError, ValueError):
+        return _commit_blocked("final_send_gate", "final send gate queue_revision must be an integer")
+    if normalized_guard_revision != expected_revision:
+        return _commit_blocked("final_send_gate", "final send gate queue revision is stale")
+
+    guard_snapshot_hash = _clean_text(guard.get("queue_snapshot_hash"))
+    if not guard_snapshot_hash:
+        return _commit_blocked("final_send_gate", "final send gate queue_snapshot_hash is required")
+    context_snapshot_hash = _clean_text(ctx.get("queue_snapshot_hash") or ctx.get("final_guard_queue_snapshot_hash"))
+    if context_snapshot_hash and guard_snapshot_hash != context_snapshot_hash:
+        return _commit_blocked("final_send_gate", "final send gate queue snapshot hash mismatch")
+
+    gate_identity = _as_dict(guard.get("identity"))
+    if not _dispatch_identity_matches(gate_identity, identity):
+        return _commit_blocked("final_send_gate", "final send gate identity mismatch")
+
+    return None
+
+
 def _dispatch_final_guard_ready(
     final_guard_result: Any,
     identity: dict[str, str],
@@ -1240,6 +1284,8 @@ def _dispatch_final_guard_ready(
     ctx = _as_dict(context)
     if not guard:
         return _commit_blocked("final_guard", "final guard result is required")
+    if guard.get("final_send_gate_result_type") == "FINAL_SEND_GATE_SERVICE":
+        return _dispatch_common_final_send_gate_ready(guard, identity, context, expected_revision)
     if guard.get("guard_type") != "SELL_DISPATCH_FINAL_EXECUTION_GUARD":
         return _commit_blocked("final_guard", "final guard type mismatch")
     if guard.get("status") != "READY" or guard.get("final_guard_ready") is not True:
@@ -1285,6 +1331,9 @@ def _dispatch_final_guard_ready(
             candidate = _as_dict(_as_dict(item).get("candidate"))
             queue_record = _as_dict(_as_dict(item).get("queue_record"))
             if _dispatch_identity_matches_without_queued_id(candidate, identity) or _dispatch_identity_matches(queue_record, identity):
+                side = _clean_text(queue_record.get("side") or candidate.get("side")).upper()
+                if side and side != "SELL":
+                    return _commit_blocked("final_guard", "SELL final guard cannot claim non-SELL order")
                 return None
         return _commit_blocked("final_guard", "final guard does not contain target identity")
     return None
@@ -1300,8 +1349,8 @@ def _dispatch_claim_record_blocked(record: dict[str, Any], *, allow_release: boo
         return _commit_blocked(stage, f"target record status is {status or 'missing'}")
 
     if not allow_release:
-        if record.get("execution_enabled") is not True:
-            return _commit_blocked("dispatch_claim", "target record execution_enabled is not true")
+        if record.get("execution_enabled") is not False:
+            return _commit_blocked("dispatch_claim", "target record execution_enabled is not false")
         if record.get("send_order_called") is not False:
             return _commit_blocked("dispatch_claim", "target record send_order_called is not false")
         if _clean_text(record.get("broker_order_no")):

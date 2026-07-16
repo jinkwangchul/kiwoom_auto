@@ -220,22 +220,56 @@ class KiwoomSendOrderPreviewServiceTest(unittest.TestCase):
         self.assertEqual(0, result["send_order_request_preview"]["price"])
         self.assertEqual("MARKET", result["send_order_request_preview"]["hoga"])
 
-    def test_cancel_modify_candidate_is_blocked(self) -> None:
-        candidates = [
-            self._request_preview(action="CANCEL"),
-            self._request_preview(order_action="MODIFY"),
-            self._request_preview(original_order_no="12345"),
-        ]
-        for request_preview in candidates:
-            with self.subTest(request_preview=request_preview):
-                request = self._execution_request(request_preview=request_preview)
-                result = preview_kiwoom_send_order_request(self._review(), self._record(execution_request=request))
+    def test_original_order_no_without_action_is_blocked(self) -> None:
+        request = self._execution_request(request_preview=self._request_preview(original_order_no="12345"))
+        result = preview_kiwoom_send_order_request(self._review(), self._record(execution_request=request))
 
-                self.assertFalse(result["adapter_preview_ok"])
-                self.assertIn(
-                    "cancel/modify orders are not supported in adapter preview phase 1",
-                    result["blocked_reasons"],
-                )
+        self.assertFalse(result["adapter_preview_ok"])
+        self.assertIn("cancel/modify action is required", result["blocked_reasons"])
+
+    def test_cancel_preview_allows_zero_price_with_original_order_no(self) -> None:
+        request = self._execution_request(
+            request_preview=self._request_preview(
+                order_action="CANCEL",
+                original_order_no="12345",
+                quantity=3,
+                price=0,
+                hoga="LIMIT",
+            )
+        )
+        result = preview_kiwoom_send_order_request(self._review(), self._record(execution_request=request))
+
+        self.assertTrue(result["adapter_preview_ok"], result)
+        preview = result["send_order_request_preview"]
+        self.assertEqual("CANCEL", preview["order_action"])
+        self.assertEqual("12345", preview["original_order_no"])
+        self.assertEqual(0, preview["price"])
+
+    def test_modify_preview_requires_original_order_no(self) -> None:
+        request = self._execution_request(
+            request_preview=self._request_preview(order_action="MODIFY", quantity=3, price=1100, hoga="LIMIT")
+        )
+        result = preview_kiwoom_send_order_request(self._review(), self._record(execution_request=request))
+
+        self.assertFalse(result["adapter_preview_ok"])
+        self.assertIn("original_order_no is required for cancel/modify", result["blocked_reasons"])
+
+    def test_modify_preview_succeeds_with_original_order_no(self) -> None:
+        request = self._execution_request(
+            request_preview=self._request_preview(
+                order_action="MODIFY",
+                original_order_no="12345",
+                quantity=3,
+                price=1100,
+                hoga="LIMIT",
+            )
+        )
+        result = preview_kiwoom_send_order_request(self._review(), self._record(execution_request=request))
+
+        self.assertTrue(result["adapter_preview_ok"], result)
+        preview = result["send_order_request_preview"]
+        self.assertEqual("MODIFY", preview["order_action"])
+        self.assertEqual("12345", preview["original_order_no"])
 
     def test_record_and_execution_request_identity_mismatch_is_blocked(self) -> None:
         mismatches = {

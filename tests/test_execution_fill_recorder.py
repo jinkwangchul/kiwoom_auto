@@ -325,6 +325,22 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self.assertEqual("EXEC_1", fill["execution_id"])
             self.assertEqual(3, fill["filled_quantity"])
             self.assertEqual(1000, fill["filled_price"])
+            self.assertEqual(fill, result["fill_record"])
+
+    def test_live_chejan_context_records_without_manual_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write_fills(tmpdir)
+
+            result = self._record_fill(
+                path,
+                context={
+                    "kiwoom_api_live_event": True,
+                    "live_event_source": "KiwoomApi.raw_chejan_received",
+                },
+            )
+
+            self.assertTrue(result["fill_recorded"], result)
+            self.assertEqual(1, len(self._read_json(path)["fills"]))
 
     def test_full_fill_success_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

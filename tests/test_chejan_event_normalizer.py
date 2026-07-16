@@ -136,9 +136,10 @@ class ChejanEventNormalizerTest(unittest.TestCase):
         self.assertNotIn("order_price could not be parsed as int", result["warnings"])
 
     def test_core_identity_fields_are_preserved(self) -> None:
-        result = normalize_kiwoom_chejan_event(self._raw())
+        result = normalize_kiwoom_chejan_event(self._raw(**{"904": "54321"}))
 
         self.assertEqual("12345", result["broker_order_no"])
+        self.assertEqual("54321", result["original_order_no"])
         self.assertEqual("12345678", result["account_no"])
         self.assertEqual("LG", result["name"])
         self.assertEqual("체결", result["order_status"])

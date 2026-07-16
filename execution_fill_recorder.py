@@ -67,7 +67,13 @@ def _blocked(stage: str, reason: str) -> dict[str, Any]:
 
 
 def _confirmed(context: Any) -> bool:
-    return _as_dict(context).get("manual_fill_record_confirmed") is True
+    ctx = _as_dict(context)
+    if ctx.get("manual_fill_record_confirmed") is True:
+        return True
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+    )
 
 
 def _snapshot_sha256(snapshot: Any) -> str:
@@ -183,6 +189,14 @@ def _read_fills(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
             return {}, _blocked("read_fills", "fills must contain only objects")
 
     return data, None
+
+
+def _read_fills_for_lookup(path: Path) -> list[dict[str, Any]]:
+    data, blocked = _read_fills(path)
+    if blocked is not None:
+        return []
+    fills = data.get("fills")
+    return [dict(item) for item in fills if isinstance(item, dict)] if isinstance(fills, list) else []
 
 
 def _validate_event_record_result(result_value: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -354,6 +368,48 @@ def _duplicate_reason(fills: list[Any], candidate: dict[str, Any]) -> str | None
         if _stable_hash(item.get("normalized_event")) == candidate_event_hash:
             return "duplicate normalized_event"
 
+    return None
+
+
+def _matching_existing_fill_record(
+    fill: dict[str, Any],
+    chejan_result: dict[str, Any],
+    normalized_event: dict[str, Any],
+) -> bool:
+    for field in ("order_id", "order_queued_id", "request_hash", "lock_id", "execution_id"):
+        expected = _clean_text(chejan_result.get(field))
+        actual = _clean_text(fill.get(field))
+        if expected and actual and expected != actual:
+            return False
+    for field in ("broker_order_no", "event_type"):
+        expected = _clean_text(chejan_result.get(field) or normalized_event.get(field))
+        actual = _clean_text(fill.get(field))
+        if expected and actual != expected:
+            return False
+    source, identity = _raw_event_identity(normalized_event)
+    if source and identity:
+        return (
+            _clean_text(fill.get("execution_identity_source")) == source
+            and _clean_text(fill.get("execution_identity")) == identity
+        )
+    return (
+        fill.get("filled_quantity") == normalized_event.get("filled_quantity")
+        and fill.get("remaining_quantity") == normalized_event.get("remaining_quantity")
+        and fill.get("filled_price") == normalized_event.get("filled_price")
+    )
+
+
+def find_existing_execution_fill_record(
+    fills_path: str | Path,
+    chejan_event_record_result: Any,
+    normalized_event: Any,
+) -> dict[str, Any] | None:
+    target_path = Path(fills_path)
+    chejan_result = _as_dict(chejan_event_record_result)
+    event = _as_dict(normalized_event)
+    for fill in _read_fills_for_lookup(target_path):
+        if _matching_existing_fill_record(fill, chejan_result, event):
+            return dict(fill)
     return None
 
 
@@ -547,6 +603,7 @@ def record_execution_fill(
                     "execution_id": fill_record["execution_id"],
                     "filled_quantity": fill_record["filled_quantity"],
                     "filled_price": fill_record["filled_price"],
+                    "fill_record": deepcopy(fill_record),
                     "before_sha256": before_sha256,
                     "after_sha256": after_sha256,
                     "blocked_reasons": [],

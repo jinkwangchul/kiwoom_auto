@@ -15,6 +15,13 @@ NEXT_STAGE_MANUAL_REVIEW = "MANUAL_CHEJAN_REVIEW_REQUIRED"
 NEXT_STAGE_EVENT_RECORD_REQUIRED = "CHEJAN_EVENT_RECORD_REQUIRED"
 NEXT_STAGE_FILL_RECORD_REQUIRED = "FILL_RECORD_REQUIRED"
 RESULT_STATUS_CALLED = "SEND_ORDER_CALLED"
+CALL_RESULT_STATUSES = {
+    "SEND_CALL_ACCEPTED",
+    "SEND_UNCERTAIN",
+    "BROKER_ACCEPTED",
+    "PARTIALLY_FILLED",
+    "FILLED",
+}
 
 _EVENT_RECORD_TYPES = {
     "ORDER_ACCEPTED",
@@ -129,6 +136,35 @@ def _broker_order_match(event: dict[str, Any], record: dict[str, Any]) -> tuple[
     return None, warnings, _blocked("event_link", "broker_order_no is required to link Chejan event in phase 1")
 
 
+def _request_preview(record: dict[str, Any]) -> dict[str, Any]:
+    execution_request = record.get("execution_request")
+    if not isinstance(execution_request, dict):
+        return {}
+    request_preview = execution_request.get("request_preview")
+    return request_preview if isinstance(request_preview, dict) else {}
+
+
+def _cancel_modify_action(record: dict[str, Any]) -> str:
+    action = _clean_text(_request_preview(record).get("order_action")).upper()
+    return action if action in {"CANCEL", "MODIFY"} else ""
+
+
+def _original_order_link_match(event: dict[str, Any], record: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    action = _cancel_modify_action(record)
+    if not action:
+        return None, None
+
+    event_original_order_no = _clean_text(event.get("original_order_no"))
+    request_original_order_no = _clean_text(_request_preview(record).get("original_order_no"))
+    if not event_original_order_no:
+        return None, _blocked("event_link", "normalized_event.original_order_no is required for cancel/modify Chejan")
+    if not request_original_order_no:
+        return None, _blocked("event_link", "order_record original_order_no is required for cancel/modify Chejan")
+    if event_original_order_no != request_original_order_no:
+        return None, _blocked("event_link", "normalized_event.original_order_no does not match order_record original_order_no")
+    return event_original_order_no, None
+
+
 def review_chejan_event(
     normalized_event: Any,
     order_record: Any = None,
@@ -164,8 +200,14 @@ def review_chejan_event(
     if order_record.get("send_order_called") is not True:
         return _blocked("order_record", "order_record.send_order_called is not true", event_type)
 
-    if order_record.get("send_order_result_status") != RESULT_STATUS_CALLED:
-        return _blocked("order_record", "order_record.send_order_result_status is not SEND_ORDER_CALLED", event_type)
+    lifecycle_status = _clean_text(order_record.get("status"))
+    legacy_result_status = _clean_text(order_record.get("send_order_result_status"))
+    if legacy_result_status != RESULT_STATUS_CALLED and lifecycle_status not in CALL_RESULT_STATUSES:
+        return _blocked(
+            "order_record",
+            "order_record send result is not SEND_ORDER_CALLED, SEND_CALL_ACCEPTED, or SEND_UNCERTAIN",
+            event_type,
+        )
 
     for key in ("account_no", "code", "side"):
         event_value = _clean_text(normalized_event.get(key))
@@ -185,6 +227,13 @@ def review_chejan_event(
         link_blocked["event_type"] = event_type
         return link_blocked
 
+    original_order_no, original_blocked = _original_order_link_match(normalized_event, order_record)
+    if original_blocked is not None:
+        original_blocked["event_type"] = event_type
+        return original_blocked
+    if original_order_no:
+        matched_by = f"{matched_by}+original_order_no"
+
     fill_blocked, fill_warnings = (None, [])
     if event_type in _FILL_RECORD_TYPES:
         fill_blocked, fill_warnings = _validate_fill_event(normalized_event, event_type)
@@ -200,6 +249,7 @@ def review_chejan_event(
         "order_id": _clean_text(order_record.get("order_id")),
         "order_queued_id": _clean_text(order_record.get("id")),
         "broker_order_no": _clean_text(normalized_event.get("broker_order_no")),
+        "original_order_no": original_order_no or _clean_text(normalized_event.get("original_order_no")),
         "request_hash": _clean_text(order_record.get("request_hash")),
         "lock_id": _clean_text(order_record.get("lock_id")),
         "execution_id": _clean_text(order_record.get("execution_id")),

@@ -140,6 +140,12 @@ class ExecutionRuntimeCommitServiceTest(unittest.TestCase):
             self.assertTrue(result["runtime_write"])
             self.assertTrue(result["committed"])
             self.assertTrue(result["read_back_verified"])
+            self.assertEqual("EXEC_1", result["execution_id"])
+            self.assertEqual("ORDER_1", result["order_id"])
+            self.assertEqual("HASH_1", result["request_hash"])
+            self.assertEqual("LOCK_1", result["lock_id"])
+            self.assertEqual("EXEC_1", result["execution_record"]["execution_id"])
+            self.assertEqual("LOCK_1", result["lock_record"]["lock_id"])
             self.assertEqual([], result["issues"])
 
             execution_data = json.loads(executions.read_text(encoding="utf-8"))
@@ -395,6 +401,27 @@ class ExecutionRuntimeCommitServiceTest(unittest.TestCase):
             )
 
             self.assertTrue(result["read_back_verified"])
+
+    def test_read_back_verification_failure_preserves_write_but_not_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions, locks = self._paths(temp_dir)
+
+            with mock.patch("execution_runtime_commit_service._read_back_contains", return_value=False):
+                result = commit_execution_runtime_plan(
+                    self._commit_orchestrator(),
+                    executions,
+                    locks,
+                    context=self._context(),
+                )
+
+            self.assertEqual("ERROR", result["status"])
+            self.assertTrue(result["runtime_write"])
+            self.assertFalse(result["committed"])
+            self.assertFalse(result["read_back_verified"])
+            self.assertEqual("EXEC_1", result["execution_id"])
+            self.assertEqual("ORDER_1", result["order_id"])
+            self.assertEqual("HASH_1", result["request_hash"])
+            self.assertEqual("LOCK_1", result["lock_id"])
 
     def test_second_write_failure_rolls_back_from_backup(self) -> None:
         import execution_runtime_commit_service

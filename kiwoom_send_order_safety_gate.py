@@ -11,7 +11,9 @@ STATUS_SAFE = "SEND_ORDER_SAFE"
 STATUS_BLOCKED = "BLOCKED"
 STATUS_INVALID = "INVALID"
 
-VALID_ORDER_TYPES = {1, 2}
+VALID_ORDER_TYPES = {1, 2, 3, 4, 5, 6}
+CANCEL_ORDER_TYPES = {3, 4}
+MODIFY_ORDER_TYPES = {5, 6}
 VALID_HOGAS = {"00", "03"}
 
 
@@ -134,9 +136,14 @@ def _validate_params(params: dict[str, Any]) -> str | None:
         return "send_order_params.hoga is invalid"
     if not _positive_number(params.get("quantity")):
         return "send_order_params.quantity must be greater than 0"
-    if _text(params.get("hoga")) == "00" and not _positive_number(params.get("price")):
+    order_type = params.get("order_type")
+    if order_type in CANCEL_ORDER_TYPES | MODIFY_ORDER_TYPES and not _text(params.get("original_order_no")):
+        return "send_order_params.original_order_no is required for cancel/modify"
+    if order_type in CANCEL_ORDER_TYPES and not _zero_or_positive_number(params.get("price")):
+        return "send_order_params cancel price must be zero or greater"
+    if order_type not in CANCEL_ORDER_TYPES and _text(params.get("hoga")) == "00" and not _positive_number(params.get("price")):
         return "send_order_params LIMIT price must be greater than 0"
-    if _text(params.get("hoga")) == "03" and not _zero_or_positive_number(params.get("price")):
+    if order_type not in CANCEL_ORDER_TYPES and _text(params.get("hoga")) == "03" and not _zero_or_positive_number(params.get("price")):
         return "send_order_params MARKET price must be zero or greater"
     if not _validate_screen_no(_text(params.get("screen_no"))):
         return "send_order_params.screen_no is invalid"
