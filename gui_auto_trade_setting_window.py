@@ -920,9 +920,20 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_queue_commit.setMinimumHeight(28)
         self.btn_manual_queue_commit.setEnabled(False)
         self.btn_fetch_minute_candles.setMinimumHeight(28)
+        for button in (
+            self.btn_fetch_minute_candles,
+            self.btn_preview_order_candidates,
+            self.btn_execution_enable,
+            self.btn_real_ready_preflight,
+            self.btn_execution_preview,
+            self.btn_manual_queue_commit,
+            self.btn_manual_send_order,
+            self.btn_manual_cancel_pending_order,
+            self.btn_manual_modify_pending_order,
+        ):
+            button.setVisible(False)
         self.btn_set_schedule = QPushButton("환경설정")
         self.btn_delete = QPushButton("등록 해제")
-        self.btn_config = QPushButton("환경설정")
         self.btn_order_view = QPushButton("주문상태 보기")
         self.btn_log_view = QPushButton("로그 보기")
         self.btn_review_view = QPushButton("검토관리")
