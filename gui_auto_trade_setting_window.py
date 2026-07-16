@@ -364,6 +364,78 @@ ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 PROGRAM_START_RESET_APPLIED = False
 
 
+def handle_kiwoom_raw_chejan_event(
+    raw_event: dict[str, object],
+    live_context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    normalized = normalize_kiwoom_chejan_event(raw_event)
+    if normalized.get("normalized") is not True:
+        return {"recorded": False, "stage": "normalize", "normalized_event": normalized}
+
+    queue_path = ORDER_QUEUE_PATH
+    try:
+        data = json.loads(queue_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"recorded": False, "stage": "queue_read", "blocked_reasons": [str(exc)]}
+    orders = data.get("orders") if isinstance(data, dict) else None
+    if not isinstance(orders, list):
+        return {"recorded": False, "stage": "queue_structure", "blocked_reasons": ["queue orders must be a list"]}
+
+    broker_order_no = str(normalized.get("broker_order_no") or "").strip()
+    account_no = str(normalized.get("account_no") or "").strip()
+    code = str(normalized.get("code") or "").strip()
+    side = str(normalized.get("side") or "").strip().upper()
+    candidates: list[dict[str, object]] = []
+    for item in orders:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip()
+        if status not in {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
+            continue
+        if str(item.get("account_no") or "").strip() not in {"", account_no}:
+            continue
+        if str(item.get("code") or "").strip() != code:
+            continue
+        if str(item.get("side") or "").strip().upper() != side:
+            continue
+        item_broker_order_no = str(item.get("broker_order_no") or "").strip()
+        if item_broker_order_no and broker_order_no and item_broker_order_no != broker_order_no:
+            continue
+        candidates.append(dict(item))
+
+    if len(candidates) != 1:
+        return {
+            "recorded": False,
+            "stage": "chejan_target_match",
+            "normalized_event": normalized,
+            "blocked_reasons": [f"matching send order record count is {len(candidates)}"],
+        }
+
+    review = review_chejan_event(normalized, order_record=candidates[0])
+    if review.get("chejan_review_ok") is not True:
+        return {
+            "recorded": False,
+            "stage": "chejan_review",
+            "normalized_event": normalized,
+            "review_result": review,
+            "blocked_reasons": list(review.get("blocked_reasons") or []),
+        }
+    recorded = record_chejan_event(
+        review,
+        normalized,
+        queue_path,
+        context=live_context or {},
+    )
+    return {
+        "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,
+        "stage": "chejan_record",
+        "normalized_event": normalized,
+        "review_result": review,
+        "record_result": recorded,
+        "blocked_reasons": list(recorded.get("blocked_reasons") or []),
+    }
+
+
 def get_routine_dirs() -> list[Path]:
     """루틴 원본 경로를 조회한다.
 
@@ -3449,7 +3521,7 @@ class AutoTradeSettingWindow(QDialog):
 
         button_layout = QHBoxLayout()
         button_layout.addStretch(1)
-        ok_button = QPushButton("?뺤씤")
+        ok_button = QPushButton("확인")
         ok_button.clicked.connect(dialog.accept)
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
@@ -3556,10 +3628,58 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("Manual SendOrder blocked")
             return
 
-        identity = self.send_order_identity_from_record(order_dict)
+        latest_read_result = self.read_order_from_queue_by_id(order_id, queue_path)
+        if latest_read_result.get("ok") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "latest_order_read",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": latest_read_result.get("blocked_reasons", []),
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+        latest_order = latest_read_result.get("order")
+        latest_order_dict = latest_order if isinstance(latest_order, dict) else {}
+        if latest_order_dict.get("status") != "ORDER_QUEUED":
+            result = {
+                "status": "BLOCKED",
+                "stage": "latest_order_status",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": ["latest target record status is not ORDER_QUEUED"],
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        latest_environment = self.build_manual_send_order_environment(latest_order_dict, queue_path)
+        if latest_environment.get("send_order_environment_ready") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "send_order_environment_after_confirmation",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(latest_environment.get("issues") or []),
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
+        identity = self.send_order_identity_from_record(latest_order_dict)
         final_gate = self.build_manual_final_send_gate_result(
-            order_dict,
-            environment,
+            latest_order_dict,
+            latest_environment,
             queue_path,
             snapshot,
             current_snapshot,
@@ -3580,7 +3700,7 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("Manual SendOrder blocked")
             return
 
-        call_preview = self.build_manual_send_order_call_preview(order_dict, environment, operator_confirmed=True)
+        call_preview = self.build_manual_send_order_call_preview(latest_order_dict, latest_environment, operator_confirmed=True)
         if call_preview.get("status") != "SEND_ORDER_CALL_READY":
             result = {
                 "status": "BLOCKED",
@@ -3639,7 +3759,7 @@ class AutoTradeSettingWindow(QDialog):
             claim_token,
             "GUI_MANUAL_SEND_ORDER",
             claim.get("revision_after"),
-            environment.get("send_order_callable"),
+            latest_environment.get("send_order_callable"),
             call_preview.get("send_order_args"),
             context={
                 "send_order_attempt_owner": "GUI_MANUAL_SEND_ORDER",
@@ -3659,72 +3779,7 @@ class AutoTradeSettingWindow(QDialog):
         raw_event: dict[str, object],
         live_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        normalized = normalize_kiwoom_chejan_event(raw_event)
-        if normalized.get("normalized") is not True:
-            return {"recorded": False, "stage": "normalize", "normalized_event": normalized}
-
-        queue_path = ORDER_QUEUE_PATH
-        try:
-            data = json.loads(queue_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {"recorded": False, "stage": "queue_read", "blocked_reasons": [str(exc)]}
-        orders = data.get("orders") if isinstance(data, dict) else None
-        if not isinstance(orders, list):
-            return {"recorded": False, "stage": "queue_structure", "blocked_reasons": ["queue orders must be a list"]}
-
-        broker_order_no = str(normalized.get("broker_order_no") or "").strip()
-        account_no = str(normalized.get("account_no") or "").strip()
-        code = str(normalized.get("code") or "").strip()
-        side = str(normalized.get("side") or "").strip().upper()
-        candidates: list[dict[str, object]] = []
-        for item in orders:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status") or "").strip()
-            if status not in {"SEND_CALL_ACCEPTED", "SEND_UNCERTAIN", "BROKER_ACCEPTED", "PARTIALLY_FILLED"}:
-                continue
-            if str(item.get("account_no") or "").strip() not in {"", account_no}:
-                continue
-            if str(item.get("code") or "").strip() != code:
-                continue
-            if str(item.get("side") or "").strip().upper() != side:
-                continue
-            item_broker_order_no = str(item.get("broker_order_no") or "").strip()
-            if item_broker_order_no and broker_order_no and item_broker_order_no != broker_order_no:
-                continue
-            candidates.append(dict(item))
-
-        if len(candidates) != 1:
-            return {
-                "recorded": False,
-                "stage": "chejan_target_match",
-                "normalized_event": normalized,
-                "blocked_reasons": [f"matching send order record count is {len(candidates)}"],
-            }
-
-        review = review_chejan_event(normalized, order_record=candidates[0])
-        if review.get("chejan_review_ok") is not True:
-            return {
-                "recorded": False,
-                "stage": "chejan_review",
-                "normalized_event": normalized,
-                "review_result": review,
-                "blocked_reasons": list(review.get("blocked_reasons") or []),
-            }
-        recorded = record_chejan_event(
-            review,
-            normalized,
-            queue_path,
-            context=live_context or {},
-        )
-        return {
-            "recorded": recorded.get("recorded") is True or recorded.get("committed") is True,
-            "stage": "chejan_record",
-            "normalized_event": normalized,
-            "review_result": review,
-            "record_result": recorded,
-            "blocked_reasons": list(recorded.get("blocked_reasons") or []),
-        }
+        return handle_kiwoom_raw_chejan_event(raw_event, live_context)
 
     def int_state_value(self, state: dict[str, object], key: str) -> int:
         try:

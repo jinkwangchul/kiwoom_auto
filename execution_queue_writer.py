@@ -1284,7 +1284,7 @@ def _dispatch_final_guard_ready(
     ctx = _as_dict(context)
     if not guard:
         return _commit_blocked("final_guard", "final guard result is required")
-    if guard.get("final_send_gate_result_type") == "FINAL_SEND_GATE_SERVICE" or guard.get("final_send_gate_ok") is True:
+    if guard.get("final_send_gate_result_type") == "FINAL_SEND_GATE_SERVICE":
         return _dispatch_common_final_send_gate_ready(guard, identity, context, expected_revision)
     if guard.get("guard_type") != "SELL_DISPATCH_FINAL_EXECUTION_GUARD":
         return _commit_blocked("final_guard", "final guard type mismatch")

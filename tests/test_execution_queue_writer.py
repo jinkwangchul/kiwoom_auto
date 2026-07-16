@@ -1469,6 +1469,32 @@ class ExecutionQueueWriterPreviewTest(unittest.TestCase):
         self.assertTrue(result["claimed"], result)
         self.assertEqual("DISPATCH_CLAIMED", self._read_queue(queue_path)["orders"][0]["status"])
 
+    def test_dispatch_claim_rejects_forged_final_send_gate_ok_without_type(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        queue_path = Path(tmp.name) / "order_queue.json"
+        record = self._claimable_record()
+        self._write_queue(queue_path, orders=[record])
+
+        result = claim_order_for_dispatch(
+            queue_path,
+            self._identity(record),
+            {
+                "final_send_gate_ok": True,
+                "next_stage": "SEND_ORDER_ENTRYPOINT_REQUIRED",
+                "no_send": True,
+                "send_order_called": False,
+            },
+            claim_token="CLAIM_TOKEN",
+            claim_owner="GUI_MANUAL",
+            context=self._claim_context(),
+            expected_revision=0,
+        )
+
+        self.assertFalse(result["committed"])
+        self.assertIn("final guard type mismatch", result["blocked_reasons"])
+        self.assertEqual("ORDER_QUEUED", self._read_queue(queue_path)["orders"][0]["status"])
+
     def test_dispatch_claim_rejects_sell_guard_for_buy_record(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

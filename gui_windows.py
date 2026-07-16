@@ -62,6 +62,7 @@ from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
     get_routine_dirs,
     get_stock_dirs_in_routine,
+    handle_kiwoom_raw_chejan_event,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
     reset_runtime_statuses_for_program_start,
@@ -676,21 +677,16 @@ class MainWindow(QMainWindow):
         self.auto_trade_setting_window.show()
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
+        self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(
+            raw_event,
+            {
+                "kiwoom_api_live_event": True,
+                "live_event_source": "KiwoomApi.raw_chejan_received",
+            },
+        )
         window = getattr(self, "auto_trade_setting_window", None)
-        handler = getattr(window, "handle_raw_chejan_event", None)
-        if callable(handler):
-            self.last_chejan_record_result = handler(
-                raw_event,
-                {
-                    "kiwoom_api_live_event": True,
-                    "live_event_source": "KiwoomApi.raw_chejan_received",
-                },
-            )
-        else:
-            self.last_chejan_record_result = {
-                "recorded": False,
-                "stage": "auto_trade_setting_window_unavailable",
-            }
+        if window is not None:
+            setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
 
     def open_review_required_window(self) -> None:
         self.review_required_window = GlobalReviewRequiredWindow(self)
