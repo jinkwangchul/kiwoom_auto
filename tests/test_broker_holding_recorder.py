@@ -68,6 +68,12 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_positions_root(self, path: Path, positions: list[dict[str, object]]) -> None:
+        path.write_text(
+            json.dumps({"version": 1, "updated_at": "before", "positions": positions}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def _read_holdings(self, path: Path) -> list[dict[str, object]]:
         return json.loads(path.read_text(encoding="utf-8"))["holdings"]
 
@@ -108,7 +114,7 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self._write_positions(positions_path, quantity=3)
 
             result = record_broker_holding_snapshot(
-                self._raw_event(fid_values={"930": "0", "933": "0", "932": "0"}),
+                self._raw_event(fid_values={"930": "0", "933": "0", "931": "0", "932": "0"}),
                 holdings_path,
                 positions_path,
                 context=self._context(),
@@ -117,7 +123,29 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertEqual("INTERNAL_ONLY", result["reconciliation_status"])
             holding = self._read_holdings(holdings_path)[0]
             self.assertEqual(0, holding["holding_quantity"])
+            self.assertEqual(0, holding["available_quantity"])
+            self.assertEqual(0, holding["average_price"])
             self.assertTrue(holding["manual_reconciliation_required"])
+
+    def test_zero_holding_without_internal_position_is_consistent_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            result = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"930": "0", "933": "0", "931": "0", "932": "0"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertTrue(result["holding_recorded"], result)
+            self.assertEqual("CONSISTENT", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertEqual(0, holding["holding_quantity"])
+            self.assertEqual(0, holding["available_quantity"])
+            self.assertEqual(0, holding["average_price"])
+            self.assertFalse(holding["manual_reconciliation_required"])
 
     def test_quantity_and_average_price_mismatch_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,6 +179,65 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertEqual("POSITION_SOURCE_INVALID", result["reconciliation_status"])
             holding = self._read_holdings(holdings_path)[0]
             self.assertTrue(holding["position_read_failure_reason"])
+
+    def test_duplicate_internal_positions_are_position_source_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            first = {
+                "position_id": "POSITION_KIWOOM_12345678_003550_A",
+                "broker": "KIWOOM",
+                "account_no": "12345678",
+                "code": "003550",
+                "quantity": 3,
+                "average_price": 1000,
+            }
+            second = dict(first, position_id="POSITION_KIWOOM_12345678_003550_B")
+            self._write_positions_root(positions_path, [first, second])
+
+            result = record_broker_holding_snapshot(self._raw_event(), holdings_path, positions_path, context=self._context())
+
+            self.assertTrue(result["holding_recorded"], result)
+            self.assertEqual("POSITION_SOURCE_INVALID", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertIn("multiple internal positions", holding["position_read_failure_reason"])
+
+    def test_invalid_internal_position_values_are_position_source_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_positions_root(
+                positions_path,
+                [
+                    {
+                        "position_id": "POSITION_KIWOOM_12345678_003550",
+                        "broker": "KIWOOM",
+                        "account_no": "12345678",
+                        "code": "003550",
+                        "quantity": "bad",
+                        "average_price": -1,
+                    }
+                ],
+            )
+
+            result = record_broker_holding_snapshot(self._raw_event(), holdings_path, positions_path, context=self._context())
+
+            self.assertTrue(result["holding_recorded"], result)
+            self.assertEqual("POSITION_SOURCE_INVALID", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertTrue(holding["position_read_failure_reason"])
+
+    def test_fractional_average_price_mismatch_is_not_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            self._write_positions(positions_path, quantity=3, average_price=1000.9)
+
+            result = record_broker_holding_snapshot(self._raw_event(), holdings_path, positions_path, context=self._context())
+
+            self.assertEqual("AVERAGE_PRICE_MISMATCH", result["reconciliation_status"])
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertEqual(1000.9, holding["internal_average_price"])
 
     def test_corrupt_broker_holdings_json_blocks_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,6 +301,66 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertTrue(second["holding_recorded"], second)
             self.assertEqual(2, len(self._read_holdings(holdings_path)))
 
+    def test_older_event_does_not_replace_latest_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            latest = record_broker_holding_snapshot(
+                self._raw_event(received_at="2026-07-16 11:10:00"),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+            after_latest = holdings_path.read_text(encoding="utf-8")
+            stale = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"930": "7", "933": "7"}, received_at="2026-07-16 11:09:00"),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertTrue(latest["holding_recorded"], latest)
+            self.assertFalse(stale["holding_recorded"], stale)
+            self.assertEqual("stale_broker_holding_event", stale["holding_stage"])
+            self.assertEqual(after_latest, holdings_path.read_text(encoding="utf-8"))
+
+    def test_same_received_at_different_identity_blocks_as_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            first = record_broker_holding_snapshot(self._raw_event(), holdings_path, positions_path, context=self._context())
+            after_first = holdings_path.read_text(encoding="utf-8")
+            ambiguous = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"933": "1"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertTrue(first["holding_recorded"], first)
+            self.assertFalse(ambiguous["holding_recorded"], ambiguous)
+            self.assertEqual("ambiguous_broker_holding_event", ambiguous["holding_stage"])
+            self.assertEqual(after_first, holdings_path.read_text(encoding="utf-8"))
+
+    def test_event_identity_history_is_bounded_and_recent_duplicates_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            last_event = None
+            for index in range(25):
+                last_event = self._raw_event(received_at=f"2026-07-16 11:{index:02d}:00", fid_values={"933": str(index)})
+                result = record_broker_holding_snapshot(last_event, holdings_path, positions_path, context=self._context())
+                self.assertTrue(result["holding_recorded"], result)
+            holding = self._read_holdings(holdings_path)[0]
+            self.assertLessEqual(len(holding["event_identities"]), 20)
+
+            duplicate = record_broker_holding_snapshot(last_event, holdings_path, positions_path, context=self._context())
+            self.assertFalse(duplicate["holding_recorded"], duplicate)
+            self.assertEqual("duplicate_broker_holding_event", duplicate["holding_stage"])
+
     def test_mismatch_resolves_for_same_account_code_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             holdings_path = Path(tmp) / "broker_holdings.json"
@@ -255,6 +402,22 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
 
             self.assertFalse(no_context["holding_recorded"])
             self.assertFalse(missing_quantity["holding_recorded"])
+            self.assertFalse(holdings_path.exists())
+
+    def test_negative_broker_quantities_are_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+
+            result = record_broker_holding_snapshot(
+                self._raw_event(fid_values={"930": "-3"}),
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertFalse(result["holding_recorded"])
+            self.assertIn("holding_quantity must not be negative", result["blocked_reasons"][0])
             self.assertFalse(holdings_path.exists())
 
 

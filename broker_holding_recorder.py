@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import msvcrt
@@ -26,6 +27,7 @@ NEXT_STAGE_HOLDING_RECORDED = "BROKER_HOLDING_RECORDED"
 _BROKER_HOLDING_THREAD_LOCK = threading.RLock()
 _LOCK_POLL_SECONDS = 0.02
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+_MAX_EVENT_IDENTITIES_PER_HOLDING = 20
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -40,6 +42,21 @@ def _clean_text(value: Any) -> str:
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_received_at(value: Any) -> datetime | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -185,10 +202,14 @@ def _parse_int(value: Any, field: str, errors: list[str]) -> int | None:
         errors.append(f"{field} is required")
         return None
     try:
-        return abs(int(float(text)))
+        parsed = int(float(text))
     except (TypeError, ValueError):
         errors.append(f"{field} must be numeric")
         return None
+    if parsed < 0:
+        errors.append(f"{field} must not be negative")
+        return None
+    return parsed
 
 
 def _parse_optional_number(value: Any, field: str, warnings: list[str]) -> int | float | None:
@@ -204,6 +225,19 @@ def _parse_optional_number(value: Any, field: str, warnings: list[str]) -> int |
     if number == int(number):
         return int(number)
     return number
+
+
+def _decimal_value(value: Any, field: str) -> tuple[Decimal | None, str]:
+    text = _clean_text(value).replace(",", "")
+    if not text:
+        return None, f"{field} is missing"
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None, f"{field} must be numeric"
+    if number < 0:
+        return None, f"{field} must not be negative"
+    return number, ""
 
 
 def _code_from_fid(value: Any) -> str:
@@ -237,6 +271,8 @@ def normalize_broker_holding_chejan_event(raw_event: Any, context: Any = None) -
         current_price = abs(current_price)
     profit_loss_rate = _parse_optional_number(fids.get("8019"), "profit_loss_rate", warnings)
     received_at = _clean_text(event.get("received_at")) or _now_text()
+    if _parse_received_at(received_at) is None:
+        errors.append("received_at must be comparable")
 
     if errors:
         blocked = _blocked("normalize_broker_holding", "; ".join(errors))
@@ -311,21 +347,23 @@ def _read_positions_for_compare(path: Path) -> tuple[list[dict[str, Any]], str]:
     return records, ""
 
 
-def _find_internal_position(positions: list[dict[str, Any]], account_no: str, code: str) -> dict[str, Any] | None:
+def _find_internal_position(positions: list[dict[str, Any]], account_no: str, code: str) -> tuple[dict[str, Any] | None, str]:
     matches = [
         item for item in positions
         if _clean_text(item.get("account_no")) == account_no and _clean_text(item.get("code")) == code
     ]
+    if len(matches) > 1:
+        return None, "multiple internal positions found for account_no + code"
     if len(matches) != 1:
-        return None
-    return matches[0]
+        return None, ""
+    return matches[0], ""
 
 
 def _reconciliation_status(snapshot: dict[str, Any], positions_path: Path) -> dict[str, Any]:
     positions, read_failure = _read_positions_for_compare(positions_path)
     detected_at = _now_text()
     broker_qty = snapshot["holding_quantity"]
-    broker_avg = snapshot["average_price"]
+    broker_avg = Decimal(str(snapshot["average_price"]))
     if read_failure:
         return {
             "status": "POSITION_SOURCE_INVALID",
@@ -334,12 +372,24 @@ def _reconciliation_status(snapshot: dict[str, Any], positions_path: Path) -> di
             "internal_quantity": None,
             "internal_average_price": None,
             "broker_holding_quantity": broker_qty,
-            "broker_average_price": broker_avg,
+            "broker_average_price": snapshot["average_price"],
             "position_read_failure_reason": read_failure,
             "detected_at": detected_at,
         }
 
-    position = _find_internal_position(positions, snapshot["account_no"], snapshot["code"])
+    position, position_error = _find_internal_position(positions, snapshot["account_no"], snapshot["code"])
+    if position_error:
+        return {
+            "status": "POSITION_SOURCE_INVALID",
+            "manual_reconciliation_required": True,
+            "mismatch_fields": ["position_source"],
+            "internal_quantity": None,
+            "internal_average_price": None,
+            "broker_holding_quantity": broker_qty,
+            "broker_average_price": snapshot["average_price"],
+            "position_read_failure_reason": position_error,
+            "detected_at": detected_at,
+        }
     if position is None:
         status = "BROKER_ONLY" if broker_qty > 0 else "CONSISTENT"
         return {
@@ -349,13 +399,27 @@ def _reconciliation_status(snapshot: dict[str, Any], positions_path: Path) -> di
             "internal_quantity": None,
             "internal_average_price": None,
             "broker_holding_quantity": broker_qty,
-            "broker_average_price": broker_avg,
+            "broker_average_price": snapshot["average_price"],
             "position_read_failure_reason": "",
             "detected_at": detected_at,
         }
 
-    internal_qty = int(position.get("quantity") or 0)
-    internal_avg = int(float(position.get("average_price") or 0))
+    internal_qty_decimal, qty_error = _decimal_value(position.get("quantity"), "position.quantity")
+    internal_avg, avg_error = _decimal_value(position.get("average_price"), "position.average_price")
+    if qty_error or avg_error or internal_qty_decimal != internal_qty_decimal.to_integral_value():
+        reason = "; ".join(reason for reason in (qty_error, avg_error, "position.quantity must be an integer" if internal_qty_decimal is not None and internal_qty_decimal != internal_qty_decimal.to_integral_value() else "") if reason)
+        return {
+            "status": "POSITION_SOURCE_INVALID",
+            "manual_reconciliation_required": True,
+            "mismatch_fields": ["position_source"],
+            "internal_quantity": None,
+            "internal_average_price": None,
+            "broker_holding_quantity": broker_qty,
+            "broker_average_price": snapshot["average_price"],
+            "position_read_failure_reason": reason,
+            "detected_at": detected_at,
+        }
+    internal_qty = int(internal_qty_decimal)
     mismatch_fields: list[str] = []
     if broker_qty == 0 and internal_qty > 0:
         status = "INTERNAL_ONLY"
@@ -374,9 +438,9 @@ def _reconciliation_status(snapshot: dict[str, Any], positions_path: Path) -> di
         "manual_reconciliation_required": status != "CONSISTENT",
         "mismatch_fields": mismatch_fields,
         "internal_quantity": internal_qty,
-        "internal_average_price": internal_avg,
+        "internal_average_price": int(internal_avg) if internal_avg == internal_avg.to_integral_value() else float(internal_avg),
         "broker_holding_quantity": broker_qty,
-        "broker_average_price": broker_avg,
+        "broker_average_price": snapshot["average_price"],
         "position_read_failure_reason": "",
         "detected_at": detected_at,
     }
@@ -457,6 +521,37 @@ def record_broker_holding_snapshot(
                             return _with_lock_metadata(result, lock_acquired=True, lock_wait_ms=lock.wait_ms)
                         break
 
+                if existing_index >= 0:
+                    existing = _as_dict(holdings[existing_index])
+                    existing_received_at = _parse_received_at(existing.get("received_at"))
+                    incoming_received_at = _parse_received_at(snapshot.get("received_at"))
+                    if existing_received_at is None or incoming_received_at is None:
+                        return _with_lock_metadata(
+                            _blocked("broker_holding_received_at", "existing or incoming received_at is not comparable"),
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+                    if incoming_received_at < existing_received_at:
+                        result = _noop("stale_broker_holding_event", "older broker holding event did not replace latest snapshot")
+                        result.update(
+                            {
+                                "account_no": snapshot["account_no"],
+                                "code": snapshot["code"],
+                                "event_identity": snapshot["event_identity"],
+                                "reconciliation_status": _clean_text(existing.get("reconciliation_status")),
+                                "manual_reconciliation_required": existing.get("manual_reconciliation_required") is True,
+                                "mismatch_fields": list(existing.get("mismatch_fields") or []) if isinstance(existing.get("mismatch_fields"), list) else [],
+                                "before_sha256": before_sha256,
+                            }
+                        )
+                        return _with_lock_metadata(result, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+                    if incoming_received_at == existing_received_at:
+                        return _with_lock_metadata(
+                            _blocked("ambiguous_broker_holding_event", "same received_at with a different event identity cannot replace latest snapshot"),
+                            lock_acquired=True,
+                            lock_wait_ms=lock.wait_ms,
+                        )
+
                 reconciliation = _reconciliation_status(snapshot, positions_target)
                 now = _now_text()
                 record = _holding_record(snapshot, reconciliation, now)
@@ -464,7 +559,7 @@ def record_broker_holding_snapshot(
                     existing = dict(holdings[existing_index])
                     identities = existing.get("event_identities")
                     prior = list(identities) if isinstance(identities, list) else []
-                    record["event_identities"] = prior + [snapshot["event_identity"]]
+                    record["event_identities"] = (prior + [snapshot["event_identity"]])[-_MAX_EVENT_IDENTITIES_PER_HOLDING:]
                 updated = deepcopy(data)
                 updated["version"] = updated.get("version", 1)
                 updated["updated_at"] = now
