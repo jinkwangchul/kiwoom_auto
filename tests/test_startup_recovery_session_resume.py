@@ -125,7 +125,10 @@ def _install_pyqt5_import_stubs() -> None:
 _install_pyqt5_import_stubs()
 
 import gui_main_table_loader
-from gui_auto_trade_policy import auto_trade_setting_current_session_trade_started
+from gui_auto_trade_policy import (
+    auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_display_status_for_current_session,
+)
 from gui_auto_trade_run_control import auto_trade_start_selected_auto_trades
 from gui_auto_trade_timer import auto_trade_on_time_policy_timer_tick
 from operator_reconciliation_service import assess_startup_recovery
@@ -523,15 +526,33 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                     "trade_started": trade_started
                 },
             ),
+            patch.object(
+                gui_main_table_loader,
+                "create_auto_trade_setting_status_item",
+                side_effect=lambda status: {"status": status},
+            ),
         )
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             blocked = Window(ready=False)
             gui_main_table_loader.main_load_running_stock_table(blocked)
             self.assertEqual(1, blocked.running_stock_table.row_count)
             self.assertEqual(
                 {"trade_started": False},
                 blocked.running_stock_table.items[(0, 4)],
+            )
+            self.assertEqual({"status": "감시/대기"}, blocked.running_stock_table.items[(0, 5)])
+            self.assertEqual(
+                "감시/대기",
+                auto_trade_setting_display_status_for_current_session(
+                    state,
+                    config,
+                    holding_qty=0,
+                    buy_pending_qty=0,
+                    sell_pending_qty=0,
+                    current_session_trade_started=False,
+                    persisted_trade_started=True,
+                ),
             )
 
             approved = Window(ready=True)

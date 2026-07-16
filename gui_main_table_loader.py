@@ -30,7 +30,6 @@ from gui_review_utils import safe_float_value
 from runtime_io import read_json_dict
 from state_policy import normalize_operation_mode
 from gui_auto_trade_display import (
-    auto_trade_setting_display_status,
     create_auto_trade_setting_status_item,
     SORT_ROLE,
     SortableTableWidgetItem,
@@ -42,7 +41,10 @@ from gui_auto_trade_setting_window import (
     is_review_required_state,
     routine_display_name,
 )
-from gui_auto_trade_policy import auto_trade_setting_current_session_trade_started
+from gui_auto_trade_policy import (
+    auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_display_status_for_current_session,
+)
 from gui_base_stock_service import read_base_stocks
 from gui_routine_registry import read_routine_budget
 
@@ -227,9 +229,6 @@ def main_load_running_stock_table(window) -> None:
         raw_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
         operation = "수동" if raw_mode == "CONTINUOUS" else "시간"
 
-        raw_status = str(state.get("status", "STOPPED")).strip() or "STOPPED"
-        display_status = auto_trade_setting_display_status(raw_status)
-
         if is_review_required_state(state):
             continue
 
@@ -242,6 +241,15 @@ def main_load_running_stock_table(window) -> None:
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
         avg_price = safe_float_value(state.get("avg_price"), 0.0)
         buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state) if stock_dir is not None else (0, 0)
+        display_status = auto_trade_setting_display_status_for_current_session(
+            state,
+            config,
+            holding_qty=holding_qty,
+            buy_pending_qty=buy_pending_qty,
+            sell_pending_qty=sell_pending_qty,
+            current_session_trade_started=current_session_trade_started,
+            persisted_trade_started=trade_started,
+        )
 
         rows.append(
             {

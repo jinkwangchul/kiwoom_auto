@@ -74,6 +74,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_today_date_text,
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_display_status_for_current_session,
     clear_early_close_runtime_metadata_only,
     clear_auto_close_runtime_metadata,
     close_method_from_state_or_policy,
@@ -311,6 +312,19 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     raw_display_status = display_status_text_for_gui(policy_status)
 
             display_status = auto_trade_setting_display_status(raw_display_status)
+            current_session_trade_started = auto_trade_setting_current_session_trade_started(
+                window,
+                trade_started,
+            )
+            display_status = auto_trade_setting_display_status_for_current_session(
+                state,
+                config,
+                holding_qty=holding_qty,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+                current_session_trade_started=current_session_trade_started,
+                persisted_trade_started=trade_started,
+            )
 
             # 검토종목은 자동매매설정 리스트에서 제거한다.
             # 검토종목 정보 확인/복귀는 검토관리창에서만 처리한다.

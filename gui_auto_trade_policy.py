@@ -23,10 +23,11 @@ from state_policy import (
     operation_text_and_color,
     scheduled_status_for_now,
     seconds_from_hhmmss,
+    status_after_operation_mode_change,
 )
 
 from gui_operation_environment import read_operation_policy
-from gui_auto_trade_display import auto_trade_setting_display_status
+from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
 from gui_auto_trade_runtime import now_text
 
 
@@ -110,6 +111,62 @@ def auto_trade_setting_current_session_trade_started(
         return bool(checker(refresh=False))
     except Exception:
         return False
+
+
+def auto_trade_setting_display_status_for_current_session(
+    state: dict[str, object],
+    config: dict[str, object],
+    *,
+    holding_qty: int,
+    buy_pending_qty: object = 0,
+    sell_pending_qty: object = 0,
+    current_session_trade_started: bool,
+    persisted_trade_started: bool | None = None,
+) -> str:
+    """Return the production display status for the current GUI session."""
+    if not isinstance(state, dict):
+        state = {}
+    if not isinstance(config, dict):
+        config = {}
+
+    raw_state_status = state.get("status", "STOPPED")
+    raw_status_key = str(raw_state_status or "STOPPED").strip().upper() or "STOPPED"
+    trade_started = (
+        auto_trade_setting_trade_started(state)
+        if persisted_trade_started is None
+        else bool(persisted_trade_started)
+    )
+
+    if auto_trade_setting_should_preserve_raw_status(state, raw_state_status):
+        raw_display_status = display_status_text_for_gui(raw_state_status)
+    elif not current_session_trade_started:
+        raw_display_status = display_status_text_for_gui("WAIT_BUY")
+    elif auto_trade_setting_no_next_step_notice(state):
+        raw_display_status = display_status_text_for_gui("WAIT_BUY")
+    elif auto_trade_setting_liquidation_phase_active(config, holding_qty, state=state):
+        raw_display_status = display_status_text_for_gui("WAIT_BUY")
+    elif (
+        not auto_trade_setting_is_after_regular_end()
+        and auto_trade_setting_early_close_requested(state)
+        and auto_trade_setting_has_close_progress_quantity(holding_qty, sell_pending_qty)
+    ):
+        raw_display_status = display_status_text_for_gui("EARLY_CLOSE")
+    elif raw_status_key in {"STOPPED", "STOP", "MANUAL_STOPPED"} or not trade_started:
+        raw_display_status = display_status_text_for_gui("STOPPED")
+    else:
+        mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+        policy_status = status_after_operation_mode_change(mode, config)
+        policy_display = auto_trade_setting_display_status(display_status_text_for_gui(policy_status))
+        if policy_display in ("자동마감", "조기마감") and not auto_trade_setting_has_unresolved_quantity(
+            holding_qty,
+            buy_pending_qty,
+            sell_pending_qty,
+        ):
+            raw_display_status = display_status_text_for_gui("WAIT_BUY")
+        else:
+            raw_display_status = display_status_text_for_gui(policy_status)
+
+    return auto_trade_setting_display_status(raw_display_status)
 
 
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:
