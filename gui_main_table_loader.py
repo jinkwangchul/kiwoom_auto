@@ -42,6 +42,7 @@ from gui_auto_trade_setting_window import (
     is_review_required_state,
     routine_display_name,
 )
+from gui_auto_trade_policy import auto_trade_setting_current_session_trade_started
 from gui_base_stock_service import read_base_stocks
 from gui_routine_registry import read_routine_budget
 
@@ -233,6 +234,12 @@ def main_load_running_stock_table(window) -> None:
             continue
 
         trade_started = auto_trade_setting_trade_started(state)
+        current_session_trade_started = auto_trade_setting_current_session_trade_started(
+            window,
+            trade_started,
+        )
+        if not current_session_trade_started:
+            continue
 
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
         avg_price = safe_float_value(state.get("avg_price"), 0.0)
@@ -245,7 +252,7 @@ def main_load_running_stock_table(window) -> None:
                 "routine": routine_name or "미지정",
                 "operation": operation,
                 "state": state,
-                "trade_started": trade_started,
+                "trade_started": current_session_trade_started,
                 "status": display_status,
                 "holding": f"{holding_qty:,}",
                 "avg_price": format_number_value(avg_price),

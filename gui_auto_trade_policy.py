@@ -95,6 +95,23 @@ def auto_trade_setting_trade_started(state: dict[str, object]) -> bool:
     return raw_status not in ("STOPPED", "STOP", "MANUAL_STOPPED")
 
 
+def auto_trade_setting_current_session_trade_started(
+    window,
+    persisted_trade_started: bool,
+) -> bool:
+    if not persisted_trade_started:
+        return False
+
+    checker = getattr(window, "startup_recovery_session_ready", None)
+    if not callable(checker):
+        return True
+
+    try:
+        return bool(checker(refresh=False))
+    except Exception:
+        return False
+
+
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:
     """시간정책 자동 재판정에서 그대로 유지할 상태인지 판단한다.
 
@@ -893,4 +910,3 @@ def auto_trade_setting_liquidation_phase_active(
         display_status="",
         state=state,
     )
-

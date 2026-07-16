@@ -73,6 +73,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_regular_end_seconds,
     auto_trade_setting_today_date_text,
     auto_trade_setting_trade_started,
+    auto_trade_setting_current_session_trade_started,
     clear_early_close_runtime_metadata_only,
     clear_auto_close_runtime_metadata,
     close_method_from_state_or_policy,
@@ -91,22 +92,6 @@ from gui_ats_utils import (
     manual_ats_session_labels,
     manual_ats_source,
 )
-
-
-
-
-def auto_trade_setting_current_session_trade_started(window, persisted_trade_started: bool) -> bool:
-    if not persisted_trade_started:
-        return False
-
-    checker = getattr(window, "startup_recovery_session_ready", None)
-    if not callable(checker):
-        return True
-
-    try:
-        return bool(checker(refresh=False))
-    except Exception:
-        return False
 
 
 def auto_trade_load_selected_routine_stocks(window) -> None:

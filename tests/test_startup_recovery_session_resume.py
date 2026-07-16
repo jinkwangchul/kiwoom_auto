@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 def _install_pyqt5_import_stubs() -> None:
@@ -18,6 +18,7 @@ def _install_pyqt5_import_stubs() -> None:
         UserRole = 256
         AlignCenter = 0
         AlignLeft = 0
+        AlignRight = 0
         AlignVCenter = 0
 
     class _FakeColor:
@@ -123,7 +124,8 @@ def _install_pyqt5_import_stubs() -> None:
 
 _install_pyqt5_import_stubs()
 
-from gui_auto_trade_table_loader import auto_trade_setting_current_session_trade_started
+import gui_main_table_loader
+from gui_auto_trade_policy import auto_trade_setting_current_session_trade_started
 from gui_auto_trade_run_control import auto_trade_start_selected_auto_trades
 from gui_auto_trade_timer import auto_trade_on_time_policy_timer_tick
 from operator_reconciliation_service import assess_startup_recovery
@@ -440,6 +442,90 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         self.assertTrue(auto_trade_setting_current_session_trade_started(Window(), True))
         self.assertFalse(auto_trade_setting_current_session_trade_started(Window(), False))
+
+    def test_main_running_table_uses_same_current_session_recovery_gate(self) -> None:
+        class Header:
+            def setSortIndicator(self, *_args) -> None:
+                return None
+
+        class Table:
+            def __init__(self) -> None:
+                self.row_count = -1
+                self.items: dict[tuple[int, int], object] = {}
+
+            def columnCount(self) -> int:
+                return 10
+
+            def setRowCount(self, count: int) -> None:
+                self.row_count = count
+
+            def setItem(self, row: int, col: int, item: object) -> None:
+                self.items[(row, col)] = item
+
+            def sortItems(self, *_args) -> None:
+                return None
+
+            def horizontalHeader(self) -> Header:
+                return Header()
+
+        class Window:
+            def __init__(self, ready: bool) -> None:
+                self.running_stock_table = Table()
+                self._main_running_sort_column = -1
+                self._main_running_sort_order = 0
+                self._ready = ready
+
+            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                return self._ready
+
+        state = {
+            "status": "WAIT_BUY",
+            "trade_enabled": True,
+            "trade_started_at": "2026-07-16 09:00:00",
+        }
+        config = {"operation_mode": "SCHEDULED"}
+        stock_dir = Path("stocks") / "003550_LG"
+
+        def read_json(path: Path) -> dict[str, object]:
+            if path.name == "state.json":
+                return dict(state)
+            if path.name == "config.json":
+                return dict(config)
+            return {}
+
+        patches = (
+            patch.object(
+                gui_main_table_loader,
+                "read_base_stocks",
+                return_value=[
+                    {
+                        "code": "003550",
+                        "name": "LG",
+                        "routines": ["지표추종매매"],
+                    }
+                ],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "stock_runtime_dir_for_routine",
+                return_value=stock_dir,
+            ),
+            patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                gui_main_table_loader,
+                "pending_order_side_quantities",
+                return_value=(0, 0),
+            ),
+        )
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            blocked = Window(ready=False)
+            gui_main_table_loader.main_load_running_stock_table(blocked)
+            self.assertEqual(0, blocked.running_stock_table.row_count)
+
+            approved = Window(ready=True)
+            gui_main_table_loader.main_load_running_stock_table(approved)
+            self.assertEqual(1, approved.running_stock_table.row_count)
 
 
 if __name__ == "__main__":
