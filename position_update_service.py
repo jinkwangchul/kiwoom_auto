@@ -349,6 +349,15 @@ def _fill_delta(position: dict[str, Any], fill: dict[str, Any]) -> tuple[int, in
     return previous_cumulative, delta, None
 
 
+def _allow_later_cumulative_reconciliation(context: Any) -> bool:
+    ctx = _as_dict(context)
+    return (
+        ctx.get("kiwoom_api_live_event") is True
+        and _clean_text(ctx.get("live_event_source")) == "KiwoomApi.raw_chejan_received"
+        and ctx.get("chejan_reconciliation_reprocess") is True
+    )
+
+
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value))
 
@@ -508,6 +517,24 @@ def update_position_from_fill(
 
                 previous_cumulative, fill_delta, delta_blocked = _fill_delta(working_position, fill)
                 if delta_blocked is not None:
+                    if _allow_later_cumulative_reconciliation(context) and previous_cumulative > fill["filled_quantity"]:
+                        payload = _noop(
+                            "later_cumulative_fill_already_applied",
+                            "filled_quantity is included in a later cumulative fill already applied to position",
+                        )
+                        payload.update(
+                            {
+                                "fill_id": fill_id,
+                                "positions_path": str(target_path),
+                                "position_id": position_id,
+                                "before_sha256": before_sha256,
+                                "previous_applied_filled_quantity": previous_cumulative,
+                                "current_filled_quantity": fill["filled_quantity"],
+                                "fill_delta_applied": 0,
+                                "later_cumulative_already_applied": True,
+                            }
+                        )
+                        return _with_lock_metadata(payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
                     delta_blocked.update(
                         {
                             "position_id": position_id,

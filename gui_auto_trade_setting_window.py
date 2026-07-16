@@ -422,7 +422,11 @@ def handle_kiwoom_raw_chejan_event(
         item_broker_order_no = str(item.get("broker_order_no") or "").strip()
         if item_broker_order_no and broker_order_no and item_broker_order_no != broker_order_no:
             continue
-        if status == "FILLED" and not _has_pending_chejan_reconciliation_for_event(item, normalized):
+        if (
+            status == "FILLED"
+            and not _has_pending_chejan_reconciliation_for_event(item, normalized)
+            and existing_chejan_record_result(item, normalized) is None
+        ):
             continue
         candidates.append(dict(item))
 
@@ -459,10 +463,18 @@ def handle_kiwoom_raw_chejan_event(
     }
     downstream_source = recorded
     if response["recorded"] is not True and _chejan_record_duplicate(recorded):
-        reconstructed = existing_chejan_record_result(candidates[0], normalized, recorded)
+        if _has_pending_chejan_reconciliation_for_event(candidates[0], normalized):
+            reconstructed = existing_chejan_record_result(candidates[0], normalized, recorded)
+        else:
+            reconstructed = None
         if reconstructed is not None:
             downstream_source = reconstructed
             response["duplicate_reprocess"] = True
+            live_context = dict(live_context or {})
+            live_context["chejan_reconciliation_reprocess"] = True
+        else:
+            response["duplicate_noop"] = True
+            return response
 
     fill_result, position_result, reconciliation_result = _record_fill_and_position_from_chejan(
         downstream_source,
@@ -524,7 +536,11 @@ def _position_result_ok(result: dict[str, object] | None) -> bool:
         return False
     if result.get("position_updated") is True:
         return True
-    return _clean_runtime_text(result.get("position_stage")) in {"duplicate_fill", "fill_delta_noop"}
+    return _clean_runtime_text(result.get("position_stage")) in {
+        "duplicate_fill",
+        "fill_delta_noop",
+        "later_cumulative_fill_already_applied",
+    }
 
 
 def _record_fill_and_position_from_chejan(
