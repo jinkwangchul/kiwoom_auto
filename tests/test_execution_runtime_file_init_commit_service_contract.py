@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -17,6 +18,8 @@ from execution_runtime_file_init_commit_service import (
 )
 from execution_runtime_file_init_open_policy import evaluate_execution_runtime_file_init_open_policy
 from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
+from execution_runtime_file_schema import default_order_executions_data
+from execution_runtime_reader import read_order_executions, read_order_locks
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,15 +190,19 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
         self.assertIn("PARENT_DIRECTORY_MISSING", result["issues"])
         self.assertFalse(missing_root.exists())
 
-    def test_target_already_exists_blocked(self) -> None:
+    def test_valid_existing_target_creates_only_missing_file(self) -> None:
         orchestrator = self._orchestrator()
-        self.order_executions_path.write_text("{}", encoding="utf-8")
+        existing = default_order_executions_data()
+        existing["updated_at"] = "existing"
+        self.order_executions_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
 
         result = self._commit(orchestrator)
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertIn("ORDER_EXECUTIONS_FILE_ALREADY_EXISTS", result["issues"])
-        self.assertFalse(result["committed"])
+        self.assertEqual("COMMITTED", result["status"])
+        self.assertTrue(result["committed"])
+        self.assertEqual([str(self.order_locks_path)], result["created_files"])
+        self.assertEqual(existing, read_order_executions(self.order_executions_path)["data"])
+        self.assertTrue(read_order_locks(self.order_locks_path)["ok"])
 
     def test_malformed_plan_invalid(self) -> None:
         result = self._commit({"bad": True})

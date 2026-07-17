@@ -65,23 +65,23 @@ class ExecutionRuntimeFileInitPreviewTest(unittest.TestCase):
         self.assertEqual(["order_executions", "order_locks"], result["existing"])
         self.assertEqual([], result["would_create"])
 
-    def test_order_executions_only_existing_blocked(self) -> None:
+    def test_order_executions_only_existing_ready_to_create_missing_locks(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
 
         result = self._preview()
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertEqual("READY", result["status"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
         self.assertEqual(["order_executions"], result["existing"])
         self.assertEqual(["order_locks"], result["would_create"])
 
-    def test_order_locks_only_existing_blocked(self) -> None:
+    def test_order_locks_only_existing_ready_to_create_missing_executions(self) -> None:
         self.order_locks_path.write_text("{}", encoding="utf-8")
 
         result = self._preview()
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertEqual("READY", result["status"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
         self.assertEqual(["order_locks"], result["existing"])
         self.assertEqual(["order_executions"], result["would_create"])
 

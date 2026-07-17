@@ -470,9 +470,13 @@ class MainWindow(QMainWindow):
         self._startup_recovery_approved_snapshot = str(result.get("snapshot_hash") or "")
         self.refresh_startup_recovery_status()
         window = getattr(self, "auto_trade_setting_window", None)
-        refresh_controls = getattr(window, "update_startup_recovery_controls", None)
-        if callable(refresh_controls):
-            refresh_controls()
+        refresh_actions = getattr(window, "update_action_buttons", None)
+        if callable(refresh_actions):
+            refresh_actions()
+        else:
+            refresh_controls = getattr(window, "update_startup_recovery_controls", None)
+            if callable(refresh_controls):
+                refresh_controls()
         self.statusBar().showMessage(f"운영 재개 승인 완료: {status}")
 
     def login_kiwoom_manually(self) -> None:

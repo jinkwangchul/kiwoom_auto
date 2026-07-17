@@ -49,9 +49,11 @@ class ExecutionRuntimeFileInitOpenPolicyContractTest(unittest.TestCase):
                 manual_project_runtime_path_confirmed=True,
             )
         elif status_case == "BLOCKED":
-            existing = self.temp_root / "order_executions.json"
-            existing.write_text("{}", encoding="utf-8")
-            preview = build_execution_runtime_file_init_preview(existing, self.temp_root / "order_locks.json")
+            missing = self.temp_root / "missing"
+            preview = build_execution_runtime_file_init_preview(
+                missing / "order_executions.json",
+                missing / "order_locks.json",
+            )
             approval = approve_execution_runtime_file_init(
                 preview,
                 manual_runtime_file_init_confirmed=True,

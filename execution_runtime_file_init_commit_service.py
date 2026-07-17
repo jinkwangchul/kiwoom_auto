@@ -198,9 +198,19 @@ def _target_paths_ok(
     if not order_executions_path.parent.exists() or not order_locks_path.parent.exists():
         return _result(status=STATUS_BLOCKED, issues=["PARENT_DIRECTORY_MISSING"])
     if order_executions_path.exists():
-        return _result(status=STATUS_BLOCKED, issues=["ORDER_EXECUTIONS_FILE_ALREADY_EXISTS"])
+        executions = read_order_executions(order_executions_path)
+        if executions.get("ok") is not True:
+            return _result(
+                status=STATUS_BLOCKED,
+                issues=list(executions.get("issues") or ["ORDER_EXECUTIONS_FILE_INVALID"]),
+            )
     if order_locks_path.exists():
-        return _result(status=STATUS_BLOCKED, issues=["ORDER_LOCKS_FILE_ALREADY_EXISTS"])
+        locks = read_order_locks(order_locks_path)
+        if locks.get("ok") is not True:
+            return _result(
+                status=STATUS_BLOCKED,
+                issues=list(locks.get("issues") or ["ORDER_LOCKS_FILE_INVALID"]),
+            )
     return None
 
 
@@ -273,10 +283,12 @@ def commit_execution_runtime_file_init_plan(
 
     created_files: list[str] = []
     try:
-        _write_json_atomic(order_executions_path, order_executions_schema)
-        created_files.append(str(order_executions_path))
-        _write_json_atomic(order_locks_path, order_locks_schema)
-        created_files.append(str(order_locks_path))
+        if not order_executions_path.exists():
+            _write_json_atomic(order_executions_path, order_executions_schema)
+            created_files.append(str(order_executions_path))
+        if not order_locks_path.exists():
+            _write_json_atomic(order_locks_path, order_locks_schema)
+            created_files.append(str(order_locks_path))
     except Exception as exc:
         for created_file in created_files:
             try:

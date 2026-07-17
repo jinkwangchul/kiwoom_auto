@@ -125,12 +125,13 @@ def _install_pyqt5_import_stubs() -> None:
 _install_pyqt5_import_stubs()
 
 import gui_main_table_loader
+import gui_auto_trade_timer
 from gui_auto_trade_policy import (
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
 )
 from gui_auto_trade_run_control import auto_trade_start_selected_auto_trades
-from gui_auto_trade_timer import auto_trade_on_time_policy_timer_tick
+from gui_auto_trade_timer import auto_trade_on_time_policy_timer_tick, auto_trade_real_execution_active
 from operator_reconciliation_service import assess_startup_recovery
 
 
@@ -418,6 +419,117 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         timer_window.recalculate_all_status_by_operation_policy.assert_not_called()
         self.assertEqual(1, timer_window.update_controls_calls)
+
+    def test_real_auto_trade_state_allows_pending_signal_consumer(self) -> None:
+        class Parent:
+            def refresh_all(self) -> None:
+                return None
+
+        class TimerWindow:
+            def __init__(self, routine_dir: Path) -> None:
+                self.routine_dir = routine_dir
+                self._last_time_policy_minute_key = "2026-07-16 09:00"
+                self.status_messages: list[str] = []
+                self.auto_execution_calls: list[int] = []
+
+            def isVisible(self) -> bool:
+                return True
+
+            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                return True
+
+            def current_time_policy_minute_key(self) -> str:
+                return "2026-07-16 09:01"
+
+            def recalculate_all_status_by_operation_policy(self, *_args, **_kwargs) -> dict[str, int]:
+                return {"changed": 0, "failed": 0}
+
+            def capture_stock_table_view_state(self) -> tuple[set[str], int]:
+                return set(), 0
+
+            def refresh_all(self) -> None:
+                return None
+
+            def restore_stock_table_view_state(self, *_args) -> None:
+                return None
+
+            def parent(self) -> Parent:
+                return Parent()
+
+            def current_selected_routine_dir(self) -> Path:
+                return self.routine_dir
+
+            def statusBarMessage(self, message: str) -> None:
+                self.status_messages.append(message)
+
+            def auto_process_executable_orders_for_real_trade(self, *, limit: int = 5) -> dict[str, object]:
+                self.auto_execution_calls.append(limit)
+                return {"processed": 1, "blocked": 0, "results": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            routine_dir = Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = TimerWindow(routine_dir)
+            consumer = Mock(return_value={"summary": {"signals_checked": 1, "orders_created": 1}})
+
+            with patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+                self.assertTrue(auto_trade_real_execution_active(window))
+            with patch.object(gui_auto_trade_timer, "probe_selected_routine_once", return_value={"logged": 0, "error": 0}), patch.object(
+                gui_auto_trade_timer,
+                "consume_pending_routine_signals_dry_run",
+                consumer,
+            ), patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+                auto_trade_on_time_policy_timer_tick(window)
+
+            consumer.assert_called_once_with(
+                limit=5,
+                mark_previewed=True,
+                write_order_queue=True,
+                apply_approval=True,
+            )
+            self.assertEqual([5], window.auto_execution_calls)
+
+    def test_real_auto_trade_consumer_stays_blocked_without_trade_enabled(self) -> None:
+        class Window:
+            def __init__(self, routine_dir: Path) -> None:
+                self.routine_dir = routine_dir
+
+            def current_selected_routine_dir(self) -> Path:
+                return self.routine_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            routine_dir = Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "STOPPED",
+                        "trade_enabled": False,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+                self.assertFalse(auto_trade_real_execution_active(Window(routine_dir)))
 
     def test_persisted_trade_enabled_does_not_mark_current_session_started_before_recovery(self) -> None:
         class Window:

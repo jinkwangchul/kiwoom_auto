@@ -154,21 +154,13 @@ def build_execution_runtime_file_init_preview(
             warnings=["RUNTIME_FILES_ALREADY_EXIST"],
         )
 
-    if order_executions_exists != order_locks_exists:
-        return _base_result(
-            status=STATUS_BLOCKED,
-            order_executions_path=order_executions_target,
-            order_locks_path=order_locks_target,
-            would_create=would_create,
-            existing=existing,
-            issues=["PARTIAL_RUNTIME_FILES_EXIST"],
-        )
-
     return _base_result(
         status=STATUS_READY,
         order_executions_path=order_executions_target,
         order_locks_path=order_locks_target,
         would_create=would_create,
+        existing=existing,
+        warnings=["PARTIAL_RUNTIME_FILES_EXIST"] if order_executions_exists != order_locks_exists else [],
     )
 
 

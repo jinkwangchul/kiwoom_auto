@@ -102,14 +102,14 @@ class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
         self.assertEqual("SKIPPED", result["status"])
         self.assertFalse(result["init_commit_allowed"])
 
-    def test_blocked_preview_blocked(self) -> None:
+    def test_partial_preview_approved_with_warning(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
 
         result = self._approve(self._preview())
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertFalse(result["init_commit_allowed"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertEqual("APPROVED", result["status"])
+        self.assertTrue(result["init_commit_allowed"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
 
     def test_invalid_preview_invalid(self) -> None:
         result = self._approve(self._preview(order_executions_path=""))

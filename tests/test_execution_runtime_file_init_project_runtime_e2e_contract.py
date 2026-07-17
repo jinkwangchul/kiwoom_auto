@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -144,7 +145,7 @@ class ExecutionRuntimeFileInitProjectRuntimeE2EContractTest(unittest.TestCase):
         self.assertFalse(self.order_executions_path.exists())
         self.assertFalse(self.order_locks_path.exists())
 
-    def test_file_already_exists_blocks_without_overwrite(self) -> None:
+    def test_valid_existing_file_creates_only_missing_project_runtime_file(self) -> None:
         if self.order_executions_path.exists() or self.order_locks_path.exists():
             result = self._commit_project_runtime(
                 self._project_orchestrator(),
@@ -155,14 +156,23 @@ class ExecutionRuntimeFileInitProjectRuntimeE2EContractTest(unittest.TestCase):
 
         orchestrator = self._project_orchestrator()
         policy = self._open_policy(orchestrator)
-        self.order_executions_path.write_text("{}\n", encoding="utf-8")
-        self.created_paths = [self.order_executions_path]
+        existing = default_order_executions_data()
+        existing["updated_at"] = "existing"
+        self.order_executions_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+        self.created_paths = [self.order_executions_path, self.order_locks_path]
 
-        result = self._commit_project_runtime(orchestrator, policy=policy)
+        try:
+            result = self._commit_project_runtime(orchestrator, policy=policy)
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertIn("ORDER_EXECUTIONS_FILE_ALREADY_EXISTS", result["issues"])
-        self.assertFalse(self.order_locks_path.exists())
+            self.assertEqual("COMMITTED", result["status"])
+            self.assertTrue(result["committed"])
+            self.assertEqual([str(self.order_locks_path)], result["created_files"])
+            self.assertEqual(existing, read_order_executions(self.order_executions_path)["data"])
+            self.assertTrue(read_order_locks(self.order_locks_path)["ok"])
+        finally:
+            for path in self.created_paths:
+                if path.exists():
+                    path.unlink()
 
     def test_no_queue_sendorder_execution_controller_or_gui_calls(self) -> None:
         if self.order_executions_path.exists() or self.order_locks_path.exists():

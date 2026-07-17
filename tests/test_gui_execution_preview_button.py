@@ -359,6 +359,84 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertFalse(allowed)
         window.require_startup_recovery_session.assert_called_once_with("Manual SendOrder")
 
+    def test_start_button_recomputes_selected_stock_after_recovery_approval(self) -> None:
+        class Parent:
+            def __init__(self, ready: bool) -> None:
+                self.ready = ready
+
+            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                return self.ready
+
+        def start_enabled(*, has_stock: bool, ready: bool) -> bool:
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            for name in (
+                "btn_start",
+                "btn_stop",
+                "btn_early_close",
+                "btn_set_schedule",
+                "btn_delete",
+                "btn_order_view",
+                "btn_log_view",
+                "btn_review_view",
+                "btn_execution_enable",
+                "btn_real_ready_preflight",
+                "btn_execution_preview",
+                "btn_manual_send_order",
+                "btn_manual_cancel_pending_order",
+                "btn_manual_modify_pending_order",
+                "btn_manual_queue_commit",
+            ):
+                setattr(window, name, _FakeButton(name))
+            window.has_selected_stock = mock.Mock(return_value=has_stock)
+            window.has_single_selected_stock = mock.Mock(return_value=has_stock)
+            window.parent = lambda: Parent(ready)
+            window._last_execution_preview_result = {}
+
+            gui.AutoTradeSettingWindow.update_action_buttons(window)
+
+            return bool(window.btn_start.enabled)
+
+        self.assertFalse(start_enabled(has_stock=True, ready=False))
+        self.assertTrue(start_enabled(has_stock=True, ready=True))
+        self.assertFalse(start_enabled(has_stock=False, ready=True))
+
+    def test_review_startup_recovery_refreshes_auto_trade_action_buttons(self) -> None:
+        class StatusBar:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            def showMessage(self, message: str) -> None:
+                self.messages.append(message)
+
+        setting_window = mock.Mock()
+        main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        main._startup_recovery_approved = False
+        main._startup_recovery_approved_snapshot = ""
+        main._startup_recovery_result = {}
+        main.auto_trade_setting_window = setting_window
+        main.refresh_startup_recovery_status = mock.Mock(
+            return_value={
+                "status": "RESUME_READY",
+                "operator_approval_allowed": True,
+                "snapshot_hash": "SNAPSHOT_A",
+            }
+        )
+        status_bar = StatusBar()
+        main.statusBar = lambda: status_bar
+
+        with mock.patch.object(main_gui.QMessageBox, "Yes", 1, create=True), mock.patch.object(
+            main_gui.QMessageBox,
+            "No",
+            0,
+            create=True,
+        ), mock.patch.object(main_gui.QMessageBox, "question", return_value=1, create=True):
+            main_gui.MainWindow.review_startup_recovery(main)
+
+        self.assertTrue(main._startup_recovery_approved)
+        self.assertEqual("SNAPSHOT_A", main._startup_recovery_approved_snapshot)
+        setting_window.update_action_buttons.assert_called_once_with()
+        setting_window.update_startup_recovery_controls.assert_not_called()
+
     def _window_for_queue_commit(self):
         window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
         window.messages = []
@@ -1421,17 +1499,64 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertFalse(gui.ORDER_EXECUTIONS_PATH.exists())
         self.assertFalse(gui.ORDER_LOCKS_PATH.exists())
 
-    def test_partial_runtime_files_block_without_auto_repair(self) -> None:
+    def test_partial_runtime_files_create_only_missing_file_without_overwrite(self) -> None:
         window = self._window_for_queue_commit()
         window.execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
             locks_path = gui.Path(temp_dir) / "order_locks.json"
-            executions_path.write_text(
-                json.dumps(default_order_executions_data(), ensure_ascii=False),
-                encoding="utf-8",
+            existing = default_order_executions_data()
+            existing["updated_at"] = "existing"
+            executions_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
             )
+
+            self.assertTrue(result["runtime_files_ready"], result)
+            self.assertTrue(result["runtime_file_init_required"])
+            self.assertEqual("COMMITTED", result["runtime_file_init_result"]["status"])
+            self.assertTrue(executions_path.exists())
+            self.assertTrue(locks_path.exists())
+            self.assertEqual(existing, json.loads(executions_path.read_text(encoding="utf-8")))
+            self.assertEqual(default_order_locks_data(), json.loads(locks_path.read_text(encoding="utf-8")))
+            window.confirm_execution_runtime_file_init.assert_called_once()
+
+    def test_partial_runtime_files_create_missing_executions_without_overwriting_locks(self) -> None:
+        window = self._window_for_queue_commit()
+        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+            existing = default_order_locks_data()
+            existing["updated_at"] = "existing"
+            locks_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=executions_path,
+                order_locks_path=locks_path,
+            )
+
+            self.assertTrue(result["runtime_files_ready"], result)
+            self.assertTrue(executions_path.exists())
+            self.assertTrue(locks_path.exists())
+            self.assertEqual(default_order_executions_data(), json.loads(executions_path.read_text(encoding="utf-8")))
+            self.assertEqual(existing, json.loads(locks_path.read_text(encoding="utf-8")))
+            window.confirm_execution_runtime_file_init.assert_called_once()
+
+    def test_partial_runtime_files_block_when_existing_file_is_invalid(self) -> None:
+        window = self._window_for_queue_commit()
+        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executions_path = gui.Path(temp_dir) / "order_executions.json"
+            locks_path = gui.Path(temp_dir) / "order_locks.json"
+            executions_path.write_text("not-json", encoding="utf-8")
 
             result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
                 window,
@@ -1440,10 +1565,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             )
 
             self.assertFalse(result["runtime_files_ready"])
-            self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["blocked_reasons"])
-            self.assertTrue(executions_path.exists())
+            self.assertEqual("not-json", executions_path.read_text(encoding="utf-8"))
             self.assertFalse(locks_path.exists())
-            window.confirm_execution_runtime_file_init.assert_not_called()
+            self.assertTrue(result["blocked_reasons"])
 
     def test_invalid_existing_runtime_files_block_without_overwrite(self) -> None:
         window = self._window_for_queue_commit()
@@ -1967,6 +2091,355 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 self.assertTrue(executions_path.exists())
                 self.assertTrue(locks_path.exists())
                 send_order_stub.assert_not_called()
+
+    def test_auto_trade_process_executable_order_reaches_mock_send_order_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = gui.Path(temp_dir)
+            runtime_dir = root / "runtime"
+            routine_dir = root / "routines" / "지표추종매매"
+            stock_dir = routine_dir / "003550_LG"
+            runtime_dir.mkdir(parents=True)
+            stock_dir.mkdir(parents=True)
+            queue_path = runtime_dir / "order_queue.json"
+            executions_path = runtime_dir / "order_executions.json"
+            locks_path = runtime_dir / "order_locks.json"
+            (stock_dir / "config.json").write_text(
+                json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "revision": 0,
+                        "updated_at": "",
+                        "orders": [
+                            {
+                                "id": "ORDER_AUTO_1",
+                                "status": "EXECUTABLE",
+                                "source_signal_id": "SIG_AUTO_1",
+                                "code": "003550",
+                                "side": "BUY",
+                                "quantity": 3,
+                                "price": 85000,
+                                "order_type": "LIMIT",
+                                "order_intent": {"side": "BUY", "hoga": "LIMIT"},
+                                "approval_status": "APPROVED",
+                                "policy_status": "EXECUTABLE",
+                                "execution_enabled": False,
+                                "send_order_called": False,
+                                "broker_api_called": False,
+                                "actual_order_sent": False,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window.messages = []
+            window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
+            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            parent.account_combo = _FakeAccountCombo()
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.parent = lambda: parent
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+            window.current_selected_routine_dir = lambda: routine_dir
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
+                mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
+                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+            ):
+                result = gui.AutoTradeSettingWindow.process_executable_order_for_auto_trade(
+                    window,
+                    "ORDER_AUTO_1",
+                )
+                duplicate = gui.AutoTradeSettingWindow.process_executable_order_for_auto_trade(
+                    window,
+                    "ORDER_AUTO_1",
+                )
+
+            self.assertTrue(result["processed"], result)
+            self.assertEqual("send_order", result["stage"])
+            self.assertTrue(executions_path.exists())
+            self.assertTrue(locks_path.exists())
+            self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), result)
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            queued = [
+                item for item in data["orders"]
+                if isinstance(item, dict) and item.get("status") == "SEND_CALL_ACCEPTED"
+            ]
+            self.assertEqual(1, len(queued), data)
+            self.assertTrue(queued[0]["send_order_called"])
+            self.assertTrue(queued[0]["broker_api_called"])
+            self.assertFalse(duplicate["processed"])
+            self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), duplicate)
+
+    def test_auto_trade_process_executable_order_blocks_probe_only_without_send_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = gui.Path(temp_dir)
+            runtime_dir = root / "runtime"
+            routine_dir = root / "routines" / "지표추종매매"
+            stock_dir = routine_dir / "003550_LG"
+            runtime_dir.mkdir(parents=True)
+            stock_dir.mkdir(parents=True)
+            queue_path = runtime_dir / "order_queue.json"
+            executions_path = runtime_dir / "order_executions.json"
+            locks_path = runtime_dir / "order_locks.json"
+            executions_path.write_text(
+                json.dumps(default_order_executions_data(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            locks_path.write_text(
+                json.dumps(default_order_locks_data(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (stock_dir / "config.json").write_text(
+                json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": True,
+                        "review_required": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "revision": 0,
+                        "updated_at": "",
+                        "orders": [
+                            {
+                                "id": "ORDER_AUTO_1",
+                                "status": "EXECUTABLE",
+                                "source_signal_id": "SIG_AUTO_1",
+                                "code": "003550",
+                                "side": "BUY",
+                                "quantity": 3,
+                                "price": 85000,
+                                "order_type": "LIMIT",
+                                "order_intent": {"side": "BUY", "hoga": "LIMIT"},
+                                "approval_status": "APPROVED",
+                                "policy_status": "EXECUTABLE",
+                                "execution_enabled": False,
+                                "send_order_called": False,
+                                "broker_api_called": False,
+                                "actual_order_sent": False,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            parent.account_combo = _FakeAccountCombo()
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.parent = lambda: parent
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+            window.current_selected_routine_dir = lambda: routine_dir
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
+                mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
+                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+            ):
+                result = gui.AutoTradeSettingWindow.process_executable_order_for_auto_trade(
+                    window,
+                    "ORDER_AUTO_1",
+                )
+
+            self.assertFalse(result["processed"])
+            self.assertEqual("auto_trade_runtime_state", result["stage"])
+            self.assertIn("signal_probe_only is true", result["blocked_reasons"])
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+
+    def test_auto_trade_runtime_state_blocks_unsafe_flags(self) -> None:
+        cases = [
+            ({"status": "RUNNING", "trade_enabled": False, "real_trade_enabled": True}, "trade_enabled is not true"),
+            ({"status": "RUNNING", "trade_enabled": True, "real_trade_enabled": False}, "real_trade_enabled is not true"),
+            ({"status": "RUNNING", "trade_enabled": True, "real_trade_enabled": True, "review_required": True}, "review_required is true"),
+            ({"status": "EMERGENCY_STOPPED", "trade_enabled": True, "real_trade_enabled": True}, "auto trade status is not RUNNING"),
+        ]
+        for state_update, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason), tempfile.TemporaryDirectory() as temp_dir:
+                routine_dir = gui.Path(temp_dir) / "routine"
+                stock_dir = routine_dir / "003550_LG"
+                stock_dir.mkdir(parents=True)
+                (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+                state = {
+                    "status": "RUNNING",
+                    "trade_enabled": True,
+                    "real_trade_enabled": True,
+                    "signal_probe_only": False,
+                    "review_required": False,
+                }
+                state.update(state_update)
+                (stock_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+                window.current_selected_routine_dir = lambda: routine_dir
+
+                with mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]):
+                    reasons = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
+                        window,
+                        {"code": "003550"},
+                    )
+
+                self.assertIn(expected_reason, reasons)
+
+    def test_auto_send_order_blocks_without_send_order_callable(self) -> None:
+        class ApiWithoutSendOrder:
+            def is_connected(self) -> bool:
+                return True
+
+            def account_numbers(self) -> list[str]:
+                return ["12345678"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order()
+            self._write_queue_for_send_order(queue_path, record)
+            routine_dir = gui.Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            parent.kiwoom_api = ApiWithoutSendOrder()
+            parent.account_combo = _FakeAccountCombo()
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.parent = lambda: parent
+            window.current_selected_routine_dir = lambda: routine_dir
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+            ):
+                result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
+                    window,
+                    "ORDER_QUEUED_ORDER_1",
+                    queue_path=queue_path,
+                )
+
+            self.assertEqual("send_order_environment", result["stage"])
+            self.assertIn("kiwoom api SendOrder callable is unavailable", result["blocked_reasons"])
+
+    def test_auto_send_order_final_gate_failure_does_not_call_send_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order()
+            self._write_queue_for_send_order(queue_path, record)
+            routine_dir = gui.Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
+            parent.account_combo = _FakeAccountCombo()
+            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            window.parent = lambda: parent
+            window.current_selected_routine_dir = lambda: routine_dir
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+            window.build_manual_final_send_gate_result = lambda *_args, **_kwargs: {
+                "final_send_gate_ok": False,
+                "blocked_reasons": ["forced final gate failure"],
+            }
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+            ):
+                result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
+                    window,
+                    "ORDER_QUEUED_ORDER_1",
+                    queue_path=queue_path,
+                )
+
+            self.assertEqual("final_send_gate", result["stage"])
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
 
     def test_manual_queue_commit_failure_result_is_displayed(self) -> None:
         window = self._window_for_queue_commit()

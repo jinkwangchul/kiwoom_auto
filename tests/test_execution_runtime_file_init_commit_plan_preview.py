@@ -79,16 +79,16 @@ class ExecutionRuntimeFileInitCommitPlanPreviewTest(unittest.TestCase):
         self.assertEqual("SKIPPED", result["status"])
         self.assertFalse(result["init_commit_ready"])
 
-    def test_blocked_plan(self) -> None:
+    def test_partial_plan_ready_with_warning(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
         preview = self._preview()
         approval = self._approval(preview)
 
         result = self._plan(preview, approval)
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertFalse(result["init_commit_ready"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertEqual("READY", result["status"])
+        self.assertTrue(result["init_commit_ready"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
 
     def test_invalid_plan(self) -> None:
         preview = self._preview(order_executions_path="")

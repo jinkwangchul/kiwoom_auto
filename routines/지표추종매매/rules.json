@@ -126,6 +126,10 @@
       "price_compare": {
         "enabled": false,
         "conditions": []
+      },
+      "bollinger": {
+        "enabled": false,
+        "conditions": []
       }
     }
   },
@@ -179,7 +183,7 @@
         "basic_signal_interval_combo": "5",
         "basic_duplicate_signal_combo": "후행신호 우선",
         "basic_error_policy_combo": "매매중지",
-        "buy_signal_expr_line": "RESTORE_TEST_BUY_EXPR",
+        "buy_signal_expr_line": "A and B and C and D",
         "sell_signal_expr_line": "A and B and C",
         "sell_method_select_a_check": true,
         "sell_method_select_b_check": false,
@@ -463,7 +467,6 @@
           "perform1_multi_down_line": "0",
           "perform1_multi_up_line": "3",
           "perform1_single_combo": "주문가",
-          "perform1_title_combo": "단일호가",
           "perform2_ratio_compare": "이상",
           "perform2_ratio_count": "3",
           "perform2_ratio_direction": "상향",
@@ -530,7 +533,6 @@
           "perform1_multi_down_line": "0",
           "perform1_multi_up_line": "3",
           "perform1_single_combo": "주문가",
-          "perform1_title_combo": "단일호가",
           "perform2_ratio_compare": "이상",
           "perform2_ratio_count": "3",
           "perform2_ratio_direction": "상향",
@@ -556,7 +558,6 @@
           "repeat_perform1_multi_down_line": "0",
           "repeat_perform1_multi_up_line": "3",
           "repeat_perform1_single_combo": "주문가",
-          "repeat_perform1_title_combo": "단일호가",
           "repeat_perform2_ratio_compare": "이상",
           "repeat_perform2_ratio_count": "3",
           "repeat_perform2_ratio_direction": "상향",
@@ -598,6 +599,7 @@
       "bar.bar_minutes",
       "buy.groups[0].conditions",
       "buy.filters.moving_average",
+      "buy.filters.bollinger",
       "indicators.rsi",
       "sell.signals.ui_preview_condition_c_macd_sell"
     ],
@@ -640,6 +642,23 @@
                 "compare_target": "MA",
                 "period": 60,
                 "description": "UI preview: BUY current price / 60MA filter"
+              }
+            ]
+          }
+        },
+        "bollinger": {
+          "path": "buy.filters.bollinger",
+          "value": {
+            "enabled": true,
+            "conditions": [
+              {
+                "enabled": true,
+                "not": false,
+                "target": "CLOSE",
+                "operator": ">=",
+                "compare_target": "BOLLINGER",
+                "value": 0.1,
+                "description": "UI preview: BUY current price / Bollinger filter"
               }
             ]
           }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -17,6 +18,7 @@ from execution_runtime_file_init_commit_service import (
 )
 from execution_runtime_file_init_open_policy import evaluate_execution_runtime_file_init_open_policy
 from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
+from execution_runtime_file_schema import default_order_executions_data
 from execution_runtime_reader import read_order_executions, read_order_locks
 
 
@@ -194,7 +196,7 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
                 if path.exists():
                     path.unlink()
 
-    def test_project_runtime_file_already_exists_blocked_after_open_policy(self) -> None:
+    def test_project_runtime_valid_existing_file_creates_only_missing_file_after_open_policy(self) -> None:
         order_executions_path = ROOT / "runtime" / "order_executions.json"
         order_locks_path = ROOT / "runtime" / "order_locks.json"
         self.assertFalse(order_executions_path.exists())
@@ -202,7 +204,9 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
         orchestrator = self._project_orchestrator()
 
         try:
-            order_executions_path.write_text("{}", encoding="utf-8")
+            existing = default_order_executions_data()
+            existing["updated_at"] = "existing"
+            order_executions_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
             result = commit_execution_runtime_file_init_plan(
                 orchestrator,
                 manual_runtime_file_init_commit_confirmed=True,
@@ -210,9 +214,11 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
                 manual_project_runtime_file_init_commit_confirmed=True,
             )
 
-            self.assertEqual("BLOCKED", result["status"])
-            self.assertIn("ORDER_EXECUTIONS_FILE_ALREADY_EXISTS", result["issues"])
-            self.assertFalse(result["committed"])
+            self.assertEqual("COMMITTED", result["status"])
+            self.assertTrue(result["committed"])
+            self.assertEqual([str(order_locks_path)], result["created_files"])
+            self.assertEqual(existing, read_order_executions(order_executions_path)["data"])
+            self.assertTrue(read_order_locks(order_locks_path)["ok"])
         finally:
             for path in (order_executions_path, order_locks_path):
                 if path.exists():
@@ -230,13 +236,14 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
         self.assertEqual("BLOCKED", result["status"])
         self.assertFalse(result["committed"])
 
-    def test_target_already_exists_blocked(self) -> None:
+    def test_invalid_existing_target_blocks_without_overwrite(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
         orchestrator = self._orchestrator()
 
         result = self._commit(orchestrator)
 
         self.assertEqual("BLOCKED", result["status"])
+        self.assertTrue(result["issues"])
         self.assertFalse(result["committed"])
 
     def test_malformed_plan_invalid(self) -> None:

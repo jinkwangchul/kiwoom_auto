@@ -63,17 +63,17 @@ class ExecutionRuntimeFileInitCommitPlanOrchestratorTest(unittest.TestCase):
         self.assertTrue(result["preview_only"])
         self.assertFalse(result["runtime_write"])
 
-    def test_blocked_flow(self) -> None:
+    def test_partial_flow_ready_with_warning(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
         preview = self._preview()
         approval = self._approval(preview)
 
         result = self._run(preview, approval)
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertFalse(result["init_commit_ready"])
+        self.assertEqual("READY", result["status"])
+        self.assertTrue(result["init_commit_ready"])
         self.assertTrue(result["validation"]["valid"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
 
     def test_invalid_flow(self) -> None:
         preview = self._preview(order_executions_path="")

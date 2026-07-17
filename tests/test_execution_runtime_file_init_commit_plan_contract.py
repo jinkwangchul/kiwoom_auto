@@ -78,14 +78,14 @@ class ExecutionRuntimeFileInitCommitPlanContractTest(unittest.TestCase):
         self.assertEqual("SKIPPED", result["status"])
         self.assertFalse(result["init_commit_ready"])
 
-    def test_one_existing_blocked(self) -> None:
+    def test_one_existing_ready_with_partial_warning(self) -> None:
         self.order_executions_path.write_text("{}", encoding="utf-8")
 
         _preview, _approval, result = self._run_flow()
 
-        self.assertEqual("BLOCKED", result["status"])
-        self.assertFalse(result["init_commit_ready"])
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
+        self.assertEqual("READY", result["status"])
+        self.assertTrue(result["init_commit_ready"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
 
     def test_parent_missing_blocked(self) -> None:
         missing_root = self.temp_root / "missing"
@@ -153,8 +153,8 @@ class ExecutionRuntimeFileInitCommitPlanContractTest(unittest.TestCase):
 
         _preview, _approval, result = self._run_flow()
 
-        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["issues"])
-        self.assertEqual(result["commit_plan"]["issues"], result["issues"])
+        self.assertIn("PARTIAL_RUNTIME_FILES_EXIST", result["warnings"])
+        self.assertEqual(result["commit_plan"]["warnings"], result["warnings"])
 
     def test_input_immutability(self) -> None:
         preview = build_execution_runtime_file_init_preview(

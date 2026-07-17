@@ -66,6 +66,28 @@ def auto_trade_signal_probe_only_active(window) -> bool:
     return False
 
 
+def auto_trade_real_execution_active(window) -> bool:
+    routine_dir = window.current_selected_routine_dir()
+    if routine_dir is None:
+        return False
+
+    try:
+        from gui_auto_trade_runtime import get_stock_dirs_in_routine
+        stock_dirs = get_stock_dirs_in_routine(Path(routine_dir))
+    except Exception:
+        stock_dirs = assigned_stock_dirs_in_routine(Path(routine_dir))
+
+    for stock_dir in stock_dirs:
+        state = _read_json_dict(Path(stock_dir) / "state.json")
+        if state.get("signal_probe_only") is True:
+            continue
+        if state.get("review_required") is True:
+            continue
+        if state.get("trade_enabled") is True and state.get("real_trade_enabled") is True:
+            return True
+    return False
+
+
 def auto_trade_current_time_policy_minute_key(window) -> str:
     """시간정책 자동 재판정용 분 단위 키."""
     return datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -167,7 +189,10 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
                 )
             if (
                 callable(consume_pending_routine_signals_dry_run)
-                and auto_trade_signal_probe_only_active(window)
+                and (
+                    auto_trade_signal_probe_only_active(window)
+                    or auto_trade_real_execution_active(window)
+                )
             ):
                 try:
                     consumer_result = consume_pending_routine_signals_dry_run(
@@ -189,6 +214,16 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
                             f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
                             f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
                         )
+                    if auto_trade_real_execution_active(window):
+                        auto_executor = getattr(type(window), "auto_process_executable_orders_for_real_trade", None)
+                        if callable(auto_executor):
+                            auto_result = auto_executor(window, limit=5)
+                            processed = int(auto_result.get("processed", 0) or 0)
+                            auto_blocked = int(auto_result.get("blocked", 0) or 0)
+                            if processed > 0 or auto_blocked > 0:
+                                window.statusBarMessage(
+                                    f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
+                                )
                 except Exception as exc:
                     window.statusBarMessage(f"주문후보검증 실패: {exc}")
         except Exception:
