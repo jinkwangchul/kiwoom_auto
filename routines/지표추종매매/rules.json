@@ -179,7 +179,7 @@
         "basic_signal_interval_combo": "5",
         "basic_duplicate_signal_combo": "후행신호 우선",
         "basic_error_policy_combo": "매매중지",
-        "buy_signal_expr_line": "RESTORE_TEST_BUY_EXPR",
+        "buy_signal_expr_line": "A and B and C and D",
         "sell_signal_expr_line": "A and B and C",
         "sell_method_select_a_check": true,
         "sell_method_select_b_check": false,
