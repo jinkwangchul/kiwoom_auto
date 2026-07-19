@@ -17,7 +17,7 @@ INSTANCE_ID = UUID("a52f539d-4f18-4ef6-b0cf-f471567982a1")
 
 
 class RoutineInstanceRepositoryTest(unittest.TestCase):
-    def _repository(self, root: Path) -> RoutineInstanceRepository:
+    def _repository(self, root: Path, *, id_factory=None) -> RoutineInstanceRepository:
         routine_dir = root / "routines" / "indicator_follow"
         routine_dir.mkdir(parents=True)
         (routine_dir / "routine.json").write_text(
@@ -37,7 +37,7 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         )
         return RoutineInstanceRepository(
             root,
-            id_factory=lambda: INSTANCE_ID,
+            id_factory=id_factory or (lambda: INSTANCE_ID),
             now_factory=lambda: datetime(2026, 7, 18, 14, 0, tzinfo=timezone.utc),
         )
 
@@ -141,6 +141,138 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(before, json.dumps(rules, sort_keys=True))
 
+    def test_rename_updates_display_name_without_touching_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            create_result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Before Name",
+                ),
+                {"buy": {"enabled": True}},
+            )
+
+            result = repository.rename_instance(str(INSTANCE_ID), "After Name")
+
+            instance_dir = root / "routine_instances" / str(INSTANCE_ID)
+            metadata = json.loads((instance_dir / "instance.json").read_text(encoding="utf-8"))
+            rules = json.loads((instance_dir / "rules.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(create_result.success)
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.instance)
+        self.assertEqual("After Name", result.instance.display_name)
+        self.assertEqual("After Name", metadata["display_name"])
+        self.assertEqual({"buy": {"enabled": True}}, rules)
+
+    def test_rename_rejects_blank_and_duplicate_names(self) -> None:
+        ids = iter(
+            (
+                UUID("a52f539d-4f18-4ef6-b0cf-f471567982a1"),
+                UUID("b52f539d-4f18-4ef6-b0cf-f471567982a2"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root, id_factory=lambda: next(ids))
+            first = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="First",
+                ),
+                {},
+            )
+            second = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Second",
+                ),
+                {},
+            )
+
+            blank = repository.rename_instance(str(INSTANCE_ID), "  ")
+            duplicate = repository.rename_instance(str(INSTANCE_ID), "second")
+
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertFalse(blank.success)
+        self.assertEqual("DISPLAY_NAME_REQUIRED", blank.error_code)
+        self.assertFalse(duplicate.success)
+        self.assertEqual("DISPLAY_NAME_DUPLICATE", duplicate.error_code)
+        self.assertEqual("First", metadata["display_name"])
+
+    def test_update_buy_limit_toggles_enabled_amount_without_touching_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            create_result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Limit Routine",
+                ),
+                {"sell": {"enabled": True}},
+            )
+
+            enabled = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=1_000_000,
+            )
+            disabled = repository.update_buy_limit(str(INSTANCE_ID), enabled=False)
+
+            instance_dir = root / "routine_instances" / str(INSTANCE_ID)
+            metadata = json.loads((instance_dir / "instance.json").read_text(encoding="utf-8"))
+            rules = json.loads((instance_dir / "rules.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(create_result.success)
+        self.assertTrue(enabled.success)
+        self.assertTrue(disabled.success)
+        self.assertFalse(metadata["buy_limit_enabled"])
+        self.assertIsNone(metadata["buy_limit_amount"])
+        self.assertEqual({"sell": {"enabled": True}}, rules)
+
+    def test_update_buy_limit_rejects_non_positive_enabled_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            create_result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Limit Routine",
+                ),
+                {},
+            )
+
+            result = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=0,
+            )
+
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(create_result.success)
+        self.assertFalse(result.success)
+        self.assertEqual("BUY_LIMIT_INVALID", result.error_code)
+        self.assertFalse(metadata["buy_limit_enabled"])
+        self.assertIsNone(metadata["buy_limit_amount"])
 
 if __name__ == "__main__":
     unittest.main()

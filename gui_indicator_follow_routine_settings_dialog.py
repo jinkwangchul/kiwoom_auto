@@ -118,6 +118,7 @@ class IndicatorFollowRoutineSettingsDialog(
         definition_id=None,
         definition_display_name=None,
         instance_id=None,
+        settings_mode=None,
     ):
         super().__init__(parent)
         self.routine_path = Path(routine_path) if routine_path else None
@@ -125,6 +126,14 @@ class IndicatorFollowRoutineSettingsDialog(
         self.definition_id = str(definition_id or "").strip()
         self.definition_display_name = str(definition_display_name or routine_name or "").strip()
         self.instance_id = str(instance_id or "").strip()
+        inferred_mode = "edit" if self.instance_id else "registration"
+        self.settings_mode = str(settings_mode or inferred_mode).strip().lower()
+        if self.settings_mode not in {"registration", "edit"}:
+            raise ValueError("settings_mode must be registration or edit")
+        if self.settings_mode == "edit" and not self.instance_id:
+            raise ValueError("edit mode requires instance_id")
+        if self.settings_mode == "registration" and self.instance_id:
+            raise ValueError("registration mode cannot use instance_id")
         self._update_window_title()
         self.setWindowFlags(
             Qt.Window
@@ -209,9 +218,14 @@ class IndicatorFollowRoutineSettingsDialog(
         button_row = QHBoxLayout()
         self.reload_button = QPushButton("다시 불러오기")
         self.validate_button = QPushButton("설정 검증")
-        self.save_button = QPushButton("UI 상태 저장")
-        self.register_button = QPushButton("다른 이름으로 등록" if self.instance_id else "등록")
-        self.register_button.setObjectName("routineRegisterButton")
+        if self.settings_mode == "edit":
+            self.register_button = QPushButton("다른 이름으로 등록")
+            self.register_button.setObjectName("routineRegisterButton")
+            self.save_button = QPushButton("저장")
+        else:
+            self.save_button = QPushButton("등록")
+            self.save_button.setObjectName("routineRegisterButton")
+            self.register_button = self.save_button
         self.close_button = QPushButton("닫기")
 
         self.save_button.setEnabled(True)
@@ -232,14 +246,18 @@ class IndicatorFollowRoutineSettingsDialog(
             )
         )
         self.validate_button.clicked.connect(self._handle_validate_clicked)
-        self.save_button.clicked.connect(self.save_indicator_follow_ui_state_to_rules)
-        self.register_button.clicked.connect(self.open_registration_dialog)
+        if self.settings_mode == "edit":
+            self.save_button.clicked.connect(self.save_indicator_follow_ui_state_to_rules)
+            self.register_button.clicked.connect(self.open_registration_dialog)
+        else:
+            self.save_button.clicked.connect(self.open_registration_dialog)
         self.close_button.clicked.connect(self.close)
 
         button_row.addWidget(self.reload_button)
         button_row.addWidget(self.validate_button)
         button_row.addStretch(1)
-        button_row.addWidget(self.register_button)
+        if self.settings_mode == "edit":
+            button_row.addWidget(self.register_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
         root.addLayout(button_row)

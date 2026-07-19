@@ -256,3 +256,29 @@ def update_base_stock_routines(code: str, name: str, routines: list[str]) -> boo
     if central_updated is not None:
         return central_updated
     return False
+
+
+def update_base_stock_routine_instance(
+    code: str,
+    name: str,
+    *,
+    instance_id: str,
+    instance_name: str,
+    definition_id: str,
+    routine_type: str,
+) -> bool:
+    if not _central_repository_available():
+        return False
+    try:
+        return bool(
+            stock_repository_factory().update_stock_routine_instance(
+                code,
+                name,
+                instance_id=instance_id,
+                instance_name=instance_name,
+                definition_id=definition_id,
+                routine_type=routine_type,
+            )
+        )
+    except Exception:
+        return False

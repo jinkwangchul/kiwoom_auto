@@ -42,6 +42,22 @@ class RoutineInstanceCreateResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class RoutineInstanceRenameResult:
+    success: bool
+    instance: RoutineInstanceRecord | None = None
+    error_code: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class RoutineInstanceBuyLimitResult:
+    success: bool
+    instance: RoutineInstanceRecord | None = None
+    error_code: str = ""
+    error: str = ""
+
+
 class RoutineInstanceRepository:
     def __init__(
         self,
@@ -169,9 +185,141 @@ class RoutineInstanceRepository:
                 error=str(exc),
             )
 
+    def rename_instance(
+        self,
+        instance_id: str,
+        display_name: str,
+    ) -> RoutineInstanceRenameResult:
+        instance = self.get_instance(instance_id)
+        if instance is None:
+            return RoutineInstanceRenameResult(
+                False,
+                error_code="INSTANCE_UNKNOWN",
+                error="변경할 등록 루틴을 찾을 수 없습니다.",
+            )
+
+        new_name = str(display_name or "").strip()
+        if not new_name:
+            return RoutineInstanceRenameResult(
+                False,
+                error_code="DISPLAY_NAME_REQUIRED",
+                error="루틴 이름을 입력하세요.",
+            )
+        if new_name == instance.display_name:
+            return RoutineInstanceRenameResult(True, instance=instance)
+        if any(
+            item.instance_id != instance.instance_id
+            and item.definition_id == instance.definition_id
+            and item.display_name.casefold() == new_name.casefold()
+            for item in self.list_instances(instance.definition_id)
+        ):
+            return RoutineInstanceRenameResult(
+                False,
+                error_code="DISPLAY_NAME_DUPLICATE",
+                error="같은 루틴 유형에 동일한 루틴 이름이 이미 있습니다.",
+            )
+
+        instance_dir = self.instances_root / instance.instance_id
+        metadata_path = instance_dir / "instance.json"
+        temp_path = instance_dir / f".instance.{uuid4().hex}.tmp"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise ValueError("instance.json must contain an object")
+            metadata["display_name"] = new_name
+            metadata["updated_at"] = self._now_factory().isoformat(timespec="seconds")
+            self._write_json_replace(temp_path, metadata)
+            os.replace(temp_path, metadata_path)
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if saved != metadata:
+                raise ValueError("instance.json 저장 후 검증이 일치하지 않습니다.")
+            renamed = self.get_instance(instance.instance_id)
+            if renamed is None or renamed.display_name != new_name:
+                raise RuntimeError("변경된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            return RoutineInstanceRenameResult(True, instance=renamed)
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            return RoutineInstanceRenameResult(
+                False,
+                error_code="INSTANCE_RENAME_FAILED",
+                error=str(exc),
+            )
+
+    def update_buy_limit(
+        self,
+        instance_id: str,
+        *,
+        enabled: bool,
+        amount: int | None = None,
+    ) -> RoutineInstanceBuyLimitResult:
+        instance = self.get_instance(instance_id)
+        if instance is None:
+            return RoutineInstanceBuyLimitResult(
+                False,
+                error_code="INSTANCE_UNKNOWN",
+                error="변경할 등록 루틴을 찾을 수 없습니다.",
+            )
+        if not isinstance(enabled, bool):
+            return RoutineInstanceBuyLimitResult(
+                False,
+                error_code="BUY_LIMIT_ENABLED_INVALID",
+                error="매수한도 활성 여부가 올바르지 않습니다.",
+            )
+        clean_amount = None
+        if enabled:
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+                return RoutineInstanceBuyLimitResult(
+                    False,
+                    error_code="BUY_LIMIT_INVALID",
+                    error="매수한도는 0보다 큰 원 단위 정수여야 합니다.",
+                )
+            clean_amount = amount
+
+        instance_dir = self.instances_root / instance.instance_id
+        metadata_path = instance_dir / "instance.json"
+        temp_path = instance_dir / f".instance.{uuid4().hex}.tmp"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise ValueError("instance.json must contain an object")
+            metadata["buy_limit_enabled"] = enabled
+            metadata["buy_limit_amount"] = clean_amount
+            metadata["updated_at"] = self._now_factory().isoformat(timespec="seconds")
+            self._write_json_replace(temp_path, metadata)
+            os.replace(temp_path, metadata_path)
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if saved != metadata:
+                raise ValueError("instance.json 저장 후 검증이 일치하지 않습니다.")
+            updated = self.get_instance(instance.instance_id)
+            if updated is None:
+                raise RuntimeError("변경된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            if (
+                updated.buy_limit_enabled != enabled
+                or updated.buy_limit_amount != clean_amount
+            ):
+                raise RuntimeError("변경된 매수한도 값이 재읽기 검증과 일치하지 않습니다.")
+            return RoutineInstanceBuyLimitResult(True, instance=updated)
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            return RoutineInstanceBuyLimitResult(
+                False,
+                error_code="INSTANCE_BUY_LIMIT_UPDATE_FAILED",
+                error=str(exc),
+            )
+
     @staticmethod
     def _write_json(path: Path, data: dict[str, Any]) -> None:
         with path.open("x", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _write_json_replace(path: Path, data: dict[str, Any]) -> None:
+        with path.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()

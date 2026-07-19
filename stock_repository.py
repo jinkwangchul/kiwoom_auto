@@ -92,6 +92,10 @@ class StockRecord:
     routine: str
     enabled: bool
     stock_path: str
+    assigned_routine_instance_id: str = ""
+    routine_instance_name: str = ""
+    routine_definition_id: str = ""
+    routine_type: str = ""
 
     def to_base_stock_dict(self) -> dict[str, Any]:
         routines = [self.routine] if self.routine else []
@@ -103,6 +107,10 @@ class StockRecord:
             "validation_status": "정상",
             "stock_path": self.stock_path,
             "enabled": self.enabled,
+            "assigned_routine_instance_id": self.assigned_routine_instance_id,
+            "routine_instance_name": self.routine_instance_name,
+            "routine_definition_id": self.routine_definition_id,
+            "routine_type": self.routine_type,
         }
 
 
@@ -155,6 +163,21 @@ class StockRepository:
                 return value
         return ""
 
+    def load_config_assignment(self, path: Path) -> dict[str, str]:
+        config = read_json_dict(path / "config.json")
+        return {
+            "assigned_routine_instance_id": str(
+                config.get("assigned_routine_instance_id", "") or ""
+            ).strip(),
+            "routine_instance_name": str(
+                config.get("routine_instance_name", "") or ""
+            ).strip(),
+            "routine_definition_id": str(
+                config.get("routine_definition_id", "") or ""
+            ).strip(),
+            "routine_type": str(config.get("routine_type", "") or "").strip(),
+        }
+
     def list_from_central_stocks(self) -> list[StockRecord]:
         records: list[StockRecord] = []
         for path in self.list_stock_dirs():
@@ -162,6 +185,7 @@ class StockRepository:
             if not is_valid_stock_code(code):
                 continue
             routine = self.load_config_routine(path)
+            assignment = self.load_config_assignment(path)
             records.append(
                 StockRecord(
                     code=code,
@@ -169,6 +193,7 @@ class StockRepository:
                     routine=routine,
                     enabled=True,
                     stock_path=str(path.relative_to(self.project_root)),
+                    **assignment,
                 )
             )
         return records
@@ -228,7 +253,53 @@ class StockRepository:
         config["assigned_routine"] = routine_name
         config["active_routine"] = routine_name
         config["routines"] = [routine_name] if routine_name else []
+        config["assigned_routine_instance_id"] = ""
+        config["routine_instance_name"] = ""
+        config["routine_definition_id"] = ""
+        config["routine_type"] = routine_name
 
+        config["updated_at"] = now_text()
+        write_json_dict(config_path, config)
+        return True
+
+    def update_stock_routine_instance(
+        self,
+        code: str,
+        name: str,
+        *,
+        instance_id: str,
+        instance_name: str,
+        definition_id: str,
+        routine_type: str,
+    ) -> bool:
+        clean_instance_id = str(instance_id or "").strip()
+        clean_instance_name = str(instance_name or "").strip()
+        clean_definition_id = str(definition_id or "").strip()
+        clean_routine_type = str(routine_type or "").strip()
+        if not all(
+            (
+                clean_instance_id,
+                clean_instance_name,
+                clean_definition_id,
+                clean_routine_type,
+            )
+        ):
+            return False
+
+        path = self.resolve_stock_dir(code, name)
+        if not path.exists():
+            return False
+        config_path = path / "config.json"
+        config = read_json_dict(config_path)
+        config["routine"] = clean_routine_type
+        config["routine_name"] = clean_routine_type
+        config["assigned_routine"] = clean_routine_type
+        config["active_routine"] = clean_routine_type
+        config["routines"] = [clean_routine_type]
+        config["assigned_routine_instance_id"] = clean_instance_id
+        config["routine_instance_name"] = clean_instance_name
+        config["routine_definition_id"] = clean_definition_id
+        config["routine_type"] = clean_routine_type
         config["updated_at"] = now_text()
         write_json_dict(config_path, config)
         return True

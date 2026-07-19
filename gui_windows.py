@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt5.QtCore import QEvent, QObject, QRect, Qt
-from PyQt5.QtGui import QBrush, QColor
+from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -61,8 +62,13 @@ from gui_main_table_loader import (
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
     ROUTINE_CHECKBOX_SIZE,
     ROUTINE_CHILD_CHECKBOX_OFFSET,
+    ROUTINE_CHILD_PROFIT_LED_ROLE,
     ROUTINE_INSTANCE_ID_ROLE,
+    ROUTINE_INSTANCE_NAME_WIDTH,
     ROUTINE_MONITORING_HEADERS,
+    ROUTINE_PARENT_AGGREGATE_ROLE,
+    ROUTINE_PARENT_COLLAPSED_ROLE,
+    ROUTINE_PARENT_NAME_ROLE,
     ROUTINE_COMPLETION_STATUSES,
     ROUTINE_ROW_CHILD,
     ROUTINE_ROW_KIND_ROLE,
@@ -70,6 +76,9 @@ from gui_main_table_loader import (
     ROUTINE_PARENT_CHECKBOX_OFFSET,
     ROUTINE_PARENT_EXPAND_OFFSET,
     ROUTINE_PARENT_EXPAND_WIDTH,
+    ROUTINE_PROFIT_LED_BOX_SIZE,
+    ROUTINE_PROFIT_LED_GAP,
+    ROUTINE_PROFIT_LED_SIZE,
     ROUTINE_STATUS_DEFAULT,
     ROUTINE_STATUS_EARLY_CLOSE,
     ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
@@ -93,6 +102,7 @@ from gui_auto_trade_setting_window import (
 )
 from gui_routine_registry import routine_record_by_name
 from routine_instance_registry import routine_definition_by_id, routine_instance_by_id
+from routine_instance_repository import RoutineInstanceRepository
 from gui_main_routine_selection import (
     routine_definition_enabled,
     routine_instance_checkbox_enabled,
@@ -116,6 +126,55 @@ from operation_command_service import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
+ROUTINE_INLINE_EDIT_STYLE = """
+QLineEdit {
+    border: none;
+    background: transparent;
+    padding: 0px;
+    margin: 0px;
+}
+QLineEdit:focus {
+    background: transparent;
+}
+"""
+
+
+def _routine_parent_font(base_font: QFont) -> QFont:
+    font = QFont(base_font)
+    if font.pointSizeF() > 0:
+        font.setPointSizeF(font.pointSizeF() + 1.0)
+    elif font.pixelSize() > 0:
+        font.setPixelSize(font.pixelSize() + 1)
+    return font
+
+
+def _apply_routine_inline_edit_style(editor: QLineEdit, table) -> None:
+    editor.setFrame(False)
+    editor.setStyleSheet(ROUTINE_INLINE_EDIT_STYLE)
+    editor.setFont(table.font())
+    editor.setContentsMargins(0, 0, 0, 0)
+
+
+def _create_routine_operation_confirmation(
+    parent: QWidget | None,
+    command: str,
+    icon: QMessageBox.Icon = QMessageBox.Question,
+) -> QMessageBox:
+    title, message = {
+        MODE_EARLY_CLOSE: ("조기마감", "조기마감을 적용합니다."),
+        COMMAND_IMMEDIATE_LIQUIDATION: ("즉시청산", "즉시청산을 적용합니다."),
+    }[command]
+    dialog = QMessageBox(
+        icon,
+        title,
+        message,
+        QMessageBox.Yes | QMessageBox.No,
+        parent,
+    )
+    dialog.setDefaultButton(QMessageBox.No)
+    dialog.button(QMessageBox.Yes).setText("진행")
+    dialog.button(QMessageBox.No).setText("취소")
+    return dialog
 
 
 class _RoutineCheckBoxController(QObject):
@@ -126,9 +185,70 @@ class _RoutineCheckBoxController(QObject):
         self.window = window
         self.table = window.routine_table
 
+    def _set_parent_name_hover(self, definition_id: str) -> None:
+        current = str(
+            getattr(self.table, "_hovered_routine_definition_id", "") or ""
+        )
+        if definition_id == current:
+            return
+        self.table._hovered_routine_definition_id = definition_id
+        self.table.viewport().update()
+
+    def _parent_name_rect(self, index) -> QRect:
+        cell_rect = self.table.visualRect(index)
+        name = str(index.data(ROUTINE_PARENT_NAME_ROLE) or "")
+        prefix = "▶ " if index.data(ROUTINE_PARENT_COLLAPSED_ROLE) else "▼ "
+        metrics = QFontMetrics(_routine_parent_font(self.table.font()))
+        text_left = (
+            cell_rect.left()
+            + ROUTINE_PARENT_CHECKBOX_OFFSET
+            + ROUTINE_CHECKBOX_SIZE
+            + 6
+        )
+        name_left = text_left + metrics.horizontalAdvance(prefix)
+        return QRect(
+            name_left,
+            cell_rect.top(),
+            metrics.horizontalAdvance(name),
+            cell_rect.height(),
+        )
+
+    def _child_name_rect(self, index) -> QRect:
+        cell_rect = self.table.visualRect(index)
+        name = str(index.data(Qt.DisplayRole) or "")
+        metrics = QFontMetrics(self.table.font())
+        name_left = (
+            cell_rect.left()
+            + ROUTINE_CHILD_CHECKBOX_OFFSET
+            + ROUTINE_CHECKBOX_SIZE
+            + ROUTINE_PROFIT_LED_GAP
+            + ROUTINE_PROFIT_LED_BOX_SIZE
+            + ROUTINE_PROFIT_LED_GAP
+        )
+        return QRect(
+            name_left,
+            cell_rect.top(),
+            metrics.horizontalAdvance(name),
+            cell_rect.height(),
+        )
+
     def eventFilter(self, watched, event):
-        if event.type() == QEvent.Leave:
-            self.window.clear_routine_parent_hover()
+        if event.type() == QEvent.MouseMove:
+            index = self.table.indexAt(event.pos())
+            definition_id = ""
+            if (
+                index.isValid()
+                and index.column() == 0
+                and str(index.data(ROUTINE_ROW_KIND_ROLE) or "") == ROUTINE_ROW_PARENT
+                and self._parent_name_rect(index).contains(event.pos())
+            ):
+                definition_id = str(
+                    index.data(ROUTINE_DEFINITION_ID_ROLE) or ""
+                ).strip()
+            self._set_parent_name_hover(definition_id)
+        elif event.type() == QEvent.Leave:
+            self._set_parent_name_hover("")
+
         if event.type() in {
             QEvent.MouseButtonPress,
             QEvent.MouseButtonRelease,
@@ -177,11 +297,94 @@ class _RoutineCheckBoxController(QObject):
                         self.window.toggle_routine_expansion(index.row())
                     event.accept()
                     return True
+                if (
+                    event.type() == QEvent.MouseButtonDblClick
+                    and event.button() == Qt.LeftButton
+                ):
+                    if row_kind == ROUTINE_ROW_PARENT:
+                        self.window.open_routine_settings_from_main_table(
+                            self.table.item(index.row(), 0)
+                        )
+                    elif (
+                        row_kind == ROUTINE_ROW_CHILD
+                        and self._child_name_rect(index).contains(event.pos())
+                    ):
+                        self.window.start_routine_instance_name_edit(index.row())
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.MouseButtonDblClick:
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+
+class _RoutineInstanceNameEdit(QLineEdit):
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window.routine_table.viewport())
+        self.window = window
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.window.finish_routine_instance_name_edit(save=True)
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.window.finish_routine_instance_name_edit(save=False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        self.window.finish_routine_instance_name_edit(save=True)
+        super().focusOutEvent(event)
+
+
+class _RoutineBuyLimitValueEditFilter(QObject):
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window)
+        self.window = window
+
+    def eventFilter(self, watched, event):
+        object_name = watched.objectName()
+        if (
+            object_name == "routineInstanceBuyLimitAmount"
+            and event.type() == QEvent.MouseButtonDblClick
+            and event.button() == Qt.LeftButton
+        ):
+            self.window.handle_routine_instance_buy_limit_double_click(watched)
+            event.accept()
+            return True
+        if object_name == "routineInstanceBuyLimitEditor":
+            if event.type() == QEvent.KeyPress:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    self.window.finish_routine_instance_buy_limit_edit(save=True)
+                    event.accept()
+                    return True
+                if event.key() == Qt.Key_Escape:
+                    self.window.finish_routine_instance_buy_limit_edit(save=False)
+                    event.accept()
+                    return True
+            if event.type() == QEvent.FocusOut:
+                self.window.finish_routine_instance_buy_limit_edit(save=True)
         return super().eventFilter(watched, event)
 
 
 class _RoutineTreeItemDelegate(QStyledItemDelegate):
     """Paint the first-column hierarchy without text-based indentation."""
+
+    def display_text(self, index, widget) -> str:
+        display_text = str(index.data(Qt.DisplayRole) or "")
+        if str(index.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
+            return display_text
+        definition_id = str(index.data(ROUTINE_DEFINITION_ID_ROLE) or "")
+        aggregate = str(index.data(ROUTINE_PARENT_AGGREGATE_ROLE) or "")
+        collapsed = bool(index.data(ROUTINE_PARENT_COLLAPSED_ROLE))
+        hovered = str(
+            getattr(widget, "_hovered_routine_definition_id", "") or ""
+        )
+        if aggregate and (collapsed or definition_id == hovered):
+            return f"{display_text}    {aggregate}"
+        return display_text
 
     def paint(self, painter, option, index):
         base_option = QStyleOptionViewItem(option)
@@ -221,8 +424,49 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         )
         painter.restore()
 
+        text_left_offset = checkbox_offset + ROUTINE_CHECKBOX_SIZE + 6
+        if row_kind == ROUTINE_ROW_CHILD:
+            led_state = str(index.data(ROUTINE_CHILD_PROFIT_LED_ROLE) or "gray")
+            led_color = {
+                "red": "#DC2626",
+                "yellow": "#D97706",
+                "green": "#16A34A",
+                "gray": "#9CA3AF",
+            }.get(led_state, "#9CA3AF")
+            led_box_left = (
+                option.rect.left()
+                + checkbox_offset
+                + ROUTINE_CHECKBOX_SIZE
+                + ROUTINE_PROFIT_LED_GAP
+            )
+            led_box_top = (
+                option.rect.top()
+                + (option.rect.height() - ROUTINE_PROFIT_LED_BOX_SIZE) // 2
+            )
+            led_rect = QRect(
+                led_box_left + (ROUTINE_PROFIT_LED_BOX_SIZE - ROUTINE_PROFIT_LED_SIZE) // 2,
+                led_box_top + (ROUTINE_PROFIT_LED_BOX_SIZE - ROUTINE_PROFIT_LED_SIZE) // 2,
+                ROUTINE_PROFIT_LED_SIZE,
+                ROUTINE_PROFIT_LED_SIZE,
+            )
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            if not visually_enabled:
+                painter.setOpacity(0.45)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(led_color))
+            painter.drawEllipse(led_rect)
+            painter.restore()
+            text_left_offset = (
+                checkbox_offset
+                + ROUTINE_CHECKBOX_SIZE
+                + ROUTINE_PROFIT_LED_GAP
+                + ROUTINE_PROFIT_LED_BOX_SIZE
+                + ROUTINE_PROFIT_LED_GAP
+            )
+
         text_rect = option.rect.adjusted(
-            checkbox_offset + ROUTINE_CHECKBOX_SIZE + 6,
+            text_left_offset,
             0,
             -4,
             0,
@@ -238,12 +482,48 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                 painter.setPen(foreground.color())
             else:
                 painter.setPen(option.palette.text().color())
-        painter.setFont(option.font)
-        painter.drawText(
-            text_rect,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            str(index.data(Qt.DisplayRole) or ""),
-        )
+        if row_kind == ROUTINE_ROW_PARENT:
+            parent_text = str(index.data(Qt.DisplayRole) or "")
+            parent_font = _routine_parent_font(option.font)
+            painter.setFont(parent_font)
+            painter.drawText(
+                text_rect,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                parent_text,
+            )
+            display_text = self.display_text(index, option.widget)
+            if display_text != parent_text:
+                aggregate = display_text[len(parent_text) :].lstrip()
+                aggregate_left = (
+                    text_rect.left()
+                    + QFontMetrics(parent_font).horizontalAdvance(parent_text)
+                    + 16
+                )
+                aggregate_rect = QRect(
+                    aggregate_left,
+                    text_rect.top(),
+                    max(0, text_rect.right() - aggregate_left),
+                    text_rect.height(),
+                )
+                painter.setFont(option.font)
+                painter.drawText(
+                    aggregate_rect,
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    aggregate,
+                )
+        else:
+            painter.setFont(option.font)
+            child_text = self.display_text(index, option.widget)
+            child_text = painter.fontMetrics().elidedText(
+                child_text,
+                Qt.ElideRight,
+                text_rect.width(),
+            )
+            painter.drawText(
+                text_rect,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                child_text,
+            )
         painter.restore()
 
 
@@ -319,8 +599,18 @@ class MainWindow(QMainWindow):
         self._routine_instance_selection: dict[str, bool] = {}
         self._routine_instance_ids_by_definition: dict[str, tuple[str, ...]] = {}
         self._routine_definition_by_instance: dict[str, str] = {}
+        self._routine_assigned_stock_count_by_instance: dict[str, int] = {}
         self._routine_operation_status_by_instance: dict[str, str] = {}
-        self._hovered_routine_definition_id = ""
+        self._routine_instance_name_editor = None
+        self._routine_instance_name_editor_instance_id = ""
+        self._routine_instance_name_editor_original = ""
+        self._routine_instance_name_editor_item = None
+        self._routine_instance_name_edit_finishing = False
+        self._routine_buy_limit_edit_filter = _RoutineBuyLimitValueEditFilter(self)
+        self._routine_instance_buy_limit_editor = None
+        self._routine_instance_buy_limit_editor_instance_id = ""
+        self._routine_instance_buy_limit_editor_label = None
+        self._routine_instance_buy_limit_edit_finishing = False
         self._main_running_sort_column = -1
         self._main_running_sort_order = Qt.AscendingOrder
         self._startup_recovery_result: dict[str, object] = {}
@@ -470,7 +760,8 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout()
         layout.setSpacing(8)
 
-        routine_box = QWidget()
+        routine_box = QGroupBox("등록된 자동매매 루틴")
+        routine_box.setMinimumWidth(860)
         routine_layout = QVBoxLayout()
         routine_layout.setContentsMargins(8, 6, 8, 8)
         self._setup_routine_table()
@@ -484,8 +775,8 @@ class MainWindow(QMainWindow):
         running_layout.addWidget(self.running_stock_table)
         running_box.setLayout(running_layout)
 
-        layout.addWidget(routine_box, 2)
-        layout.addWidget(running_box, 3)
+        layout.addWidget(routine_box, 4)
+        layout.addWidget(running_box, 1)
 
         return layout
 
@@ -519,30 +810,30 @@ class MainWindow(QMainWindow):
         self.routine_table.setColumnCount(len(headers))
         self.routine_table.setHorizontalHeaderLabels(headers)
 
-        self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.routine_table.horizontalHeader().setStretchLastSection(True)
-        
-        self.routine_table.setColumnWidth(0, 180)
-        self.routine_table.setColumnWidth(1, 90)
-        self.routine_table.setColumnWidth(2, 70)
-        self.routine_table.setColumnWidth(3, 70)
-        self.routine_table.setColumnWidth(4, 70)
-        self.routine_table.setColumnWidth(5, 70)
-        self.routine_table.setColumnWidth(6, 135)
-        self.routine_table.setColumnWidth(7, 135)
-        self.routine_table.setColumnWidth(8, 85)
-        self.routine_table.setColumnWidth(9, 100)
+        routine_header = self.routine_table.horizontalHeader()
+        routine_header.setMinimumSectionSize(0)
+        routine_header.setSectionResizeMode(QHeaderView.Fixed)
+        routine_header.setStretchLastSection(False)
 
-        self.routine_table.horizontalHeader().setSectionsClickable(True)
-        self.routine_table.horizontalHeader().setSortIndicatorShown(True)
+        self.routine_table.setColumnWidth(0, ROUTINE_INSTANCE_NAME_WIDTH)
+        for column in range(1, len(headers) - 1):
+            self.routine_table.setColumnWidth(column, 0)
+        routine_header.setSectionResizeMode(len(headers) - 1, QHeaderView.Stretch)
+        self.routine_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        routine_header.setSectionsClickable(True)
+        routine_header.setSortIndicatorShown(True)
         self.routine_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.routine_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.routine_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.routine_table.verticalHeader().setDefaultSectionSize(24)
         self.routine_table.verticalHeader().setVisible(False)
+        self.routine_table.horizontalHeader().setVisible(False)
         self.routine_table.setAlternatingRowColors(True)
         self.routine_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.routine_table.setMouseTracking(True)
+        self.routine_table.viewport().setMouseTracking(True)
+        self.routine_table._hovered_routine_definition_id = ""
         self._routine_tree_item_delegate = _RoutineTreeItemDelegate(self.routine_table)
         self.routine_table.setItemDelegateForColumn(0, self._routine_tree_item_delegate)
 
@@ -694,9 +985,7 @@ class MainWindow(QMainWindow):
         self.btn_log_view.clicked.connect(self.not_implemented)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
-        self.routine_table.itemDoubleClicked.connect(self.open_routine_settings_from_main_table)
         self.routine_table.itemChanged.connect(self.on_routine_check_item_changed)
-        self.routine_table.cellEntered.connect(self.on_routine_cell_entered)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
         self._routine_checkbox_controller = _RoutineCheckBoxController(self)
         self.routine_table.viewport().installEventFilter(self._routine_checkbox_controller)
@@ -971,6 +1260,7 @@ class MainWindow(QMainWindow):
 
     def load_routine_table(self) -> None:
         main_load_routine_table(self)
+        self._install_routine_buy_limit_edit_filters()
 
     def load_running_stock_table(self) -> None:
         main_load_running_stock_table(self)
@@ -1125,6 +1415,7 @@ class MainWindow(QMainWindow):
             definition_id=definition.definition_id,
             definition_display_name=definition.display_name,
             instance_id=instance.instance_id if instance is not None else "",
+            settings_mode="edit" if instance is not None else "registration",
         )
         dialog.exec_()
 
@@ -1216,55 +1507,319 @@ class MainWindow(QMainWindow):
     def selected_routine_instance_ids(self) -> tuple[str, ...]:
         return selected_routine_instance_ids(self)
 
-    def on_routine_cell_entered(self, row: int, _column: int) -> None:
-        first_item = self.routine_table.item(row, 0)
-        definition_id = ""
-        if (
-            first_item is not None
-            and str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "") == ROUTINE_ROW_PARENT
-        ):
-            definition_id = str(
-                first_item.data(ROUTINE_DEFINITION_ID_ROLE) or ""
-            ).strip()
-        if definition_id != self._hovered_routine_definition_id:
-            self._hovered_routine_definition_id = definition_id
-            self.load_routine_table()
+    def start_routine_instance_name_edit(self, row: int) -> None:
+        item = self.routine_table.item(row, 0)
+        if item is None:
+            return
+        if str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
+            return
+        instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+        if not instance_id:
+            return
 
-    def clear_routine_parent_hover(self) -> None:
-        if self._hovered_routine_definition_id:
-            self._hovered_routine_definition_id = ""
-            self.load_routine_table()
+        self.finish_routine_instance_name_edit(save=True)
+        index = self.routine_table.model().index(row, 0)
+        name_rect = self._routine_checkbox_controller._child_name_rect(index)
+        cell_rect = self.routine_table.visualRect(index)
+        max_width = max(80, cell_rect.right() - name_rect.left() - 4)
+        editor_width = min(max_width, max(name_rect.width() + 24, 96))
+        editor_rect = QRect(
+            name_rect.left(),
+            cell_rect.top() + 2,
+            editor_width,
+            max(20, cell_rect.height() - 4),
+        )
+
+        editor = _RoutineInstanceNameEdit(self)
+        editor.setObjectName("routineInstanceNameEditor")
+        _apply_routine_inline_edit_style(editor, self.routine_table)
+        editor.setText(item.text())
+        editor.setGeometry(editor_rect)
+        editor.selectAll()
+        editor.show()
+        editor.setFocus(Qt.MouseFocusReason)
+
+        self._routine_instance_name_editor = editor
+        self._routine_instance_name_editor_instance_id = instance_id
+        self._routine_instance_name_editor_original = item.text()
+        self._routine_instance_name_editor_item = item
+        item.setText("")
+
+    def finish_routine_instance_name_edit(self, *, save: bool) -> None:
+        editor = self._routine_instance_name_editor
+        if editor is None or self._routine_instance_name_edit_finishing:
+            return
+        self._routine_instance_name_edit_finishing = True
+        instance_id = self._routine_instance_name_editor_instance_id
+        original_name = self._routine_instance_name_editor_original
+        original_item = self._routine_instance_name_editor_item
+        new_name = editor.text().strip()
+
+        self._routine_instance_name_editor = None
+        self._routine_instance_name_editor_instance_id = ""
+        self._routine_instance_name_editor_original = ""
+        self._routine_instance_name_editor_item = None
+        editor.hide()
+        editor.deleteLater()
+        self._routine_instance_name_edit_finishing = False
+
+        if not save or not new_name or new_name == original_name:
+            if original_item is not None:
+                original_item.setText(original_name)
+            return
+
+        result = RoutineInstanceRepository(PROJECT_ROOT).rename_instance(
+            instance_id,
+            new_name,
+        )
+        if not result.success:
+            if original_item is not None:
+                original_item.setText(original_name)
+            QMessageBox.warning(
+                self,
+                "루틴 이름 변경",
+                result.error or "등록 루틴 이름을 변경하지 못했습니다.",
+            )
+            return
+
+        self.refresh_all()
+
+    def _install_routine_buy_limit_edit_filters(self) -> None:
+        for row in range(self.routine_table.rowCount()):
+            status_widget = self.routine_table.cellWidget(row, 1)
+            if status_widget is None:
+                continue
+            for object_name in (
+                "routineInstanceBuyLimitAmount",
+                "routineInstanceBuyLimitEditor",
+            ):
+                child = status_widget.findChild(QWidget, object_name)
+                if child is not None:
+                    child.installEventFilter(self._routine_buy_limit_edit_filter)
+
+    def _routine_row_for_child_widget(self, widget: QWidget) -> int:
+        position = widget.mapTo(
+            self.routine_table.viewport(),
+            widget.rect().center(),
+        )
+        index = self.routine_table.indexAt(position)
+        return index.row() if index.isValid() else -1
+
+    @staticmethod
+    def _parse_buy_limit_amount(text: str) -> int | None:
+        normalized = str(text or "").replace(",", "").strip()
+        if not normalized or not normalized.isdigit():
+            return None
+        try:
+            amount = int(normalized)
+        except ValueError:
+            return None
+        return amount if amount > 0 else None
+
+    def handle_routine_instance_buy_limit_double_click(self, amount_label: QLabel) -> None:
+        instance_id = str(amount_label.property("routine_instance_id") or "").strip()
+        if not instance_id:
+            row = self._routine_row_for_child_widget(amount_label)
+            if row < 0:
+                return
+            item = self.routine_table.item(row, 0)
+            if item is None:
+                return
+            if str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
+                return
+            instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+            if not instance_id:
+                return
+        instance = routine_instance_by_id(instance_id)
+        if instance is None:
+            return
+
+        self.finish_routine_instance_buy_limit_edit(save=True)
+        if instance.buy_limit_enabled:
+            result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
+                instance_id,
+                enabled=False,
+            )
+            if not result.success:
+                QMessageBox.warning(
+                    self,
+                    "매수한도 변경",
+                    result.error or "매수한도를 변경하지 못했습니다.",
+                )
+                return
+            amount_label.setText("미사용")
+            self.refresh_all()
+            return
+
+        value_slot = amount_label.parentWidget()
+        editor = (
+            value_slot.findChild(QLineEdit, "routineInstanceBuyLimitEditor")
+            if value_slot is not None
+            else None
+        )
+        value_stack = value_slot.layout() if value_slot is not None else None
+        if editor is None or value_stack is None:
+            return
+
+        _apply_routine_inline_edit_style(editor, self.routine_table)
+        editor.setText("")
+        editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        editor.selectAll()
+        if hasattr(value_stack, "setCurrentWidget"):
+            value_stack.setCurrentWidget(editor)
+        amount_label.hide()
+        editor.show()
+        editor.setFocus(Qt.MouseFocusReason)
+
+        self._routine_instance_buy_limit_editor = editor
+        self._routine_instance_buy_limit_editor_instance_id = instance_id
+        self._routine_instance_buy_limit_editor_label = amount_label
+
+    def finish_routine_instance_buy_limit_edit(self, *, save: bool) -> None:
+        editor = self._routine_instance_buy_limit_editor
+        if editor is None or self._routine_instance_buy_limit_edit_finishing:
+            return
+        self._routine_instance_buy_limit_edit_finishing = True
+        instance_id = self._routine_instance_buy_limit_editor_instance_id
+        amount_label = self._routine_instance_buy_limit_editor_label
+        amount = self._parse_buy_limit_amount(editor.text()) if save else None
+
+        self._routine_instance_buy_limit_editor = None
+        self._routine_instance_buy_limit_editor_instance_id = ""
+        self._routine_instance_buy_limit_editor_label = None
+
+        value_slot = editor.parentWidget()
+        value_stack = value_slot.layout() if value_slot is not None else None
+        editor.hide()
+        if amount_label is not None:
+            amount_label.show()
+            if hasattr(value_stack, "setCurrentWidget"):
+                value_stack.setCurrentWidget(amount_label)
+        self._routine_instance_buy_limit_edit_finishing = False
+
+        result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
+            instance_id,
+            enabled=amount is not None,
+            amount=amount,
+        )
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "매수한도 변경",
+                result.error or "매수한도를 변경하지 못했습니다.",
+            )
+            return
+        self.refresh_all()
+
+    def _routine_instance_has_assigned_stocks(self, instance_id: str) -> bool:
+        return int(
+            self._routine_assigned_stock_count_by_instance.get(instance_id, 0) or 0
+        ) > 0
+
+    @staticmethod
+    def _set_routine_operation_actions_enabled(actions, enabled: bool) -> None:
+        unavailable_reason = "등록된 종목이 없어 실행할 수 없습니다."
+        for action in actions:
+            action.setEnabled(enabled)
+            action.setStatusTip("" if enabled else unavailable_reason)
+            action.setToolTip("" if enabled else unavailable_reason)
 
     def open_routine_context_menu(self, position) -> None:
         item = self.routine_table.itemAt(position)
         if item is None:
             return
         first_item = self.routine_table.item(item.row(), 0)
-        if first_item is None or str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
+        if first_item is None:
             return
-        definition_id = str(first_item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-        if not definition_id:
+        row_kind = str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "")
+        if row_kind == ROUTINE_ROW_PARENT:
+            index = self.routine_table.model().index(item.row(), 0)
+            if not self._routine_checkbox_controller._parent_name_rect(index).contains(
+                position
+            ):
+                return
+            definition_id = str(
+                first_item.data(ROUTINE_DEFINITION_ID_ROLE) or ""
+            ).strip()
+            definition = routine_definition_by_id(definition_id)
+            if definition is None:
+                QMessageBox.warning(
+                    self,
+                    "루틴 운영",
+                    "선택한 루틴 카테고리를 확인할 수 없습니다.",
+                )
+                return
+            menu = QMenu(self.routine_table)
+            menu.setToolTipsVisible(True)
+            early_close_action = menu.addAction("조기마감")
+            immediate_action = menu.addAction("즉시청산")
+            has_valid_target = any(
+                routine_instance_checked(self, instance_id)
+                and self._routine_instance_has_assigned_stocks(instance_id)
+                for instance_id in self._routine_instance_ids_by_definition.get(
+                    definition_id,
+                    (),
+                )
+            )
+            self._set_routine_operation_actions_enabled(
+                (early_close_action, immediate_action),
+                has_valid_target,
+            )
+            early_close_action.triggered.connect(
+                lambda _checked=False: self.request_routine_definition_operation(
+                    definition_id,
+                    definition.display_name,
+                    MODE_EARLY_CLOSE,
+                    ROUTINE_STATUS_EARLY_CLOSE,
+                )
+            )
+            immediate_action.triggered.connect(
+                lambda _checked=False: self.request_routine_definition_operation(
+                    definition_id,
+                    definition.display_name,
+                    COMMAND_IMMEDIATE_LIQUIDATION,
+                    ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
+                )
+            )
+            menu.exec_(self.routine_table.viewport().mapToGlobal(position))
             return
-        definition = routine_definition_by_id(definition_id)
-        if definition is None:
-            QMessageBox.warning(self, "루틴 운영", "선택한 루틴 유형을 확인할 수 없습니다.")
+        if row_kind != ROUTINE_ROW_CHILD:
+            return
+        instance_id = str(first_item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+        if not instance_id:
+            return
+        instance = routine_instance_by_id(instance_id)
+        if instance is None:
+            QMessageBox.warning(self, "루틴 운영", "선택한 등록 루틴을 확인할 수 없습니다.")
             return
 
         menu = QMenu(self.routine_table)
+        menu.setToolTipsVisible(True)
+        settings_action = menu.addAction("설정변경")
+        menu.addSeparator()
         early_close_action = menu.addAction("조기마감")
         immediate_action = menu.addAction("즉시청산")
+        settings_action.triggered.connect(
+            lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
+                item
+            )
+        )
+        self._set_routine_operation_actions_enabled(
+            (early_close_action, immediate_action),
+            self._routine_instance_has_assigned_stocks(instance_id),
+        )
         early_close_action.triggered.connect(
-            lambda _checked=False: self.request_routine_definition_operation(
-                definition_id,
-                definition.display_name,
+            lambda _checked=False: self.request_routine_operation(
+                instance_id,
+                instance.display_name,
                 MODE_EARLY_CLOSE,
                 ROUTINE_STATUS_EARLY_CLOSE,
             )
         )
         immediate_action.triggered.connect(
-            lambda _checked=False: self.request_routine_definition_operation(
-                definition_id,
-                definition.display_name,
+            lambda _checked=False: self.request_routine_operation(
+                instance_id,
+                instance.display_name,
                 COMMAND_IMMEDIATE_LIQUIDATION,
                 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
             )
@@ -1279,7 +1834,12 @@ class MainWindow(QMainWindow):
         display_status: str,
     ) -> None:
         instance_ids = tuple(
-            sorted(self._routine_instance_ids_by_definition.get(definition_id, ()))
+            instance_id
+            for instance_id in sorted(
+                self._routine_instance_ids_by_definition.get(definition_id, ())
+            )
+            if routine_instance_checked(self, instance_id)
+            and self._routine_instance_has_assigned_stocks(instance_id)
         )
         command_label = (
             ROUTINE_STATUS_EARLY_CLOSE
@@ -1289,23 +1849,28 @@ class MainWindow(QMainWindow):
         if not instance_ids:
             QMessageBox.warning(
                 self,
-                f"루틴 {command_label} 불가",
-                "등록된 하위 루틴 인스턴스가 없습니다.",
+                f"카테고리 {command_label} 불가",
+                "체크된 하위 루틴 인스턴스가 없습니다.",
             )
             return
-        answer = QMessageBox.question(
-            self,
-            f"루틴 {command_label}",
-            f"'{display_name}'의 등록 인스턴스 전체에 {command_label} 명령을 적용하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
+
+        if command == COMMAND_IMMEDIATE_LIQUIDATION:
+            answer = _create_routine_operation_confirmation(
+                self,
+                command,
+                QMessageBox.Warning,
+            ).exec_()
+        else:
+            answer = _create_routine_operation_confirmation(self, command).exec_()
         if answer != QMessageBox.Yes:
-            self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
+            self.statusBar().showMessage(
+                f"카테고리 {command_label} 취소: {display_name}"
+            )
             return
 
         service = OperationCommandService(PROJECT_ROOT)
         applied_count = 0
+        partial_count = 0
         failed_count = 0
         for instance_id in instance_ids:
             result = service.apply(
@@ -1313,25 +1878,32 @@ class MainWindow(QMainWindow):
                     target_scope=SCOPE_ROUTINE_INSTANCE,
                     target_id=instance_id,
                     command=command,
-                    source="main_routine_context_menu",
+                    source="main_routine_parent_context_menu",
                 )
             )
             if result.status == RESULT_FAILED or not result.stock_results:
                 failed_count += 1
                 continue
             self._routine_operation_status_by_instance[instance_id] = display_status
-            applied_count += 1
+            if result.status == RESULT_PARTIAL_SUCCESS:
+                partial_count += 1
+            else:
+                applied_count += 1
 
         self.load_routine_table()
         self.update_review_required_button_text()
-        if failed_count:
+        if partial_count or failed_count:
             QMessageBox.warning(
                 self,
-                f"루틴 {command_label} 일부 적용" if applied_count else f"루틴 {command_label} 실패",
-                f"적용 {applied_count}개 / 실패 {failed_count}개입니다. 검토관리 상태를 확인하세요.",
+                f"카테고리 {command_label} 일부 적용"
+                if applied_count or partial_count
+                else f"카테고리 {command_label} 실패",
+                f"성공 {applied_count}개 / 일부 적용 {partial_count}개 / "
+                f"실패 {failed_count}개입니다. 검토관리 상태를 확인하세요.",
             )
         self.statusBar().showMessage(
-            f"루틴 {command_label}: {display_name} / 적용 {applied_count} / 실패 {failed_count}"
+            f"카테고리 {command_label}: {display_name} / 성공 {applied_count} / "
+            f"일부 적용 {partial_count} / 실패 {failed_count}"
         )
 
     def request_routine_operation(
@@ -1346,13 +1918,10 @@ class MainWindow(QMainWindow):
             if command == MODE_EARLY_CLOSE
             else ROUTINE_STATUS_IMMEDIATE_LIQUIDATION
         )
-        answer = QMessageBox.question(
-            self,
-            f"루틴 {command_label}",
-            f"'{display_name}' 루틴에 {command_label} 명령을 적용하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
+        if command == COMMAND_IMMEDIATE_LIQUIDATION:
+            answer = _create_routine_operation_confirmation(self, command).exec_()
+        else:
+            answer = _create_routine_operation_confirmation(self, command).exec_()
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
             return

@@ -60,6 +60,12 @@ from gui_routine_policy import (
     can_unassign_active_routine_from_stock,
 )
 from gui_routine_service import ensure_single_real_trade_routine_for_stock
+from gui_base_stock_service import update_base_stock_routine_instance
+from routine_instance_registry import (
+    load_persisted_routine_instances,
+    routine_definition_by_id,
+    routine_instance_by_id,
+)
 from stock_repository import repository as stock_repository_factory
 from runtime_io import read_json_dict
 from state_policy import (
@@ -77,13 +83,16 @@ from gui_auto_trade_setting_window import (
     PROJECT_ROOT,
     append_changelog,
     append_stock_log,
-    get_routine_dirs,
     now_text,
     parse_stock_folder_name,
     read_base_stocks,
-    routine_display_name,
     update_base_stock_routines,
 )
+
+
+ROUTINE_ASSIGN_INSTANCE_ID_ROLE = Qt.UserRole + 401
+
+
 def active_stock_register_status_display(code: str, name: str, current_routine: str) -> str:
     """루틴지정창 좌측 목록의 운영상태 표시값을 중앙 stocks 기준으로 반환한다."""
     routine_name = str(current_routine or "").strip()
@@ -607,26 +616,35 @@ class RoutineAssignWindow(QDialog):
         self.sync_routine_with_checked_stocks()
 
     def load_routine_table(self) -> None:
-        routine_dirs = get_routine_dirs()
+        instances = [
+            instance
+            for instance in load_persisted_routine_instances()
+            if routine_definition_by_id(instance.definition_id) is not None
+        ]
 
         self._updating_routine_checks = True
         self.routine_table.blockSignals(True)
         try:
             self.routine_table.setColumnCount(2)
             self.routine_table.setHorizontalHeaderLabels(["선택", "루틴명"])
-            self.routine_table.setRowCount(len(routine_dirs))
+            self.routine_table.setRowCount(len(instances))
 
-            for row, routine_dir in enumerate(routine_dirs):
-                display_name = routine_display_name(routine_dir)
+            for row, instance in enumerate(instances):
+                definition = routine_definition_by_id(instance.definition_id)
+                if definition is None:
+                    continue
 
                 check_item = QTableWidgetItem("")
                 check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 check_item.setCheckState(Qt.Unchecked)
                 check_item.setTextAlignment(Qt.AlignCenter)
+                check_item.setData(ROUTINE_ASSIGN_INSTANCE_ID_ROLE, instance.instance_id)
                 self.routine_table.setItem(row, 0, check_item)
 
-                name_item = QTableWidgetItem(display_name)
+                name_item = QTableWidgetItem(instance.display_name)
                 name_item.setTextAlignment(Qt.AlignCenter)
+                name_item.setData(ROUTINE_ASSIGN_INSTANCE_ID_ROLE, instance.instance_id)
+                name_item.setToolTip(f"루틴 유형: {definition.display_name}")
                 self.routine_table.setItem(row, 1, name_item)
 
             apply_plain_table_header(self.routine_table)
@@ -700,16 +718,18 @@ class RoutineAssignWindow(QDialog):
             self.routine_table.blockSignals(False)
             self._updating_routine_checks = False
 
-    def set_checked_routine_by_name(self, routine_name: str) -> None:
+    def set_checked_routine_by_id(self, instance_id: str) -> None:
         self._updating_routine_checks = True
         self.routine_table.blockSignals(True)
         try:
             for row in range(self.routine_table.rowCount()):
                 check_item = self.routine_table.item(row, 0)
-                name_item = self.routine_table.item(row, 1)
-                if check_item is None or name_item is None:
+                if check_item is None:
                     continue
-                checked = name_item.text().strip() == routine_name
+                checked = (
+                    str(check_item.data(ROUTINE_ASSIGN_INSTANCE_ID_ROLE) or "").strip()
+                    == str(instance_id or "").strip()
+                )
                 check_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
                 if checked:
                     self.routine_table.selectRow(row)
@@ -867,31 +887,37 @@ class RoutineAssignWindow(QDialog):
         self.load_selected_routine_stocks()
 
     def on_routine_item_clicked(self, item: QTableWidgetItem) -> None:
-        row = item.row()
-        name_item = self.routine_table.item(row, 1)
-        if name_item is None:
+        instance_id = str(
+            item.data(ROUTINE_ASSIGN_INSTANCE_ID_ROLE) or ""
+        ).strip()
+        if not instance_id:
             return
-        self.set_checked_routine_by_name(name_item.text().strip())
+        self.set_checked_routine_by_id(instance_id)
 
-    def checked_routines(self) -> list[tuple[str, Path]]:
-        routines: list[tuple[str, Path]] = []
-        routine_dir_by_name = {routine_display_name(path): path for path in get_routine_dirs()}
+    def checked_routines(self) -> list[tuple[object, object]]:
+        routines: list[tuple[object, object]] = []
 
         for row in range(self.routine_table.rowCount()):
             check_item = self.routine_table.item(row, 0)
-            routine_item = self.routine_table.item(row, 1)
-            if check_item is None or routine_item is None:
+            if check_item is None:
                 continue
 
             if check_item.checkState() == Qt.Checked:
-                routine_name = routine_item.text().strip()
-                routine_dir = routine_dir_by_name.get(routine_name)
-                if routine_dir is not None:
-                    routines.append((routine_name, routine_dir))
+                instance_id = str(
+                    check_item.data(ROUTINE_ASSIGN_INSTANCE_ID_ROLE) or ""
+                ).strip()
+                instance = routine_instance_by_id(instance_id)
+                definition = (
+                    routine_definition_by_id(instance.definition_id)
+                    if instance is not None
+                    else None
+                )
+                if instance is not None and definition is not None:
+                    routines.append((instance, definition))
 
         return routines
 
-    def selected_routine_for_detail(self) -> tuple[str, Path] | None:
+    def selected_routine_for_detail(self) -> tuple[object, object] | None:
         selected_rows = self.routine_table.selectionModel().selectedRows()
         row: int | None = selected_rows[0].row() if len(selected_rows) == 1 else None
 
@@ -905,17 +931,23 @@ class RoutineAssignWindow(QDialog):
         if row is None:
             return None
 
-        routine_item = self.routine_table.item(row, 1)
+        routine_item = self.routine_table.item(row, 0)
         if routine_item is None:
             return None
 
-        routine_name = routine_item.text().strip()
-        routine_dir_by_name = {routine_display_name(path): path for path in get_routine_dirs()}
-        routine_dir = routine_dir_by_name.get(routine_name)
-        if routine_dir is None:
+        instance_id = str(
+            routine_item.data(ROUTINE_ASSIGN_INSTANCE_ID_ROLE) or ""
+        ).strip()
+        instance = routine_instance_by_id(instance_id)
+        definition = (
+            routine_definition_by_id(instance.definition_id)
+            if instance is not None
+            else None
+        )
+        if instance is None or definition is None:
             return None
 
-        return routine_name, routine_dir
+        return instance, definition
 
     def assigned_stock_name_display(self, name: str) -> str:
         """선택 루틴 연결 종목 표의 종목명은 최대 12자까지만 표시한다."""
@@ -934,14 +966,16 @@ class RoutineAssignWindow(QDialog):
             self.btn_unassign.setEnabled(False)
             return
 
-        routine_name, routine_dir = selected_routine
+        instance, definition = selected_routine
+        routine_dir = definition.package_dir
         stocks = read_base_stocks()
         assigned = []
 
         for stock in stocks:
-            routines = stock.get("routines", [])
-            routine_list = [str(item).strip() for item in routines] if isinstance(routines, list) else []
-            if routine_name in routine_list:
+            assigned_instance_id = str(
+                stock.get("assigned_routine_instance_id", "") or ""
+            ).strip()
+            if assigned_instance_id == instance.instance_id:
                 assigned.append(stock)
 
         self.assigned_stock_table.setRowCount(len(assigned))
@@ -1189,8 +1223,9 @@ class RoutineAssignWindow(QDialog):
             self.show_status("지정할 루틴은 1개만 선택하세요.")
             return
 
-        selected_routine_name, selected_routine_dir = selected_routines[0]
-        selected_routine_names = [selected_routine_name]
+        selected_instance, selected_definition = selected_routines[0]
+        selected_routine_name = selected_instance.display_name
+        selected_routine_type = selected_definition.display_name
         applied_items: list[str] = []
         created_paths: list[str] = []
         blocked_items: list[dict[str, object]] = []
@@ -1221,9 +1256,14 @@ class RoutineAssignWindow(QDialog):
                 skipped_items.append(f"{code} {name}: 라이브러리 불일치")
                 continue
 
-            final_routines = selected_routine_names
-
-            if not update_base_stock_routines(code, name, final_routines):
+            if not update_base_stock_routine_instance(
+                code,
+                name,
+                instance_id=selected_instance.instance_id,
+                instance_name=selected_instance.display_name,
+                definition_id=selected_definition.definition_id,
+                routine_type=selected_definition.display_name,
+            ):
                 skipped_items.append(f"{code} {name}: 기초종목.txt 갱신 실패")
                 continue
 
@@ -1233,14 +1273,14 @@ class RoutineAssignWindow(QDialog):
                 stock_dir = stock_repository_factory().ensure_stock_folder(
                     code,
                     name,
-                    routine=selected_routine_name,
+                    routine=selected_routine_type,
                 )
             except Exception:
                 skipped_items.append(f"{code} {name}: 중앙 stocks 폴더 준비 실패")
                 continue
 
             created_paths.append(str(stock_dir.relative_to(PROJECT_ROOT)))
-            ensure_single_real_trade_routine_for_stock(code, name, selected_routine_name)
+            ensure_single_real_trade_routine_for_stock(code, name, selected_routine_type)
             applied_items.append(f"{code},{name}({selected_routine_name})")
 
         report_path = write_blocked_action_report(
@@ -1264,7 +1304,7 @@ class RoutineAssignWindow(QDialog):
         append_changelog(
             "UPDATE",
             "기초종목.txt",
-            f"매매루틴 지정: {' / '.join(applied_items)} -> {', '.join(selected_routine_names)}",
+            f"매매루틴 지정: {' / '.join(applied_items)} -> {selected_routine_name}",
         )
 
         if created_paths:
@@ -1312,7 +1352,8 @@ class RoutineAssignWindow(QDialog):
             self.show_status("해제할 루틴을 선택하세요.")
             return
 
-        routine_name, _ = selected_routine
+        instance, _definition = selected_routine
+        routine_name = instance.display_name
         checked_stocks: list[tuple[str, str]] = []
 
         for row in range(self.assigned_stock_table.rowCount()):
@@ -1343,9 +1384,10 @@ class RoutineAssignWindow(QDialog):
                 skipped_items.append(f"{code} {name}: 기초종목.txt에서 종목을 찾지 못했습니다.")
                 continue
 
-            routines = stock.get("routines", [])
-            routine_list = [str(item).strip() for item in routines] if isinstance(routines, list) else []
-            if routine_name not in routine_list:
+            assigned_instance_id = str(
+                stock.get("assigned_routine_instance_id", "") or ""
+            ).strip()
+            if assigned_instance_id != instance.instance_id:
                 skipped_items.append(f"{code} {name}: 선택 루틴에 연결되어 있지 않음")
                 continue
 
@@ -1383,11 +1425,7 @@ class RoutineAssignWindow(QDialog):
                 skipped_items.append(f"{code} {name}: 기초종목.txt에서 종목을 찾지 못했습니다.")
                 continue
 
-            routines = stock.get("routines", [])
-            routine_list = [str(item).strip() for item in routines] if isinstance(routines, list) else []
-            new_routines = [item for item in routine_list if item != routine_name]
-
-            if update_base_stock_routines(code, name, new_routines):
+            if update_base_stock_routines(code, name, []):
                 ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}")
             else:
@@ -1437,4 +1475,3 @@ class RoutineAssignWindow(QDialog):
         self.show_status(
             f"{len(removed_items)}개 종목의 {routine_name} 연결이 해제되었습니다."
         )
-

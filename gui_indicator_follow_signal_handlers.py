@@ -175,34 +175,13 @@ class IndicatorFollowSignalHandlersMixin:
         if hasattr(self, "sell_title"):
             self.sell_title.setText(("▼ " if sell_expanded else "▶ ") + "매도설정")
 
-    def _set_control_full_view_button_state(self, mode):
-        """전체보기 버튼 연결을 한 곳에서만 갱신한다."""
-        if not hasattr(self, "control_full_view_button"):
-            return
-
-        if mode == "all":
-            button_text = "전체접기"
-            target_mode = "summary"
-        else:
-            button_text = "전체보기"
-            target_mode = "all"
-
-        self.control_full_view_button.setText(button_text)
-        try:
-            self.control_full_view_button.clicked.disconnect()
-        except TypeError:
-            pass
-        self.control_full_view_button.clicked.connect(
-            lambda checked=False, m=target_mode: self._apply_control_section_mode(m, force=True)
-        )
-
     def _apply_control_section_mode(self, mode, force=False):
         """
         구성탭 전용 표시모드.
         - summary: 기본설정은 표시, 매수/매도는 제목 라인만 표시
         - buy: 기본설정 표시 + 매수 상세 표시
         - sell: 기본설정 표시 + 매도 상세 표시
-        - all: 기본설정 표시 + 매수/매도 상세 표시(전체보기/동시 펼침)
+        - all: 기본설정 표시 + 매수/매도 상세 동시 펼침
         """
         if not hasattr(self, "buy_detail_widget") or not hasattr(self, "sell_detail_widget"):
             return
@@ -235,9 +214,7 @@ class IndicatorFollowSignalHandlersMixin:
             self._sell_collapsed_height,
         )
 
-        # 제목/전체보기 버튼 상태는 전용 헬퍼에서만 갱신한다.
         self._set_control_section_title_states(buy_expanded, sell_expanded)
-        self._set_control_full_view_button_state(mode)
 
         if hasattr(self, "control_scroll"):
             self.control_scroll.setVerticalScrollBarPolicy(

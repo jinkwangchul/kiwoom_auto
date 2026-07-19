@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtWidgets import QApplication, QDialog, QPushButton
 
 from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
 from gui_routine_registration_dialog import (
     RoutineRegistrationDialog,
     suggest_routine_instance_display_name,
 )
-from routine_instance_repository import RoutineInstanceCreateRequest
+from routine_instance_repository import RoutineInstanceCreateRequest, RoutineInstanceRepository
 
 
 @unittest.skipIf(
@@ -229,6 +231,25 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             self.assertEqual(312, dialog.registration_mode_label.width())
             self.assertEqual(52, dialog.registration_mode_label.height())
             self.assertEqual(18, dialog.registration_mode_label.font().pointSize())
+            self.assertEqual("registration", dialog.settings_mode)
+            self.assertEqual("등록", dialog.save_button.text())
+            self.assertIs(dialog.register_button, dialog.save_button)
+            self.assertFalse(hasattr(dialog, "control_full_view_button"))
+            self.assertFalse(
+                {
+                    "전체보기",
+                    "전체접기",
+                }
+                & {
+                    button.text()
+                    for button in dialog.control_tab.findChildren(QPushButton)
+                }
+            )
+            dialog._apply_control_section_mode("summary", force=True)
+            dialog._toggle_control_section_mode("buy")
+            self.assertTrue(dialog.buy_detail_expanded)
+            self.assertFalse(dialog.sell_detail_expanded)
+            dialog._apply_control_section_mode("summary", force=True)
             screenshot_path = os.environ.get("ROUTINE_SETTINGS_SCREENSHOT_PATH", "").strip()
             if screenshot_path:
                 dialog.show()
@@ -262,6 +283,9 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             self.assertEqual("동전주 매매 설정", dialog.registration_mode_label.text())
             self.assertEqual(312, dialog.registration_mode_label.width())
             self.assertEqual(52, dialog.registration_mode_label.height())
+            self.assertEqual("edit", dialog.settings_mode)
+            self.assertEqual("다른 이름으로 등록", dialog.register_button.text())
+            self.assertEqual("저장", dialog.save_button.text())
             screenshot_path = os.environ.get(
                 "ROUTINE_EXISTING_SETTINGS_SCREENSHOT_PATH",
                 "",
@@ -272,6 +296,56 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 self.assertTrue(dialog.grab().save(screenshot_path))
         finally:
             dialog.close()
+
+    def test_edit_mode_loads_and_updates_current_instance_rules_only(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        routine_dir = project_root / "routines" / "지표추종매매"
+        source_rules = json.loads(
+            (routine_dir / "rules.json").read_text(encoding="utf-8")
+        )
+        source_rules["indicator_follow_ui_state"]["state"]["basic"][
+            "basic_error_policy_combo"
+        ] = "매매지속"
+
+        with tempfile.TemporaryDirectory() as temp:
+            instance_rules_path = Path(temp) / "rules.json"
+            instance_rules_path.write_text(
+                json.dumps(source_rules, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with patch("gui_indicator_follow_routine_settings_dialog.QTimer.singleShot"):
+                dialog = IndicatorFollowRoutineSettingsDialog(
+                    rules_path=instance_rules_path,
+                    routine_path=routine_dir,
+                    routine_name="동전주 매매",
+                    definition_id="indicator_follow",
+                    definition_display_name="지표추종매매",
+                    instance_id="edit-instance-id",
+                    settings_mode="edit",
+                )
+            try:
+                self.assertEqual(
+                    "매매지속",
+                    dialog.basic_error_policy_combo.currentText(),
+                )
+                dialog.basic_error_policy_combo.setCurrentText("매매중지")
+                with patch.object(
+                    RoutineInstanceRepository,
+                    "create_instance",
+                ) as create_instance:
+                    result = dialog.save_indicator_follow_ui_state_to_rules()
+                create_instance.assert_not_called()
+                self.assertTrue(result["success"], result.get("error"))
+            finally:
+                dialog.close()
+
+            saved_rules = json.loads(instance_rules_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "매매중지",
+                saved_rules["indicator_follow_ui_state"]["state"]["basic"][
+                    "basic_error_policy_combo"
+                ],
+            )
 
     def test_long_instance_name_shrinks_then_uses_ellipsis_inside_fixed_stamp(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
