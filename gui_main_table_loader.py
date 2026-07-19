@@ -286,12 +286,17 @@ def main_load_routine_table(window) -> None:
         parent_running = sum(int(item["running"]) for item in children)
         parent_error = sum(int(item["error"]) for item in children)
         parent_stopped = max(0, parent_registered - parent_running)
+        child_statuses = {
+            str(item.get("operation_status", ""))
+            for item in children
+            if str(item.get("operation_status", ""))
+        }
         groups.append(
             {
                 "kind": ROUTINE_ROW_PARENT,
                 "definition_id": definition.definition_id,
                 "name": definition.display_name,
-                "operation_status": "",
+                "operation_status": child_statuses.pop() if len(child_statuses) == 1 else "",
                 "registered": parent_registered,
                 "running": parent_running,
                 "stopped": parent_stopped,
@@ -337,6 +342,11 @@ def main_load_routine_table(window) -> None:
         )
         row_visually_enabled = group_enabled and (is_parent or checked)
         prefix = ("▶ " if row_data.get("collapsed") else "▼ ") if is_parent else ""
+        show_parent_aggregate = bool(row_data.get("collapsed")) or (
+            is_parent
+            and str(row_data["definition_id"])
+            == str(getattr(window, "_hovered_routine_definition_id", "") or "")
+        )
         used_amount_text = format_routine_used_amount()
         buy_limit_text = format_routine_buy_limit(
             enabled=bool(row_data.get("buy_limit_enabled")),
@@ -347,7 +357,7 @@ def main_load_routine_table(window) -> None:
         )
         profit_signal, profit_text, _profit_color = routine_profit_signal()
 
-        values = [
+        aggregate_values = [
             f"{prefix}{row_data['name']}",
             str(row_data.get("operation_status", "")),
             str(row_data["registered"]),
@@ -359,7 +369,12 @@ def main_load_routine_table(window) -> None:
             usage_rate_text,
             f"● {profit_text}" if profit_text != "-" else "-",
         ]
-        row_data["values"] = values
+        row_data["values"] = aggregate_values
+        values = (
+            [aggregate_values[0], *([""] * (len(aggregate_values) - 1))]
+            if is_parent and not show_parent_aggregate
+            else aggregate_values
+        )
 
         for col, value in enumerate(values):
             item = SortableTableWidgetItem(value)
@@ -391,6 +406,9 @@ def main_load_routine_table(window) -> None:
         set_enabled = getattr(profit_widget, "setEnabled", None)
         if callable(set_enabled):
             set_enabled(row_visually_enabled)
+        set_visible = getattr(profit_widget, "setVisible", None)
+        if is_parent and not show_parent_aggregate and callable(set_visible):
+            set_visible(False)
         window.routine_table.setCellWidget(
             row,
             9,

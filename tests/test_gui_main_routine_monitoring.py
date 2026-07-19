@@ -170,11 +170,33 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual(table.columnCount(), 10)
         self.assertEqual(
             [table.item(0, col).text() for col in range(10)],
-            ["▼ 지표추종매매", "", "3", "0", "3", "0", "-", "-", "-", "-"],
+            ["▼ 지표추종매매", "", "", "", "", "", "", "", "", ""],
         )
         self.assertNotIn("총예산", [table.item(0, col).text() for col in range(10)])
 
         self.assertEqual(table.cellWidget(0, 9), "profit-widget")
+
+        window._collapsed_routine_definition_ids.add("indicator_follow")
+        with (
+            patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
+            patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[]),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_stock_counts_from_base_stocks",
+                return_value={"지표추종매매": 3},
+            ),
+            patch.object(gui_main_table_loader, "_instance_stock_counts", return_value={}),
+            patch.object(
+                gui_main_table_loader,
+                "create_routine_profit_signal_widget",
+                return_value="profit-widget",
+            ),
+        ):
+            gui_main_table_loader.main_load_routine_table(window)
+        self.assertEqual(
+            [table.item(0, col).text() for col in range(10)],
+            ["▶ 지표추종매매", "", "3", "0", "3", "0", "-", "-", "-", "-"],
+        )
 
     def test_parent_and_registered_instance_rows_show_independent_buy_limits(self) -> None:
         table = FakeRoutineTable()
@@ -231,11 +253,23 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual("기본운영", table.item(1, 1).text())
         self.assertTrue(table.item(0, 0).flags() & Qt.ItemIsUserCheckable)
         self.assertTrue(table.item(1, 0).flags() & Qt.ItemIsUserCheckable)
-        self.assertEqual("₩12,000,000", table.item(0, 7).text())
+        self.assertEqual("", table.item(0, 7).text())
         self.assertEqual("₩12,000,000", table.item(1, 7).text())
-        self.assertEqual("-", table.item(0, 8).text())
+        self.assertEqual("", table.item(0, 8).text())
         self.assertEqual("", table.item(0, 0).toolTip())
         self.assertEqual("대형주 중심의 보수적 추세 진입", table.item(1, 0).toolTip())
+
+        window._hovered_routine_definition_id = "indicator_follow"
+        with (
+            patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
+            patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
+            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
+            patch.object(gui_main_table_loader, "_instance_stock_counts", return_value={}),
+            patch.object(gui_main_table_loader, "create_routine_profit_signal_widget", return_value="profit-widget"),
+        ):
+            gui_main_table_loader.main_load_routine_table(window)
+        self.assertEqual("기본운영", table.item(0, 1).text())
+        self.assertEqual("₩12,000,000", table.item(0, 7).text())
 
     def test_actual_main_window_renders_and_toggles_parent_child_rows(self) -> None:
         import gui_windows
@@ -296,6 +330,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertEqual("대형주 추세형", window.routine_table.item(1, 0).text())
                 self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
                 self.assertEqual(Qt.Checked, window.routine_table.item(1, 0).checkState())
+                self.assertEqual("", window.routine_table.item(0, 1).text())
+                window.on_routine_cell_entered(0, 0)
+                self.assertEqual("기본운영", window.routine_table.item(0, 1).text())
+                window.on_routine_cell_entered(1, 0)
+                self.assertEqual("", window.routine_table.item(0, 1).text())
                 self.assertEqual("기본운영", window.routine_table.item(1, 1).text())
                 self.assertEqual(Qt.CustomContextMenu, window.routine_table.contextMenuPolicy())
                 self.assertFalse(window.grab().isNull())
@@ -304,22 +343,22 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     self.assertTrue(window.grab().save(screenshot_path))
 
                 parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                with patch.object(gui_windows, "QMenu") as menu_factory:
-                    window.open_routine_context_menu(parent_rect.center())
-                    menu_factory.assert_not_called()
-
-                child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
                 fake_menu = MagicMock()
                 fake_menu.addAction.side_effect = [MagicMock(), MagicMock()]
                 with (
                     patch.object(gui_windows, "QMenu", return_value=fake_menu),
-                    patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                    patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
                 ):
-                    window.open_routine_context_menu(child_rect.center())
+                    window.open_routine_context_menu(parent_rect.center())
                 self.assertEqual(
                     ["조기마감", "즉시청산"],
                     [call.args[0] for call in fake_menu.addAction.call_args_list],
                 )
+
+                child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
+                with patch.object(gui_windows, "QMenu") as menu_factory:
+                    window.open_routine_context_menu(child_rect.center())
+                    menu_factory.assert_not_called()
 
                 fake_result = SimpleNamespace(
                     status="SUCCESS",
@@ -332,9 +371,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     patch.object(gui_windows, "OperationCommandService", return_value=command_service),
                     patch.object(gui_windows.QMessageBox, "question", return_value=gui_windows.QMessageBox.Yes),
                 ):
-                    window.request_routine_operation(
-                        instance.instance_id,
-                        instance.display_name,
+                    window.request_routine_definition_operation(
+                        definition.definition_id,
+                        definition.display_name,
                         "EARLY_CLOSE",
                         "조기마감",
                     )
@@ -350,9 +389,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     patch.object(gui_windows, "OperationCommandService", return_value=command_service),
                     patch.object(gui_windows.QMessageBox, "question", return_value=gui_windows.QMessageBox.Yes),
                 ):
-                    window.request_routine_operation(
-                        instance.instance_id,
-                        instance.display_name,
+                    window.request_routine_definition_operation(
+                        definition.definition_id,
+                        definition.display_name,
                         "IMMEDIATE_LIQUIDATION",
                         "즉시청산",
                     )

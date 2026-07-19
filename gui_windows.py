@@ -127,6 +127,8 @@ class _RoutineCheckBoxController(QObject):
         self.table = window.routine_table
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.Leave:
+            self.window.clear_routine_parent_hover()
         if event.type() in {
             QEvent.MouseButtonPress,
             QEvent.MouseButtonRelease,
@@ -318,6 +320,7 @@ class MainWindow(QMainWindow):
         self._routine_instance_ids_by_definition: dict[str, tuple[str, ...]] = {}
         self._routine_definition_by_instance: dict[str, str] = {}
         self._routine_operation_status_by_instance: dict[str, str] = {}
+        self._hovered_routine_definition_id = ""
         self._main_running_sort_column = -1
         self._main_running_sort_order = Qt.AscendingOrder
         self._startup_recovery_result: dict[str, object] = {}
@@ -467,7 +470,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout()
         layout.setSpacing(8)
 
-        routine_box = QGroupBox("등록된 자동매매 루틴")
+        routine_box = QWidget()
         routine_layout = QVBoxLayout()
         routine_layout.setContentsMargins(8, 6, 8, 8)
         self._setup_routine_table()
@@ -539,6 +542,7 @@ class MainWindow(QMainWindow):
         self.routine_table.verticalHeader().setVisible(False)
         self.routine_table.setAlternatingRowColors(True)
         self.routine_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.routine_table.setMouseTracking(True)
         self._routine_tree_item_delegate = _RoutineTreeItemDelegate(self.routine_table)
         self.routine_table.setItemDelegateForColumn(0, self._routine_tree_item_delegate)
 
@@ -692,6 +696,7 @@ class MainWindow(QMainWindow):
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
         self.routine_table.itemDoubleClicked.connect(self.open_routine_settings_from_main_table)
         self.routine_table.itemChanged.connect(self.on_routine_check_item_changed)
+        self.routine_table.cellEntered.connect(self.on_routine_cell_entered)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
         self._routine_checkbox_controller = _RoutineCheckBoxController(self)
         self.routine_table.viewport().installEventFilter(self._routine_checkbox_controller)
@@ -1211,41 +1216,123 @@ class MainWindow(QMainWindow):
     def selected_routine_instance_ids(self) -> tuple[str, ...]:
         return selected_routine_instance_ids(self)
 
+    def on_routine_cell_entered(self, row: int, _column: int) -> None:
+        first_item = self.routine_table.item(row, 0)
+        definition_id = ""
+        if (
+            first_item is not None
+            and str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "") == ROUTINE_ROW_PARENT
+        ):
+            definition_id = str(
+                first_item.data(ROUTINE_DEFINITION_ID_ROLE) or ""
+            ).strip()
+        if definition_id != self._hovered_routine_definition_id:
+            self._hovered_routine_definition_id = definition_id
+            self.load_routine_table()
+
+    def clear_routine_parent_hover(self) -> None:
+        if self._hovered_routine_definition_id:
+            self._hovered_routine_definition_id = ""
+            self.load_routine_table()
+
     def open_routine_context_menu(self, position) -> None:
         item = self.routine_table.itemAt(position)
         if item is None:
             return
         first_item = self.routine_table.item(item.row(), 0)
-        if first_item is None or str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
+        if first_item is None or str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
             return
-        instance_id = str(first_item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        if not instance_id:
+        definition_id = str(first_item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
+        if not definition_id:
             return
-        instance = routine_instance_by_id(instance_id)
-        if instance is None:
-            QMessageBox.warning(self, "루틴 운영", "선택한 등록 루틴을 확인할 수 없습니다.")
+        definition = routine_definition_by_id(definition_id)
+        if definition is None:
+            QMessageBox.warning(self, "루틴 운영", "선택한 루틴 유형을 확인할 수 없습니다.")
             return
 
         menu = QMenu(self.routine_table)
         early_close_action = menu.addAction("조기마감")
         immediate_action = menu.addAction("즉시청산")
         early_close_action.triggered.connect(
-            lambda _checked=False: self.request_routine_operation(
-                instance_id,
-                instance.display_name,
+            lambda _checked=False: self.request_routine_definition_operation(
+                definition_id,
+                definition.display_name,
                 MODE_EARLY_CLOSE,
                 ROUTINE_STATUS_EARLY_CLOSE,
             )
         )
         immediate_action.triggered.connect(
-            lambda _checked=False: self.request_routine_operation(
-                instance_id,
-                instance.display_name,
+            lambda _checked=False: self.request_routine_definition_operation(
+                definition_id,
+                definition.display_name,
                 COMMAND_IMMEDIATE_LIQUIDATION,
                 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
             )
         )
         menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+
+    def request_routine_definition_operation(
+        self,
+        definition_id: str,
+        display_name: str,
+        command: str,
+        display_status: str,
+    ) -> None:
+        instance_ids = tuple(
+            sorted(self._routine_instance_ids_by_definition.get(definition_id, ()))
+        )
+        command_label = (
+            ROUTINE_STATUS_EARLY_CLOSE
+            if command == MODE_EARLY_CLOSE
+            else ROUTINE_STATUS_IMMEDIATE_LIQUIDATION
+        )
+        if not instance_ids:
+            QMessageBox.warning(
+                self,
+                f"루틴 {command_label} 불가",
+                "등록된 하위 루틴 인스턴스가 없습니다.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            f"루틴 {command_label}",
+            f"'{display_name}'의 등록 인스턴스 전체에 {command_label} 명령을 적용하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
+            return
+
+        service = OperationCommandService(PROJECT_ROOT)
+        applied_count = 0
+        failed_count = 0
+        for instance_id in instance_ids:
+            result = service.apply(
+                OperationCommandRequest(
+                    target_scope=SCOPE_ROUTINE_INSTANCE,
+                    target_id=instance_id,
+                    command=command,
+                    source="main_routine_context_menu",
+                )
+            )
+            if result.status == RESULT_FAILED or not result.stock_results:
+                failed_count += 1
+                continue
+            self._routine_operation_status_by_instance[instance_id] = display_status
+            applied_count += 1
+
+        self.load_routine_table()
+        self.update_review_required_button_text()
+        if failed_count:
+            QMessageBox.warning(
+                self,
+                f"루틴 {command_label} 일부 적용" if applied_count else f"루틴 {command_label} 실패",
+                f"적용 {applied_count}개 / 실패 {failed_count}개입니다. 검토관리 상태를 확인하세요.",
+            )
+        self.statusBar().showMessage(
+            f"루틴 {command_label}: {display_name} / 적용 {applied_count} / 실패 {failed_count}"
+        )
 
     def request_routine_operation(
         self,
