@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "instance_id": "187a8fde-bc01-4c8d-bc4d-90071066ca56",
+  "definition_id": "indicator_follow",
+  "display_name": "지표추종매매B",
+  "description": "",
+  "enabled": false,
+  "buy_limit_enabled": false,
+  "buy_limit_amount": null,
+  "rules_file": "rules.json",
+  "created_at": "2026-07-19T09:09:53+09:00",
+  "updated_at": "2026-07-19T09:09:53+09:00"
+}

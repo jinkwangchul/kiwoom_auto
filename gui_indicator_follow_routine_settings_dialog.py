@@ -66,6 +66,8 @@ from gui_indicator_follow_buy_controls import IndicatorFollowBuyControlsMixin
 from gui_indicator_follow_sell_controls import IndicatorFollowSellControlsMixin
 from gui_routine_registry import get_routine_records
 import rule_approval_session_file_service as rule_approval_session_file_service
+from routine_instance_registry import load_persisted_routine_instances, load_routine_definitions
+from routine_instance_repository import RoutineInstanceRepository
 
 
 DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
@@ -106,11 +108,24 @@ class IndicatorFollowRoutineSettingsDialog(
     - 항목별 활성/비활성 상태와 진입 버튼 중심
     """
 
-    def __init__(self, rules_path=None, routine_path=None, routine_name=None, parent=None):
+    def __init__(
+        self,
+        rules_path=None,
+        routine_path=None,
+        routine_name=None,
+        parent=None,
+        *,
+        definition_id=None,
+        definition_display_name=None,
+        instance_id=None,
+    ):
         super().__init__(parent)
         self.routine_path = Path(routine_path) if routine_path else None
         self.routine_name = str(routine_name or "").strip()
-        self.setWindowTitle(f"{self.routine_name or 'Routine'} \uc124\uc815")
+        self.definition_id = str(definition_id or "").strip()
+        self.definition_display_name = str(definition_display_name or routine_name or "").strip()
+        self.instance_id = str(instance_id or "").strip()
+        self._update_window_title()
         self.setWindowFlags(
             Qt.Window
             | Qt.WindowSystemMenuHint
@@ -124,6 +139,8 @@ class IndicatorFollowRoutineSettingsDialog(
         self.setMinimumSize(1600, 360)
 
         self.rules_path = Path(rules_path) if rules_path else self._default_rules_path()
+        if not self.definition_id:
+            self.definition_id = self._default_definition_id()
         self.rules_data = {}
         self._approval_session_path = self._default_rule_approval_session_path()
 
@@ -142,6 +159,12 @@ class IndicatorFollowRoutineSettingsDialog(
         here = Path(__file__).resolve().parent
         return here / "routines" / "rules.json"
 
+    def _update_window_title(self):
+        if self.instance_id:
+            self.setWindowTitle(f"{self.routine_name or 'Routine'} 설정")
+        else:
+            self.setWindowTitle(f"{self.routine_name or 'Routine'} 신규 등록설정")
+
     def _default_rule_approval_session_path(self):
         return (
             Path(__file__).resolve().parent
@@ -150,6 +173,15 @@ class IndicatorFollowRoutineSettingsDialog(
             / "indicator_follow"
             / "approval_session.json"
         )
+
+    def _default_definition_id(self):
+        routine_path = self.routine_path.resolve() if self.routine_path is not None else None
+        for definition in load_routine_definitions():
+            if routine_path is not None and definition.package_dir.resolve() == routine_path:
+                return definition.definition_id
+            if definition.display_name == self.routine_name:
+                return definition.definition_id
+        return ""
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -178,6 +210,8 @@ class IndicatorFollowRoutineSettingsDialog(
         self.reload_button = QPushButton("다시 불러오기")
         self.validate_button = QPushButton("설정 검증")
         self.save_button = QPushButton("UI 상태 저장")
+        self.register_button = QPushButton("다른 이름으로 등록" if self.instance_id else "등록")
+        self.register_button.setObjectName("routineRegisterButton")
         self.close_button = QPushButton("닫기")
 
         self.save_button.setEnabled(True)
@@ -199,11 +233,13 @@ class IndicatorFollowRoutineSettingsDialog(
         )
         self.validate_button.clicked.connect(self._handle_validate_clicked)
         self.save_button.clicked.connect(self.save_indicator_follow_ui_state_to_rules)
+        self.register_button.clicked.connect(self.open_registration_dialog)
         self.close_button.clicked.connect(self.close)
 
         button_row.addWidget(self.reload_button)
         button_row.addWidget(self.validate_button)
         button_row.addStretch(1)
+        button_row.addWidget(self.register_button)
         button_row.addWidget(self.save_button)
         button_row.addWidget(self.close_button)
         root.addLayout(button_row)
@@ -343,7 +379,7 @@ class IndicatorFollowRoutineSettingsDialog(
     def load_rules(self):
         if not self.rules_path.exists():
             self.rules_data = {}
-            self.setWindowTitle(f"{self.routine_name or 'Routine'} \uc124\uc815")
+            self._update_window_title()
             QMessageBox.warning(self, "rules.json 없음", f"rules.json을 찾을 수 없습니다.\n{self.rules_path}")
             self._clear_fields()
             return
@@ -353,13 +389,14 @@ class IndicatorFollowRoutineSettingsDialog(
                 self.rules_data = json.load(f)
         except Exception as exc:
             self.rules_data = {}
-            self.setWindowTitle(f"{self.routine_name or 'Routine'} 설정")
+            self._update_window_title()
             QMessageBox.critical(self, "로드 실패", f"rules.json 로드 실패\n{exc}")
             self._clear_fields()
             return
 
         self._populate_fields()
         self.refresh_preview()
+        self._update_window_title()
 
     def _clear_fields(self):
         self._set_card_status(self.card_routine, "로드 실패", "error")
@@ -410,7 +447,6 @@ class IndicatorFollowRoutineSettingsDialog(
 
         routine_name = data.get("routine_name") or data.get("name") or self.routine_name or (self.routine_path.name if self.routine_path else "Routine")
         self.title_label.setText(str(routine_name))
-        self.setWindowTitle(f"{routine_name} 설정")
 
         principle = data.get("principle", {}) if isinstance(data.get("principle", {}), dict) else {}
 
@@ -553,6 +589,101 @@ class IndicatorFollowRoutineSettingsDialog(
             "state": state,
         }
         return rules_copy
+
+    def build_registration_rules_from_current_ui_state(self):
+        """Build a validated, non-writing rules snapshot for a new instance."""
+        try:
+            rules_with_ui_state = self.build_rules_with_indicator_follow_ui_state()
+            ui_state = self.collect_indicator_follow_ui_state()
+            mapper = self._load_indicator_follow_rule_mapper()
+            pending_result = mapper.build_engine_rules_pending_from_ui_state(
+                ui_state,
+                rules_with_ui_state,
+            )
+            pending_rules = pending_result.get("pending_rules", {})
+            pending = pending_rules.get("indicator_follow_rule_pending", {})
+            if not isinstance(pending_rules, dict) or not isinstance(pending, dict):
+                raise ValueError("공식 rules 변환 결과가 올바르지 않습니다.")
+            if pending.get("mode") == "error":
+                raise ValueError("공식 rules 변환 검증이 실패했습니다.")
+            return {
+                "success": True,
+                "rules": pending_rules,
+                "validation_warnings": list(pending_result.get("validation_warnings", [])),
+                "postponed": list(pending_result.get("postponed", [])),
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "rules": {},
+                "validation_warnings": [],
+                "postponed": [],
+                "error": str(exc),
+            }
+
+    def open_registration_dialog(self):
+        from gui_routine_registration_dialog import (
+            RoutineRegistrationDialog,
+            suggest_routine_instance_display_name,
+        )
+
+        if not self.definition_id:
+            QMessageBox.warning(self, "루틴 등록", "현재 루틴 유형의 definition_id를 확인할 수 없습니다.")
+            return None
+
+        existing_names = [
+            item.display_name
+            for item in load_persisted_routine_instances()
+            if item.definition_id == self.definition_id
+        ]
+        suggested_name = suggest_routine_instance_display_name(
+            self.definition_display_name,
+            len(existing_names),
+        )
+        dialog = RoutineRegistrationDialog(
+            definition_id=self.definition_id,
+            definition_display_name=self.definition_display_name,
+            initial_display_name=suggested_name,
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted or dialog.registration_request is None:
+            return None
+
+        rules_result = self.build_registration_rules_from_current_ui_state()
+        if rules_result.get("success") is not True:
+            QMessageBox.critical(
+                self,
+                "루틴 등록 실패",
+                "현재 설정을 공식 rules 경로로 변환하지 못했습니다.\n"
+                f"{rules_result.get('error', '')}",
+            )
+            return None
+
+        repository = RoutineInstanceRepository(Path(__file__).resolve().parent)
+        result = repository.create_instance(
+            dialog.registration_request,
+            rules_result.get("rules", {}),
+        )
+        if not result.success or result.instance is None:
+            QMessageBox.critical(
+                self,
+                "루틴 등록 실패",
+                result.error or "등록 루틴을 저장하지 못했습니다.",
+            )
+            return None
+
+        self.last_registered_instance_id = result.instance.instance_id
+        parent = self.parent()
+        refresh_all = getattr(parent, "refresh_all", None)
+        if callable(refresh_all):
+            refresh_all()
+        QMessageBox.information(
+            self,
+            "루틴 등록",
+            f"'{result.instance.display_name}' 루틴을 비활성 상태로 등록했습니다.",
+        )
+        return result.instance
 
     def _load_indicator_follow_rule_mapper(self):
         import importlib.util

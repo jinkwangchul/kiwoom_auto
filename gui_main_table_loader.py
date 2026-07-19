@@ -15,6 +15,7 @@ gui_main_table_loader.py
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -30,7 +31,12 @@ from gui_review_utils import safe_float_value
 from runtime_io import read_json_dict
 from state_policy import normalize_operation_mode
 from gui_auto_trade_display import (
+    create_routine_profit_signal_widget,
     create_auto_trade_setting_status_item,
+    format_routine_buy_limit,
+    format_routine_buy_limit_usage,
+    format_routine_used_amount,
+    routine_profit_signal,
     SORT_ROLE,
     SortableTableWidgetItem,
 )
@@ -46,9 +52,52 @@ from gui_auto_trade_policy import (
     auto_trade_setting_display_status_for_current_session,
 )
 from gui_base_stock_service import read_base_stocks
-from gui_routine_registry import read_routine_budget
+from routine_instance_registry import (
+    load_persisted_routine_instances,
+    load_routine_definitions,
+)
+from gui_main_routine_selection import (
+    routine_definition_enabled,
+    routine_instance_checkbox_enabled,
+    routine_instance_checked,
+    sync_routine_selection_state,
+)
 
 
+ROUTINE_MONITORING_HEADERS = (
+    "루틴명",
+    "상태",
+    "등록",
+    "실행",
+    "정지",
+    "오류",
+    "사용금액",
+    "매수한도",
+    "사용률",
+    "수익률",
+)
+
+ROUTINE_STATUS_DEFAULT = "기본운영"
+ROUTINE_STATUS_EARLY_CLOSE = "조기마감"
+ROUTINE_STATUS_IMMEDIATE_LIQUIDATION = "즉시청산"
+ROUTINE_STATUS_COMPLETED = "매매완료"
+ROUTINE_STATUS_PARTIAL_COMPLETION = "일부완료"
+ROUTINE_COMPLETION_STATUSES = frozenset(
+    {ROUTINE_STATUS_COMPLETED, ROUTINE_STATUS_PARTIAL_COMPLETION}
+)
+
+ROUTINE_ROW_KIND_ROLE = Qt.UserRole + 201
+ROUTINE_DEFINITION_ID_ROLE = Qt.UserRole + 202
+ROUTINE_INSTANCE_ID_ROLE = Qt.UserRole + 203
+ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE = Qt.UserRole + 204
+ROUTINE_ROW_PARENT = "definition"
+ROUTINE_ROW_CHILD = "instance"
+ROUTINE_PARENT_CHECKBOX_OFFSET = 4
+ROUTINE_CHILD_CHECKBOX_OFFSET = 24
+ROUTINE_CHECKBOX_SIZE = 16
+ROUTINE_CHECKBOX_HIT_PADDING = 4
+ROUTINE_PARENT_EXPAND_OFFSET = 25
+ROUTINE_PARENT_EXPAND_WIDTH = 20
 def main_sort_routine_table_by_column(window, column: int) -> None:
     """메인 관제창 좌측 루틴표 헤더 정렬."""
     if column < 0 or column >= window.routine_table.columnCount():
@@ -59,8 +108,7 @@ def main_sort_routine_table_by_column(window, column: int) -> None:
         window._main_routine_sort_order,
     )
     window._main_routine_sort_column = column
-    window.routine_table.sortItems(column, window._main_routine_sort_order)
-    window.routine_table.horizontalHeader().setSortIndicator(column, window._main_routine_sort_order)
+    main_load_routine_table(window)
 
 
 def main_sort_running_table_by_column(window, column: int) -> None:
@@ -79,7 +127,6 @@ def main_sort_running_table_by_column(window, column: int) -> None:
 
 def main_apply_routine_sort(window) -> None:
     if 0 <= window._main_routine_sort_column < window.routine_table.columnCount():
-        window.routine_table.sortItems(window._main_routine_sort_column, window._main_routine_sort_order)
         window.routine_table.horizontalHeader().setSortIndicator(
             window._main_routine_sort_column,
             window._main_routine_sort_order,
@@ -144,56 +191,211 @@ def _routine_stock_counts_from_base_stocks() -> dict[str, int]:
     return counts
 
 
+def _instance_stock_counts() -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for stock in read_base_stocks():
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        if not stock_path:
+            continue
+        stock_dir = Path(__file__).resolve().parent / stock_path
+        config = read_json_dict(stock_dir / "config.json")
+        state = read_json_dict(stock_dir / "state.json")
+        instance_id = str(config.get("assigned_routine_instance_id", "") or "").strip()
+        if not instance_id:
+            continue
+        item = counts.setdefault(instance_id, {"registered": 0, "running": 0, "stopped": 0, "error": 0})
+        item["registered"] += 1
+        status = str(state.get("status", "") or "").strip().upper()
+        running = auto_trade_setting_trade_started(state)
+        if running:
+            item["running"] += 1
+        else:
+            item["stopped"] += 1
+        if status == "ERROR":
+            item["error"] += 1
+    return counts
+
+
+def _routine_monitor_sort_value(row: dict[str, object], column: int):
+    if column == 0:
+        return str(row.get("name", "")).casefold()
+    if column == 1:
+        return str(row.get("operation_status", "")).casefold()
+    if column in {2, 3, 4, 5}:
+        return int(row.get(("registered", "running", "stopped", "error")[column - 2], 0) or 0)
+    if column == 7:
+        return int(row.get("buy_limit_amount", 0) or 0)
+    return str(row.get("values", [""] * len(ROUTINE_MONITORING_HEADERS))[column]).casefold()
+
+
 def main_load_routine_table(window) -> None:
-    """budget.json이 있는 루틴 폴더를 메인 좌측 루틴표에 표시한다.
+    """등록 루틴의 운영 수와 1차 관제 상태를 메인 좌측 표에 표시한다.
 
     종목수는 더 이상 루틴폴더 안의 물리 종목폴더 개수로 계산하지 않는다.
     중앙 종목관리(read_base_stocks -> stocks/config.json) 기준으로 계산한다.
+
+    루틴 매수한도와 루틴 수익률의 공식 공급 경로는 아직 없다.
+    예산 데이터를 매수한도로 재해석하지 않고 공급값 없음/중립으로 표시한다.
     """
-    routine_dirs = get_routine_dirs()
     routine_counts = _routine_stock_counts_from_base_stocks()
+    instance_counts = _instance_stock_counts()
+    definitions = load_routine_definitions()
+    instances = load_persisted_routine_instances()
+    sync_routine_selection_state(window, definitions, instances)
+    by_definition: dict[str, list[object]] = {}
+    for instance in instances:
+        by_definition.setdefault(instance.definition_id, []).append(instance)
 
-    window.routine_table.setRowCount(len(routine_dirs))
+    groups: list[dict[str, object]] = []
+    collapsed = getattr(window, "_collapsed_routine_definition_ids", set())
+    for definition in definitions:
+        children: list[dict[str, object]] = []
+        buy_limit_total = 0
+        for instance in by_definition.get(definition.definition_id, []):
+            count = instance_counts.get(
+                instance.instance_id,
+                {"registered": 0, "running": 0, "stopped": 0, "error": 0},
+            )
+            if instance.buy_limit_enabled and instance.buy_limit_amount:
+                buy_limit_total += int(instance.buy_limit_amount)
+            children.append(
+                {
+                    "kind": ROUTINE_ROW_CHILD,
+                    "definition_id": definition.definition_id,
+                    "instance_id": instance.instance_id,
+                    "name": instance.display_name,
+                    "description": instance.description,
+                    "operation_status": str(
+                        getattr(window, "_routine_operation_status_by_instance", {}).get(
+                            instance.instance_id,
+                            ROUTINE_STATUS_DEFAULT,
+                        )
+                    ),
+                    "registered": count["registered"],
+                    "running": count["running"],
+                    "stopped": count["stopped"],
+                    "error": count["error"],
+                    "buy_limit_enabled": instance.buy_limit_enabled,
+                    "buy_limit_amount": instance.buy_limit_amount,
+                    "rules_path": instance.rules_path,
+                }
+            )
 
-    for row, routine_dir in enumerate(routine_dirs):
-        routine_name = routine_display_name(routine_dir)
+        legacy_count = int(routine_counts.get(definition.display_name, 0))
+        parent_registered = sum(int(item["registered"]) for item in children) or legacy_count
+        parent_running = sum(int(item["running"]) for item in children)
+        parent_error = sum(int(item["error"]) for item in children)
+        parent_stopped = max(0, parent_registered - parent_running)
+        groups.append(
+            {
+                "kind": ROUTINE_ROW_PARENT,
+                "definition_id": definition.definition_id,
+                "name": definition.display_name,
+                "operation_status": "",
+                "registered": parent_registered,
+                "running": parent_running,
+                "stopped": parent_stopped,
+                "error": parent_error,
+                "buy_limit_enabled": buy_limit_total > 0,
+                "buy_limit_amount": buy_limit_total or None,
+                "collapsed": definition.definition_id in collapsed,
+                "children": children,
+            }
+        )
 
-        total_budget = 0
-        used_budget = 0
-        available_budget = 0
+    sort_column = getattr(window, "_main_routine_sort_column", -1)
+    reverse = getattr(window, "_main_routine_sort_order", Qt.AscendingOrder) == Qt.DescendingOrder
+    if 0 <= sort_column < len(ROUTINE_MONITORING_HEADERS):
+        groups.sort(key=lambda item: _routine_monitor_sort_value(item, sort_column), reverse=reverse)
+        for group in groups:
+            group["children"].sort(
+                key=lambda item: _routine_monitor_sort_value(item, sort_column),
+                reverse=reverse,
+            )
 
-        try:
-            budget = read_routine_budget(routine_dir)
-            total_budget = int(budget.get("total_budget", 0))
-            used_budget = int(budget.get("used_budget", 0))
-            available_budget = int(budget.get("available_budget", 0))
-        except Exception:
-            total_budget = 0
-            used_budget = 0
-            available_budget = 0
+    rows: list[dict[str, object]] = []
+    for group in groups:
+        rows.append(group)
+        if not group["collapsed"]:
+            rows.extend(group["children"])
 
-        stock_count = int(routine_counts.get(routine_name, 0))
+    window.routine_table.setRowCount(len(rows))
+
+    for row, row_data in enumerate(rows):
+        is_parent = row_data["kind"] == ROUTINE_ROW_PARENT
+        group_enabled = routine_definition_enabled(
+            window,
+            str(row_data["definition_id"]),
+        )
+        checked = (
+            group_enabled
+            if is_parent
+            else routine_instance_checked(
+                window,
+                str(row_data.get("instance_id", "")),
+            )
+        )
+        row_visually_enabled = group_enabled and (is_parent or checked)
+        prefix = ("▶ " if row_data.get("collapsed") else "▼ ") if is_parent else ""
+        used_amount_text = format_routine_used_amount()
+        buy_limit_text = format_routine_buy_limit(
+            enabled=bool(row_data.get("buy_limit_enabled")),
+            amount=row_data.get("buy_limit_amount"),
+        )
+        usage_rate_text = format_routine_buy_limit_usage(
+            enabled=bool(row_data.get("buy_limit_enabled")),
+        )
+        profit_signal, profit_text, _profit_color = routine_profit_signal()
 
         values = [
-            routine_name,
-            str(stock_count),
-            "0",
-            str(stock_count),
-            "0",
-            f"{total_budget:,}",
-            f"{used_budget:,}",
-            f"{available_budget:,}",
+            f"{prefix}{row_data['name']}",
+            str(row_data.get("operation_status", "")),
+            str(row_data["registered"]),
+            str(row_data["running"]),
+            str(row_data["stopped"]),
+            str(row_data["error"]),
+            used_amount_text,
+            buy_limit_text,
+            usage_rate_text,
+            f"● {profit_text}" if profit_text != "-" else "-",
         ]
+        row_data["values"] = values
 
         for col, value in enumerate(values):
             item = SortableTableWidgetItem(value)
-            if col in {1, 2, 3, 4, 5, 6, 7}:
+            item.setData(ROUTINE_ROW_KIND_ROLE, row_data["kind"])
+            item.setData(ROUTINE_DEFINITION_ID_ROLE, row_data["definition_id"])
+            item.setData(ROUTINE_INSTANCE_ID_ROLE, row_data.get("instance_id", ""))
+            if col == 0:
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, row_visually_enabled)
+            if row_data["kind"] == ROUTINE_ROW_CHILD and row_data.get("description"):
+                item.setToolTip(str(row_data["description"]))
+            if not row_visually_enabled:
+                item.setForeground(QColor("#9ca3af"))
+            if col in {1, 2, 3, 4}:
                 try:
                     item.setData(SORT_ROLE, int(str(value).replace(",", "")))
                 except Exception:
                     pass
-            item.setTextAlignment(Qt.AlignCenter)
+            elif col == 9:
+                item.setData(SORT_ROLE, profit_signal)
+            if col in {6, 7}:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            else:
+                item.setTextAlignment(Qt.AlignCenter)
             window.routine_table.setItem(row, col, item)
+
+        profit_widget = create_routine_profit_signal_widget()
+        set_enabled = getattr(profit_widget, "setEnabled", None)
+        if callable(set_enabled):
+            set_enabled(row_visually_enabled)
+        window.routine_table.setCellWidget(
+            row,
+            9,
+            profit_widget,
+        )
 
     main_apply_routine_sort(window)
 

@@ -1,4 +1,5 @@
 from PyQt5.QtCore import Qt, QEvent, QTimer
+from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -24,6 +25,26 @@ from PyQt5.QtWidgets import (
 )
 
 class IndicatorFollowControlTabMixin:
+    def _set_registration_identity_stamp(self, text):
+        label = self.registration_mode_label
+        source_text = str(text or "-").strip() or "-"
+        available_width = 270
+        font = label.font()
+        font.setBold(True)
+        point_size = 18
+        font.setPointSize(point_size)
+        while point_size > 11 and QFontMetrics(font).horizontalAdvance(source_text) > available_width:
+            point_size -= 1
+            font.setPointSize(point_size)
+        display_text = QFontMetrics(font).elidedText(
+            source_text,
+            Qt.ElideRight,
+            available_width,
+        )
+        label.setFont(font)
+        label.setText(display_text)
+        label.setToolTip(source_text if display_text != source_text else "")
+
     def _build_control_tab(self):
         """
         STEP41:
@@ -76,7 +97,7 @@ class IndicatorFollowControlTabMixin:
             "}"
         )
         basic_layout = QVBoxLayout(basic_box)
-        basic_layout.setContentsMargins(10, 8, 10, 10)
+        basic_layout.setContentsMargins(10, 4, 10, 6)
         basic_layout.setSpacing(4)
         basic_box.setMinimumHeight(52)
         basic_box.setMaximumHeight(88)
@@ -153,9 +174,21 @@ class IndicatorFollowControlTabMixin:
         basic_row.addWidget(self.control_full_view_button)
 
         basic_row.addStretch(1)
+        self.registration_mode_label = QLabel()
+        self.registration_mode_label.setObjectName("routineRegistrationModeLabel")
+        self.registration_mode_label.setFixedSize(312, 52)
+        self.registration_mode_label.setAlignment(Qt.AlignCenter)
+        self.registration_mode_label.setStyleSheet(
+            "color: #A91F18;"
+            "padding: 5px 17px; border: 2px solid #A91F18;"
+            "border-radius: 2px; background: #FFFDFD;"
+        )
+        stamp_text = f"{self.routine_name} 설정" if self.instance_id else "신규 등록"
+        self._set_registration_identity_stamp(stamp_text)
+        basic_row.addWidget(self.registration_mode_label)
         self.basic_header_widget = QWidget()
         self.basic_header_widget.setLayout(basic_row)
-        self.basic_header_widget.setFixedHeight(44)
+        self.basic_header_widget.setFixedHeight(52)
         self.basic_header_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         basic_layout.addWidget(self.basic_header_widget)
 

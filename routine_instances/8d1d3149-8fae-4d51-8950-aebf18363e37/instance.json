@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "instance_id": "8d1d3149-8fae-4d51-8950-aebf18363e37",
+  "definition_id": "indicator_follow",
+  "display_name": "동전주",
+  "description": "동전주 매매",
+  "enabled": false,
+  "buy_limit_enabled": true,
+  "buy_limit_amount": 1000000,
+  "rules_file": "rules.json",
+  "created_at": "2026-07-18T15:50:48+09:00",
+  "updated_at": "2026-07-18T15:50:48+09:00"
+}

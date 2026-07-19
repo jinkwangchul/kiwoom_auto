@@ -78,6 +78,9 @@ class ExecutionPreviewOrderServiceTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["read_result"]["ok"])
         self.assertIsNone(result["preview_result"])
+        self.assertEqual("ORDER_QUEUE_REAL_READY_READ", result["blocked_stage"])
+        self.assertEqual(["order_id not found"], result["blocked_reasons"])
+        self.assertEqual(result["blocked_reasons"], result["issues"])
         preview.assert_not_called()
 
     def test_non_real_ready_order_is_blocked(self) -> None:
@@ -93,6 +96,7 @@ class ExecutionPreviewOrderServiceTest(unittest.TestCase):
         self.assertFalse(result["read_result"]["ok"])
         self.assertIsNone(result["preview_result"])
         self.assertIn("order status is not REAL_READY: APPROVED", result["read_result"]["blocked_reasons"])
+        self.assertEqual(["order status is not REAL_READY: APPROVED"], result["blocked_reasons"])
 
     def test_guard_block_is_reflected_in_summary(self) -> None:
         self._write_queue([self._order()])
@@ -111,6 +115,27 @@ class ExecutionPreviewOrderServiceTest(unittest.TestCase):
             "guard.operator_confirmed is not true",
             result["preview_result"]["summary"]["blocked_reasons"],
         )
+        self.assertEqual("final_guard", result["blocked_stage"])
+        self.assertEqual("guard.operator_confirmed is not true", result["blocked_reason"])
+        self.assertIn("guard.operator_confirmed is not true", result["blocked_reasons"])
+        self.assertEqual(result["blocked_reasons"], result["issues"])
+
+    def test_preview_result_exposes_queue_write_preview_for_auto_caller(self) -> None:
+        self._write_queue([self._order()])
+
+        result = preview_execution_for_real_ready_order(
+            "ORDER_1",
+            self._guard(),
+            queue_path=self.queue_path,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIs(result["summary"], result["preview_result"]["summary"])
+        self.assertIs(
+            result["queue_write_preview_result"],
+            result["preview_result"]["queue_write_preview_result"],
+        )
+        self.assertEqual([], result["blocked_reasons"])
 
     def test_file_content_is_not_mutated(self) -> None:
         self._write_queue([self._order()])

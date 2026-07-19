@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
-from PyQt5.QtWidgets import QTableWidgetItem
+from PyQt5.QtWidgets import QHBoxLayout, QLabel, QTableWidgetItem, QWidget
 
 SORT_ROLE = Qt.UserRole + 100
 
@@ -33,6 +33,126 @@ class SortableTableWidgetItem(QTableWidgetItem):
             except Exception:
                 return str(left) < str(right)
         return self.text() < (other.text() if other is not None else "")
+
+
+ROUTINE_PROFIT_SIGNAL_COLORS = {
+    "LOSS": "#dc2626",
+    "COST_NOT_RECOVERED": "#d97706",
+    "NET_PROFIT": "#16a34a",
+    "NEUTRAL": "#9ca3af",
+}
+
+
+def format_routine_buy_limit(
+    *,
+    enabled: bool,
+    amount: object = None,
+) -> str:
+    """루틴 매수한도를 독립 금액 셀용 문자열로 만든다."""
+    if not enabled:
+        return "-"
+
+    try:
+        limit_value = int(float(str(amount).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return "-"
+
+    if limit_value <= 0:
+        return "-"
+
+    return f"₩{limit_value:,}"
+
+
+def format_routine_used_amount(amount: object = None) -> str:
+    """루틴의 공식 사용금액이 공급된 경우 원화 형식으로 표시한다."""
+    if amount in (None, "", "-"):
+        return "-"
+
+    try:
+        amount_value = int(float(str(amount).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return "-"
+
+    return f"₩{amount_value:,}"
+
+
+def format_routine_buy_limit_usage(
+    *,
+    enabled: bool,
+    limit_amount: object = None,
+    used_amount: object = None,
+) -> str:
+    """사용금액이 매수한도에서 차지하는 비율을 독립 셀로 표시한다."""
+    if not enabled:
+        return "-"
+
+    try:
+        limit_value = float(str(limit_amount).replace(",", "").strip())
+        used_value = float(str(used_amount).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return "-"
+
+    if limit_value <= 0:
+        return "-"
+
+    usage_rate = (used_value / limit_value) * 100.0
+    if usage_rate.is_integer():
+        return f"{int(usage_rate)}%"
+    return f"{usage_rate:.2f}%"
+
+
+def routine_profit_signal(
+    gross_rate: object = None,
+    net_rate: object = None,
+) -> tuple[str, str, str]:
+    """수익률 표시값과 비용 반영 상태를 신호등 계약으로 변환한다."""
+    try:
+        gross_value = float(gross_rate)
+    except (TypeError, ValueError):
+        return "NEUTRAL", "-", ROUTINE_PROFIT_SIGNAL_COLORS["NEUTRAL"]
+
+    display_text = f"{gross_value:+.2f}%" if gross_value != 0 else "0.00%"
+
+    if gross_value < 0:
+        signal = "LOSS"
+    elif gross_value == 0:
+        signal = "NEUTRAL"
+    else:
+        try:
+            net_value = float(net_rate)
+        except (TypeError, ValueError):
+            signal = "NEUTRAL"
+        else:
+            signal = "NET_PROFIT" if net_value > 0 else "COST_NOT_RECOVERED"
+
+    return signal, display_text, ROUTINE_PROFIT_SIGNAL_COLORS[signal]
+
+
+def create_routine_profit_signal_widget(
+    gross_rate: object = None,
+    net_rate: object = None,
+) -> QWidget:
+    """숫자 글자색은 유지하고 원형 점에만 신호색을 적용한다."""
+    signal, display_text, color = routine_profit_signal(gross_rate, net_rate)
+
+    widget = QWidget()
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(4, 0, 4, 0)
+    layout.setSpacing(5)
+    layout.setAlignment(Qt.AlignCenter)
+
+    value_label = QLabel(display_text)
+    value_label.setObjectName("routineProfitSignalValue")
+
+    if display_text != "-":
+        dot_label = QLabel("●")
+        dot_label.setObjectName("routineProfitSignalDot")
+        dot_label.setAlignment(Qt.AlignCenter)
+        dot_label.setStyleSheet(f"color: {color}; font-size: 11pt;")
+        dot_label.setProperty("signal", signal)
+        layout.addWidget(dot_label)
+    layout.addWidget(value_label)
+    return widget
 
 
 from state_policy import (
@@ -189,4 +309,3 @@ def routine_status_display_text(routine_name: str, status: str) -> str:
         return f"{routine_name}({normalized})"
 
     return f"{routine_name}(상태없음)"
-

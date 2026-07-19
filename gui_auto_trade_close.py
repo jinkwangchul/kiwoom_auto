@@ -42,6 +42,15 @@ from gui_auto_trade_policy import (
     auto_trade_setting_liquidation_text,
     short_close_method_text,
 )
+from operation_command_service import (
+    EarlyCloseCompatibility,
+    MODE_EARLY_CLOSE,
+    OperationCommandRequest,
+    OperationCommandService,
+    RESULT_FAILED,
+    STOCK_APPLIED,
+    SCOPE_STOCK,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -525,6 +534,7 @@ def auto_trade_apply_selected_early_close(
 
     completed: list[str] = []
     skipped: list[str] = []
+    command_service = OperationCommandService(PROJECT_ROOT)
 
     for stock_dir, code, name in selected:
         state = read_json_dict(stock_dir / "state.json")
@@ -554,76 +564,30 @@ def auto_trade_apply_selected_early_close(
             holding_qty,
             sell_pending_qty,
         )
+        command_result = command_service.apply_early_close(
+            OperationCommandRequest(
+                target_scope=SCOPE_STOCK,
+                target_id=str(stock_dir.resolve()),
+                command=MODE_EARLY_CLOSE,
+                source=source,
+            ),
+            EarlyCloseCompatibility(
+                method=method_text,
+                policy=dict(extra_policy or {}),
+                has_close_progress_quantity=has_close_progress_qty,
+            ),
+        )
+        if command_result.status == RESULT_FAILED or command_result.failed:
+            reason = command_result.error
+            if command_result.failed:
+                reason = command_result.failed[0].error or reason
+            skipped.append(f"{code} {name}({reason or '명령 적용 실패'})")
+            continue
 
-        metadata = {
-            "review_required": False,
-            "review_status": "",
-            "review_location": "",
-            "review_reason": "",
-            "review_detail": "",
-            "trade_enabled": True,
-            "startup_reset_reason": "",
-            "startup_reset_cleared_at": now_text(),
-            "buy_enabled": True,
-            "operation_notice": "",
-            "operation_notice_reason": "",
-            "operation_notice_at": "",
-        }
-
-        if has_close_progress_qty:
-            metadata.update(
-                {
-                    "early_close_requested_at": now_text(),
-                    "early_close_source": source,
-                    "early_close_method": method_text,
-                    "early_close_policy": {
-                        "method": method_text,
-                        **(extra_policy or {}),
-                    },
-                    "liquidation_policy_forced": True,
-                    "liquidation_policy_reason": "EARLY_CLOSE",
-                    "buy_enabled": True,
-                    "sell_enabled": True,
-                    "close_routine_final_sell_ordered": False,
-                    "close_routine_final_sell_ordered_at": "",
-                    "close_routine_final_sell_source": "",
-                    "close_routine_final_sell_reason": "",
-                    # 새 조기마감 명령이 과거 복귀/재시작/정지 시각 때문에
-                    # 즉시 과거 메타로 오판되어 지워지지 않도록 종료 마커를 초기화한다.
-                    "review_returned_at": "",
-                    "resumed_at": "",
-                    "trade_started_at": "",
-                    "startup_reset_cleared_at": "",
-                    "startup_reset_at": "",
-                    "trade_stopped_at": "",
-                }
-            )
-            log_reason = f"조기마감/{method_text}/마감진행"
-        else:
-            metadata.update(
-                {
-                    "early_close_requested_at": "",
-                    "early_close_source": "",
-                    "early_close_method": "",
-                    "early_close_policy": {},
-                    "liquidation_policy_forced": False,
-                    "liquidation_policy_reason": "",
-                    "buy_enabled": False,
-                    "sell_enabled": False,
-                    "operation_notice": "EARLY_CLOSE_NO_TARGET",
-                    "operation_notice_reason": "조기마감 대상 없음",
-                    "operation_notice_at": now_text(),
-                    "close_routine_final_sell_ordered": False,
-                    "close_routine_final_sell_ordered_at": "",
-                    "close_routine_final_sell_source": "",
-                    "close_routine_final_sell_reason": "",
-                }
-            )
-            log_reason = ""
-
-        next_status = "EARLY_CLOSE" if has_close_progress_qty else "WAIT_BUY"
-        if window.update_stock_status(stock_dir, code, name, next_status, metadata, log_reason):
-            completed.append(f"{code} {name}")
+        completed.append(f"{code} {name}")
+        if command_result.stock_results and command_result.stock_results[0].status == STOCK_APPLIED:
+            log_reason = f"조기마감/{method_text}/마감진행" if has_close_progress_qty else "조기마감 대상 없음"
+            append_stock_log(stock_dir, "GUI", f"자동매매 상태 변경: {log_reason}")
 
     if completed or skipped:
         changelog_parts: list[str] = []
@@ -645,4 +609,3 @@ def auto_trade_apply_selected_early_close(
     if skipped:
         message += f" / 제외 {len(skipped)}개"
     window.statusBarMessage(message)
-

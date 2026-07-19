@@ -3,7 +3,7 @@
   "holding_qty": 0,
   "avg_price": 0,
   "created_at": "2026-06-15 19:03:54",
-  "updated_at": "2026-07-14 12:30:17",
+  "updated_at": "2026-07-19T10:39:27+09:00",
   "review_required": false,
   "review_status": "",
   "review_location": "",
@@ -44,5 +44,13 @@
   "signal_probe_stopped_at": "2026-07-03 08:51:28",
   "operation_policy_recalculated_at": "2026-07-14 12:30:17",
   "operation_policy_reason": "매매시작",
-  "operation_policy_mode": "SCHEDULED"
+  "operation_policy_mode": "SCHEDULED",
+  "operation_sequence": 2,
+  "operation_command_mode": "NORMAL",
+  "operation_command_id": "e53ad9f3-c803-4d50-ad83-29ed4d58484d",
+  "operation_command_source": "main_monitoring_window",
+  "operation_command_occurred_at": "",
+  "operation_command_updated_at": "2026-07-19T10:39:27+09:00",
+  "operation_command_scope": "STOCK",
+  "operation_command_target_id": "C:\\Users\\JIN KWANG CHUL\\Documents\\kiwoom_auto\\stocks\\003550_LG"
 }

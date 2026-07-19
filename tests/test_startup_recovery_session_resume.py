@@ -675,6 +675,171 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 approved.running_stock_table.items[(0, 4)],
             )
 
+    def test_main_running_table_keeps_assigned_non_review_stocks_visible(self) -> None:
+        class Header:
+            def setSortIndicator(self, *_args) -> None:
+                return None
+
+        class Table:
+            def __init__(self) -> None:
+                self.row_count = -1
+                self.items: dict[tuple[int, int], object] = {}
+                self.sorted: list[tuple[int, int]] = []
+
+            def columnCount(self) -> int:
+                return 10
+
+            def setRowCount(self, count: int) -> None:
+                self.row_count = count
+
+            def setItem(self, row: int, col: int, item: object) -> None:
+                self.items[(row, col)] = item
+
+            def sortItems(self, column: int, order: int) -> None:
+                self.sorted.append((column, order))
+
+            def horizontalHeader(self) -> Header:
+                return Header()
+
+        class Window:
+            def __init__(self) -> None:
+                self.running_stock_table = Table()
+                self._main_running_sort_column = 0
+                self._main_running_sort_order = 0
+
+            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                return False
+
+        class Item:
+            def __init__(self, text: str = "") -> None:
+                self._text = str(text)
+
+            def text(self) -> str:
+                return self._text
+
+            def setData(self, *_args) -> None:
+                return None
+
+            def setTextAlignment(self, *_args) -> None:
+                return None
+
+            def setForeground(self, *_args) -> None:
+                return None
+
+        routine_name = "indicator follow"
+        stock_dirs = {
+            "001111": Path("stocks") / "001111_STOPPED",
+            "002222": Path("stocks") / "002222_TRADE_FALSE",
+            "003333": Path("stocks") / "003333_REVIEW",
+        }
+        states = {
+            stock_dirs["001111"]: {
+                "status": "STOPPED",
+                "trade_enabled": False,
+                "holding_qty": 0,
+            },
+            stock_dirs["002222"]: {
+                "status": "WAIT_BUY",
+                "trade_enabled": False,
+                "holding_qty": 0,
+            },
+            stock_dirs["003333"]: {
+                "status": "REVIEW_REQUIRED",
+                "review_required": True,
+                "trade_enabled": True,
+            },
+        }
+        configs = {
+            path: {"operation_mode": "SCHEDULED"}
+            for path in stock_dirs.values()
+        }
+
+        base_stocks = [
+            {"code": "001111", "name": "Stopped", "routines": [routine_name]},
+            {"code": "002222", "name": "TradeFalse", "routines": [routine_name]},
+            {"code": "003333", "name": "Review", "routines": [routine_name]},
+            {"code": "004444", "name": "Unassigned", "routines": []},
+        ]
+
+        def runtime_dir(routine: str, code: str, _name: str) -> Path | None:
+            if routine != routine_name:
+                return None
+            return stock_dirs.get(code)
+
+        def read_json(path: Path) -> dict[str, object]:
+            parent = path.parent
+            if path.name == "state.json":
+                return dict(states.get(parent, {}))
+            if path.name == "config.json":
+                return dict(configs.get(parent, {}))
+            return {}
+
+        with (
+            patch.object(gui_main_table_loader, "read_base_stocks", return_value=base_stocks),
+            patch.object(gui_main_table_loader, "stock_runtime_dir_for_routine", side_effect=runtime_dir),
+            patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(gui_main_table_loader, "pending_order_side_quantities", return_value=(0, 0)),
+            patch.object(gui_main_table_loader, "SortableTableWidgetItem", Item),
+            patch.object(
+                gui_main_table_loader,
+                "create_auto_trade_situation_item",
+                side_effect=lambda _state, trade_started, _status: {
+                    "trade_started": trade_started
+                },
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "create_auto_trade_setting_status_item",
+                side_effect=lambda status: {"status": status},
+            ),
+        ):
+            window = Window()
+            gui_main_table_loader.main_load_running_stock_table(window)
+
+        self.assertEqual(2, window.running_stock_table.row_count)
+        displayed_codes = {
+            window.running_stock_table.items[(row, 0)].text()
+            for row in range(window.running_stock_table.row_count)
+        }
+        displayed_names = {
+            window.running_stock_table.items[(row, 1)].text()
+            for row in range(window.running_stock_table.row_count)
+        }
+        displayed_routines = {
+            window.running_stock_table.items[(row, 2)].text()
+            for row in range(window.running_stock_table.row_count)
+        }
+
+        self.assertEqual({"001111", "002222"}, displayed_codes)
+        self.assertEqual({"Stopped", "TradeFalse"}, displayed_names)
+        self.assertEqual({routine_name}, displayed_routines)
+        self.assertNotIn("003333", displayed_codes)
+        self.assertNotIn("004444", displayed_codes)
+        self.assertEqual([(0, 0)], window.running_stock_table.sorted)
+
+        for row in range(window.running_stock_table.row_count):
+            self.assertEqual(
+                {"trade_started": False},
+                window.running_stock_table.items[(row, 4)],
+            )
+            code = window.running_stock_table.items[(row, 0)].text()
+            expected_status = auto_trade_setting_display_status_for_current_session(
+                states[stock_dirs[code]],
+                configs[stock_dirs[code]],
+                holding_qty=0,
+                buy_pending_qty=0,
+                sell_pending_qty=0,
+                current_session_trade_started=False,
+                persisted_trade_started=auto_trade_setting_current_session_trade_started(
+                    window,
+                    False,
+                ),
+            )
+            self.assertEqual(
+                {"status": expected_status},
+                window.running_stock_table.items[(row, 5)],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
