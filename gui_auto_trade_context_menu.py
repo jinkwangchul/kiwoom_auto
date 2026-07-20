@@ -34,12 +34,14 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     action_unregister.setEnabled(has_selection)
 
     menu.addSeparator()
-    early_close_menu = menu.addMenu("조기 마감")
-    action_early_market = early_close_menu.addAction("시장가즉시")
-    action_early_current = early_close_menu.addAction("현재가즉시")
-    action_early_routine = early_close_menu.addAction("루틴")
+    early_close_menu = menu.addMenu("조기마감")
+    action_early_routine = early_close_menu.addAction("조기마감")
+    action_early_market = early_close_menu.addAction("시장가")
+    action_early_current = early_close_menu.addAction("현재가")
     action_early_profit_loss = early_close_menu.addAction("손/익절")
     action_early_carry = early_close_menu.addAction("이월")
+    early_close_menu.addSeparator()
+    action_early_cancel = early_close_menu.addAction("취소")
     early_close_menu.setEnabled(has_selection)
 
     action_individual_liquidation = menu.addAction("개별 청산")
@@ -74,20 +76,21 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         window.unregister_selected_auto_trade_stocks()
     elif chosen == action_individual_liquidation:
         window.open_selected_individual_liquidation_settings()
+    elif chosen == action_early_routine:
+        window.apply_selected_early_close("루틴", source="우클릭")
     elif chosen == action_early_market:
         window.apply_selected_early_close("시장가즉시", source="우클릭")
     elif chosen == action_early_current:
         window.apply_selected_early_close("현재가즉시", source="우클릭")
-    elif chosen == action_early_routine:
-        window.apply_selected_early_close("루틴", source="우클릭")
     elif chosen == action_early_profit_loss:
         window.apply_selected_early_close_profit_loss()
     elif chosen == action_early_carry:
         window.apply_selected_early_close("이월", source="우클릭")
+    elif chosen == action_early_cancel:
+        window.cancel_selected_early_close()
     elif action_time_change is not None and chosen == action_time_change:
         window.set_selected_individual_schedule_time()
     elif action_time_reset is not None and chosen == action_time_reset:
         window.reset_selected_schedule_to_global()
     elif action_ats_settings is not None and chosen == action_ats_settings:
         window.open_selected_manual_ats_settings_dialog()
-

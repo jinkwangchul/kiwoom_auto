@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from operation_command_service import (
     COMMAND_IMMEDIATE_LIQUIDATION,
@@ -784,6 +788,545 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         append_changelog.assert_called_once()
         window.refresh_all.assert_called_once()
         window.statusBarMessage.assert_called_with("조기마감 적용: 1개 / 제외 1개")
+
+
+class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
+    def test_status_bar_message_updates_parent_status_bar_only(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        dialog = Mock()
+        parent_status_bar = Mock()
+        parent = Mock()
+        parent.statusBar.return_value = parent_status_bar
+        dialog.parent.return_value = parent
+
+        AutoTradeSettingWindow.statusBarMessage(dialog, "마감정책이 취소되었습니다.", 1234)
+
+        parent_status_bar.showMessage.assert_called_once_with("마감정책이 취소되었습니다.", 1234)
+        dialog.setWindowTitle.assert_not_called()
+
+    def test_legacy_status_bar_message_uses_same_visible_path(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        dialog = Mock()
+
+        AutoTradeSettingWindow.statusBar_message(dialog, "현재 상태는 마감정책 취소 대상이 아닙니다.", 2345)
+
+        dialog.statusBarMessage.assert_called_once_with("현재 상태는 마감정책 취소 대상이 아닙니다.", 2345)
+
+    def test_popup_message_is_non_modal_buttonless_and_auto_closes(self) -> None:
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QApplication
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        window.show()
+        app.processEvents()
+        original_title = window.windowTitle()
+
+        window.showAutoTradePopupMessage("현재 상태는 마감정책 취소 대상이 아닙니다.", 80)
+        app.processEvents()
+        popup = window._notification_popup
+
+        self.assertIsNotNone(popup)
+        self.assertTrue(popup.isVisible())
+        self.assertEqual("현재 상태는 마감정책 취소 대상이 아닙니다.", popup.text())
+        self.assertIs(popup.parentWidget(), window)
+        self.assertEqual(Qt.NonModal, popup.windowModality())
+        self.assertEqual(0, popup.button_count())
+        self.assertEqual(original_title, window.windowTitle())
+
+        deadline = time.time() + 1.0
+        while popup.isVisible() and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+        self.assertFalse(popup.isVisible())
+
+    def test_popup_message_reuses_single_popup_instance(self) -> None:
+        from PyQt5.QtWidgets import QApplication
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        window.show()
+        app.processEvents()
+
+        window.showAutoTradePopupMessage("현재 상태는 마감정책 취소 대상이 아닙니다.", 0)
+        app.processEvents()
+        first_popup = window._notification_popup
+        window.showAutoTradePopupMessage("마감정책이 취소되었습니다.", 0)
+        app.processEvents()
+
+        self.assertIs(first_popup, window._notification_popup)
+        self.assertTrue(window._notification_popup.isVisible())
+        self.assertEqual("마감정책이 취소되었습니다.", window._notification_popup.text())
+
+
+class EarlyCloseCancelSafetyTest(unittest.TestCase):
+    @staticmethod
+    def _write_stock(root: Path, name: str) -> tuple[Path, str, str]:
+        stock_dir = root / "stocks" / name
+        stock_dir.mkdir(parents=True)
+        code, display_name = name.split("_", 1)
+        (stock_dir / "state.json").write_text(
+            json.dumps({"status": "RUNNING", "holding_qty": 5, "trade_enabled": True}),
+            encoding="utf-8",
+        )
+        (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+        return stock_dir, code, display_name
+
+    @staticmethod
+    def _window(selected) -> Mock:
+        window = Mock()
+        window.selected_stock_infos.return_value = selected
+        window.showAutoTradePopupMessage = Mock()
+        viewport = Mock()
+        window.stock_table.viewport.return_value = viewport
+        window.stock_table.selectionModel.return_value.selectedRows.return_value = []
+        return window
+
+    def test_cancel_early_close_succeeds_when_safe(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["status"] = "EARLY_CLOSE"
+            state["trade_enabled"] = True
+            state["operation_command_mode"] = MODE_EARLY_CLOSE
+            state["early_close_requested_at"] = "2026-07-21 09:30:00"
+            state["early_close_source"] = "우클릭"
+            state["early_close_method"] = "루틴"
+            state["liquidation_policy_forced"] = True
+            state["liquidation_policy_reason"] = "EARLY_CLOSE"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window = self._window(selected)
+
+            with (
+                patch("gui_auto_trade_close.QMessageBox.warning") as warning,
+                patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
+                patch("gui_auto_trade_close.OperationCommandService", return_value=OperationCommandService(Path(temp))),
+                patch("gui_auto_trade_close.append_changelog") as append_changelog,
+                patch("gui_auto_trade_close.append_stock_log") as append_stock_log,
+            ):
+                auto_trade_cancel_selected_early_close(window)
+
+            warning.assert_not_called()
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual("", saved["early_close_requested_at"])
+            self.assertEqual("", saved["early_close_source"])
+            self.assertEqual("", saved["early_close_method"])
+            self.assertFalse(saved["liquidation_policy_forced"])
+            self.assertEqual(MODE_NORMAL, saved["operation_command_mode"])
+            append_stock_log.assert_called_once()
+            append_changelog.assert_called_once()
+            window.refresh_all.assert_called_once()
+            window.showAutoTradePopupMessage.assert_called_with("마감정책이 취소되었습니다.")
+
+    def test_cancel_early_close_blocks_not_applied_stock(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.QMessageBox.warning") as warning:
+                auto_trade_cancel_selected_early_close(window)
+
+            warning.assert_not_called()
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_when_selected_row_displays_waiting(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["status"] = "EARLY_CLOSE"
+            state["trade_enabled"] = True
+            state["operation_command_mode"] = MODE_EARLY_CLOSE
+            state["early_close_requested_at"] = "2026-07-21 09:30:00"
+            state["early_close_source"] = "우클릭"
+            state["early_close_method"] = "루틴"
+            state["liquidation_policy_forced"] = True
+            state["liquidation_policy_reason"] = "EARLY_CLOSE"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+            window = self._window(selected)
+            selected_index = Mock()
+            selected_index.row.return_value = 0
+            path_item = Mock()
+            path_item.data.return_value = str(selected[0][0])
+            status_item = Mock()
+            status_item.text.return_value = "감시/대기"
+            window.stock_table.selectionModel.return_value.selectedRows.return_value = [selected_index]
+            window.stock_table.item.side_effect = lambda _row, col: path_item if col == 0 else status_item if col == 4 else None
+
+            with patch("gui_auto_trade_close.OperationCommandService") as service_type:
+                auto_trade_cancel_selected_early_close(window)
+
+            service_type.assert_not_called()
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_when_not_trading(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": False,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.append_stock_log") as append_stock_log:
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            append_stock_log.assert_called_once()
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_order_queued(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            queue_path = root / "runtime" / "order_queue.json"
+            queue_path.parent.mkdir()
+            queue_path.write_text(
+                json.dumps({"orders": [{"status": "ORDER_QUEUED", "code": "005930"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", queue_path):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_send_order_called_without_fill(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            queue_path = root / "runtime" / "order_queue.json"
+            queue_path.parent.mkdir()
+            queue_path.write_text(
+                json.dumps({"orders": [{"status": "REAL_READY", "code": "005930", "send_order_called": True}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", queue_path):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_dispatch_claim(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            queue_path = root / "runtime" / "order_queue.json"
+            queue_path.parent.mkdir()
+            queue_path.write_text(
+                json.dumps({"orders": [{"status": "REAL_READY", "code": "005930", "dispatch_id": "D1"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", queue_path):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_broker_or_pending_order(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (selected[0][0] / "orders.json").write_text(
+                json.dumps({
+                    "orders": [{
+                        "side": "SELL",
+                        "order_time": "2026-07-21 09:31:00",
+                        "status": "ACCEPTED",
+                        "broker_order_no": "BRK1",
+                        "pending_qty": 1,
+                    }]
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", root / "runtime" / "order_queue.json"):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_filled_sell_order(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (selected[0][0] / "orders.json").write_text(
+                json.dumps({
+                    "orders": [{
+                        "side": "SELL",
+                        "order_time": "2026-07-21 09:31:00",
+                        "filled_qty": 1,
+                    }]
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", root / "runtime" / "order_queue.json"):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_runtime_queue_read_failure(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [self._write_stock(root, "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            queue_path = root / "runtime" / "order_queue.json"
+            queue_path.parent.mkdir()
+            queue_path.write_text("{broken", encoding="utf-8")
+            window = self._window(selected)
+
+            with patch("gui_auto_trade_close.ORDER_QUEUE_PATH", queue_path):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_blocks_read_back_failure(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            service = Mock()
+            service.apply.return_value = OperationCommandResult(
+                RESULT_SUCCESS,
+                "cancel-readback-fail",
+                (StockOperationCommandResult("005930", str(selected[0][0]), STOCK_APPLIED, 1),),
+            )
+            window = self._window(selected)
+
+            with (
+                patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
+                patch("gui_auto_trade_close.OperationCommandService", return_value=service),
+            ):
+                auto_trade_cancel_selected_early_close(window)
+
+            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+    def test_cancel_early_close_second_run_is_blocked(self) -> None:
+        from gui_auto_trade_close import auto_trade_cancel_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            state_path = selected[0][0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update({
+                "status": "EARLY_CLOSE",
+                "trade_enabled": True,
+                "operation_command_mode": MODE_EARLY_CLOSE,
+                "early_close_requested_at": "2026-07-21 09:30:00",
+                "liquidation_policy_forced": True,
+            })
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window = self._window(selected)
+
+            with (
+                patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
+                patch("gui_auto_trade_close.OperationCommandService", return_value=OperationCommandService(Path(temp))),
+            ):
+                auto_trade_cancel_selected_early_close(window)
+                auto_trade_cancel_selected_early_close(window)
+
+            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+
+
+class AutoTradeContextMenuTest(unittest.TestCase):
+    class _FakeAction:
+        def __init__(self, text: str, separator: bool = False) -> None:
+            self.text = text
+            self.enabled = True
+            self.separator = separator
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = bool(enabled)
+
+    class _FakeMenu:
+        root = None
+        chosen_text = None
+
+        def __init__(self, _parent=None, title: str = "") -> None:
+            self.title = title
+            self.actions: list[AutoTradeContextMenuTest._FakeAction] = []
+            self.submenus: list[AutoTradeContextMenuTest._FakeMenu] = []
+            if not title:
+                AutoTradeContextMenuTest._FakeMenu.root = self
+
+        def addAction(self, text: str):
+            action = AutoTradeContextMenuTest._FakeAction(text)
+            self.actions.append(action)
+            return action
+
+        def addMenu(self, text: str):
+            submenu = AutoTradeContextMenuTest._FakeMenu(title=text)
+            self.submenus.append(submenu)
+            return submenu
+
+        def addSeparator(self) -> None:
+            self.actions.append(AutoTradeContextMenuTest._FakeAction("<separator>", separator=True))
+            return None
+
+        def setEnabled(self, _enabled: bool) -> None:
+            return None
+
+        def exec_(self, _pos):
+            chosen_text = AutoTradeContextMenuTest._FakeMenu.chosen_text
+            if chosen_text is None:
+                return None
+            for menu in [self, *self.submenus]:
+                for action in menu.actions:
+                    if action.text == chosen_text:
+                        return action
+            return None
+
+    @staticmethod
+    def _window() -> Mock:
+        window = Mock()
+        item = Mock()
+        item.row.return_value = 0
+        window.stock_table.itemAt.return_value = item
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = object()
+        window.selected_stock_infos.return_value = [(Path("stocks/005930_Samsung"), "005930", "Samsung")]
+        window.selected_operation_mode_set.return_value = set()
+        return window
+
+    def test_early_close_menu_order_and_display_labels(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_text = None
+        with patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu):
+            show_auto_trade_stock_context_menu(window, object())
+
+        early_menu = self._FakeMenu.root.submenus[0]
+        self.assertEqual("조기마감", early_menu.title)
+        self.assertEqual(
+            ["조기마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+            [action.text for action in early_menu.actions if not action.separator],
+        )
+        self.assertEqual("<separator>", early_menu.actions[5].text)
+
+    def test_early_close_menu_display_labels_keep_existing_call_values(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        expected = {
+            "조기마감": ("apply_selected_early_close", ("루틴",), {"source": "우클릭"}),
+            "시장가": ("apply_selected_early_close", ("시장가즉시",), {"source": "우클릭"}),
+            "현재가": ("apply_selected_early_close", ("현재가즉시",), {"source": "우클릭"}),
+            "손/익절": ("apply_selected_early_close_profit_loss", (), {}),
+            "이월": ("apply_selected_early_close", ("이월",), {"source": "우클릭"}),
+            "취소": ("cancel_selected_early_close", (), {}),
+        }
+        for chosen_text, (method_name, args, kwargs) in expected.items():
+            with self.subTest(chosen_text=chosen_text):
+                window = self._window()
+                self._FakeMenu.chosen_text = chosen_text
+                with patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu):
+                    show_auto_trade_stock_context_menu(window, object())
+                getattr(window, method_name).assert_called_once_with(*args, **kwargs)
 
 
 if __name__ == "__main__":

@@ -191,6 +191,7 @@ from gui_auto_trade_display import (
     auto_trade_setting_status_color,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
+    draw_stock_position_metric,
     yes_no_display,
     display_status_text_for_gui,
     routine_status_display_text,
@@ -265,6 +266,7 @@ from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close,
     auto_trade_apply_selected_early_close_default,
     auto_trade_apply_selected_early_close_profit_loss,
+    auto_trade_cancel_selected_early_close,
     auto_trade_open_selected_individual_liquidation_settings,
     auto_trade_save_selected_individual_liquidation_settings,
 )
@@ -358,6 +360,82 @@ from final_send_gate_service import evaluate_final_send_gate
 from order_queued_review_service import review_order_queued_record
 from position_update_service import update_position_from_fill
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
+
+
+class StockPositionMetricDelegate(QStyledItemDelegate):
+    """보유/가격/손익/미체결 셀의 숫자 슬롯을 우측 정렬해 그린다."""
+
+    def paint(self, painter, option, index) -> None:
+        text = str(index.data(Qt.DisplayRole) or "")
+        color = (
+            option.palette.highlightedText().color()
+            if option.state & QStyle.State_Selected
+            else option.palette.text().color()
+        )
+        if draw_stock_position_metric(
+            painter,
+            option.rect.adjusted(2, 0, -2, 0),
+            text,
+            color,
+        ):
+            return
+        super().paint(painter, option, index)
+
+
+class AutoTradeNotificationPopup(QFrame):
+    """자동매매설정창 안에서 쓰는 버튼 없는 비모달 자동닫힘 알림."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint)
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setObjectName("autoTradeNotificationPopup")
+        self._label = QLabel(self)
+        self._label.setObjectName("autoTradeNotificationText")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setWordWrap(False)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.addWidget(self._label)
+        self.setStyleSheet(
+            """
+            QFrame#autoTradeNotificationPopup {
+                background-color: #111827;
+                border: 1px solid #374151;
+                border-radius: 6px;
+            }
+            QLabel#autoTradeNotificationText {
+                color: #ffffff;
+                font-weight: 600;
+            }
+            """
+        )
+
+    def show_message(self, message: str, timeout_ms: int = 2500) -> None:
+        self._label.setText(str(message or ""))
+        self.adjustSize()
+        self._move_to_parent_center()
+        self.show()
+        self.raise_()
+        if timeout_ms > 0:
+            QTimer.singleShot(timeout_ms, self.hide)
+
+    def text(self) -> str:
+        return self._label.text()
+
+    def button_count(self) -> int:
+        return 0
+
+    def _move_to_parent_center(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        parent_rect = parent.frameGeometry()
+        popup_rect = self.frameGeometry()
+        center = parent_rect.center()
+        popup_rect.moveCenter(center)
+        self.move(popup_rect.topLeft())
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -939,6 +1017,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_review_view = QPushButton("검토관리")
         self.btn_refresh = QPushButton("안정성검사")
         self.btn_close = QPushButton("닫기")
+        self._notification_popup = None
 
         self._routine_sort_column = -1
         self._routine_sort_order = Qt.AscendingOrder
@@ -1071,10 +1150,9 @@ class AutoTradeSettingWindow(QDialog):
             "방식",
             "청산",
             "보유",
-            "평단",
-            "매매",
-            "미수",
-            "미도",
+            "가격",
+            "손익",
+            "미체결",
         ]
 
         self.stock_table.setColumnCount(len(headers))
@@ -1092,9 +1170,15 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.verticalHeader().setMinimumWidth(40)
         self.stock_table.verticalHeader().setMaximumWidth(40)
         self.stock_table.verticalHeader().setFixedWidth(40)
+        self._stock_position_metric_delegate = StockPositionMetricDelegate(self.stock_table)
+        for col in (7, 8, 9, 10):
+            self.stock_table.setItemDelegateForColumn(
+                col,
+                self._stock_position_metric_delegate,
+            )
 
-        # 자동매매설정창 하단 종목표 고정폭 배분
-        # 합계 920px: 전체 컬럼을 소폭 확대해 말줄임을 줄인다.
+        # 자동매매설정창 하단 종목표 고정폭 배분.
+        # 보유/가격/손익/미체결은 관제 트리와 같은 묶음 단위로 표시한다.
         self._apply_stock_table_column_widths()
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1106,6 +1190,9 @@ class AutoTradeSettingWindow(QDialog):
 
     def _apply_stock_table_column_widths(self) -> None:
         """자동매매설정창 하단 종목표 컬럼 폭을 강제로 재적용한다."""
+        from gui_main_table_loader import routine_stock_column_widths
+
+        stock_metric_widths = routine_stock_column_widths(self.stock_table.font())
         widths = {
             0: 80,    # 코드: 6자리 여유
             1: 205,   # 종목: 13자 기준
@@ -1114,11 +1201,10 @@ class AutoTradeSettingWindow(QDialog):
             4: 90,   # 상태: 감시/대기, 매수/매도
             5: 80,    # 방식: 루틴, 시장가, 현재가
             6: 120,   # 청산: 10분/시장가, 10분/현재가
-            7: 75,    # 보유: 십만 단위
-            8: 90,    # 평단: 천만 단위
-            9: 47,    # 매매: 건수 백단위
-            10: 47,   # 미수: 건수 백단위
-            11: 47,   # 미도: 건수 백단위
+            7: 174,   # 보유: 수량 / 총매수금액
+            8: stock_metric_widths[7],   # 가격: 평단가 / 현재가
+            9: 174,   # 손익: 손익금 / 수익률
+            10: 110,  # 미체결: 미수 / 미도
         }
         self.stock_table.verticalHeader().setMinimumWidth(40)
         self.stock_table.verticalHeader().setMaximumWidth(40)
@@ -5124,13 +5210,7 @@ class AutoTradeSettingWindow(QDialog):
         unregister_selected_auto_trade_stocks(self)
 
     def statusBar_message(self, message: str, timeout_ms: int = 7000) -> None:
-        parent = self.parent()
-        status_bar_getter = getattr(parent, "statusBar", None)
-        if callable(status_bar_getter):
-            try:
-                status_bar_getter().showMessage(message, timeout_ms)
-            except Exception:
-                pass
+        self.statusBarMessage(message, timeout_ms)
 
 
     def open_operation_environment_settings(self) -> None:
@@ -5423,6 +5503,9 @@ class AutoTradeSettingWindow(QDialog):
     def apply_selected_early_close_profit_loss(self) -> None:
         auto_trade_apply_selected_early_close_profit_loss(self)
 
+    def cancel_selected_early_close(self) -> None:
+        auto_trade_cancel_selected_early_close(self)
+
     def apply_selected_early_close(
         self,
         method: str,
@@ -5452,7 +5535,6 @@ class AutoTradeSettingWindow(QDialog):
         """부모 창 상태바에 메시지를 전달한다.
 
         분리 모듈에서는 MainWindow를 직접 참조하지 않는다.
-        부모가 statusBar()를 제공하면 사용하고, 아니면 창 제목만 갱신한다.
         """
         parent = self.parent()
         status_bar_getter = getattr(parent, "statusBar", None)
@@ -5461,7 +5543,13 @@ class AutoTradeSettingWindow(QDialog):
                 status_bar_getter().showMessage(message, timeout_ms)
             except Exception:
                 pass
-        self.setWindowTitle(f"자동매매설정 - {message}")
+
+    def showAutoTradePopupMessage(self, message: str, timeout_ms: int = 2500) -> None:
+        popup = getattr(self, "_notification_popup", None)
+        if popup is None:
+            popup = AutoTradeNotificationPopup(self)
+            self._notification_popup = popup
+        popup.show_message(message, timeout_ms)
 
     def open_order_status_window(self) -> None:
         open_auto_trade_order_status_window(self)

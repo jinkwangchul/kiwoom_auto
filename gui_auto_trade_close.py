@@ -11,6 +11,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -27,15 +28,21 @@ from PyQt5.QtWidgets import (
 
 from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
+from gui_order_utils import order_current_pending_qty
+from gui_order_utils import order_datetime
+from gui_order_utils import order_value
 from gui_order_utils import pending_order_side_quantities
+from gui_order_utils import read_orders_data
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
 from gui_auto_trade_integrity import auto_trade_setting_data_inconsistency_reasons
 from gui_auto_trade_policy import (
     operation_policy_section,
+    auto_trade_setting_early_close_requested,
     auto_trade_setting_has_buy_pending_problem,
     auto_trade_setting_has_close_progress_quantity,
     auto_trade_setting_liquidation_phase_active,
+    auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
     close_method_from_state_or_policy,
     effective_liquidation_policy_for_config,
@@ -45,9 +52,11 @@ from gui_auto_trade_policy import (
 from operation_command_service import (
     EarlyCloseCompatibility,
     MODE_EARLY_CLOSE,
+    MODE_NORMAL,
     OperationCommandRequest,
     OperationCommandService,
     RESULT_FAILED,
+    RESULT_SUCCESS,
     STOCK_APPLIED,
     SCOPE_STOCK,
 )
@@ -55,6 +64,7 @@ from operation_command_service import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
+ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -388,6 +398,272 @@ def auto_trade_apply_selected_early_close_profit_loss(window) -> None:
         },
     )
 
+
+
+def _read_runtime_order_queue() -> tuple[list[dict[str, object]], str]:
+    if not ORDER_QUEUE_PATH.exists():
+        return [], ""
+    try:
+        data = json.loads(ORDER_QUEUE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], f"queue_read_failed:{exc}"
+    if not isinstance(data, dict):
+        return [], "queue_root_invalid"
+    orders = data.get("orders", [])
+    if not isinstance(orders, list):
+        return [], "queue_orders_invalid"
+    if not all(isinstance(order, dict) for order in orders):
+        return [], "queue_order_invalid"
+    return orders, ""
+
+
+def _nested_text_values(value: object) -> list[str]:
+    if isinstance(value, dict):
+        result: list[str] = []
+        for child in value.values():
+            result.extend(_nested_text_values(child))
+        return result
+    if isinstance(value, list):
+        result: list[str] = []
+        for child in value:
+            result.extend(_nested_text_values(child))
+        return result
+    return [str(value or "").strip()]
+
+
+def _record_mentions_code(record: dict[str, object], code: str) -> bool:
+    if not code:
+        return False
+    return any(text == code for text in _nested_text_values(record))
+
+
+def _truthy_record_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() not in {"", "0", "false", "none", "no", "n"}
+
+
+def _queue_execution_evidence_for_code(code: str) -> str:
+    records, read_error = _read_runtime_order_queue()
+    if read_error:
+        return read_error
+    for record in records:
+        if not _record_mentions_code(record, code):
+            continue
+        status = str(record.get("status") or "").strip().upper()
+        if status == "ORDER_QUEUED":
+            return "ORDER_QUEUED"
+        for key in (
+            "dispatch_id",
+            "claim_token",
+            "claimed_at",
+            "send_order_attempt_id",
+            "send_order_called_at",
+            "broker_order_no",
+            "broker_status",
+        ):
+            if str(record.get(key) or "").strip():
+                return key
+        for key in ("send_order_called", "execution_enabled"):
+            if _truthy_record_value(record.get(key)):
+                return key
+    return ""
+
+
+def _order_is_after_early_close(order: dict[str, object], requested_at: str) -> tuple[bool, str]:
+    order_dt = order_datetime(order)
+    if order_dt is None:
+        return False, "order_time_unknown"
+    try:
+        requested_dt = datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            requested_dt = datetime.strptime(requested_at, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False, "early_close_time_unknown"
+    if order_dt.tzinfo is not None and requested_dt.tzinfo is None:
+        order_dt = order_dt.replace(tzinfo=None)
+    if order_dt.tzinfo is None and requested_dt.tzinfo is not None:
+        requested_dt = requested_dt.replace(tzinfo=None)
+    return order_dt >= requested_dt, ""
+
+
+def _stock_order_execution_evidence(stock_dir: Path, requested_at: str) -> str:
+    for order in read_orders_data(stock_dir / "orders.json"):
+        side = str(order_value(order, ["side", "order_side", "구분", "매매구분"], "")).strip().upper()
+        if side not in {"SELL", "매도", "S"}:
+            continue
+        is_after, time_error = _order_is_after_early_close(order, requested_at)
+        evidence_fields = (
+            "id",
+            "order_id",
+            "broker_order_no",
+            "dispatch_id",
+            "send_order_attempt_id",
+            "send_order_called_at",
+            "send_order_status",
+        )
+        has_identity = any(str(order.get(key) or "").strip() for key in evidence_fields)
+        has_send_order = _truthy_record_value(order.get("send_order_called"))
+        filled_qty = safe_int_value(order_value(order, ["filled_qty", "executed_qty", "체결수량"], 0), 0)
+        pending_qty, pending_unknown = order_current_pending_qty(order)
+        if time_error and (has_identity or has_send_order or filled_qty > 0 or pending_qty > 0 or pending_unknown):
+            return time_error
+        if not is_after:
+            continue
+        if has_identity:
+            return "order_identity"
+        if has_send_order:
+            return "send_order_called"
+        if filled_qty > 0:
+            return "filled_qty"
+        if pending_unknown or pending_qty > 0:
+            return "pending_order"
+    return ""
+
+
+def _selected_display_status_by_stock_dir(window) -> dict[str, str]:
+    table = getattr(window, "stock_table", None)
+    if table is None:
+        return {}
+    try:
+        selected_rows = list(table.selectionModel().selectedRows())
+    except Exception:
+        return {}
+
+    result: dict[str, str] = {}
+    for index in selected_rows:
+        try:
+            row = index.row()
+            path_item = table.item(row, 0)
+            status_item = table.item(row, 4)
+        except Exception:
+            continue
+        if path_item is None or status_item is None:
+            continue
+        try:
+            path_text = str(path_item.data(Qt.UserRole) or "").strip()
+        except Exception:
+            path_text = ""
+        if not path_text:
+            continue
+        try:
+            key = str(Path(path_text).resolve())
+        except Exception:
+            key = path_text
+        result[key] = str(status_item.text() or "").strip()
+    return result
+
+
+def _early_close_cancel_block_reason(
+    stock_dir: Path,
+    code: str,
+    state: dict[str, object],
+    *,
+    display_status: str = "",
+) -> str:
+    if not isinstance(state, dict) or not state:
+        return "state_read_failed"
+    if not auto_trade_setting_trade_started(state):
+        return "trade_not_started"
+    if not auto_trade_setting_early_close_requested(state):
+        return "early_close_not_active"
+    if display_status and display_status != "조기마감":
+        return "display_not_early_close"
+    requested_at = str(state.get("early_close_requested_at") or "").strip()
+    if not requested_at:
+        return "early_close_identity_missing"
+    if str(state.get("close_routine_final_sell_ordered_at") or "").strip():
+        return "final_sell_ordered_at"
+    if bool(state.get("close_routine_final_sell_ordered", False)):
+        return "final_sell_ordered"
+    buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
+    if buy_pending_qty == "?" or sell_pending_qty == "?":
+        return "pending_unknown"
+    if safe_int_value(buy_pending_qty, 0) > 0 or safe_int_value(sell_pending_qty, 0) > 0:
+        return "pending_order"
+    queue_evidence = _queue_execution_evidence_for_code(code)
+    if queue_evidence:
+        return queue_evidence
+    order_evidence = _stock_order_execution_evidence(stock_dir, requested_at)
+    if order_evidence:
+        return order_evidence
+    return ""
+
+
+def auto_trade_cancel_selected_early_close(window) -> None:
+    """우클릭 조기마감 > 취소.
+
+    실행 증거가 없는 조기마감 명령만 기존 OperationCommandService의 NORMAL
+    적용 경로로 철회한다. 안전성을 확인할 수 없으면 fail-closed로 차단한다.
+    """
+    blocked_message = "현재 상태는 마감정책 취소 대상이 아닙니다."
+    success_message = "마감정책이 취소되었습니다."
+    notify = getattr(window, "showAutoTradePopupMessage", None)
+    if not callable(notify):
+        notify = window.statusBarMessage
+    selected = window.selected_stock_infos()
+    if not selected:
+        notify(blocked_message)
+        return
+
+    states: list[tuple[Path, str, str, dict[str, object]]] = []
+    block_reasons: list[tuple[Path, str, str, str]] = []
+    display_status_by_stock_dir = _selected_display_status_by_stock_dir(window)
+    for stock_dir, code, name in selected:
+        state = read_json_dict(stock_dir / "state.json")
+        stock_dir_key = str(stock_dir.resolve())
+        reason = _early_close_cancel_block_reason(
+            stock_dir,
+            code,
+            state,
+            display_status=display_status_by_stock_dir.get(stock_dir_key, ""),
+        )
+        if reason:
+            block_reasons.append((stock_dir, code, name, reason))
+            continue
+        states.append((stock_dir, code, name, state))
+
+    if block_reasons or not states:
+        for stock_dir, code, name, reason in block_reasons:
+            append_stock_log(stock_dir, "GUI", f"조기마감 취소 차단: {code} {name} / {reason}")
+        notify(blocked_message)
+        return
+
+    command_service = OperationCommandService(PROJECT_ROOT)
+    completed: list[str] = []
+    failed: list[tuple[Path, str, str, str]] = []
+    for stock_dir, code, name, _state in states:
+        result = command_service.apply(
+            OperationCommandRequest(
+                target_scope=SCOPE_STOCK,
+                target_id=str(stock_dir.resolve()),
+                command=MODE_NORMAL,
+                source="우클릭",
+            )
+        )
+        if result.status != RESULT_SUCCESS or not result.stock_results or result.stock_results[0].status != STOCK_APPLIED:
+            reason = result.error or (result.stock_results[0].error if result.stock_results else "cancel_failed")
+            failed.append((stock_dir, code, name, reason))
+            continue
+        saved = read_json_dict(stock_dir / "state.json")
+        if auto_trade_setting_early_close_requested(saved):
+            failed.append((stock_dir, code, name, "read_back_early_close_still_active"))
+            continue
+        completed.append(f"{code} {name}")
+        append_stock_log(stock_dir, "GUI", "조기마감 취소 완료")
+
+    if failed or not completed:
+        for stock_dir, code, name, reason in failed:
+            append_stock_log(stock_dir, "GUI", f"조기마감 취소 차단: {code} {name} / {reason}")
+        notify(blocked_message)
+        return
+
+    append_changelog("UPDATE", "state.json", f"조기마감 취소: {' / '.join(completed)}")
+    window.refresh_all()
+    window.stock_table.viewport().update()
+    window.stock_table.repaint()
+    notify(success_message)
 
 
 def auto_trade_apply_selected_early_close(
