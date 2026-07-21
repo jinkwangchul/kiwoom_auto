@@ -607,6 +607,337 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             QFontMetrics(QFont()).horizontalAdvance("9,999,999"),
         )
 
+    def test_main_stock_metric_display_can_keep_labels(self) -> None:
+        holding_metric, *_ = stock_position_metric_values(
+            holding_qty=120,
+            avg_price=28750,
+            current_price=29100,
+        )
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+
+        draw_stock_position_metric_display(
+            painter,
+            QRect(0, 0, 260, 24),
+            holding_metric,
+            outer_padding=2,
+            show_label=True,
+        )
+
+        drawn_text = [call.args[-1] for call in painter.drawText.call_args_list]
+        self.assertIn("\ubcf4\uc720(", drawn_text)
+        self.assertIn("120\uc8fc", drawn_text)
+        self.assertIn(" / ", drawn_text)
+        self.assertIn("3,450,000", drawn_text)
+        self.assertIn(")", drawn_text)
+
+    def test_main_stock_metric_sequence_uses_fixed_separator_gap(self) -> None:
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+        texts = [
+            "보유(99999주 / 999,999,999)",
+            "가격(9,999,999 / 9,999,999)",
+            "손익(-99,999,999 / -00.00%)",
+            "미체결(99 / 99)",
+            "한도(999,999,999)",
+            "소모(999,999,999 / 00.0%)",
+        ]
+
+        texts = list(gui_windows.MAIN_STOCK_METRIC_MAX_TEXTS)
+
+        rows, _end_x = gui_windows._draw_routine_stock_metric_text_sequence(
+            painter,
+            row_rect=QRect(0, 0, 1200, 24),
+            start_x=100,
+            texts=texts,
+        )
+
+        for _text, _text_start, text_end, separator_start, next_text_start in rows[:-1]:
+            self.assertEqual(
+                gui_windows.ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
+                separator_start - text_end,
+            )
+            self.assertEqual(
+                gui_windows.ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
+                next_text_start - (separator_start + gui_windows.ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH),
+            )
+
+        drawn_texts = [call.args[-1] for call in painter.drawText.call_args_list]
+        for text in texts:
+            self.assertNotIn(text, drawn_texts)
+        self.assertEqual(len(texts) - 1, drawn_texts.count("|"))
+        self.assertEqual(gui_windows.MAIN_STOCK_METRIC_SLOT_WIDTHS[: len(texts)], tuple(row[2] - row[1] for row in rows))
+
+    def test_main_stock_metric_sequence_uses_max_text_slots(self) -> None:
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+        actual_texts = [
+            "\ubcf4\uc720(0\uc8fc / 0)",
+            "\uac00\uaca9(- / -)",
+            "\uc190\uc775(0 / 0.00%)",
+            "\ubbf8\uccb4\uacb0(0 / 0)",
+            "\ud55c\ub3c4(\ubbf8\uc124\uc815)",
+            "\uc18c\ubaa8(0 / 0.0%)",
+        ]
+
+        max_rows, _ = gui_windows._draw_routine_stock_metric_text_sequence(
+            painter,
+            row_rect=QRect(0, 0, 1600, 24),
+            start_x=100,
+            texts=list(gui_windows.MAIN_STOCK_METRIC_MAX_TEXTS),
+        )
+        painter.reset_mock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+        actual_rows, _ = gui_windows._draw_routine_stock_metric_text_sequence(
+            painter,
+            row_rect=QRect(0, 0, 1600, 24),
+            start_x=100,
+            texts=actual_texts,
+        )
+
+        self.assertEqual(
+            [row[1] for row in max_rows],
+            [row[1] for row in actual_rows],
+        )
+        self.assertEqual(
+            [row[3] for row in max_rows[:-1]],
+            [row[3] for row in actual_rows[:-1]],
+        )
+
+    def test_main_stock_metric_layout_rects_are_text_independent(self) -> None:
+        row_rect = QRect(0, 5, 1600, 24)
+        preview_metric_rects, preview_separator_rects, preview_end_x = (
+            gui_windows._routine_stock_metric_layout_rects(
+                row_rect=row_rect,
+                start_x=100,
+                count=len(gui_windows.MAIN_STOCK_METRIC_MAX_TEXTS),
+            )
+        )
+        actual_metric_rects, actual_separator_rects, actual_end_x = (
+            gui_windows._routine_stock_metric_layout_rects(
+                row_rect=row_rect,
+                start_x=100,
+                count=6,
+            )
+        )
+
+        self.assertEqual(preview_metric_rects, actual_metric_rects)
+        self.assertEqual(preview_separator_rects, actual_separator_rects)
+        self.assertEqual(preview_end_x, actual_end_x)
+        self.assertEqual(
+            list(gui_windows.MAIN_STOCK_METRIC_SLOT_WIDTHS),
+            [rect.width() for rect in actual_metric_rects],
+        )
+        self.assertEqual(
+            [gui_windows.ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH] * 5,
+            [rect.width() for rect in actual_separator_rects],
+        )
+
+    def test_main_stock_metric_component_rects_are_text_independent(self) -> None:
+        row_rect = QRect(0, 5, 1600, 24)
+        metric_rects, _separator_rects, _end_x = gui_windows._routine_stock_metric_layout_rects(
+            row_rect=row_rect,
+            start_x=100,
+            count=6,
+        )
+        metrics = QFontMetrics(QFont())
+        preview_components = gui_windows._main_stock_metric_component_layouts(
+            metrics,
+            metric_rects,
+        )
+        actual_components = gui_windows._main_stock_metric_component_layouts(
+            metrics,
+            metric_rects,
+        )
+
+        self.assertEqual(preview_components, actual_components)
+        self.assertIn("label", actual_components[0])
+        self.assertIn("open_paren", actual_components[0])
+        self.assertIn("left_value", actual_components[0])
+        self.assertIn("slash", actual_components[0])
+        self.assertIn("right_value", actual_components[0])
+        self.assertIn("close_paren", actual_components[0])
+        self.assertNotIn("slash", actual_components[4])
+
+    def test_main_stock_limit_hit_rect_uses_display_layout_rect(self) -> None:
+        class FakeIndex:
+            def data(self, role):
+                if role == gui_main_table_loader.ROUTINE_STOCK_VALUES_ROLE:
+                    return [""] * 12
+                return None
+
+        class FakeTable:
+            def visualRect(self, _index):
+                return QRect(0, 7, 2400, 24)
+
+            def font(self):
+                return QFont()
+
+        table = FakeTable()
+        index = FakeIndex()
+        controller = gui_windows._RoutineCheckBoxController.__new__(
+            gui_windows._RoutineCheckBoxController
+        )
+        controller.table = table
+        legacy_holding_rect = controller._stock_legacy_metric_rect(index, 6)
+        expected_metric_rects, _separator_rects, _end_x = (
+            gui_windows._routine_stock_metric_layout_rects(
+                row_rect=table.visualRect(index),
+                start_x=legacy_holding_rect.left()
+                + gui_windows.ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
+                count=5,
+            )
+        )
+
+        self.assertEqual(expected_metric_rects[4], controller._stock_metric_rect(index, 10))
+
+    def test_stock_buy_limit_editor_rect_uses_limit_value_display_slot(self) -> None:
+        class FakeIndex:
+            def isValid(self):
+                return True
+
+            def data(self, role):
+                if role == gui_main_table_loader.ROUTINE_STOCK_VALUES_ROLE:
+                    return [""] * 12
+                return None
+
+        class FakeModel:
+            def __init__(self, index):
+                self._index = index
+
+            def index(self, _row, _column):
+                return self._index
+
+        class FakeTable:
+            def __init__(self, index):
+                self._index = index
+
+            def model(self):
+                return FakeModel(self._index)
+
+            def visualRect(self, _index):
+                return QRect(0, 7, 2400, 24)
+
+            def font(self):
+                return QFont()
+
+        index = FakeIndex()
+        table = FakeTable(index)
+        controller = gui_windows._RoutineCheckBoxController.__new__(
+            gui_windows._RoutineCheckBoxController
+        )
+        controller.table = table
+        window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+        window.routine_table = table
+        window._routine_checkbox_controller = controller
+
+        limit_rect = controller._stock_metric_rect(index, 10)
+        component_rects = gui_windows._main_stock_metric_component_rects(
+            QFontMetrics(table.font()),
+            limit_rect,
+            gui_windows.MAIN_STOCK_METRIC_LAYOUT["metrics"][4],
+        )
+        value_rect = component_rects["left_value"]
+
+        self.assertEqual(
+            QRect(
+                value_rect.left(),
+                value_rect.top() + 2,
+                value_rect.width(),
+                max(20, limit_rect.height() - 4),
+            ),
+            window._routine_stock_buy_limit_value_rect(0),
+        )
+
+    def test_main_stock_limit_edit_hides_only_limit_value_slot(self) -> None:
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+        texts = [
+            "\ubcf4\uc720(0\uc8fc / 0)",
+            "\uac00\uaca9(- / -)",
+            "\uc190\uc775(0 / 0.00%)",
+            "\ubbf8\uccb4\uacb0(0 / 0)",
+            "\ud55c\ub3c4(\ubbf8\uc124\uc815)",
+            "\uc18c\ubaa8(0 / 0.0%)",
+        ]
+
+        gui_windows._draw_routine_stock_metric_text_sequence(
+            painter,
+            row_rect=QRect(0, 0, 1600, 24),
+            start_x=100,
+            texts=texts,
+            hidden_value_indexes={4},
+        )
+
+        drawn_texts = [call_args.args[-1] for call_args in painter.drawText.call_args_list]
+        self.assertIn("\ud55c\ub3c4", drawn_texts)
+        self.assertIn("(", drawn_texts)
+        self.assertIn(")", drawn_texts)
+        self.assertNotIn("\ubbf8\uc124\uc815", drawn_texts)
+        self.assertIn("\uc18c\ubaa8", drawn_texts)
+        self.assertIn("0.0%", drawn_texts)
+
+    def test_main_stock_metric_texts_omits_consumed_when_limit_unconfigured(self) -> None:
+        holding_metric, price_metric, profit_metric, pending_metric, *_ = (
+            stock_position_metric_values(
+                holding_qty=0,
+                avg_price=None,
+                current_price=None,
+            )
+        )
+        values = [
+            "003550 LG",
+            "09:30~13:30",
+            "",
+            "\uac10\uc2dc/\ub300\uae30",
+            "\ub8e8\ud2f4",
+            "10\ubd84/\uc2dc\uc7a5\uac00",
+            "\ubcf4\uc720(0\uc8fc / 0)",
+            "\uac00\uaca9(- / -)",
+            "\uc190\uc775(0 / 0.00%)",
+            "\ubbf8\uccb4\uacb0(0 / 0)",
+            "\ud55c\ub3c4(\ubbf8\uc124\uc815)",
+        ]
+
+        texts = gui_windows._routine_stock_metric_texts(
+            values,
+            (holding_metric, price_metric, profit_metric, pending_metric, None),
+        )
+
+        self.assertEqual("\ud55c\ub3c4(\ubbf8\uc124\uc815)", texts[-1])
+        self.assertNotIn("\uc18c\ubaa8(0 / 0.0%)", texts)
+        self.assertEqual(5, len(texts))
+
+    def test_main_stock_metric_texts_includes_consumed_when_limit_configured(self) -> None:
+        row = gui_main_table_loader._routine_tree_stock_row(
+            SimpleNamespace(),
+            definition_id="indicator_follow",
+            instance_id="instance-a",
+            stock={
+                "code": "003550",
+                "name": "LG",
+                "enabled": True,
+                "stock_path": "",
+                "state": {
+                    "holding_qty": 1,
+                    "avg_price": 1_223_344,
+                },
+                "config": {
+                    "buy_limit_enabled": True,
+                    "buy_limit_amount": 1_223_344,
+                },
+            },
+        )
+
+        texts = gui_windows._routine_stock_metric_texts(
+            list(row["stock_values"]),
+            tuple(row["stock_metrics"]),
+        )
+
+        self.assertEqual("\ud55c\ub3c4(1,223,344)", texts[-2])
+        self.assertTrue(texts[-1].startswith("\uc18c\ubaa8("))
+        self.assertEqual(6, len(texts))
+
     def test_routine_stock_row_stores_structured_metric_role(self) -> None:
         row = gui_main_table_loader._routine_tree_stock_row(
             SimpleNamespace(),

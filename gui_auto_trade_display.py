@@ -500,6 +500,7 @@ def draw_stock_position_metric_display(
     color=None,
     *,
     outer_padding: int = 0,
+    show_label: bool = False,
 ) -> bool:
     if not isinstance(metric, RatioMetricDisplay):
         return False
@@ -509,7 +510,7 @@ def draw_stock_position_metric_display(
         metric,
         color=color,
         outer_padding=outer_padding,
-        show_label=False,
+        show_label=show_label,
     )
     return True
 

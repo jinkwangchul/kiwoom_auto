@@ -85,6 +85,7 @@ from gui_main_table_loader import (
     ROUTINE_PROFIT_LED_GAP,
     ROUTINE_PROFIT_LED_SIZE,
     ROUTINE_STOCK_CHECKBOX_OFFSET,
+    MAIN_STOCK_METRIC_LAYOUT_PREVIEW,
     ROUTINE_STOCK_METRICS_ROLE,
     ROUTINE_STOCK_PATH_ROLE,
     ROUTINE_STOCK_PROFIT_LED_ROLE,
@@ -106,7 +107,11 @@ from gui_main_table_loader import (
     routine_instance_buy_limit_configured,
 )
 from gui_main_budget_panel import update_main_budget_panel
-from gui_auto_trade_display import draw_limit_metric, draw_stock_position_metric, draw_stock_position_metric_display
+from gui_auto_trade_display import (
+    draw_limit_metric,
+    draw_stock_position_metric,
+    draw_stock_position_metric_display,
+)
 from runtime_io import read_json_dict
 from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
@@ -201,6 +206,263 @@ def _draw_routine_profit_led(
     painter.setBrush(QColor(_routine_profit_led_color(led_state)))
     painter.drawEllipse(led_rect)
     painter.restore()
+
+
+MAIN_STOCK_METRIC_LAYOUT = {
+    "separator_gap": 5,
+    "separator_width": 9,
+    "metrics": (
+        {
+            "key": "holding",
+            "max_text": "\ubcf4\uc720(99999\uc8fc / 999,999,999)",
+            "slot_width": 232,
+        },
+        {
+            "key": "price",
+            "max_text": "\uac00\uaca9(9,999,999 / 9,999,999)",
+            "slot_width": 226,
+        },
+        {
+            "key": "profit",
+            "max_text": "\uc190\uc775(-99,999,999 / -00.00%)",
+            "slot_width": 232,
+        },
+        {
+            "key": "unfilled",
+            "max_text": "\ubbf8\uccb4\uacb0(99 / 99)",
+            "slot_width": 120,
+        },
+        {
+            "key": "limit",
+            "max_text": "\ud55c\ub3c4(999,999,999)",
+            "slot_width": 146,
+        },
+        {
+            "key": "consumed",
+            "max_text": "\uc18c\ubaa8(999,999,999 / 00.0%)",
+            "slot_width": 214,
+        },
+    ),
+}
+ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(MAIN_STOCK_METRIC_LAYOUT["separator_gap"])
+ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH = int(MAIN_STOCK_METRIC_LAYOUT["separator_width"])
+MAIN_STOCK_METRIC_MAX_TEXTS = tuple(
+    str(metric["max_text"]) for metric in MAIN_STOCK_METRIC_LAYOUT["metrics"]
+)
+MAIN_STOCK_METRIC_SLOT_WIDTHS = tuple(
+    int(metric["slot_width"]) for metric in MAIN_STOCK_METRIC_LAYOUT["metrics"]
+)
+
+
+def _routine_stock_metric_display_text(metric: object) -> str:
+    label = str(getattr(metric, "label", "") or "").strip()
+    value1 = str(getattr(metric, "value1", "") or "").strip()
+    value2 = str(getattr(metric, "value2", "") or "").strip()
+    if not label:
+        return ""
+    return f"{label}({value1} / {value2})"
+
+
+def _routine_stock_metric_texts_legacy_unused(values: list[object], metrics_data: tuple[object, ...]) -> list[str]:
+    if MAIN_STOCK_METRIC_LAYOUT_PREVIEW:
+        return list(MAIN_STOCK_METRIC_MAX_TEXTS)
+    texts: list[str] = []
+    for metric in metrics_data[:4]:
+        metric_text = _routine_stock_metric_display_text(metric)
+        if metric_text:
+            texts.append(metric_text)
+    if len(values) > 10:
+        texts.append(str(values[10] or "").strip())
+    if len(metrics_data) > 5:
+        consumed_text = _routine_stock_metric_display_text(metrics_data[5])
+        if consumed_text:
+            texts.append(consumed_text)
+    elif len(values) > 11:
+        texts.append(str(values[11] or "").strip())
+    else:
+        texts.append("소모(0 / 0.0%)")
+    return [text for text in texts if text]
+
+
+def _routine_stock_metric_texts(values: list[object], metrics_data: tuple[object, ...]) -> list[str]:
+    if MAIN_STOCK_METRIC_LAYOUT_PREVIEW:
+        return list(MAIN_STOCK_METRIC_MAX_TEXTS)
+
+    texts: list[str] = []
+    for metric in metrics_data[:4]:
+        metric_text = _routine_stock_metric_display_text(metric)
+        if metric_text:
+            texts.append(metric_text)
+    if len(values) > 10:
+        texts.append(str(values[10] or "").strip())
+    if len(metrics_data) > 5:
+        consumed_text = _routine_stock_metric_display_text(metrics_data[5])
+        if consumed_text:
+            texts.append(consumed_text)
+    elif len(values) > 11:
+        texts.append(str(values[11] or "").strip())
+    return [text for text in texts if text]
+
+
+def _routine_stock_metric_layout_rects(
+    *,
+    row_rect: QRect,
+    start_x: int,
+    count: int,
+) -> tuple[list[QRect], list[QRect], int]:
+    metric_rects: list[QRect] = []
+    separator_rects: list[QRect] = []
+    x = start_x
+    gap = ROUTINE_STOCK_METRIC_SEPARATOR_GAP
+    separator_width = ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH
+    for index, slot_width in enumerate(MAIN_STOCK_METRIC_SLOT_WIDTHS[:count]):
+        metric_rect = QRect(x, row_rect.top(), slot_width, row_rect.height())
+        metric_rects.append(metric_rect)
+        x += slot_width
+        if index < count - 1:
+            separator_rect = QRect(x + gap, row_rect.top(), separator_width, row_rect.height())
+            separator_rects.append(separator_rect)
+            x = separator_rect.left() + separator_width + gap
+    return metric_rects, separator_rects, x
+
+
+def _split_main_stock_metric_text(text: str) -> tuple[str, str, str | None]:
+    value = str(text or "").strip()
+    if "(" not in value or not value.endswith(")"):
+        return value, "", None
+    label, inner = value.split("(", 1)
+    inner = inner[:-1]
+    if " / " in inner:
+        left_value, right_value = inner.split(" / ", 1)
+        return label, left_value, right_value
+    return label, inner, None
+
+
+def _main_stock_metric_component_rects(
+    metrics,
+    metric_rect: QRect,
+    layout_metric: dict[str, object],
+) -> dict[str, QRect]:
+    max_label, max_left_value, max_right_value = _split_main_stock_metric_text(
+        str(layout_metric["max_text"])
+    )
+    x = metric_rect.left()
+    label_rect = QRect(x, metric_rect.top(), metrics.horizontalAdvance(max_label), metric_rect.height())
+    x += label_rect.width()
+    open_paren_rect = QRect(x, metric_rect.top(), metrics.horizontalAdvance("("), metric_rect.height())
+    x += open_paren_rect.width()
+    left_value_rect = QRect(
+        x,
+        metric_rect.top(),
+        metrics.horizontalAdvance(max_left_value),
+        metric_rect.height(),
+    )
+    x += left_value_rect.width()
+    if max_right_value is None:
+        close_paren_rect = QRect(x, metric_rect.top(), metrics.horizontalAdvance(")"), metric_rect.height())
+        return {
+            "label": label_rect,
+            "open_paren": open_paren_rect,
+            "left_value": left_value_rect,
+            "close_paren": close_paren_rect,
+        }
+
+    slash_rect = QRect(x, metric_rect.top(), metrics.horizontalAdvance(" / "), metric_rect.height())
+    x += slash_rect.width()
+    right_value_rect = QRect(
+        x,
+        metric_rect.top(),
+        metrics.horizontalAdvance(max_right_value),
+        metric_rect.height(),
+    )
+    x += right_value_rect.width()
+    close_paren_rect = QRect(x, metric_rect.top(), metrics.horizontalAdvance(")"), metric_rect.height())
+    return {
+        "label": label_rect,
+        "open_paren": open_paren_rect,
+        "left_value": left_value_rect,
+        "slash": slash_rect,
+        "right_value": right_value_rect,
+        "close_paren": close_paren_rect,
+    }
+
+
+def _main_stock_metric_component_layouts(
+    metrics,
+    metric_rects: list[QRect],
+) -> list[dict[str, QRect]]:
+    return [
+        _main_stock_metric_component_rects(metrics, metric_rect, layout_metric)
+        for metric_rect, layout_metric in zip(metric_rects, MAIN_STOCK_METRIC_LAYOUT["metrics"])
+    ]
+
+
+def _main_stock_value_alignment(value: str):
+    if str(value).strip() in {"-", "\ubbf8\uc124\uc815"}:
+        return Qt.AlignCenter | Qt.AlignVCenter
+    return Qt.AlignRight | Qt.AlignVCenter
+
+
+def _draw_main_stock_metric_components(
+    painter,
+    text: str,
+    rects: dict[str, QRect],
+    *,
+    hide_left_value: bool = False,
+) -> None:
+    label, left_value, right_value = _split_main_stock_metric_text(text)
+    painter.drawText(rects["label"], Qt.AlignLeft | Qt.AlignVCenter, label)
+    painter.drawText(rects["open_paren"], Qt.AlignCenter | Qt.AlignVCenter, "(")
+    if not hide_left_value:
+        painter.drawText(rects["left_value"], _main_stock_value_alignment(left_value), left_value)
+    if right_value is not None and "slash" in rects and "right_value" in rects:
+        painter.drawText(rects["slash"], Qt.AlignCenter | Qt.AlignVCenter, " / ")
+        painter.drawText(rects["right_value"], _main_stock_value_alignment(right_value), right_value)
+    painter.drawText(rects["close_paren"], Qt.AlignCenter | Qt.AlignVCenter, ")")
+
+
+def _draw_routine_stock_metric_text_sequence(
+    painter,
+    *,
+    row_rect: QRect,
+    start_x: int,
+    texts: list[str],
+    hidden_value_indexes: set[int] | None = None,
+) -> tuple[list[tuple[str, int, int, int, int]], int]:
+    metric_rects, separator_rects, end_x = _routine_stock_metric_layout_rects(
+        row_rect=row_rect,
+        start_x=start_x,
+        count=len(texts),
+    )
+    component_rects = _main_stock_metric_component_layouts(painter.fontMetrics(), metric_rects)
+    layout_rows: list[tuple[str, int, int, int, int]] = []
+    hidden_value_indexes = hidden_value_indexes or set()
+    for index, (text, metric_rect, rects) in enumerate(zip(texts, metric_rects, component_rects)):
+        _draw_main_stock_metric_components(
+            painter,
+            text,
+            rects,
+            hide_left_value=index in hidden_value_indexes,
+        )
+        text_start = metric_rect.left()
+        text_end = metric_rect.left() + metric_rect.width()
+        if index < len(separator_rects):
+            separator_rect = separator_rects[index]
+            next_text_start = (
+                separator_rect.left()
+                + separator_rect.width()
+                + ROUTINE_STOCK_METRIC_SEPARATOR_GAP
+            )
+            layout_rows.append((text, text_start, text_end, separator_rect.left(), next_text_start))
+        else:
+            layout_rows.append((text, text_start, text_end, -1, -1))
+    for separator_rect in separator_rects:
+        painter.drawText(
+            separator_rect,
+            Qt.AlignCenter | Qt.AlignVCenter,
+            "|",
+        )
+    return layout_rows, end_x
 
 
 def _apply_routine_inline_edit_style(editor: QLineEdit, table) -> None:
@@ -312,6 +574,24 @@ class _RoutineCheckBoxController(QObject):
         )
 
     def _stock_metric_rect(self, index, target_column: int) -> QRect:
+        if target_column == 10:
+            return self._stock_main_metric_rect(index, 4)
+        return self._stock_legacy_metric_rect(index, target_column)
+
+    def _stock_main_metric_rect(self, index, metric_index: int) -> QRect:
+        if metric_index < 0 or metric_index >= len(MAIN_STOCK_METRIC_SLOT_WIDTHS):
+            return QRect()
+        base_metric_rect = self._stock_legacy_metric_rect(index, 6)
+        if base_metric_rect.isNull():
+            return QRect()
+        metric_rects, _separator_rects, _end_x = _routine_stock_metric_layout_rects(
+            row_rect=self.table.visualRect(index),
+            start_x=base_metric_rect.left() + ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
+            count=metric_index + 1,
+        )
+        return metric_rects[metric_index] if metric_index < len(metric_rects) else QRect()
+
+    def _stock_legacy_metric_rect(self, index, target_column: int) -> QRect:
         cell_rect = self.table.visualRect(index)
         values = index.data(ROUTINE_STOCK_VALUES_ROLE)
         if not isinstance(values, (list, tuple)):
@@ -650,11 +930,28 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     x += width
                     continue
                 alignment = (
-                    Qt.AlignLeft | Qt.AlignVCenter
-                    if column == 0
-                    else Qt.AlignCenter
+                        Qt.AlignLeft | Qt.AlignVCenter
+                        if column == 0
+                        else Qt.AlignCenter
                 )
                 if column >= 6:
+                    if column == 6:
+                        metric_texts = _routine_stock_metric_texts(list(values), tuple(metrics_data))
+                        hidden_value_indexes: set[int] = set()
+                        if (
+                            str(getattr(option.widget, "_editing_stock_buy_limit_path", "") or "")
+                            == str(index.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
+                        ):
+                            hidden_value_indexes.add(4)
+                        _draw_routine_stock_metric_text_sequence(
+                            painter,
+                            row_rect=option.rect,
+                            start_x=cell_rect.left() + ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
+                            texts=metric_texts,
+                            hidden_value_indexes=hidden_value_indexes,
+                        )
+                        painter.restore()
+                        return
                     stock_metric_label_hint = {
                         6: "보유",
                         7: "가격",
@@ -672,6 +969,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         cell_rect.adjusted(2, 0, -2, 0),
                         metric,
                         outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
+                        show_label=True,
                     ):
                         x += width
                         continue
@@ -878,7 +1176,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("키움 OpenAPI 자동매매 시스템 - v1.1 Windows GUI")
-        self.resize(2250, 720)
+        self.resize(2137, 720)
         self.setMinimumWidth(1680)
         try:
             self.kiwoom_api = KiwoomApi(parent=self)
@@ -1181,6 +1479,7 @@ class MainWindow(QMainWindow):
             self.routine_table.setColumnWidth(column, 0)
         routine_header.setSectionResizeMode(len(headers) - 1, QHeaderView.Stretch)
         self.routine_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.routine_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
 
         routine_header.setSectionsClickable(True)
         routine_header.setSortIndicatorShown(True)
@@ -2071,20 +2370,18 @@ class MainWindow(QMainWindow):
         metric_rect = self._routine_checkbox_controller._stock_metric_rect(index, 10)
         if metric_rect.isNull():
             return QRect()
-        metrics = QFontMetrics(self.routine_table.font())
-        value_width = routine_instance_number_widths(self.routine_table.font())[
-            "limit_amount"
-        ]
-        label_width = metrics.horizontalAdvance("한도(")
-        value_left = (
-            metric_rect.left()
-            + ROUTINE_INSTANCE_MONEY_OUTER_PADDING
-            + label_width
+        component_rects = _main_stock_metric_component_rects(
+            QFontMetrics(self.routine_table.font()),
+            metric_rect,
+            MAIN_STOCK_METRIC_LAYOUT["metrics"][4],
         )
+        value_rect = component_rects.get("left_value", QRect())
+        if value_rect.isNull():
+            return QRect()
         return QRect(
-            value_left,
-            metric_rect.top() + 2,
-            value_width,
+            value_rect.left(),
+            value_rect.top() + 2,
+            value_rect.width(),
             max(20, metric_rect.height() - 4),
         )
 
