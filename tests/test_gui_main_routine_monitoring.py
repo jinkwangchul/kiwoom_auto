@@ -1,23 +1,33 @@
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
-from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
-from PyQt5.QtGui import QMouseEvent
+from PyQt5.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PyQt5.QtGui import QFont, QFontMetrics, QMouseEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QHeaderView, QLabel, QWidget
+from PyQt5.QtWidgets import QApplication, QHeaderView, QLabel, QLineEdit, QWidget
 
 import gui_main_table_loader
+import gui_windows
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 from gui_auto_trade_display import (
+    RatioMetricDisplay,
     ROUTINE_PROFIT_SIGNAL_COLORS,
+    draw_limit_metric,
+    draw_ratio_metric_display,
+    draw_stock_position_metric_display,
     format_routine_buy_limit,
     format_routine_buy_limit_usage,
+    ratio_metric_layout,
     format_routine_used_amount,
+    stock_position_display_values,
     routine_profit_signal,
+    stock_position_metric_values,
 )
 from gui_main_table_loader import (
     routine_instance_buy_limit_text,
@@ -154,7 +164,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertEqual(
             routine_instance_buy_limit_text(enabled=False, amount=None),
-            "한도(미사용)",
+            "한도(미설정)",
         )
         self.assertEqual(
             routine_instance_buy_limit_text(enabled=True, amount=0),
@@ -345,7 +355,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             running=0,
             stopped=0,
             error=0,
-            buy_limit_text="한도(미사용)",
+            buy_limit_text="한도(미설정)",
             consumed_text="소모(0 / -)",
             profit_text="수익(0 / 0.00%)",
             enabled=True,
@@ -360,6 +370,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             consumed_text="소모(98,765,432 / 98.8%)",
             profit_text="수익(-1,250,000 / -12.50%)",
             profit_color="#2563EB",
+            buy_limit_configured=True,
             enabled=True,
         )
         first.show()
@@ -454,6 +465,403 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "수익률",
             ],
         )
+
+    def test_stock_position_metric_values_return_structured_slots(self) -> None:
+        holding, price, profit, pending, profit_amount, profit_rate = stock_position_metric_values(
+            holding_qty=120,
+            avg_price=28750,
+            current_price=29100,
+            buy_pending_qty=10,
+            sell_pending_qty=0,
+        )
+
+        self.assertIsInstance(holding, RatioMetricDisplay)
+        self.assertEqual(("보유", "120주", "3,450,000"), (holding.label, holding.value1, holding.value2))
+        self.assertEqual(("가격", "28,750", "29,100"), (price.label, price.value1, price.value2))
+        self.assertEqual(("손익", "+42,000", "+1.22%"), (profit.label, profit.value1, profit.value2))
+        self.assertEqual(("미체결", "10", "0"), (pending.label, pending.value1, pending.value2))
+        self.assertEqual(42000, int(round(profit_amount)))
+        self.assertAlmostEqual(1.217391, profit_rate, places=5)
+
+    def test_stock_position_display_values_omit_inner_labels(self) -> None:
+        holding, price, profit, pending, *_ = stock_position_display_values(
+            holding_qty=0,
+            avg_price=0,
+            current_price=None,
+            buy_pending_qty=0,
+            sell_pending_qty=0,
+        )
+        self.assertEqual("0주 / 0", holding)
+        self.assertEqual("- / -", price)
+        self.assertEqual("0 / 0.00%", profit)
+        self.assertEqual("0 / 0", pending)
+
+        separated_holding, separated_price, separated_profit, separated_pending, *_ = stock_position_display_values(
+            holding_qty=120,
+            avg_price=28750,
+            current_price=29100,
+            buy_pending_qty=10,
+            sell_pending_qty=0,
+            include_separator=True,
+        )
+        self.assertEqual("| 120주 / 3,450,000", separated_holding)
+        self.assertEqual("| 28,750 / 29,100", separated_price)
+        self.assertEqual("| +42,000 / +1.22%", separated_profit)
+        self.assertEqual("| 10 / 0", separated_pending)
+
+    def test_empty_price_slots_are_center_aligned_independently(self) -> None:
+        _, empty_price, *_ = stock_position_metric_values(
+            holding_qty=0,
+            avg_price=0,
+            current_price=None,
+        )
+        self.assertEqual("-", empty_price.value1)
+        self.assertEqual("-", empty_price.value2)
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, empty_price.value1_alignment)
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, empty_price.value2_alignment)
+        self.assertEqual("9,999,999", empty_price.value1_sample)
+        self.assertEqual("9,999,999", empty_price.value2_sample)
+
+        _, mixed_price, *_ = stock_position_metric_values(
+            holding_qty=1,
+            avg_price=1234,
+            current_price=None,
+        )
+        self.assertEqual("1,234", mixed_price.value1)
+        self.assertEqual("-", mixed_price.value2)
+        self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, mixed_price.value1_alignment)
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, mixed_price.value2_alignment)
+
+        _, right_only_price, *_ = stock_position_metric_values(
+            holding_qty=0,
+            avg_price=0,
+            current_price=5678,
+        )
+        self.assertEqual("-", right_only_price.value1)
+        self.assertEqual("5,678", right_only_price.value2)
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, right_only_price.value1_alignment)
+        self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, right_only_price.value2_alignment)
+
+    def test_price_metric_keeps_fixed_slots_for_empty_and_max_values(self) -> None:
+        metrics = QFontMetrics(QFont())
+        _, empty_price, *_ = stock_position_metric_values(
+            holding_qty=0,
+            avg_price=0,
+            current_price=None,
+        )
+        _, max_price, *_ = stock_position_metric_values(
+            holding_qty=1,
+            avg_price=9_999_999,
+            current_price=9_999_999,
+        )
+        _, mixed_price, *_ = stock_position_metric_values(
+            holding_qty=1,
+            avg_price=65_500,
+            current_price=1_234_567,
+        )
+
+        empty_layout = ratio_metric_layout(metrics, empty_price, outer_padding=2)
+        max_layout = ratio_metric_layout(metrics, max_price, outer_padding=2)
+        mixed_layout = ratio_metric_layout(metrics, mixed_price, outer_padding=2)
+
+        self.assertEqual(max_layout.value1_width, empty_layout.value1_width)
+        self.assertEqual(max_layout.value2_width, empty_layout.value2_width)
+        self.assertEqual(max_layout.slash_width, empty_layout.slash_width)
+        self.assertEqual(max_layout.close_width, empty_layout.close_width)
+        self.assertEqual(max_layout.total_width, empty_layout.total_width)
+        self.assertEqual(max_layout.total_width, mixed_layout.total_width)
+        price_column_width = gui_main_table_loader.routine_stock_column_widths(QFont())[7]
+        self.assertGreaterEqual(price_column_width, max_layout.total_width + 6)
+
+    def test_price_metric_draws_fixed_value_slot_rects(self) -> None:
+        _, price_metric, *_ = stock_position_metric_values(
+            holding_qty=0,
+            avg_price=0,
+            current_price=None,
+        )
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+
+        draw_stock_position_metric_display(
+            painter,
+            QRect(0, 0, 242, 24),
+            price_metric,
+            outer_padding=2,
+        )
+
+        draw_calls = painter.drawText.call_args_list
+        self.assertEqual("", draw_calls[0].args[-1])
+        self.assertEqual("-", draw_calls[1].args[-1])
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, draw_calls[1].args[-2])
+        self.assertEqual(" / ", draw_calls[2].args[-1])
+        self.assertEqual("-", draw_calls[3].args[-1])
+        self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, draw_calls[3].args[-2])
+
+        layout = ratio_metric_layout(QFontMetrics(QFont()), price_metric, outer_padding=2)
+        self.assertEqual(layout.value1_width, draw_calls[1].args[2])
+        self.assertEqual(layout.slash_width, draw_calls[2].args[2])
+        self.assertEqual(layout.value2_width, draw_calls[3].args[2])
+        self.assertEqual(layout.value1_width, layout.value2_width)
+        self.assertGreaterEqual(
+            layout.value1_width,
+            QFontMetrics(QFont()).horizontalAdvance("9,999,999"),
+        )
+
+    def test_routine_stock_row_stores_structured_metric_role(self) -> None:
+        row = gui_main_table_loader._routine_tree_stock_row(
+            SimpleNamespace(),
+            definition_id="indicator_follow",
+            instance_id="instance-a",
+            stock={
+                "code": "003550",
+                "name": "LG",
+                "enabled": True,
+                "stock_path": "",
+                "state": {
+                    "holding_qty": 120,
+                    "avg_price": 28750,
+                    "current_price": 29100,
+                    "pending_buy_qty": 10,
+                    "pending_sell_qty": 0,
+                },
+                "config": {},
+            },
+        )
+
+        metrics = row["stock_metrics"]
+        self.assertEqual(
+            ["보유", "가격", "손익", "미체결", None],
+            [getattr(metric, "label", None) for metric in metrics],
+        )
+        self.assertEqual("120주", metrics[0].value1)
+        self.assertEqual("3,450,000", metrics[0].value2)
+        self.assertEqual("29,100", metrics[1].value2)
+        self.assertEqual("gray", row["stock_profit_led"])
+        self.assertEqual("한도(미설정)", row["stock_values"][10])
+        self.assertEqual(11, len(row["stock_values"]))
+
+    def test_routine_stock_row_price_uses_existing_average_price_aliases(self) -> None:
+        row = gui_main_table_loader._routine_tree_stock_row(
+            SimpleNamespace(),
+            definition_id="indicator_follow",
+            instance_id="instance-a",
+            stock={
+                "code": "003550",
+                "name": "LG",
+                "enabled": True,
+                "stock_path": "",
+                "state": {
+                    "holding_qty": 3,
+                    "average_price": 65000,
+                    "last_checked_price": 66100,
+                },
+                "config": {},
+            },
+        )
+
+        price_metric = row["stock_metrics"][1]
+        self.assertEqual("가격", price_metric.label)
+        self.assertEqual("65,000", price_metric.value1)
+        self.assertEqual("66,100", price_metric.value2)
+
+    def test_routine_stock_row_adds_limit_and_consumed_when_limit_configured(self) -> None:
+        row = gui_main_table_loader._routine_tree_stock_row(
+            SimpleNamespace(),
+            definition_id="indicator_follow",
+            instance_id="instance-a",
+            stock={
+                "code": "003550",
+                "name": "LG",
+                "enabled": True,
+                "stock_path": "",
+                "state": {
+                    "holding_qty": 120,
+                    "avg_price": 28750,
+                    "current_price": 29100,
+                },
+                "config": {
+                    "buy_limit_enabled": True,
+                    "buy_limit_amount": 10_000_000,
+                },
+            },
+        )
+
+        self.assertEqual("한도(10,000,000)", row["stock_values"][10])
+        self.assertEqual("소모(3,450,000 / 34.5%)", row["stock_values"][11])
+        self.assertEqual("소모", row["stock_metrics"][5].label)
+        self.assertEqual(12, len(row["stock_values"]))
+
+    def test_stock_buy_limit_config_writer_keeps_stock_limits_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stock_a = root / "003550_LG" / "config.json"
+            stock_b = root / "005930_삼성전자" / "config.json"
+            stock_c = root / "006400_삼성SDI" / "config.json"
+            stock_a.parent.mkdir()
+            stock_b.parent.mkdir()
+            stock_c.parent.mkdir()
+            stock_a.write_text(json.dumps({"name": "LG"}, ensure_ascii=False), encoding="utf-8")
+            stock_b.write_text(
+                json.dumps({"name": "삼성전자"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            stock_c.write_text(
+                json.dumps(
+                    {
+                        "name": "삼성SDI",
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            gui_windows.MainWindow._write_stock_buy_limit_config(
+                stock_a,
+                enabled=True,
+                amount=100_000,
+            )
+            gui_windows.MainWindow._write_stock_buy_limit_config(
+                stock_b,
+                enabled=True,
+                amount=200_000,
+            )
+
+            config_a = json.loads(stock_a.read_text(encoding="utf-8"))
+            config_b = json.loads(stock_b.read_text(encoding="utf-8"))
+            config_c = json.loads(stock_c.read_text(encoding="utf-8"))
+            self.assertEqual(100_000, config_a["buy_limit_amount"])
+            self.assertEqual(200_000, config_b["buy_limit_amount"])
+            self.assertFalse(config_c["buy_limit_enabled"])
+            self.assertIsNone(config_c["buy_limit_amount"])
+
+            gui_windows.MainWindow._write_stock_buy_limit_config(
+                stock_a,
+                enabled=False,
+                amount=None,
+            )
+            config_a = json.loads(stock_a.read_text(encoding="utf-8"))
+            config_b = json.loads(stock_b.read_text(encoding="utf-8"))
+            config_c = json.loads(stock_c.read_text(encoding="utf-8"))
+            self.assertFalse(config_a["buy_limit_enabled"])
+            self.assertIsNone(config_a["buy_limit_amount"])
+            self.assertEqual(200_000, config_b["buy_limit_amount"])
+            self.assertFalse(config_c["buy_limit_enabled"])
+            self.assertIsNone(config_c["buy_limit_amount"])
+
+    def test_stock_buy_limit_editor_finish_writes_selected_stock_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stock_a = root / "003550_LG" / "config.json"
+            stock_b = root / "005930_삼성전자" / "config.json"
+            stock_a.parent.mkdir()
+            stock_b.parent.mkdir()
+            stock_a.write_text(json.dumps({"name": "LG"}, ensure_ascii=False), encoding="utf-8")
+            stock_b.write_text(
+                json.dumps(
+                    {
+                        "name": "삼성전자",
+                        "buy_limit_enabled": True,
+                        "buy_limit_amount": 200_000,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            editor = QLineEdit()
+            editor.setText("100,000")
+            window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            window._routine_stock_buy_limit_editor = editor
+            window._routine_stock_buy_limit_editor_config_path = str(stock_a)
+            window._routine_stock_buy_limit_edit_finishing = False
+            window.routine_table = SimpleNamespace(
+                _editing_stock_buy_limit_path="003550_LG",
+                viewport=lambda: SimpleNamespace(update=MagicMock()),
+            )
+            window.load_routine_table = MagicMock()
+
+            window.finish_routine_stock_buy_limit_edit(save=True)
+
+            config_a = json.loads(stock_a.read_text(encoding="utf-8"))
+            config_b = json.loads(stock_b.read_text(encoding="utf-8"))
+            self.assertTrue(config_a["buy_limit_enabled"])
+            self.assertEqual(100_000, config_a["buy_limit_amount"])
+            self.assertEqual(200_000, config_b["buy_limit_amount"])
+            window.load_routine_table.assert_called_once_with()
+
+    def test_draw_limit_metric_can_hide_only_value_slot_while_editing(self) -> None:
+        painter = MagicMock()
+        painter.fontMetrics.return_value = QFontMetrics(QFont())
+
+        self.assertTrue(
+            draw_limit_metric(
+                painter,
+                QRect(0, 0, 220, 24),
+                "한도(미설정)",
+                value_width=90,
+                hide_value=True,
+            )
+        )
+
+        drawn_texts = [call_args.args[-1] for call_args in painter.drawText.call_args_list]
+        self.assertIn("한도(", drawn_texts)
+        self.assertIn(")", drawn_texts)
+        self.assertNotIn("미설정", drawn_texts)
+
+    def test_stock_buy_limit_editor_cancel_clears_edit_state_without_saving(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_config = Path(temp_dir) / "003550_LG" / "config.json"
+            stock_config.parent.mkdir()
+            stock_config.write_text(
+                json.dumps(
+                    {
+                        "name": "LG",
+                        "buy_limit_enabled": True,
+                        "buy_limit_amount": 100_000,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            editor = QLineEdit()
+            editor.setText("200,000")
+            window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            window._routine_stock_buy_limit_editor = editor
+            window._routine_stock_buy_limit_editor_config_path = str(stock_config)
+            window._routine_stock_buy_limit_edit_finishing = False
+            window.routine_table = SimpleNamespace(
+                _editing_stock_buy_limit_path="003550_LG",
+                viewport=lambda: SimpleNamespace(update=MagicMock()),
+            )
+            window.load_routine_table = MagicMock()
+
+            window.finish_routine_stock_buy_limit_edit(save=False)
+
+            config = json.loads(stock_config.read_text(encoding="utf-8"))
+            self.assertEqual(100_000, config["buy_limit_amount"])
+            self.assertEqual("", window.routine_table._editing_stock_buy_limit_path)
+            window.load_routine_table.assert_not_called()
+
+    def test_unconfigured_buy_limit_value_is_center_aligned(self) -> None:
+        widget = gui_main_table_loader.create_routine_instance_status_widget(
+            "기본운영",
+            registered=0,
+            running=0,
+            stopped=0,
+            error=0,
+            buy_limit_text="한도(미설정)",
+            profit_text="수익(0 / 0.00%)",
+            enabled=True,
+        )
+        try:
+            amount_label = widget.findChild(QLabel, "routineInstanceBuyLimitAmount")
+            self.assertIsNotNone(amount_label)
+            self.assertEqual(Qt.AlignCenter | Qt.AlignVCenter, amount_label.alignment())
+        finally:
+            widget.close()
 
     def test_routine_table_keeps_counts_and_replaces_budget_columns(self) -> None:
         table = FakeRoutineTable()

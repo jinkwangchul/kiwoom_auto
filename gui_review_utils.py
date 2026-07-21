@@ -43,6 +43,14 @@ def current_price_from_state(state: dict[str, object]) -> float | None:
     return None
 
 
+def average_price_from_state(state: dict[str, object]) -> float:
+    for key in ("avg_price", "average_price", "broker_average_price"):
+        value = safe_float_value(state.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
 def pending_order_summary(stock_dir: Path, state: dict[str, object]) -> tuple[bool, int]:
     """
     현재 미체결 존재 여부와 수량 합계를 반환한다.
@@ -111,7 +119,7 @@ def build_review_required_item(
 
     status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
     holding_qty = safe_int_value(state.get("holding_qty"), 0)
-    avg_price = safe_float_value(state.get("avg_price"), 0.0)
+    avg_price = average_price_from_state(state)
     buy_count = safe_int_value(state.get("buy_count"), 0)
     missed_buy = safe_int_value(state.get("missed_buy_signal_count"), 0)
     missed_sell = safe_int_value(state.get("missed_sell_signal_count"), 0)
@@ -207,7 +215,10 @@ def review_reason_summary(item: dict[str, object]) -> str:
     tokens = [pending_text, current_text, signal_text]
 
     holding_qty = safe_int_value(item.get("holding_qty"), 0)
-    avg_price = safe_float_value(item.get("avg_price"), 0.0)
+    avg_price = safe_float_value(
+        item.get("avg_price", item.get("average_price", item.get("broker_average_price"))),
+        0.0,
+    )
     if holding_qty > 0 and avg_price <= 0:
         tokens.append("평단오류")
 
@@ -240,5 +251,3 @@ def review_required_for_start(item: dict[str, object]) -> bool:
     자동매매 시작 전 사전점검 결과 검토관리창으로 보낼지 판단한다.
     """
     return bool(item.get("review_reasons"))
-
-

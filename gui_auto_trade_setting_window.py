@@ -43,9 +43,11 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QApplication,
     QPushButton,
     QStyle,
     QStyleOptionButton,
+    QStyleOptionViewItem,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
@@ -365,19 +367,61 @@ from real_order_preflight_service import commit_real_order_preflight, preview_re
 class StockPositionMetricDelegate(QStyledItemDelegate):
     """보유/가격/손익/미체결 셀의 숫자 슬롯을 우측 정렬해 그린다."""
 
+    LABEL_BY_COLUMN = {
+        7: "보유",
+        8: "가격",
+        9: "손익",
+        10: "미체결",
+    }
+
     def paint(self, painter, option, index) -> None:
         text = str(index.data(Qt.DisplayRole) or "")
+        label_hint = self.LABEL_BY_COLUMN.get(index.column())
         color = (
             option.palette.highlightedText().color()
             if option.state & QStyle.State_Selected
             else option.palette.text().color()
         )
+        metric_option = QStyleOptionViewItem(option)
+        metric_option.text = ""
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, metric_option, painter, option.widget)
         if draw_stock_position_metric(
             painter,
-            option.rect.adjusted(2, 0, -2, 0),
+            option.rect,
             text,
             color,
+            label_hint=label_hint,
+            compact=True,
+            compact_margins=self._operation_column_margins(option.widget),
         ):
+            return
+        super().paint(painter, option, index)
+
+    @staticmethod
+    def _operation_column_margins(table) -> tuple[int, int]:
+        if table is None:
+            return 2, 2
+        metrics = table.fontMetrics()
+        text_width = metrics.horizontalAdvance("09:30~13:30")
+        column_width = table.columnWidth(2)
+        spare_width = max(0, column_width - text_width)
+        left_margin = spare_width // 2
+        right_margin = spare_width - left_margin
+        return left_margin, right_margin
+
+
+class SelectedTextReadableDelegate(QStyledItemDelegate):
+    """선택 행에서는 고정 foreground 대신 HighlightedText로 그린다."""
+
+    def paint(self, painter, option, index) -> None:
+        if option.state & QStyle.State_Selected:
+            readable_option = QStyleOptionViewItem(option)
+            readable_option.palette.setColor(
+                readable_option.palette.Text,
+                option.palette.highlightedText().color(),
+            )
+            super().paint(painter, readable_option, index)
             return
         super().paint(painter, option, index)
 
@@ -966,8 +1010,8 @@ class AutoTradeSettingWindow(QDialog):
         super().__init__(parent)
 
         self.setWindowTitle("자동매매설정")
-        self.resize(1180, 680)
-        self.setMinimumWidth(1180)
+        self.resize(1548, 680)
+        self.setMinimumWidth(1548)
 
         self.routine_table = QTableWidget()
         self.stock_table = QTableWidget()
@@ -1164,6 +1208,7 @@ class AutoTradeSettingWindow(QDialog):
         for col in range(len(headers)):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
         self.stock_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stock_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         header.setMinimumSectionSize(30)
         self.stock_table.verticalHeader().setSectionsMovable(False)
         self.stock_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
@@ -1171,6 +1216,12 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.verticalHeader().setMaximumWidth(40)
         self.stock_table.verticalHeader().setFixedWidth(40)
         self._stock_position_metric_delegate = StockPositionMetricDelegate(self.stock_table)
+        self._stock_selected_text_delegate = SelectedTextReadableDelegate(self.stock_table)
+        for col in (2, 4, 5, 6):
+            self.stock_table.setItemDelegateForColumn(
+                col,
+                self._stock_selected_text_delegate,
+            )
         for col in (7, 8, 9, 10):
             self.stock_table.setItemDelegateForColumn(
                 col,
@@ -1190,21 +1241,18 @@ class AutoTradeSettingWindow(QDialog):
 
     def _apply_stock_table_column_widths(self) -> None:
         """자동매매설정창 하단 종목표 컬럼 폭을 강제로 재적용한다."""
-        from gui_main_table_loader import routine_stock_column_widths
-
-        stock_metric_widths = routine_stock_column_widths(self.stock_table.font())
         widths = {
             0: 80,    # 코드: 6자리 여유
             1: 205,   # 종목: 13자 기준
             2: 120,   # 운영: 09:30~13:30 표시
             3: 50,    # 현황: 종목 운영 건강도 표시등
-            4: 90,   # 상태: 감시/대기, 매수/매도
+            4: 90,    # 상태: 감시/대기, 매수/매도
             5: 80,    # 방식: 루틴, 시장가, 현재가
             6: 120,   # 청산: 10분/시장가, 10분/현재가
-            7: 174,   # 보유: 수량 / 총매수금액
-            8: stock_metric_widths[7],   # 가격: 평단가 / 현재가
-            9: 174,   # 손익: 손익금 / 수익률
-            10: 110,  # 미체결: 미수 / 미도
+            7: 204,   # 보유: 수량 / 총매수금액
+            8: 194,   # 가격: 평단가 / 현재가
+            9: 199,   # 손익: 손익금 / 수익률
+            10: 78,   # 미체결: 미수 / 미도
         }
         self.stock_table.verticalHeader().setMinimumWidth(40)
         self.stock_table.verticalHeader().setMaximumWidth(40)

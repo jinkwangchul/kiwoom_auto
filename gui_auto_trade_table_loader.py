@@ -16,13 +16,13 @@ from PyQt5.QtWidgets import QMessageBox
 
 from gui_common_utils import safe_int_value
 from gui_order_utils import (
-    format_number_value,
     pending_order_side_quantities,
 )
 from gui_config_utils import default_config
 from gui_review_utils import (
+    average_price_from_state,
     build_review_required_item,
-    safe_float_value,
+    current_price_from_state,
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import (
@@ -49,6 +49,7 @@ from gui_auto_trade_display import (
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
+    stock_position_display_values,
     yes_no_display,
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
@@ -177,7 +178,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
             holding_qty = safe_int_value(state.get("holding_qty"), 0)
-            avg_price = safe_int_value(state.get("avg_price"), 0)
+            avg_price = average_price_from_state(state)
             has_unresolved_qty = auto_trade_setting_has_unresolved_quantity(
                 holding_qty,
                 buy_pending_qty,
@@ -425,6 +426,16 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 and liquidation_active
                 and liquidation_has_policy
             )
+            current_price = current_price_from_state(state)
+            holding_text, price_text, profit_text, pending_text, profit_amount, _profit_rate = (
+                stock_position_display_values(
+                    holding_qty=holding_qty,
+                    avg_price=avg_price,
+                    current_price=current_price,
+                    buy_pending_qty=buy_pending_qty,
+                    sell_pending_qty=sell_pending_qty,
+                )
+            )
 
             values = [
                 code,
@@ -434,11 +445,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 display_status,
                 method_text,
                 liquidation_text,
-                str(holding_qty),
-                f"{avg_price:,}",
-                str(state.get("buy_count", 0)),
-                str(buy_pending_qty),
-                str(sell_pending_qty),
+                holding_text,
+                price_text,
+                profit_text,
+                pending_text,
             ]
             status_rank = {
                 "감시/대기": 0,
@@ -465,9 +475,8 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 liquidation_text,
                 holding_qty,
                 avg_price,
-                safe_int_value(state.get("buy_count"), 0),
-                buy_pending_qty if isinstance(buy_pending_qty, int) else 10**12,
-                sell_pending_qty if isinstance(sell_pending_qty, int) else 10**12,
+                profit_amount,
+                safe_int_value(buy_pending_qty, 0) + safe_int_value(sell_pending_qty, 0),
             ]
 
             for col, value in enumerate(values):
@@ -512,14 +521,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                         liquidation_has_policy,
                         liquidation_is_individual,
                     )
-                elif col in (10, 11) and value == "?":
-                    item.setToolTip("미결 수량 확인 필요")
-                    item.setForeground(QColor("#D32F2F"))
-
                 if col == 4:
                     apply_auto_trade_setting_activity_style(item, status_cell_active)
 
-                if col in (0, 2, 3, 5, 6, 7, 8, 9, 10, 11):
+                if col in (0, 2, 3, 5, 6, 7, 8, 9, 10):
                     item.setTextAlignment(Qt.AlignCenter)
                 elif col == 4:
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)

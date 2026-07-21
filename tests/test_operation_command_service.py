@@ -862,6 +862,211 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         self.assertTrue(window._notification_popup.isVisible())
         self.assertEqual("마감정책이 취소되었습니다.", window._notification_popup.text())
 
+    def test_selected_text_delegate_uses_highlighted_text_palette(self) -> None:
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QApplication, QStyle, QStyleOptionViewItem, QStyledItemDelegate
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow, SelectedTextReadableDelegate
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        delegate = SelectedTextReadableDelegate(window.stock_table)
+        option = QStyleOptionViewItem()
+        option.state |= QStyle.State_Selected
+        option.palette = window.stock_table.palette()
+        expected_color = option.palette.highlightedText().color()
+        index = Mock()
+
+        with patch.object(QStyledItemDelegate, "paint") as paint:
+            delegate.paint(Mock(), option, index)
+
+        painted_option = paint.call_args.args[1]
+        self.assertEqual(expected_color, painted_option.palette.color(painted_option.palette.Text))
+
+    def test_stock_position_metric_delegate_paints_empty_background_before_metric_text(self) -> None:
+        from PyQt5.QtCore import QRect, Qt
+        from PyQt5.QtGui import QPainter, QPixmap
+        from PyQt5.QtWidgets import QApplication, QStyle, QStyleOptionViewItem
+        import gui_auto_trade_setting_window as setting_window
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow, StockPositionMetricDelegate
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        events = []
+
+        class FakeStyle:
+            def drawControl(self, element, option_arg, painter_arg, widget_arg=None):
+                events.append(("background", element, option_arg.text, widget_arg))
+
+        delegate = StockPositionMetricDelegate(window.stock_table)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 220, 24)
+        option.state |= QStyle.State_Selected
+        option.palette = window.stock_table.palette()
+        index = Mock()
+        index.data.return_value = "0주 / 0"
+        pixmap = QPixmap(220, 24)
+        pixmap.fill(Qt.white)
+        painter = QPainter(pixmap)
+
+        def record_metric(*args, **kwargs):
+            events.append(("metric", None, None, None))
+            return True
+
+        with patch.object(QApplication, "style", return_value=FakeStyle()), patch.object(
+            setting_window,
+            "draw_stock_position_metric",
+            side_effect=record_metric,
+        ):
+            delegate.paint(painter, option, index)
+        painter.end()
+
+        self.assertEqual(
+            [("background", QStyle.CE_ItemViewItem, "", None), ("metric", None, None, None)],
+            events,
+        )
+
+    def test_stock_position_metric_delegate_uses_compact_value_paint_without_separator(self) -> None:
+        from PyQt5.QtCore import QRect, Qt
+        from PyQt5.QtGui import QPainter, QPixmap
+        from PyQt5.QtWidgets import QApplication, QStyleOptionViewItem
+        import gui_auto_trade_setting_window as setting_window
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow, StockPositionMetricDelegate
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        before_widths = [window.stock_table.columnWidth(i) for i in range(window.stock_table.columnCount())]
+        delegate = StockPositionMetricDelegate(window.stock_table)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, window.stock_table.columnWidth(7), 24)
+        option.palette = window.stock_table.palette()
+        option.widget = window.stock_table
+        index = Mock()
+        index.column.return_value = 7
+        index.data.return_value = "0주 / 0"
+        pixmap = QPixmap(option.rect.width(), option.rect.height())
+        pixmap.fill(Qt.white)
+        painter = QPainter(pixmap)
+
+        with patch.object(setting_window, "draw_stock_position_metric", return_value=True) as draw_metric:
+            delegate.paint(painter, option, index)
+        painter.end()
+
+        self.assertEqual("0주 / 0", index.data.return_value)
+        self.assertEqual(before_widths, [window.stock_table.columnWidth(i) for i in range(window.stock_table.columnCount())])
+        self.assertEqual(True, draw_metric.call_args.kwargs["compact"])
+        self.assertEqual("보유", draw_metric.call_args.kwargs["label_hint"])
+
+    def test_compact_stock_position_metric_uses_fixed_slots(self) -> None:
+        from PyQt5.QtCore import QRect, Qt
+        from PyQt5.QtGui import QFont, QFontMetrics
+        from PyQt5.QtWidgets import QApplication
+        from gui_auto_trade_display import (
+            compact_stock_position_metric_rects,
+            default_stock_position_metric_value_widths,
+            draw_stock_position_metric,
+        )
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        class FakePainter:
+            def __init__(self, font) -> None:
+                self.calls = []
+                self._font = QFont(font)
+
+            def save(self) -> None:
+                pass
+
+            def restore(self) -> None:
+                pass
+
+            def setPen(self, color) -> None:
+                pass
+
+            def font(self):
+                return self._font
+
+            def fontMetrics(self):
+                return QFontMetrics(self._font)
+
+            def drawText(self, rect, alignment, text) -> None:
+                self.calls.append((QRect(rect), alignment, text))
+
+        app = QApplication.instance() or QApplication([])
+        window = AutoTradeSettingWindow()
+        test_font = window.stock_table.font()
+        samples = [
+            ("보유", "0주 / 0", "120주 / 3,450,000"),
+            ("가격", "- / -", "28,750 / 29,100"),
+            ("손익", "0 / 0.00%", "+42,000 / +1.22%"),
+            ("미체결", "0 / 0", "10 / 0"),
+        ]
+        column_widths = {
+            "보유": 204,
+            "가격": 194,
+            "손익": 199,
+            "미체결": 78,
+        }
+        compact_margins = (9, 10)
+        for label, short_text, long_text in samples:
+            painter = FakePainter(test_font)
+            cell_rect = QRect(0, 0, column_widths[label], 24)
+            self.assertTrue(
+                draw_stock_position_metric(
+                    painter,
+                    cell_rect,
+                    short_text,
+                    label_hint=label,
+                    compact=True,
+                    compact_margins=compact_margins,
+                )
+            )
+            left_width, right_width = default_stock_position_metric_value_widths(painter.font())[label]
+            slash_width = painter.fontMetrics().horizontalAdvance(" / ")
+            expected_rects = compact_stock_position_metric_rects(
+                cell_rect,
+                left_width,
+                slash_width,
+                right_width,
+                left_margin=compact_margins[0],
+                right_margin=compact_margins[1],
+            )
+            short_left_value, short_right_value = short_text.split(" / ", 1)
+            expected_left_alignment = (
+                Qt.AlignCenter | Qt.AlignVCenter
+                if label == "가격" and short_left_value == "-"
+                else Qt.AlignRight | Qt.AlignVCenter
+            )
+            expected_right_alignment = (
+                Qt.AlignCenter | Qt.AlignVCenter
+                if label == "가격" and short_right_value == "-"
+                else Qt.AlignRight | Qt.AlignVCenter
+            )
+            self.assertEqual(
+                [
+                    (expected_rects[0], expected_left_alignment, short_left_value),
+                    (expected_rects[1], Qt.AlignCenter | Qt.AlignVCenter, " / "),
+                    (expected_rects[2], expected_right_alignment, short_right_value),
+                ],
+                painter.calls,
+            )
+            self.assertEqual(compact_margins[0], expected_rects[0].left())
+            self.assertLess(expected_rects[0].right(), expected_rects[1].left())
+            self.assertLess(expected_rects[1].right(), expected_rects[2].left())
+
+            painter_long = FakePainter(test_font)
+            self.assertTrue(
+                draw_stock_position_metric(
+                    painter_long,
+                    cell_rect,
+                    long_text,
+                    label_hint=label,
+                    compact=True,
+                    compact_margins=compact_margins,
+                )
+            )
+            self.assertEqual([call[0] for call in painter.calls], [call[0] for call in painter_long.calls])
+            if label == "가격":
+                self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, painter_long.calls[0][1])
+                self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, painter_long.calls[2][1])
 
 class EarlyCloseCancelSafetyTest(unittest.TestCase):
     @staticmethod
