@@ -1848,16 +1848,17 @@ class AutoTradeSettingWindow(QDialog):
             self.btn_manual_queue_commit.setEnabled(False)
             self.btn_start.setEnabled(False)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._time_policy_timer.isActive():
+            self._time_policy_timer.start()
+        if not self._runtime_file_timer.isActive():
+            self._runtime_file_timer.start()
+
     def closeEvent(self, event) -> None:
-        """창을 닫을 때 시간정책 타이머를 정리한다."""
-        try:
-            self._time_policy_timer.stop()
-        except Exception:
-            pass
-        try:
-            self._runtime_file_timer.stop()
-        except Exception:
-            pass
+        """창을 닫을 때 주기 갱신 타이머를 정리한다."""
+        self._time_policy_timer.stop()
+        self._runtime_file_timer.stop()
         super().closeEvent(event)
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
