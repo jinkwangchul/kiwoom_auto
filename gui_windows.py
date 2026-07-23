@@ -2850,7 +2850,12 @@ class MainWindow(QMainWindow):
         if window is None:
             window = AutoTradeSettingWindow(self)
             self.auto_trade_setting_window = window
-        window.show()
+        if window.isMinimized():
+            window.showNormal()
+        else:
+            window.show()
+        window.raise_()
+        window.activateWindow()
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(

@@ -97,6 +97,28 @@ class FakeCellWidget:
     "requires real PyQt widgets; the legacy GUI test module installed global stubs",
 )
 class MainRoutineMonitoringDisplayTest(unittest.TestCase):
+    def test_auto_trade_setting_window_reuse_restores_and_activates(self) -> None:
+        window = MagicMock()
+        owner = SimpleNamespace(auto_trade_setting_window=window)
+
+        window.isMinimized.return_value = False
+        gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+
+        window.show.assert_called_once_with()
+        window.showNormal.assert_not_called()
+        window.raise_.assert_called_once_with()
+        window.activateWindow.assert_called_once_with()
+
+        window.reset_mock()
+        window.isMinimized.return_value = True
+        gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+
+        window.show.assert_not_called()
+        window.showNormal.assert_called_once_with()
+        window.raise_.assert_called_once_with()
+        window.activateWindow.assert_called_once_with()
+        self.assertIs(window, owner.auto_trade_setting_window)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
