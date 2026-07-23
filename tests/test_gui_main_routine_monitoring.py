@@ -7,10 +7,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
-from PyQt5.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PyQt5.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt, QTimer
 from PyQt5.QtGui import QFont, QFontMetrics, QMouseEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QHeaderView, QLabel, QLineEdit, QWidget
+from PyQt5.QtWidgets import QApplication, QDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QWidget
 
 import gui_main_table_loader
 import gui_windows
@@ -101,23 +101,64 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         window = MagicMock()
         owner = SimpleNamespace(auto_trade_setting_window=window)
 
-        window.isMinimized.return_value = False
-        gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+        with patch.object(gui_windows.sip, "isdeleted", return_value=False):
+            window.isMinimized.return_value = False
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
 
-        window.show.assert_called_once_with()
-        window.showNormal.assert_not_called()
-        window.raise_.assert_called_once_with()
-        window.activateWindow.assert_called_once_with()
+            window.show.assert_called_once_with()
+            window.showNormal.assert_not_called()
+            window.raise_.assert_called_once_with()
+            window.activateWindow.assert_called_once_with()
 
-        window.reset_mock()
-        window.isMinimized.return_value = True
-        gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+            window.reset_mock()
+            window.isMinimized.return_value = True
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
 
-        window.show.assert_not_called()
-        window.showNormal.assert_called_once_with()
-        window.raise_.assert_called_once_with()
-        window.activateWindow.assert_called_once_with()
-        self.assertIs(window, owner.auto_trade_setting_window)
+            window.show.assert_not_called()
+            window.showNormal.assert_called_once_with()
+            window.raise_.assert_called_once_with()
+            window.activateWindow.assert_called_once_with()
+            self.assertIs(window, owner.auto_trade_setting_window)
+
+    def test_auto_trade_setting_window_recreates_after_qobject_destroy(self) -> None:
+        class ProbeWindow(QDialog):
+            created = 0
+
+            def __init__(self, parent=None) -> None:
+                super().__init__(parent)
+                ProbeWindow.created += 1
+                self.time_timer = QTimer(self)
+                self.runtime_timer = QTimer(self)
+                self.time_timer.timeout.connect(self.update)
+                self.runtime_timer.timeout.connect(self.update)
+
+        owner = QMainWindow()
+        with patch.object(gui_windows, "AutoTradeSettingWindow", ProbeWindow):
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+            first = owner.auto_trade_setting_window
+            first.close()
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+            self.assertIs(first, owner.auto_trade_setting_window)
+            self.assertEqual(1, ProbeWindow.created)
+
+            first.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
+            self.assertTrue(gui_windows.sip.isdeleted(first))
+
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+            second = owner.auto_trade_setting_window
+            self.assertIsNot(first, second)
+            self.assertEqual(2, ProbeWindow.created)
+            self.assertEqual(2, len(second.findChildren(QTimer)))
+            self.assertEqual(1, second.time_timer.receivers(second.time_timer.timeout))
+            self.assertEqual(1, second.runtime_timer.receivers(second.runtime_timer.timeout))
+
+            second.close()
+            second.deleteLater()
+            owner.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
 
     @classmethod
     def setUpClass(cls) -> None:

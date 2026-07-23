@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from PyQt5 import sip
 from PyQt5.QtCore import QEvent, QObject, QRect, Qt
 from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (
@@ -2847,6 +2848,9 @@ class MainWindow(QMainWindow):
 
     def open_auto_trade_setting_window(self) -> None:
         window = getattr(self, "auto_trade_setting_window", None)
+        if window is not None and sip.isdeleted(window):
+            self.auto_trade_setting_window = None
+            window = None
         if window is None:
             window = AutoTradeSettingWindow(self)
             self.auto_trade_setting_window = window
