@@ -376,6 +376,11 @@ AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
 AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
+    "category": frozenset({"profit", "average", "efficiency"}),
+    "routine": frozenset({"period", "profit", "average", "efficiency"}),
+    "stock": frozenset({"all", "current", "period", "profit", "average", "efficiency"}),
+}
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
     0: 80,    # 코드: 6자리 여유
@@ -1211,6 +1216,7 @@ class AutoTradeSettingWindow(QDialog):
         self._auto_trade_stock_scope_by_instance: dict[str, str] = {}
         self._collapsed_auto_trade_instance_ids: set[str] = set()
         self._routine_tree_display_level = "category"
+        self._routine_tree_display_criterion = "profit"
         self._fixed_signals_connected = False
 
         self._setup_ui()
@@ -2743,9 +2749,32 @@ class AutoTradeSettingWindow(QDialog):
             layout.addWidget(button, 0, Qt.AlignVCenter)
             buttons[level] = button
 
-        container.setFixedSize((64 * len(buttons)) + (layout.spacing() * (len(buttons) - 1)), 22)
+        layout.addSpacing(12)
+        criterion_buttons: dict[str, QPushButton] = {}
+        for criterion, text, object_name in (
+            ("all", "전체", "autoTradeSettingRoutineTreeAllCriterionBadge"),
+            ("current", "현재", "autoTradeSettingRoutineTreeCurrentCriterionBadge"),
+            ("period", "기간", "autoTradeSettingRoutineTreePeriodCriterionBadge"),
+            ("profit", "수익", "autoTradeSettingRoutineTreeProfitCriterionBadge"),
+            ("average", "평균", "autoTradeSettingRoutineTreeAverageCriterionBadge"),
+            ("efficiency", "효율", "autoTradeSettingRoutineTreeEfficiencyCriterionBadge"),
+        ):
+            button = QPushButton(text, container)
+            button.setObjectName(object_name)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedSize(64, 22)
+            button.clicked.connect(
+                lambda _checked=False, target_criterion=criterion:
+                self._set_routine_tree_display_criterion(target_criterion)
+            )
+            layout.addWidget(button, 0, Qt.AlignVCenter)
+            criterion_buttons[criterion] = button
+
+        container.setFixedSize(layout.sizeHint())
         self._routine_tree_display_level_badges = container
         self._routine_tree_display_level_buttons = buttons
+        self._routine_tree_display_criterion_buttons = criterion_buttons
         self._update_routine_tree_display_level_badges()
         container.show()
         container.raise_()
@@ -2777,6 +2806,70 @@ class AutoTradeSettingWindow(QDialog):
                 )
             )
 
+        supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA.get(
+            selected_level,
+            frozenset(),
+        )
+        selected_criterion = str(
+            getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
+        )
+        disabled_style = (
+            "QPushButton:disabled, QPushButton:disabled:hover {"
+            " background-color: transparent;"
+            " border: 1px solid #D1D5DB;"
+            " border-radius: 4px;"
+            " color: #9CA3AF;"
+            " font-weight: 600;"
+            " padding: 0 6px;"
+            "}"
+        )
+        for criterion, button in getattr(self, "_routine_tree_display_criterion_buttons", {}).items():
+            enabled = criterion in supported_criteria
+            button.setEnabled(enabled)
+            button.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if enabled and criterion == selected_criterion
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+                + disabled_style
+            )
+
+    def _set_routine_tree_display_criterion(self, criterion: str) -> None:
+        clean_criterion = str(criterion or "").strip()
+        supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA.get(
+            str(getattr(self, "_routine_tree_display_level", "category") or "category"),
+            frozenset(),
+        )
+        if clean_criterion not in supported_criteria:
+            return
+
+        self._routine_tree_display_criterion = clean_criterion
+        if clean_criterion in {"all", "current"}:
+            scopes = getattr(self, "_auto_trade_stock_scope_by_instance", {})
+            instance_ids: set[str] = set()
+            for row in range(self.routine_table.rowCount()):
+                item = self.routine_table.item(row, 0)
+                metadata = item.data(Qt.UserRole) if item is not None else None
+                if isinstance(metadata, dict) and str(metadata.get("row_kind", "") or "") == "instance":
+                    instance_id = str(metadata.get("instance_id", "") or "").strip()
+                    if instance_id:
+                        instance_ids.add(instance_id)
+            for instance_id in instance_ids:
+                scopes[instance_id] = clean_criterion
+            self._auto_trade_stock_scope_by_instance = scopes
+            current_metadata = self.current_selected_routine_row_metadata()
+            self.load_routine_table()
+            if current_metadata:
+                self.restore_routine_selection_metadata(current_metadata)
+        self._update_routine_tree_display_level_badges()
+
     def _set_routine_tree_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
         if clean_level not in {"category", "routine", "stock"}:
@@ -2800,6 +2893,9 @@ class AutoTradeSettingWindow(QDialog):
                     instance_ids.add(instance_id)
 
         self._routine_tree_display_level = clean_level
+        supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA[clean_level]
+        if str(getattr(self, "_routine_tree_display_criterion", "profit") or "profit") not in supported_criteria:
+            self._routine_tree_display_criterion = "profit"
         self._collapsed_auto_trade_definition_ids = definition_ids if clean_level == "category" else set()
         self._collapsed_auto_trade_instance_ids = instance_ids if clean_level != "stock" else set()
         self._update_routine_tree_display_level_badges()

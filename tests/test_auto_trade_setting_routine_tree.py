@@ -65,6 +65,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._collapsed_auto_trade_instance_ids = set()
         harness._auto_trade_stock_scope_by_instance = {}
         harness._routine_tree_display_level = "category"
+        harness._routine_tree_display_criterion = "profit"
         for name in (
             "_setup_routine_table",
             "_routine_instance_stock_counts",
@@ -80,6 +81,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_setup_routine_tree_display_level_badges",
             "_position_routine_tree_display_level_badges",
             "_update_routine_tree_display_level_badges",
+            "_set_routine_tree_display_criterion",
             "_set_routine_tree_display_level",
             "_toggle_routine_definition_collapsed",
             "_toggle_routine_instance_collapsed",
@@ -313,6 +315,30 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertIn("padding: 0 6px", badge.styleSheet())
         self.assertIn("color: #16A34A", badges["category"].styleSheet())
         self.assertIn("color: #111827", badges["routine"].styleSheet())
+        criteria = window._routine_tree_display_criterion_buttons
+        self.assertEqual(
+            ["전체", "현재", "기간", "수익", "평균", "효율"],
+            [criteria[key].text() for key in ("all", "current", "period", "profit", "average", "efficiency")],
+        )
+        self.assertFalse(criteria["all"].isEnabled())
+        self.assertFalse(criteria["current"].isEnabled())
+        self.assertFalse(criteria["period"].isEnabled())
+        self.assertTrue(criteria["profit"].isEnabled())
+        self.assertTrue(criteria["average"].isEnabled())
+        self.assertTrue(criteria["efficiency"].isEnabled())
+        self.assertIn("color: #16A34A", criteria["profit"].styleSheet())
+        self.assertIn("color: #9CA3AF", criteria["period"].styleSheet())
+        criteria["period"].click()
+        self.assertEqual("profit", window._routine_tree_display_criterion)
+        badges["routine"].click()
+        self.assertTrue(criteria["period"].isEnabled())
+        self.assertFalse(criteria["all"].isEnabled())
+        criteria["period"].click()
+        self.assertEqual("period", window._routine_tree_display_criterion)
+        badges["category"].click()
+        self.assertEqual("profit", window._routine_tree_display_criterion)
+        badges["stock"].click()
+        self.assertTrue(all(button.isEnabled() for button in criteria.values()))
         self.assertEqual(table_geometry_before, window.routine_table.geometry())
 
         badge_group = window._routine_tree_display_level_badges
@@ -380,6 +406,48 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertFalse(window.routine_table.isRowHidden(1))
         self.assertTrue(window.routine_table.isRowHidden(2))
         self.assertTrue(window.routine_table.isRowHidden(3))
+
+    def test_tree_display_criteria_follow_level_support_and_reuse_stock_scope(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+        ]
+        window = self._window_harness()
+        window._routine_tree_display_level_buttons = {}
+        window._routine_tree_display_criterion_buttons = {}
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window.load_routine_table()
+            window._set_routine_tree_display_criterion("period")
+            self.assertEqual("profit", window._routine_tree_display_criterion)
+
+            window._set_routine_tree_display_level("routine")
+            window._set_routine_tree_display_criterion("period")
+            self.assertEqual("period", window._routine_tree_display_criterion)
+
+            window._set_routine_tree_display_level("category")
+            self.assertEqual("profit", window._routine_tree_display_criterion)
+
+            window._set_routine_tree_display_level("stock")
+            window._set_routine_tree_display_criterion("all")
+            self.assertEqual("all", window._routine_tree_display_criterion)
+            self.assertEqual("all", window._auto_trade_stock_scope_by_instance["inst-a"])
+            scope_metadata = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+            self.assertEqual("all", scope_metadata["stock_scope"])
+
+            window._set_routine_tree_display_criterion("current")
+            self.assertEqual("current", window._routine_tree_display_criterion)
+            self.assertEqual("current", window._auto_trade_stock_scope_by_instance["inst-a"])
 
     def test_parent_arrow_click_only_collapses_definition_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
