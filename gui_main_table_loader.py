@@ -92,6 +92,29 @@ ROUTINE_MONITORING_HEADERS = (
     "수익률",
 )
 
+MAIN_MONITORING_TABLE_FONT_FAMILY = "Malgun Gothic"
+MAIN_MONITORING_CELL_FONT_FAMILY = "Gulim"
+MAIN_MONITORING_FONT_POINT_SIZE = 9
+
+
+def _main_monitoring_font(family: str) -> QFont:
+    font = QFont(family, MAIN_MONITORING_FONT_POINT_SIZE)
+    font.setWeight(QFont.Normal)
+    font.setBold(False)
+    font.setItalic(False)
+    return font
+
+
+def main_monitoring_table_font() -> QFont:
+    """Return the font currently rendered by the monitoring table and painter."""
+    return _main_monitoring_font(MAIN_MONITORING_TABLE_FONT_FAMILY)
+
+
+def main_monitoring_cell_font() -> QFont:
+    """Return the current embedded-cell font without changing its geometry."""
+    return _main_monitoring_font(MAIN_MONITORING_CELL_FONT_FAMILY)
+
+
 ROUTINE_STATUS_DEFAULT = "기본운영"
 ROUTINE_STATUS_EARLY_CLOSE = "조기마감"
 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION = "즉시청산"
@@ -355,6 +378,7 @@ def _split_ratio_metric_text(text: object, label: str) -> tuple[str, str]:
 
 def _routine_metric_text_label(text: str, color_value: str) -> QLabel:
     label = QLabel(text)
+    label.setFont(main_monitoring_cell_font())
     label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
     label.setFocusPolicy(Qt.NoFocus)
     label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -423,6 +447,7 @@ def _routine_limit_metric_widget(
 
     amount_editor = QLineEdit()
     amount_editor.setObjectName("routineInstanceBuyLimitEditor")
+    amount_editor.setFont(main_monitoring_cell_font())
     amount_editor.setFixedWidth(number_widths["limit_amount"])
     amount_editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
     amount_editor.setFrame(False)
@@ -612,6 +637,7 @@ def create_routine_instance_status_widget(
     display_status, color = routine_status_stamp_spec(status)
     container = QWidget()
     container.setObjectName("routineInstanceStatusContainer")
+    container.setFont(main_monitoring_cell_font())
     container.setFocusPolicy(Qt.NoFocus)
 
     layout = QHBoxLayout(container)
@@ -642,6 +668,7 @@ def create_routine_instance_status_widget(
     stamp_color = color or "#9CA3AF"
     status_text = QLabel(display_status or "-")
     status_text.setObjectName("routineInstanceStatusText")
+    status_text.setFont(main_monitoring_cell_font())
     status_text.setAlignment(Qt.AlignCenter)
     for label in (status_text,):
         label.setFocusPolicy(Qt.NoFocus)
@@ -749,6 +776,7 @@ def create_routine_instance_status_widget(
         else:
             metric_widget = QLabel(str(text or ""))
             metric_widget.setObjectName(object_name)
+            metric_widget.setFont(main_monitoring_cell_font())
             metric_widget.setAlignment(Qt.AlignCenter)
             metric_widget.setFixedWidth(column_widths[column_key])
             _set_fixed_metric_widget_policy(metric_widget)

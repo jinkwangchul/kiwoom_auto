@@ -104,6 +104,7 @@ from gui_main_table_loader import (
     main_apply_running_sort,
     main_load_routine_table,
     main_load_running_stock_table,
+    main_monitoring_table_font,
     routine_instance_buy_limit_configured,
 )
 from gui_main_budget_panel import update_main_budget_panel
@@ -820,6 +821,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         row_kind = str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
         if row_kind == ROUTINE_ROW_STOCK:
             painter.save()
+            painter.setFont(option.font)
             visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
             checkbox_rect = QRect(
                 option.rect.left() + ROUTINE_STOCK_CHECKBOX_OFFSET,
@@ -1073,6 +1075,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     0,
                 )
                 painter.save()
+                painter.setFont(option.font)
                 if not visually_enabled:
                     painter.setPen(QColor("#9ca3af"))
                 elif option.state & QStyle.State_Selected:
@@ -1085,7 +1088,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     arrow,
                 )
                 painter.restore()
-                text_left_offset += painter.fontMetrics().horizontalAdvance("▶") + 4
+                text_left_offset += QFontMetrics(option.font).horizontalAdvance("▶") + 4
 
         text_rect = option.rect.adjusted(
             text_left_offset,
@@ -1466,6 +1469,7 @@ class MainWindow(QMainWindow):
     def _setup_routine_table(self) -> None:
         headers = list(ROUTINE_MONITORING_HEADERS)
 
+        self.routine_table.setFont(main_monitoring_table_font())
         self.routine_table.setColumnCount(len(headers))
         self.routine_table.setHorizontalHeaderLabels(headers)
 
@@ -1511,6 +1515,7 @@ class MainWindow(QMainWindow):
             "미도",
         ]
 
+        self.running_stock_table.setFont(main_monitoring_table_font())
         self.running_stock_table.setColumnCount(len(headers))
         self.running_stock_table.setHorizontalHeaderLabels(headers)
         self.running_stock_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)

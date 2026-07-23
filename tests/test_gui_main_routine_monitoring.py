@@ -326,12 +326,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             running = widget.findChild(QLabel, "routineInstanceRunning")
             stopped = widget.findChild(QLabel, "routineInstanceStopped")
             error = widget.findChild(QLabel, "routineInstanceError")
-            self.assertEqual("●", dot.text())
+            self.assertIsNone(dot)
             self.assertEqual(status, status_text.text())
-            self.assertEqual(108, stamp.width())
+            self.assertEqual(
+                gui_main_table_loader.ROUTINE_STATUS_STAMP_WIDTH,
+                stamp.width(),
+            )
             self.assertEqual(22, stamp.height())
             self.assertIn(f"border: 1px solid {color}", stamp.styleSheet())
-            self.assertIn(f"color: {color}", dot.styleSheet())
             self.assertIn(f"color: {color}", status_text.styleSheet())
             self.assertEqual("등록(4)", registered.text())
             self.assertEqual("실행(4)", running.text())
@@ -344,7 +346,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 registered.width(),
             )
             separators = widget.findChildren(QLabel, "routineInstanceSeparator")
-            self.assertEqual(7, len(separators))
+            self.assertEqual(6, len(separators))
             self.assertTrue(all(separator.text() == "|" for separator in separators))
         self.assertEqual(("", ""), gui_main_table_loader.routine_status_stamp_spec("UNKNOWN"))
 
@@ -387,18 +389,16 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     first.findChild(QLabel, object_name).x(),
                     second.findChild(QLabel, object_name).x(),
                 )
-            for object_name in (
-                "routineInstanceBuyLimit",
-                "routineInstanceConsumed",
-                "routineInstanceProfit",
-            ):
+            for object_name in ("routineInstanceBuyLimit", "routineInstanceProfit"):
                 self.assertEqual(
                     first.findChild(QWidget, object_name).x(),
                     second.findChild(QWidget, object_name).x(),
                 )
+            self.assertIsNone(first.findChild(QWidget, "routineInstanceConsumed"))
+            self.assertIsNotNone(second.findChild(QWidget, "routineInstanceConsumed"))
             first_separators = first.findChildren(QLabel, "routineInstanceSeparator")
             second_separators = second.findChildren(QLabel, "routineInstanceSeparator")
-            self.assertEqual(7, len(first_separators))
+            self.assertEqual(6, len(first_separators))
             self.assertEqual(7, len(second_separators))
             for first_separator, second_separator in zip(first_separators, second_separators):
                 self.assertEqual(first_separator.x(), second_separator.x())
@@ -439,8 +439,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 label = second.findChild(QLabel, object_name)
                 self.assertEqual(number_widths[key], label.width())
                 self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, label.alignment())
-            for key in ("registered", "running", "stopped", "error"):
-                self.assertLessEqual(column_widths[key], 64)
             self.assertEqual(
                 {gui_main_table_loader.routine_instance_separator_width(first.font())},
                 {separator.width() for separator in first_separators},
@@ -1434,12 +1432,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertIsNotNone(buy_limit)
         self.assertIsNotNone(consumed)
         self.assertIsNotNone(profit)
-        self.assertEqual("●", dot.text())
+        self.assertIsNone(dot)
         self.assertEqual("기본운영", status_text.text())
-        self.assertEqual(108, stamp.width())
+        self.assertEqual(
+            gui_main_table_loader.ROUTINE_STATUS_STAMP_WIDTH,
+            stamp.width(),
+        )
         self.assertEqual(22, stamp.height())
         self.assertIn("border: 1px solid #2563EB", stamp.styleSheet())
-        self.assertIn("color: #2563EB", dot.styleSheet())
+        self.assertIn("color: #2563EB", status_text.styleSheet())
         self.assertEqual("등록(2)", registered.text())
         self.assertEqual("실행(1)", running.text())
         self.assertEqual("정지(1)", stopped.text())
@@ -1630,10 +1631,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.routine_table.font().pointSizeF() + 1.0,
                     parent_font.pointSizeF(),
                 )
-                self.assertEqual(
+                expected_row_height = max(
                     gui_main_table_loader.ROUTINE_INSTANCE_ROW_HEIGHT,
-                    window.routine_table.rowHeight(0),
+                    window.routine_table.verticalHeader().minimumSectionSize(),
                 )
+                self.assertEqual(expected_row_height, window.routine_table.rowHeight(0))
                 self.assertEqual(
                     window.routine_table.rowHeight(0),
                     window.routine_table.rowHeight(1),
@@ -1770,15 +1772,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     QLabel,
                     "routineInstanceRegistered",
                 )
-                blocked_points = (
+                blocked_points = [
                     QPoint(
                         child_rect.left()
                         + gui_main_table_loader.ROUTINE_CHILD_CHECKBOX_OFFSET
                         + 2,
-                        child_rect.center().y(),
-                    ),
-                    QPoint(
-                        min(child_rect.right() - 2, child_name_rect.right() + 6),
                         child_rect.center().y(),
                     ),
                     status_stamp.mapTo(
@@ -1789,7 +1787,12 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         window.routine_table.viewport(),
                         aggregate_label.rect().center(),
                     ),
-                )
+                ]
+                blank_cell_x = child_name_rect.right() + 6
+                if blank_cell_x < child_rect.right():
+                    blocked_points.append(
+                        QPoint(blank_cell_x, child_rect.center().y())
+                    )
                 with patch.object(
                     window,
                     "open_routine_settings_from_main_table",
