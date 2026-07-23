@@ -2846,8 +2846,11 @@ class MainWindow(QMainWindow):
         self.stock_register_window.show()
 
     def open_auto_trade_setting_window(self) -> None:
-        self.auto_trade_setting_window = AutoTradeSettingWindow(self)
-        self.auto_trade_setting_window.show()
+        window = getattr(self, "auto_trade_setting_window", None)
+        if window is None:
+            window = AutoTradeSettingWindow(self)
+            self.auto_trade_setting_window = window
+        window.show()
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(
