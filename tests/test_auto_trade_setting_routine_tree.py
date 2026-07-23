@@ -306,7 +306,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         badges = window._routine_tree_display_level_buttons
         self.assertEqual({"category", "routine", "stock"}, set(badges))
-        self.assertEqual(["대분류", "루틴", "종목"], [badges[level].text() for level in ("category", "routine", "stock")])
+        self.assertEqual(["그룹", "루틴", "종목"], [badges[level].text() for level in ("category", "routine", "stock")])
         for badge in badges.values():
             self.assertEqual((64, 22), (badge.width(), badge.height()))
             self.assertIn("border-radius: 4px", badge.styleSheet())

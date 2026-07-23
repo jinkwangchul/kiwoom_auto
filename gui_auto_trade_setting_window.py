@@ -2727,7 +2727,7 @@ class AutoTradeSettingWindow(QDialog):
 
         buttons: dict[str, QPushButton] = {}
         for level, text, object_name in (
-            ("category", "대분류", "autoTradeSettingRoutineTreeCategoryLevelBadge"),
+            ("category", "그룹", "autoTradeSettingRoutineTreeCategoryLevelBadge"),
             ("routine", "루틴", "autoTradeSettingRoutineTreeRoutineLevelBadge"),
             ("stock", "종목", "autoTradeSettingRoutineTreeStockLevelBadge"),
         ):
