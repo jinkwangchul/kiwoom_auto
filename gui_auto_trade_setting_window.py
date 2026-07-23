@@ -1188,6 +1188,7 @@ class AutoTradeSettingWindow(QDialog):
         self._collapsed_auto_trade_instance_ids: set[str] = set()
 
         self._setup_ui()
+        # Initialization contract: font, state, input state, geometry, then signals.
         for control_type in (QPushButton, QLabel, QGroupBox):
             for control in self.findChildren(control_type):
                 control.setFont(QFont(control.font()))
@@ -1489,6 +1490,9 @@ class AutoTradeSettingWindow(QDialog):
         header.setFont(routine_table_font)
         header.setDefaultAlignment(Qt.AlignCenter)
         header.setHighlightSections(False)
+        header.setSectionsClickable(False)
+        header.setSectionsMovable(False)
+        header.setSortIndicatorShown(False)
         for col in range(len(headers)):
             header_item = self.routine_table.horizontalHeaderItem(col)
             if header_item is not None:
@@ -1512,7 +1516,6 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerItem)
         self.routine_table.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
         self.routine_table.setSortingEnabled(False)
-        self.routine_table.horizontalHeader().setSectionsClickable(True)
         self.routine_table.setColumnCount(1)
         self.routine_table.horizontalHeader().hide()
         self.routine_table.verticalHeader().hide()
@@ -1526,9 +1529,6 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.routine_table.horizontalHeader().setStretchLastSection(True)
-        self.routine_table.horizontalHeader().setSectionsClickable(False)
-        self.routine_table.horizontalHeader().setSectionsMovable(False)
-        self.routine_table.horizontalHeader().setSortIndicatorShown(False)
         self.routine_table.verticalHeader().setMinimumSectionSize(22)
         self.routine_table.setMinimumWidth(970)
         self.routine_table.setColumnWidth(0, 950)
@@ -1571,6 +1571,9 @@ class AutoTradeSettingWindow(QDialog):
         header.setFont(header_font)
         header.setDefaultAlignment(Qt.AlignCenter)
         header.setHighlightSections(False)
+        header.setSectionsClickable(True)
+        header.setSectionsMovable(False)
+        header.setSortIndicatorShown(False)
         for col in range(len(headers)):
             header_item = self.stock_table.horizontalHeaderItem(col)
             if header_item is not None:
@@ -1619,9 +1622,6 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
         self.stock_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.stock_table.setSortingEnabled(False)
-        self.stock_table.horizontalHeader().setSectionsClickable(True)
-        self.stock_table.horizontalHeader().setSectionsMovable(False)
-        self.stock_table.horizontalHeader().setSortIndicatorShown(False)
         QTimer.singleShot(0, self._apply_stock_table_column_widths)
 
     def _apply_stock_table_column_widths(self) -> None:
