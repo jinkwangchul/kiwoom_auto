@@ -431,6 +431,20 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         append_stock_log(stock_dir, "ERROR", f"운영방식 저장 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / {exc}")
         return False
 
+    saved_config = read_json_dict(config_path)
+    if saved_config != config:
+        QMessageBox.critical(
+            window,
+            "운영방식 저장 오류",
+            f"{code} {name} 운영방식 저장 결과를 확인하지 못했습니다.",
+        )
+        append_stock_log(
+            stock_dir,
+            "ERROR",
+            f"운영방식 저장 read-back 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
+        )
+        return False
+
     append_stock_log(stock_dir, "GUI", f"운영방식 변경: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}")
     return True
 
@@ -455,11 +469,14 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
     mode = normalize_operation_mode(operation_mode)
     display_mode = operation_mode_display(mode)
     completed: list[str] = []
+    failed: list[str] = []
     status_changed: list[str] = []
+    status_failed: list[str] = []
     protected: list[str] = []
 
     for stock_dir, code, name in selected:
         if not window.update_stock_operation_mode(stock_dir, code, name, mode, config_updates):
+            failed.append(f"{code} {name}")
             continue
 
         completed.append(f"{code} {name}")
@@ -473,6 +490,8 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         )
         if result == "changed":
             status_changed.append(f"{code} {name}({auto_trade_status_display(new_status)})")
+        elif result == "failed":
+            status_failed.append(f"{code} {name}")
         elif result == "protected":
             protected.append(f"{code} {name}({auto_trade_status_display(before_status)})")
 
@@ -483,6 +502,8 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
             changelog_parts.append(schedule_log_text)
         if status_changed:
             changelog_parts.append(f"상태재판정: {' / '.join(status_changed)}")
+        if status_failed:
+            changelog_parts.append(f"상태재판정실패: {' / '.join(status_failed)}")
         if protected:
             changelog_parts.append(f"보호상태유지: {' / '.join(protected)}")
 
@@ -493,13 +514,25 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         )
 
     window.refresh_all()
+    parent = window.parent()
+    refresh_parent = getattr(parent, "refresh_all", None)
+    if callable(refresh_parent):
+        refresh_parent()
+
+    if not completed:
+        window.statusBarMessage(f"운영방식 변경 실패: {display_mode} / 실패 {len(failed)}개")
+        return
 
     status_text = f"운영방식 변경 완료: {display_mode} {len(completed)}개"
+    if failed:
+        status_text += f" / 실패 {len(failed)}개"
     schedule_suffix = schedule_status_suffix(config_updates)
     if schedule_suffix:
         status_text += schedule_suffix
     if status_changed:
         status_text += f" / 상태재판정 {len(status_changed)}개"
+    if status_failed:
+        status_text += f" / 상태재판정 실패 {len(status_failed)}개"
     if protected:
         status_text += f" / 보호상태유지 {len(protected)}개"
     window.statusBarMessage(status_text)
