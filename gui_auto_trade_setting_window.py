@@ -1798,10 +1798,20 @@ class AutoTradeSettingWindow(QDialog):
         return auto_trade_current_runtime_file_signature(self)
 
     def on_runtime_file_timer_tick(self) -> None:
-        auto_trade_on_runtime_file_timer_tick(self)
+        previous_snapshot = self._runtime_file_snapshot
+        try:
+            auto_trade_on_runtime_file_timer_tick(self)
+        except Exception as exc:
+            self._runtime_file_snapshot = previous_snapshot
+            self.statusBarMessage(f"runtime 파일 자동 갱신 실패: {exc}")
 
     def on_time_policy_timer_tick(self) -> None:
-        auto_trade_on_time_policy_timer_tick(self)
+        previous_minute_key = self._last_time_policy_minute_key
+        try:
+            auto_trade_on_time_policy_timer_tick(self)
+        except Exception as exc:
+            self._last_time_policy_minute_key = previous_minute_key
+            self.statusBarMessage(f"시간정책 자동 갱신 실패: {exc}")
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         parent = self.parent()

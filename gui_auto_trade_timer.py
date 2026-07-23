@@ -171,8 +171,8 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     if callable(refresh_all):
         try:
             refresh_all()
-        except Exception:
-            pass
+        except Exception as exc:
+            window.statusBarMessage(f"메인 화면 자동 갱신 실패: {exc}")
 
     # STEP 3: 루틴 evaluate() 연결 확인용 안전 프로브.
     # - 로그만 기록한다.
@@ -226,8 +226,8 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
                                 )
                 except Exception as exc:
                     window.statusBarMessage(f"주문후보검증 실패: {exc}")
-        except Exception:
-            pass
+        except Exception as exc:
+            window.statusBarMessage(f"루틴 신호 자동 점검 실패: {exc}")
 
     if changed_count > 0 or failed_count > 0:
         window.statusBarMessage(
