@@ -1188,6 +1188,9 @@ class AutoTradeSettingWindow(QDialog):
         self._collapsed_auto_trade_instance_ids: set[str] = set()
 
         self._setup_ui()
+        for control_type in (QPushButton, QLabel, QGroupBox):
+            for control in self.findChildren(control_type):
+                control.setFont(QFont(control.font()))
         self._apply_initial_strategy_workspace_size()
         self._connect_events()
 
