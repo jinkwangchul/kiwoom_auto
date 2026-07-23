@@ -1533,6 +1533,12 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setHorizontalHeaderLabels(headers)
         apply_plain_table_header(self.stock_table)
         header = self.stock_table.horizontalHeader()
+        header_font = QFont(self.stock_table.font())
+        header.setFont(header_font)
+        for col in range(len(headers)):
+            header_item = self.stock_table.horizontalHeaderItem(col)
+            if header_item is not None:
+                header_item.setFont(header_font)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.Fixed)
         for col in range(len(headers)):
