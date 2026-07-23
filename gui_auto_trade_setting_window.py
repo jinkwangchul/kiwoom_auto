@@ -1470,11 +1470,19 @@ class AutoTradeSettingWindow(QDialog):
             "가용예산",
         ]
 
+        routine_table_font = QFont(self.routine_table.font())
+        self.routine_table.setFont(routine_table_font)
         self.routine_table.setColumnCount(len(headers))
         self.routine_table.setHorizontalHeaderLabels(headers)
         apply_plain_table_header(self.routine_table)
-        self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.routine_table.horizontalHeader().setStretchLastSection(True)
+        header = self.routine_table.horizontalHeader()
+        header.setFont(routine_table_font)
+        for col in range(len(headers)):
+            header_item = self.routine_table.horizontalHeaderItem(col)
+            if header_item is not None:
+                header_item.setFont(routine_table_font)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
         self.routine_table.setColumnWidth(0, 220)
         self.routine_table.setColumnWidth(1, 90)
         self.routine_table.setColumnWidth(2, 140)
@@ -2184,6 +2192,7 @@ class AutoTradeSettingWindow(QDialog):
         is_definition = row_kind == "definition"
         has_period_metric = is_instance or is_stock
         container = QWidget()
+        container.setFont(QFont(self.routine_table.font()))
         container.setFocusPolicy(Qt.NoFocus)
         container.setMouseTracking(True)
         container.setAttribute(Qt.WA_StyledBackground, True)
@@ -2230,7 +2239,7 @@ class AutoTradeSettingWindow(QDialog):
             f" color: {AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else '#6B7280'};"
         )
         if is_definition:
-            icon_font = QFont(icon_label.font())
+            icon_font = QFont(container.font())
             icon_font.setPointSize(icon_font.pointSize() + 2)
             icon_label.setFont(icon_font)
             icon_label.setCursor(Qt.PointingHandCursor)
@@ -2280,7 +2289,7 @@ class AutoTradeSettingWindow(QDialog):
         title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         if is_stock:
             title_label.setToolTip(str(row_data.get("display_name", "") or text))
-        base_title_font = QFont(title_label.font())
+        base_title_font = QFont(container.font())
         title_font = QFont(base_title_font)
         if not is_definition:
             title_font.setBold(False)
