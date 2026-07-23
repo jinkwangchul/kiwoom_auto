@@ -187,7 +187,10 @@ def _startup_stock_state_summary(stock_state_paths: list[str | Path]) -> dict[st
         if not isinstance(state, dict):
             invalid_items.append(f"{path}: root must be an object")
             continue
-        status = _clean_text(state.get("status") or "STOPPED").upper()
+        status = _clean_text(state.get("status")).upper()
+        if not status:
+            invalid_items.append(f"{path}: required field status is missing")
+            continue
         statuses[status] = statuses.get(status, 0) + 1
         if status in {"EMERGENCY_STOP", "EMERGENCY_STOPPED", "EMERGENCY"}:
             blocked_items.append(f"{path.parent.name}: {status}")
@@ -493,6 +496,11 @@ def assess_startup_recovery(
         for read in reads.values()
         if read.get("status") == "MISSING"
     ]
+    invalid_reasons.extend(
+        read["reason"]
+        for read in reads.values()
+        if read.get("status") == "MISSING"
+    )
 
     executions_present = reads["order_executions"]["status"] != "MISSING"
     locks_present = reads["order_locks"]["status"] != "MISSING"
