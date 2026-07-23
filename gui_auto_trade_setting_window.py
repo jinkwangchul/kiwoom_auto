@@ -42,7 +42,6 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
-    QApplication,
     QPushButton,
     QStyle,
     QStyleOptionButton,
