@@ -22,7 +22,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QSize, QEvent
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -33,7 +33,6 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -62,7 +61,6 @@ from PyQt5.QtWidgets import (
 
 from gui_styles import (
     apply_plain_table_header,
-    apply_selected_routine_label_style,
 )
 from gui_common_utils import safe_int_value, sanitize_path_part
 from gui_stock_data import active_routine_for_stock, stock_runtime_dir_for_routine
@@ -372,9 +370,34 @@ from real_order_preflight_service import commit_real_order_preflight, preview_re
 
 ROUTINE_INSTANCE_REQUIRED_MESSAGE = "이 작업을 수행할 대상 루틴 인스턴스를 선택하세요."
 ROUTINE_STATUS_DEFAULT = "기본운영"
-ROUTINE_TREE_TITLE_DISPLAY_CHARS = 7
+ROUTINE_TREE_TITLE_DISPLAY_CHARS = 6
 ROUTINE_TREE_TITLE_PREFIX_CHARS = 6
 ROUTINE_TREE_TITLE_CELL_PADDING = 12
+AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
+AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
+AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
+AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
+AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
+    0: 80,    # 코드: 6자리 여유
+    1: 205,   # 종목: 13자 기준
+    2: 120,   # 운영: 09:30~13:30 표시
+    3: 50,    # 현황: 종목 운영 건강도 표시등
+    4: 90,    # 상태: 감시/대기, 매수/매도
+    5: 80,    # 방식: 루틴, 시장가, 현재가
+    6: 120,   # 청산: 10분/시장가, 10분/현재가
+    7: 204,   # 보유: 수량 / 총매수금액
+    8: 194,   # 가격: 평단가 / 현재가
+    9: 199,   # 손익: 손익금 / 수익률
+    10: 78,   # 미체결: 미수 / 미도
+}
+AUTO_TRADE_SETTING_INITIAL_STOCK_LAST_COLUMN = 6
+AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP = 6
+AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT = 24
+AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X = 4
+AUTO_TRADE_SETTING_STOCK_ROW_SPACING = 2
+AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION = 4
+AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION = 4
 
 
 def routine_tree_title_text(display_name: object) -> str:
@@ -382,21 +405,43 @@ def routine_tree_title_text(display_name: object) -> str:
     text = str(display_name or "").strip()
     if len(text) <= ROUTINE_TREE_TITLE_DISPLAY_CHARS:
         return text
-    return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}…"
+    return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}..."
 
 
 def routine_tree_title_width(font_metrics) -> int:
     samples = (
         "가" * ROUTINE_TREE_TITLE_DISPLAY_CHARS,
-        ("가" * ROUTINE_TREE_TITLE_PREFIX_CHARS) + "…",
-        "1234567",
-        "123456…",
+        ("가" * ROUTINE_TREE_TITLE_PREFIX_CHARS) + "...",
+        "123456",
+        "123456...",
     )
     text_width = max(
         max(font_metrics.horizontalAdvance(sample), font_metrics.boundingRect(sample).width())
         for sample in samples
     )
     return text_width + ROUTINE_TREE_TITLE_CELL_PADDING
+
+
+def auto_trade_setting_badge_stylesheet(
+    selector: str,
+    text_color: str = AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
+    border_color: str = AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
+) -> str:
+    return (
+        f"{selector} {{"
+        " background-color: transparent;"
+        f" border: 1px solid {border_color};"
+        " border-radius: 4px;"
+        f" color: {text_color};"
+        " font-weight: 600;"
+        " padding: 0 6px;"
+        "}"
+        f"{selector}:hover {{"
+        " background-color: transparent;"
+        f" color: {text_color};"
+        f" border-color: {border_color};"
+        "}"
+    )
 
 
 class StockPositionMetricDelegate(QStyledItemDelegate):
@@ -1045,8 +1090,13 @@ class AutoTradeSettingWindow(QDialog):
         super().__init__(parent)
 
         self.setWindowTitle("자동매매설정")
-        self.resize(1548, 680)
-        self.setMinimumWidth(1548)
+        flags = self.windowFlags()
+        flags &= ~Qt.WindowContextHelpButtonHint
+        flags |= Qt.WindowMinimizeButtonHint
+        flags |= Qt.WindowMaximizeButtonHint
+        flags |= Qt.WindowCloseButtonHint
+        self.setWindowFlags(flags)
+        self.setMinimumHeight(650)
 
         self.routine_table = QTableWidget()
         self.stock_table = QTableWidget()
@@ -1125,8 +1175,13 @@ class AutoTradeSettingWindow(QDialog):
         self._last_execution_enable_queue_snapshot: dict[str, object] | None = None
         self._last_real_preflight_preview_result: dict[str, object] | None = None
         self._last_real_preflight_queue_snapshot: dict[str, object] | None = None
+        self._stock_status_filter = "all"
+        self._last_strategy_workspace_width = 0
+        self._auto_trade_stock_scope_by_instance: dict[str, str] = {}
+        self._collapsed_auto_trade_instance_ids: set[str] = set()
 
         self._setup_ui()
+        self._apply_initial_strategy_workspace_size()
         self._connect_events()
 
         self.refresh_all()
@@ -1144,22 +1199,17 @@ class AutoTradeSettingWindow(QDialog):
         self._setup_routine_table()
         routine_layout.addWidget(self.routine_table)
         routine_box.setLayout(routine_layout)
-        routine_box.setMinimumWidth(700)
-
-        self.selection_summary_box = QGroupBox("Selection Summary")
-        self._setup_selection_summary_panel()
+        routine_box.setMinimumWidth(1000)
+        self.routine_box = routine_box
 
         self.stock_box = QGroupBox("Stock List")
         stock_layout = QVBoxLayout()
-        self.selected_routine_label = QLabel("선택 루틴: -")
-        apply_selected_routine_label_style(self.selected_routine_label)
-        self.selected_routine_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.selected_routine_label.setMinimumHeight(28)
+        self._setup_selected_routine_status_bar()
         self._setup_stock_table()
 
         selected_routine_header_layout = QHBoxLayout()
         selected_routine_header_layout.setContentsMargins(0, 0, 0, 0)
-        selected_routine_header_layout.addWidget(self.selected_routine_label)
+        selected_routine_header_layout.addWidget(self.selected_routine_status_bar)
         selected_routine_header_layout.addStretch(1)
         selected_routine_header_layout.addWidget(self.btn_fetch_minute_candles)
         selected_routine_header_layout.addWidget(self.btn_preview_order_candidates)
@@ -1179,9 +1229,10 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_box.setLayout(stock_layout)
 
         workspace_widget = QWidget()
+        workspace_widget.setMinimumWidth(700)
+        self.strategy_workspace_widget = workspace_widget
         workspace_layout = QVBoxLayout()
         workspace_layout.setContentsMargins(0, 0, 0, 0)
-        workspace_layout.addWidget(self.selection_summary_box, 0)
         workspace_layout.addWidget(self.stock_box, 1)
         workspace_widget.setLayout(workspace_layout)
 
@@ -1190,7 +1241,6 @@ class AutoTradeSettingWindow(QDialog):
         self.strategy_workspace_splitter.addWidget(workspace_widget)
         self.strategy_workspace_splitter.setStretchFactor(0, 0)
         self.strategy_workspace_splitter.setStretchFactor(1, 1)
-        self.strategy_workspace_splitter.setSizes([720, 880])
 
         buttons = [
             self.btn_start,
@@ -1213,69 +1263,196 @@ class AutoTradeSettingWindow(QDialog):
         main_layout.addLayout(button_layout)
         self.setLayout(main_layout)
 
-    def _setup_selection_summary_panel(self) -> None:
-        summary_layout = QGridLayout()
-        summary_layout.setContentsMargins(8, 8, 8, 8)
-        summary_layout.setHorizontalSpacing(16)
-        summary_layout.setVerticalSpacing(4)
-        self.summary_routine_value = QLabel("-")
-        self.summary_instance_value = QLabel("-")
-        self.summary_registered_value = QLabel("-")
-        self.summary_running_value = QLabel("-")
-        self.summary_error_value = QLabel("-")
-        self.summary_default_operation_value = QLabel("-")
-        summary_fields = [
-            ("Routine Name", self.summary_routine_value),
-            ("Instance Name", self.summary_instance_value),
-            ("등록", self.summary_registered_value),
-            ("실행", self.summary_running_value),
-            ("오류", self.summary_error_value),
-            ("기본운영", self.summary_default_operation_value),
-        ]
-        for index, (label_text, value_label) in enumerate(summary_fields):
-            row = index // 3
-            col = (index % 3) * 2
-            label = QLabel(label_text)
-            value_label.setMinimumWidth(110)
-            value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            summary_layout.addWidget(label, row, col)
-            summary_layout.addWidget(value_label, row, col + 1)
-        self.selection_summary_box.setLayout(summary_layout)
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not hasattr(self, "strategy_workspace_splitter"):
+            return
+        current_width = int(self.width())
+        grew = current_width > int(getattr(self, "_last_strategy_workspace_width", 0) or 0)
+        self._last_strategy_workspace_width = current_width
+        if grew or self.isMaximized():
+            QTimer.singleShot(0, self._rebalance_strategy_workspace_splitter)
 
-    def update_selection_summary_panel(self) -> None:
-        if not hasattr(self, "summary_routine_value"):
+    def _stock_table_required_width(self, last_column: int | None = None) -> int:
+        self._apply_stock_table_column_widths()
+        if last_column is None:
+            column_range = range(self.stock_table.columnCount())
+        else:
+            column_range = range(min(last_column, self.stock_table.columnCount() - 1) + 1)
+        header_width = sum(
+            self.stock_table.horizontalHeader().sectionSize(col)
+            for col in column_range
+        )
+        vertical_header_width = self.stock_table.verticalHeader().width()
+        if vertical_header_width <= 0:
+            vertical_header_width = self.stock_table.verticalHeader().minimumWidth()
+        vertical_scroll_width = self.stock_table.verticalScrollBar().sizeHint().width()
+        frame_width = self.stock_table.frameWidth() * 2
+        return header_width + vertical_header_width + vertical_scroll_width + frame_width
+
+    def _right_workspace_required_width(self, last_stock_column: int | None = None) -> int:
+        stock_layout_margins = self.stock_box.layout().contentsMargins()
+        stock_box_extra = (
+            stock_layout_margins.left()
+            + stock_layout_margins.right()
+        )
+        stock_required_width = self._stock_table_required_width(last_stock_column) + stock_box_extra
+        return max(stock_required_width, self.strategy_workspace_widget.minimumWidth())
+
+    def _right_workspace_initial_width(self) -> int:
+        return self._right_workspace_required_width(AUTO_TRADE_SETTING_INITIAL_STOCK_LAST_COLUMN)
+
+    def _apply_initial_strategy_workspace_size(self) -> None:
+        self._apply_stock_table_column_widths()
+        main_layout = self.layout()
+        margins = main_layout.contentsMargins() if main_layout is not None else None
+        outer_width = (margins.left() + margins.right()) if margins is not None else 0
+        left_width = self.routine_box.minimumWidth()
+        right_width = self._right_workspace_initial_width()
+        handle_width = self.strategy_workspace_splitter.handleWidth()
+        initial_width = left_width + right_width + handle_width + outer_width
+        self.setMinimumSize(initial_width, 650)
+        self.resize(initial_width, 680)
+        self.strategy_workspace_splitter.setSizes([left_width, right_width])
+        self._last_strategy_workspace_width = initial_width
+        QTimer.singleShot(0, self._rebalance_strategy_workspace_splitter)
+
+    def _rebalance_strategy_workspace_splitter(self) -> None:
+        if not hasattr(self, "strategy_workspace_splitter"):
+            return
+        available_width = self.strategy_workspace_splitter.width()
+        if available_width <= 0:
+            return
+        handle_width = self.strategy_workspace_splitter.handleWidth()
+        left_minimum_width = self.routine_box.minimumWidth()
+        right_required_width = self._right_workspace_required_width()
+        right_width = min(
+            right_required_width,
+            max(self.strategy_workspace_widget.minimumWidth(), available_width - left_minimum_width - handle_width),
+        )
+        left_width = max(left_minimum_width, available_width - right_width - handle_width)
+        current_sizes = self.strategy_workspace_splitter.sizes()
+        if len(current_sizes) == 2 and current_sizes[1] >= right_required_width:
+            return
+        if right_width > 0 and left_width > 0:
+            self.strategy_workspace_splitter.setSizes([left_width, right_width])
+
+    def _setup_selected_routine_status_bar(self) -> None:
+        self.selected_routine_status_bar = QWidget()
+        self.selected_routine_status_bar.setObjectName("autoTradeSettingSelectedRoutineStatusBar")
+        layout = QHBoxLayout(self.selected_routine_status_bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.selected_routine_signal_label = QLabel("●")
+        self.selected_routine_signal_label.setObjectName("autoTradeSettingSelectedRoutineSignal")
+        self.selected_routine_signal_label.setAlignment(Qt.AlignCenter)
+        self.selected_routine_signal_label.setFixedWidth(18)
+        self.selected_routine_signal_label.setStyleSheet("background: transparent; color: #6B7280;")
+        layout.addWidget(self.selected_routine_signal_label, 0, Qt.AlignVCenter)
+
+        self.selected_routine_name_button = QPushButton("-")
+        self.selected_routine_name_button.setObjectName("autoTradeSettingSelectedRoutineNameButton")
+        self.selected_routine_name_button.setFlat(True)
+        self.selected_routine_name_button.setFocusPolicy(Qt.NoFocus)
+        self.selected_routine_name_button.setCursor(Qt.PointingHandCursor)
+        self.selected_routine_name_button.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #111827; "
+            "font-weight: 600; padding: 0 2px; text-align: left; }"
+            "QPushButton:hover { color: #1D4ED8; }"
+        )
+        self.selected_routine_name_button.clicked.connect(lambda: self.set_stock_status_filter("all"))
+        layout.addWidget(self.selected_routine_name_button, 0, Qt.AlignVCenter)
+
+        self.selected_routine_instance_count_badge = QLabel("")
+        self.selected_routine_instance_count_badge.setObjectName("autoTradeSettingSelectedRoutineInstanceCount")
+        self.selected_routine_instance_count_badge.setAlignment(Qt.AlignCenter)
+        self.selected_routine_instance_count_badge.setFixedWidth(64)
+        self.selected_routine_instance_count_badge.setStyleSheet(
+            "background-color: transparent; color: #7E22CE; border: 1px solid #C084FC; "
+            "border-radius: 3px; padding: 0 3px;"
+        )
+        layout.addWidget(self.selected_routine_instance_count_badge, 0, Qt.AlignVCenter)
+
+        self.selected_routine_status_buttons: dict[str, QPushButton] = {}
+        for filter_key, object_name in (
+            ("all", "autoTradeSettingSelectedRoutineRegistered"),
+            ("running", "autoTradeSettingSelectedRoutineRunning"),
+            ("stopped", "autoTradeSettingSelectedRoutineStopped"),
+            ("error", "autoTradeSettingSelectedRoutineError"),
+        ):
+            button = QPushButton()
+            button.setObjectName(object_name)
+            button.setFlat(True)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(
+                "QPushButton { background: transparent; border: none; color: #374151; padding: 0 2px; }"
+                "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
+            )
+            button.clicked.connect(lambda _checked=False, key=filter_key: self.set_stock_status_filter(key))
+            self.selected_routine_status_buttons[filter_key] = button
+            layout.addWidget(button, 0, Qt.AlignVCenter)
+
+        layout.addStretch(1)
+        self.update_selected_routine_status_bar()
+
+    def set_stock_status_filter(self, filter_key: str) -> None:
+        normalized = str(filter_key or "all").strip().lower()
+        if normalized not in {"all", "running", "stopped", "error"}:
+            normalized = "all"
+        self._stock_status_filter = normalized
+        self.update_selected_routine_status_bar()
+        self.load_selected_routine_stocks()
+
+    def update_selected_routine_status_bar(self) -> None:
+        if not hasattr(self, "selected_routine_status_bar"):
             return
         metadata = self.current_selected_routine_row_metadata()
         if not metadata:
-            routine_name = "-"
-            instance_name = "-"
-            registered = "-"
-            running = "-"
-            error = "-"
-            default_operation = "-"
+            self.selected_routine_signal_label.setText("●")
+            self.selected_routine_name_button.setText("-")
+            self.selected_routine_instance_count_badge.setText("")
+            self.selected_routine_instance_count_badge.hide()
+            counts = {"registered": 0, "running": 0, "stopped": 0, "error": 0}
         else:
-            routine_name = str(metadata.get("definition_name", "") or "-")
             row_kind = str(metadata.get("row_kind", "") or "")
-            instance_name = (
-                str(metadata.get("instance_name", "") or "-")
-                if row_kind == "instance"
-                else "전체 인스턴스"
+            self.selected_routine_signal_label.setText("●")
+            if row_kind in {"instance", "stock_scope", "stock"}:
+                self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
+                self.selected_routine_instance_count_badge.setText("")
+                self.selected_routine_instance_count_badge.hide()
+            else:
+                self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
+                self.selected_routine_instance_count_badge.setText(
+                    f"루틴{int(metadata.get('instance_count', 0) or 0)}"
+                )
+                self.selected_routine_instance_count_badge.show()
+            counts = {
+                "registered": int(metadata.get("registered", 0) or 0),
+                "running": int(metadata.get("running", 0) or 0),
+                "stopped": int(metadata.get("stopped", 0) or 0),
+                "error": int(metadata.get("error", 0) or 0),
+            }
+        button_texts = {
+            "all": f"종목({counts['registered']})",
+            "running": f"실행({counts['running']})",
+            "stopped": f"정지({counts['stopped']})",
+            "error": f"검토({counts['error']})",
+        }
+        current_filter = str(getattr(self, "_stock_status_filter", "all") or "all")
+        for key, button in self.selected_routine_status_buttons.items():
+            button.setText(button_texts[key])
+            is_active = key == current_filter
+            button.setStyleSheet(
+                "QPushButton { background: transparent; border: none; "
+                f"color: {'#1D4ED8' if is_active else '#374151'}; "
+                f"font-weight: {'600' if is_active else '400'}; padding: 0 2px; }}"
+                "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
             )
-            registered = str(metadata.get("registered", metadata.get("stock_count", "-")) or "0")
-            running = str(metadata.get("running", "0") or "0")
-            error = str(metadata.get("error", "0") or "0")
-            default_operation = (
-                "ON"
-                if row_kind == "instance"
-                and self._is_default_operation_instance(metadata)
-                else "OFF"
-            )
-        self.summary_routine_value.setText(routine_name)
-        self.summary_instance_value.setText(instance_name)
-        self.summary_registered_value.setText(registered)
-        self.summary_running_value.setText(running)
-        self.summary_error_value.setText(error)
-        self.summary_default_operation_value.setText(default_operation)
+
+    def update_selection_summary_panel(self) -> None:
+        return
 
     def _setup_routine_table(self) -> None:
         headers = [
@@ -1307,9 +1484,13 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setShowGrid(False)
         self.routine_table.setAlternatingRowColors(False)
         self.routine_table.setWordWrap(False)
+        self.routine_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.routine_table.horizontalHeader().setStretchLastSection(True)
         self.routine_table.horizontalHeader().setSectionsClickable(False)
+        self.routine_table.verticalHeader().setMinimumSectionSize(22)
+        self.routine_table.setMinimumWidth(970)
+        self.routine_table.setColumnWidth(0, 950)
         self.routine_table.setStyleSheet(
             """
             QTableWidget {
@@ -1383,26 +1564,13 @@ class AutoTradeSettingWindow(QDialog):
 
     def _apply_stock_table_column_widths(self) -> None:
         """자동매매설정창 하단 종목표 컬럼 폭을 강제로 재적용한다."""
-        widths = {
-            0: 80,    # 코드: 6자리 여유
-            1: 205,   # 종목: 13자 기준
-            2: 120,   # 운영: 09:30~13:30 표시
-            3: 50,    # 현황: 종목 운영 건강도 표시등
-            4: 90,    # 상태: 감시/대기, 매수/매도
-            5: 80,    # 방식: 루틴, 시장가, 현재가
-            6: 120,   # 청산: 10분/시장가, 10분/현재가
-            7: 204,   # 보유: 수량 / 총매수금액
-            8: 194,   # 가격: 평단가 / 현재가
-            9: 199,   # 손익: 손익금 / 수익률
-            10: 78,   # 미체결: 미수 / 미도
-        }
         self.stock_table.verticalHeader().setMinimumWidth(40)
         self.stock_table.verticalHeader().setMaximumWidth(40)
         self.stock_table.verticalHeader().setFixedWidth(40)
         header = self.stock_table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.Fixed)
-        for col, width in widths.items():
+        for col, width in AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS.items():
             header.setSectionResizeMode(col, QHeaderView.Fixed)
             header.resizeSection(col, width)
             self.stock_table.setColumnWidth(col, width)
@@ -1861,12 +2029,22 @@ class AutoTradeSettingWindow(QDialog):
     def _routine_instance_stock_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         root = Path(__file__).resolve().parent
+        for stock_dir, instance_id, _stock in self._current_stock_entries_by_instance(root=root):
+            counts[instance_id] = counts.get(instance_id, 0) + 1
+        return counts
+
+    def _current_stock_entries_by_instance(
+        self,
+        root: Path | None = None,
+    ) -> list[tuple[Path, str, dict[str, object]]]:
+        project_root = root if root is not None else Path(__file__).resolve().parent
+        entries: list[tuple[Path, str, dict[str, object]]] = []
         for stock in read_base_stocks():
-            instance_id = str(stock.get("assigned_routine_instance_id", "") or "").strip()
             stock_path = str(stock.get("stock_path", "") or "").strip()
             if not stock_path:
                 continue
-            stock_dir = root / stock_path
+            stock_dir = project_root / stock_path
+            instance_id = str(stock.get("assigned_routine_instance_id", "") or "").strip()
             if not instance_id:
                 config = read_json_dict(stock_dir / "config.json")
                 instance_id = str(config.get("assigned_routine_instance_id", "") or "").strip()
@@ -1874,8 +2052,28 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             if is_review_required_stock_dir(stock_dir):
                 continue
-            counts[instance_id] = counts.get(instance_id, 0) + 1
-        return counts
+            entries.append((stock_dir, instance_id, dict(stock)))
+        return entries
+
+    def _current_stocks_by_instance(self) -> dict[str, list[dict[str, object]]]:
+        stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+        for stock_dir, instance_id, stock in self._current_stock_entries_by_instance():
+            stock_name = str(stock.get("name", "") or "").strip()
+            stock_code = str(stock.get("code", "") or "").strip()
+            if not stock_name or not stock_code:
+                parsed_code, parsed_name = parse_stock_folder_name(stock_dir.name)
+                stock_code = stock_code or parsed_code
+                stock_name = stock_name or parsed_name
+            stocks_by_instance.setdefault(instance_id, []).append(
+                {
+                    "stock_path": str(stock.get("stock_path", "") or stock_dir),
+                    "stock_code": stock_code,
+                    "stock_name": stock_name or stock_code or stock_dir.name,
+                }
+            )
+        for stocks in stocks_by_instance.values():
+            stocks.sort(key=lambda item: (str(item.get("stock_name", "")), str(item.get("stock_code", ""))))
+        return stocks_by_instance
 
     def _routine_instance_operation_counts(self) -> dict[str, dict[str, object]]:
         from gui_main_table_loader import _instance_stock_counts
@@ -1968,44 +2166,110 @@ class AutoTradeSettingWindow(QDialog):
     def _routine_tree_row_widget(self, row_data: dict[str, object], text: str) -> QWidget:
         row_kind = str(row_data.get("row_kind", "") or "")
         is_instance = row_kind == "instance"
+        is_stock_scope = row_kind == "stock_scope"
+        is_stock = row_kind == "stock"
+        is_definition = row_kind == "definition"
+        has_period_metric = is_instance or is_stock
         container = QWidget()
         container.setFocusPolicy(Qt.NoFocus)
         container.setMouseTracking(True)
         container.setAttribute(Qt.WA_StyledBackground, True)
         container.setStyleSheet("background: transparent;")
         layout = QHBoxLayout(container)
-        layout.setContentsMargins(6, 0, 6, 0)
-        layout.setSpacing(4)
+        top_margin = (
+            AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP
+            if is_instance and bool(row_data.get("instance_group_top_gap"))
+            else 0
+        )
+        horizontal_margin = AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X if is_stock else 6
+        row_spacing = AUTO_TRADE_SETTING_STOCK_ROW_SPACING if is_stock else 4
+        layout.setContentsMargins(horizontal_margin, top_margin, horizontal_margin, 0)
+        layout.setSpacing(row_spacing)
         if is_instance:
             indent_spacer = QWidget()
             indent_spacer.setObjectName("autoTradeSettingRoutineTreeIndent")
             indent_spacer.setFixedWidth(28)
             indent_spacer.setFocusPolicy(Qt.NoFocus)
             layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
+        elif is_stock_scope:
+            indent_spacer = QWidget()
+            indent_spacer.setObjectName("autoTradeSettingRoutineTreeStockScopeIndent")
+            indent_spacer.setFixedWidth(56)
+            indent_spacer.setFocusPolicy(Qt.NoFocus)
+            layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
+        elif is_stock:
+            indent_spacer = QWidget()
+            indent_spacer.setObjectName("autoTradeSettingRoutineTreeStockIndent")
+            indent_spacer.setFixedWidth(28)
+            indent_spacer.setFocusPolicy(Qt.NoFocus)
+            layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
+            row_data = dict(row_data)
+            row_data["tree_icon"] = "\u25aa"
         icon_label = QLabel(str(row_data.get("tree_icon", "") or ""))
         icon_label.setObjectName("autoTradeSettingRoutineTreeIcon")
         icon_label.setAlignment(Qt.AlignCenter)
-        icon_label.setFixedWidth(28 if not is_instance else 18)
+        icon_label.setFixedWidth(28 if row_kind == "definition" else 18)
         icon_label.setWordWrap(False)
         icon_label.setFocusPolicy(Qt.NoFocus)
         icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         icon_label.setStyleSheet(
             "background: transparent;"
-            " color: #6B7280;"
+            f" color: {AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else '#6B7280'};"
         )
-        if not is_instance:
+        if is_definition:
             icon_font = QFont(icon_label.font())
             icon_font.setPointSize(icon_font.pointSize() + 2)
             icon_label.setFont(icon_font)
-        title_text = routine_tree_title_text(str(row_data.get("display_name", "") or text))
+            icon_label.setCursor(Qt.PointingHandCursor)
+            icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            icon_label.setProperty(
+                "autoTradeSettingRoutineTreeToggleDefinitionId",
+                str(row_data.get("definition_id", "") or ""),
+            )
+            icon_label.setProperty(
+                "autoTradeSettingRoutineTreeToggleEnabled",
+                bool(row_data.get("has_toggle_children", True)),
+            )
+            try:
+                can_install_event_filter = isinstance(self, AutoTradeSettingWindow) and self.routine_table is not None
+            except RuntimeError:
+                can_install_event_filter = False
+            if can_install_event_filter:
+                icon_label.installEventFilter(self)
+        elif is_instance:
+            icon_label.setCursor(Qt.PointingHandCursor)
+            icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            icon_label.setProperty(
+                "autoTradeSettingRoutineTreeToggleInstanceId",
+                str(row_data.get("instance_id", "") or ""),
+            )
+            icon_label.setProperty(
+                "autoTradeSettingRoutineTreeToggleEnabled",
+                bool(row_data.get("has_toggle_children", True)),
+            )
+            try:
+                can_install_event_filter = isinstance(self, AutoTradeSettingWindow) and self.routine_table is not None
+            except RuntimeError:
+                can_install_event_filter = False
+            if can_install_event_filter:
+                icon_label.installEventFilter(self)
+        raw_title_text = str(row_data.get("display_name", "") or text)
+        title_text = raw_title_text if is_stock_scope else routine_tree_title_text(raw_title_text)
         title_label = QLabel(title_text)
         title_label.setObjectName("autoTradeSettingRoutineTreeTitle")
-        title_label.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        title_label.setAlignment(
+            Qt.AlignLeft | Qt.AlignVCenter
+            if is_stock
+            else Qt.AlignCenter | Qt.AlignVCenter
+        )
         title_label.setWordWrap(False)
         title_label.setFocusPolicy(Qt.NoFocus)
         title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        title_font = QFont(title_label.font())
-        if is_instance:
+        if is_stock:
+            title_label.setToolTip(str(row_data.get("display_name", "") or text))
+        base_title_font = QFont(title_label.font())
+        title_font = QFont(base_title_font)
+        if not is_definition:
             title_font.setBold(False)
         else:
             title_font.setPointSize(title_font.pointSize() + 1)
@@ -2013,23 +2277,75 @@ class AutoTradeSettingWindow(QDialog):
         title_label.setStyleSheet(
             "background: transparent;"
             " border: none;"
-            " color: #374151;"
+            f" color: {AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else '#374151'};"
         )
         title_label.setFont(title_font)
-        title_width = routine_tree_title_width(title_label.fontMetrics())
+        instance_title_width = routine_tree_title_width(QFontMetrics(base_title_font))
+        if is_stock_scope:
+            title_width = title_label.fontMetrics().horizontalAdvance(title_text) + 12
+        elif is_stock:
+            title_width = instance_title_width
+        else:
+            title_width = routine_tree_title_width(title_label.fontMetrics())
         title_label.setFixedWidth(title_width)
         title_label.setMinimumWidth(title_width)
         title_label.setMaximumWidth(title_width)
         title_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         layout.addWidget(icon_label, 0, Qt.AlignVCenter)
 
-        status_slot_width = max(
-            container.fontMetrics().horizontalAdvance(text)
-            for text in ("종목(999)", "실행(999)", "정지(999)", "검토(999)")
-        ) + 8
-        compact_status_slot_width = int(status_slot_width * 0.80)
+        performance_item_specs = (
+            {
+                "key": "period",
+                "object_name": "autoTradeSettingRoutineTreePerformancePeriod",
+                "label": "기간",
+                "left_fallback": "0",
+                "left_sample": "9999",
+                "right_fallback": "",
+                "right_sample": "",
+            },
+            {
+                "key": "profit",
+                "object_name": "autoTradeSettingRoutineTreePerformanceProfit",
+                "label": "수익",
+                "left_fallback": "0",
+                "left_sample": "99,999,999",
+                "right_fallback": "0.0%",
+                "right_sample": "000.0%",
+            },
+            {
+                "key": "average",
+                "object_name": "autoTradeSettingRoutineTreePerformanceAverage",
+                "label": "평균",
+                "left_fallback": "0",
+                "left_sample": "99,999,999",
+                "right_fallback": "0.0%",
+                "right_sample": "00.0%",
+            },
+            {
+                "key": "efficiency",
+                "object_name": "autoTradeSettingRoutineTreePerformanceEfficiency",
+                "label": "효율",
+                "left_fallback": "0.0",
+                "left_sample": "000.0",
+                "right_fallback": "",
+                "right_sample": "",
+            },
+        )
+        separator_width = container.fontMetrics().horizontalAdvance("|")
 
-        if not is_instance:
+        def _performance_metric_width(spec: dict[str, str]) -> int:
+            prefix_width = container.fontMetrics().horizontalAdvance(f"{spec['label']}(")
+            left_width = container.fontMetrics().horizontalAdvance(str(spec["left_sample"]))
+            close_width = container.fontMetrics().horizontalAdvance(")")
+            metric_width = prefix_width + left_width + close_width
+            if str(spec["right_sample"]):
+                metric_width += (
+                    container.fontMetrics().horizontalAdvance(" / ")
+                    + container.fontMetrics().horizontalAdvance(str(spec["right_sample"]))
+                )
+            return metric_width
+
+        if is_definition:
             meta_group = QWidget()
             meta_group.setObjectName("autoTradeSettingRoutineTreeMetaGroup")
             meta_group.setFocusPolicy(Qt.NoFocus)
@@ -2049,55 +2365,222 @@ class AutoTradeSettingWindow(QDialog):
             routine_count_label.setFixedSize(64, 22)
             routine_count_label.setFocusPolicy(Qt.NoFocus)
             routine_count_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            routine_count_label.setStyleSheet(
-                "QLabel {"
-                " background-color: transparent;"
-                " border: 1px solid #A855F7;"
-                " border-radius: 4px;"
-                " color: #6D28D9;"
-                " font-weight: 600;"
-                "}"
-            )
+            routine_count_label.setStyleSheet(auto_trade_setting_badge_stylesheet("QLabel"))
             meta_layout.addWidget(routine_count_label, 0, Qt.AlignVCenter)
             meta_layout.addStretch(1)
             layout.addWidget(meta_group, 0, Qt.AlignVCenter)
-        else:
-            layout.addWidget(title_label, 0, Qt.AlignVCenter)
+            period_width = _performance_metric_width(dict(performance_item_specs[0]))
+            instance_profit_x = (
+                28
+                + layout.spacing()
+                + 18
+                + layout.spacing()
+                + instance_title_width
+                + layout.spacing()
+                + period_width
+                + layout.spacing()
+                + separator_width
+                + layout.spacing()
+            )
+            parent_profit_base_x = 28 + layout.spacing() + meta_group.width()
+            parent_profit_spacer_width = max(
+                0,
+                instance_profit_x - parent_profit_base_x - (layout.spacing() * 2),
+            )
+            if parent_profit_spacer_width > 0:
+                parent_profit_spacer = QWidget()
+                parent_profit_spacer.setObjectName("autoTradeSettingRoutineTreeParentProfitColumnSpacer")
+                parent_profit_spacer.setFixedWidth(parent_profit_spacer_width)
+                parent_profit_spacer.setFocusPolicy(Qt.NoFocus)
+                parent_profit_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                parent_profit_spacer.setProperty("autoTradeSettingParentSummaryMetric", True)
+                layout.addWidget(parent_profit_spacer, 0, Qt.AlignVCenter)
+        elif is_stock_scope:
+            scope = str(row_data.get("stock_scope", "current") or "current")
+            instance_id = str(row_data.get("instance_id", "") or "")
 
-        registered = int(row_data.get("registered", 0) or 0)
-        running = int(row_data.get("running", 0) or 0)
-        stopped = int(row_data.get("stopped", 0) or 0)
-        error = int(row_data.get("error", 0) or 0)
-        summary_labels = [
-            ("autoTradeSettingRoutineTreeRegistered", f"종목({registered})"),
-            ("autoTradeSettingRoutineTreeRunning", f"실행({running})"),
-            ("autoTradeSettingRoutineTreeStopped", f"정지({stopped})"),
-            ("autoTradeSettingRoutineTreeError", f"검토({error})"),
-        ]
-        status_group = QWidget()
-        status_group.setObjectName("autoTradeSettingRoutineTreeStatusGroup")
-        status_group.setFocusPolicy(Qt.NoFocus)
-        status_group.setAttribute(Qt.WA_StyledBackground, True)
-        status_group.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        status_group.setStyleSheet("background: transparent;")
-        status_layout = QHBoxLayout(status_group)
-        status_layout.setContentsMargins(0, 0, 0, 0)
-        status_layout.setSpacing(4)
-        for object_name, value in summary_labels:
-            summary_label = QLabel(value)
-            summary_label.setObjectName(object_name)
-            summary_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            summary_label.setWordWrap(False)
-            summary_label.setFixedWidth(compact_status_slot_width)
-            summary_label.setFocusPolicy(Qt.NoFocus)
-            summary_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            if not is_instance:
-                summary_label.setProperty("autoTradeSettingParentSummaryMetric", True)
-            summary_label.setStyleSheet("background: transparent; color: #4B5563;")
-            status_layout.addWidget(summary_label, 0, Qt.AlignVCenter)
-        layout.addWidget(status_group, 0, Qt.AlignVCenter)
+            def _scope_badge(text: str, scope_value: str) -> QPushButton:
+                is_active = scope == scope_value
+                badge = QPushButton(text)
+                badge.setObjectName(
+                    "autoTradeSettingRoutineTreeStockScopeAllBadge"
+                    if scope_value == "all"
+                    else "autoTradeSettingRoutineTreeStockScopeCurrentBadge"
+                )
+                badge.setFocusPolicy(Qt.NoFocus)
+                badge.setCursor(Qt.PointingHandCursor)
+                badge.setFixedSize(64, 22)
+                badge.setStyleSheet(
+                    auto_trade_setting_badge_stylesheet(
+                        "QPushButton",
+                        text_color=(
+                            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                            if is_active
+                            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+                        ),
+                        border_color=(
+                            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                            if is_active
+                            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+                        ),
+                    )
+                )
+                badge.clicked.connect(
+                    lambda _checked=False, target_scope=scope_value, target_instance_id=instance_id:
+                    self._set_auto_trade_stock_scope(target_instance_id, target_scope)
+                )
+                return badge
+
+            layout.addWidget(_scope_badge("전체", "all"), 0, Qt.AlignVCenter)
+            layout.addWidget(_scope_badge("현재", "current"), 0, Qt.AlignVCenter)
+        else:
+            if is_stock:
+                stock_title_spacer = QWidget()
+                stock_title_spacer.setObjectName("autoTradeSettingRoutineTreeStockTitleXCompensation")
+                stock_title_spacer.setFixedWidth(AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION)
+                stock_title_spacer.setFocusPolicy(Qt.NoFocus)
+                stock_title_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                layout.addWidget(stock_title_spacer, 0, Qt.AlignVCenter)
+            layout.addWidget(title_label, 0, Qt.AlignVCenter)
+            if is_stock:
+                stock_performance_spacer = QWidget()
+                stock_performance_spacer.setObjectName("autoTradeSettingRoutineTreeStockPerformanceXCompensation")
+                stock_performance_spacer.setFixedWidth(AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION)
+                stock_performance_spacer.setFocusPolicy(Qt.NoFocus)
+                stock_performance_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                layout.addWidget(stock_performance_spacer, 0, Qt.AlignVCenter)
+
+        if is_stock_scope:
+            layout.addStretch(1)
+            return container
+
+        def _performance_metric_text_parts(key: str, left_fallback: str, right_fallback: str) -> tuple[str, str]:
+            raw_text = str(row_data.get(f"performance_{key}_text", "") or "").strip()
+            if raw_text:
+                open_index = raw_text.find("(")
+                close_index = raw_text.rfind(")")
+                if open_index >= 0 and close_index > open_index:
+                    inside = raw_text[open_index + 1:close_index]
+                    if " / " in inside:
+                        left, right = inside.split(" / ", 1)
+                        return left.strip() or left_fallback, right.strip() or right_fallback
+                    return inside.strip() or left_fallback, right_fallback
+            return left_fallback, right_fallback
+
+        def _metric_label(text: str, object_name: str, width: int, alignment: Qt.AlignmentFlag) -> QLabel:
+            label = QLabel(text)
+            label.setObjectName(object_name)
+            label.setAlignment(alignment)
+            label.setWordWrap(False)
+            label.setFixedWidth(width)
+            label.setFocusPolicy(Qt.NoFocus)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            metric_color = AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else "#6B7280"
+            label.setStyleSheet(f"background: transparent; color: {metric_color};")
+            if is_definition:
+                label.setProperty("autoTradeSettingParentSummaryMetric", True)
+            return label
+
+        for index, spec in enumerate(performance_item_specs):
+            key = str(spec["key"])
+            if key == "period" and not has_period_metric:
+                continue
+            if index > 0 and not (is_definition and key == "profit"):
+                separator = QLabel("|")
+                separator.setObjectName("autoTradeSettingRoutineTreePerformanceSeparator")
+                separator.setAlignment(Qt.AlignCenter)
+                separator.setFixedWidth(separator_width)
+                separator.setFocusPolicy(Qt.NoFocus)
+                separator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                separator_color = AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else "#9CA3AF"
+                separator.setStyleSheet(f"background: transparent; color: {separator_color};")
+                if is_definition:
+                    separator.setProperty("autoTradeSettingParentSummaryMetric", True)
+                layout.addWidget(separator, 0, Qt.AlignVCenter)
+            label_text = str(spec["label"])
+            left_sample = str(spec["left_sample"])
+            right_sample = str(spec["right_sample"])
+            left_value, right_value = _performance_metric_text_parts(
+                key,
+                str(spec["left_fallback"]),
+                str(spec["right_fallback"]),
+            )
+            metric_widget = QWidget()
+            metric_widget.setObjectName(str(spec["object_name"]))
+            metric_widget.setFocusPolicy(Qt.NoFocus)
+            metric_widget.setAttribute(Qt.WA_StyledBackground, True)
+            metric_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            metric_widget.setStyleSheet("background: transparent;")
+            metric_layout = QHBoxLayout(metric_widget)
+            metric_layout.setContentsMargins(0, 0, 0, 0)
+            metric_layout.setSpacing(0)
+            label_prefix = f"{label_text}("
+            prefix_width = container.fontMetrics().horizontalAdvance(label_prefix)
+            left_width = container.fontMetrics().horizontalAdvance(left_sample)
+            close_width = container.fontMetrics().horizontalAdvance(")")
+            metric_layout.addWidget(
+                _metric_label(
+                    label_prefix,
+                    f"{spec['object_name']}Label",
+                    prefix_width,
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                ),
+                0,
+                Qt.AlignVCenter,
+            )
+            metric_layout.addWidget(
+                _metric_label(
+                    left_value,
+                    f"{spec['object_name']}LeftValue",
+                    left_width,
+                    Qt.AlignRight | Qt.AlignVCenter,
+                ),
+                0,
+                Qt.AlignVCenter,
+            )
+            metric_width = prefix_width + left_width + close_width
+            if right_sample:
+                slash_width = container.fontMetrics().horizontalAdvance(" / ")
+                right_width = container.fontMetrics().horizontalAdvance(right_sample)
+                metric_layout.addWidget(
+                    _metric_label(
+                        " / ",
+                        f"{spec['object_name']}Slash",
+                        slash_width,
+                        Qt.AlignCenter | Qt.AlignVCenter,
+                    ),
+                    0,
+                    Qt.AlignVCenter,
+                )
+                metric_layout.addWidget(
+                    _metric_label(
+                        right_value,
+                        f"{spec['object_name']}RightValue",
+                        right_width,
+                        Qt.AlignRight | Qt.AlignVCenter,
+                    ),
+                    0,
+                    Qt.AlignVCenter,
+                )
+                metric_width += slash_width + right_width
+            metric_layout.addWidget(
+                _metric_label(
+                    ")",
+                    f"{spec['object_name']}Close",
+                    close_width,
+                    Qt.AlignCenter | Qt.AlignVCenter,
+                ),
+                0,
+                Qt.AlignVCenter,
+            )
+            metric_widget.setFixedWidth(metric_width)
+            metric_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            if is_definition:
+                metric_widget.setProperty("autoTradeSettingParentSummaryMetric", True)
+            layout.addWidget(metric_widget, 0, Qt.AlignVCenter)
+
         layout.addStretch(1)
-        if not is_instance:
+        if is_definition:
             container.setProperty("autoTradeSettingRoutineTreeRowKind", "definition")
             container.setProperty(
                 "autoTradeSettingRoutineTreeSummaryPinned",
@@ -2116,11 +2599,33 @@ class AutoTradeSettingWindow(QDialog):
         return container
 
     def _set_routine_tree_parent_summary_visible(self, row_widget: QWidget, visible: bool) -> None:
-        for label in row_widget.findChildren(QLabel):
-            if label.property("autoTradeSettingParentSummaryMetric"):
-                label.setVisible(visible)
+        for widget in row_widget.findChildren(QWidget):
+            if widget.property("autoTradeSettingParentSummaryMetric"):
+                widget.setVisible(visible)
 
     def eventFilter(self, obj, event) -> bool:
+        if (
+            isinstance(obj, QLabel)
+            and obj.objectName() == "autoTradeSettingRoutineTreeIcon"
+            and (
+                obj.property("autoTradeSettingRoutineTreeToggleDefinitionId")
+                or obj.property("autoTradeSettingRoutineTreeToggleInstanceId")
+            )
+        ):
+            if event.type() == QEvent.MouseButtonPress:
+                return True
+            if event.type() == QEvent.MouseButtonRelease:
+                if hasattr(event, "button") and event.button() != Qt.LeftButton:
+                    return True
+                if not bool(obj.property("autoTradeSettingRoutineTreeToggleEnabled")):
+                    return True
+                definition_id = str(obj.property("autoTradeSettingRoutineTreeToggleDefinitionId") or "").strip()
+                instance_id = str(obj.property("autoTradeSettingRoutineTreeToggleInstanceId") or "").strip()
+                if definition_id:
+                    self._toggle_routine_definition_collapsed(definition_id)
+                elif instance_id:
+                    self._toggle_routine_instance_collapsed(instance_id)
+                return True
         if (
             isinstance(obj, QWidget)
             and obj.property("autoTradeSettingRoutineTreeRowKind") == "definition"
@@ -2134,6 +2639,120 @@ class AutoTradeSettingWindow(QDialog):
                 self._set_routine_tree_parent_summary_visible(obj, pinned)
         return super().eventFilter(obj, event)
 
+    def _toggle_routine_definition_collapsed(self, definition_id: str) -> None:
+        clean_definition_id = str(definition_id or "").strip()
+        if not clean_definition_id:
+            return
+        if not self._routine_tree_toggle_enabled("definition", clean_definition_id):
+            return
+        collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
+        if clean_definition_id in collapsed:
+            collapsed.remove(clean_definition_id)
+        else:
+            collapsed.add(clean_definition_id)
+        self._collapsed_auto_trade_definition_ids = collapsed
+        self._apply_routine_tree_collapse_visibility()
+
+    def _toggle_routine_instance_collapsed(self, instance_id: str) -> None:
+        clean_instance_id = str(instance_id or "").strip()
+        if not clean_instance_id:
+            return
+        if not self._routine_tree_toggle_enabled("instance", clean_instance_id):
+            return
+        collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        if clean_instance_id in collapsed_instances:
+            collapsed_instances.remove(clean_instance_id)
+        else:
+            collapsed_instances.add(clean_instance_id)
+        self._collapsed_auto_trade_instance_ids = collapsed_instances
+        self._apply_routine_tree_collapse_visibility()
+
+    def _routine_tree_toggle_enabled(self, row_kind: str, target_id: str) -> bool:
+        clean_row_kind = str(row_kind or "").strip()
+        clean_target_id = str(target_id or "").strip()
+        if not clean_row_kind or not clean_target_id:
+            return False
+        target_key = "definition_id" if clean_row_kind == "definition" else "instance_id"
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict):
+                continue
+            if str(metadata.get("row_kind", "") or "") != clean_row_kind:
+                continue
+            if str(metadata.get(target_key, "") or "") != clean_target_id:
+                continue
+            return bool(metadata.get("has_toggle_children", True))
+        return False
+
+    def _apply_routine_tree_collapse_visibility(self) -> None:
+        collapsed_definitions = getattr(self, "_collapsed_auto_trade_definition_ids", set())
+        collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        current_definition_collapsed = False
+        current_instance_id = ""
+        current_instance_collapsed = False
+        current_instance_has_toggle_children = False
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict):
+                continue
+            row_kind = str(metadata.get("row_kind", "") or "")
+            definition_id = str(metadata.get("definition_id", "") or "")
+            instance_id = str(metadata.get("instance_id", "") or "")
+            widget = self.routine_table.cellWidget(row, 0)
+            icon = widget.findChild(QLabel, "autoTradeSettingRoutineTreeIcon") if widget is not None else None
+            if row_kind == "definition":
+                has_toggle_children = bool(metadata.get("has_toggle_children", True))
+                if not has_toggle_children:
+                    collapsed_definitions.discard(definition_id)
+                current_definition_collapsed = has_toggle_children and definition_id in collapsed_definitions
+                current_instance_id = ""
+                current_instance_collapsed = False
+                current_instance_has_toggle_children = False
+                self.routine_table.setRowHidden(row, False)
+                if icon is not None:
+                    icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
+                if widget is not None:
+                    widget.setProperty("autoTradeSettingRoutineTreeSummaryPinned", current_definition_collapsed)
+                    self._set_routine_tree_parent_summary_visible(widget, current_definition_collapsed)
+                continue
+            hidden_by_definition = current_definition_collapsed
+            if row_kind == "instance":
+                has_toggle_children = bool(metadata.get("has_toggle_children", True))
+                if not has_toggle_children:
+                    collapsed_instances.discard(instance_id)
+                current_instance_id = instance_id
+                current_instance_has_toggle_children = has_toggle_children
+                current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
+                self.routine_table.setRowHidden(row, hidden_by_definition)
+                if icon is not None:
+                    icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
+                continue
+            hidden_by_instance = bool(current_instance_id and instance_id == current_instance_id and current_instance_collapsed)
+            hidden_by_empty_instance = (
+                row_kind == "stock_scope"
+                and current_instance_id
+                and instance_id == current_instance_id
+                and not current_instance_has_toggle_children
+            )
+            self.routine_table.setRowHidden(row, hidden_by_definition or hidden_by_instance or hidden_by_empty_instance)
+
+    def _set_auto_trade_stock_scope(self, instance_id: str, scope: str) -> None:
+        clean_instance_id = str(instance_id or "").strip()
+        clean_scope = str(scope or "current").strip()
+        if not clean_instance_id or clean_scope not in {"all", "current"}:
+            return
+        scopes = getattr(self, "_auto_trade_stock_scope_by_instance", {})
+        if scopes.get(clean_instance_id, "current") == clean_scope:
+            return
+        current_metadata = self.current_selected_routine_row_metadata()
+        scopes[clean_instance_id] = clean_scope
+        self._auto_trade_stock_scope_by_instance = scopes
+        self.load_routine_table()
+        if current_metadata:
+            self.restore_routine_selection_metadata(current_metadata)
+
     def load_routine_table(self) -> None:
         current_metadata = self.current_selected_routine_row_metadata()
         definitions = load_routine_definitions()
@@ -2143,13 +2762,20 @@ class AutoTradeSettingWindow(QDialog):
             instances_by_definition.setdefault(str(instance.definition_id), []).append(instance)
 
         instance_counts = self._routine_instance_operation_counts()
+        current_stocks_by_instance = self._current_stocks_by_instance()
+        historical_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
+        collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        stock_scope_by_instance = getattr(self, "_auto_trade_stock_scope_by_instance", {})
         rows: list[dict[str, object]] = []
 
         for definition in definitions:
             definition_id = str(definition.definition_id)
             child_instances = instances_by_definition.get(definition_id, [])
-            is_collapsed = definition_id in collapsed
+            has_definition_children = bool(child_instances)
+            if not has_definition_children:
+                collapsed.discard(definition_id)
+            is_collapsed = has_definition_children and definition_id in collapsed
             rows.append(
                 {
                     "row_kind": "definition",
@@ -2160,7 +2786,8 @@ class AutoTradeSettingWindow(QDialog):
                     "package_dir": str(definition.package_dir),
                     "instance_dir": "",
                     "display_name": str(definition.display_name),
-                    "tree_icon": "\u25b6" if is_collapsed else "\u25bc",
+                    "tree_icon": "\u25b6" if is_collapsed or not has_definition_children else "\u25bc",
+                    "has_toggle_children": has_definition_children,
                     "instance_count": len(child_instances),
                     "registered": sum(
                         int(instance_counts.get(str(instance.instance_id), {}).get("registered", 0) or 0)
@@ -2180,25 +2807,32 @@ class AutoTradeSettingWindow(QDialog):
                     ),
                 }
             )
-            if is_collapsed:
-                continue
             for _index, instance in enumerate(child_instances):
                 instance_dir = Path(instance.rules_path).parent if instance.rules_path else Path()
+                instance_id = str(instance.instance_id)
+                current_stocks = current_stocks_by_instance.get(instance_id, [])
+                historical_stocks = historical_stocks_by_instance.get(instance_id, [])
+                has_instance_children = bool(current_stocks or historical_stocks)
+                if not has_instance_children:
+                    collapsed_instances.discard(instance_id)
                 count = instance_counts.get(
-                    str(instance.instance_id),
+                    instance_id,
                     {"registered": 0, "running": 0, "stopped": 0, "error": 0},
                 )
+                is_instance_collapsed = has_instance_children and instance_id in collapsed_instances
                 rows.append(
                     {
                         "row_kind": "instance",
                         "definition_id": definition_id,
-                        "instance_id": str(instance.instance_id),
+                        "instance_id": instance_id,
                         "definition_name": str(definition.display_name),
                         "instance_name": str(instance.display_name),
                         "package_dir": str(definition.package_dir),
                         "instance_dir": str(instance_dir) if instance_dir else "",
                         "display_name": str(instance.display_name),
-                        "tree_icon": "\u25cf",
+                        "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
+                        "has_toggle_children": has_instance_children,
+                        "instance_group_top_gap": _index > 0,
                         "instance_count": 0,
                         "registered": int(count.get("registered", 0) or 0),
                         "running": int(count.get("running", 0) or 0),
@@ -2206,16 +2840,52 @@ class AutoTradeSettingWindow(QDialog):
                         "error": int(count.get("error", 0) or 0),
                     }
                 )
+                scope = str(stock_scope_by_instance.get(instance_id, "current") or "current")
+                if scope not in {"all", "current"}:
+                    scope = "current"
+                rows.append(
+                    {
+                        "row_kind": "stock_scope",
+                        "definition_id": definition_id,
+                        "instance_id": instance_id,
+                        "definition_name": str(definition.display_name),
+                        "instance_name": str(instance.display_name),
+                        "package_dir": str(definition.package_dir),
+                        "instance_dir": str(instance_dir) if instance_dir else "",
+                        "display_name": "[전체] [현재]",
+                        "stock_scope": scope,
+                        "tree_icon": "",
+                        "has_toggle_children": has_instance_children,
+                    }
+                )
+                visible_stocks = list(current_stocks)
+                if scope == "all":
+                    visible_stocks = current_stocks + historical_stocks
+                for stock in visible_stocks:
+                    stock_name = str(stock.get("stock_name", "") or "").strip()
+                    rows.append(
+                        {
+                            "row_kind": "stock",
+                            "definition_id": definition_id,
+                            "instance_id": instance_id,
+                            "definition_name": str(definition.display_name),
+                            "instance_name": str(instance.display_name),
+                            "package_dir": str(definition.package_dir),
+                            "instance_dir": str(instance_dir) if instance_dir else "",
+                            "display_name": stock_name,
+                            "stock_scope": scope,
+                            "stock_code": str(stock.get("stock_code", "") or ""),
+                            "stock_path": str(stock.get("stock_path", "") or ""),
+                            "tree_icon": "\u25aa",
+                        }
+                    )
 
         self.routine_table.setSortingEnabled(False)
+        self.routine_table.verticalHeader().setMinimumSectionSize(22)
         self.routine_table.setRowCount(len(rows))
 
         for row, row_data in enumerate(rows):
             row_kind = str(row_data.get("row_kind", "") or "")
-            registered = int(row_data.get("registered", 0) or 0)
-            running = int(row_data.get("running", 0) or 0)
-            stopped = int(row_data.get("stopped", 0) or 0)
-            error = int(row_data.get("error", 0) or 0)
             instance_count_text = (
                 f"루틴({int(row_data.get('instance_count', 0) or 0)}) | "
                 if row_kind == "definition"
@@ -2223,18 +2893,28 @@ class AutoTradeSettingWindow(QDialog):
             )
             display_text = (
                 f"{row_data['display_name']}   "
-                f"{instance_count_text}종목({registered}) | 실행({running}) | 정지({stopped}) | 검토({error})"
+                f"{instance_count_text}"
             )
             item = SortableTableWidgetItem("")
             item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             item.setData(Qt.UserRole, dict(row_data))
-            item.setData(Qt.ToolTipRole, "")
+            item.setData(
+                Qt.ToolTipRole,
+                str(row_data.get("display_name", "") or "") if row_kind == "stock" else "",
+            )
             item.setData(SORT_ROLE, str(row_data["definition_name"]))
             self.routine_table.setItem(row, 0, item)
             row_widget = self._routine_tree_row_widget(dict(row_data), display_text)
             row_hint = row_widget.sizeHint()
-            min_row_height = 32 if row_kind == "definition" else 30
-            row_height = max(row_hint.height(), min_row_height)
+            if row_kind == "definition":
+                min_row_height = 32
+            elif row_kind == "stock":
+                min_row_height = AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT
+            else:
+                min_row_height = 30
+            row_height = min_row_height if row_kind == "stock" else max(row_hint.height(), min_row_height)
+            if row_kind == "instance" and bool(row_data.get("instance_group_top_gap")):
+                row_height += AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP
             row_widget.setMinimumHeight(row_height)
             item.setSizeHint(QSize(row_hint.width(), row_height))
             self.routine_table.setCellWidget(row, 0, row_widget)
@@ -2243,6 +2923,7 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.clearSelection()
         if current_metadata:
             self.restore_routine_selection_metadata(current_metadata)
+        self._apply_routine_tree_collapse_visibility()
 
     def current_selected_routine_row_metadata(self) -> dict[str, object] | None:
         selected_rows = self.routine_table.selectionModel().selectedRows()
@@ -2260,13 +2941,13 @@ class AutoTradeSettingWindow(QDialog):
 
     def current_selected_instance_id(self) -> str:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) != "instance":
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
             return ""
         return str(metadata.get("instance_id", "") or "").strip()
 
     def current_selected_instance_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) != "instance":
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
             return None
         path_text = str(metadata.get("instance_dir", "") or "").strip()
         if not path_text:
@@ -2279,7 +2960,7 @@ class AutoTradeSettingWindow(QDialog):
         if not metadata:
             return ()
         row_kind = str(metadata.get("row_kind", "") or "")
-        if row_kind == "instance":
+        if row_kind in {"instance", "stock_scope", "stock"}:
             instance_id = str(metadata.get("instance_id", "") or "").strip()
             return (instance_id,) if instance_id else ()
         if row_kind == "definition":
@@ -2291,30 +2972,17 @@ class AutoTradeSettingWindow(QDialog):
             )
         return ()
 
-    def current_selected_routine_label_text(self) -> str:
-        metadata = self.current_selected_routine_row_metadata()
-        if not metadata:
-            return "선택 루틴: -"
-        row_kind = str(metadata.get("row_kind", "") or "")
-        definition_name = str(metadata.get("definition_name", "") or "").strip()
-        instance_name = str(metadata.get("instance_name", "") or "").strip()
-        if row_kind == "definition":
-            return f"선택 부모: {definition_name} · 하위 인스턴스 전체"
-        if row_kind == "instance":
-            return f"선택 인스턴스: {definition_name} / {instance_name}"
-        return "선택 루틴: -"
-
     def current_selected_routine_name(self) -> str:
         metadata = self.current_selected_routine_row_metadata()
         if not metadata:
             return ""
-        if str(metadata.get("row_kind", "")) == "instance":
+        if str(metadata.get("row_kind", "")) in {"instance", "stock_scope", "stock"}:
             return str(metadata.get("instance_name", "") or "").strip()
         return str(metadata.get("definition_name", "") or "").strip()
 
     def current_selected_routine_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) != "instance":
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
             return None
         path_text = str(metadata.get("package_dir", "") or "").strip()
         if not path_text:
@@ -2342,6 +3010,7 @@ class AutoTradeSettingWindow(QDialog):
         row_kind = str(metadata.get("row_kind", "") or "").strip()
         definition_id = str(metadata.get("definition_id", "") or "").strip()
         instance_id = str(metadata.get("instance_id", "") or "").strip()
+        stock_path = str(metadata.get("stock_path", "") or "").strip()
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             candidate = item.data(Qt.UserRole) if item is not None else None
@@ -2351,7 +3020,9 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             if str(candidate.get("definition_id", "") or "") != definition_id:
                 continue
-            if row_kind == "instance" and str(candidate.get("instance_id", "") or "") != instance_id:
+            if row_kind in {"instance", "stock_scope", "stock"} and str(candidate.get("instance_id", "") or "") != instance_id:
+                continue
+            if row_kind == "stock" and str(candidate.get("stock_path", "") or "") != stock_path:
                 continue
             self.routine_table.selectRow(row)
             return
@@ -2362,22 +3033,16 @@ class AutoTradeSettingWindow(QDialog):
         metadata = item.data(Qt.UserRole)
         if not isinstance(metadata, dict):
             return
-        if str(metadata.get("row_kind", "") or "") != "definition":
-            return
-        definition_id = str(metadata.get("definition_id", "") or "").strip()
-        if not definition_id:
-            return
-        collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
-        if definition_id in collapsed:
-            collapsed.remove(definition_id)
-        else:
-            collapsed.add(definition_id)
-        self._collapsed_auto_trade_definition_ids = collapsed
-        self.load_routine_table()
-        self.restore_routine_selection_metadata(metadata)
+        row_kind = str(metadata.get("row_kind", "") or "")
+        return
+
+    def on_routine_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        return
 
     def on_routine_selection_changed(self) -> None:
+        self._stock_status_filter = "all"
         self.update_selection_summary_panel()
+        self.update_selected_routine_status_bar()
         self.load_selected_routine_stocks()
 
     def load_selected_routine_stocks(self) -> None:

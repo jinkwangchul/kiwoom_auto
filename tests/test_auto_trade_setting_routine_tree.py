@@ -4,6 +4,7 @@ from types import MethodType
 from unittest.mock import patch
 
 from PyQt5.QtCore import QObject
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QAbstractItemView, QTableWidget
 
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
@@ -54,14 +55,20 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         harness = Harness()
         harness.routine_table = QTableWidget(0, 1)
+        harness.stock_table = QTableWidget(0, 1)
         harness.routine_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         harness.routine_table.setSelectionMode(QAbstractItemView.SingleSelection)
         harness._collapsed_auto_trade_definition_ids = set()
         harness._default_operation_instance_by_definition = {}
         harness._routine_operation_status_by_instance = {}
+        harness._stock_status_filter = "all"
+        harness._collapsed_auto_trade_instance_ids = set()
+        harness._auto_trade_stock_scope_by_instance = {}
         for name in (
             "_setup_routine_table",
             "_routine_instance_stock_counts",
+            "_current_stock_entries_by_instance",
+            "_current_stocks_by_instance",
             "_routine_instance_operation_counts",
             "_is_default_operation_instance",
             "_routine_status_text_for_metadata",
@@ -69,6 +76,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_refresh_default_operation_stamps",
             "_routine_tree_row_widget",
             "_set_routine_tree_parent_summary_visible",
+            "_toggle_routine_definition_collapsed",
+            "_toggle_routine_instance_collapsed",
+            "_routine_tree_toggle_enabled",
+            "_apply_routine_tree_collapse_visibility",
+            "_set_auto_trade_stock_scope",
             "eventFilter",
             "load_routine_table",
             "current_selected_routine_row_metadata",
@@ -76,19 +88,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "current_selected_instance_id",
             "current_selected_instance_dir",
             "current_selected_target_instance_ids",
-            "current_selected_routine_label_text",
             "current_selected_routine_name",
             "current_selected_routine_dir",
             "restore_routine_selection",
             "restore_routine_selection_metadata",
             "on_routine_table_item_clicked",
+            "on_routine_table_item_double_clicked",
+            "on_routine_selection_changed",
             "auto_trade_runtime_state_for_order",
             "update_selection_summary_panel",
+            "_setup_selected_routine_status_bar",
+            "set_stock_status_filter",
+            "update_selected_routine_status_bar",
+            "load_selected_routine_stocks",
         ):
             setattr(harness, name, MethodType(getattr(AutoTradeSettingWindow, name), harness))
         return harness
 
-    def test_top_table_uses_definition_instance_rows_without_stock_nodes(self) -> None:
+    def test_top_table_uses_definition_instance_stock_scope_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
         counts = {
             "inst-a": {"registered": 1, "running": 1, "stopped": 0, "error": 0},
@@ -97,16 +114,33 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window = self._window_harness()
         window._routine_instance_operation_counts = lambda: counts
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
-                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances):
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
             window.load_routine_table()
 
-        self.assertEqual(3, window.routine_table.rowCount())
+        self.assertEqual(5, window.routine_table.rowCount())
         self.assertEqual(1, window.routine_table.columnCount())
         parent_meta = window.routine_table.item(0, 0).data(setting_window.Qt.UserRole)
         child_a_meta = window.routine_table.item(1, 0).data(setting_window.Qt.UserRole)
-        child_b_meta = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        scope_a_meta = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        child_b_meta = window.routine_table.item(3, 0).data(setting_window.Qt.UserRole)
         self.assertEqual("definition", parent_meta["row_kind"])
         self.assertEqual("instance", child_a_meta["row_kind"])
+        self.assertEqual("stock_scope", scope_a_meta["row_kind"])
+        self.assertEqual("[전체] [현재]", scope_a_meta["display_name"])
+        self.assertEqual("current", scope_a_meta["stock_scope"])
+        self.assertEqual("", scope_a_meta["tree_icon"])
+        scope_a_widget = window.routine_table.cellWidget(2, 0)
+        scope_all_badge = scope_a_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeAllBadge")
+        scope_current_badge = scope_a_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeCurrentBadge")
+        self.assertEqual("전체", scope_all_badge.text())
+        self.assertEqual("현재", scope_current_badge.text())
+        self.assertEqual(22, scope_all_badge.height())
+        self.assertEqual(22, scope_current_badge.height())
+        self.assertIn("border-radius: 4px", scope_all_badge.styleSheet())
+        self.assertIn("padding: 0 6px", scope_all_badge.styleSheet())
+        self.assertIn("color: #111827", scope_all_badge.styleSheet())
+        self.assertIn("color: #16A34A", scope_current_badge.styleSheet())
         self.assertEqual("instance", child_b_meta["row_kind"])
         self.assertEqual("", window.routine_table.item(0, 0).text())
         self.assertEqual("", window.routine_table.item(1, 0).text())
@@ -120,14 +154,19 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent_widget = window.routine_table.cellWidget(0, 0)
         parent_title = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
         parent_icon = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeIcon")
-        parent_registered = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered")
-        parent_running = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRunning")
-        parent_stopped = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeStopped")
-        parent_error = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeError")
         parent_stamp = parent_widget.findChild(setting_window.QPushButton, "autoTradeSettingDefaultOperationStamp")
         parent_instance_count = parent_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeInstanceCount")
         parent_meta_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeMetaGroup")
         parent_status_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeStatusGroup")
+        parent_period = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
+        parent_period_spacer = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
+        parent_profit_column_spacer = parent_widget.findChild(
+            setting_window.QWidget,
+            "autoTradeSettingRoutineTreeParentProfitColumnSpacer",
+        )
+        parent_profit = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit")
+        parent_average = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage")
+        parent_efficiency = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceEfficiency")
         parent_widget.resize(900, parent_widget.sizeHint().height())
         parent_widget.show()
         self._app.processEvents()
@@ -136,7 +175,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIsNone(parent_stamp)
         self.assertIsNotNone(parent_instance_count)
         self.assertIsNotNone(parent_meta_group)
-        self.assertIsNotNone(parent_status_group)
+        self.assertIsNone(parent_status_group)
+        self.assertIsNotNone(parent_profit)
+        self.assertIsNone(parent_period)
+        self.assertIsNone(parent_period_spacer)
+        self.assertIsNotNone(parent_profit_column_spacer)
+        self.assertIsNotNone(parent_average)
+        self.assertIsNotNone(parent_efficiency)
         self.assertEqual(28, parent_icon.width())
         self.assertEqual(
             setting_window.routine_tree_title_width(parent_title.fontMetrics()),
@@ -154,78 +199,66 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(setting_window.Qt.AlignCenter, parent_instance_count.alignment())
         self.assertIn("background-color: transparent", parent_instance_count.styleSheet())
         self.assertIn("#A855F7", parent_instance_count.styleSheet())
+        self.assertIn("padding: 0 6px", parent_instance_count.styleSheet())
         self.assertGreater(parent_icon.font().pointSize(), parent_title.font().pointSize())
         self.assertTrue(parent_title.font().bold())
-        self.assertEqual("종목(3)", parent_registered.text())
-        self.assertEqual("실행(1)", parent_running.text())
-        self.assertEqual("정지(2)", parent_stopped.text())
-        self.assertEqual("검토(1)", parent_error.text())
+        self.assertTrue(parent_profit.isHidden())
+        self.assertTrue(parent_average.isHidden())
+        self.assertTrue(parent_efficiency.isHidden())
+        self.assertEqual("0", parent_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitLeftValue").text())
+        self.assertEqual("0.0%", parent_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
+        self.assertEqual("0", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
+        self.assertEqual("0.0%", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
+        self.assertEqual("0.0", parent_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
+        self.assertEqual("", parent_widget.toolTip())
         self.assertFalse(parent_instance_count.isHidden())
-        self.assertTrue(parent_registered.isHidden())
-        self.assertTrue(parent_running.isHidden())
-        self.assertTrue(parent_stopped.isHidden())
-        self.assertTrue(parent_error.isHidden())
-        status_slot_width = max(
-            parent_registered.fontMetrics().horizontalAdvance(text)
-            for text in ("종목(999)", "실행(999)", "정지(999)", "검토(999)")
-        ) + 8
-        parent_status_slot_width = int(status_slot_width * 0.80)
-        self.assertEqual(parent_status_slot_width, parent_registered.width())
-        self.assertEqual(parent_status_slot_width, parent_running.width())
-        self.assertEqual(parent_status_slot_width, parent_stopped.width())
-        self.assertEqual(parent_status_slot_width, parent_error.width())
-        self.assertEqual(
-            parent_status_group.mapTo(parent_widget, parent_status_group.rect().topLeft()).x(),
-            parent_registered.mapTo(parent_widget, parent_registered.rect().topLeft()).x(),
-        )
-        parent_columns = [
-            parent_registered,
-            parent_running,
-            parent_stopped,
-            parent_error,
-        ]
-        self.assertEqual(1, len({label.width() for label in parent_columns}))
         window._set_routine_tree_parent_summary_visible(parent_widget, True)
-        self.assertFalse(parent_registered.isHidden())
-        self.assertFalse(parent_running.isHidden())
-        self.assertFalse(parent_stopped.isHidden())
-        self.assertFalse(parent_error.isHidden())
-        self.assertGreaterEqual(
-            parent_registered.width(),
-            parent_registered.fontMetrics().horizontalAdvance(parent_registered.text()),
-        )
-        self.assertGreaterEqual(
-            parent_running.width(),
-            parent_running.fontMetrics().horizontalAdvance(parent_running.text()),
-        )
-        self.assertGreaterEqual(
-            parent_stopped.width(),
-            parent_stopped.fontMetrics().horizontalAdvance(parent_stopped.text()),
-        )
-        self.assertGreaterEqual(
-            parent_error.width(),
-            parent_error.fontMetrics().horizontalAdvance(parent_error.text()),
+        parent_widget.layout().activate()
+        self._app.processEvents()
+        self.assertFalse(parent_profit.isHidden())
+        self.assertFalse(parent_average.isHidden())
+        self.assertFalse(parent_efficiency.isHidden())
+        parent_layout_widgets = [
+            parent_widget.layout().itemAt(index).widget()
+            for index in range(parent_widget.layout().count())
+            if parent_widget.layout().itemAt(index).widget() is not None
+        ]
+        self.assertEqual(
+            parent_profit,
+            parent_layout_widgets[parent_layout_widgets.index(parent_profit_column_spacer) + 1],
         )
         self.assertGreaterEqual(window.routine_table.item(0, 0).sizeHint().height(), parent_widget.sizeHint().height())
         child_widget = window.routine_table.cellWidget(1, 0)
         child_title = child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
         child_indent = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeIndent")
         stamp = child_widget.findChild(setting_window.QPushButton, "autoTradeSettingDefaultOperationStamp")
-        child_registered = child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered")
         child_default_slot = child_widget.findChild(setting_window.QWidget, "autoTradeSettingDefaultOperationSlot")
         child_instance_count = child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeInstanceCount")
+        child_period = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
+        child_period_spacer = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
+        child_profit = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit")
+        child_average = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage")
+        child_efficiency = child_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceEfficiency")
         self.assertIsNotNone(child_title)
         self.assertIsNotNone(child_indent)
         self.assertIsNone(stamp)
         self.assertIsNone(child_default_slot)
         self.assertIsNone(child_instance_count)
+        self.assertIsNotNone(child_profit)
+        self.assertIsNotNone(child_period)
+        self.assertIsNone(child_period_spacer)
+        self.assertIsNotNone(child_average)
+        self.assertIsNotNone(child_efficiency)
         self.assertEqual(28, child_indent.width())
         self.assertEqual(setting_window.routine_tree_title_width(child_title.fontMetrics()), child_title.width())
         self.assertEqual(child_title.width(), child_title.minimumWidth())
         self.assertEqual(child_title.width(), child_title.maximumWidth())
         self.assertEqual(setting_window.QSizePolicy.Fixed, child_title.sizePolicy().horizontalPolicy())
         self.assertEqual(setting_window.Qt.AlignCenter | setting_window.Qt.AlignVCenter, child_title.alignment())
-        self.assertEqual(parent_status_slot_width, child_registered.width())
+        self.assertIsNone(child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered"))
+        self.assertIsNone(child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRunning"))
+        self.assertIsNone(child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeStopped"))
+        self.assertIsNone(child_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeError"))
         self.assertFalse(child_title.font().bold())
         self.assertGreaterEqual(
             child_title.mapTo(child_widget, child_title.rect().topLeft()).x()
@@ -235,15 +268,158 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertGreater(parent_title.font().pointSize(), child_title.font().pointSize())
         self.assertEqual(setting_window.QFont.DemiBold, parent_title.font().weight())
         self.assertLess(parent_title.font().weight(), setting_window.QFont.Bold)
-        self.assertGreaterEqual(
-            child_registered.width(),
-            child_registered.fontMetrics().horizontalAdvance(child_registered.text()),
-        )
+        self.assertEqual("0", child_period.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformancePeriodLeftValue").text())
+        self.assertEqual("0", child_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitLeftValue").text())
+        self.assertEqual("0.0%", child_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
+        self.assertEqual("0", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
+        self.assertEqual("0.0%", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
+        self.assertEqual("0.0", child_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
+        self.assertFalse(child_period.isHidden())
+        self.assertFalse(child_profit.isHidden())
+        self.assertFalse(child_average.isHidden())
+        self.assertFalse(child_efficiency.isHidden())
+        self.assertEqual("", child_widget.toolTip())
         self.assertEqual("A 인스턴스", child_title.text())
         self.assertNotIn("기본운영", child_title.text())
         self.assertFalse(child_title.text().startswith(" "))
         self.assertEqual(2, window.routine_table.rowHeight(0) - window.routine_table.rowHeight(1))
         self.assertLessEqual(window.routine_table.rowHeight(0), 40)
+
+    def test_parent_arrow_click_only_collapses_definition_rows(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0}
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+
+            parent_icon = window.routine_table.cellWidget(0, 0).findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreeIcon",
+            )
+            self.assertEqual("▼", parent_icon.text())
+            self.assertEqual(setting_window.Qt.PointingHandCursor, parent_icon.cursor().shape())
+            self.assertFalse(parent_icon.testAttribute(setting_window.Qt.WA_TransparentForMouseEvents))
+
+            window.on_routine_table_item_clicked(window.routine_table.item(0, 0))
+            self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+            window.on_routine_table_item_double_clicked(window.routine_table.item(0, 0))
+            self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+            window.load_routine_table = lambda: self.fail("definition collapse must not rebuild the routine table")
+            window._toggle_routine_definition_collapsed("indicator_follow")
+
+        self.assertEqual({"indicator_follow"}, window._collapsed_auto_trade_definition_ids)
+        self.assertEqual(
+            ["definition", "instance", "stock_scope"],
+            [
+                window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["row_kind"]
+                for row in range(window.routine_table.rowCount())
+            ],
+        )
+        self.assertFalse(window.routine_table.isRowHidden(0))
+        self.assertTrue(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+
+    def test_parent_arrow_stays_locked_for_empty_definition(self) -> None:
+        review_definition = RoutineDefinitionRecord(
+            definition_id="review",
+            display_name="등록확인루틴",
+            package_dir=Path("routines") / "review",
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="review_routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="routine.json",
+        )
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {}
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition(), review_definition]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=[]), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+            self.assertEqual(["definition", "definition"], [
+                window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["row_kind"]
+                for row in range(window.routine_table.rowCount())
+            ])
+
+            for _index in range(20):
+                review_row = next(
+                    row
+                    for row in range(window.routine_table.rowCount())
+                    if window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["definition_id"] == "review"
+                )
+                icon = window.routine_table.cellWidget(review_row, 0).findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreeIcon",
+                )
+                metadata = window.routine_table.item(review_row, 0).data(setting_window.Qt.UserRole)
+                self.assertEqual("▶", icon.text())
+                self.assertFalse(bool(metadata["has_toggle_children"]))
+                self.assertFalse(bool(icon.property("autoTradeSettingRoutineTreeToggleEnabled")))
+                window._apply_routine_tree_collapse_visibility = lambda: self.fail("locked parent arrow must not apply collapse")
+                window._toggle_routine_definition_collapsed("review")
+
+            self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+            self.assertFalse(window.routine_table.isRowHidden(review_row))
+
+    def test_instance_arrow_stays_locked_when_no_stock_rows_exist(self) -> None:
+        instances = [self._instance("inst-empty", "빈 인스턴스")]
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {
+            "inst-empty": {"registered": 0, "running": 0, "stopped": 0, "error": 0}
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+
+            self.assertEqual(
+                ["definition", "instance", "stock_scope"],
+                [
+                    window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["row_kind"]
+                    for row in range(window.routine_table.rowCount())
+                ],
+            )
+            instance_icon = window.routine_table.cellWidget(1, 0).findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreeIcon",
+            )
+            instance_metadata = window.routine_table.item(1, 0).data(setting_window.Qt.UserRole)
+            self.assertEqual("▶", instance_icon.text())
+            self.assertFalse(bool(instance_metadata["has_toggle_children"]))
+            self.assertFalse(bool(instance_icon.property("autoTradeSettingRoutineTreeToggleEnabled")))
+            self.assertFalse(window.routine_table.isRowHidden(1))
+            self.assertTrue(window.routine_table.isRowHidden(2))
+
+            original_apply_visibility = window._apply_routine_tree_collapse_visibility
+            window._apply_routine_tree_collapse_visibility = lambda: self.fail("locked instance arrow must not apply collapse")
+            window._toggle_routine_instance_collapsed("inst-empty")
+            window._apply_routine_tree_collapse_visibility = original_apply_visibility
+
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+            window._toggle_routine_definition_collapsed("indicator_follow")
+            self.assertTrue(window.routine_table.isRowHidden(1))
+            self.assertTrue(window.routine_table.isRowHidden(2))
+            window._toggle_routine_definition_collapsed("indicator_follow")
+            self.assertFalse(window.routine_table.isRowHidden(1))
+            self.assertTrue(window.routine_table.isRowHidden(2))
 
     def test_routine_tree_hides_table_header_and_grid(self) -> None:
         window = self._window_harness()
@@ -253,10 +429,33 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertTrue(window.routine_table.horizontalHeader().isHidden())
         self.assertTrue(window.routine_table.verticalHeader().isHidden())
         self.assertFalse(window.routine_table.showGrid())
+        self.assertEqual(setting_window.Qt.ScrollBarAlwaysOn, window.routine_table.verticalScrollBarPolicy())
         self.assertIn("selection-background-color: #dbeafe", window.routine_table.styleSheet())
         self.assertIn("selection-color: #111827", window.routine_table.styleSheet())
 
-    def test_parent_summary_labels_use_compressed_equal_slots(self) -> None:
+    def test_window_uses_standard_minimize_maximize_close_title_buttons(self) -> None:
+        window = setting_window.AutoTradeSettingWindow()
+        try:
+            flags = window.windowFlags()
+            self.assertFalse(bool(flags & setting_window.Qt.WindowContextHelpButtonHint))
+            self.assertTrue(bool(flags & setting_window.Qt.WindowMinimizeButtonHint))
+            self.assertTrue(bool(flags & setting_window.Qt.WindowMaximizeButtonHint))
+            self.assertTrue(bool(flags & setting_window.Qt.WindowCloseButtonHint))
+            expected_minimum_width = (
+                window.routine_box.minimumWidth()
+                + window._right_workspace_initial_width()
+                + window.strategy_workspace_splitter.handleWidth()
+                + window.layout().contentsMargins().left()
+                + window.layout().contentsMargins().right()
+            )
+            self.assertEqual(expected_minimum_width, window.minimumWidth())
+            self.assertEqual(650, window.minimumHeight())
+            self.assertGreater(window.maximumWidth(), window.minimumWidth())
+            self.assertGreater(window.maximumHeight(), window.minimumHeight())
+        finally:
+            window.close()
+
+    def test_parent_summary_counts_are_removed_from_tree_tooltip(self) -> None:
         window = self._window_harness()
         row_data = {
             "row_kind": "definition",
@@ -274,25 +473,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window._set_routine_tree_parent_summary_visible(widget, True)
         widget.show()
         self._app.processEvents()
-        labels = []
-        for object_name, expected in (
-            ("autoTradeSettingRoutineTreeRegistered", "종목(12)"),
-            ("autoTradeSettingRoutineTreeRunning", "실행(12)"),
-            ("autoTradeSettingRoutineTreeStopped", "정지(8)"),
-            ("autoTradeSettingRoutineTreeError", "검토(0)"),
+        for object_name in (
+            "autoTradeSettingRoutineTreeRegistered",
+            "autoTradeSettingRoutineTreeRunning",
+            "autoTradeSettingRoutineTreeStopped",
+            "autoTradeSettingRoutineTreeError",
         ):
-            label = widget.findChild(setting_window.QLabel, object_name)
-            labels.append(label)
-            self.assertEqual(expected, label.text())
-            self.assertGreaterEqual(
-                label.width(),
-                label.fontMetrics().horizontalAdvance(label.text()),
-            )
-            self.assertNotIn("(00", label.text())
-        self.assertEqual(1, len({label.width() for label in labels}))
-        self.assertLess(labels[0].x(), labels[1].x())
-        self.assertLess(labels[1].x(), labels[2].x())
-        self.assertLess(labels[2].x(), labels[3].x())
+            self.assertIsNone(widget.findChild(setting_window.QLabel, object_name))
+        self.assertIsNone(widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeStatusGroup"))
+        self.assertEqual("", widget.toolTip())
 
     def test_parent_title_uses_fixed_six_character_slot_and_fixed_columns(self) -> None:
         window = self._window_harness()
@@ -300,18 +489,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ("단기", "단기"),
             ("단기매매", "단기매매"),
             ("지표추종매매", "지표추종매매"),
-            ("지표추종매매A", "지표추종매매A"),
-            ("지표추종매매BC", "지표추종매매…"),
-            ("아주긴자동매매루틴", "아주긴자동매…"),
+            ("지표추종매매A", "지표추종매매..."),
+            ("지표추종매매BC", "지표추종매매..."),
+            ("아주긴자동매매루틴", "아주긴자동매..."),
             ("123456", "123456"),
-            ("1234567", "1234567"),
-            ("12345678", "123456…"),
+            ("1234567", "123456..."),
+            ("12345678", "123456..."),
         ]
         badge_x_values = set()
-        registered_x_values = set()
-        running_x_values = set()
-        stopped_x_values = set()
-        error_x_values = set()
         title_widths = set()
 
         for display_name, expected_title in samples:
@@ -334,10 +519,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             title = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
             badge = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeInstanceCount")
-            registered = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered")
-            running = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRunning")
-            stopped = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeStopped")
-            error = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeError")
 
             self.assertEqual(expected_title, title.text())
             self.assertEqual(
@@ -346,7 +527,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
             required_width = max(
                 max(title.fontMetrics().horizontalAdvance(sample), title.fontMetrics().boundingRect(sample).width())
-                for sample in ("가" * 7, "가" * 6 + "…", "1234567", "123456…")
+                for sample in ("가" * 6, "가" * 6 + "...", "123456", "123456...")
             )
             self.assertGreaterEqual(title.contentsRect().width(), required_width)
             self.assertEqual(title.width(), title.minimumWidth())
@@ -360,40 +541,35 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 self.assertLessEqual(abs(left_padding - right_padding), 1)
             title_widths.add(title.width())
             badge_x = badge.mapTo(widget, badge.rect().topLeft()).x()
-            registered_x = registered.mapTo(widget, registered.rect().topLeft()).x()
             badge_x_values.add(badge_x)
-            registered_x_values.add(registered_x)
-            running_x_values.add(running.mapTo(widget, running.rect().topLeft()).x())
-            stopped_x_values.add(stopped.mapTo(widget, stopped.rect().topLeft()).x())
-            error_x_values.add(error.mapTo(widget, error.rect().topLeft()).x())
+            self.assertEqual("", widget.toolTip())
+            for object_name in (
+                "autoTradeSettingRoutineTreeRegistered",
+                "autoTradeSettingRoutineTreeRunning",
+                "autoTradeSettingRoutineTreeStopped",
+                "autoTradeSettingRoutineTreeError",
+            ):
+                self.assertIsNone(widget.findChild(setting_window.QLabel, object_name))
 
         self.assertEqual(1, len(title_widths))
         self.assertEqual(1, len(badge_x_values))
-        self.assertEqual(1, len(registered_x_values))
-        self.assertEqual(1, len(running_x_values))
-        self.assertEqual(1, len(stopped_x_values))
-        self.assertEqual(1, len(error_x_values))
 
-    def test_child_title_uses_fixed_six_character_slot_and_fixed_status_columns(self) -> None:
+    def test_child_title_uses_fixed_name_slot_without_status_tooltip(self) -> None:
         window = self._window_harness()
         samples = [
             ("두자", "두자"),
             ("동전주", "동전주"),
             ("네글자명", "네글자명"),
             ("지표추종매매", "지표추종매매"),
-            ("지표추종매매B", "지표추종매매B"),
-            ("지표추종매매BC", "지표추종매매…"),
-            ("아주긴자동매매루틴", "아주긴자동매…"),
+            ("지표추종매매B", "지표추종매매..."),
+            ("지표추종매매BC", "지표추종매매..."),
+            ("아주긴자동매매루틴", "아주긴자동매..."),
             ("123456", "123456"),
-            ("1234567", "1234567"),
-            ("12345678", "123456…"),
+            ("1234567", "123456..."),
+            ("12345678", "123456..."),
         ]
         title_x_values = set()
         title_widths = set()
-        registered_x_values = set()
-        running_x_values = set()
-        stopped_x_values = set()
-        error_x_values = set()
 
         for display_name, expected_title in samples:
             row_data = {
@@ -409,15 +585,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "error": 0,
             }
             widget = window._routine_tree_row_widget(row_data, "")
-            widget.resize(900, widget.sizeHint().height())
+            widget.resize(widget.sizeHint().width(), widget.sizeHint().height())
             widget.show()
             self._app.processEvents()
 
             title = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
-            registered = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered")
-            running = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRunning")
-            stopped = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeStopped")
-            error = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeError")
 
             self.assertEqual(expected_title, title.text())
             self.assertEqual(
@@ -426,7 +598,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
             required_width = max(
                 max(title.fontMetrics().horizontalAdvance(sample), title.fontMetrics().boundingRect(sample).width())
-                for sample in ("가" * 7, "가" * 6 + "…", "1234567", "123456…")
+                for sample in ("가" * 6, "가" * 6 + "...", "123456", "123456...")
             )
             self.assertGreaterEqual(title.contentsRect().width(), required_width)
             self.assertEqual(title.width(), title.minimumWidth())
@@ -441,19 +613,186 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             title_x_values.add(title.mapTo(widget, title.rect().topLeft()).x())
             title_widths.add(title.width())
-            title_x = title.mapTo(widget, title.rect().topLeft()).x()
-            registered_x = registered.mapTo(widget, registered.rect().topLeft()).x()
-            registered_x_values.add(registered_x)
-            running_x_values.add(running.mapTo(widget, running.rect().topLeft()).x())
-            stopped_x_values.add(stopped.mapTo(widget, stopped.rect().topLeft()).x())
-            error_x_values.add(error.mapTo(widget, error.rect().topLeft()).x())
+            self.assertEqual("", widget.toolTip())
+            for object_name in (
+                "autoTradeSettingRoutineTreeRegistered",
+                "autoTradeSettingRoutineTreeRunning",
+                "autoTradeSettingRoutineTreeStopped",
+                "autoTradeSettingRoutineTreeError",
+            ):
+                self.assertIsNone(widget.findChild(setting_window.QLabel, object_name))
 
         self.assertEqual(1, len(title_x_values))
         self.assertEqual(1, len(title_widths))
-        self.assertEqual(1, len(registered_x_values))
-        self.assertEqual(1, len(running_x_values))
-        self.assertEqual(1, len(stopped_x_values))
-        self.assertEqual(1, len(error_x_values))
+
+    def test_routine_tree_performance_columns_keep_fixed_x_axis_by_row_kind(self) -> None:
+        window = self._window_harness()
+        rows = [
+            {
+                "row_kind": "definition",
+                "definition_id": "indicator_follow",
+                "instance_id": "",
+                "display_name": "지표추종매매",
+                "tree_icon": "▼",
+                "instance_count": 3,
+                "performance_period_text": "기간(0123)",
+                "performance_profit_text": "수익(12,345,678 / 18.42%)",
+                "performance_average_text": "평균(102,345 / 0.83%)",
+                "performance_efficiency_text": "효율(1.86)",
+            },
+            {
+                "row_kind": "definition",
+                "definition_id": "review",
+                "instance_id": "",
+                "display_name": "등록확인루틴",
+                "tree_icon": "▶",
+                "instance_count": 0,
+                "performance_period_text": "기간(0000)",
+                "performance_profit_text": "수익(0 / 0.00%)",
+                "performance_average_text": "평균(0 / 0.00%)",
+                "performance_efficiency_text": "효율(0.00)",
+            },
+            {
+                "row_kind": "instance",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-a",
+                "display_name": "지표추종매매B",
+                "tree_icon": "●",
+                "performance_period_text": "기간(0045)",
+                "performance_profit_text": "수익(1,200 / 1.20%)",
+                "performance_average_text": "평균(27 / 0.03%)",
+                "performance_efficiency_text": "효율(1.20)",
+            },
+            {
+                "row_kind": "instance",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-b",
+                "display_name": "매우긴인스턴스이름",
+                "tree_icon": "●",
+                "performance_period_text": "기간(9999)",
+                "performance_profit_text": "수익(99,999,999 / 000.0%)",
+                "performance_average_text": "평균(99,999,999 / 00.0%)",
+                "performance_efficiency_text": "효율(000.0)",
+            },
+            {
+                "row_kind": "instance",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-c",
+                "display_name": "단기매매",
+                "tree_icon": "●",
+                "performance_period_text": "기간(0001)",
+                "performance_profit_text": "수익(125,000 / 8.40%)",
+                "performance_average_text": "평균(125,000 / 8.40%)",
+                "performance_efficiency_text": "효율(2.45)",
+            },
+            {
+                "row_kind": "stock",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-c",
+                "display_name": "삼성전자",
+                "tree_icon": "",
+                "performance_period_text": "기간(0000)",
+                "performance_profit_text": "수익(0 / 0.0%)",
+                "performance_average_text": "평균(0 / 0.0%)",
+                "performance_efficiency_text": "효율(0.0)",
+            },
+        ]
+        x_values = {
+            "definition": {"profit": set(), "average": set(), "efficiency": set()},
+            "instance": {"period": set(), "profit": set(), "average": set(), "efficiency": set()},
+            "stock": {"period": set(), "profit": set(), "average": set(), "efficiency": set()},
+        }
+        widths = {"period": set(), "profit": set(), "average": set(), "efficiency": set()}
+
+        for row_data in rows:
+            widget = window._routine_tree_row_widget(row_data, "")
+            if row_data["row_kind"] == "definition":
+                window._set_routine_tree_parent_summary_visible(widget, True)
+            widget.resize(widget.sizeHint().width(), widget.sizeHint().height())
+            widget.show()
+            self._app.processEvents()
+
+            title = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
+            period = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
+            period_spacer = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
+            parent_profit_column_spacer = widget.findChild(
+                setting_window.QWidget,
+                "autoTradeSettingRoutineTreeParentProfitColumnSpacer",
+            )
+            profit = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit")
+            average = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage")
+            efficiency = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceEfficiency")
+
+            self.assertIsNotNone(title)
+            if row_data["row_kind"] == "definition":
+                self.assertIsNone(period)
+                self.assertIsNone(period_spacer)
+                self.assertIsNotNone(parent_profit_column_spacer)
+            else:
+                self.assertIsNotNone(period)
+                self.assertIsNone(period_spacer)
+                self.assertIsNone(parent_profit_column_spacer)
+            self.assertIsNotNone(profit)
+            self.assertIsNotNone(average)
+            self.assertIsNotNone(efficiency)
+            if row_data["row_kind"] in {"instance", "stock"}:
+                self.assertGreater(
+                    period.mapTo(widget, period.rect().topLeft()).x(),
+                    title.mapTo(widget, title.rect().topLeft()).x() + title.width(),
+                )
+            labels = {"profit": profit, "average": average, "efficiency": efficiency}
+            if row_data["row_kind"] in {"instance", "stock"}:
+                labels["period"] = period
+            for key, label in labels.items():
+                x_values[str(row_data["row_kind"])][key].add(label.mapTo(widget, label.rect().topLeft()).x())
+                widths[key].add(label.width())
+                left_value = label.findChild(
+                    setting_window.QLabel,
+                    f"autoTradeSettingRoutineTreePerformance{key.title()}LeftValue",
+                )
+                if key == "period":
+                    left_value = label.findChild(
+                        setting_window.QLabel,
+                        "autoTradeSettingRoutineTreePerformancePeriodLeftValue",
+                    )
+                if key == "profit":
+                    left_value = label.findChild(
+                        setting_window.QLabel,
+                        "autoTradeSettingRoutineTreePerformanceProfitLeftValue",
+                    )
+                if key == "average":
+                    left_value = label.findChild(
+                        setting_window.QLabel,
+                        "autoTradeSettingRoutineTreePerformanceAverageLeftValue",
+                    )
+                if key == "efficiency":
+                    left_value = label.findChild(
+                        setting_window.QLabel,
+                        "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue",
+                    )
+                self.assertIsNotNone(left_value)
+                self.assertEqual(setting_window.Qt.AlignRight | setting_window.Qt.AlignVCenter, left_value.alignment())
+                self.assertGreaterEqual(left_value.width(), left_value.fontMetrics().horizontalAdvance(left_value.text()))
+                if key in {"profit", "average"}:
+                    right_value = label.findChild(
+                        setting_window.QLabel,
+                        f"autoTradeSettingRoutineTreePerformance{key.title()}RightValue",
+                    )
+                    self.assertIsNotNone(right_value)
+                    self.assertEqual(setting_window.Qt.AlignRight | setting_window.Qt.AlignVCenter, right_value.alignment())
+                    self.assertGreaterEqual(right_value.width(), right_value.fontMetrics().horizontalAdvance(right_value.text()))
+            self.assertEqual("", widget.toolTip())
+
+        for row_kind, keys in (
+            ("definition", ("profit", "average", "efficiency")),
+            ("instance", ("period", "profit", "average", "efficiency")),
+            ("stock", ("period", "profit", "average", "efficiency")),
+        ):
+            for key in keys:
+                self.assertEqual(1, len(x_values[row_kind][key]))
+                self.assertEqual(1, len(widths[key]))
+        self.assertEqual(x_values["definition"]["profit"], x_values["instance"]["profit"])
+        self.assertEqual(x_values["instance"]["profit"], x_values["stock"]["profit"])
 
     def test_routine_tree_title_text_contract(self) -> None:
         samples = [
@@ -461,12 +800,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ("동전주", "동전주"),
             ("단기매매", "단기매매"),
             ("지표추종매매", "지표추종매매"),
-            ("지표추종매매B", "지표추종매매B"),
-            ("지표추종매매BC", "지표추종매매…"),
-            ("ABCDEFGHI", "ABCDEF…"),
+            ("지표추종매매B", "지표추종매매..."),
+            ("지표추종매매BC", "지표추종매매..."),
+            ("ABCDEFGHI", "ABCDEF..."),
             ("123456", "123456"),
-            ("1234567", "1234567"),
-            ("12345678", "123456…"),
+            ("1234567", "123456..."),
+            ("12345678", "123456..."),
         ]
 
         for display_name, expected in samples:
@@ -489,18 +828,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
 
         widget = window._routine_tree_row_widget(row_data, "지표추종매매")
-        labels = [
-            widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRegistered"),
-            widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeRunning"),
-            widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeStopped"),
-            widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeError"),
-        ]
 
         count_badge = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeInstanceCount")
         self.assertEqual("루틴3", count_badge.text())
         self.assertFalse(count_badge.isHidden())
-        self.assertEqual(["종목(12)", "실행(4)", "정지(8)", "검토(0)"], [label.text() for label in labels])
-        self.assertTrue(all(not label.isHidden() for label in labels))
+        self.assertEqual("", widget.toolTip())
+        for object_name in (
+            "autoTradeSettingRoutineTreeRegistered",
+            "autoTradeSettingRoutineTreeRunning",
+            "autoTradeSettingRoutineTreeStopped",
+            "autoTradeSettingRoutineTreeError",
+        ):
+            self.assertIsNone(widget.findChild(setting_window.QLabel, object_name))
 
     def test_parent_selection_is_view_scope_and_not_routine_dir(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
@@ -591,34 +930,434 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             result["issues"],
         )
 
-    def test_selection_summary_panel_reflects_definition_and_instance_scope(self) -> None:
+    def test_selection_summary_area_is_removed_from_workspace(self) -> None:
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+
+        group_titles = [group.title() for group in window.findChildren(setting_window.QGroupBox)]
+        self.assertNotIn("Selection Summary", group_titles)
+        self.assertFalse(hasattr(window, "selection_summary_box"))
+        self.assertFalse(hasattr(window, "summary_routine_value"))
+
+        workspace_layout = window.strategy_workspace_widget.layout()
+        self.assertEqual(window.stock_box, workspace_layout.itemAt(0).widget())
+        self.assertEqual(1, workspace_layout.count())
+        self.assertEqual("Stock List", window.stock_box.title())
+
+    def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
         window = self._window_harness()
-        window.summary_routine_value = setting_window.QLabel("-")
-        window.summary_instance_value = setting_window.QLabel("-")
-        window.summary_registered_value = setting_window.QLabel("-")
-        window.summary_running_value = setting_window.QLabel("-")
-        window.summary_error_value = setting_window.QLabel("-")
-        window.summary_default_operation_value = setting_window.QLabel("-")
-        counts = {"inst-a": {"registered": 7, "running": 3, "error": 1}}
+        window._setup_selected_routine_status_bar()
+        window.load_selected_routine_stocks = lambda: None
+        counts = {"inst-a": {"registered": 7, "running": 3, "stopped": 4, "error": 1}}
         window._routine_instance_operation_counts = lambda: counts
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances):
             window.load_routine_table()
             window.routine_table.selectRow(0)
-            window.update_selection_summary_panel()
-            self.assertEqual("지표추종매매", window.summary_routine_value.text())
-            self.assertEqual("전체 인스턴스", window.summary_instance_value.text())
-            self.assertEqual("7", window.summary_registered_value.text())
-            self.assertEqual("3", window.summary_running_value.text())
-            self.assertEqual("1", window.summary_error_value.text())
-            self.assertEqual("OFF", window.summary_default_operation_value.text())
+            window.update_selected_routine_status_bar()
+
+            self.assertEqual("●", window.selected_routine_signal_label.text())
+            self.assertEqual("지표추종매매", window.selected_routine_name_button.text())
+            self.assertEqual("루틴1", window.selected_routine_instance_count_badge.text())
+            self.assertFalse(window.selected_routine_instance_count_badge.isHidden())
+            self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
+            self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())
+            self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
+
+            calls = []
+            window.load_selected_routine_stocks = lambda: calls.append(window._stock_status_filter)
+            window.selected_routine_status_buttons["running"].click()
+            self.assertEqual("running", window._stock_status_filter)
+            window.selected_routine_name_button.click()
+            self.assertEqual("all", window._stock_status_filter)
+            self.assertEqual(["running", "all"], calls)
 
             window.routine_table.selectRow(1)
-            window.update_selection_summary_panel()
-            self.assertEqual("A 인스턴스", window.summary_instance_value.text())
-            self.assertEqual("7", window.summary_registered_value.text())
+            window.update_selected_routine_status_bar()
+            self.assertEqual("A 인스턴스", window.selected_routine_name_button.text())
+            self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
+            self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
+            self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())
+            self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
+
+    def test_instance_renders_stock_scope_badges_and_current_stock_rows(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+            {
+                "stock_path": "stocks/005380_B",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005380",
+                "name": "현대차",
+            },
+        ]
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 2, "running": 0, "stopped": 2, "error": 0}
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window.load_routine_table()
+
+        row_kinds = [
+            window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["row_kind"]
+            for row in range(window.routine_table.rowCount())
+        ]
+        self.assertEqual(
+            ["definition", "instance", "stock_scope", "stock", "stock"],
+            row_kinds,
+        )
+        scope_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        self.assertEqual("stock_scope", scope_row["row_kind"])
+        self.assertEqual("[전체] [현재]", scope_row["display_name"])
+        self.assertEqual("current", scope_row["stock_scope"])
+        self.assertNotIn("현재 종목", [window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["display_name"] for row in range(window.routine_table.rowCount())])
+        self.assertNotIn("과거 종목", [window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["display_name"] for row in range(window.routine_table.rowCount())])
+
+        stock_widget = window.routine_table.cellWidget(3, 0)
+        instance_widget = window.routine_table.cellWidget(1, 0)
+        stock_layout_margins = stock_widget.layout().contentsMargins()
+        self.assertEqual(
+            (
+                setting_window.AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X,
+                0,
+                setting_window.AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X,
+                0,
+            ),
+            (
+                stock_layout_margins.left(),
+                stock_layout_margins.top(),
+                stock_layout_margins.right(),
+                stock_layout_margins.bottom(),
+            ),
+        )
+        self.assertEqual(setting_window.AUTO_TRADE_SETTING_STOCK_ROW_SPACING, stock_widget.layout().spacing())
+        instance_icon = instance_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeIcon")
+        stock_icon = stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeIcon")
+        instance_title = instance_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
+        stock_title = stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
+        self.assertEqual("▼", instance_icon.text())
+        self.assertEqual(setting_window.Qt.PointingHandCursor, instance_icon.cursor().shape())
+        self.assertFalse(instance_icon.testAttribute(setting_window.Qt.WA_TransparentForMouseEvents))
+        self.assertEqual("▪", stock_icon.text())
+        self.assertIn("color: #7E22CE", stock_icon.styleSheet())
+        self.assertEqual("삼성전자", stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle").text())
+        self.assertEqual("삼성전자", stock_title.toolTip())
+        self.assertEqual("삼성전자", window.routine_table.item(3, 0).data(setting_window.Qt.ToolTipRole))
+        self.assertEqual(setting_window.Qt.AlignCenter | setting_window.Qt.AlignVCenter, instance_title.alignment())
+        self.assertEqual(setting_window.Qt.AlignLeft | setting_window.Qt.AlignVCenter, stock_title.alignment())
+        self.assertIn("color: #7E22CE", stock_title.styleSheet())
+        self.assertEqual(
+            instance_title.mapTo(instance_widget, instance_title.rect().topLeft()).x(),
+            stock_title.mapTo(stock_widget, stock_title.rect().topLeft()).x(),
+        )
+        stock_title_spacer = stock_widget.findChild(
+            setting_window.QWidget,
+            "autoTradeSettingRoutineTreeStockTitleXCompensation",
+        )
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION,
+            stock_title_spacer.width(),
+        )
+        stock_performance_spacer = stock_widget.findChild(
+            setting_window.QWidget,
+            "autoTradeSettingRoutineTreeStockPerformanceXCompensation",
+        )
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION,
+            stock_performance_spacer.width(),
+        )
+        self.assertIsNotNone(stock_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod"))
+        self.assertIsNotNone(stock_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit"))
+        self.assertIsNotNone(stock_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage"))
+        self.assertIsNotNone(stock_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceEfficiency"))
+        for label in stock_widget.findChildren(setting_window.QLabel):
+            if label.objectName().startswith("autoTradeSettingRoutineTreePerformance"):
+                self.assertIn("color: #7E22CE", label.styleSheet())
+        self.assertEqual(
+            "0",
+            stock_widget.findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreePerformancePeriodLeftValue",
+            ).text(),
+        )
+        self.assertEqual(setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT, window.routine_table.rowHeight(3))
+        self.assertLessEqual(window.routine_table.rowHeight(3), window.routine_table.rowHeight(1) - 2)
+        stock_widget.resize(max(stock_widget.sizeHint().width(), 960), stock_widget.sizeHint().height())
+        stock_widget.layout().activate()
+        previous_x = -1
+        for object_name in (
+            "autoTradeSettingRoutineTreeTitle",
+            "autoTradeSettingRoutineTreePerformancePeriod",
+            "autoTradeSettingRoutineTreePerformanceProfit",
+            "autoTradeSettingRoutineTreePerformanceAverage",
+            "autoTradeSettingRoutineTreePerformanceEfficiency",
+        ):
+            child = stock_widget.findChild(setting_window.QWidget, object_name)
+            self.assertIsNotNone(child)
+            child_x = child.mapTo(stock_widget, child.rect().topLeft()).x()
+            self.assertGreaterEqual(child_x, previous_x)
+            previous_x = child_x
+        window.routine_table.selectRow(2)
+        self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
+        window.routine_table.selectRow(3)
+        self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
+
+        scope_widget = window.routine_table.cellWidget(2, 0)
+        all_badge = scope_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeAllBadge")
+        current_badge = scope_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeCurrentBadge")
+        self.assertIn("color: #111827", all_badge.styleSheet())
+        self.assertIn("color: #16A34A", current_badge.styleSheet())
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            all_badge.click()
+        scope_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        self.assertEqual("all", scope_row["stock_scope"])
+        self.assertEqual("[전체] [현재]", scope_row["display_name"])
+        scope_widget = window.routine_table.cellWidget(2, 0)
+        all_badge = scope_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeAllBadge")
+        current_badge = scope_widget.findChild(setting_window.QPushButton, "autoTradeSettingRoutineTreeStockScopeCurrentBadge")
+        self.assertIn("color: #16A34A", all_badge.styleSheet())
+        self.assertIn("color: #111827", current_badge.styleSheet())
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            all_badge.click()
+        scope_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        self.assertEqual("all", scope_row["stock_scope"])
+
+    def test_instance_arrow_click_collapses_scope_and_stock_rows_independently(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+            {
+                "stock_path": "stocks/005380_B",
+                "assigned_routine_instance_id": "inst-b",
+                "code": "005380",
+                "name": "현대차",
+            },
+        ]
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+            "inst-b": {"registered": 1, "running": 1, "stopped": 0, "error": 0},
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window.load_routine_table()
+
+            self.assertEqual(
+                ["definition", "instance", "stock_scope", "stock", "instance", "stock_scope", "stock"],
+                [
+                    window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["row_kind"]
+                    for row in range(window.routine_table.rowCount())
+                ],
+            )
+            first_icon = window.routine_table.cellWidget(1, 0).findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreeIcon",
+            )
+            self.assertEqual("▼", first_icon.text())
+            first_instance_meta = window.routine_table.item(1, 0).data(setting_window.Qt.UserRole)
+            second_instance_meta = window.routine_table.item(4, 0).data(setting_window.Qt.UserRole)
+            self.assertFalse(bool(first_instance_meta.get("instance_group_top_gap")))
+            self.assertTrue(bool(second_instance_meta.get("instance_group_top_gap")))
+            self.assertEqual(
+                setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
+                window.routine_table.rowHeight(4) - window.routine_table.rowHeight(1),
+            )
+            self.assertEqual(window.routine_table.rowHeight(3), window.routine_table.rowHeight(6))
+
+            window.routine_table.selectRow(1)
+            selected_before_toggle = []
+            window.load_selected_routine_stocks = lambda: selected_before_toggle.append(window._stock_status_filter)
+            original_load_routine_table = window.load_routine_table
+            window.load_routine_table = lambda: self.fail("instance collapse must not rebuild the routine table")
+            window._toggle_routine_instance_collapsed("inst-a")
+            window.load_routine_table = original_load_routine_table
+
+        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        self.assertEqual([], selected_before_toggle)
+        row_metadata = [
+            window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)
+            for row in range(window.routine_table.rowCount())
+        ]
+        self.assertEqual(
+            [
+                ("definition", ""),
+                ("instance", "inst-a"),
+                ("stock_scope", "inst-a"),
+                ("stock", "inst-a"),
+                ("instance", "inst-b"),
+                ("stock_scope", "inst-b"),
+                ("stock", "inst-b"),
+            ],
+            [(str(meta["row_kind"]), str(meta.get("instance_id", ""))) for meta in row_metadata],
+        )
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+        self.assertTrue(window.routine_table.isRowHidden(3))
+        self.assertFalse(window.routine_table.isRowHidden(4))
+        self.assertFalse(window.routine_table.isRowHidden(5))
+        self.assertFalse(window.routine_table.isRowHidden(6))
+        collapsed_icon = window.routine_table.cellWidget(1, 0).findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeIcon",
+        )
+        self.assertEqual("▶", collapsed_icon.text())
+        self.assertEqual("inst-a", window.current_selected_instance_id())
+        self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
+        window.on_routine_table_item_double_clicked(window.routine_table.item(1, 0))
+        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+
+        window._toggle_routine_definition_collapsed("indicator_follow")
+        self.assertEqual({"indicator_follow"}, window._collapsed_auto_trade_definition_ids)
+        self.assertTrue(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+        self.assertTrue(window.routine_table.isRowHidden(3))
+        window._toggle_routine_definition_collapsed("indicator_follow")
+        self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+        self.assertTrue(window.routine_table.isRowHidden(3))
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window._set_auto_trade_stock_scope("inst-a", "all")
+
+        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        scope_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
+        self.assertEqual("all", scope_row["stock_scope"])
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+        self.assertTrue(window.routine_table.isRowHidden(3))
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window._toggle_routine_instance_collapsed("inst-a")
+
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertEqual(7, window.routine_table.rowCount())
+
+    def test_stock_status_filter_limits_loaded_stock_rows_by_existing_status_rules(self) -> None:
+        class Window:
+            pass
+
+        window = Window()
+        window.stock_table = QTableWidget(0, 11)
+        window.current_selected_target_instance_ids = lambda: ("inst-a",)
+        window.current_selected_routine_dir = lambda: Path("routines") / "indicator_follow"
+        window.current_selected_routine_name = lambda: "지표추종매매"
+        window.capture_stock_table_view_state = lambda: (set(), 0)
+        window.restore_stock_table_view_state = lambda _paths, _scroll: None
+        window.update_selected_routine_status_bar = lambda: None
+        window.update_action_buttons = lambda: None
+        window._stock_visual_order = []
+
+        stocks = [
+            {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "실행"},
+            {"stock_path": "stocks/222222_STOP", "assigned_routine_instance_id": "inst-a", "code": "222222", "name": "정지"},
+            {"stock_path": "stocks/333333_ERR", "assigned_routine_instance_id": "inst-a", "code": "333333", "name": "검토"},
+        ]
+
+        def fake_read_json(path: Path):
+            text = str(path)
+            if text.endswith("config.json"):
+                return {"assigned_routine_instance_id": "inst-a", "operation_mode": "SCHEDULED"}
+            if "111111_RUN" in text:
+                return {"status": "RUNNING", "trade_enabled": True}
+            if "333333_ERR" in text:
+                return {"status": "ERROR", "trade_enabled": False}
+            return {"status": "STOPPED", "trade_enabled": False}
+
+        with patch.object(table_loader, "read_base_stocks", return_value=stocks), \
+                patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
+            window._stock_status_filter = "all"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(3, window.stock_table.rowCount())
+
+            window._stock_status_filter = "running"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(["111111"], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
+
+            window._stock_status_filter = "stopped"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(
+                ["222222", "333333"],
+                [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())],
+            )
+
+            window._stock_status_filter = "error"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(["333333"], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
+
+    def test_maximized_workspace_reserves_stock_table_required_width(self) -> None:
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+        window.show()
+        self._app.processEvents()
+
+        header = window.stock_table.horizontalHeader()
+        column_width_sum = sum(header.sectionSize(col) for col in range(window.stock_table.columnCount()))
+        initial_column_width_sum = sum(
+            header.sectionSize(col)
+            for col in range(setting_window.AUTO_TRADE_SETTING_INITIAL_STOCK_LAST_COLUMN + 1)
+        )
+        initial_stock_width = window._stock_table_required_width(
+            setting_window.AUTO_TRADE_SETTING_INITIAL_STOCK_LAST_COLUMN
+        )
+        initial_right_width = window._right_workspace_initial_width()
+        stock_required_width = window._stock_table_required_width()
+        right_required_width = window._right_workspace_required_width()
+        self.assertGreaterEqual(initial_stock_width, initial_column_width_sum)
+        self.assertLess(initial_stock_width, stock_required_width)
+        self.assertGreaterEqual(initial_right_width, initial_stock_width)
+        self.assertLess(initial_right_width, right_required_width)
+        self.assertGreaterEqual(stock_required_width, column_width_sum)
+        self.assertGreaterEqual(right_required_width, stock_required_width)
+        initial_left_width, initial_splitter_right_width = window.strategy_workspace_splitter.sizes()
+        self.assertGreaterEqual(initial_left_width, window.routine_box.minimumWidth())
+        self.assertGreaterEqual(initial_splitter_right_width, initial_right_width)
+        self.assertLess(initial_splitter_right_width, right_required_width)
+
+        handle_width = window.strategy_workspace_splitter.handleWidth()
+        available_width = window.routine_box.minimumWidth() + right_required_width + handle_width + 120
+        window.strategy_workspace_splitter.resize(available_width, 420)
+        window._rebalance_strategy_workspace_splitter()
+        self._app.processEvents()
+
+        left_width, right_width = window.strategy_workspace_splitter.sizes()
+        self.assertGreaterEqual(left_width, window.routine_box.minimumWidth())
+        self.assertGreaterEqual(right_width, right_required_width)
+        self.assertEqual(setting_window.Qt.ScrollBarAlwaysOff, window.stock_table.horizontalScrollBarPolicy())
+        self.assertEqual(setting_window.QHeaderView.Fixed, header.sectionResizeMode(0))
 
     def test_routine_tree_does_not_render_default_operation_stamp_buttons(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]

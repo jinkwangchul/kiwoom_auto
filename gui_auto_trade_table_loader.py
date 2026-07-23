@@ -31,6 +31,7 @@ from gui_auto_trade_runtime import (
     assigned_stock_dirs_in_routine,
     write_state_json,
 )
+from gui_base_stock_service import read_base_stocks
 from state_policy import (
     status_after_operation_mode_change,
     operation_text_and_color,
@@ -85,7 +86,6 @@ from gui_auto_trade_policy import (
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
-    is_review_required_state,
 )
 from gui_ats_utils import (
     auto_trade_setting_regular_market_active_now,
@@ -94,6 +94,46 @@ from gui_ats_utils import (
     manual_ats_session_labels,
     manual_ats_source,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _selected_instance_stock_dirs(window) -> list[Path]:
+    instance_ids_getter = getattr(window, "current_selected_target_instance_ids", None)
+    if not callable(instance_ids_getter):
+        return []
+    target_instance_ids = {
+        str(instance_id or "").strip()
+        for instance_id in instance_ids_getter()
+        if str(instance_id or "").strip()
+    }
+    if not target_instance_ids:
+        return []
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for stock in read_base_stocks():
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        if not stock_path:
+            continue
+        stock_dir = PROJECT_ROOT / stock_path
+        assigned_instance_id = str(
+            stock.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        if not assigned_instance_id:
+            config = read_json_dict(stock_dir / "config.json")
+            assigned_instance_id = str(
+                config.get("assigned_routine_instance_id", "") or ""
+            ).strip()
+        if assigned_instance_id not in target_instance_ids:
+            continue
+        stock_dir_text = str(stock_dir)
+        if stock_dir_text in seen:
+            continue
+        seen.add(stock_dir_text)
+        result.append(stock_dir)
+    return sorted(result, key=lambda path: path.name)
 
 
 def auto_trade_load_selected_routine_stocks(window) -> None:
@@ -127,11 +167,9 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
     previous_stock_order_index = {path: index for index, path in enumerate(previous_stock_path_order)}
     preserve_visual_order = False
 
-    if hasattr(window, "selected_routine_label"):
-        if routine_dir is None or not routine_name:
-            window.selected_routine_label.setText("선택 루틴: -")
-        else:
-            window.selected_routine_label.setText(f"선택 루틴: {routine_name}")
+    status_bar_updater = getattr(window, "update_selected_routine_status_bar", None)
+    if callable(status_bar_updater):
+        status_bar_updater()
 
     window.stock_table.blockSignals(True)
     window.stock_table.setUpdatesEnabled(False)
@@ -144,11 +182,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 window.stock_table.removeCellWidget(row, col)
         window.stock_table.clearContents()
 
-        if routine_dir is None:
+        stock_dirs = _selected_instance_stock_dirs(window)
+        if not stock_dirs:
             window.stock_table.setRowCount(0)
             return
-
-        stock_dirs = assigned_stock_dirs_in_routine(routine_dir)
         if previous_stock_order_index:
             matched_previous_paths = {str(path) for path in stock_dirs} & set(previous_stock_order_index)
             if matched_previous_paths:
@@ -168,10 +205,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             state = read_json_dict(stock_dir / "state.json")
 
             # 검토종목은 자동매매설정 창에서 완전 제외한다.
-            # status가 MONITORING이어도 review_required 플래그가 남아 있으면 검토관리 전용이다.
-            if is_review_required_state(state):
-                continue
-
             config = read_json_dict(stock_dir / "config.json")
             if not config:
                 config = default_config()
@@ -327,9 +360,12 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 persisted_trade_started=trade_started,
             )
 
-            # 검토종목은 자동매매설정 리스트에서 제거한다.
-            # 검토종목 정보 확인/복귀는 검토관리창에서만 처리한다.
-            if display_status == "검토종목":
+            stock_status_filter = str(getattr(window, "_stock_status_filter", "all") or "all").strip().lower()
+            if stock_status_filter == "running" and not auto_trade_setting_trade_started(state):
+                continue
+            if stock_status_filter == "stopped" and auto_trade_setting_trade_started(state):
+                continue
+            if stock_status_filter == "error" and raw_status_key != "ERROR":
                 continue
 
             window.stock_table.insertRow(row)
