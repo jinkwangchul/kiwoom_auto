@@ -1096,6 +1096,7 @@ class AutoTradeSettingWindow(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
+        self.setObjectName("autoTradeSettingWindow")
         self.setWindowTitle("자동매매설정")
         flags = self.windowFlags()
         flags &= ~Qt.WindowContextHelpButtonHint
@@ -1106,7 +1107,9 @@ class AutoTradeSettingWindow(QDialog):
         self.setMinimumHeight(650)
 
         self.routine_table = QTableWidget()
+        self.routine_table.setObjectName("autoTradeSettingRoutineTable")
         self.stock_table = QTableWidget()
+        self.stock_table.setObjectName("autoTradeSettingStockTable")
 
         self.btn_start = QPushButton("매매시작")
         self.btn_stop = QPushButton("강제종료")
@@ -1153,6 +1156,28 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_review_view = QPushButton("검토관리")
         self.btn_refresh = QPushButton("안정성검사")
         self.btn_close = QPushButton("닫기")
+        for button, object_name in (
+            (self.btn_start, "autoTradeSettingStartButton"),
+            (self.btn_stop, "autoTradeSettingStopButton"),
+            (self.btn_early_close, "autoTradeSettingEarlyCloseButton"),
+            (self.btn_preview_order_candidates, "autoTradeSettingPreviewOrderCandidatesButton"),
+            (self.btn_execution_enable, "autoTradeSettingExecutionEnableButton"),
+            (self.btn_real_ready_preflight, "autoTradeSettingRealReadyPreflightButton"),
+            (self.btn_execution_preview, "autoTradeSettingExecutionPreviewButton"),
+            (self.btn_manual_send_order, "autoTradeSettingManualSendOrderButton"),
+            (self.btn_manual_cancel_pending_order, "autoTradeSettingManualCancelPendingOrderButton"),
+            (self.btn_manual_modify_pending_order, "autoTradeSettingManualModifyPendingOrderButton"),
+            (self.btn_manual_queue_commit, "autoTradeSettingManualQueueCommitButton"),
+            (self.btn_fetch_minute_candles, "autoTradeSettingFetchMinuteCandlesButton"),
+            (self.btn_set_schedule, "autoTradeSettingScheduleButton"),
+            (self.btn_delete, "autoTradeSettingDeleteButton"),
+            (self.btn_order_view, "autoTradeSettingOrderViewButton"),
+            (self.btn_log_view, "autoTradeSettingLogViewButton"),
+            (self.btn_review_view, "autoTradeSettingReviewViewButton"),
+            (self.btn_refresh, "autoTradeSettingRefreshButton"),
+            (self.btn_close, "autoTradeSettingCloseButton"),
+        ):
+            button.setObjectName(object_name)
         self._notification_popup = None
 
         self._routine_sort_column = -1
@@ -1213,6 +1238,7 @@ class AutoTradeSettingWindow(QDialog):
         button_layout = QHBoxLayout()
 
         routine_box = QGroupBox("자동매매 루틴")
+        routine_box.setObjectName("autoTradeSettingRoutineGroup")
         routine_layout = QVBoxLayout()
         self._setup_routine_table()
         routine_layout.addWidget(self.routine_table)
@@ -1221,6 +1247,7 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_box = routine_box
 
         self.stock_box = QGroupBox("Stock List")
+        self.stock_box.setObjectName("autoTradeSettingStockGroup")
         stock_layout = QVBoxLayout()
         self._setup_selected_routine_status_bar()
         self._setup_stock_table()
@@ -1247,6 +1274,7 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_box.setLayout(stock_layout)
 
         workspace_widget = QWidget()
+        workspace_widget.setObjectName("autoTradeSettingStockWorkspace")
         workspace_widget.setMinimumWidth(700)
         self.strategy_workspace_widget = workspace_widget
         workspace_layout = QVBoxLayout()
@@ -1255,6 +1283,7 @@ class AutoTradeSettingWindow(QDialog):
         workspace_widget.setLayout(workspace_layout)
 
         self.strategy_workspace_splitter = QSplitter(Qt.Horizontal)
+        self.strategy_workspace_splitter.setObjectName("autoTradeSettingWorkspaceSplitter")
         self.strategy_workspace_splitter.addWidget(routine_box)
         self.strategy_workspace_splitter.addWidget(workspace_widget)
         self.strategy_workspace_splitter.setStretchFactor(0, 0)
@@ -1487,6 +1516,7 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setHorizontalHeaderLabels(headers)
         apply_plain_table_header(self.routine_table)
         header = self.routine_table.horizontalHeader()
+        header.setObjectName("autoTradeSettingRoutineHeader")
         header.setFont(routine_table_font)
         header.setDefaultAlignment(Qt.AlignCenter)
         header.setHighlightSections(False)
@@ -1567,6 +1597,7 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setHorizontalHeaderLabels(headers)
         apply_plain_table_header(self.stock_table)
         header = self.stock_table.horizontalHeader()
+        header.setObjectName("autoTradeSettingStockHeader")
         header_font = QFont(self.stock_table.font())
         header.setFont(header_font)
         header.setDefaultAlignment(Qt.AlignCenter)
