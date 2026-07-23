@@ -1211,6 +1211,7 @@ class AutoTradeSettingWindow(QDialog):
         self._last_strategy_workspace_width = 0
         self._auto_trade_stock_scope_by_instance: dict[str, str] = {}
         self._collapsed_auto_trade_instance_ids: set[str] = set()
+        self._fixed_signals_connected = False
 
         self._setup_ui()
         # Initialization contract: font, state, input state, geometry, then signals.
@@ -1669,6 +1670,8 @@ class AutoTradeSettingWindow(QDialog):
             self.stock_table.setColumnWidth(col, width)
 
     def _connect_events(self) -> None:
+        if self._fixed_signals_connected:
+            return
         self.routine_table.itemSelectionChanged.connect(self.on_routine_selection_changed)
         self.routine_table.itemClicked.connect(self.on_routine_table_item_clicked)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_routine_table_by_column)
@@ -1695,6 +1698,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_order_view.clicked.connect(self.open_order_status_window)
         self.btn_log_view.clicked.connect(self.open_log_view_window)
         self.btn_review_view.clicked.connect(self.open_review_required_window)
+        self._fixed_signals_connected = True
 
     def sort_routine_table_by_column(self, column: int) -> None:
         """상단 루틴표 헤더 클릭 정렬."""
