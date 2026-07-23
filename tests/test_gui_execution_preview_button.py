@@ -33,6 +33,11 @@ class _QtImportStub:
     DescendingOrder = 1
     ItemIsEnabled = 1
     ItemIsSelectable = 2
+    Question = 0
+    Yes = 1
+    No = 0
+    AcceptRole = 0
+    RejectRole = 1
 
     def __init__(self, *args, **kwargs) -> None:
         self.clicked = _QtImportStubSignal()
@@ -65,9 +70,12 @@ def _install_pyqt5_import_stubs() -> None:
         return
 
     pyqt5 = types.ModuleType("PyQt5")
+    sip = types.ModuleType("PyQt5.sip")
     qtcore = types.ModuleType("PyQt5.QtCore")
     qtgui = types.ModuleType("PyQt5.QtGui")
     qtwidgets = types.ModuleType("PyQt5.QtWidgets")
+    sip.isdeleted = lambda obj: False
+    pyqt5.sip = sip
 
     qtcore.Qt = _QtImportStub()
     qtcore.QDate = _QtImportStub
@@ -121,6 +129,7 @@ def _install_pyqt5_import_stubs() -> None:
     qtwidgets.QTextEdit.NoWrap = "NoWrap"
 
     sys.modules["PyQt5"] = pyqt5
+    sys.modules["PyQt5.sip"] = sip
     sys.modules["PyQt5.QtCore"] = qtcore
     sys.modules["PyQt5.QtGui"] = qtgui
     sys.modules["PyQt5.QtWidgets"] = qtwidgets

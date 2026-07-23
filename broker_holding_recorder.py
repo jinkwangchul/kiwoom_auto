@@ -307,8 +307,10 @@ def normalize_broker_holding_chejan_event(raw_event: Any, context: Any = None) -
     if isinstance(current_price, (int, float)):
         current_price = abs(current_price)
     profit_loss_rate = _parse_optional_number(fids.get("8019"), "profit_loss_rate", warnings)
-    received_at = _clean_text(event.get("received_at")) or _now_text()
-    if _parse_received_at(received_at) is None:
+    received_at = _clean_text(event.get("received_at"))
+    if not received_at:
+        errors.append("received_at is required")
+    elif _parse_received_at(received_at) is None:
         errors.append("received_at must be comparable")
 
     if errors:

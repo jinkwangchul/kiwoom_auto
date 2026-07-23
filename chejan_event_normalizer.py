@@ -111,6 +111,18 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
     if not isinstance(raw_event, dict):
         return _blocked("raw_event must be a dict")
 
+    source = _clean_text(raw_event.get("source"))
+    if not source:
+        return _blocked("raw_event.source is required")
+
+    gubun = _clean_text(raw_event.get("gubun"))
+    if gubun != "0":
+        return _blocked("raw_event.gubun must be 0 for an order Chejan event")
+
+    received_at = _clean_text(raw_event.get("received_at"))
+    if not received_at:
+        return _blocked("raw_event.received_at is required")
+
     fid_values = raw_event.get("fid_values")
     if not isinstance(fid_values, dict):
         return _blocked("raw_event.fid_values must be a dict")
@@ -139,8 +151,9 @@ def normalize_kiwoom_chejan_event(raw_event: Any, context: Any = None) -> dict[s
         "event_stage": STAGE_NORMALIZED,
         "event_type": event_type,
         "broker": "KIWOOM",
-        "source": _clean_text(raw_event.get("source")) or "kiwoom_chejan",
-        "gubun": _clean_text(raw_event.get("gubun")),
+        "source": source,
+        "gubun": gubun,
+        "received_at": received_at,
         "broker_order_no": broker_order_no,
         "original_order_no": original_order_no,
         "account_no": account_no,

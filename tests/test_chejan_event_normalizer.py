@@ -41,10 +41,35 @@ class ChejanEventNormalizerTest(unittest.TestCase):
         self.assertIn("raw_event must be a dict", result["blocked_reasons"])
 
     def test_fid_values_missing_is_blocked(self) -> None:
-        result = normalize_kiwoom_chejan_event({"source": "kiwoom_chejan"})
+        result = normalize_kiwoom_chejan_event(
+            {
+                "source": "kiwoom_chejan",
+                "gubun": "0",
+                "received_at": "2026-07-04 10:00:00",
+            }
+        )
 
         self.assertFalse(result["normalized"])
         self.assertIn("raw_event.fid_values must be a dict", result["blocked_reasons"])
+
+    def test_missing_source_gubun_or_received_at_is_blocked(self) -> None:
+        cases = (
+            ({"source": "", "gubun": "0"}, "raw_event.source is required"),
+            ({"source": "kiwoom_chejan", "gubun": ""}, "raw_event.gubun must be 0"),
+            ({"source": "kiwoom_chejan", "gubun": "0"}, "raw_event.received_at is required"),
+        )
+
+        for overrides, expected_reason in cases:
+            with self.subTest(overrides=overrides):
+                raw = self._raw()
+                raw.update(overrides)
+                if "received_at" not in overrides:
+                    raw.pop("received_at", None)
+                result = normalize_kiwoom_chejan_event(raw)
+
+                self.assertFalse(result["normalized"])
+                self.assertTrue(result["unresolved"])
+                self.assertIn(expected_reason, result["blocked_reasons"][0])
 
     def test_buy_partial_fill_normalizes_to_partial_fill(self) -> None:
         result = normalize_kiwoom_chejan_event(self._raw())
@@ -145,6 +170,7 @@ class ChejanEventNormalizerTest(unittest.TestCase):
         self.assertEqual("체결", result["order_status"])
         self.assertEqual("kiwoom_chejan", result["source"])
         self.assertEqual("0", result["gubun"])
+        self.assertEqual("2026-07-04 10:00:00", result["received_at"])
 
     def test_request_lock_execution_ids_remain_none(self) -> None:
         result = normalize_kiwoom_chejan_event(self._raw())

@@ -444,6 +444,24 @@ class BrokerHoldingRecorderTest(unittest.TestCase):
             self.assertFalse(missing_quantity["holding_recorded"])
             self.assertFalse(holdings_path.exists())
 
+    def test_missing_received_at_is_blocked_without_runtime_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            holdings_path = Path(tmp) / "broker_holdings.json"
+            positions_path = Path(tmp) / "positions.json"
+            event = self._raw_event()
+            event.pop("received_at")
+
+            result = record_broker_holding_snapshot(
+                event,
+                holdings_path,
+                positions_path,
+                context=self._context(),
+            )
+
+            self.assertFalse(result["holding_recorded"])
+            self.assertIn("received_at is required", result["blocked_reasons"][0])
+            self.assertFalse(holdings_path.exists())
+
     def test_negative_broker_quantities_are_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             holdings_path = Path(tmp) / "broker_holdings.json"
