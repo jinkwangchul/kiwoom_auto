@@ -1191,6 +1191,13 @@ class AutoTradeSettingWindow(QDialog):
         for control_type in (QPushButton, QLabel, QGroupBox):
             for control in self.findChildren(control_type):
                 control.setFont(QFont(control.font()))
+        for widget_type in (QPushButton, QLabel, QGroupBox, QTableWidget, QComboBox, QCheckBox):
+            for widget in self.findChildren(widget_type):
+                widget.setEnabled(widget.isEnabled())
+                widget.setVisible(not widget.isHidden())
+        for input_type in (QLineEdit, QTextEdit):
+            for input_widget in self.findChildren(input_type):
+                input_widget.setReadOnly(input_widget.isReadOnly())
         self._apply_initial_strategy_workspace_size()
         self._connect_events()
 
