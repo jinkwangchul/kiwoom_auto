@@ -1487,6 +1487,8 @@ class AutoTradeSettingWindow(QDialog):
         apply_plain_table_header(self.routine_table)
         header = self.routine_table.horizontalHeader()
         header.setFont(routine_table_font)
+        header.setDefaultAlignment(Qt.AlignCenter)
+        header.setHighlightSections(False)
         for col in range(len(headers)):
             header_item = self.routine_table.horizontalHeaderItem(col)
             if header_item is not None:
@@ -1517,6 +1519,9 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setShowGrid(False)
         self.routine_table.setAlternatingRowColors(False)
         self.routine_table.setWordWrap(False)
+        self.routine_table.setTextElideMode(Qt.ElideRight)
+        self.routine_table.setContextMenuPolicy(Qt.DefaultContextMenu)
+        self.routine_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.routine_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.routine_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.routine_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1564,6 +1569,8 @@ class AutoTradeSettingWindow(QDialog):
         header = self.stock_table.horizontalHeader()
         header_font = QFont(self.stock_table.font())
         header.setFont(header_font)
+        header.setDefaultAlignment(Qt.AlignCenter)
+        header.setHighlightSections(False)
         for col in range(len(headers)):
             header_item = self.stock_table.horizontalHeaderItem(col)
             if header_item is not None:
@@ -1599,6 +1606,9 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.stock_table.setWordWrap(True)
+        self.stock_table.setTextElideMode(Qt.ElideRight)
+        self.stock_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.stock_table.setFocusPolicy(Qt.StrongFocus)
         self.stock_table.setTabKeyNavigation(True)
         self.stock_table.setMouseTracking(False)
