@@ -455,6 +455,8 @@ class StockPositionMetricDelegate(QStyledItemDelegate):
     }
 
     def paint(self, painter, option, index) -> None:
+        painter.setFont(option.font)
+        font_metrics = QFontMetrics(option.font)
         text = str(index.data(Qt.DisplayRole) or "")
         label_hint = self.LABEL_BY_COLUMN.get(index.column())
         color = (
@@ -473,17 +475,22 @@ class StockPositionMetricDelegate(QStyledItemDelegate):
             color,
             label_hint=label_hint,
             compact=True,
-            compact_margins=self._operation_column_margins(option.widget),
+            compact_margins=self._operation_column_margins(
+                option.widget,
+                font_metrics,
+            ),
         ):
             return
         super().paint(painter, option, index)
 
     @staticmethod
-    def _operation_column_margins(table) -> tuple[int, int]:
+    def _operation_column_margins(
+        table,
+        font_metrics: QFontMetrics,
+    ) -> tuple[int, int]:
         if table is None:
             return 2, 2
-        metrics = table.fontMetrics()
-        text_width = metrics.horizontalAdvance("09:30~13:30")
+        text_width = font_metrics.horizontalAdvance("09:30~13:30")
         column_width = table.columnWidth(2)
         spare_width = max(0, column_width - text_width)
         left_margin = spare_width // 2
