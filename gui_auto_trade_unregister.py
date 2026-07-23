@@ -366,10 +366,12 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if not code or not name:
             continue
 
+        item_reset_failed = False
         if (code, name) in force_keys:
             for runtime_routine_name, stock_dir in item.get("runtime_dirs", []):
                 if not reset_runtime_state_for_force_unregister(stock_dir):
                     reset_failed_items.append(f"{code} {name} / {runtime_routine_name}")
+                    item_reset_failed = True
                     continue
                 append_stock_log(
                     stock_dir,
@@ -377,13 +379,18 @@ def unregister_selected_auto_trade_stocks(window) -> None:
                     "자동매매설정 등록해제로 state.json과 orders.json 현재 표시/판단값 초기화",
                 )
 
-        if reset_failed_items:
+        if item_reset_failed:
             continue
 
         if update_base_stock_routines(code, name, []):
             completed_items.append(f"{code},{name}")
 
     if reset_failed_items:
+        if completed_items:
+            parent = window.parent()
+            if parent is not None and hasattr(parent, "refresh_all"):
+                parent.refresh_all()
+            window.refresh_all()
         preview_text = "\n".join(reset_failed_items[:10])
         if len(reset_failed_items) > 10:
             preview_text += f"\n... 외 {len(reset_failed_items) - 10}개"
@@ -424,4 +431,3 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if report_path is not None:
             result_lines.append(f"리포트: {report_path.name}")
     QMessageBox.information(window, "등록해제 결과", "\n".join(result_lines))
-
