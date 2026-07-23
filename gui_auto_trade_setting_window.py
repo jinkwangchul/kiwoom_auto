@@ -1210,6 +1210,7 @@ class AutoTradeSettingWindow(QDialog):
         self._last_strategy_workspace_width = 0
         self._auto_trade_stock_scope_by_instance: dict[str, str] = {}
         self._collapsed_auto_trade_instance_ids: set[str] = set()
+        self._routine_tree_display_level = "category"
         self._fixed_signals_connected = False
 
         self._setup_ui()
@@ -1228,6 +1229,7 @@ class AutoTradeSettingWindow(QDialog):
         self._connect_events()
 
         self.refresh_all()
+        self._set_routine_tree_display_level(self._routine_tree_display_level)
         self.update_startup_recovery_controls()
         self._runtime_file_snapshot = self.current_runtime_file_signature()
         self._time_policy_timer.start()
@@ -1245,6 +1247,7 @@ class AutoTradeSettingWindow(QDialog):
         routine_box.setLayout(routine_layout)
         routine_box.setMinimumWidth(1000)
         self.routine_box = routine_box
+        self._setup_routine_tree_display_level_badges()
 
         self.stock_box = QGroupBox("Stock List")
         self.stock_box.setObjectName("autoTradeSettingStockGroup")
@@ -1312,6 +1315,7 @@ class AutoTradeSettingWindow(QDialog):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._position_routine_tree_display_level_badges()
         if not hasattr(self, "strategy_workspace_splitter"):
             return
         current_width = int(self.width())
@@ -2711,7 +2715,103 @@ class AutoTradeSettingWindow(QDialog):
             if widget.property("autoTradeSettingParentSummaryMetric"):
                 widget.setVisible(visible)
 
+    def _setup_routine_tree_display_level_badges(self) -> None:
+        container = QWidget(self.routine_box)
+        container.setObjectName("autoTradeSettingRoutineTreeDisplayLevelBadges")
+        container.setFocusPolicy(Qt.NoFocus)
+        container.setAttribute(Qt.WA_StyledBackground, True)
+        container.setStyleSheet("background: transparent;")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        buttons: dict[str, QPushButton] = {}
+        for level, text, object_name in (
+            ("category", "대분류", "autoTradeSettingRoutineTreeCategoryLevelBadge"),
+            ("routine", "루틴", "autoTradeSettingRoutineTreeRoutineLevelBadge"),
+            ("stock", "종목", "autoTradeSettingRoutineTreeStockLevelBadge"),
+        ):
+            button = QPushButton(text, container)
+            button.setObjectName(object_name)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedSize(64, 22)
+            button.clicked.connect(
+                lambda _checked=False, target_level=level:
+                self._set_routine_tree_display_level(target_level)
+            )
+            layout.addWidget(button, 0, Qt.AlignVCenter)
+            buttons[level] = button
+
+        container.setFixedSize((64 * len(buttons)) + (layout.spacing() * (len(buttons) - 1)), 22)
+        self._routine_tree_display_level_badges = container
+        self._routine_tree_display_level_buttons = buttons
+        self._update_routine_tree_display_level_badges()
+        container.show()
+        container.raise_()
+        self.routine_box.installEventFilter(self)
+        QTimer.singleShot(0, self._position_routine_tree_display_level_badges)
+
+    def _position_routine_tree_display_level_badges(self) -> None:
+        container = getattr(self, "_routine_tree_display_level_badges", None)
+        routine_box = getattr(self, "routine_box", None)
+        if container is None or routine_box is None:
+            return
+        right_margin = routine_box.layout().contentsMargins().right() if routine_box.layout() is not None else 0
+        container.move(max(0, routine_box.width() - right_margin - container.width()), 0)
+        container.raise_()
+
+    def _update_routine_tree_display_level_badges(self) -> None:
+        selected_level = str(getattr(self, "_routine_tree_display_level", "category") or "category")
+        for level, button in getattr(self, "_routine_tree_display_level_buttons", {}).items():
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if level == selected_level
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+            )
+
+    def _set_routine_tree_display_level(self, level: str) -> None:
+        clean_level = str(level or "").strip()
+        if clean_level not in {"category", "routine", "stock"}:
+            return
+
+        definition_ids: set[str] = set()
+        instance_ids: set[str] = set()
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict) or not bool(metadata.get("has_toggle_children", True)):
+                continue
+            row_kind = str(metadata.get("row_kind", "") or "")
+            if row_kind == "definition":
+                definition_id = str(metadata.get("definition_id", "") or "").strip()
+                if definition_id:
+                    definition_ids.add(definition_id)
+            elif row_kind == "instance":
+                instance_id = str(metadata.get("instance_id", "") or "").strip()
+                if instance_id:
+                    instance_ids.add(instance_id)
+
+        self._routine_tree_display_level = clean_level
+        self._collapsed_auto_trade_definition_ids = definition_ids if clean_level == "category" else set()
+        self._collapsed_auto_trade_instance_ids = instance_ids if clean_level != "stock" else set()
+        self._update_routine_tree_display_level_badges()
+
+        scroll_bar = self.routine_table.verticalScrollBar()
+        scroll_value = scroll_bar.value()
+        self._apply_routine_tree_collapse_visibility()
+        scroll_bar.setValue(scroll_value)
+
     def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "routine_box", None) and event.type() == QEvent.Resize:
+            self._position_routine_tree_display_level_badges()
         if (
             isinstance(obj, QLabel)
             and obj.objectName() == "autoTradeSettingRoutineTreeIcon"
