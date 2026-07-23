@@ -944,7 +944,9 @@ class StockRegisterWindow(QDialog):
         self.btn_delete_stock.setEnabled(False)
 
         parent = self.parent()
-        if parent is not None and hasattr(parent, "refresh_all"):
+        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
+            parent.refresh_auto_trade_assignment_views()
+        elif parent is not None and hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
         result_lines = [f"루틴 해제 완료: {len(removed_items)}개"]
@@ -1178,7 +1180,9 @@ class StockRegisterWindow(QDialog):
         self.btn_delete_stock.setEnabled(False)
 
         parent = self.parent()
-        if parent is not None and hasattr(parent, "refresh_all"):
+        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
+            parent.refresh_auto_trade_assignment_views()
+        elif parent is not None and hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
         blocked_count = len(blocked_items)

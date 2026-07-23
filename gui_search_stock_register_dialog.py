@@ -309,7 +309,10 @@ class SearchStockRegisterDialog(QDialog):
                 duplicate_items.append(f"{code},{name}")
                 continue
 
-            append_base_stock(code, name)
+            if not append_base_stock(code, name):
+                error_count += 1
+                error_items.append(f"{code},{name}")
+                continue
             existing_codes.add(code)
             existing_names.add(name)
             completed_count += 1
@@ -322,7 +325,7 @@ class SearchStockRegisterDialog(QDialog):
                 f"종목 라이브러리 선택등록: {' / '.join(registered_items)}",
             )
 
-        if parent is not None and hasattr(parent, "refresh_stock_table"):
+        if registered_items and parent is not None and hasattr(parent, "refresh_stock_table"):
             parent.refresh_stock_table()
             main_window = parent.parent() if hasattr(parent, "parent") else None
             if main_window is not None and hasattr(main_window, "refresh_all"):
@@ -350,5 +353,4 @@ class SearchStockRegisterDialog(QDialog):
             "등록 결과",
             result_message,
         )
-
 

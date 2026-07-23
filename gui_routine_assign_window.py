@@ -1325,7 +1325,12 @@ class RoutineAssignWindow(QDialog):
             except Exception:
                 pass
             main_window = parent.parent() if hasattr(parent, "parent") else None
-            if main_window is not None and hasattr(main_window, "refresh_all"):
+            if main_window is not None and hasattr(main_window, "refresh_auto_trade_assignment_views"):
+                try:
+                    main_window.refresh_auto_trade_assignment_views()
+                except Exception:
+                    pass
+            elif main_window is not None and hasattr(main_window, "refresh_all"):
                 try:
                     main_window.refresh_all()
                 except Exception:
@@ -1455,7 +1460,12 @@ class RoutineAssignWindow(QDialog):
             except Exception:
                 pass
             main_window = parent.parent() if hasattr(parent, "parent") else None
-            if main_window is not None and hasattr(main_window, "refresh_all"):
+            if main_window is not None and hasattr(main_window, "refresh_auto_trade_assignment_views"):
+                try:
+                    main_window.refresh_auto_trade_assignment_views()
+                except Exception:
+                    pass
+            elif main_window is not None and hasattr(main_window, "refresh_all"):
                 try:
                     main_window.refresh_all()
                 except Exception:

@@ -1908,6 +1908,17 @@ class MainWindow(QMainWindow):
         self.update_emergency_button_state()
         self.update_review_required_button_text()
 
+    def refresh_auto_trade_assignment_views(self) -> None:
+        """Refresh monitoring and an already-open auto-trade settings window once."""
+        self.refresh_all()
+        window = getattr(self, "auto_trade_setting_window", None)
+        if window is None:
+            return
+        if sip.isdeleted(window):
+            self.auto_trade_setting_window = None
+            return
+        window.refresh_all()
+
     def update_budget_panel(self) -> None:
         update_main_budget_panel(self)
 
