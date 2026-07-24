@@ -405,11 +405,12 @@ AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X = 4
 AUTO_TRADE_SETTING_STOCK_ROW_SPACING = 2
 AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION = 4
 AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION = 4
+AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP = 9
 AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE = (
     "QGroupBox {"
     " border: 1px solid #9CA3AF;"
-    " margin-top: 9px;"
-    " padding-top: 9px;"
+    f" margin-top: {AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP}px;"
+    f" padding-top: {AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP}px;"
     "}"
     " QGroupBox::title {"
     " subcontrol-origin: margin;"
@@ -2922,7 +2923,10 @@ class AutoTradeSettingWindow(QDialog):
         if container is None or routine_box is None:
             return
         right_margin = routine_box.layout().contentsMargins().right() if routine_box.layout() is not None else 0
-        container.move(max(0, routine_box.width() - right_margin - container.width()), 0)
+        container.move(
+            max(0, routine_box.width() - right_margin - container.width()),
+            AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
+        )
         container.raise_()
 
     def _update_routine_tree_display_level_badges(self) -> None:

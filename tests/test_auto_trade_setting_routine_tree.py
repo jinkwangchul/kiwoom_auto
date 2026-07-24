@@ -364,7 +364,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         badge_group = window._routine_tree_display_level_badges
         expected_x = window.routine_box.width() - layout.contentsMargins().right() - badge_group.width()
         self.assertEqual(expected_x, badge_group.x())
-        self.assertEqual(0, badge_group.y())
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
+            badge_group.y(),
+        )
 
     def test_actual_window_badges_change_visible_hierarchy(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -1957,8 +1960,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             (stock_frame_rect.y(), stock_frame_rect.height()),
         )
         self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
+            routine_frame_rect.y(),
+        )
+        self.assertEqual(
             (routine_contents_rect.y(), routine_contents_rect.height()),
             (stock_contents_rect.y(), stock_contents_rect.height()),
+        )
+        window._position_routine_tree_display_level_badges()
+        self.assertEqual(
+            routine_frame_rect.y(),
+            window._routine_tree_display_level_badges.y(),
         )
 
     def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
