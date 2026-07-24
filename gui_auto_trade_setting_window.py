@@ -327,7 +327,10 @@ from gui_routine_registry import (
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
+    routine_definition_by_id,
+    routine_instance_by_id,
 )
+from routine_instance_repository import RoutineInstanceRepository
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_final_send_gate_input_adapter import adapt_final_send_gate_readiness_to_input
 from execution_final_send_gate_orchestrator import orchestrate_final_send_gate_preview
@@ -1590,7 +1593,7 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.setAlternatingRowColors(False)
         self.routine_table.setWordWrap(False)
         self.routine_table.setTextElideMode(Qt.ElideRight)
-        self.routine_table.setContextMenuPolicy(Qt.DefaultContextMenu)
+        self.routine_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.routine_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.routine_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.routine_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
@@ -1710,6 +1713,7 @@ class AutoTradeSettingWindow(QDialog):
             return
         self.routine_table.itemSelectionChanged.connect(self.on_routine_selection_changed)
         self.routine_table.itemClicked.connect(self.on_routine_table_item_clicked)
+        self.routine_table.customContextMenuRequested.connect(self.on_routine_table_context_menu)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_routine_table_by_column)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.horizontalHeader().sectionClicked.connect(self.sort_stock_table_by_column)
@@ -3677,6 +3681,140 @@ class AutoTradeSettingWindow(QDialog):
 
     def on_routine_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         return
+
+    def on_routine_table_context_menu(self, pos) -> None:
+        item = self.routine_table.itemAt(pos)
+        if item is None:
+            return
+        metadata = item.data(Qt.UserRole)
+        if not isinstance(metadata, dict):
+            return
+
+        row_kind = str(metadata.get("row_kind", "") or "").strip()
+        if row_kind == "definition":
+            menu = QMenu(self.routine_table)
+            register_action = menu.addAction("루틴등록")
+            register_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.open_routine_registration(target)
+            )
+        elif row_kind == "instance":
+            menu = QMenu(self.routine_table)
+            settings_action = menu.addAction("루틴수정")
+            rename_action = menu.addAction("이름변경")
+            settings_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.open_routine_instance_settings(target)
+            )
+            rename_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.rename_routine_instance(target)
+            )
+        else:
+            return
+        menu.exec_(self.routine_table.viewport().mapToGlobal(pos))
+
+    def _open_routine_settings_dialog(
+        self,
+        metadata: dict[str, object],
+        *,
+        registration: bool,
+    ) -> None:
+        definition_id = str(metadata.get("definition_id", "") or "").strip()
+        definition = routine_definition_by_id(definition_id)
+        if definition is None:
+            QMessageBox.warning(self, "루틴 설정", "선택한 루틴 정의를 확인할 수 없습니다.")
+            return
+
+        instance = None
+        if not registration:
+            instance_id = str(metadata.get("instance_id", "") or "").strip()
+            instance = routine_instance_by_id(instance_id)
+            if instance is None:
+                QMessageBox.warning(self, "루틴 설정", "선택한 루틴 인스턴스를 확인할 수 없습니다.")
+                return
+
+        settings_ui = str(definition.settings_ui or "").strip().lower()
+        if settings_ui != "indicator_follow":
+            QMessageBox.information(
+                self,
+                "루틴 설정",
+                f"선택한 루틴의 설정창이 아직 연결되지 않았습니다.\n루틴명: {definition.display_name}",
+            )
+            return
+
+        rules_path = (
+            definition.package_dir / definition.default_rules_file
+            if registration
+            else instance.rules_path
+        )
+        if rules_path is None or not rules_path.exists():
+            QMessageBox.warning(
+                self,
+                "rules.json 없음",
+                f"선택한 루틴의 rules.json을 찾을 수 없습니다.\n{rules_path}",
+            )
+            return
+
+        try:
+            from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "설정창 로드 실패",
+                "gui_indicator_follow_routine_settings_dialog.py 파일을 불러오지 못했습니다.\n"
+                f"{exc}",
+            )
+            return
+
+        dialog = IndicatorFollowRoutineSettingsDialog(
+            rules_path=rules_path,
+            routine_path=definition.package_dir,
+            routine_name=definition.display_name if registration else instance.display_name,
+            parent=self,
+            definition_id=definition.definition_id,
+            definition_display_name=definition.display_name,
+            instance_id="" if registration else instance.instance_id,
+            settings_mode="registration" if registration else "edit",
+        )
+        dialog.exec_()
+
+    def open_routine_registration(self, metadata: dict[str, object]) -> None:
+        if str(metadata.get("row_kind", "") or "") != "definition":
+            return
+        self._open_routine_settings_dialog(metadata, registration=True)
+
+    def open_routine_instance_settings(self, metadata: dict[str, object]) -> None:
+        if str(metadata.get("row_kind", "") or "") != "instance":
+            return
+        self._open_routine_settings_dialog(metadata, registration=False)
+
+    def rename_routine_instance(self, metadata: dict[str, object]) -> None:
+        if str(metadata.get("row_kind", "") or "") != "instance":
+            return
+        instance_id = str(metadata.get("instance_id", "") or "").strip()
+        current_name = str(metadata.get("instance_name", "") or "").strip()
+        if not instance_id:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "이름변경",
+            "새 루틴 이름:",
+            QLineEdit.Normal,
+            current_name,
+        )
+        if not accepted:
+            return
+        clean_name = str(new_name or "").strip()
+        if not clean_name or clean_name == current_name:
+            return
+
+        result = RoutineInstanceRepository(PROJECT_ROOT).rename_instance(instance_id, clean_name)
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "이름변경",
+                result.error or "루틴 이름을 변경하지 못했습니다.",
+            )
+            return
+        self.refresh_all()
 
     def on_routine_selection_changed(self) -> None:
         self._stock_status_filter = "all"

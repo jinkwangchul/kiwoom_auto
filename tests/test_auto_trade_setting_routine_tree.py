@@ -2,10 +2,10 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import MethodType
-from unittest.mock import patch
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from PyQt5.QtCore import QObject
+from PyQt5.QtCore import QObject, QPoint, Qt
 from PyQt5.QtGui import QMouseEvent
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QStyleOptionGroupBox,
     QTableWidget,
+    QTableWidgetItem,
 )
 
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
@@ -116,6 +117,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "restore_routine_selection_metadata",
             "on_routine_table_item_clicked",
             "on_routine_table_item_double_clicked",
+            "on_routine_table_context_menu",
+            "_open_routine_settings_dialog",
+            "open_routine_registration",
+            "open_routine_instance_settings",
+            "rename_routine_instance",
             "on_routine_selection_changed",
             "auto_trade_runtime_state_for_order",
             "update_selection_summary_panel",
@@ -126,6 +132,134 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             setattr(harness, name, MethodType(getattr(AutoTradeSettingWindow, name), harness))
         return harness
+
+    def test_routine_tree_context_menu_contract_by_row_kind(self) -> None:
+        window = self._window_harness()
+        metadata_by_kind = {
+            "definition": {
+                "row_kind": "definition",
+                "definition_id": "indicator_follow",
+                "definition_name": "지표추종매매",
+            },
+            "instance": {
+                "row_kind": "instance",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-a",
+                "instance_name": "A 인스턴스",
+            },
+            "stock": {
+                "row_kind": "stock",
+                "definition_id": "indicator_follow",
+                "instance_id": "inst-a",
+                "stock_path": "stocks/005930_삼성전자",
+            },
+        }
+        item = QTableWidgetItem()
+        window.routine_table.setRowCount(1)
+        window.routine_table.setItem(0, 0, item)
+
+        for row_kind, expected_labels in (
+            ("definition", ["루틴등록"]),
+            ("instance", ["루틴수정", "이름변경"]),
+        ):
+            item.setData(Qt.UserRole, metadata_by_kind[row_kind])
+            menu = MagicMock()
+            actions = [MagicMock() for _label in expected_labels]
+            menu.addAction.side_effect = actions
+            with (
+                patch.object(window.routine_table, "itemAt", return_value=item),
+                patch.object(setting_window, "QMenu", return_value=menu),
+            ):
+                window.on_routine_table_context_menu(QPoint(1, 1))
+            self.assertEqual(
+                expected_labels,
+                [call.args[0] for call in menu.addAction.call_args_list],
+            )
+            menu.exec_.assert_called_once()
+            for action in actions:
+                action.triggered.connect.assert_called_once()
+
+        item.setData(Qt.UserRole, metadata_by_kind["stock"])
+        with (
+            patch.object(window.routine_table, "itemAt", return_value=item),
+            patch.object(setting_window, "QMenu") as menu_factory,
+        ):
+            window.on_routine_table_context_menu(QPoint(1, 1))
+        menu_factory.assert_not_called()
+
+    def test_routine_tree_context_actions_dispatch_to_captured_target(self) -> None:
+        window = self._window_harness()
+        item = QTableWidgetItem()
+        window.routine_table.setRowCount(1)
+        window.routine_table.setItem(0, 0, item)
+
+        cases = (
+            (
+                {
+                    "row_kind": "definition",
+                    "definition_id": "indicator_follow",
+                },
+                "open_routine_registration",
+                0,
+            ),
+            (
+                {
+                    "row_kind": "instance",
+                    "definition_id": "indicator_follow",
+                    "instance_id": "inst-a",
+                    "instance_name": "A 인스턴스",
+                },
+                "open_routine_instance_settings",
+                0,
+            ),
+            (
+                {
+                    "row_kind": "instance",
+                    "definition_id": "indicator_follow",
+                    "instance_id": "inst-a",
+                    "instance_name": "A 인스턴스",
+                },
+                "rename_routine_instance",
+                1,
+            ),
+        )
+        for metadata, method_name, action_index in cases:
+            item.setData(Qt.UserRole, metadata)
+            menu = MagicMock()
+            action_count = 1 if metadata["row_kind"] == "definition" else 2
+            actions = [MagicMock() for _index in range(action_count)]
+            callbacks = []
+            for action in actions:
+                action.triggered.connect.side_effect = callbacks.append
+            menu.addAction.side_effect = actions
+            with (
+                patch.object(window.routine_table, "itemAt", return_value=item),
+                patch.object(setting_window, "QMenu", return_value=menu),
+                patch.object(window, method_name) as target_method,
+            ):
+                window.on_routine_table_context_menu(QPoint(1, 1))
+                callbacks[action_index](False)
+            target_method.assert_called_once_with(metadata)
+
+    def test_routine_instance_rename_uses_repository_and_refreshes(self) -> None:
+        window = self._window_harness()
+        window.refresh_all = MagicMock()
+        metadata = {
+            "row_kind": "instance",
+            "definition_id": "indicator_follow",
+            "instance_id": "inst-a",
+            "instance_name": "변경 전",
+        }
+        repository = MagicMock()
+        repository.rename_instance.return_value = SimpleNamespace(success=True, error="")
+        with (
+            patch.object(setting_window.QInputDialog, "getText", return_value=("변경 후", True)),
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+        ):
+            window.rename_routine_instance(metadata)
+
+        repository.rename_instance.assert_called_once_with("inst-a", "변경 후")
+        window.refresh_all.assert_called_once_with()
 
     def test_top_table_uses_definition_and_instance_rows_without_stock_scope_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
