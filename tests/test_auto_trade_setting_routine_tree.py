@@ -1918,9 +1918,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 stock_margins.bottom(),
             ),
         )
-        self.assertEqual(
-            window._routine_tree_display_level_badges.height(),
+        self.assertGreaterEqual(
             routine_margins.top(),
+            window._routine_tree_display_level_badges.height(),
         )
         self.assertGreater(routine_margins.top(), stock_margins.top())
         self.assertEqual(window.routine_box.styleSheet(), window.stock_box.styleSheet())
@@ -1991,6 +1991,25 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         self.assertFalse(badge_rect.intersects(window.routine_table.geometry()))
         self.assertGreaterEqual(window.routine_table.geometry().y(), badge_rect.bottom() + 1)
+
+        window.routine_table.setRowCount(1)
+        first_item = setting_window.QTableWidgetItem("첫 번째 루틴")
+        window.routine_table.setItem(0, 0, first_item)
+        window.show()
+        self._app.processEvents()
+        window._position_routine_tree_display_level_badges()
+        self._app.processEvents()
+        first_row_rect = window.routine_table.visualItemRect(first_item)
+        first_row_y = window.routine_table.viewport().mapTo(
+            window,
+            first_row_rect.topLeft(),
+        ).y()
+        stock_header = window.stock_table.horizontalHeader()
+        stock_header_y = stock_header.mapTo(
+            window,
+            stock_header.rect().topLeft(),
+        ).y()
+        self.assertLessEqual(abs(first_row_y - stock_header_y), 1)
 
     def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
