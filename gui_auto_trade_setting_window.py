@@ -379,6 +379,9 @@ AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
 AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = 22
+AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
+AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
     "category": frozenset({"profit", "average", "efficiency"}),
     "routine": frozenset({"period", "profit", "average", "efficiency"}),
@@ -1147,8 +1150,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_modify_pending_order = QPushButton("Manual Modify")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
-        self.btn_early_close.setMinimumHeight(28)
-        self.btn_stop.setMinimumHeight(28)
+        self.btn_early_close.setFixedHeight(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        self.btn_stop.setFixedHeight(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
         self.btn_preview_order_candidates.setMinimumHeight(28)
         self.btn_execution_enable.setMinimumHeight(28)
         self.btn_real_ready_preflight.setMinimumHeight(28)
@@ -1294,8 +1297,8 @@ class AutoTradeSettingWindow(QDialog):
         selected_routine_header_layout.addWidget(self.btn_manual_send_order)
         selected_routine_header_layout.addWidget(self.btn_manual_cancel_pending_order)
         selected_routine_header_layout.addWidget(self.btn_manual_modify_pending_order)
-        selected_routine_header_layout.addWidget(self.btn_early_close)
-        selected_routine_header_layout.addWidget(self.btn_stop)
+        selected_routine_header_layout.addWidget(self.btn_early_close, 0, Qt.AlignVCenter)
+        selected_routine_header_layout.addWidget(self.btn_stop, 0, Qt.AlignVCenter)
 
         stock_layout.addLayout(selected_routine_header_layout)
         stock_layout.addWidget(self.stock_table)
@@ -1420,6 +1423,7 @@ class AutoTradeSettingWindow(QDialog):
     def _setup_selected_routine_status_bar(self) -> None:
         self.selected_routine_status_bar = QWidget()
         self.selected_routine_status_bar.setObjectName("autoTradeSettingSelectedRoutineStatusBar")
+        self.selected_routine_status_bar.setFixedHeight(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
         layout = QHBoxLayout(self.selected_routine_status_bar)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -2860,7 +2864,7 @@ class AutoTradeSettingWindow(QDialog):
             button.setObjectName(object_name)
             button.setFocusPolicy(Qt.NoFocus)
             button.setCursor(Qt.PointingHandCursor)
-            button.setFixedSize(64, 22)
+            button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
             button.clicked.connect(
                 lambda _checked=False, target_level=level:
                 self._set_routine_tree_display_level(target_level)
@@ -2878,7 +2882,7 @@ class AutoTradeSettingWindow(QDialog):
             button.setObjectName(object_name)
             button.setFocusPolicy(Qt.NoFocus)
             button.setCursor(Qt.PointingHandCursor)
-            button.setFixedSize(64, 22)
+            button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
             button.clicked.connect(
                 lambda _checked=False, target_scope=scope:
                 self._set_routine_tree_display_scope(target_scope)
@@ -2898,7 +2902,7 @@ class AutoTradeSettingWindow(QDialog):
             button.setObjectName(object_name)
             button.setFocusPolicy(Qt.NoFocus)
             button.setCursor(Qt.PointingHandCursor)
-            button.setFixedSize(64, 22)
+            button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
             button.clicked.connect(
                 lambda _checked=False, target_criterion=criterion:
                 self._set_routine_tree_display_criterion(target_criterion)
@@ -2922,6 +2926,19 @@ class AutoTradeSettingWindow(QDialog):
         routine_box = getattr(self, "routine_box", None)
         if container is None or routine_box is None:
             return
+        stock_box = getattr(self, "stock_box", None)
+        stock_layout = stock_box.layout() if stock_box is not None else None
+        if stock_layout is not None:
+            stock_margins = stock_layout.contentsMargins()
+            if stock_margins.top() != AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN:
+                stock_layout.setContentsMargins(
+                    stock_margins.left(),
+                    AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN,
+                    stock_margins.right(),
+                    stock_margins.bottom(),
+                )
+            stock_layout.setSpacing(AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING)
+            stock_layout.activate()
         routine_layout = routine_box.layout()
         right_margin = routine_layout.contentsMargins().right() if routine_layout is not None else 0
         control_row_top = routine_box.contentsRect().top()

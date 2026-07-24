@@ -2041,6 +2041,33 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             stock_header.rect().topLeft(),
         ).y()
         self.assertLessEqual(abs(first_row_y - stock_header_y), 1)
+        routine_label_rect, _, _ = _group_box_rects(window.routine_box)
+        stock_label_rect, _, _ = _group_box_rects(window.stock_box)
+        badge_rect = window._routine_tree_display_level_badges.geometry()
+        status_rect = window.selected_routine_status_bar.geometry()
+        routine_title_gap = badge_rect.top() - routine_label_rect.bottom() - 1
+        stock_title_gap = status_rect.top() - stock_label_rect.bottom() - 1
+        self.assertEqual(routine_title_gap, stock_title_gap)
+        self.assertIn(routine_title_gap, range(0, 4))
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+            badge_rect.height(),
+        )
+        self.assertEqual(badge_rect.height(), status_rect.height())
+        badge_bottom_y = window._routine_tree_display_level_badges.mapTo(
+            window,
+            window._routine_tree_display_level_badges.rect().bottomLeft(),
+        ).y()
+        status_bottom_y = window.selected_routine_status_bar.mapTo(
+            window,
+            window.selected_routine_status_bar.rect().bottomLeft(),
+        ).y()
+        self.assertIn(first_row_y - badge_bottom_y - 1, range(2, 5))
+        self.assertIn(stock_header_y - status_bottom_y - 1, range(2, 5))
+        self.assertEqual(
+            window.routine_table.geometry().bottom(),
+            window.stock_table.geometry().bottom(),
+        )
 
     def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
