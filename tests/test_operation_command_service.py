@@ -928,25 +928,39 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         self.assertTrue(window._notification_popup.isVisible())
         self.assertEqual("마감정책이 취소되었습니다.", window._notification_popup.text())
 
-    def test_selected_text_delegate_uses_highlighted_text_palette(self) -> None:
+    def test_selected_text_delegate_preserves_item_foreground_when_selected(self) -> None:
         from PyQt5.QtCore import Qt
-        from PyQt5.QtWidgets import QApplication, QStyle, QStyleOptionViewItem, QStyledItemDelegate
+        from PyQt5.QtGui import QColor
+        from PyQt5.QtWidgets import QApplication, QStyle, QStyleOptionViewItem, QTableWidgetItem
         from gui_auto_trade_setting_window import AutoTradeSettingWindow, SelectedTextReadableDelegate
 
         app = QApplication.instance() or QApplication([])
         window = AutoTradeSettingWindow()
         delegate = SelectedTextReadableDelegate(window.stock_table)
+        window.stock_table.setRowCount(1)
+        item = QTableWidgetItem("검토")
+        expected_color = QColor("#94a3b8")
+        item.setForeground(expected_color)
+        window.stock_table.setItem(0, 4, item)
+        index = window.stock_table.model().index(0, 4)
         option = QStyleOptionViewItem()
         option.state |= QStyle.State_Selected
         option.palette = window.stock_table.palette()
-        expected_color = option.palette.highlightedText().color()
-        index = Mock()
+        painted_options = []
 
-        with patch.object(QStyledItemDelegate, "paint") as paint:
+        class FakeStyle:
+            def drawControl(self, element, option_arg, painter_arg, widget_arg=None):
+                self.element = element
+                painted_options.append(option_arg)
+
+        with patch.object(QApplication, "style", return_value=FakeStyle()):
             delegate.paint(Mock(), option, index)
 
-        painted_option = paint.call_args.args[1]
-        self.assertEqual(expected_color, painted_option.palette.color(painted_option.palette.Text))
+        self.assertEqual(1, len(painted_options))
+        self.assertEqual(
+            expected_color,
+            painted_options[0].palette.highlightedText().color(),
+        )
 
     def test_stock_position_metric_delegate_paints_empty_background_before_metric_text(self) -> None:
         from PyQt5.QtCore import QRect, Qt

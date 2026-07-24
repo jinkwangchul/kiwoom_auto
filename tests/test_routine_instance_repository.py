@@ -211,6 +211,52 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertEqual("DISPLAY_NAME_DUPLICATE", duplicate.error_code)
         self.assertEqual("First", metadata["display_name"])
 
+    def test_delete_removes_only_target_instance_registration(self) -> None:
+        ids = iter(
+            (
+                UUID("a52f539d-4f18-4ef6-b0cf-f471567982a1"),
+                UUID("b52f539d-4f18-4ef6-b0cf-f471567982a2"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root, id_factory=lambda: next(ids))
+            first = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="First",
+                ),
+                {},
+            )
+            second = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Second",
+                ),
+                {},
+            )
+
+            result = repository.delete_instance(str(INSTANCE_ID))
+
+            first_dir = root / "routine_instances" / str(INSTANCE_ID)
+            second_dir = root / "routine_instances" / str(second.instance.instance_id)
+            first_exists = first_dir.exists()
+            second_exists = second_dir.exists()
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertTrue(result.success)
+        self.assertFalse(first_exists)
+        self.assertTrue(second_exists)
+
+    def test_delete_unknown_instance_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repository = self._repository(Path(temp))
+            result = repository.delete_instance("missing")
+
+        self.assertFalse(result.success)
+        self.assertEqual("INSTANCE_UNKNOWN", result.error_code)
+
     def test_update_buy_limit_toggles_enabled_amount_without_touching_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

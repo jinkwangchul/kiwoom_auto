@@ -51,6 +51,13 @@ class RoutineInstanceRenameResult:
 
 
 @dataclass(frozen=True)
+class RoutineInstanceDeleteResult:
+    success: bool
+    error_code: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class RoutineInstanceBuyLimitResult:
     success: bool
     instance: RoutineInstanceRecord | None = None
@@ -243,6 +250,32 @@ class RoutineInstanceRepository:
             return RoutineInstanceRenameResult(
                 False,
                 error_code="INSTANCE_RENAME_FAILED",
+                error=str(exc),
+            )
+
+    def delete_instance(self, instance_id: str) -> RoutineInstanceDeleteResult:
+        instance = self.get_instance(instance_id)
+        if instance is None:
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code="INSTANCE_UNKNOWN",
+                error="삭제할 등록 루틴을 찾을 수 없습니다.",
+            )
+
+        instance_dir = self.instances_root / instance.instance_id
+        staged_dir = self.instances_root / f".{instance.instance_id}.{uuid4().hex}.delete"
+        try:
+            os.replace(instance_dir, staged_dir)
+            if self.get_instance(instance.instance_id) is not None:
+                raise RuntimeError("등록 삭제 후 재조회 검증에 실패했습니다.")
+            shutil.rmtree(staged_dir)
+            return RoutineInstanceDeleteResult(True)
+        except Exception as exc:
+            if staged_dir.exists() and not instance_dir.exists():
+                os.replace(staged_dir, instance_dir)
+            return RoutineInstanceDeleteResult(
+                False,
+                error_code="INSTANCE_DELETE_FAILED",
                 error=str(exc),
             )
 

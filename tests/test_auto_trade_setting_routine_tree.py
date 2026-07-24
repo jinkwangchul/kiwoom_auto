@@ -80,6 +80,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_tree_valid_only = False
         for name in (
             "_setup_routine_table",
+            "_setup_stock_table",
+            "_apply_stock_table_column_widths",
             "_routine_instance_stock_counts",
             "_current_stock_entries_by_instance",
             "_current_stocks_by_instance",
@@ -125,6 +127,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "open_routine_registration",
             "open_routine_instance_settings",
             "rename_routine_instance",
+            "delete_routine_instance",
             "on_routine_selection_changed",
             "auto_trade_runtime_state_for_order",
             "update_selection_summary_panel",
@@ -163,7 +166,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         for row_kind, expected_labels in (
             ("definition", ["루틴등록"]),
-            ("instance", ["루틴수정", "이름변경"]),
+            ("instance", ["루틴수정", "이름변경", "등록삭제"]),
         ):
             item.setData(Qt.UserRole, metadata_by_kind[row_kind])
             menu = MagicMock()
@@ -225,11 +228,21 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "rename_routine_instance",
                 1,
             ),
+            (
+                {
+                    "row_kind": "instance",
+                    "definition_id": "indicator_follow",
+                    "instance_id": "inst-a",
+                    "instance_name": "A 인스턴스",
+                },
+                "delete_routine_instance",
+                2,
+            ),
         )
         for metadata, method_name, action_index in cases:
             item.setData(Qt.UserRole, metadata)
             menu = MagicMock()
-            action_count = 1 if metadata["row_kind"] == "definition" else 2
+            action_count = 1 if metadata["row_kind"] == "definition" else 3
             actions = [MagicMock() for _index in range(action_count)]
             callbacks = []
             for action in actions:
@@ -262,6 +275,106 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.rename_routine_instance(metadata)
 
         repository.rename_instance.assert_called_once_with("inst-a", "변경 후")
+        window.refresh_all.assert_called_once_with()
+
+    def test_routine_instance_delete_cancel_keeps_state_unchanged(self) -> None:
+        window = self._window_harness()
+        window.refresh_all = MagicMock()
+        metadata = {
+            "row_kind": "instance",
+            "instance_id": "inst-a",
+            "instance_name": "A 인스턴스",
+        }
+        repository = MagicMock()
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.No,
+            ),
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+        ):
+            window.delete_routine_instance(metadata)
+
+        repository.delete_instance.assert_not_called()
+        window.refresh_all.assert_not_called()
+
+    def test_routine_instance_delete_blocks_when_stocks_are_assigned(self) -> None:
+        window = self._window_harness()
+        window.refresh_all = MagicMock()
+        metadata = {
+            "row_kind": "instance",
+            "instance_id": "inst-a",
+            "instance_name": "A 인스턴스",
+        }
+        repository = MagicMock()
+        with (
+            patch.object(
+                setting_window,
+                "read_base_stocks",
+                return_value=[{"assigned_routine_instance_id": "inst-a"}],
+            ),
+            patch.object(setting_window.QMessageBox, "warning") as warning,
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+        ):
+            window.delete_routine_instance(metadata)
+
+        warning.assert_called_once()
+        repository.delete_instance.assert_not_called()
+        window.refresh_all.assert_not_called()
+
+    def test_routine_instance_delete_checks_config_assignment_fallback(self) -> None:
+        window = self._window_harness()
+        window.refresh_all = MagicMock()
+        metadata = {
+            "row_kind": "instance",
+            "instance_id": "inst-a",
+            "instance_name": "A 인스턴스",
+        }
+        repository = MagicMock()
+        with (
+            patch.object(
+                setting_window,
+                "read_base_stocks",
+                return_value=[{"stock_path": "stocks/005930_삼성전자"}],
+            ),
+            patch.object(
+                setting_window,
+                "read_json_dict",
+                return_value={"assigned_routine_instance_id": "inst-a"},
+            ),
+            patch.object(setting_window.QMessageBox, "warning") as warning,
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+        ):
+            window.delete_routine_instance(metadata)
+
+        warning.assert_called_once()
+        repository.delete_instance.assert_not_called()
+        window.refresh_all.assert_not_called()
+
+    def test_routine_instance_delete_uses_repository_and_refreshes(self) -> None:
+        window = self._window_harness()
+        window.refresh_all = MagicMock()
+        metadata = {
+            "row_kind": "instance",
+            "instance_id": "inst-a",
+            "instance_name": "A 인스턴스",
+        }
+        repository = MagicMock()
+        repository.delete_instance.return_value = SimpleNamespace(success=True, error="")
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+        ):
+            window.delete_routine_instance(metadata)
+
+        repository.delete_instance.assert_called_once_with("inst-a")
         window.refresh_all.assert_called_once_with()
 
     def test_top_table_uses_definition_and_instance_rows_without_stock_scope_rows(self) -> None:
@@ -1577,6 +1690,30 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(setting_window.Qt.ScrollBarAlwaysOn, window.routine_table.verticalScrollBarPolicy())
         self.assertIn("selection-background-color: #dbeafe", window.routine_table.styleSheet())
         self.assertIn("selection-color: #111827", window.routine_table.styleSheet())
+
+    def test_stock_table_uses_light_selection_without_geometry_changes(self) -> None:
+        window = self._window_harness()
+        window._setup_stock_table()
+
+        style = window.stock_table.styleSheet()
+        self.assertIn("selection-background-color: #dbeafe", style)
+        self.assertIn("selection-color: #111827", style)
+        self.assertIn("QTableWidget::item:selected:!active", style)
+        self.assertIn("outline: 0", style)
+        self.assertEqual(
+            setting_window.QAbstractItemView.ExtendedSelection,
+            window.stock_table.selectionMode(),
+        )
+        self.assertEqual(
+            [
+                setting_window.AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS[column]
+                for column in range(window.stock_table.columnCount())
+            ],
+            [
+                window.stock_table.columnWidth(column)
+                for column in range(window.stock_table.columnCount())
+            ],
+        )
 
     def test_window_uses_standard_minimize_maximize_close_title_buttons(self) -> None:
         window = setting_window.AutoTradeSettingWindow()

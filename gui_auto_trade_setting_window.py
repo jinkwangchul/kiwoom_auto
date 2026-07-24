@@ -22,7 +22,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QSize, QEvent
-from PyQt5.QtGui import QColor, QFont, QFontMetrics
+from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -495,9 +495,10 @@ class StockPositionMetricDelegate(QStyledItemDelegate):
         font_metrics = QFontMetrics(option.font)
         text = str(index.data(Qt.DisplayRole) or "")
         label_hint = self.LABEL_BY_COLUMN.get(index.column())
+        foreground = index.data(Qt.ForegroundRole)
         color = (
-            option.palette.highlightedText().color()
-            if option.state & QStyle.State_Selected
+            foreground.color()
+            if isinstance(foreground, QBrush)
             else option.palette.text().color()
         )
         metric_option = QStyleOptionViewItem(option)
@@ -535,16 +536,22 @@ class StockPositionMetricDelegate(QStyledItemDelegate):
 
 
 class SelectedTextReadableDelegate(QStyledItemDelegate):
-    """선택 행에서는 고정 foreground 대신 HighlightedText로 그린다."""
+    """옅은 선택 배경에서도 셀의 상태별 foreground를 유지한다."""
 
     def paint(self, painter, option, index) -> None:
         if option.state & QStyle.State_Selected:
             readable_option = QStyleOptionViewItem(option)
-            readable_option.palette.setColor(
-                readable_option.palette.Text,
-                option.palette.highlightedText().color(),
+            self.initStyleOption(readable_option, index)
+            foreground = index.data(Qt.ForegroundRole)
+            if isinstance(foreground, QBrush):
+                readable_option.palette.setBrush(QPalette.HighlightedText, foreground)
+            style = option.widget.style() if option.widget is not None else QApplication.style()
+            style.drawControl(
+                QStyle.CE_ItemViewItem,
+                readable_option,
+                painter,
+                option.widget,
             )
-            super().paint(painter, readable_option, index)
             return
         super().paint(painter, option, index)
 
@@ -1689,6 +1696,23 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.stock_table.setStyleSheet(
+            """
+            QTableWidget {
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            QTableWidget::item:selected,
+            QTableWidget::item:selected:active,
+            QTableWidget::item:selected:!active {
+                background: #dbeafe;
+                color: #111827;
+            }
+            QTableWidget::item:focus {
+                outline: 0;
+            }
+            """
+        )
         self.stock_table.setWordWrap(True)
         self.stock_table.setTextElideMode(Qt.ElideRight)
         self.stock_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -3800,11 +3824,15 @@ class AutoTradeSettingWindow(QDialog):
             menu = QMenu(self.routine_table)
             settings_action = menu.addAction("루틴수정")
             rename_action = menu.addAction("이름변경")
+            delete_action = menu.addAction("등록삭제")
             settings_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.open_routine_instance_settings(target)
             )
             rename_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.rename_routine_instance(target)
+            )
+            delete_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.delete_routine_instance(target)
             )
         else:
             return
@@ -3911,6 +3939,56 @@ class AutoTradeSettingWindow(QDialog):
                 self,
                 "이름변경",
                 result.error or "루틴 이름을 변경하지 못했습니다.",
+            )
+            return
+        self.refresh_all()
+
+    def delete_routine_instance(self, metadata: dict[str, object]) -> None:
+        if str(metadata.get("row_kind", "") or "") != "instance":
+            return
+        instance_id = str(metadata.get("instance_id", "") or "").strip()
+        instance_name = str(metadata.get("instance_name", "") or "").strip()
+        if not instance_id:
+            return
+
+        assigned_stocks: list[dict[str, object]] = []
+        for stock in read_base_stocks():
+            assigned_instance_id = str(
+                stock.get("assigned_routine_instance_id", "") or ""
+            ).strip()
+            stock_path = str(stock.get("stock_path", "") or "").strip()
+            if not assigned_instance_id and stock_path:
+                config = read_json_dict(PROJECT_ROOT / stock_path / "config.json")
+                assigned_instance_id = str(
+                    config.get("assigned_routine_instance_id", "") or ""
+                ).strip()
+            if assigned_instance_id == instance_id:
+                assigned_stocks.append(stock)
+        if assigned_stocks:
+            QMessageBox.warning(
+                self,
+                "등록삭제",
+                "연결된 종목이 있는 루틴은 삭제할 수 없습니다.\n"
+                "매매루틴지정 창에서 종목의 루틴 연결을 먼저 해제하세요.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "등록삭제",
+            f"'{instance_name or instance_id}' 루틴 등록을 삭제하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        result = RoutineInstanceRepository(PROJECT_ROOT).delete_instance(instance_id)
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "등록삭제",
+                result.error or "루틴 등록을 삭제하지 못했습니다.",
             )
             return
         self.refresh_all()
