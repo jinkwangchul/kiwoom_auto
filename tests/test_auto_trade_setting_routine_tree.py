@@ -64,7 +64,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._stock_status_filter = "all"
         harness._collapsed_auto_trade_instance_ids = set()
         harness._routine_tree_display_level = "category"
-        harness._routine_tree_display_scope = "current"
+        harness._routine_tree_display_scope = ""
+        harness._routine_tree_last_stock_scope = "all"
         harness._routine_tree_display_criterion = "profit"
         for name in (
             "_setup_routine_table",
@@ -312,9 +313,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ["전체", "현재"],
             [scopes[key].text() for key in ("all", "current")],
         )
-        self.assertTrue(all(button.isEnabled() for button in scopes.values()))
-        self.assertIn("color: #111827", scopes["all"].styleSheet())
-        self.assertIn("color: #16A34A", scopes["current"].styleSheet())
+        self.assertTrue(all(not button.isEnabled() for button in scopes.values()))
+        self.assertIn("color: #9CA3AF", scopes["all"].styleSheet())
+        self.assertIn("color: #9CA3AF", scopes["current"].styleSheet())
+        scopes["current"].click()
+        self.assertEqual("", window._routine_tree_display_scope)
         criteria = window._routine_tree_display_criterion_buttons
         self.assertEqual(
             ["기간", "수익", "평균", "효율"],
@@ -329,14 +332,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         criteria["period"].click()
         self.assertEqual("profit", window._routine_tree_display_criterion)
         badges["routine"].click()
+        self.assertTrue(all(not button.isEnabled() for button in scopes.values()))
         self.assertTrue(criteria["period"].isEnabled())
         criteria["period"].click()
         self.assertEqual("period", window._routine_tree_display_criterion)
         badges["category"].click()
         self.assertEqual("profit", window._routine_tree_display_criterion)
         badges["stock"].click()
+        self.assertTrue(all(button.isEnabled() for button in scopes.values()))
+        self.assertIn("color: #16A34A", scopes["all"].styleSheet())
         self.assertTrue(all(button.isEnabled() for button in criteria.values()))
-        self.assertEqual("current", window._routine_tree_display_scope)
+        self.assertEqual("all", window._routine_tree_display_scope)
         self.assertEqual(table_geometry_before, window.routine_table.geometry())
 
         badge_group = window._routine_tree_display_level_badges
@@ -427,13 +433,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("period", window._routine_tree_display_criterion)
             instance_metadata = window.routine_table.item(1, 0).data(setting_window.Qt.UserRole)
             self.assertEqual("routine", instance_metadata["display_level"])
-            self.assertEqual("current", instance_metadata["display_scope"])
+            self.assertEqual("", instance_metadata["display_scope"])
             self.assertEqual("period", instance_metadata["display_metric"])
 
             window._set_routine_tree_display_level("category")
             self.assertEqual("profit", window._routine_tree_display_criterion)
 
             window._set_routine_tree_display_level("stock")
+            self.assertEqual("all", window._routine_tree_display_scope)
             window._toggle_routine_instance_collapsed("inst-a")
             collapsed_before = set(window._collapsed_auto_trade_instance_ids)
             window._set_routine_tree_display_scope("all")
@@ -456,6 +463,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window._set_routine_tree_display_scope("current")
             self.assertEqual("current", window._routine_tree_display_scope)
             self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
+            window._set_routine_tree_display_level("routine")
+            self.assertEqual("", window._routine_tree_display_scope)
+            window._set_routine_tree_display_level("stock")
+            self.assertEqual("current", window._routine_tree_display_scope)
 
     def test_parent_arrow_click_only_collapses_definition_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -1383,6 +1394,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
                 patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window._set_routine_tree_display_level("stock")
             window._set_routine_tree_display_scope("all")
 
         self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)

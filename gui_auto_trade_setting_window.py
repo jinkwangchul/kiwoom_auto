@@ -1215,7 +1215,8 @@ class AutoTradeSettingWindow(QDialog):
         self._last_strategy_workspace_width = 0
         self._collapsed_auto_trade_instance_ids: set[str] = set()
         self._routine_tree_display_level = "category"
-        self._routine_tree_display_scope = "current"
+        self._routine_tree_display_scope = ""
+        self._routine_tree_last_stock_scope = "all"
         self._routine_tree_display_criterion = "profit"
         self._fixed_signals_connected = False
 
@@ -2773,29 +2774,9 @@ class AutoTradeSettingWindow(QDialog):
             )
 
         selected_scope = str(
-            getattr(self, "_routine_tree_display_scope", "current") or "current"
+            getattr(self, "_routine_tree_display_scope", "") or ""
         )
-        for scope, button in getattr(self, "_routine_tree_display_scope_buttons", {}).items():
-            color = (
-                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                if scope == selected_scope
-                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
-            )
-            button.setStyleSheet(
-                auto_trade_setting_badge_stylesheet(
-                    "QPushButton",
-                    text_color=color,
-                    border_color=color,
-                )
-            )
-
-        supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA.get(
-            selected_level,
-            frozenset(),
-        )
-        selected_criterion = str(
-            getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
-        )
+        scope_enabled = selected_level == "stock"
         disabled_style = (
             "QPushButton:disabled, QPushButton:disabled:hover {"
             " background-color: transparent;"
@@ -2805,6 +2786,30 @@ class AutoTradeSettingWindow(QDialog):
             " font-weight: 600;"
             " padding: 0 6px;"
             "}"
+        )
+        for scope, button in getattr(self, "_routine_tree_display_scope_buttons", {}).items():
+            button.setEnabled(scope_enabled)
+            button.setCursor(Qt.PointingHandCursor if scope_enabled else Qt.ArrowCursor)
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if scope_enabled and scope == selected_scope
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+                + disabled_style
+            )
+
+        supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA.get(
+            selected_level,
+            frozenset(),
+        )
+        selected_criterion = str(
+            getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
         )
         for criterion, button in getattr(self, "_routine_tree_display_criterion_buttons", {}).items():
             enabled = criterion in supported_criteria
@@ -2828,14 +2833,17 @@ class AutoTradeSettingWindow(QDialog):
         clean_scope = str(scope or "").strip()
         if clean_scope not in {"all", "current"}:
             return
+        if str(getattr(self, "_routine_tree_display_level", "category") or "category") != "stock":
+            return
         if clean_scope == str(
-            getattr(self, "_routine_tree_display_scope", "current") or "current"
+            getattr(self, "_routine_tree_display_scope", "") or ""
         ):
             return
 
         scroll_bar = self.routine_table.verticalScrollBar()
         scroll_value = scroll_bar.value()
         self._routine_tree_display_scope = clean_scope
+        self._routine_tree_last_stock_scope = clean_scope
         self.load_routine_table()
         scroll_bar.setValue(scroll_value)
         self._update_routine_tree_display_level_badges()
@@ -2845,7 +2853,7 @@ class AutoTradeSettingWindow(QDialog):
             getattr(self, "_routine_tree_display_level", "category") or "category"
         )
         display_scope = str(
-            getattr(self, "_routine_tree_display_scope", "current") or "current"
+            getattr(self, "_routine_tree_display_scope", "") or ""
         )
         display_metric = str(
             getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
@@ -2881,6 +2889,20 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         self._routine_tree_display_level = clean_level
+        if clean_level == "stock":
+            restored_scope = str(
+                getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
+            )
+            self._routine_tree_display_scope = (
+                restored_scope if restored_scope in {"all", "current"} else "all"
+            )
+        else:
+            current_scope = str(
+                getattr(self, "_routine_tree_display_scope", "") or ""
+            )
+            if current_scope in {"all", "current"}:
+                self._routine_tree_last_stock_scope = current_scope
+            self._routine_tree_display_scope = ""
         supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA[clean_level]
         if str(getattr(self, "_routine_tree_display_criterion", "profit") or "profit") not in supported_criteria:
             self._routine_tree_display_criterion = "profit"
@@ -3029,10 +3051,15 @@ class AutoTradeSettingWindow(QDialog):
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
         selected_scope = str(
-            getattr(self, "_routine_tree_display_scope", "current") or "current"
+            getattr(self, "_routine_tree_display_scope", "") or ""
         )
-        if selected_scope not in {"all", "current"}:
-            selected_scope = "current"
+        stock_data_scope = selected_scope
+        if stock_data_scope not in {"all", "current"}:
+            stock_data_scope = str(
+                getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
+            )
+        if stock_data_scope not in {"all", "current"}:
+            stock_data_scope = "all"
         rows: list[dict[str, object]] = []
 
         for definition in definitions:
@@ -3121,7 +3148,7 @@ class AutoTradeSettingWindow(QDialog):
                     }
                 )
                 visible_stocks = list(current_stocks)
-                if selected_scope == "all":
+                if stock_data_scope == "all":
                     visible_stocks = current_stocks + historical_stocks
                 for stock in visible_stocks:
                     stock_name = str(stock.get("stock_name", "") or "").strip()
