@@ -1332,6 +1332,7 @@ class AutoTradeSettingWindow(QDialog):
         self._routine_tree_display_scope = ""
         self._routine_tree_last_stock_scope = "all"
         self._routine_tree_display_criterion = "profit"
+        self._routine_tree_stock_performance_sort_active = False
         self._routine_tree_valid_only = False
         self._hidden_historical_stock_fixture_keys: set[tuple[str, str]] = set()
         self._fixed_signals_connected = False
@@ -3390,6 +3391,8 @@ class AutoTradeSettingWindow(QDialog):
 
         scroll_bar = self.routine_table.verticalScrollBar()
         scroll_value = scroll_bar.value()
+        if clean_scope == "current":
+            self._routine_tree_stock_performance_sort_active = False
         self._routine_tree_display_scope = clean_scope
         self._routine_tree_last_stock_scope = clean_scope
         self.load_routine_table()
@@ -3460,8 +3463,19 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         self._routine_tree_display_criterion = clean_criterion
+        should_sort_stocks = (
+            str(getattr(self, "_routine_tree_display_level", "") or "") == "stock"
+            and str(getattr(self, "_routine_tree_display_scope", "") or "") == "all"
+        )
+        self._routine_tree_stock_performance_sort_active = should_sort_stocks
         self._update_routine_tree_display_level_badges()
-        self._refresh_routine_tree_display_state()
+        if should_sort_stocks:
+            scroll_bar = self.routine_table.verticalScrollBar()
+            scroll_value = scroll_bar.value()
+            self.load_routine_table()
+            scroll_bar.setValue(scroll_value)
+        else:
+            self._refresh_routine_tree_display_state()
 
     def _apply_routine_tree_display_level_command(self, level: str) -> None:
         clean_level = str(level or "").strip()
@@ -3755,6 +3769,79 @@ class AutoTradeSettingWindow(QDialog):
                 display_stocks = list(current_stocks)
                 if stock_data_scope == "all":
                     display_stocks = current_stocks + historical_stocks
+                    if bool(
+                        getattr(
+                            self,
+                            "_routine_tree_stock_performance_sort_active",
+                            False,
+                        )
+                    ):
+                        display_criterion = str(
+                            getattr(
+                                self,
+                                "_routine_tree_display_criterion",
+                                "profit",
+                            )
+                            or "profit"
+                        )
+                        source_key_by_criterion = {
+                            "period": "trade_days",
+                            "profit": "realized_profit",
+                            "average": "average",
+                            "efficiency": "efficiency",
+                        }
+                        source_key = source_key_by_criterion.get(
+                            display_criterion,
+                            "realized_profit",
+                        )
+
+                        def _performance_sort_value(
+                            stock: dict[str, object],
+                        ) -> float:
+                            stock_path_key = str(
+                                stock.get("stock_path", "") or ""
+                            ).strip()
+                            is_historical = bool(
+                                stock.get("is_historical", False)
+                            )
+                            cache_key = stock_path_key
+                            if is_historical or not cache_key:
+                                cache_key = "|".join(
+                                    (
+                                        str(
+                                            stock.get("instance_id", "")
+                                            or instance_id
+                                        ).strip(),
+                                        str(
+                                            stock.get("stock_code", "") or ""
+                                        ).strip(),
+                                        stock_path_key,
+                                        (
+                                            "historical"
+                                            if is_historical
+                                            else "current"
+                                        ),
+                                    )
+                                )
+                            if cache_key not in performance_source_cache:
+                                performance_source_cache[cache_key] = (
+                                    self._routine_tree_stock_performance_source(
+                                        stock
+                                    )
+                                )
+                            raw_value = performance_source_cache[cache_key].get(
+                                source_key
+                            )
+                            try:
+                                return float(raw_value)
+                            except (TypeError, ValueError):
+                                return 0.0
+
+                        display_stocks = sorted(
+                            display_stocks,
+                            key=_performance_sort_value,
+                            reverse=True,
+                        )
                 display_stocks_by_instance[instance_id] = display_stocks
             definition_stocks = [
                 stock

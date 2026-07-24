@@ -88,6 +88,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_tree_display_scope = ""
         harness._routine_tree_last_stock_scope = "all"
         harness._routine_tree_display_criterion = "profit"
+        harness._routine_tree_stock_performance_sort_active = False
         harness._routine_tree_valid_only = False
         harness._hidden_historical_stock_fixture_keys = set()
         for name in (
@@ -1830,7 +1831,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ):
                 window.load_routine_table()
             window._set_routine_tree_display_level("stock")
-            window._set_routine_tree_display_criterion("profit")
+            window._routine_tree_display_criterion = "profit"
+            window._update_routine_tree_display_level_badges()
+            window._refresh_routine_tree_display_state()
             window.resize(1280, 720)
             window.show()
             self._app.processEvents()
@@ -3407,6 +3410,176 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertFalse(window.routine_table.isRowHidden(5))
             self.assertIn("stocks/003550_LG", performance_paths)
             self.assertIn("stocks/005930_삼성전자", performance_paths)
+
+    def test_stock_metrics_sort_current_and_historical_together_and_scope_resets_order(
+        self,
+    ) -> None:
+        instance = self._instance("inst-sort", "정렬 인스턴스")
+        current_stocks = [
+            {
+                "stock_path": "fixture/current-c1",
+                "stock_code": "000001",
+                "stock_name": "현재1",
+            },
+            {
+                "stock_path": "fixture/current-c2",
+                "stock_code": "000002",
+                "stock_name": "현재2",
+            },
+        ]
+        historical_stocks = [
+            {
+                "instance_id": "inst-sort",
+                "stock_path": "fixture/history-h1",
+                "stock_code": "100001",
+                "stock_name": "과거1",
+                "is_historical": True,
+            },
+            {
+                "instance_id": "inst-sort",
+                "stock_path": "fixture/history-h2",
+                "stock_code": "100002",
+                "stock_name": "과거2",
+                "is_historical": True,
+            },
+        ]
+        performance_by_code = {
+            "000001": {
+                "trade_days": 3,
+                "realized_profit": 100.0,
+                "average": 5.0,
+                "efficiency": 1.0,
+            },
+            "000002": {
+                "trade_days": 8,
+                "realized_profit": -50.0,
+                "average": 30.0,
+                "efficiency": 4.0,
+            },
+            "100001": {
+                "trade_days": 10,
+                "realized_profit": 100.0,
+                "average": -10.0,
+                "efficiency": 2.0,
+            },
+            "100002": {
+                "trade_days": 1,
+                "realized_profit": 200.0,
+                "average": 10.0,
+                "efficiency": -1.0,
+            },
+        }
+
+        with (
+            patch.object(AutoTradeSettingWindow, "refresh_all"),
+            patch.object(
+                AutoTradeSettingWindow,
+                "update_startup_recovery_controls",
+            ),
+        ):
+            window = AutoTradeSettingWindow()
+        try:
+            window._routine_instance_operation_counts = lambda: {
+                "inst-sort": {
+                    "registered": 2,
+                    "running": 0,
+                    "stopped": 2,
+                    "error": 0,
+                },
+            }
+            window._current_stocks_by_instance = lambda: {
+                "inst-sort": list(current_stocks)
+            }
+            window._historical_stocks_by_instance = lambda: {
+                "inst-sort": list(historical_stocks)
+            }
+
+            def performance_source(
+                _window,
+                stock: dict[str, object],
+            ) -> dict[str, object]:
+                code = str(stock.get("stock_code", "") or "")
+                return {
+                    **performance_by_code[code],
+                    "profit_rate": 0.0,
+                    "average_rate": 0.0,
+                    "is_current": not bool(stock.get("is_historical", False)),
+                }
+
+            window._routine_tree_stock_performance_source = MethodType(
+                performance_source,
+                window,
+            )
+
+            def stock_codes() -> list[str]:
+                result = []
+                for row in range(window.routine_table.rowCount()):
+                    metadata = window.routine_table.item(
+                        row,
+                        0,
+                    ).data(Qt.UserRole)
+                    if metadata.get("row_kind") == "stock":
+                        result.append(str(metadata.get("stock_code", "")))
+                return result
+
+            with (
+                patch.object(
+                    setting_window,
+                    "load_routine_definitions",
+                    return_value=[self._definition()],
+                ),
+                patch.object(
+                    setting_window,
+                    "load_persisted_routine_instances",
+                    return_value=[instance],
+                ),
+            ):
+                window._set_routine_tree_display_level("stock")
+                window.load_routine_table()
+                self.assertEqual(
+                    ["000001", "000002", "100001", "100002"],
+                    stock_codes(),
+                )
+
+                expected_by_criterion = {
+                    "period": ["100001", "000002", "000001", "100002"],
+                    "profit": ["100002", "000001", "100001", "000002"],
+                    "average": ["000002", "100002", "000001", "100001"],
+                    "efficiency": ["000002", "100001", "000001", "100002"],
+                }
+                for criterion, expected_codes in expected_by_criterion.items():
+                    window._set_routine_tree_display_criterion(criterion)
+                    self.assertEqual(expected_codes, stock_codes())
+
+                screenshot_path = os.environ.get(
+                    "AUTO_TRADE_STOCK_SORT_SCREENSHOT_PATH",
+                    "",
+                ).strip()
+                if screenshot_path:
+                    window._set_routine_tree_parent_summary_visible(
+                        window.routine_table.cellWidget(0, 0),
+                        False,
+                    )
+                    window.resize(1880, 720)
+                    window.show()
+                    self._app.processEvents()
+                    self.assertTrue(window.grab().save(screenshot_path))
+
+                window._set_routine_tree_display_scope("current")
+                self.assertFalse(
+                    window._routine_tree_stock_performance_sort_active
+                )
+                self.assertEqual(["000001", "000002"], stock_codes())
+
+                window._set_routine_tree_display_scope("all")
+                self.assertEqual(
+                    ["000001", "000002", "100001", "100002"],
+                    stock_codes(),
+                )
+        finally:
+            window.close()
+            window.deleteLater()
+            self._app.processEvents()
 
     def test_historical_stock_context_menu_only_offers_display_delete(self) -> None:
         window = self._window_harness()
