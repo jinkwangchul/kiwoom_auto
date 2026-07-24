@@ -84,6 +84,7 @@ from gui_order_utils import (
     build_full_trade_export_text,
     numeric_order_value,
     order_datetime,
+    parse_order_datetime_value,
     order_sort_key,
     summarize_orders,
 )
@@ -421,6 +422,32 @@ AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_CANDIDATES = (
     ("267250", "HD현대"),
     ("329180", "HD현대중공업"),
     ("373220", "LG에너지솔루션"),
+)
+AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE = (
+    {
+        "trade_days": 3,
+        "realized_profit": 125000.0,
+        "profit_rate": 3.25,
+        "average": 62500.0,
+        "average_rate": 1.63,
+        "efficiency": 3.25,
+    },
+    {
+        "trade_days": 2,
+        "realized_profit": -48000.0,
+        "profit_rate": -1.40,
+        "average": -24000.0,
+        "average_rate": -0.70,
+        "efficiency": -1.40,
+    },
+    {
+        "trade_days": 0,
+        "realized_profit": 0.0,
+        "profit_rate": 0.0,
+        "average": 0.0,
+        "average_rate": 0.0,
+        "efficiency": 0.0,
+    },
 )
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
     0: 80,    # 코드: 6자리 여유
@@ -2351,7 +2378,9 @@ class AutoTradeSettingWindow(QDialog):
                     fixture_stocks.append((stock_code, stock_name))
                     if len(fixture_stocks) == 5:
                         break
-                for stock_code, stock_name in fixture_stocks:
+                for fixture_index, (stock_code, stock_name) in enumerate(
+                    fixture_stocks
+                ):
                     fixture_key = (instance_id, stock_code)
                     if fixture_key in hidden_fixture_keys:
                         continue
@@ -2363,6 +2392,14 @@ class AutoTradeSettingWindow(QDialog):
                             "stock_name": stock_name,
                             "is_historical": True,
                             "is_development_fixture": True,
+                            "performance_fixture": dict(
+                                AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE[
+                                    fixture_index
+                                    % len(
+                                        AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE
+                                    )
+                                ]
+                            ),
                         }
                     )
         for stocks in stocks_by_instance.values():
@@ -2378,10 +2415,32 @@ class AutoTradeSettingWindow(QDialog):
         self,
         stock: dict[str, object],
     ) -> dict[str, object]:
+        if bool(stock.get("is_development_fixture", False)):
+            fixture = stock.get("performance_fixture")
+            if isinstance(fixture, dict):
+                return {
+                    **fixture,
+                    "is_current": False,
+                }
         stock_path = Path(str(stock.get("stock_path", "") or "").strip())
         if not stock_path.is_absolute():
             stock_path = Path(__file__).resolve().parent / stock_path
         orders = read_orders_data(stock_path / "orders.json")
+        is_historical = bool(stock.get("is_historical", False))
+        if is_historical:
+            registered_at = parse_order_datetime_value(
+                stock.get("registered_at")
+            )
+            unregistered_at = parse_order_datetime_value(
+                stock.get("unregistered_at")
+            )
+            orders = [
+                order
+                for order in orders
+                if (parsed := order_datetime(order)) is not None
+                and (registered_at is None or parsed >= registered_at)
+                and (unregistered_at is None or parsed <= unregistered_at)
+            ]
         filled_orders = [
             order
             for order in orders
@@ -2400,8 +2459,9 @@ class AutoTradeSettingWindow(QDialog):
             "realized_profit": realized_profit,
             "profit_rate": None,
             "average": None,
+            "average_rate": None,
             "efficiency": None,
-            "is_current": bool(stock.get("is_current", True)),
+            "is_current": bool(stock.get("is_current", not is_historical)),
         }
 
     def _routine_tree_performance_texts(
@@ -2412,7 +2472,18 @@ class AutoTradeSettingWindow(QDialog):
         cache = source_cache if source_cache is not None else {}
         source_rows: list[dict[str, object]] = []
         for stock in stocks:
-            cache_key = str(stock.get("stock_path", "") or "").strip()
+            stock_path_key = str(stock.get("stock_path", "") or "").strip()
+            is_historical = bool(stock.get("is_historical", False))
+            cache_key = stock_path_key
+            if is_historical or not cache_key:
+                cache_key = "|".join(
+                    (
+                        str(stock.get("instance_id", "") or "").strip(),
+                        str(stock.get("stock_code", "") or "").strip(),
+                        stock_path_key,
+                        "historical" if is_historical else "current",
+                    )
+                )
             if cache_key not in cache:
                 cache[cache_key] = self._routine_tree_stock_performance_source(stock)
             source_rows.append(cache[cache_key])
@@ -2440,9 +2511,10 @@ class AutoTradeSettingWindow(QDialog):
             if len(source_rows) == 1
             else None
         )
-        profit_rate_text = format_signed_percent(
-            profit_rate_value if profit_rate_value is not None else 0.0,
-            digits=2,
+        profit_rate_text = (
+            format_signed_percent(profit_rate_value, digits=2)
+            if profit_rate_value is not None
+            else "-"
         )
         average_values = [
             float(source["average"])
@@ -2464,8 +2536,16 @@ class AutoTradeSettingWindow(QDialog):
             if average_rate_values
             else 0.0
         )
-        average_amount_text = format_signed_money(average_value)
-        average_rate_text = format_signed_percent(average_rate_value, digits=2)
+        average_amount_text = (
+            format_signed_money(average_value)
+            if average_values
+            else "-"
+        )
+        average_rate_text = (
+            format_signed_percent(average_rate_value, digits=2)
+            if average_rate_values
+            else "-"
+        )
         efficiency_value = (
             source_rows[0].get("efficiency")
             if len(source_rows) == 1
@@ -2474,7 +2554,7 @@ class AutoTradeSettingWindow(QDialog):
         try:
             efficiency_text = f"{float(efficiency_value):.1f}"
         except (TypeError, ValueError):
-            efficiency_text = "0.0"
+            efficiency_text = "-"
 
         return {
             "performance_period_text": f"기간({period_text})",
@@ -2491,7 +2571,9 @@ class AutoTradeSettingWindow(QDialog):
             "performance_profit_color": directional_value_color(profit_value),
             "performance_average_amount": average_amount_text,
             "performance_average_rate": average_rate_text,
-            "performance_average_color": directional_value_color(average_value),
+            "performance_average_color": directional_value_color(
+                average_value if average_values else None
+            ),
             "performance_efficiency_value": efficiency_text,
             "performance_efficiency_color": directional_value_color(
                 efficiency_value
@@ -3792,20 +3874,9 @@ class AutoTradeSettingWindow(QDialog):
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
                     is_historical = bool(stock.get("is_historical", False))
-                    stock_performance = (
-                        {
-                            "performance_period_value": "-",
-                            "performance_profit_amount": "-",
-                            "performance_profit_rate": "-",
-                            "performance_average_amount": "-",
-                            "performance_average_rate": "-",
-                            "performance_efficiency_value": "-",
-                        }
-                        if is_historical
-                        else self._routine_tree_performance_texts(
-                            [stock],
-                            performance_source_cache,
-                        )
+                    stock_performance = self._routine_tree_performance_texts(
+                        [stock],
+                        performance_source_cache,
                     )
                     rows.append(
                         {
