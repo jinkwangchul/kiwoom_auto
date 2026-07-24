@@ -2025,6 +2025,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with self.subTest(control=control.objectName()):
                 control_center_y = control.mapTo(window, control.rect().center()).y()
                 self.assertLessEqual(abs(control_center_y - status_center_y), 1)
+        self.assertEqual("조기마감", window.btn_early_close.text())
+        self.assertEqual("강제종료", window.btn_stop.text())
+        self.assertEqual(window.btn_early_close.height(), window.btn_stop.height())
+        self.assertGreaterEqual(window.btn_early_close.height(), 28)
+        self.assertGreater(
+            window.btn_early_close.height(),
+            window.btn_early_close.fontMetrics().height(),
+        )
 
         window.routine_table.setRowCount(1)
         first_item = setting_window.QTableWidgetItem("첫 번째 루틴")
@@ -2048,7 +2056,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         routine_title_gap = badge_rect.top() - routine_label_rect.bottom() - 1
         stock_title_gap = status_rect.top() - stock_label_rect.bottom() - 1
         self.assertEqual(routine_title_gap, stock_title_gap)
-        self.assertIn(routine_title_gap, range(7, 10))
+        self.assertIn(routine_title_gap, range(6, 10))
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
             badge_rect.height(),
@@ -2062,8 +2070,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window,
             window.selected_routine_status_bar.rect().bottomLeft(),
         ).y()
-        self.assertIn(first_row_y - badge_bottom_y - 1, range(8, 11))
-        self.assertIn(stock_header_y - status_bottom_y - 1, range(8, 11))
+        routine_body_gap = first_row_y - badge_bottom_y - 1
+        stock_body_gap = stock_header_y - status_bottom_y - 1
+        self.assertEqual(routine_body_gap, stock_body_gap)
+        self.assertIn(routine_body_gap, range(6, 11))
         self.assertEqual(
             window.routine_table.geometry().bottom(),
             window.stock_table.geometry().bottom(),

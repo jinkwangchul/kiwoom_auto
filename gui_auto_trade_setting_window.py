@@ -380,8 +380,8 @@ AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
 AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = 22
-AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 7
-AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 8
+AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
+AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
     "category": frozenset({"profit", "average", "efficiency"}),
     "routine": frozenset({"period", "profit", "average", "efficiency"}),
@@ -1139,7 +1139,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_start = QPushButton("매매시작")
         self.btn_stop = QPushButton("강제종료")
         self.btn_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
-        self.btn_early_close = QPushButton("조기 마감")
+        self.btn_early_close = QPushButton("조기마감")
         self.btn_early_close.setStyleSheet("color: #2563eb; font-weight: bold;")
         self.btn_preview_order_candidates = QPushButton("주문후보검증")
         self.btn_execution_enable = QPushButton("수동 실주문 후보 활성화")
@@ -1150,8 +1150,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_modify_pending_order = QPushButton("Manual Modify")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
-        self.btn_early_close.setFixedHeight(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
-        self.btn_stop.setFixedHeight(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        self.btn_early_close.setMinimumHeight(28)
+        self.btn_stop.setMinimumHeight(28)
         self.btn_preview_order_candidates.setMinimumHeight(28)
         self.btn_execution_enable.setMinimumHeight(28)
         self.btn_real_ready_preflight.setMinimumHeight(28)
