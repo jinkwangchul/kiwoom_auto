@@ -379,7 +379,7 @@ AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
     "category": frozenset({"profit", "average", "efficiency"}),
     "routine": frozenset({"period", "profit", "average", "efficiency"}),
-    "stock": frozenset({"all", "current", "period", "profit", "average", "efficiency"}),
+    "stock": frozenset({"period", "profit", "average", "efficiency"}),
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
@@ -1213,9 +1213,9 @@ class AutoTradeSettingWindow(QDialog):
         self._last_real_preflight_queue_snapshot: dict[str, object] | None = None
         self._stock_status_filter = "all"
         self._last_strategy_workspace_width = 0
-        self._auto_trade_stock_scope_by_instance: dict[str, str] = {}
         self._collapsed_auto_trade_instance_ids: set[str] = set()
         self._routine_tree_display_level = "category"
+        self._routine_tree_display_scope = "current"
         self._routine_tree_display_criterion = "profit"
         self._fixed_signals_connected = False
 
@@ -1475,7 +1475,7 @@ class AutoTradeSettingWindow(QDialog):
         else:
             row_kind = str(metadata.get("row_kind", "") or "")
             self.selected_routine_signal_label.setText("●")
-            if row_kind in {"instance", "stock_scope", "stock"}:
+            if row_kind in {"instance", "stock"}:
                 self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
                 self.selected_routine_instance_count_badge.setText("")
                 self.selected_routine_instance_count_badge.hide()
@@ -2283,7 +2283,6 @@ class AutoTradeSettingWindow(QDialog):
     def _routine_tree_row_widget(self, row_data: dict[str, object], text: str) -> QWidget:
         row_kind = str(row_data.get("row_kind", "") or "")
         is_instance = row_kind == "instance"
-        is_stock_scope = row_kind == "stock_scope"
         is_stock = row_kind == "stock"
         is_definition = row_kind == "definition"
         has_period_metric = is_instance or is_stock
@@ -2307,12 +2306,6 @@ class AutoTradeSettingWindow(QDialog):
             indent_spacer = QWidget()
             indent_spacer.setObjectName("autoTradeSettingRoutineTreeIndent")
             indent_spacer.setFixedWidth(28)
-            indent_spacer.setFocusPolicy(Qt.NoFocus)
-            layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
-        elif is_stock_scope:
-            indent_spacer = QWidget()
-            indent_spacer.setObjectName("autoTradeSettingRoutineTreeStockScopeIndent")
-            indent_spacer.setFixedWidth(56)
             indent_spacer.setFocusPolicy(Qt.NoFocus)
             layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
         elif is_stock:
@@ -2372,7 +2365,7 @@ class AutoTradeSettingWindow(QDialog):
             if can_install_event_filter:
                 icon_label.installEventFilter(self)
         raw_title_text = str(row_data.get("display_name", "") or text)
-        title_text = raw_title_text if is_stock_scope else routine_tree_title_text(raw_title_text)
+        title_text = routine_tree_title_text(raw_title_text)
         title_label = QLabel(title_text)
         title_label.setObjectName("autoTradeSettingRoutineTreeTitle")
         title_label.setAlignment(
@@ -2399,9 +2392,7 @@ class AutoTradeSettingWindow(QDialog):
         )
         title_label.setFont(title_font)
         instance_title_width = routine_tree_title_width(QFontMetrics(base_title_font))
-        if is_stock_scope:
-            title_width = title_label.fontMetrics().horizontalAdvance(title_text) + 12
-        elif is_stock:
+        if is_stock:
             title_width = instance_title_width
         else:
             title_width = routine_tree_title_width(title_label.fontMetrics())
@@ -2513,44 +2504,6 @@ class AutoTradeSettingWindow(QDialog):
                 parent_profit_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 parent_profit_spacer.setProperty("autoTradeSettingParentSummaryMetric", True)
                 layout.addWidget(parent_profit_spacer, 0, Qt.AlignVCenter)
-        elif is_stock_scope:
-            scope = str(row_data.get("stock_scope", "current") or "current")
-            instance_id = str(row_data.get("instance_id", "") or "")
-
-            def _scope_badge(text: str, scope_value: str) -> QPushButton:
-                is_active = scope == scope_value
-                badge = QPushButton(text)
-                badge.setObjectName(
-                    "autoTradeSettingRoutineTreeStockScopeAllBadge"
-                    if scope_value == "all"
-                    else "autoTradeSettingRoutineTreeStockScopeCurrentBadge"
-                )
-                badge.setFocusPolicy(Qt.NoFocus)
-                badge.setCursor(Qt.PointingHandCursor)
-                badge.setFixedSize(64, 22)
-                badge.setStyleSheet(
-                    auto_trade_setting_badge_stylesheet(
-                        "QPushButton",
-                        text_color=(
-                            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                            if is_active
-                            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
-                        ),
-                        border_color=(
-                            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                            if is_active
-                            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
-                        ),
-                    )
-                )
-                badge.clicked.connect(
-                    lambda _checked=False, target_scope=scope_value, target_instance_id=instance_id:
-                    self._set_auto_trade_stock_scope(target_instance_id, target_scope)
-                )
-                return badge
-
-            layout.addWidget(_scope_badge("전체", "all"), 0, Qt.AlignVCenter)
-            layout.addWidget(_scope_badge("현재", "current"), 0, Qt.AlignVCenter)
         else:
             if is_stock:
                 stock_title_spacer = QWidget()
@@ -2567,10 +2520,6 @@ class AutoTradeSettingWindow(QDialog):
                 stock_performance_spacer.setFocusPolicy(Qt.NoFocus)
                 stock_performance_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 layout.addWidget(stock_performance_spacer, 0, Qt.AlignVCenter)
-
-        if is_stock_scope:
-            layout.addStretch(1)
-            return container
 
         def _performance_metric_text_parts(key: str, left_fallback: str, right_fallback: str) -> tuple[str, str]:
             raw_text = str(row_data.get(f"performance_{key}_text", "") or "").strip()
@@ -2750,10 +2699,26 @@ class AutoTradeSettingWindow(QDialog):
             buttons[level] = button
 
         layout.addSpacing(12)
+        scope_buttons: dict[str, QPushButton] = {}
+        for scope, text, object_name in (
+            ("all", "전체", "autoTradeSettingRoutineTreeAllScopeBadge"),
+            ("current", "현재", "autoTradeSettingRoutineTreeCurrentScopeBadge"),
+        ):
+            button = QPushButton(text, container)
+            button.setObjectName(object_name)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedSize(64, 22)
+            button.clicked.connect(
+                lambda _checked=False, target_scope=scope:
+                self._set_routine_tree_display_scope(target_scope)
+            )
+            layout.addWidget(button, 0, Qt.AlignVCenter)
+            scope_buttons[scope] = button
+
+        layout.addSpacing(12)
         criterion_buttons: dict[str, QPushButton] = {}
         for criterion, text, object_name in (
-            ("all", "전체", "autoTradeSettingRoutineTreeAllCriterionBadge"),
-            ("current", "현재", "autoTradeSettingRoutineTreeCurrentCriterionBadge"),
             ("period", "기간", "autoTradeSettingRoutineTreePeriodCriterionBadge"),
             ("profit", "수익", "autoTradeSettingRoutineTreeProfitCriterionBadge"),
             ("average", "평균", "autoTradeSettingRoutineTreeAverageCriterionBadge"),
@@ -2774,6 +2739,7 @@ class AutoTradeSettingWindow(QDialog):
         container.setFixedSize(layout.sizeHint())
         self._routine_tree_display_level_badges = container
         self._routine_tree_display_level_buttons = buttons
+        self._routine_tree_display_scope_buttons = scope_buttons
         self._routine_tree_display_criterion_buttons = criterion_buttons
         self._update_routine_tree_display_level_badges()
         container.show()
@@ -2796,6 +2762,23 @@ class AutoTradeSettingWindow(QDialog):
             color = (
                 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                 if level == selected_level
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+            )
+
+        selected_scope = str(
+            getattr(self, "_routine_tree_display_scope", "current") or "current"
+        )
+        for scope, button in getattr(self, "_routine_tree_display_scope_buttons", {}).items():
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if scope == selected_scope
                 else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
             )
             button.setStyleSheet(
@@ -2841,6 +2824,44 @@ class AutoTradeSettingWindow(QDialog):
                 + disabled_style
             )
 
+    def _set_routine_tree_display_scope(self, scope: str) -> None:
+        clean_scope = str(scope or "").strip()
+        if clean_scope not in {"all", "current"}:
+            return
+        if clean_scope == str(
+            getattr(self, "_routine_tree_display_scope", "current") or "current"
+        ):
+            return
+
+        scroll_bar = self.routine_table.verticalScrollBar()
+        scroll_value = scroll_bar.value()
+        self._routine_tree_display_scope = clean_scope
+        self.load_routine_table()
+        scroll_bar.setValue(scroll_value)
+        self._update_routine_tree_display_level_badges()
+
+    def _refresh_routine_tree_display_state(self) -> None:
+        display_level = str(
+            getattr(self, "_routine_tree_display_level", "category") or "category"
+        )
+        display_scope = str(
+            getattr(self, "_routine_tree_display_scope", "current") or "current"
+        )
+        display_metric = str(
+            getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
+        )
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict):
+                continue
+            updated_metadata = dict(metadata)
+            updated_metadata["display_level"] = display_level
+            updated_metadata["display_scope"] = display_scope
+            updated_metadata["display_metric"] = display_metric
+            item.setData(Qt.UserRole, updated_metadata)
+        self.routine_table.viewport().update()
+
     def _set_routine_tree_display_criterion(self, criterion: str) -> None:
         clean_criterion = str(criterion or "").strip()
         supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA.get(
@@ -2851,59 +2872,20 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         self._routine_tree_display_criterion = clean_criterion
-        if clean_criterion in {"all", "current"}:
-            scopes = getattr(self, "_auto_trade_stock_scope_by_instance", {})
-            instance_ids: set[str] = set()
-            for row in range(self.routine_table.rowCount()):
-                item = self.routine_table.item(row, 0)
-                metadata = item.data(Qt.UserRole) if item is not None else None
-                if isinstance(metadata, dict) and str(metadata.get("row_kind", "") or "") == "instance":
-                    instance_id = str(metadata.get("instance_id", "") or "").strip()
-                    if instance_id:
-                        instance_ids.add(instance_id)
-            for instance_id in instance_ids:
-                scopes[instance_id] = clean_criterion
-            self._auto_trade_stock_scope_by_instance = scopes
-            current_metadata = self.current_selected_routine_row_metadata()
-            self.load_routine_table()
-            if current_metadata:
-                self.restore_routine_selection_metadata(current_metadata)
         self._update_routine_tree_display_level_badges()
+        self._refresh_routine_tree_display_state()
 
     def _set_routine_tree_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
         if clean_level not in {"category", "routine", "stock"}:
             return
 
-        definition_ids: set[str] = set()
-        instance_ids: set[str] = set()
-        for row in range(self.routine_table.rowCount()):
-            item = self.routine_table.item(row, 0)
-            metadata = item.data(Qt.UserRole) if item is not None else None
-            if not isinstance(metadata, dict) or not bool(metadata.get("has_toggle_children", True)):
-                continue
-            row_kind = str(metadata.get("row_kind", "") or "")
-            if row_kind == "definition":
-                definition_id = str(metadata.get("definition_id", "") or "").strip()
-                if definition_id:
-                    definition_ids.add(definition_id)
-            elif row_kind == "instance":
-                instance_id = str(metadata.get("instance_id", "") or "").strip()
-                if instance_id:
-                    instance_ids.add(instance_id)
-
         self._routine_tree_display_level = clean_level
         supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA[clean_level]
         if str(getattr(self, "_routine_tree_display_criterion", "profit") or "profit") not in supported_criteria:
             self._routine_tree_display_criterion = "profit"
-        self._collapsed_auto_trade_definition_ids = definition_ids if clean_level == "category" else set()
-        self._collapsed_auto_trade_instance_ids = instance_ids if clean_level != "stock" else set()
         self._update_routine_tree_display_level_badges()
-
-        scroll_bar = self.routine_table.verticalScrollBar()
-        scroll_value = scroll_bar.value()
-        self._apply_routine_tree_collapse_visibility()
-        scroll_bar.setValue(scroll_value)
+        self._refresh_routine_tree_display_state()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is getattr(self, "routine_box", None) and event.type() == QEvent.Resize:
@@ -2995,7 +2977,6 @@ class AutoTradeSettingWindow(QDialog):
         current_definition_collapsed = False
         current_instance_id = ""
         current_instance_collapsed = False
-        current_instance_has_toggle_children = False
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             metadata = item.data(Qt.UserRole) if item is not None else None
@@ -3013,7 +2994,6 @@ class AutoTradeSettingWindow(QDialog):
                 current_definition_collapsed = has_toggle_children and definition_id in collapsed_definitions
                 current_instance_id = ""
                 current_instance_collapsed = False
-                current_instance_has_toggle_children = False
                 self.routine_table.setRowHidden(row, False)
                 if icon is not None:
                     icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
@@ -3027,35 +3007,13 @@ class AutoTradeSettingWindow(QDialog):
                 if not has_toggle_children:
                     collapsed_instances.discard(instance_id)
                 current_instance_id = instance_id
-                current_instance_has_toggle_children = has_toggle_children
                 current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
                 self.routine_table.setRowHidden(row, hidden_by_definition)
                 if icon is not None:
                     icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
                 continue
             hidden_by_instance = bool(current_instance_id and instance_id == current_instance_id and current_instance_collapsed)
-            hidden_by_empty_instance = (
-                row_kind == "stock_scope"
-                and current_instance_id
-                and instance_id == current_instance_id
-                and not current_instance_has_toggle_children
-            )
-            self.routine_table.setRowHidden(row, hidden_by_definition or hidden_by_instance or hidden_by_empty_instance)
-
-    def _set_auto_trade_stock_scope(self, instance_id: str, scope: str) -> None:
-        clean_instance_id = str(instance_id or "").strip()
-        clean_scope = str(scope or "current").strip()
-        if not clean_instance_id or clean_scope not in {"all", "current"}:
-            return
-        scopes = getattr(self, "_auto_trade_stock_scope_by_instance", {})
-        if scopes.get(clean_instance_id, "current") == clean_scope:
-            return
-        current_metadata = self.current_selected_routine_row_metadata()
-        scopes[clean_instance_id] = clean_scope
-        self._auto_trade_stock_scope_by_instance = scopes
-        self.load_routine_table()
-        if current_metadata:
-            self.restore_routine_selection_metadata(current_metadata)
+            self.routine_table.setRowHidden(row, hidden_by_definition or hidden_by_instance)
 
     def load_routine_table(self) -> None:
         current_metadata = self.current_selected_routine_row_metadata()
@@ -3070,7 +3028,11 @@ class AutoTradeSettingWindow(QDialog):
         historical_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
-        stock_scope_by_instance = getattr(self, "_auto_trade_stock_scope_by_instance", {})
+        selected_scope = str(
+            getattr(self, "_routine_tree_display_scope", "current") or "current"
+        )
+        if selected_scope not in {"all", "current"}:
+            selected_scope = "current"
         rows: list[dict[str, object]] = []
 
         for definition in definitions:
@@ -3109,6 +3071,13 @@ class AutoTradeSettingWindow(QDialog):
                         int(instance_counts.get(str(instance.instance_id), {}).get("error", 0) or 0)
                         for instance in child_instances
                     ),
+                    "display_level": str(
+                        getattr(self, "_routine_tree_display_level", "category") or "category"
+                    ),
+                    "display_scope": selected_scope,
+                    "display_metric": str(
+                        getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
+                    ),
                 }
             )
             for _index, instance in enumerate(child_instances):
@@ -3142,28 +3111,17 @@ class AutoTradeSettingWindow(QDialog):
                         "running": int(count.get("running", 0) or 0),
                         "stopped": int(count.get("stopped", 0) or 0),
                         "error": int(count.get("error", 0) or 0),
-                    }
-                )
-                scope = str(stock_scope_by_instance.get(instance_id, "current") or "current")
-                if scope not in {"all", "current"}:
-                    scope = "current"
-                rows.append(
-                    {
-                        "row_kind": "stock_scope",
-                        "definition_id": definition_id,
-                        "instance_id": instance_id,
-                        "definition_name": str(definition.display_name),
-                        "instance_name": str(instance.display_name),
-                        "package_dir": str(definition.package_dir),
-                        "instance_dir": str(instance_dir) if instance_dir else "",
-                        "display_name": "[전체] [현재]",
-                        "stock_scope": scope,
-                        "tree_icon": "",
-                        "has_toggle_children": has_instance_children,
+                        "display_level": str(
+                            getattr(self, "_routine_tree_display_level", "category") or "category"
+                        ),
+                        "display_scope": selected_scope,
+                        "display_metric": str(
+                            getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
+                        ),
                     }
                 )
                 visible_stocks = list(current_stocks)
-                if scope == "all":
+                if selected_scope == "all":
                     visible_stocks = current_stocks + historical_stocks
                 for stock in visible_stocks:
                     stock_name = str(stock.get("stock_name", "") or "").strip()
@@ -3177,7 +3135,13 @@ class AutoTradeSettingWindow(QDialog):
                             "package_dir": str(definition.package_dir),
                             "instance_dir": str(instance_dir) if instance_dir else "",
                             "display_name": stock_name,
-                            "stock_scope": scope,
+                            "display_level": str(
+                                getattr(self, "_routine_tree_display_level", "category") or "category"
+                            ),
+                            "display_scope": selected_scope,
+                            "display_metric": str(
+                                getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
+                            ),
                             "stock_code": str(stock.get("stock_code", "") or ""),
                             "stock_path": str(stock.get("stock_path", "") or ""),
                             "tree_icon": "\u25aa",
@@ -3245,13 +3209,13 @@ class AutoTradeSettingWindow(QDialog):
 
     def current_selected_instance_id(self) -> str:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
             return ""
         return str(metadata.get("instance_id", "") or "").strip()
 
     def current_selected_instance_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
             return None
         path_text = str(metadata.get("instance_dir", "") or "").strip()
         if not path_text:
@@ -3264,7 +3228,7 @@ class AutoTradeSettingWindow(QDialog):
         if not metadata:
             return ()
         row_kind = str(metadata.get("row_kind", "") or "")
-        if row_kind in {"instance", "stock_scope", "stock"}:
+        if row_kind in {"instance", "stock"}:
             instance_id = str(metadata.get("instance_id", "") or "").strip()
             return (instance_id,) if instance_id else ()
         if row_kind == "definition":
@@ -3280,13 +3244,13 @@ class AutoTradeSettingWindow(QDialog):
         metadata = self.current_selected_routine_row_metadata()
         if not metadata:
             return ""
-        if str(metadata.get("row_kind", "")) in {"instance", "stock_scope", "stock"}:
+        if str(metadata.get("row_kind", "")) in {"instance", "stock"}:
             return str(metadata.get("instance_name", "") or "").strip()
         return str(metadata.get("definition_name", "") or "").strip()
 
     def current_selected_routine_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
-        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock_scope", "stock"}:
+        if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
             return None
         path_text = str(metadata.get("package_dir", "") or "").strip()
         if not path_text:
@@ -3324,7 +3288,7 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             if str(candidate.get("definition_id", "") or "") != definition_id:
                 continue
-            if row_kind in {"instance", "stock_scope", "stock"} and str(candidate.get("instance_id", "") or "") != instance_id:
+            if row_kind in {"instance", "stock"} and str(candidate.get("instance_id", "") or "") != instance_id:
                 continue
             if row_kind == "stock" and str(candidate.get("stock_path", "") or "") != stock_path:
                 continue
