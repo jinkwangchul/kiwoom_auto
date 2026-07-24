@@ -438,9 +438,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent_status_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeStatusGroup")
         parent_period = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
         parent_period_spacer = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
-        parent_profit_column_spacer = parent_widget.findChild(
+        parent_identity_compensation = parent_widget.findChild(
             setting_window.QWidget,
-            "autoTradeSettingRoutineTreeParentProfitColumnSpacer",
+            "autoTradeSettingRoutineTreeIdentityXCompensation",
         )
         parent_profit = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit")
         parent_average = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage")
@@ -454,10 +454,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIsNotNone(parent_instance_count)
         self.assertIsNotNone(parent_meta_group)
         self.assertIsNone(parent_status_group)
+        self.assertIsNotNone(parent_period)
         self.assertIsNotNone(parent_profit)
-        self.assertIsNone(parent_period)
         self.assertIsNone(parent_period_spacer)
-        self.assertIsNotNone(parent_profit_column_spacer)
+        self.assertIsNone(parent_identity_compensation)
         self.assertIsNotNone(parent_average)
         self.assertIsNotNone(parent_efficiency)
         self.assertEqual(28, parent_icon.width())
@@ -480,17 +480,19 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("padding: 0 6px", parent_instance_count.styleSheet())
         self.assertGreater(parent_icon.font().pointSize(), parent_title.font().pointSize())
         self.assertTrue(parent_title.font().bold())
+        self.assertTrue(parent_period.isHidden())
         self.assertTrue(parent_profit.isHidden())
         self.assertTrue(parent_average.isHidden())
         self.assertTrue(parent_efficiency.isHidden())
         self.assertEqual("0", parent_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitLeftValue").text())
-        self.assertEqual("-", parent_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
-        self.assertEqual("-", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
-        self.assertEqual("-", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
-        self.assertEqual("-", parent_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
+        self.assertEqual("0.00%", parent_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
+        self.assertEqual("0", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
+        self.assertEqual("0.00%", parent_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
+        self.assertEqual("0.0", parent_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
         self.assertEqual("", parent_widget.toolTip())
         self.assertFalse(parent_instance_count.isHidden())
         window._set_routine_tree_parent_summary_visible(parent_widget, True)
+        self.assertFalse(parent_period.isHidden())
         parent_widget.layout().activate()
         self._app.processEvents()
         self.assertFalse(parent_profit.isHidden())
@@ -502,8 +504,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             if parent_widget.layout().itemAt(index).widget() is not None
         ]
         self.assertEqual(
-            parent_profit,
-            parent_layout_widgets[parent_layout_widgets.index(parent_profit_column_spacer) + 1],
+            parent_period,
+            parent_layout_widgets[parent_layout_widgets.index(parent_meta_group) + 1],
         )
         self.assertGreaterEqual(window.routine_table.item(0, 0).sizeHint().height(), parent_widget.sizeHint().height())
         child_widget = window.routine_table.cellWidget(1, 0)
@@ -548,10 +550,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertLess(parent_title.font().weight(), setting_window.QFont.Bold)
         self.assertEqual("0", child_period.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformancePeriodLeftValue").text())
         self.assertEqual("0", child_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitLeftValue").text())
-        self.assertEqual("-", child_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
-        self.assertEqual("-", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
-        self.assertEqual("-", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
-        self.assertEqual("-", child_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
+        self.assertEqual("0.00%", child_profit.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceProfitRightValue").text())
+        self.assertEqual("0", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageLeftValue").text())
+        self.assertEqual("0.00%", child_average.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceAverageRightValue").text())
+        self.assertEqual("0.0", child_efficiency.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue").text())
         self.assertFalse(child_period.isHidden())
         self.assertFalse(child_profit.isHidden())
         self.assertFalse(child_average.isHidden())
@@ -1039,10 +1041,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         expected_labels = (
             ("autoTradeSettingRoutineTreePerformanceProfitLeftValue", "0"),
-            ("autoTradeSettingRoutineTreePerformanceProfitRightValue", "-"),
-            ("autoTradeSettingRoutineTreePerformanceAverageLeftValue", "-"),
-            ("autoTradeSettingRoutineTreePerformanceAverageRightValue", "-"),
-            ("autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue", "-"),
+            ("autoTradeSettingRoutineTreePerformanceProfitRightValue", "0.00%"),
+            ("autoTradeSettingRoutineTreePerformanceAverageLeftValue", "0"),
+            ("autoTradeSettingRoutineTreePerformanceAverageRightValue", "0.00%"),
+            ("autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue", "0.0"),
         )
 
         def _assert_default_summary_visible() -> None:
@@ -1281,15 +1283,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             source = window._routine_tree_stock_performance_source(stocks[0])
 
         self.assertEqual("기간(1)", texts["performance_period_text"])
-        self.assertEqual("수익(+10 / -)", texts["performance_profit_text"])
-        self.assertEqual("평균(- / -)", texts["performance_average_text"])
-        self.assertEqual("효율(-)", texts["performance_efficiency_text"])
+        self.assertEqual("수익(+10 / 0.00%)", texts["performance_profit_text"])
+        self.assertEqual("평균(0 / 0.00%)", texts["performance_average_text"])
+        self.assertEqual("효율(0.0)", texts["performance_efficiency_text"])
         self.assertEqual("기간(0)", empty_texts["performance_period_text"])
         self.assertEqual("+10", texts["performance_profit_amount"])
-        self.assertEqual("-", texts["performance_profit_rate"])
-        self.assertEqual("-", texts["performance_average_amount"])
-        self.assertEqual("-", texts["performance_average_rate"])
-        self.assertEqual("-", texts["performance_efficiency_value"])
+        self.assertEqual("0.00%", texts["performance_profit_rate"])
+        self.assertEqual("0", texts["performance_average_amount"])
+        self.assertEqual("0.00%", texts["performance_average_rate"])
+        self.assertEqual("0.0", texts["performance_efficiency_value"])
         self.assertEqual(
             {
                 "trade_days",
@@ -1357,8 +1359,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 setting_window.QLabel,
                 "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue",
             )
-            self.assertEqual("-", instance_average.text())
-            self.assertEqual("-", instance_efficiency.text())
+            self.assertEqual("0", instance_average.text())
+            self.assertEqual("0.0", instance_efficiency.text())
             self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
             self.assertTrue(window.routine_table.isRowHidden(2))
 
@@ -1376,8 +1378,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
             self.assertEqual("+10", stock_profit.text())
             self.assertEqual("2", stock_period.text())
-            self.assertEqual("-", instance_average.text())
-            self.assertEqual("-", instance_efficiency.text())
+            self.assertEqual("0", instance_average.text())
+            self.assertEqual("0.0", instance_efficiency.text())
             self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
             self.assertFalse(window.routine_table.isRowHidden(2))
 
@@ -1421,7 +1423,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "performance_profit_rate": "-4.20%",
                     "performance_average_amount": "-24,000",
                     "performance_average_rate": "-0.70%",
-                    "performance_efficiency_value": "-",
+                    "performance_efficiency_value": "0.0",
                 },
             ),
             (
@@ -1438,10 +1440,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 {
                     "performance_period_value": "0",
                     "performance_profit_amount": "0",
-                    "performance_profit_rate": "-",
-                    "performance_average_amount": "-",
-                    "performance_average_rate": "-",
-                    "performance_efficiency_value": "-",
+                    "performance_profit_rate": "0.00%",
+                    "performance_average_amount": "0",
+                    "performance_average_rate": "0.00%",
+                    "performance_efficiency_value": "0.0",
                 },
             ),
         )
@@ -1664,6 +1666,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "code": "000003",
                 "name": "중립종목",
             },
+            {
+                "stock_path": "fixture/missing",
+                "assigned_routine_instance_id": "inst-zero",
+                "code": "000004",
+                "name": "값없음현재종목",
+            },
+            {
+                "stock_path": "fixture/balance",
+                "assigned_routine_instance_id": "inst-negative",
+                "code": "000005",
+                "name": "부모합계균형종목",
+            },
         ]
         performance_by_code = {
             "000001": {
@@ -1693,6 +1707,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "efficiency": 0.0,
                 "is_current": True,
             },
+            "000004": {
+                "trade_days": None,
+                "realized_profit": None,
+                "profit_rate": None,
+                "average": None,
+                "average_rate": None,
+                "efficiency": None,
+                "is_current": True,
+            },
+            "000005": {
+                "trade_days": 1,
+                "realized_profit": -77000.0,
+                "profit_rate": -2.00,
+                "average": -38500.0,
+                "average_rate": -0.93,
+                "efficiency": -2.00,
+                "is_current": True,
+            },
             "100001": {
                 "trade_days": 3,
                 "realized_profit": 125000.0,
@@ -1720,9 +1752,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "efficiency": 0.0,
                 "is_current": False,
             },
+            "100004": {
+                "trade_days": None,
+                "realized_profit": None,
+                "profit_rate": None,
+                "average": None,
+                "average_rate": None,
+                "efficiency": None,
+                "is_current": False,
+            },
         }
-        historical_stocks = {
-            instance_id: [
+        historical_stocks = {}
+        for instance_id, code, name in (
+                ("inst-positive", "100001", "과거양수종목"),
+                ("inst-negative", "100002", "과거음수종목"),
+                ("inst-zero", "100003", "과거중립종목"),
+                ("inst-zero", "100004", "값없음과거종목"),
+        ):
+            historical_stocks.setdefault(instance_id, []).append(
                 {
                     "instance_id": instance_id,
                     "stock_path": f"fixture/historical-{code}",
@@ -1731,13 +1778,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "is_historical": True,
                     "is_development_fixture": True,
                 }
-            ]
-            for instance_id, code, name in (
-                ("inst-positive", "100001", "과거양수종목"),
-                ("inst-negative", "100002", "과거음수종목"),
-                ("inst-zero", "100003", "과거중립종목"),
             )
-        }
 
         with (
             patch.object(AutoTradeSettingWindow, "refresh_all"),
@@ -1824,6 +1865,20 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "0.00%",
                     "#374151",
                 ),
+                "000004": (
+                    "0",
+                    "0.00%",
+                    "0",
+                    "0.00%",
+                    "#374151",
+                ),
+                "000005": (
+                    "-77,000",
+                    "-2.00%",
+                    "-38,500",
+                    "-0.93%",
+                    "#DC2626",
+                ),
                 "100001": (
                     "+125,000",
                     "+3.25%",
@@ -1839,6 +1894,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "#DC2626",
                 ),
                 "100003": (
+                    "0",
+                    "0.00%",
+                    "0",
+                    "0.00%",
+                    "#374151",
+                ),
+                "100004": (
                     "0",
                     "0.00%",
                     "0",
@@ -1893,6 +1955,110 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 )
             self.assertEqual(1, len(profit_right_edges))
             self.assertEqual(1, len(average_right_edges))
+
+            parent_widget = window.routine_table.cellWidget(0, 0)
+            window._set_routine_tree_parent_summary_visible(
+                parent_widget,
+                True,
+            )
+            parent_profit = parent_widget.findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreePerformanceProfitLeftValue",
+            )
+            parent_average = parent_widget.findChild(
+                setting_window.QLabel,
+                "autoTradeSettingRoutineTreePerformanceAverageLeftValue",
+            )
+            self.assertEqual("0", parent_profit.text())
+            self.assertEqual("0", parent_average.text())
+
+            zero_instance_row = next(
+                row
+                for row in range(window.routine_table.rowCount())
+                if (
+                    window.routine_table.item(row, 0)
+                    .data(Qt.UserRole)
+                    .get("row_kind")
+                    == "instance"
+                    and window.routine_table.item(row, 0)
+                    .data(Qt.UserRole)
+                    .get("instance_id")
+                    == "inst-zero"
+                )
+            )
+            zero_instance_widget = window.routine_table.cellWidget(
+                zero_instance_row,
+                0,
+            )
+            self.assertEqual(
+                "0",
+                zero_instance_widget.findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreePerformanceProfitLeftValue",
+                ).text(),
+            )
+
+            anchor_object_names = (
+                "autoTradeSettingRoutineTreePerformancePeriod",
+                "autoTradeSettingRoutineTreePerformancePeriodLeftValue",
+                "autoTradeSettingRoutineTreePerformancePeriodClose",
+                "autoTradeSettingRoutineTreePerformanceProfit",
+                "autoTradeSettingRoutineTreePerformanceProfitLeftValue",
+                "autoTradeSettingRoutineTreePerformanceProfitSlash",
+                "autoTradeSettingRoutineTreePerformanceProfitRightValue",
+                "autoTradeSettingRoutineTreePerformanceProfitClose",
+                "autoTradeSettingRoutineTreePerformanceAverage",
+                "autoTradeSettingRoutineTreePerformanceAverageLeftValue",
+                "autoTradeSettingRoutineTreePerformanceAverageSlash",
+                "autoTradeSettingRoutineTreePerformanceAverageRightValue",
+                "autoTradeSettingRoutineTreePerformanceAverageClose",
+                "autoTradeSettingRoutineTreePerformanceEfficiency",
+                "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue",
+                "autoTradeSettingRoutineTreePerformanceEfficiencyClose",
+            )
+            expected_anchors = None
+            for row in range(window.routine_table.rowCount()):
+                widget = window.routine_table.cellWidget(row, 0)
+                widget.layout().activate()
+                anchors = []
+                for object_name in anchor_object_names:
+                    child = widget.findChild(
+                        setting_window.QWidget,
+                        object_name,
+                    )
+                    self.assertIsNotNone(
+                        child,
+                        f"row={row} object={object_name}",
+                    )
+                    top_left = child.mapTo(widget, child.rect().topLeft())
+                    top_right = child.mapTo(widget, child.rect().topRight())
+                    anchors.append((top_left.x(), top_right.x()))
+                if expected_anchors is None:
+                    expected_anchors = anchors
+                else:
+                    identity_compensation = widget.findChild(
+                        setting_window.QWidget,
+                        "autoTradeSettingRoutineTreeIdentityXCompensation",
+                    )
+                    self.assertEqual(
+                        expected_anchors,
+                        anchors,
+                        (
+                            f"row={row} metadata="
+                            f"{window.routine_table.item(row, 0).data(Qt.UserRole)} "
+                            f"font={widget.font().toString()} "
+                            f"identity_compensation="
+                            f"{identity_compensation.width() if identity_compensation else None}"
+                        ),
+                    )
+
+                for label in widget.findChildren(setting_window.QLabel):
+                    if label.objectName().startswith(
+                        "autoTradeSettingRoutineTreePerformance"
+                    ) and label.objectName().endswith(
+                        ("LeftValue", "RightValue")
+                    ):
+                        self.assertNotEqual("-", label.text())
 
             screenshot_path = os.environ.get(
                 "AUTO_TRADE_DIRECTIONAL_PROFIT_SCREENSHOT_PATH",
@@ -2343,7 +2509,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         x_values = {
-            "definition": {"profit": set(), "average": set(), "efficiency": set()},
+            "definition": {"period": set(), "profit": set(), "average": set(), "efficiency": set()},
             "instance": {"period": set(), "profit": set(), "average": set(), "efficiency": set()},
             "stock": {"period": set(), "profit": set(), "average": set(), "efficiency": set()},
         }
@@ -2360,9 +2526,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             title = widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle")
             period = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
             period_spacer = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
-            parent_profit_column_spacer = widget.findChild(
+            identity_compensation = widget.findChild(
                 setting_window.QWidget,
-                "autoTradeSettingRoutineTreeParentProfitColumnSpacer",
+                "autoTradeSettingRoutineTreeIdentityXCompensation",
             )
             profit = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceProfit")
             average = widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformanceAverage")
@@ -2370,24 +2536,26 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             self.assertIsNotNone(title)
             if row_data["row_kind"] == "definition":
-                self.assertIsNone(period)
+                self.assertIsNotNone(period)
                 self.assertIsNone(period_spacer)
-                self.assertIsNotNone(parent_profit_column_spacer)
+                self.assertIsNone(identity_compensation)
             else:
                 self.assertIsNotNone(period)
                 self.assertIsNone(period_spacer)
-                self.assertIsNone(parent_profit_column_spacer)
+                self.assertIsNotNone(identity_compensation)
             self.assertIsNotNone(profit)
             self.assertIsNotNone(average)
             self.assertIsNotNone(efficiency)
-            if row_data["row_kind"] in {"instance", "stock"}:
-                self.assertGreater(
-                    period.mapTo(widget, period.rect().topLeft()).x(),
-                    title.mapTo(widget, title.rect().topLeft()).x() + title.width(),
-                )
-            labels = {"profit": profit, "average": average, "efficiency": efficiency}
-            if row_data["row_kind"] in {"instance", "stock"}:
-                labels["period"] = period
+            self.assertGreater(
+                period.mapTo(widget, period.rect().topLeft()).x(),
+                title.mapTo(widget, title.rect().topLeft()).x() + title.width(),
+            )
+            labels = {
+                "period": period,
+                "profit": profit,
+                "average": average,
+                "efficiency": efficiency,
+            }
             for key, label in labels.items():
                 x_values[str(row_data["row_kind"])][key].add(label.mapTo(widget, label.rect().topLeft()).x())
                 widths[key].add(label.width())

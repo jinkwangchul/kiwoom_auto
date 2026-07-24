@@ -2511,10 +2511,9 @@ class AutoTradeSettingWindow(QDialog):
             if len(source_rows) == 1
             else None
         )
-        profit_rate_text = (
-            format_signed_percent(profit_rate_value, digits=2)
-            if profit_rate_value is not None
-            else "-"
+        profit_rate_text = format_signed_percent(
+            profit_rate_value if profit_rate_value is not None else 0.0,
+            digits=2,
         )
         average_values = [
             float(source["average"])
@@ -2536,15 +2535,10 @@ class AutoTradeSettingWindow(QDialog):
             if average_rate_values
             else 0.0
         )
-        average_amount_text = (
-            format_signed_money(average_value)
-            if average_values
-            else "-"
-        )
-        average_rate_text = (
-            format_signed_percent(average_rate_value, digits=2)
-            if average_rate_values
-            else "-"
+        average_amount_text = format_signed_money(average_value)
+        average_rate_text = format_signed_percent(
+            average_rate_value,
+            digits=2,
         )
         efficiency_value = (
             source_rows[0].get("efficiency")
@@ -2554,7 +2548,7 @@ class AutoTradeSettingWindow(QDialog):
         try:
             efficiency_text = f"{float(efficiency_value):.1f}"
         except (TypeError, ValueError):
-            efficiency_text = "-"
+            efficiency_text = "0.0"
 
         return {
             "performance_period_text": f"기간({period_text})",
@@ -2726,7 +2720,6 @@ class AutoTradeSettingWindow(QDialog):
         is_stock = row_kind == "stock"
         is_historical_stock = is_stock and bool(row_data.get("is_historical", False))
         is_definition = row_kind == "definition"
-        has_period_metric = is_instance or is_stock
         container = QWidget()
         container.setFont(QFont(self.routine_table.font()))
         container.setFocusPolicy(Qt.NoFocus)
@@ -2869,18 +2862,18 @@ class AutoTradeSettingWindow(QDialog):
                 "key": "profit",
                 "object_name": "autoTradeSettingRoutineTreePerformanceProfit",
                 "label": "수익",
-                "left_fallback": "+0",
+                "left_fallback": "0",
                 "left_sample": "99,999,999",
-                "right_fallback": "0.0%",
+                "right_fallback": "0.00%",
                 "right_sample": "000.0%",
             },
             {
                 "key": "average",
                 "object_name": "autoTradeSettingRoutineTreePerformanceAverage",
                 "label": "평균",
-                "left_fallback": "+0",
+                "left_fallback": "0",
                 "left_sample": "99,999,999",
-                "right_fallback": "0.0%",
+                "right_fallback": "0.00%",
                 "right_sample": "00.0%",
             },
             {
@@ -2894,18 +2887,6 @@ class AutoTradeSettingWindow(QDialog):
             },
         )
         separator_width = container.fontMetrics().horizontalAdvance("|")
-
-        def _performance_metric_width(spec: dict[str, str]) -> int:
-            prefix_width = container.fontMetrics().horizontalAdvance(f"{spec['label']}(")
-            left_width = container.fontMetrics().horizontalAdvance(str(spec["left_sample"]))
-            close_width = container.fontMetrics().horizontalAdvance(")")
-            metric_width = prefix_width + left_width + close_width
-            if str(spec["right_sample"]):
-                metric_width += (
-                    container.fontMetrics().horizontalAdvance(" / ")
-                    + container.fontMetrics().horizontalAdvance(str(spec["right_sample"]))
-                )
-            return metric_width
 
         if is_definition:
             meta_group = QWidget()
@@ -2931,32 +2912,6 @@ class AutoTradeSettingWindow(QDialog):
             meta_layout.addWidget(routine_count_label, 0, Qt.AlignVCenter)
             meta_layout.addStretch(1)
             layout.addWidget(meta_group, 0, Qt.AlignVCenter)
-            period_width = _performance_metric_width(dict(performance_item_specs[0]))
-            instance_profit_x = (
-                28
-                + layout.spacing()
-                + 18
-                + layout.spacing()
-                + instance_title_width
-                + layout.spacing()
-                + period_width
-                + layout.spacing()
-                + separator_width
-                + layout.spacing()
-            )
-            parent_profit_base_x = 28 + layout.spacing() + meta_group.width()
-            parent_profit_spacer_width = max(
-                0,
-                instance_profit_x - parent_profit_base_x - (layout.spacing() * 2),
-            )
-            if parent_profit_spacer_width > 0:
-                parent_profit_spacer = QWidget()
-                parent_profit_spacer.setObjectName("autoTradeSettingRoutineTreeParentProfitColumnSpacer")
-                parent_profit_spacer.setFixedWidth(parent_profit_spacer_width)
-                parent_profit_spacer.setFocusPolicy(Qt.NoFocus)
-                parent_profit_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-                parent_profit_spacer.setProperty("autoTradeSettingParentSummaryMetric", True)
-                layout.addWidget(parent_profit_spacer, 0, Qt.AlignVCenter)
         else:
             if is_stock:
                 stock_title_spacer = QWidget()
@@ -2973,6 +2928,36 @@ class AutoTradeSettingWindow(QDialog):
                 stock_performance_spacer.setFocusPolicy(Qt.NoFocus)
                 stock_performance_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 layout.addWidget(stock_performance_spacer, 0, Qt.AlignVCenter)
+            parent_title_font = QFont(base_title_font)
+            parent_title_font.setPointSize(parent_title_font.pointSize() + 1)
+            parent_title_font.setWeight(QFont.DemiBold)
+            parent_identity_width = (
+                routine_tree_title_width(QFontMetrics(parent_title_font)) + 4 + 64
+            )
+            row_identity_width = 18 + layout.spacing() + instance_title_width
+            stock_identity_extra = (
+                AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION
+                + AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION
+                - (6 - horizontal_margin)
+                if is_stock
+                else 0
+            )
+            identity_compensation_width = max(
+                0,
+                parent_identity_width
+                - row_identity_width
+                - layout.spacing()
+                - stock_identity_extra,
+            )
+            if identity_compensation_width > 0:
+                identity_compensation = QWidget()
+                identity_compensation.setObjectName(
+                    "autoTradeSettingRoutineTreeIdentityXCompensation"
+                )
+                identity_compensation.setFixedWidth(identity_compensation_width)
+                identity_compensation.setFocusPolicy(Qt.NoFocus)
+                identity_compensation.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                layout.addWidget(identity_compensation, 0, Qt.AlignVCenter)
 
         def _metric_label(
             text: str,
@@ -2995,9 +2980,21 @@ class AutoTradeSettingWindow(QDialog):
 
         for index, spec in enumerate(performance_item_specs):
             key = str(spec["key"])
-            if key == "period" and not has_period_metric:
-                continue
-            if index > 0 and not (is_definition and key == "profit"):
+            if index > 0:
+                if is_stock:
+                    metric_gap_compensation = QWidget()
+                    metric_gap_compensation.setObjectName(
+                        "autoTradeSettingRoutineTreeMetricGapXCompensation"
+                    )
+                    metric_gap_compensation.setFixedWidth(
+                        4 - AUTO_TRADE_SETTING_STOCK_ROW_SPACING
+                    )
+                    metric_gap_compensation.setFocusPolicy(Qt.NoFocus)
+                    metric_gap_compensation.setAttribute(
+                        Qt.WA_TransparentForMouseEvents,
+                        True,
+                    )
+                    layout.addWidget(metric_gap_compensation, 0, Qt.AlignVCenter)
                 separator = QLabel("|")
                 separator.setObjectName("autoTradeSettingRoutineTreePerformanceSeparator")
                 separator.setAlignment(Qt.AlignCenter)
@@ -3436,8 +3433,8 @@ class AutoTradeSettingWindow(QDialog):
                 )
                 default_values = {
                     "period": ("0", ""),
-                    "profit": ("+0", "0.0%"),
-                    "average": ("+0", "0.0%"),
+                    "profit": ("0", "0.00%"),
+                    "average": ("0", "0.00%"),
                     "efficiency": ("0.0", ""),
                 }
                 left_fallback, right_fallback = default_values[metric]
