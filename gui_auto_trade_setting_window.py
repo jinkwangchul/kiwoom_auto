@@ -1250,6 +1250,7 @@ class AutoTradeSettingWindow(QDialog):
         self._routine_tree_display_scope = ""
         self._routine_tree_last_stock_scope = "all"
         self._routine_tree_display_criterion = "profit"
+        self._routine_tree_valid_only = False
         self._fixed_signals_connected = False
 
         self._setup_ui()
@@ -2870,6 +2871,30 @@ class AutoTradeSettingWindow(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
+        valid_button = QPushButton("유효", container)
+        valid_button.setObjectName("autoTradeSettingRoutineTreeValidBadge")
+        valid_button.setFocusPolicy(Qt.NoFocus)
+        valid_button.setCursor(Qt.PointingHandCursor)
+        valid_button.setCheckable(True)
+        valid_button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        valid_button.clicked.connect(self._set_routine_tree_valid_only)
+        layout.addWidget(valid_button, 0, Qt.AlignVCenter)
+
+        separators: list[QLabel] = []
+
+        def add_separator(object_name: str) -> None:
+            separator = QLabel("|", container)
+            separator.setObjectName(object_name)
+            separator.setAlignment(Qt.AlignCenter)
+            separator.setFixedSize(12, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+            separator.setFocusPolicy(Qt.NoFocus)
+            separator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            separator.setStyleSheet("background: transparent; color: #9CA3AF;")
+            layout.addWidget(separator, 0, Qt.AlignVCenter)
+            separators.append(separator)
+
+        add_separator("autoTradeSettingRoutineTreeValidSeparator")
+
         buttons: dict[str, QPushButton] = {}
         for level, text, object_name in (
             ("category", "그룹", "autoTradeSettingRoutineTreeCategoryLevelBadge"),
@@ -2888,7 +2913,7 @@ class AutoTradeSettingWindow(QDialog):
             layout.addWidget(button, 0, Qt.AlignVCenter)
             buttons[level] = button
 
-        layout.addSpacing(12)
+        add_separator("autoTradeSettingRoutineTreeLevelSeparator")
         scope_buttons: dict[str, QPushButton] = {}
         for scope, text, object_name in (
             ("all", "전체", "autoTradeSettingRoutineTreeAllScopeBadge"),
@@ -2906,7 +2931,7 @@ class AutoTradeSettingWindow(QDialog):
             layout.addWidget(button, 0, Qt.AlignVCenter)
             scope_buttons[scope] = button
 
-        layout.addSpacing(12)
+        add_separator("autoTradeSettingRoutineTreeScopeSeparator")
         criterion_buttons: dict[str, QPushButton] = {}
         for criterion, text, object_name in (
             ("period", "기간", "autoTradeSettingRoutineTreePeriodCriterionBadge"),
@@ -2928,6 +2953,8 @@ class AutoTradeSettingWindow(QDialog):
 
         container.setFixedSize(layout.sizeHint())
         self._routine_tree_display_level_badges = container
+        self._routine_tree_valid_button = valid_button
+        self._routine_tree_display_separators = tuple(separators)
         self._routine_tree_display_level_buttons = buttons
         self._routine_tree_display_scope_buttons = scope_buttons
         self._routine_tree_display_criterion_buttons = criterion_buttons
@@ -2992,6 +3019,23 @@ class AutoTradeSettingWindow(QDialog):
         container.raise_()
 
     def _update_routine_tree_display_level_badges(self) -> None:
+        valid_only = bool(getattr(self, "_routine_tree_valid_only", False))
+        valid_button = getattr(self, "_routine_tree_valid_button", None)
+        if valid_button is not None:
+            valid_button.setChecked(valid_only)
+            valid_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if valid_only
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            valid_button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=valid_color,
+                    border_color=valid_color,
+                )
+            )
+
         selected_level = str(getattr(self, "_routine_tree_display_level", "category") or "category")
         for level, button in getattr(self, "_routine_tree_display_level_buttons", {}).items():
             color = (
@@ -3062,6 +3106,12 @@ class AutoTradeSettingWindow(QDialog):
                 )
                 + disabled_style
             )
+
+    def _set_routine_tree_valid_only(self, enabled: bool) -> None:
+        self._routine_tree_valid_only = bool(enabled)
+        self._update_routine_tree_display_level_badges()
+        self._apply_routine_tree_collapse_visibility()
+        self.routine_table.viewport().update()
 
     def _set_routine_tree_display_scope(self, scope: str) -> None:
         clean_scope = str(scope or "").strip()
@@ -3302,9 +3352,15 @@ class AutoTradeSettingWindow(QDialog):
     def _apply_routine_tree_collapse_visibility(self) -> None:
         collapsed_definitions = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        valid_only = bool(getattr(self, "_routine_tree_valid_only", False))
+        display_level = str(
+            getattr(self, "_routine_tree_display_level", "category") or "category"
+        )
         current_definition_collapsed = False
+        current_definition_filtered = False
         current_instance_id = ""
         current_instance_collapsed = False
+        current_instance_filtered = False
         child_rows_visible = False
         definition_summary_rows: list[tuple[QWidget, bool, bool]] = []
         for row in range(self.routine_table.rowCount()):
@@ -3319,12 +3375,18 @@ class AutoTradeSettingWindow(QDialog):
             icon = widget.findChild(QLabel, "autoTradeSettingRoutineTreeIcon") if widget is not None else None
             if row_kind == "definition":
                 has_toggle_children = bool(metadata.get("has_toggle_children", True))
+                if display_level == "category":
+                    definition_valid = bool(metadata.get("has_instances", has_toggle_children))
+                else:
+                    definition_valid = bool(metadata.get("has_stocked_instances", False))
+                current_definition_filtered = valid_only and not definition_valid
                 if not has_toggle_children:
                     collapsed_definitions.discard(definition_id)
                 current_definition_collapsed = has_toggle_children and definition_id in collapsed_definitions
                 current_instance_id = ""
                 current_instance_collapsed = False
-                self.routine_table.setRowHidden(row, False)
+                current_instance_filtered = False
+                self.routine_table.setRowHidden(row, current_definition_filtered)
                 if icon is not None:
                     icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
                 if widget is not None:
@@ -3339,17 +3401,32 @@ class AutoTradeSettingWindow(QDialog):
             hidden_by_definition = current_definition_collapsed
             if row_kind == "instance":
                 has_toggle_children = bool(metadata.get("has_toggle_children", True))
+                current_instance_filtered = (
+                    valid_only
+                    and display_level in {"routine", "stock"}
+                    and not bool(metadata.get("has_displayable_stocks", False))
+                )
                 if not has_toggle_children:
                     collapsed_instances.discard(instance_id)
                 current_instance_id = instance_id
                 current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
-                self.routine_table.setRowHidden(row, hidden_by_definition)
-                child_rows_visible = child_rows_visible or not hidden_by_definition
+                row_hidden = (
+                    hidden_by_definition
+                    or current_definition_filtered
+                    or current_instance_filtered
+                )
+                self.routine_table.setRowHidden(row, row_hidden)
+                child_rows_visible = child_rows_visible or not row_hidden
                 if icon is not None:
                     icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
                 continue
             hidden_by_instance = bool(current_instance_id and instance_id == current_instance_id and current_instance_collapsed)
-            row_hidden = hidden_by_definition or hidden_by_instance
+            row_hidden = (
+                hidden_by_definition
+                or hidden_by_instance
+                or current_definition_filtered
+                or current_instance_filtered
+            )
             self.routine_table.setRowHidden(row, row_hidden)
             if row_kind == "stock":
                 child_rows_visible = child_rows_visible or not row_hidden
@@ -3398,6 +3475,15 @@ class AutoTradeSettingWindow(QDialog):
         for definition in definitions:
             definition_id = str(definition.definition_id)
             child_instances = instances_by_definition.get(definition_id, [])
+            display_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+            for instance in child_instances:
+                instance_id = str(instance.instance_id)
+                current_stocks = current_stocks_by_instance.get(instance_id, [])
+                historical_stocks = historical_stocks_by_instance.get(instance_id, [])
+                display_stocks = list(current_stocks)
+                if stock_data_scope == "all":
+                    display_stocks = current_stocks + historical_stocks
+                display_stocks_by_instance[instance_id] = display_stocks
             definition_stocks = [
                 stock
                 for instance in child_instances
@@ -3426,6 +3512,8 @@ class AutoTradeSettingWindow(QDialog):
                     "display_name": str(definition.display_name),
                     "tree_icon": "\u25b6" if is_collapsed or not has_definition_children else "\u25bc",
                     "has_toggle_children": has_definition_children,
+                    "has_instances": has_definition_children,
+                    "has_stocked_instances": any(display_stocks_by_instance.values()),
                     "instance_count": len(child_instances),
                     "registered": sum(
                         int(instance_counts.get(str(instance.instance_id), {}).get("registered", 0) or 0)
@@ -3463,6 +3551,7 @@ class AutoTradeSettingWindow(QDialog):
                     performance_source_cache,
                 )
                 has_instance_children = bool(current_stocks or historical_stocks)
+                visible_stocks = display_stocks_by_instance.get(instance_id, [])
                 if not has_instance_children:
                     collapsed_instances.discard(instance_id)
                 count = instance_counts.get(
@@ -3482,6 +3571,7 @@ class AutoTradeSettingWindow(QDialog):
                         "display_name": str(instance.display_name),
                         "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
                         "has_toggle_children": has_instance_children,
+                        "has_displayable_stocks": bool(visible_stocks),
                         "instance_group_top_gap": _index > 0,
                         "instance_count": 0,
                         "registered": int(count.get("registered", 0) or 0),
@@ -3498,9 +3588,6 @@ class AutoTradeSettingWindow(QDialog):
                         **instance_performance,
                     }
                 )
-                visible_stocks = list(current_stocks)
-                if stock_data_scope == "all":
-                    visible_stocks = current_stocks + historical_stocks
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
                     stock_performance = self._routine_tree_performance_texts(

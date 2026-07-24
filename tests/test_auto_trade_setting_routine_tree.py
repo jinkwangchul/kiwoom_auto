@@ -1,5 +1,6 @@
 ﻿import unittest
 import json
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MethodType, SimpleNamespace
@@ -76,6 +77,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_tree_display_scope = ""
         harness._routine_tree_last_stock_scope = "all"
         harness._routine_tree_display_criterion = "profit"
+        harness._routine_tree_valid_only = False
         for name in (
             "_setup_routine_table",
             "_routine_instance_stock_counts",
@@ -95,6 +97,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_setup_routine_tree_display_level_badges",
             "_position_routine_tree_display_level_badges",
             "_update_routine_tree_display_level_badges",
+            "_set_routine_tree_valid_only",
             "_set_routine_tree_display_scope",
             "_refresh_routine_tree_display_state",
             "_set_routine_tree_display_criterion",
@@ -454,6 +457,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self._app.processEvents()
 
         badges = window._routine_tree_display_level_buttons
+        valid_badge = window._routine_tree_valid_button
+        self.assertEqual("유효", valid_badge.text())
+        self.assertTrue(valid_badge.isCheckable())
+        self.assertFalse(valid_badge.isChecked())
+        self.assertEqual((64, 22), (valid_badge.width(), valid_badge.height()))
+        self.assertIn("color: #111827", valid_badge.styleSheet())
+        self.assertEqual(
+            ["|", "|", "|"],
+            [separator.text() for separator in window._routine_tree_display_separators],
+        )
         self.assertEqual({"category", "routine", "stock"}, set(badges))
         self.assertEqual(["그룹", "루틴", "종목"], [badges[level].text() for level in ("category", "routine", "stock")])
         for badge in badges.values():
@@ -499,6 +512,25 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("color: #16A34A", scopes["all"].styleSheet())
         self.assertTrue(all(button.isEnabled() for button in criteria.values()))
         self.assertEqual("all", window._routine_tree_display_scope)
+        selected_state = (
+            window._routine_tree_display_level,
+            window._routine_tree_display_scope,
+            window._routine_tree_display_criterion,
+        )
+        valid_badge.click()
+        self.assertTrue(window._routine_tree_valid_only)
+        self.assertTrue(valid_badge.isChecked())
+        self.assertIn("color: #16A34A", valid_badge.styleSheet())
+        self.assertEqual(
+            selected_state,
+            (
+                window._routine_tree_display_level,
+                window._routine_tree_display_scope,
+                window._routine_tree_display_criterion,
+            ),
+        )
+        valid_badge.click()
+        self.assertFalse(window._routine_tree_valid_only)
 
         badge_group = window._routine_tree_display_level_badges
         expected_x = window.routine_box.width() - layout.contentsMargins().right() - badge_group.width()
@@ -513,6 +545,119 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(table_geometry_before.x(), window.routine_table.geometry().x())
         self.assertEqual(table_geometry_before.width(), window.routine_table.geometry().width())
         self.assertEqual(table_geometry_before.bottom(), window.routine_table.geometry().bottom())
+
+    def test_valid_badge_filters_only_rows_without_required_children(self) -> None:
+        stocked_definition = self._definition()
+        empty_instance_definition = replace(
+            stocked_definition,
+            definition_id="empty_instance_group",
+            display_name="빈인스턴스그룹",
+        )
+        empty_definition = replace(
+            stocked_definition,
+            definition_id="empty_group",
+            display_name="빈그룹",
+        )
+        stocked_instance = self._instance("inst-stocked", "종목보유")
+        empty_instance = replace(
+            self._instance("inst-empty", "종목없음"),
+            definition_id="empty_instance_group",
+        )
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-stocked",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+        ]
+        window = self._window_harness()
+        window._routine_tree_display_level_buttons = {}
+        window._routine_tree_display_scope_buttons = {}
+        window._routine_tree_display_criterion_buttons = {}
+        window._routine_instance_operation_counts = lambda: {
+            "inst-stocked": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+            "inst-empty": {"registered": 0, "running": 0, "stopped": 0, "error": 0},
+        }
+
+        def visible_counts() -> dict[str, int]:
+            counts = {"definition": 0, "instance": 0, "stock": 0}
+            for row in range(window.routine_table.rowCount()):
+                metadata = window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)
+                if not window.routine_table.isRowHidden(row):
+                    counts[str(metadata["row_kind"])] += 1
+            return counts
+
+        with (
+            patch.object(
+                setting_window,
+                "load_routine_definitions",
+                return_value=[stocked_definition, empty_instance_definition, empty_definition],
+            ),
+            patch.object(
+                setting_window,
+                "load_persisted_routine_instances",
+                return_value=[stocked_instance, empty_instance],
+            ),
+            patch.object(setting_window, "read_base_stocks", return_value=stocks),
+            patch.object(setting_window, "read_orders_data", return_value=[]),
+        ):
+            window.load_routine_table()
+            window._set_routine_tree_display_level("category")
+            self.assertEqual(
+                {"definition": 3, "instance": 0, "stock": 0},
+                visible_counts(),
+            )
+
+            selected_state = (
+                window._routine_tree_display_level,
+                window._routine_tree_display_scope,
+                window._routine_tree_display_criterion,
+            )
+            window._set_routine_tree_valid_only(True)
+            self.assertEqual(
+                {"definition": 2, "instance": 0, "stock": 0},
+                visible_counts(),
+            )
+            self.assertEqual(
+                selected_state,
+                (
+                    window._routine_tree_display_level,
+                    window._routine_tree_display_scope,
+                    window._routine_tree_display_criterion,
+                ),
+            )
+
+            window._set_routine_tree_display_level("routine")
+            self.assertEqual(
+                {"definition": 1, "instance": 1, "stock": 0},
+                visible_counts(),
+            )
+
+            window._set_routine_tree_display_level("stock")
+            self.assertEqual(
+                {"definition": 1, "instance": 1, "stock": 1},
+                visible_counts(),
+            )
+            for scope in ("current", "all"):
+                window._set_routine_tree_display_scope(scope)
+                self.assertEqual(
+                    {"definition": 1, "instance": 1, "stock": 1},
+                    visible_counts(),
+                )
+
+            window.load_routine_table()
+            self.assertTrue(window._routine_tree_valid_only)
+            self.assertEqual(
+                {"definition": 1, "instance": 1, "stock": 1},
+                visible_counts(),
+            )
+
+            window._set_routine_tree_valid_only(False)
+            self.assertEqual(
+                {"definition": 3, "instance": 2, "stock": 1},
+                visible_counts(),
+            )
 
     def test_actual_window_badges_change_visible_hierarchy(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
