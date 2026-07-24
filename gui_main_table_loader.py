@@ -26,8 +26,10 @@ from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
 from gui_stock_data import stock_runtime_dir_for_routine
 from gui_order_utils import (
+    directional_value_color,
     pending_order_side_quantities,
     format_number_value,
+    format_signed_percent,
 )
 from gui_review_utils import average_price_from_state, current_price_from_state, safe_float_value
 from runtime_io import read_json_dict
@@ -606,16 +608,14 @@ def routine_instance_profit_text(
     except (TypeError, ValueError):
         return "수익(확인 필요 / 확인 필요)", "#374151"
     if cost_value > 0:
-        rate_text = _format_percent((profit_value / cost_value) * 100.0, digits=2, signed=True)
+        rate_text = format_signed_percent(
+            (profit_value / cost_value) * 100.0,
+            digits=2,
+        )
     else:
-        rate_text = "0.00%"
+        rate_text = format_signed_percent(0.0, digits=2)
     amount_text = _format_plain_amount(profit_value, signed=True)
-    if profit_value > 0:
-        color = "#DC2626"
-    elif profit_value < 0:
-        color = "#2563EB"
-    else:
-        color = "#374151"
+    color = directional_value_color(profit_value)
     return f"수익({amount_text} / {rate_text})", color
 
 

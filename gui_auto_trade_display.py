@@ -20,6 +20,15 @@ from PyQt5.QtCore import Qt, QRect
 from PyQt5.QtGui import QColor, QFont, QFontMetrics
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QTableWidgetItem, QWidget
 
+from gui_order_utils import (
+    DIRECTIONAL_NEGATIVE_COLOR,
+    DIRECTIONAL_NEUTRAL_COLOR,
+    DIRECTIONAL_POSITIVE_COLOR,
+    directional_value_color,
+    format_signed_money,
+    format_signed_percent,
+)
+
 SORT_ROLE = Qt.UserRole + 100
 
 
@@ -38,10 +47,10 @@ class SortableTableWidgetItem(QTableWidgetItem):
 
 
 ROUTINE_PROFIT_SIGNAL_COLORS = {
-    "LOSS": "#dc2626",
-    "COST_NOT_RECOVERED": "#d97706",
-    "NET_PROFIT": "#16a34a",
-    "NEUTRAL": "#9ca3af",
+    "LOSS": DIRECTIONAL_NEGATIVE_COLOR,
+    "COST_NOT_RECOVERED": DIRECTIONAL_POSITIVE_COLOR,
+    "NET_PROFIT": DIRECTIONAL_POSITIVE_COLOR,
+    "NEUTRAL": DIRECTIONAL_NEUTRAL_COLOR,
 }
 
 
@@ -57,16 +66,11 @@ def _format_plain_number(value: object) -> str:
 
 
 def _format_signed_amount(value: float) -> str:
-    rounded = int(round(value))
-    if rounded == 0:
-        return "0"
-    return f"{rounded:+,}"
+    return format_signed_money(float(int(round(value))))
 
 
 def _format_signed_rate(value: float) -> str:
-    if abs(value) < 0.005:
-        return "0.00%"
-    return f"{value:+.2f}%"
+    return format_signed_percent(value, digits=2)
 
 
 STOCK_POSITION_METRIC_SAMPLES = {
@@ -761,7 +765,7 @@ def routine_profit_signal(
         else:
             signal = "NET_PROFIT" if net_value > 0 else "COST_NOT_RECOVERED"
 
-    return signal, display_text, ROUTINE_PROFIT_SIGNAL_COLORS[signal]
+    return signal, display_text, directional_value_color(gross_value)
 
 
 def create_routine_profit_signal_widget(
@@ -779,6 +783,7 @@ def create_routine_profit_signal_widget(
 
     value_label = QLabel(display_text)
     value_label.setObjectName("routineProfitSignalValue")
+    value_label.setStyleSheet(f"color: {color};")
 
     if display_text != "-":
         dot_label = QLabel("●")

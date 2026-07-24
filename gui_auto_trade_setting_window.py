@@ -65,6 +65,8 @@ from gui_styles import (
 from gui_common_utils import safe_int_value, sanitize_path_part
 from gui_stock_data import active_routine_for_stock, stock_runtime_dir_for_routine
 from gui_order_utils import (
+    directional_value_color,
+    format_signed_percent,
     pending_order_side_quantities,
     order_value,
     order_status_display,
@@ -2407,8 +2409,6 @@ class AutoTradeSettingWindow(QDialog):
         stocks: list[dict[str, object]],
         source_cache: dict[str, dict[str, object]] | None = None,
     ) -> dict[str, str]:
-        from gui_main_table_loader import _format_percent
-
         cache = source_cache if source_cache is not None else {}
         source_rows: list[dict[str, object]] = []
         for stock in stocks:
@@ -2434,21 +2434,38 @@ class AutoTradeSettingWindow(QDialog):
         ]
         profit_value = sum(realized_values) if realized_values else 0.0
         profit_amount_text = format_signed_money(profit_value)
-        if profit_value == 0:
-            profit_amount_text = "+0"
 
         profit_rate_value = (
             source_rows[0].get("profit_rate")
             if len(source_rows) == 1
             else None
         )
-        profit_rate_text = _format_percent(
+        profit_rate_text = format_signed_percent(
             profit_rate_value if profit_rate_value is not None else 0.0,
-            digits=1,
-            signed=profit_rate_value not in (None, 0, 0.0),
+            digits=2,
         )
-        average_amount_text = "+0"
-        average_rate_text = _format_percent(0.0, digits=1)
+        average_values = [
+            float(source["average"])
+            for source in source_rows
+            if source.get("average") is not None
+        ]
+        average_value = (
+            sum(average_values) / len(average_values)
+            if average_values
+            else 0.0
+        )
+        average_rate_values = [
+            float(source["average_rate"])
+            for source in source_rows
+            if source.get("average_rate") is not None
+        ]
+        average_rate_value = (
+            sum(average_rate_values) / len(average_rate_values)
+            if average_rate_values
+            else 0.0
+        )
+        average_amount_text = format_signed_money(average_value)
+        average_rate_text = format_signed_percent(average_rate_value, digits=2)
         efficiency_value = (
             source_rows[0].get("efficiency")
             if len(source_rows) == 1
@@ -2471,9 +2488,14 @@ class AutoTradeSettingWindow(QDialog):
             "performance_period_value": period_text,
             "performance_profit_amount": profit_amount_text,
             "performance_profit_rate": profit_rate_text,
+            "performance_profit_color": directional_value_color(profit_value),
             "performance_average_amount": average_amount_text,
             "performance_average_rate": average_rate_text,
+            "performance_average_color": directional_value_color(average_value),
             "performance_efficiency_value": efficiency_text,
+            "performance_efficiency_color": directional_value_color(
+                efficiency_value
+            ),
         }
 
     def _routine_instance_operation_counts(self) -> dict[str, dict[str, object]]:
@@ -2870,7 +2892,13 @@ class AutoTradeSettingWindow(QDialog):
                 stock_performance_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 layout.addWidget(stock_performance_spacer, 0, Qt.AlignVCenter)
 
-        def _metric_label(text: str, object_name: str, width: int, alignment: Qt.AlignmentFlag) -> QLabel:
+        def _metric_label(
+            text: str,
+            object_name: str,
+            width: int,
+            alignment: Qt.AlignmentFlag,
+            color: str,
+        ) -> QLabel:
             label = QLabel(text)
             label.setObjectName(object_name)
             label.setAlignment(alignment)
@@ -2878,8 +2906,7 @@ class AutoTradeSettingWindow(QDialog):
             label.setFixedWidth(width)
             label.setFocusPolicy(Qt.NoFocus)
             label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            metric_color = stock_row_color if is_stock else "#6B7280"
-            label.setStyleSheet(f"background: transparent; color: {metric_color};")
+            label.setStyleSheet(f"background: transparent; color: {color};")
             if is_definition:
                 label.setProperty("autoTradeSettingParentSummaryMetric", True)
             return label
@@ -2909,6 +2936,13 @@ class AutoTradeSettingWindow(QDialog):
                 str(spec["left_fallback"]),
                 str(spec["right_fallback"]),
             )
+            metric_color = (
+                str(row_data.get(f"performance_{key}_color", "") or "")
+                if key in {"profit", "average", "efficiency"}
+                else ""
+            )
+            if not metric_color:
+                metric_color = stock_row_color if is_stock else "#6B7280"
             metric_widget = QWidget()
             metric_widget.setObjectName(str(spec["object_name"]))
             metric_widget.setFocusPolicy(Qt.NoFocus)
@@ -2928,6 +2962,7 @@ class AutoTradeSettingWindow(QDialog):
                     f"{spec['object_name']}Label",
                     prefix_width,
                     Qt.AlignLeft | Qt.AlignVCenter,
+                    metric_color,
                 ),
                 0,
                 Qt.AlignVCenter,
@@ -2938,6 +2973,7 @@ class AutoTradeSettingWindow(QDialog):
                     f"{spec['object_name']}LeftValue",
                     left_width,
                     Qt.AlignRight | Qt.AlignVCenter,
+                    metric_color,
                 ),
                 0,
                 Qt.AlignVCenter,
@@ -2952,6 +2988,7 @@ class AutoTradeSettingWindow(QDialog):
                         f"{spec['object_name']}Slash",
                         slash_width,
                         Qt.AlignCenter | Qt.AlignVCenter,
+                        metric_color,
                     ),
                     0,
                     Qt.AlignVCenter,
@@ -2962,6 +2999,7 @@ class AutoTradeSettingWindow(QDialog):
                         f"{spec['object_name']}RightValue",
                         right_width,
                         Qt.AlignRight | Qt.AlignVCenter,
+                        metric_color,
                     ),
                     0,
                     Qt.AlignVCenter,
@@ -2973,6 +3011,7 @@ class AutoTradeSettingWindow(QDialog):
                     f"{spec['object_name']}Close",
                     close_width,
                     Qt.AlignCenter | Qt.AlignVCenter,
+                    metric_color,
                 ),
                 0,
                 Qt.AlignVCenter,

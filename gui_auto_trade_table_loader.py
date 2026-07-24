@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import QMessageBox
 
 from gui_common_utils import safe_int_value
 from gui_order_utils import (
+    directional_value_color,
     pending_order_side_quantities,
 )
 from gui_config_utils import default_config
@@ -559,6 +560,8 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     )
                 if col == 4:
                     apply_auto_trade_setting_activity_style(item, status_cell_active)
+                if col == 9:
+                    item.setForeground(QColor(directional_value_color(profit_amount)))
 
                 if col in (0, 2, 3, 5, 6, 7, 8, 9, 10):
                     item.setTextAlignment(Qt.AlignCenter)

@@ -14,6 +14,13 @@ from PyQt5.QtWidgets import QApplication, QDialog, QHeaderView, QLabel, QLineEdi
 
 import gui_main_table_loader
 import gui_windows
+from gui_order_utils import (
+    DIRECTIONAL_NEGATIVE_COLOR,
+    DIRECTIONAL_NEUTRAL_COLOR,
+    DIRECTIONAL_POSITIVE_COLOR,
+    directional_value_color,
+    format_signed_percent,
+)
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 from gui_auto_trade_display import (
     RatioMetricDisplay,
@@ -261,19 +268,19 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_instance_profit_text(
                 profit_amount=35_200,
                 cost_basis=1_248_227,
-            )[0],
-            "수익(+35,200 / +2.82%)",
+            ),
+            ("수익(+35,200 / +2.82%)", DIRECTIONAL_POSITIVE_COLOR),
         )
         self.assertEqual(
             routine_instance_profit_text(
                 profit_amount=-12_500,
                 cost_basis=1_250_000,
-            )[0],
-            "수익(-12,500 / -1.00%)",
+            ),
+            ("수익(-12,500 / -1.00%)", DIRECTIONAL_NEGATIVE_COLOR),
         )
         self.assertEqual(
-            routine_instance_profit_text(profit_amount=0, cost_basis=0)[0],
-            "수익(0 / 0.00%)",
+            routine_instance_profit_text(profit_amount=0, cost_basis=0),
+            ("수익(0 / 0.00%)", DIRECTIONAL_NEUTRAL_COLOR),
         )
         self.assertEqual(
             routine_instance_profit_text(
@@ -283,6 +290,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )[0],
             "수익(확인 필요 / 확인 필요)",
         )
+        self.assertEqual(DIRECTIONAL_POSITIVE_COLOR, directional_value_color("+1,250"))
+        self.assertEqual(DIRECTIONAL_NEGATIVE_COLOR, directional_value_color("-325"))
+        self.assertEqual(DIRECTIONAL_NEUTRAL_COLOR, directional_value_color("0.00"))
+        self.assertEqual("+3.25%", format_signed_percent(3.25))
+        self.assertEqual("-1.40%", format_signed_percent(-1.4))
+        self.assertEqual("0.00%", format_signed_percent(0))
+        self.assertEqual("0.00%", format_signed_percent(-0.004))
 
     def test_instance_stock_counts_aggregate_instance_usage_and_profit(self) -> None:
         instance = RoutineInstanceRecord(
@@ -1513,7 +1527,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual("65.4%", consumed_rate.text())
         self.assertEqual("+35,200", profit_amount.text())
         self.assertEqual("+2.82%", profit_rate.text())
-        self.assertIn("color: #DC2626", profit_amount.styleSheet())
+        self.assertIn(f"color: {DIRECTIONAL_POSITIVE_COLOR}", profit_amount.styleSheet())
+        self.assertIn(f"color: {DIRECTIONAL_POSITIVE_COLOR}", profit_rate.styleSheet())
         column_widths = gui_main_table_loader.routine_instance_grid_columns(
             status_widget.font()
         )
@@ -2394,6 +2409,158 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertEqual(2, window.routine_table.rowCount())
                 self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
                 self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
+            finally:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+
+    def test_actual_main_window_renders_directional_profit_contract(self) -> None:
+        definition = RoutineDefinitionRecord(
+            definition_id="directional_fixture",
+            display_name="손익색상검증",
+            package_dir=Path("fixture"),
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="fixture",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="fixture",
+        )
+        instances = [
+            RoutineInstanceRecord(
+                instance_id=f"directional-{name}",
+                definition_id=definition.definition_id,
+                display_name=display_name,
+                source_routine_name=definition.display_name,
+                persisted=True,
+                source="PERSISTED",
+                enabled=False,
+                real_trade_allowed=False,
+                rules_path=Path(f"{name}.json"),
+                schema_version="1.0",
+            )
+            for name, display_name in (
+                ("positive", "양수 인스턴스"),
+                ("negative", "음수 인스턴스"),
+                ("zero", "중립 인스턴스"),
+            )
+        ]
+        counts = {
+            "directional-positive": {
+                "registered": 1,
+                "running": 0,
+                "stopped": 1,
+                "error": 0,
+                "consumed_amount": 0,
+                "consumed_unknown": False,
+                "profit_amount": 125000,
+                "profit_cost_basis": 3846153.846,
+                "profit_unknown": False,
+                "stocks": [],
+            },
+            "directional-negative": {
+                "registered": 1,
+                "running": 0,
+                "stopped": 1,
+                "error": 0,
+                "consumed_amount": 0,
+                "consumed_unknown": False,
+                "profit_amount": -48000,
+                "profit_cost_basis": 3428571.429,
+                "profit_unknown": False,
+                "stocks": [],
+            },
+            "directional-zero": {
+                "registered": 1,
+                "running": 0,
+                "stopped": 1,
+                "error": 0,
+                "consumed_amount": 0,
+                "consumed_unknown": False,
+                "profit_amount": 0,
+                "profit_cost_basis": 0,
+                "profit_unknown": False,
+                "stocks": [],
+            },
+        }
+        api = SimpleNamespace(
+            unavailable_reason=lambda: "test double",
+            login_state_changed=None,
+            raw_chejan_received=None,
+        )
+
+        with (
+            patch.object(gui_windows, "KiwoomApi", return_value=api),
+            patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
+            patch.object(
+                gui_windows.MainWindow,
+                "refresh_startup_recovery_status",
+                return_value={},
+            ),
+            patch.object(gui_windows.MainWindow, "refresh_all"),
+            patch.object(gui_windows.MainWindow, "load_running_stock_table"),
+            patch.object(
+                gui_main_table_loader,
+                "load_routine_definitions",
+                return_value=[definition],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=instances,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_stock_counts_from_base_stocks",
+                return_value={},
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_instance_stock_counts",
+                return_value=counts,
+            ),
+        ):
+            window = gui_windows.MainWindow()
+            try:
+                gui_main_table_loader.main_load_routine_table(window)
+                window.resize(1280, 720)
+                window.show()
+                self.app.processEvents()
+
+                expected = (
+                    ("+125,000", "+3.25%", DIRECTIONAL_POSITIVE_COLOR),
+                    ("-48,000", "-1.40%", DIRECTIONAL_NEGATIVE_COLOR),
+                    ("0", "0.00%", DIRECTIONAL_NEUTRAL_COLOR),
+                )
+                right_edges = set()
+                for row, (amount, rate, color) in enumerate(expected, start=1):
+                    widget = window.routine_table.cellWidget(row, 1)
+                    amount_label = widget.findChild(
+                        QLabel,
+                        "routineInstanceProfitAmount",
+                    )
+                    rate_label = widget.findChild(
+                        QLabel,
+                        "routineInstanceProfitRate",
+                    )
+                    self.assertEqual(amount, amount_label.text())
+                    self.assertEqual(rate, rate_label.text())
+                    self.assertIn(f"color: {color}", amount_label.styleSheet())
+                    self.assertIn(f"color: {color}", rate_label.styleSheet())
+                    right_edges.add(
+                        rate_label.mapTo(widget, rate_label.rect().topRight()).x()
+                    )
+                self.assertEqual(1, len(right_edges))
+
+                screenshot_path = os.environ.get(
+                    "MAIN_DIRECTIONAL_PROFIT_SCREENSHOT_PATH",
+                    "",
+                ).strip()
+                if screenshot_path:
+                    self.assertTrue(window.grab().save(screenshot_path))
             finally:
                 window.close()
                 window.deleteLater()

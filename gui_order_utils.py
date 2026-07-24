@@ -564,12 +564,44 @@ def format_money(value: float) -> str:
     return f"{value:,.2f}"
 
 
+DIRECTIONAL_POSITIVE_COLOR = "#2563EB"
+DIRECTIONAL_NEGATIVE_COLOR = "#DC2626"
+DIRECTIONAL_NEUTRAL_COLOR = "#374151"
+
+
+def directional_value_color(value: object) -> str:
+    try:
+        numeric_value = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return DIRECTIONAL_NEUTRAL_COLOR
+    if numeric_value > 0:
+        return DIRECTIONAL_POSITIVE_COLOR
+    if numeric_value < 0:
+        return DIRECTIONAL_NEGATIVE_COLOR
+    return DIRECTIONAL_NEUTRAL_COLOR
+
+
 def format_signed_money(value: float) -> str:
     if value > 0:
         return f"+{format_money(value)}"
     if value < 0:
         return f"-{format_money(abs(value))}"
     return "0"
+
+
+def format_signed_percent(value: object, *, digits: int = 2) -> str:
+    try:
+        numeric_value = round(
+            float(str(value).replace(",", "").strip()),
+            digits,
+        )
+    except (TypeError, ValueError):
+        return "-"
+    if numeric_value > 0:
+        return f"+{numeric_value:.{digits}f}%"
+    if numeric_value < 0:
+        return f"-{abs(numeric_value):.{digits}f}%"
+    return f"{0.0:.{digits}f}%"
 
 
 def settlement_summary_text(orders: list[dict[str, object]]) -> str:
@@ -723,4 +755,3 @@ def build_full_trade_export_text(
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
-

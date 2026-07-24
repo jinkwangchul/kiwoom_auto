@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gui_order_utils import directional_value_color
 from gui_stock_register_window import StockRegisterWindow
 from gui_review_required_window import GlobalReviewRequiredWindow
 from gui_main_emergency_ops import (
@@ -440,12 +441,17 @@ def _draw_routine_stock_metric_text_sequence(
     layout_rows: list[tuple[str, int, int, int, int]] = []
     hidden_value_indexes = hidden_value_indexes or set()
     for index, (text, metric_rect, rects) in enumerate(zip(texts, metric_rects, component_rects)):
+        original_pen = painter.pen()
+        if index == 2:
+            _label, left_value, _right_value = _split_main_stock_metric_text(text)
+            painter.setPen(QColor(directional_value_color(left_value)))
         _draw_main_stock_metric_components(
             painter,
             text,
             rects,
             hide_left_value=index in hidden_value_indexes,
         )
+        painter.setPen(original_pen)
         text_start = metric_rect.left()
         text_end = metric_rect.left() + metric_rect.width()
         if index < len(separator_rects):
