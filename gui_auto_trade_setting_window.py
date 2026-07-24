@@ -436,6 +436,14 @@ def routine_tree_title_text(display_name: object) -> str:
     return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}..."
 
 
+def routine_tree_instance_title_text(display_name: object) -> str:
+    """인스턴스 이름은 7자까지 표시하고 8자부터 6자로 축약한다."""
+    text = str(display_name or "").strip()
+    if len(text) <= 7:
+        return text
+    return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}..."
+
+
 def routine_tree_title_width(font_metrics) -> int:
     samples = (
         "가" * ROUTINE_TREE_TITLE_DISPLAY_CHARS,
@@ -2555,7 +2563,11 @@ class AutoTradeSettingWindow(QDialog):
             if can_install_event_filter:
                 icon_label.installEventFilter(self)
         raw_title_text = str(row_data.get("display_name", "") or text)
-        title_text = routine_tree_title_text(raw_title_text)
+        title_text = (
+            routine_tree_instance_title_text(raw_title_text)
+            if is_instance
+            else routine_tree_title_text(raw_title_text)
+        )
         title_label = QLabel(title_text)
         title_label.setObjectName("autoTradeSettingRoutineTreeTitle")
         title_label.setAlignment(

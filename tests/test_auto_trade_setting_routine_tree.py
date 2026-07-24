@@ -1561,12 +1561,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ("동전주", "동전주"),
             ("네글자명", "네글자명"),
             ("지표추종매매", "지표추종매매"),
-            ("지표추종매매B", "지표추종매매..."),
+            ("지표추종매매B", "지표추종매매B"),
             ("지표추종매매BC", "지표추종매매..."),
+            ("지표추종매매01", "지표추종매매..."),
             ("아주긴자동매매루틴", "아주긴자동매..."),
             ("123456", "123456"),
-            ("1234567", "123456..."),
+            ("1234567", "1234567"),
             ("12345678", "123456..."),
+            ("AB12가나다", "AB12가나다"),
+            ("AB12가나다라", "AB12가나..."),
         ]
         title_x_values = set()
         title_widths = set()
@@ -1606,7 +1609,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual(setting_window.QSizePolicy.Fixed, title.sizePolicy().horizontalPolicy())
             self.assertEqual(setting_window.Qt.AlignCenter | setting_window.Qt.AlignVCenter, title.alignment())
             text_width = title.fontMetrics().horizontalAdvance(title.text())
-            if len(display_name) <= 6:
+            self.assertLessEqual(text_width, title.contentsRect().width())
+            if len(display_name) <= 7:
                 left_padding = (title.width() - text_width) // 2
                 right_padding = title.width() - text_width - left_padding
                 self.assertLessEqual(abs(left_padding - right_padding), 1)
