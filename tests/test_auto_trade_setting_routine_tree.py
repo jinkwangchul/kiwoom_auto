@@ -1991,13 +1991,44 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         self.assertFalse(badge_rect.intersects(window.routine_table.geometry()))
         self.assertGreaterEqual(window.routine_table.geometry().y(), badge_rect.bottom() + 1)
+        window.selected_routine_instance_count_badge.setText("루틴3")
+        window.selected_routine_instance_count_badge.setVisible(True)
+        window.show()
+        self._app.processEvents()
+        window._position_routine_tree_display_level_badges()
+        self._app.processEvents()
+        badge_center_y = window._routine_tree_display_level_badges.mapTo(
+            window,
+            window._routine_tree_display_level_badges.rect().center(),
+        ).y()
+        status_center_y = window.selected_routine_status_bar.mapTo(
+            window,
+            window.selected_routine_status_bar.rect().center(),
+        ).y()
+        self.assertLessEqual(abs(badge_center_y - status_center_y), 1)
+        self.assertEqual(
+            window._routine_tree_display_level_badges.height(),
+            window.selected_routine_status_bar.height(),
+        )
+        aligned_controls = (
+            *window._routine_tree_display_level_buttons.values(),
+            *window._routine_tree_display_scope_buttons.values(),
+            *window._routine_tree_display_criterion_buttons.values(),
+            window.selected_routine_signal_label,
+            window.selected_routine_name_button,
+            window.selected_routine_instance_count_badge,
+            *window.selected_routine_status_buttons.values(),
+            window.btn_early_close,
+            window.btn_stop,
+        )
+        for control in aligned_controls:
+            with self.subTest(control=control.objectName()):
+                control_center_y = control.mapTo(window, control.rect().center()).y()
+                self.assertLessEqual(abs(control_center_y - status_center_y), 1)
 
         window.routine_table.setRowCount(1)
         first_item = setting_window.QTableWidgetItem("첫 번째 루틴")
         window.routine_table.setItem(0, 0, first_item)
-        window.show()
-        self._app.processEvents()
-        window._position_routine_tree_display_level_badges()
         self._app.processEvents()
         first_row_rect = window.routine_table.visualItemRect(first_item)
         first_row_y = window.routine_table.viewport().mapTo(

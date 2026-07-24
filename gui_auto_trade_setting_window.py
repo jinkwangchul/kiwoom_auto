@@ -2924,6 +2924,14 @@ class AutoTradeSettingWindow(QDialog):
             return
         routine_layout = routine_box.layout()
         right_margin = routine_layout.contentsMargins().right() if routine_layout is not None else 0
+        control_row_top = routine_box.contentsRect().top()
+        status_bar = getattr(self, "selected_routine_status_bar", None)
+        if status_bar is not None and status_bar.parentWidget() is not None:
+            status_bar_top = routine_box.mapFromGlobal(
+                status_bar.mapToGlobal(status_bar.rect().topLeft())
+            ).y()
+            control_row_top = status_bar_top
+            container.setFixedHeight(status_bar.height())
         if routine_layout is not None:
             margins = routine_layout.contentsMargins()
             required_top_margin = container.height()
@@ -2946,7 +2954,7 @@ class AutoTradeSettingWindow(QDialog):
                 routine_layout.activate()
         container.move(
             max(0, routine_box.width() - right_margin - container.width()),
-            routine_box.contentsRect().top(),
+            control_row_top,
         )
         container.raise_()
 
