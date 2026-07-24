@@ -2062,8 +2062,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window,
             window.selected_routine_status_bar.rect().bottomLeft(),
         ).y()
-        self.assertIn(first_row_y - badge_bottom_y - 1, range(2, 5))
-        self.assertIn(stock_header_y - status_bottom_y - 1, range(2, 5))
+        self.assertIn(first_row_y - badge_bottom_y - 1, range(6, 9))
+        self.assertIn(stock_header_y - status_bottom_y - 1, range(6, 9))
         self.assertEqual(
             window.routine_table.geometry().bottom(),
             window.stock_table.geometry().bottom(),
