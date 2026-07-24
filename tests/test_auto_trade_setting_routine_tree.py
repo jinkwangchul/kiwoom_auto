@@ -2048,7 +2048,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         routine_title_gap = badge_rect.top() - routine_label_rect.bottom() - 1
         stock_title_gap = status_rect.top() - stock_label_rect.bottom() - 1
         self.assertEqual(routine_title_gap, stock_title_gap)
-        self.assertIn(routine_title_gap, range(5, 8))
+        self.assertIn(routine_title_gap, range(7, 10))
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
             badge_rect.height(),
@@ -2062,8 +2062,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window,
             window.selected_routine_status_bar.rect().bottomLeft(),
         ).y()
-        self.assertIn(first_row_y - badge_bottom_y - 1, range(6, 9))
-        self.assertIn(stock_header_y - status_bottom_y - 1, range(6, 9))
+        self.assertIn(first_row_y - badge_bottom_y - 1, range(8, 11))
+        self.assertIn(stock_header_y - status_bottom_y - 1, range(8, 11))
         self.assertEqual(
             window.routine_table.geometry().bottom(),
             window.stock_table.geometry().bottom(),
