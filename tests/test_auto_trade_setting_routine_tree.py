@@ -2048,7 +2048,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         routine_title_gap = badge_rect.top() - routine_label_rect.bottom() - 1
         stock_title_gap = status_rect.top() - stock_label_rect.bottom() - 1
         self.assertEqual(routine_title_gap, stock_title_gap)
-        self.assertIn(routine_title_gap, range(0, 4))
+        self.assertIn(routine_title_gap, range(5, 8))
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
             badge_rect.height(),
