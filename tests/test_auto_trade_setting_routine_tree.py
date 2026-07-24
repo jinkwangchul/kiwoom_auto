@@ -91,6 +91,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_set_routine_tree_display_scope",
             "_refresh_routine_tree_display_state",
             "_set_routine_tree_display_criterion",
+            "_apply_routine_tree_display_level_command",
             "_set_routine_tree_display_level",
             "_toggle_routine_definition_collapsed",
             "_toggle_routine_instance_collapsed",
@@ -426,8 +427,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         level_buttons["category"].click()
         level_buttons["stock"].click()
         self._app.processEvents()
-        self.assertEqual({"definition": 1, "instance": 1, "stock": 0}, _visible_counts())
-        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        self.assertEqual({"definition": 1, "instance": 1, "stock": 1}, _visible_counts())
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
 
     def test_tree_display_level_changes_visible_hierarchy_and_preserves_collapse(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-empty", "빈 인스턴스")]
@@ -450,6 +451,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
                 patch.object(setting_window, "read_base_stocks", return_value=stocks):
             window.load_routine_table()
+            window._set_routine_tree_display_level("category")
 
             def _visible_counts() -> dict[str, int]:
                 counts = {"definition": 0, "instance": 0, "stock": 0}
@@ -482,14 +484,132 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window._set_routine_tree_display_level("category")
             window._set_routine_tree_display_level("stock")
             self.assertEqual(
-                {"definition": 1, "instance": 2, "stock": 0},
+                {"definition": 1, "instance": 2, "stock": 1},
                 _visible_counts(),
             )
 
         self.assertEqual("stock", window._routine_tree_display_level)
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        self.assertFalse(window.routine_table.isRowHidden(2))
+
+    def test_level_badges_apply_once_and_arrows_remain_authoritative(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+        ]
+        window = self._window_harness()
+        window._routine_tree_display_level_buttons = {}
+        window._routine_tree_display_scope_buttons = {}
+        window._routine_tree_display_criterion_buttons = {}
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window.load_routine_table()
+
+        definition_icon = window.routine_table.cellWidget(0, 0).findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeIcon",
+        )
+        instance_icon = window.routine_table.cellWidget(1, 0).findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeIcon",
+        )
+
+        window._set_routine_tree_display_level("category")
+        self.assertEqual({"indicator_follow"}, window._collapsed_auto_trade_definition_ids)
+        self.assertEqual("▶", definition_icon.text())
+        self.assertTrue(window.routine_table.isRowHidden(1))
+        self.assertTrue(window.routine_table.isRowHidden(2))
+
+        window._toggle_routine_definition_collapsed("indicator_follow")
+        self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+        self.assertEqual("▼", definition_icon.text())
+        self.assertFalse(window.routine_table.isRowHidden(1))
+        window._refresh_routine_tree_display_state()
+        window.routine_table.viewport().update()
+        self.assertEqual("▼", definition_icon.text())
+        self.assertFalse(window.routine_table.isRowHidden(1))
+
+        window._set_routine_tree_display_level("routine")
+        self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
         self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        self.assertEqual("▼", definition_icon.text())
+        self.assertEqual("▶", instance_icon.text())
         self.assertFalse(window.routine_table.isRowHidden(1))
         self.assertTrue(window.routine_table.isRowHidden(2))
+
+        window._toggle_routine_instance_collapsed("inst-a")
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertEqual("▼", instance_icon.text())
+        self.assertFalse(window.routine_table.isRowHidden(2))
+        window._refresh_routine_tree_display_state()
+        window.routine_table.viewport().update()
+        self.assertEqual("▼", instance_icon.text())
+        self.assertFalse(window.routine_table.isRowHidden(2))
+
+        window._toggle_routine_instance_collapsed("inst-a")
+        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        self.assertEqual("▶", instance_icon.text())
+        self.assertTrue(window.routine_table.isRowHidden(2))
+
+        window._set_routine_tree_display_level("stock")
+        self.assertEqual(set(), window._collapsed_auto_trade_definition_ids)
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertEqual("▼", definition_icon.text())
+        self.assertEqual("▼", instance_icon.text())
+        self.assertFalse(window.routine_table.isRowHidden(2))
+
+    def test_empty_definition_keeps_default_performance_visible(self) -> None:
+        empty_definition = RoutineDefinitionRecord(
+            definition_id="review",
+            display_name="등록확인루틴",
+            package_dir=Path("routines") / "review",
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="review_routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="routine.json",
+        )
+        window = self._window_harness()
+        window._routine_instance_operation_counts = lambda: {}
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[empty_definition]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=[]), \
+                patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+            window._set_routine_tree_display_level("category")
+
+        widget = window.routine_table.cellWidget(0, 0)
+        icon = widget.findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeIcon",
+        )
+        self.assertEqual("▶", icon.text())
+        for object_name, expected in (
+            ("autoTradeSettingRoutineTreePerformanceProfitLeftValue", "+0"),
+            ("autoTradeSettingRoutineTreePerformanceProfitRightValue", "0.0%"),
+            ("autoTradeSettingRoutineTreePerformanceAverageLeftValue", "+0"),
+            ("autoTradeSettingRoutineTreePerformanceAverageRightValue", "0.0%"),
+            ("autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue", "0.0"),
+        ):
+            label = widget.findChild(setting_window.QLabel, object_name)
+            self.assertIsNotNone(label)
+            self.assertFalse(label.isHidden())
+            self.assertEqual(expected, label.text())
 
     def test_tree_display_scope_and_metric_are_independent_and_preserve_collapse(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -681,8 +801,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("2", stock_period.text())
             self.assertEqual("+0", instance_average.text())
             self.assertEqual("0.0", instance_efficiency.text())
-            self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
-            self.assertTrue(window.routine_table.isRowHidden(2))
+            self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+            self.assertFalse(window.routine_table.isRowHidden(2))
 
     def test_routine_tree_performance_formatter_contract(self) -> None:
         window = self._window_harness()
@@ -1898,18 +2018,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window._set_routine_tree_display_level("stock")
             window._set_routine_tree_display_scope("all")
 
-        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
+        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
         stock_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
         self.assertEqual("all", stock_row["display_scope"])
         self.assertFalse(window.routine_table.isRowHidden(1))
-        self.assertTrue(window.routine_table.isRowHidden(2))
+        self.assertFalse(window.routine_table.isRowHidden(2))
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
                 patch.object(setting_window, "read_base_stocks", return_value=stocks):
             window._toggle_routine_instance_collapsed("inst-a")
 
-        self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
+        self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
         self.assertEqual(5, window.routine_table.rowCount())
 
     def test_stock_status_filter_limits_loaded_stock_rows_by_existing_status_rules(self) -> None:

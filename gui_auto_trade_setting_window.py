@@ -3065,6 +3065,45 @@ class AutoTradeSettingWindow(QDialog):
         self._update_routine_tree_display_level_badges()
         self._refresh_routine_tree_display_state()
 
+    def _apply_routine_tree_display_level_command(self, level: str) -> None:
+        clean_level = str(level or "").strip()
+        collapsed_definitions = set(
+            getattr(self, "_collapsed_auto_trade_definition_ids", set())
+        )
+        collapsed_instances = set(
+            getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        )
+        definition_ids: set[str] = set()
+        instance_ids: set[str] = set()
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict) or not bool(
+                metadata.get("has_toggle_children", True)
+            ):
+                continue
+            row_kind = str(metadata.get("row_kind", "") or "")
+            if row_kind == "definition":
+                definition_id = str(metadata.get("definition_id", "") or "").strip()
+                if definition_id:
+                    definition_ids.add(definition_id)
+            elif row_kind == "instance":
+                instance_id = str(metadata.get("instance_id", "") or "").strip()
+                if instance_id:
+                    instance_ids.add(instance_id)
+
+        if clean_level == "category":
+            collapsed_definitions.update(definition_ids)
+        elif clean_level == "routine":
+            collapsed_definitions.difference_update(definition_ids)
+            collapsed_instances.update(instance_ids)
+        elif clean_level == "stock":
+            collapsed_definitions.difference_update(definition_ids)
+            collapsed_instances.difference_update(instance_ids)
+
+        self._collapsed_auto_trade_definition_ids = collapsed_definitions
+        self._collapsed_auto_trade_instance_ids = collapsed_instances
+
     def _set_routine_tree_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
         if clean_level not in {"category", "routine", "stock"}:
@@ -3088,6 +3127,7 @@ class AutoTradeSettingWindow(QDialog):
         supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA[clean_level]
         if str(getattr(self, "_routine_tree_display_criterion", "profit") or "profit") not in supported_criteria:
             self._routine_tree_display_criterion = "profit"
+        self._apply_routine_tree_display_level_command(clean_level)
         self._update_routine_tree_display_level_badges()
         self._refresh_routine_tree_display_state()
 
@@ -3178,9 +3218,6 @@ class AutoTradeSettingWindow(QDialog):
     def _apply_routine_tree_collapse_visibility(self) -> None:
         collapsed_definitions = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
-        display_level = str(
-            getattr(self, "_routine_tree_display_level", "category") or "category"
-        )
         current_definition_collapsed = False
         current_instance_id = ""
         current_instance_collapsed = False
@@ -3206,7 +3243,10 @@ class AutoTradeSettingWindow(QDialog):
                     icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
                 if widget is not None:
                     widget.setProperty("autoTradeSettingRoutineTreeSummaryPinned", current_definition_collapsed)
-                    self._set_routine_tree_parent_summary_visible(widget, current_definition_collapsed)
+                    self._set_routine_tree_parent_summary_visible(
+                        widget,
+                        current_definition_collapsed or not has_toggle_children,
+                    )
                 continue
             hidden_by_definition = current_definition_collapsed
             if row_kind == "instance":
@@ -3215,10 +3255,7 @@ class AutoTradeSettingWindow(QDialog):
                     collapsed_instances.discard(instance_id)
                 current_instance_id = instance_id
                 current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
-                self.routine_table.setRowHidden(
-                    row,
-                    hidden_by_definition or display_level == "category",
-                )
+                self.routine_table.setRowHidden(row, hidden_by_definition)
                 if icon is not None:
                     icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
                 continue
@@ -3227,7 +3264,6 @@ class AutoTradeSettingWindow(QDialog):
                 row,
                 hidden_by_definition
                 or hidden_by_instance
-                or display_level != "stock",
             )
 
     def load_routine_table(self) -> None:
