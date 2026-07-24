@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from copy import deepcopy
 from datetime import date, datetime, timedelta
@@ -393,6 +394,19 @@ AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_HISTORICAL_STOCK_ROW_TEXT_COLOR = "#9CA3AF"
+AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV = (
+    "KIWOOM_AUTO_HISTORICAL_STOCK_FIXTURE"
+)
+AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_CANDIDATES = (
+    ("000660", "SK하이닉스"),
+    ("005490", "POSCO홀딩스"),
+    ("009150", "삼성전기"),
+    ("034730", "SK"),
+    ("207940", "삼성바이오로직스"),
+    ("267250", "HD현대"),
+    ("329180", "HD현대중공업"),
+    ("373220", "LG에너지솔루션"),
+)
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
     0: 80,    # 코드: 6자리 여유
     1: 205,   # 종목: 13자 기준
@@ -1260,6 +1274,7 @@ class AutoTradeSettingWindow(QDialog):
         self._routine_tree_last_stock_scope = "all"
         self._routine_tree_display_criterion = "profit"
         self._routine_tree_valid_only = False
+        self._hidden_historical_stock_fixture_keys: set[tuple[str, str]] = set()
         self._fixed_signals_connected = False
 
         self._setup_ui()
@@ -2270,6 +2285,53 @@ class AutoTradeSettingWindow(QDialog):
                     "is_historical": True,
                 }
             )
+        if str(
+            os.environ.get(AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV, "")
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            current_stocks_by_instance = self._current_stocks_by_instance()
+            hidden_fixture_keys = getattr(
+                self,
+                "_hidden_historical_stock_fixture_keys",
+                set(),
+            )
+            existing_keys = {
+                (
+                    instance_id,
+                    str(stock.get("stock_code", "") or "").strip(),
+                )
+                for instance_id, stocks in stocks_by_instance.items()
+                for stock in stocks
+            }
+            for instance in load_persisted_routine_instances():
+                instance_id = str(instance.instance_id)
+                current_codes = {
+                    str(stock.get("stock_code", "") or "").strip()
+                    for stock in current_stocks_by_instance.get(instance_id, [])
+                }
+                fixture_count = 0
+                for stock_code, stock_name in (
+                    AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_CANDIDATES
+                ):
+                    fixture_key = (instance_id, stock_code)
+                    if (
+                        stock_code in current_codes
+                        or fixture_key in existing_keys
+                        or fixture_key in hidden_fixture_keys
+                    ):
+                        continue
+                    stocks_by_instance.setdefault(instance_id, []).append(
+                        {
+                            "instance_id": instance_id,
+                            "stock_path": "",
+                            "stock_code": stock_code,
+                            "stock_name": stock_name,
+                            "is_historical": True,
+                            "is_development_fixture": True,
+                        }
+                    )
+                    fixture_count += 1
+                    if fixture_count == 5:
+                        break
         for stocks in stocks_by_instance.values():
             stocks.sort(
                 key=lambda item: (
@@ -3697,6 +3759,9 @@ class AutoTradeSettingWindow(QDialog):
                             "first_stock_for_instance": stock_index == 0,
                             "tree_icon": "\u25aa" if is_historical else "\u2713",
                             "is_historical": is_historical,
+                            "is_development_fixture": bool(
+                                stock.get("is_development_fixture", False)
+                            ),
                             **stock_performance,
                         }
                     )
@@ -4087,6 +4152,16 @@ class AutoTradeSettingWindow(QDialog):
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
+            return
+        if bool(metadata.get("is_development_fixture", False)):
+            hidden_fixture_keys = getattr(
+                self,
+                "_hidden_historical_stock_fixture_keys",
+                set(),
+            )
+            hidden_fixture_keys.add((instance_id, stock_code))
+            self._hidden_historical_stock_fixture_keys = hidden_fixture_keys
+            self.load_routine_table()
             return
         if not StockRepository(PROJECT_ROOT).hide_routine_assignment_history(
             code=stock_code,

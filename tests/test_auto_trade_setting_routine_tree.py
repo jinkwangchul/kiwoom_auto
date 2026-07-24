@@ -1,6 +1,7 @@
 ﻿import unittest
 import json
 from dataclasses import replace
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MethodType, SimpleNamespace
@@ -78,6 +79,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_tree_last_stock_scope = "all"
         harness._routine_tree_display_criterion = "profit"
         harness._routine_tree_valid_only = False
+        harness._hidden_historical_stock_fixture_keys = set()
         for name in (
             "_setup_routine_table",
             "_setup_stock_table",
@@ -2865,6 +2867,72 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         menu.addAction.assert_called_once_with("표시삭제")
         hide_display.assert_called_once_with(item.data(Qt.UserRole))
 
+    def test_development_historical_fixture_is_explicit_and_nonpersistent(self) -> None:
+        window = self._window_harness()
+        instances = [
+            self._instance("inst-a", "A 인스턴스"),
+            self._instance("inst-b", "B 인스턴스"),
+        ]
+        window._current_stocks_by_instance = lambda: {
+            "inst-a": [
+                {
+                    "stock_code": "000660",
+                    "stock_name": "SK하이닉스",
+                    "stock_path": "stocks/000660_SK하이닉스",
+                }
+            ]
+        }
+        repository = MagicMock()
+        repository.list_routine_assignment_history.return_value = []
+
+        with (
+            patch.object(setting_window, "StockRepository", return_value=repository),
+            patch.object(
+                setting_window,
+                "load_persisted_routine_instances",
+                return_value=instances,
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "1",
+                },
+            ),
+        ):
+            historical = window._historical_stocks_by_instance()
+
+        self.assertEqual({"inst-a", "inst-b"}, set(historical))
+        self.assertTrue(all(3 <= len(stocks) <= 5 for stocks in historical.values()))
+        self.assertNotIn(
+            "000660",
+            {stock["stock_code"] for stock in historical["inst-a"]},
+        )
+        self.assertTrue(
+            all(
+                stock["is_historical"] and stock["is_development_fixture"]
+                for stocks in historical.values()
+                for stock in stocks
+            )
+        )
+        repository.list_routine_assignment_history.assert_called_once_with()
+        repository.hide_routine_assignment_history.assert_not_called()
+
+    def test_development_historical_fixture_is_disabled_by_default(self) -> None:
+        window = self._window_harness()
+        repository = MagicMock()
+        repository.list_routine_assignment_history.return_value = []
+
+        with (
+            patch.object(setting_window, "StockRepository", return_value=repository),
+            patch.dict(
+                os.environ,
+                {
+                    setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "",
+                },
+            ),
+        ):
+            self.assertEqual({}, window._historical_stocks_by_instance())
+
     def test_historical_stock_display_delete_only_updates_history_visibility(self) -> None:
         window = self._window_harness()
         window.load_routine_table = MagicMock()
@@ -2891,6 +2959,35 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             code="005930",
             instance_id="inst-a",
         )
+        window.load_routine_table.assert_called_once_with()
+
+    def test_development_fixture_display_delete_is_session_only(self) -> None:
+        window = self._window_harness()
+        window.load_routine_table = MagicMock()
+        repository = MagicMock()
+        metadata = {
+            "row_kind": "stock",
+            "instance_id": "inst-a",
+            "stock_code": "005490",
+            "display_name": "POSCO홀딩스",
+            "is_historical": True,
+            "is_development_fixture": True,
+        }
+        with (
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+            patch.object(setting_window, "StockRepository", return_value=repository),
+        ):
+            window.hide_historical_stock_display(metadata)
+
+        self.assertEqual(
+            {("inst-a", "005490")},
+            window._hidden_historical_stock_fixture_keys,
+        )
+        repository.hide_routine_assignment_history.assert_not_called()
         window.load_routine_table.assert_called_once_with()
 
     def test_historical_stock_display_delete_cancel_is_noop(self) -> None:
