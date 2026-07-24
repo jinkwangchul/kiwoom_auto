@@ -379,11 +379,10 @@ AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
 AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
-AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED = False
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
-    "category": frozenset({"profit"}),
-    "routine": frozenset({"period", "profit"}),
-    "stock": frozenset({"period", "profit"}),
+    "category": frozenset({"profit", "average", "efficiency"}),
+    "routine": frozenset({"period", "profit", "average", "efficiency"}),
+    "stock": frozenset({"period", "profit", "average", "efficiency"}),
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
@@ -2857,10 +2856,7 @@ class AutoTradeSettingWindow(QDialog):
         selected_scope = str(
             getattr(self, "_routine_tree_display_scope", "") or ""
         )
-        scope_enabled = (
-            selected_level == "stock"
-            and AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED
-        )
+        scope_enabled = selected_level == "stock"
         disabled_style = (
             "QPushButton:disabled, QPushButton:disabled:hover {"
             " background-color: transparent;"
@@ -2916,8 +2912,6 @@ class AutoTradeSettingWindow(QDialog):
     def _set_routine_tree_display_scope(self, scope: str) -> None:
         clean_scope = str(scope or "").strip()
         if clean_scope not in {"all", "current"}:
-            return
-        if not AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
             return
         if str(getattr(self, "_routine_tree_display_level", "category") or "category") != "stock":
             return
@@ -2986,6 +2980,7 @@ class AutoTradeSettingWindow(QDialog):
                 left_label.setText(left_value)
                 if right_label is not None:
                     right_label.setText(right_value)
+        self._apply_routine_tree_collapse_visibility()
         self.routine_table.viewport().update()
 
     def _set_routine_tree_display_criterion(self, criterion: str) -> None:
@@ -3007,7 +3002,7 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         self._routine_tree_display_level = clean_level
-        if clean_level == "stock" and AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
+        if clean_level == "stock":
             restored_scope = str(
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
@@ -3114,6 +3109,9 @@ class AutoTradeSettingWindow(QDialog):
     def _apply_routine_tree_collapse_visibility(self) -> None:
         collapsed_definitions = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
+        display_level = str(
+            getattr(self, "_routine_tree_display_level", "category") or "category"
+        )
         current_definition_collapsed = False
         current_instance_id = ""
         current_instance_collapsed = False
@@ -3148,12 +3146,20 @@ class AutoTradeSettingWindow(QDialog):
                     collapsed_instances.discard(instance_id)
                 current_instance_id = instance_id
                 current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
-                self.routine_table.setRowHidden(row, hidden_by_definition)
+                self.routine_table.setRowHidden(
+                    row,
+                    hidden_by_definition or display_level == "category",
+                )
                 if icon is not None:
                     icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
                 continue
             hidden_by_instance = bool(current_instance_id and instance_id == current_instance_id and current_instance_collapsed)
-            self.routine_table.setRowHidden(row, hidden_by_definition or hidden_by_instance)
+            self.routine_table.setRowHidden(
+                row,
+                hidden_by_definition
+                or hidden_by_instance
+                or display_level != "stock",
+            )
 
     def load_routine_table(self) -> None:
         current_metadata = self.current_selected_routine_row_metadata()
@@ -3173,9 +3179,7 @@ class AutoTradeSettingWindow(QDialog):
             getattr(self, "_routine_tree_display_scope", "") or ""
         )
         stock_data_scope = selected_scope
-        if not AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
-            stock_data_scope = "current"
-        elif stock_data_scope not in {"all", "current"}:
+        if stock_data_scope not in {"all", "current"}:
             stock_data_scope = str(
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
