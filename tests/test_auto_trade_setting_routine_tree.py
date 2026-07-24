@@ -6,8 +6,14 @@ from types import MethodType
 from unittest.mock import patch
 
 from PyQt5.QtCore import QObject
+from PyQt5.QtGui import QMouseEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QAbstractItemView, QTableWidget
+from PyQt5.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QStyleOptionGroupBox,
+    QTableWidget,
+)
 
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 
@@ -645,6 +651,121 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.routine_table.viewport().update()
         self._app.processEvents()
         _assert_default_summary_visible()
+
+    def test_empty_definition_summary_follows_visible_tree_depth(self) -> None:
+        empty_definition = RoutineDefinitionRecord(
+            definition_id="review",
+            display_name="등록확인루틴",
+            package_dir=Path("routines") / "review",
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="review_routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="routine.json",
+        )
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+        window._routine_instance_operation_counts = lambda: {}
+
+        with patch.object(
+            setting_window,
+            "load_routine_definitions",
+            return_value=[self._definition(), empty_definition],
+        ), patch.object(
+            setting_window,
+            "load_persisted_routine_instances",
+            return_value=instances,
+        ), patch.object(setting_window, "read_base_stocks", return_value=[]):
+            window.load_routine_table()
+        window.show()
+        self._app.processEvents()
+
+        def _definition_widget(definition_id: str):
+            for row in range(window.routine_table.rowCount()):
+                item = window.routine_table.item(row, 0)
+                metadata = item.data(setting_window.Qt.UserRole)
+                if (
+                    metadata["row_kind"] == "definition"
+                    and metadata["definition_id"] == definition_id
+                ):
+                    return window.routine_table.cellWidget(row, 0)
+            self.fail(f"definition row not found: {definition_id}")
+
+        def _summary_widgets(widget):
+            return [
+                child
+                for child in widget.findChildren(setting_window.QWidget)
+                if child.property("autoTradeSettingParentSummaryMetric")
+            ]
+
+        indicator_widget = _definition_widget("indicator_follow")
+        review_widget = _definition_widget("review")
+        review_title = review_widget.findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeTitle",
+        )
+
+        window._set_routine_tree_display_level("category")
+        self._app.processEvents()
+        self.assertTrue(
+            bool(review_widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+        )
+        self.assertTrue(all(not child.isHidden() for child in _summary_widgets(review_widget)))
+
+        window._set_routine_tree_display_level("routine")
+        self._app.processEvents()
+        self.assertFalse(
+            bool(review_widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+        )
+        self.assertTrue(all(child.isHidden() for child in _summary_widgets(review_widget)))
+        self.assertFalse(
+            bool(indicator_widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+        )
+
+        hover_position = review_title.mapTo(review_widget, review_title.rect().center())
+        self._app.sendEvent(
+            review_widget,
+            QMouseEvent(
+                setting_window.QEvent.MouseMove,
+                hover_position,
+                setting_window.Qt.NoButton,
+                setting_window.Qt.NoButton,
+                setting_window.Qt.NoModifier,
+            ),
+        )
+        self._app.processEvents()
+        self.assertTrue(all(not child.isHidden() for child in _summary_widgets(review_widget)))
+
+        self._app.sendEvent(
+            review_widget,
+            setting_window.QEvent(setting_window.QEvent.Leave),
+        )
+        self._app.processEvents()
+        self.assertTrue(all(child.isHidden() for child in _summary_widgets(review_widget)))
+
+        window._toggle_routine_definition_collapsed("indicator_follow")
+        self._app.processEvents()
+        self.assertTrue(
+            bool(review_widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+        )
+        self.assertTrue(all(not child.isHidden() for child in _summary_widgets(review_widget)))
+
+        window._toggle_routine_definition_collapsed("indicator_follow")
+        window._refresh_routine_tree_display_state()
+        window.routine_table.viewport().update()
+        self._app.processEvents()
+        self.assertFalse(
+            bool(review_widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+        )
+        self.assertTrue(all(child.isHidden() for child in _summary_widgets(review_widget)))
 
     def test_tree_display_scope_and_metric_are_independent_and_preserve_collapse(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -1761,7 +1882,84 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         workspace_layout = window.strategy_workspace_widget.layout()
         self.assertEqual(window.stock_box, workspace_layout.itemAt(0).widget())
         self.assertEqual(1, workspace_layout.count())
-        self.assertEqual("Stock List", window.stock_box.title())
+        self.assertEqual("자동매매운영실적", window.routine_box.title())
+        self.assertEqual("등록종목상태", window.stock_box.title())
+        self.assertEqual(window.routine_box.font(), window.stock_box.font())
+        self.assertEqual(window.routine_box.alignment(), window.stock_box.alignment())
+        self.assertEqual(setting_window.Qt.AlignLeft, window.routine_box.alignment())
+        self.assertEqual(window.routine_box.isFlat(), window.stock_box.isFlat())
+        self.assertFalse(window.routine_box.isFlat())
+        routine_margins = window.routine_box.layout().contentsMargins()
+        stock_margins = window.stock_box.layout().contentsMargins()
+        self.assertEqual(
+            (
+                routine_margins.left(),
+                routine_margins.top(),
+                routine_margins.right(),
+                routine_margins.bottom(),
+            ),
+            (
+                stock_margins.left(),
+                stock_margins.top(),
+                stock_margins.right(),
+                stock_margins.bottom(),
+            ),
+        )
+        self.assertEqual(window.routine_box.styleSheet(), window.stock_box.styleSheet())
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE,
+            window.routine_box.styleSheet(),
+        )
+
+        def _group_box_rects(group_box):
+            option = QStyleOptionGroupBox()
+            option.initFrom(group_box)
+            option.text = group_box.title()
+            option.lineWidth = 1
+            option.subControls = (
+                setting_window.QStyle.SC_GroupBoxFrame
+                | setting_window.QStyle.SC_GroupBoxLabel
+            )
+            style = group_box.style()
+            return (
+                style.subControlRect(
+                    setting_window.QStyle.CC_GroupBox,
+                    option,
+                    setting_window.QStyle.SC_GroupBoxLabel,
+                    group_box,
+                ),
+                style.subControlRect(
+                    setting_window.QStyle.CC_GroupBox,
+                    option,
+                    setting_window.QStyle.SC_GroupBoxFrame,
+                    group_box,
+                ),
+                style.subControlRect(
+                    setting_window.QStyle.CC_GroupBox,
+                    option,
+                    setting_window.QStyle.SC_GroupBoxContents,
+                    group_box,
+                ),
+            )
+
+        routine_label_rect, routine_frame_rect, routine_contents_rect = _group_box_rects(
+            window.routine_box
+        )
+        stock_label_rect, stock_frame_rect, stock_contents_rect = _group_box_rects(
+            window.stock_box
+        )
+        self.assertEqual(
+            (routine_label_rect.x(), routine_label_rect.y(), routine_label_rect.height()),
+            (stock_label_rect.x(), stock_label_rect.y(), stock_label_rect.height()),
+        )
+        self.assertEqual(
+            (routine_frame_rect.y(), routine_frame_rect.height()),
+            (stock_frame_rect.y(), stock_frame_rect.height()),
+        )
+        self.assertEqual(
+            (routine_contents_rect.y(), routine_contents_rect.height()),
+            (stock_contents_rect.y(), stock_contents_rect.height()),
+        )
 
     def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]

@@ -405,6 +405,20 @@ AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X = 4
 AUTO_TRADE_SETTING_STOCK_ROW_SPACING = 2
 AUTO_TRADE_SETTING_STOCK_TITLE_X_COMPENSATION = 4
 AUTO_TRADE_SETTING_STOCK_PERFORMANCE_X_COMPENSATION = 4
+AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE = (
+    "QGroupBox {"
+    " border: 1px solid #9CA3AF;"
+    " margin-top: 9px;"
+    " padding-top: 9px;"
+    "}"
+    " QGroupBox::title {"
+    " subcontrol-origin: margin;"
+    " subcontrol-position: top left;"
+    " left: 4px;"
+    " padding: 0 4px;"
+    " background-color: palette(window);"
+    "}"
+)
 
 
 def routine_tree_title_text(display_name: object) -> str:
@@ -1249,7 +1263,7 @@ class AutoTradeSettingWindow(QDialog):
         main_layout = QVBoxLayout()
         button_layout = QHBoxLayout()
 
-        routine_box = QGroupBox("자동매매 루틴")
+        routine_box = QGroupBox("자동매매운영실적")
         routine_box.setObjectName("autoTradeSettingRoutineGroup")
         routine_layout = QVBoxLayout()
         self._setup_routine_table()
@@ -1259,7 +1273,7 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_box = routine_box
         self._setup_routine_tree_display_level_badges()
 
-        self.stock_box = QGroupBox("Stock List")
+        self.stock_box = QGroupBox("등록종목상태")
         self.stock_box.setObjectName("autoTradeSettingStockGroup")
         stock_layout = QVBoxLayout()
         self._setup_selected_routine_status_bar()
@@ -1285,6 +1299,10 @@ class AutoTradeSettingWindow(QDialog):
         stock_layout.addLayout(selected_routine_header_layout)
         stock_layout.addWidget(self.stock_table)
         self.stock_box.setLayout(stock_layout)
+        for group_box in (routine_box, self.stock_box):
+            group_box.setAlignment(Qt.AlignLeft)
+            group_box.setFlat(False)
+            group_box.setStyleSheet(AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE)
 
         workspace_widget = QWidget()
         workspace_widget.setObjectName("autoTradeSettingStockWorkspace")
@@ -3221,6 +3239,8 @@ class AutoTradeSettingWindow(QDialog):
         current_definition_collapsed = False
         current_instance_id = ""
         current_instance_collapsed = False
+        child_rows_visible = False
+        definition_summary_rows: list[tuple[QWidget, bool, bool]] = []
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             metadata = item.data(Qt.UserRole) if item is not None else None
@@ -3242,16 +3262,12 @@ class AutoTradeSettingWindow(QDialog):
                 if icon is not None:
                     icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
                 if widget is not None:
-                    summary_visible = (
-                        current_definition_collapsed or not has_toggle_children
-                    )
-                    widget.setProperty(
-                        "autoTradeSettingRoutineTreeSummaryPinned",
-                        summary_visible,
-                    )
-                    self._set_routine_tree_parent_summary_visible(
-                        widget,
-                        summary_visible,
+                    definition_summary_rows.append(
+                        (
+                            widget,
+                            has_toggle_children,
+                            current_definition_collapsed,
+                        )
                     )
                 continue
             hidden_by_definition = current_definition_collapsed
@@ -3262,14 +3278,29 @@ class AutoTradeSettingWindow(QDialog):
                 current_instance_id = instance_id
                 current_instance_collapsed = has_toggle_children and instance_id in collapsed_instances
                 self.routine_table.setRowHidden(row, hidden_by_definition)
+                child_rows_visible = child_rows_visible or not hidden_by_definition
                 if icon is not None:
                     icon.setText("\u25b6" if current_instance_collapsed or not has_toggle_children else "\u25bc")
                 continue
             hidden_by_instance = bool(current_instance_id and instance_id == current_instance_id and current_instance_collapsed)
-            self.routine_table.setRowHidden(
-                row,
-                hidden_by_definition
-                or hidden_by_instance
+            row_hidden = hidden_by_definition or hidden_by_instance
+            self.routine_table.setRowHidden(row, row_hidden)
+            if row_kind == "stock":
+                child_rows_visible = child_rows_visible or not row_hidden
+
+        for widget, has_toggle_children, definition_collapsed in definition_summary_rows:
+            summary_visible = (
+                definition_collapsed
+                if has_toggle_children
+                else not child_rows_visible
+            )
+            widget.setProperty(
+                "autoTradeSettingRoutineTreeSummaryPinned",
+                summary_visible,
+            )
+            self._set_routine_tree_parent_summary_visible(
+                widget,
+                summary_visible,
             )
 
     def load_routine_table(self) -> None:
