@@ -584,7 +584,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             package_enabled=True,
             source_name="routine.json",
         )
-        window = self._window_harness()
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {}
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[empty_definition]), \
@@ -592,6 +596,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(setting_window, "read_base_stocks", return_value=[]):
             window.load_routine_table()
             window._set_routine_tree_display_level("category")
+        window.show()
+        self._app.processEvents()
 
         widget = window.routine_table.cellWidget(0, 0)
         icon = widget.findChild(
@@ -599,17 +605,46 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "autoTradeSettingRoutineTreeIcon",
         )
         self.assertEqual("▶", icon.text())
-        for object_name, expected in (
+        count_badge = widget.findChild(
+            setting_window.QLabel,
+            "autoTradeSettingRoutineTreeInstanceCount",
+        )
+        self.assertEqual("루틴0", count_badge.text())
+
+        expected_labels = (
             ("autoTradeSettingRoutineTreePerformanceProfitLeftValue", "+0"),
             ("autoTradeSettingRoutineTreePerformanceProfitRightValue", "0.0%"),
             ("autoTradeSettingRoutineTreePerformanceAverageLeftValue", "+0"),
             ("autoTradeSettingRoutineTreePerformanceAverageRightValue", "0.0%"),
             ("autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue", "0.0"),
-        ):
-            label = widget.findChild(setting_window.QLabel, object_name)
-            self.assertIsNotNone(label)
-            self.assertFalse(label.isHidden())
-            self.assertEqual(expected, label.text())
+        )
+
+        def _assert_default_summary_visible() -> None:
+            self.assertTrue(
+                bool(widget.property("autoTradeSettingRoutineTreeSummaryPinned"))
+            )
+            for object_name, expected in expected_labels:
+                label = widget.findChild(setting_window.QLabel, object_name)
+                self.assertIsNotNone(label)
+                self.assertFalse(label.isHidden())
+                self.assertTrue(label.isVisible())
+                self.assertGreater(label.width(), 0)
+                self.assertEqual(expected, label.text())
+
+        _assert_default_summary_visible()
+        self._app.sendEvent(widget, setting_window.QEvent(setting_window.QEvent.Leave))
+        self._app.processEvents()
+        _assert_default_summary_visible()
+
+        for level in ("routine", "stock", "category"):
+            window._set_routine_tree_display_level(level)
+            self._app.processEvents()
+            _assert_default_summary_visible()
+
+        window._refresh_routine_tree_display_state()
+        window.routine_table.viewport().update()
+        self._app.processEvents()
+        _assert_default_summary_visible()
 
     def test_tree_display_scope_and_metric_are_independent_and_preserve_collapse(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]

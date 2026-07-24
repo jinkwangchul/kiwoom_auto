@@ -3242,10 +3242,16 @@ class AutoTradeSettingWindow(QDialog):
                 if icon is not None:
                     icon.setText("\u25b6" if current_definition_collapsed or not has_toggle_children else "\u25bc")
                 if widget is not None:
-                    widget.setProperty("autoTradeSettingRoutineTreeSummaryPinned", current_definition_collapsed)
+                    summary_visible = (
+                        current_definition_collapsed or not has_toggle_children
+                    )
+                    widget.setProperty(
+                        "autoTradeSettingRoutineTreeSummaryPinned",
+                        summary_visible,
+                    )
                     self._set_routine_tree_parent_summary_visible(
                         widget,
-                        current_definition_collapsed or not has_toggle_children,
+                        summary_visible,
                     )
                 continue
             hidden_by_definition = current_definition_collapsed
