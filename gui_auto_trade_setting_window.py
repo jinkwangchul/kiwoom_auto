@@ -79,7 +79,10 @@ from gui_order_utils import (
     today_orders,
     build_current_status_rows,
     build_full_trade_export_text,
+    numeric_order_value,
+    order_datetime,
     order_sort_key,
+    summarize_orders,
 )
 from gui_order_status_window import OrderStatusWindow
 from gui_log_view_window import LogViewWindow
@@ -2193,6 +2196,71 @@ class AutoTradeSettingWindow(QDialog):
             stocks.sort(key=lambda item: (str(item.get("stock_name", "")), str(item.get("stock_code", ""))))
         return stocks_by_instance
 
+    def _routine_tree_stock_performance_source(
+        self,
+        stock: dict[str, object],
+    ) -> dict[str, object]:
+        stock_path = Path(str(stock.get("stock_path", "") or "").strip())
+        if not stock_path.is_absolute():
+            stock_path = Path(__file__).resolve().parent / stock_path
+        orders = read_orders_data(stock_path / "orders.json")
+        filled_orders = [
+            order
+            for order in orders
+            if numeric_order_value(order, ["filled_qty", "filled", "executed_qty"], 0.0) > 0
+        ]
+        trade_dates = {
+            parsed.date()
+            for order in filled_orders
+            if (parsed := order_datetime(order)) is not None
+        }
+        realized_pnl: float | None = None
+        if filled_orders:
+            realized_pnl = float(summarize_orders(orders).get("realized_pnl", 0.0) or 0.0)
+        return {
+            "trade_days": len(trade_dates) if trade_dates else None,
+            "realized_pnl": realized_pnl,
+        }
+
+    def _routine_tree_performance_texts(
+        self,
+        stocks: list[dict[str, object]],
+        source_cache: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, str]:
+        cache = source_cache if source_cache is not None else {}
+        source_rows: list[dict[str, object]] = []
+        for stock in stocks:
+            cache_key = str(stock.get("stock_path", "") or "").strip()
+            if cache_key not in cache:
+                cache[cache_key] = self._routine_tree_stock_performance_source(stock)
+            source_rows.append(cache[cache_key])
+        trade_days = [
+            int(source.get("trade_days", 0) or 0)
+            for source in source_rows
+            if int(source.get("trade_days", 0) or 0) > 0
+        ]
+        period_text = "-"
+        if len(stocks) == 1 and trade_days:
+            period_text = str(trade_days[0])
+        elif len(stocks) > 1 and trade_days:
+            period_text = str(safe_int_value(sum(trade_days) / len(trade_days), 0))
+
+        realized_values = [
+            float(source["realized_pnl"])
+            for source in source_rows
+            if source.get("realized_pnl") is not None
+        ]
+        profit_text = "-"
+        if realized_values:
+            profit_text = format_number_value(sum(realized_values))
+
+        return {
+            "performance_period_text": f"기간({period_text})",
+            "performance_profit_text": f"수익({profit_text} / -)",
+            "performance_average_text": "평균(- / -)",
+            "performance_efficiency_text": "효율(-)",
+        }
+
     def _routine_instance_operation_counts(self) -> dict[str, dict[str, object]]:
         from gui_main_table_loader import _instance_stock_counts
 
@@ -2280,6 +2348,24 @@ class AutoTradeSettingWindow(QDialog):
                 " background-color: #FFFFFF;"
                 "}"
             )
+
+    def _routine_tree_metric_text_parts(
+        self,
+        raw_text: object,
+        left_fallback: str,
+        right_fallback: str,
+    ) -> tuple[str, str]:
+        text = str(raw_text or "").strip()
+        if text:
+            open_index = text.find("(")
+            close_index = text.rfind(")")
+            if open_index >= 0 and close_index > open_index:
+                inside = text[open_index + 1:close_index]
+                if " / " in inside:
+                    left, right = inside.split(" / ", 1)
+                    return left.strip() or left_fallback, right.strip() or right_fallback
+                return inside.strip() or left_fallback, right_fallback
+        return left_fallback, right_fallback
 
     def _routine_tree_row_widget(self, row_data: dict[str, object], text: str) -> QWidget:
         row_kind = str(row_data.get("row_kind", "") or "")
@@ -2525,19 +2611,6 @@ class AutoTradeSettingWindow(QDialog):
                 stock_performance_spacer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 layout.addWidget(stock_performance_spacer, 0, Qt.AlignVCenter)
 
-        def _performance_metric_text_parts(key: str, left_fallback: str, right_fallback: str) -> tuple[str, str]:
-            raw_text = str(row_data.get(f"performance_{key}_text", "") or "").strip()
-            if raw_text:
-                open_index = raw_text.find("(")
-                close_index = raw_text.rfind(")")
-                if open_index >= 0 and close_index > open_index:
-                    inside = raw_text[open_index + 1:close_index]
-                    if " / " in inside:
-                        left, right = inside.split(" / ", 1)
-                        return left.strip() or left_fallback, right.strip() or right_fallback
-                    return inside.strip() or left_fallback, right_fallback
-            return left_fallback, right_fallback
-
         def _metric_label(text: str, object_name: str, width: int, alignment: Qt.AlignmentFlag) -> QLabel:
             label = QLabel(text)
             label.setObjectName(object_name)
@@ -2571,8 +2644,8 @@ class AutoTradeSettingWindow(QDialog):
             label_text = str(spec["label"])
             left_sample = str(spec["left_sample"])
             right_sample = str(spec["right_sample"])
-            left_value, right_value = _performance_metric_text_parts(
-                key,
+            left_value, right_value = self._routine_tree_metric_text_parts(
+                row_data.get(f"performance_{key}_text", ""),
                 str(spec["left_fallback"]),
                 str(spec["right_fallback"]),
             )
@@ -2861,6 +2934,11 @@ class AutoTradeSettingWindow(QDialog):
         display_metric = str(
             getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
         )
+        target_row_kind = {
+            "category": "definition",
+            "routine": "instance",
+            "stock": "stock",
+        }.get(display_level, "")
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             metadata = item.data(Qt.UserRole) if item is not None else None
@@ -2871,6 +2949,33 @@ class AutoTradeSettingWindow(QDialog):
             updated_metadata["display_scope"] = display_scope
             updated_metadata["display_metric"] = display_metric
             item.setData(Qt.UserRole, updated_metadata)
+            row_widget = self.routine_table.cellWidget(row, 0)
+            if row_widget is None:
+                continue
+            row_kind = str(updated_metadata.get("row_kind", "") or "")
+            for metric in ("period", "profit", "average", "efficiency"):
+                metric_name = metric.title()
+                left_label = row_widget.findChild(
+                    QLabel,
+                    f"autoTradeSettingRoutineTreePerformance{metric_name}LeftValue",
+                )
+                if left_label is None:
+                    continue
+                right_label = row_widget.findChild(
+                    QLabel,
+                    f"autoTradeSettingRoutineTreePerformance{metric_name}RightValue",
+                )
+                if row_kind == target_row_kind and metric == display_metric:
+                    left_value, right_value = self._routine_tree_metric_text_parts(
+                        updated_metadata.get(f"performance_{metric}_text", ""),
+                        "-",
+                        "-",
+                    )
+                else:
+                    left_value, right_value = "-", "-"
+                left_label.setText(left_value)
+                if right_label is not None:
+                    right_label.setText(right_value)
         self.routine_table.viewport().update()
 
     def _set_routine_tree_display_criterion(self, criterion: str) -> None:
@@ -3051,6 +3156,7 @@ class AutoTradeSettingWindow(QDialog):
         instance_counts = self._routine_instance_operation_counts()
         current_stocks_by_instance = self._current_stocks_by_instance()
         historical_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+        performance_source_cache: dict[str, dict[str, object]] = {}
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
         selected_scope = str(
@@ -3068,6 +3174,18 @@ class AutoTradeSettingWindow(QDialog):
         for definition in definitions:
             definition_id = str(definition.definition_id)
             child_instances = instances_by_definition.get(definition_id, [])
+            definition_stocks = [
+                stock
+                for instance in child_instances
+                for stock in (
+                    current_stocks_by_instance.get(str(instance.instance_id), [])
+                    + historical_stocks_by_instance.get(str(instance.instance_id), [])
+                )
+            ]
+            definition_performance = self._routine_tree_performance_texts(
+                definition_stocks,
+                performance_source_cache,
+            )
             has_definition_children = bool(child_instances)
             if not has_definition_children:
                 collapsed.discard(definition_id)
@@ -3108,6 +3226,7 @@ class AutoTradeSettingWindow(QDialog):
                     "display_metric": str(
                         getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
                     ),
+                    **definition_performance,
                 }
             )
             for _index, instance in enumerate(child_instances):
@@ -3115,6 +3234,10 @@ class AutoTradeSettingWindow(QDialog):
                 instance_id = str(instance.instance_id)
                 current_stocks = current_stocks_by_instance.get(instance_id, [])
                 historical_stocks = historical_stocks_by_instance.get(instance_id, [])
+                instance_performance = self._routine_tree_performance_texts(
+                    current_stocks + historical_stocks,
+                    performance_source_cache,
+                )
                 has_instance_children = bool(current_stocks or historical_stocks)
                 if not has_instance_children:
                     collapsed_instances.discard(instance_id)
@@ -3148,6 +3271,7 @@ class AutoTradeSettingWindow(QDialog):
                         "display_metric": str(
                             getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
                         ),
+                        **instance_performance,
                     }
                 )
                 visible_stocks = list(current_stocks)
@@ -3155,6 +3279,10 @@ class AutoTradeSettingWindow(QDialog):
                     visible_stocks = current_stocks + historical_stocks
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
+                    stock_performance = self._routine_tree_performance_texts(
+                        [stock],
+                        performance_source_cache,
+                    )
                     rows.append(
                         {
                             "row_kind": "stock",
@@ -3176,6 +3304,7 @@ class AutoTradeSettingWindow(QDialog):
                             "stock_path": str(stock.get("stock_path", "") or ""),
                             "first_stock_for_instance": stock_index == 0,
                             "tree_icon": "\u25aa",
+                            **stock_performance,
                         }
                     )
 
@@ -3225,6 +3354,7 @@ class AutoTradeSettingWindow(QDialog):
         if current_metadata:
             self.restore_routine_selection_metadata(current_metadata)
         self._apply_routine_tree_collapse_visibility()
+        self._refresh_routine_tree_display_state()
 
     def current_selected_routine_row_metadata(self) -> dict[str, object] | None:
         selected_rows = self.routine_table.selectionModel().selectedRows()
