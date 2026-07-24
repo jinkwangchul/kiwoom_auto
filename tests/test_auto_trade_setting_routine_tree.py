@@ -30,6 +30,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._app_env_patcher = patch.dict(
+            os.environ,
+            {setting_window.AUTO_TRADE_SETTING_APP_ENV: "production"},
+        )
+        self._app_env_patcher.start()
+
+    def tearDown(self) -> None:
+        self._app_env_patcher.stop()
+
     def _definition(self) -> RoutineDefinitionRecord:
         return RoutineDefinitionRecord(
             definition_id="indicator_follow",
@@ -2867,7 +2877,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         menu.addAction.assert_called_once_with("표시삭제")
         hide_display.assert_called_once_with(item.data(Qt.UserRole))
 
-    def test_development_historical_fixture_is_explicit_and_nonpersistent(self) -> None:
+    def test_development_historical_fixture_is_default_and_nonpersistent(self) -> None:
         window = self._window_harness()
         instances = [
             self._instance("inst-a", "A 인스턴스"),
@@ -2894,15 +2904,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.dict(
                 os.environ,
-                {
-                    setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "1",
-                },
+                {},
             ),
         ):
+            os.environ.pop(setting_window.AUTO_TRADE_SETTING_APP_ENV, None)
+            os.environ.pop(
+                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV,
+                None,
+            )
             historical = window._historical_stocks_by_instance()
+            hidden_code = str(historical["inst-a"][0]["stock_code"])
+            window._hidden_historical_stock_fixture_keys.add(
+                ("inst-a", hidden_code)
+            )
+            after_display_delete = window._historical_stocks_by_instance()
 
         self.assertEqual({"inst-a", "inst-b"}, set(historical))
-        self.assertTrue(all(3 <= len(stocks) <= 5 for stocks in historical.values()))
+        self.assertTrue(all(len(stocks) == 5 for stocks in historical.values()))
         self.assertNotIn(
             "000660",
             {stock["stock_code"] for stock in historical["inst-a"]},
@@ -2914,10 +2932,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 for stock in stocks
             )
         )
-        repository.list_routine_assignment_history.assert_called_once_with()
+        self.assertEqual(4, len(after_display_delete["inst-a"]))
+        self.assertNotIn(
+            hidden_code,
+            {stock["stock_code"] for stock in after_display_delete["inst-a"]},
+        )
+        self.assertEqual(5, len(after_display_delete["inst-b"]))
+        self.assertEqual(2, repository.list_routine_assignment_history.call_count)
         repository.hide_routine_assignment_history.assert_not_called()
 
-    def test_development_historical_fixture_is_disabled_by_default(self) -> None:
+    def test_historical_fixture_is_always_disabled_in_production(self) -> None:
         window = self._window_harness()
         repository = MagicMock()
         repository.list_routine_assignment_history.return_value = []
@@ -2927,11 +2951,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
-                    setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "",
+                    setting_window.AUTO_TRADE_SETTING_APP_ENV: "production",
+                    setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "1",
                 },
             ),
         ):
             self.assertEqual({}, window._historical_stocks_by_instance())
+
+    def test_development_historical_fixture_can_be_disabled_once(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                setting_window.AUTO_TRADE_SETTING_APP_ENV: "development",
+                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV: "0",
+            },
+        ):
+            self.assertFalse(
+                setting_window.auto_trade_setting_historical_fixture_enabled()
+            )
 
     def test_historical_stock_display_delete_only_updates_history_visibility(self) -> None:
         window = self._window_harness()

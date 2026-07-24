@@ -394,14 +394,27 @@ AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_HISTORICAL_STOCK_ROW_TEXT_COLOR = "#9CA3AF"
+AUTO_TRADE_SETTING_APP_ENV = "KIWOOM_AUTO_APP_ENV"
 AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV = (
     "KIWOOM_AUTO_HISTORICAL_STOCK_FIXTURE"
 )
 AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_CANDIDATES = (
     ("000660", "SK하이닉스"),
+    ("003490", "대한항공"),
     ("005490", "POSCO홀딩스"),
     ("009150", "삼성전기"),
+    ("010130", "고려아연"),
+    ("011200", "HMM"),
+    ("015760", "한국전력"),
+    ("017670", "SK텔레콤"),
+    ("018260", "삼성에스디에스"),
+    ("030200", "KT"),
     ("034730", "SK"),
+    ("036570", "엔씨소프트"),
+    ("055550", "신한지주"),
+    ("066570", "LG전자"),
+    ("090430", "아모레퍼시픽"),
+    ("105560", "KB금융"),
     ("207940", "삼성바이오로직스"),
     ("267250", "HD현대"),
     ("329180", "HD현대중공업"),
@@ -450,6 +463,23 @@ def routine_tree_title_text(display_name: object) -> str:
     if len(text) <= ROUTINE_TREE_TITLE_DISPLAY_CHARS:
         return text
     return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}..."
+
+
+def auto_trade_setting_historical_fixture_enabled() -> bool:
+    app_env = str(
+        os.environ.get(AUTO_TRADE_SETTING_APP_ENV, "") or ""
+    ).strip().lower()
+    if app_env in {"production", "prod"}:
+        return False
+    if app_env not in {"", "development", "dev", "test", "testing"}:
+        return False
+    fixture_value = str(
+        os.environ.get(AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV, "")
+        or ""
+    ).strip().lower()
+    if fixture_value in {"0", "false", "no", "off"}:
+        return False
+    return fixture_value in {"", "1", "true", "yes", "on"}
 
 
 def routine_tree_instance_title_text(display_name: object) -> str:
@@ -2285,9 +2315,7 @@ class AutoTradeSettingWindow(QDialog):
                     "is_historical": True,
                 }
             )
-        if str(
-            os.environ.get(AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV, "")
-        ).strip().lower() in {"1", "true", "yes", "on"}:
+        if auto_trade_setting_historical_fixture_enabled():
             current_stocks_by_instance = self._current_stocks_by_instance()
             hidden_fixture_keys = getattr(
                 self,
@@ -2308,7 +2336,7 @@ class AutoTradeSettingWindow(QDialog):
                     str(stock.get("stock_code", "") or "").strip()
                     for stock in current_stocks_by_instance.get(instance_id, [])
                 }
-                fixture_count = 0
+                fixture_stocks: list[tuple[str, str]] = []
                 for stock_code, stock_name in (
                     AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_CANDIDATES
                 ):
@@ -2316,8 +2344,14 @@ class AutoTradeSettingWindow(QDialog):
                     if (
                         stock_code in current_codes
                         or fixture_key in existing_keys
-                        or fixture_key in hidden_fixture_keys
                     ):
+                        continue
+                    fixture_stocks.append((stock_code, stock_name))
+                    if len(fixture_stocks) == 5:
+                        break
+                for stock_code, stock_name in fixture_stocks:
+                    fixture_key = (instance_id, stock_code)
+                    if fixture_key in hidden_fixture_keys:
                         continue
                     stocks_by_instance.setdefault(instance_id, []).append(
                         {
@@ -2329,9 +2363,6 @@ class AutoTradeSettingWindow(QDialog):
                             "is_development_fixture": True,
                         }
                     )
-                    fixture_count += 1
-                    if fixture_count == 5:
-                        break
         for stocks in stocks_by_instance.values():
             stocks.sort(
                 key=lambda item: (
