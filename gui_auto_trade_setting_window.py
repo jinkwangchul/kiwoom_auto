@@ -430,7 +430,9 @@ AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE = (
         "profit_rate": 3.25,
         "average": 62500.0,
         "average_rate": 1.63,
-        "efficiency": 3.25,
+        "gross_profit": 125000.0,
+        "gross_loss_abs": 39062.5,
+        "profit_factor": 3.2,
     },
     {
         "trade_days": 2,
@@ -438,7 +440,9 @@ AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE = (
         "profit_rate": -1.40,
         "average": -24000.0,
         "average_rate": -0.70,
-        "efficiency": -1.40,
+        "gross_profit": None,
+        "gross_loss_abs": None,
+        "profit_factor": 0.0,
     },
     {
         "trade_days": 0,
@@ -446,7 +450,9 @@ AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_PERFORMANCE = (
         "profit_rate": 0.0,
         "average": 0.0,
         "average_rate": 0.0,
-        "efficiency": 0.0,
+        "gross_profit": None,
+        "gross_loss_abs": None,
+        "profit_factor": 0.0,
     },
 )
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
@@ -531,6 +537,14 @@ def routine_tree_title_width(font_metrics) -> int:
         for sample in samples
     )
     return text_width + ROUTINE_TREE_TITLE_CELL_PADDING
+
+
+def normalize_profit_factor(value: object) -> float:
+    """PF display input is non-negative; unavailable values normalize to zero."""
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def auto_trade_setting_badge_stylesheet(
@@ -2419,8 +2433,17 @@ class AutoTradeSettingWindow(QDialog):
         if bool(stock.get("is_development_fixture", False)):
             fixture = stock.get("performance_fixture")
             if isinstance(fixture, dict):
+                profit_factor = normalize_profit_factor(
+                    fixture.get(
+                        "profit_factor",
+                        fixture.get("efficiency"),
+                    )
+                )
                 return {
                     **fixture,
+                    "gross_profit": fixture.get("gross_profit"),
+                    "gross_loss_abs": fixture.get("gross_loss_abs"),
+                    "profit_factor": profit_factor,
                     "is_current": False,
                 }
         stock_path = Path(str(stock.get("stock_path", "") or "").strip())
@@ -2461,7 +2484,9 @@ class AutoTradeSettingWindow(QDialog):
             "profit_rate": None,
             "average": None,
             "average_rate": None,
-            "efficiency": None,
+            "gross_profit": None,
+            "gross_loss_abs": None,
+            "profit_factor": 0.0,
             "is_current": bool(stock.get("is_current", not is_historical)),
         }
 
@@ -2541,15 +2566,16 @@ class AutoTradeSettingWindow(QDialog):
             average_rate_value,
             digits=2,
         )
-        efficiency_value = (
-            source_rows[0].get("efficiency")
+        profit_factor_value = (
+            source_rows[0].get(
+                "profit_factor",
+                source_rows[0].get("efficiency"),
+            )
             if len(source_rows) == 1
-            else None
+            else 0.0
         )
-        try:
-            efficiency_text = f"{float(efficiency_value):.1f}"
-        except (TypeError, ValueError):
-            efficiency_text = "0.0"
+        profit_factor_value = normalize_profit_factor(profit_factor_value)
+        efficiency_text = f"{profit_factor_value:.1f}"
 
         return {
             "performance_period_text": f"기간({period_text})",
@@ -2571,7 +2597,7 @@ class AutoTradeSettingWindow(QDialog):
             ),
             "performance_efficiency_value": efficiency_text,
             "performance_efficiency_color": directional_value_color(
-                efficiency_value
+                profit_factor_value
             ),
         }
 
@@ -3788,7 +3814,7 @@ class AutoTradeSettingWindow(QDialog):
                             "period": "trade_days",
                             "profit": "realized_profit",
                             "average": "average",
-                            "efficiency": "efficiency",
+                            "efficiency": "profit_factor",
                         }
                         source_key = source_key_by_criterion.get(
                             display_criterion,
@@ -3832,6 +3858,15 @@ class AutoTradeSettingWindow(QDialog):
                             raw_value = performance_source_cache[cache_key].get(
                                 source_key
                             )
+                            if (
+                                source_key == "profit_factor"
+                                and raw_value is None
+                            ):
+                                raw_value = performance_source_cache[
+                                    cache_key
+                                ].get("efficiency")
+                            if source_key == "profit_factor":
+                                return normalize_profit_factor(raw_value)
                             try:
                                 return float(raw_value)
                             except (TypeError, ValueError):

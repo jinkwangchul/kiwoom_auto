@@ -1300,7 +1300,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate",
                 "average",
                 "average_rate",
-                "efficiency",
+                "gross_profit",
+                "gross_loss_abs",
+                "profit_factor",
                 "is_current",
             },
             set(source),
@@ -1395,7 +1397,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "profit_rate": 12.3,
                     "average": 62500.0,
                     "average_rate": 1.63,
-                    "efficiency": 123.4,
+                    "profit_factor": 123.4,
                     "is_current": True,
                 },
                 {
@@ -1415,7 +1417,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "profit_rate": -4.2,
                     "average": -24000.0,
                     "average_rate": -0.7,
-                    "efficiency": None,
+                    "profit_factor": -1.4,
                     "is_current": True,
                 },
                 {
@@ -1435,7 +1437,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "profit_rate": None,
                     "average": None,
                     "average_rate": None,
-                    "efficiency": None,
+                    "profit_factor": None,
                     "is_current": True,
                 },
                 {
@@ -1687,7 +1689,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": 3.25,
                 "average": 62500.0,
                 "average_rate": 1.63,
-                "efficiency": 3.25,
+                "profit_factor": 3.2,
                 "is_current": True,
             },
             "000002": {
@@ -1696,7 +1698,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": -1.40,
                 "average": -24000.0,
                 "average_rate": -0.70,
-                "efficiency": -1.40,
+                "profit_factor": 0.0,
                 "is_current": True,
             },
             "000003": {
@@ -1705,7 +1707,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": 0.0,
                 "average": 0.0,
                 "average_rate": 0.0,
-                "efficiency": 0.0,
+                "profit_factor": 0.0,
                 "is_current": True,
             },
             "000004": {
@@ -1714,7 +1716,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": None,
                 "average": None,
                 "average_rate": None,
-                "efficiency": None,
+                "profit_factor": None,
                 "is_current": True,
             },
             "000005": {
@@ -1723,7 +1725,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": -2.00,
                 "average": -38500.0,
                 "average_rate": -0.93,
-                "efficiency": -2.00,
+                "profit_factor": 0.0,
                 "is_current": True,
             },
             "100001": {
@@ -1732,7 +1734,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": 3.25,
                 "average": 62500.0,
                 "average_rate": 1.63,
-                "efficiency": 3.25,
+                "profit_factor": 3.2,
                 "is_current": False,
             },
             "100002": {
@@ -1741,7 +1743,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": -1.40,
                 "average": -24000.0,
                 "average_rate": -0.70,
-                "efficiency": -1.40,
+                "profit_factor": 0.0,
                 "is_current": False,
             },
             "100003": {
@@ -1750,7 +1752,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": 0.0,
                 "average": 0.0,
                 "average_rate": 0.0,
-                "efficiency": 0.0,
+                "profit_factor": 0.0,
                 "is_current": False,
             },
             "100004": {
@@ -1759,7 +1761,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": None,
                 "average": None,
                 "average_rate": None,
-                "efficiency": None,
+                "profit_factor": None,
                 "is_current": False,
             },
         }
@@ -1911,6 +1913,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "#374151",
                 ),
             }
+            expected_profit_factors = {
+                "000001": ("3.2", "#2563EB"),
+                "000002": ("0.0", "#374151"),
+                "000003": ("0.0", "#374151"),
+                "000004": ("0.0", "#374151"),
+                "000005": ("0.0", "#374151"),
+                "100001": ("3.2", "#2563EB"),
+                "100002": ("0.0", "#374151"),
+                "100003": ("0.0", "#374151"),
+                "100004": ("0.0", "#374151"),
+            }
             profit_right_edges = set()
             average_right_edges = set()
             for code, values in expected.items():
@@ -1931,6 +1944,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     setting_window.QLabel,
                     "autoTradeSettingRoutineTreePerformanceAverageRightValue",
                 )
+                efficiency = widget.findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue",
+                )
                 self.assertEqual(values[0], profit_amount.text())
                 self.assertEqual(values[1], profit_rate.text())
                 self.assertEqual(values[2], average_amount.text())
@@ -1950,6 +1967,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     average_rate,
                 ):
                     self.assertIn(f"color: {values[4]}", label.styleSheet())
+                self.assertEqual(
+                    expected_profit_factors[code][0],
+                    efficiency.text(),
+                )
+                self.assertIn(
+                    f"color: {expected_profit_factors[code][1]}",
+                    efficiency.styleSheet(),
+                )
+                self.assertNotIn("-", efficiency.text())
                 profit_right_edges.add(
                     profit_rate.mapTo(widget, profit_rate.rect().topRight()).x()
                 )
@@ -3261,7 +3287,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_rate": -1.40 if negative else 3.25,
                 "average": -24000 if negative else 62500,
                 "average_rate": -0.70 if negative else 1.63,
-                "efficiency": -1.40 if negative else 3.25,
+                "profit_factor": 0.0 if negative else 3.2,
             }
 
         window._routine_tree_stock_performance_source = performance_source
@@ -3448,25 +3474,25 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "trade_days": 3,
                 "realized_profit": 100.0,
                 "average": 5.0,
-                "efficiency": 1.0,
+                "profit_factor": 1.0,
             },
             "000002": {
                 "trade_days": 8,
                 "realized_profit": -50.0,
                 "average": 30.0,
-                "efficiency": 4.0,
+                "profit_factor": 4.0,
             },
             "100001": {
                 "trade_days": 10,
                 "realized_profit": 100.0,
                 "average": -10.0,
-                "efficiency": 2.0,
+                "profit_factor": 2.0,
             },
             "100002": {
                 "trade_days": 1,
                 "realized_profit": 200.0,
                 "average": 10.0,
-                "efficiency": -1.0,
+                "profit_factor": 0.0,
             },
         }
 
@@ -3686,6 +3712,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertTrue(
             all(
                 stock["is_historical"] and stock["is_development_fixture"]
+                for stocks in historical.values()
+                for stock in stocks
+            )
+        )
+        self.assertTrue(
+            all(
+                float(stock["performance_fixture"]["profit_factor"]) >= 0.0
+                and "gross_profit" in stock["performance_fixture"]
+                and "gross_loss_abs" in stock["performance_fixture"]
                 for stocks in historical.values()
                 for stock in stocks
             )
