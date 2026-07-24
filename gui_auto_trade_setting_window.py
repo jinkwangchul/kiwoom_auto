@@ -2922,10 +2922,22 @@ class AutoTradeSettingWindow(QDialog):
         routine_box = getattr(self, "routine_box", None)
         if container is None or routine_box is None:
             return
-        right_margin = routine_box.layout().contentsMargins().right() if routine_box.layout() is not None else 0
+        routine_layout = routine_box.layout()
+        right_margin = routine_layout.contentsMargins().right() if routine_layout is not None else 0
+        if routine_layout is not None:
+            margins = routine_layout.contentsMargins()
+            badge_area_height = container.height()
+            if margins.top() < badge_area_height:
+                routine_layout.setContentsMargins(
+                    margins.left(),
+                    badge_area_height,
+                    margins.right(),
+                    margins.bottom(),
+                )
+                routine_layout.activate()
         container.move(
             max(0, routine_box.width() - right_margin - container.width()),
-            AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
+            routine_box.contentsRect().top(),
         )
         container.raise_()
 

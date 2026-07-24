@@ -299,16 +299,22 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(2, window.routine_table.rowHeight(0) - window.routine_table.rowHeight(1))
         self.assertLessEqual(window.routine_table.rowHeight(0), 40)
 
-    def test_tree_display_level_badges_use_existing_badge_geometry_without_moving_table(self) -> None:
+    def test_tree_display_level_badges_reserve_control_area_without_changing_table_width(self) -> None:
         window = self._window_harness()
         window.eventFilter = MethodType(lambda _self, _obj, _event: False, window)
         window.routine_box = setting_window.QGroupBox("자동매매 루틴")
+        window.routine_box.setAlignment(setting_window.Qt.AlignLeft)
+        window.routine_box.setFlat(False)
+        window.routine_box.setStyleSheet(
+            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE
+        )
         layout = setting_window.QVBoxLayout(window.routine_box)
         layout.addWidget(window.routine_table)
         window.routine_box.resize(1000, 320)
         window.routine_box.show()
         self._app.processEvents()
         table_geometry_before = window.routine_table.geometry()
+        group_geometry_before = window.routine_box.geometry()
 
         window._setup_routine_tree_display_level_badges()
         self._app.processEvents()
@@ -359,15 +365,20 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("color: #16A34A", scopes["all"].styleSheet())
         self.assertTrue(all(button.isEnabled() for button in criteria.values()))
         self.assertEqual("all", window._routine_tree_display_scope)
-        self.assertEqual(table_geometry_before, window.routine_table.geometry())
 
         badge_group = window._routine_tree_display_level_badges
         expected_x = window.routine_box.width() - layout.contentsMargins().right() - badge_group.width()
         self.assertEqual(expected_x, badge_group.x())
-        self.assertEqual(
-            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
+        self.assertEqual(window.routine_box.contentsRect().top(), badge_group.y())
+        self.assertGreater(
             badge_group.y(),
+            setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_FRAME_TOP,
         )
+        self.assertFalse(badge_group.geometry().intersects(window.routine_table.geometry()))
+        self.assertEqual(group_geometry_before, window.routine_box.geometry())
+        self.assertEqual(table_geometry_before.x(), window.routine_table.geometry().x())
+        self.assertEqual(table_geometry_before.width(), window.routine_table.geometry().width())
+        self.assertEqual(table_geometry_before.bottom(), window.routine_table.geometry().bottom())
 
     def test_actual_window_badges_change_visible_hierarchy(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -1892,22 +1903,26 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(setting_window.Qt.AlignLeft, window.routine_box.alignment())
         self.assertEqual(window.routine_box.isFlat(), window.stock_box.isFlat())
         self.assertFalse(window.routine_box.isFlat())
+        window._position_routine_tree_display_level_badges()
         routine_margins = window.routine_box.layout().contentsMargins()
         stock_margins = window.stock_box.layout().contentsMargins()
         self.assertEqual(
             (
                 routine_margins.left(),
-                routine_margins.top(),
                 routine_margins.right(),
                 routine_margins.bottom(),
             ),
             (
                 stock_margins.left(),
-                stock_margins.top(),
                 stock_margins.right(),
                 stock_margins.bottom(),
             ),
         )
+        self.assertEqual(
+            window._routine_tree_display_level_badges.height(),
+            routine_margins.top(),
+        )
+        self.assertGreater(routine_margins.top(), stock_margins.top())
         self.assertEqual(window.routine_box.styleSheet(), window.stock_box.styleSheet())
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_WORKSPACE_GROUP_BOX_STYLE,
@@ -1968,10 +1983,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             (stock_contents_rect.y(), stock_contents_rect.height()),
         )
         window._position_routine_tree_display_level_badges()
-        self.assertEqual(
-            routine_frame_rect.y(),
-            window._routine_tree_display_level_badges.y(),
+        badge_rect = window._routine_tree_display_level_badges.geometry()
+        self.assertGreater(badge_rect.y(), routine_frame_rect.y())
+        self.assertGreaterEqual(
+            badge_rect.y(),
+            routine_label_rect.bottom() + 1,
         )
+        self.assertFalse(badge_rect.intersects(window.routine_table.geometry()))
+        self.assertGreaterEqual(window.routine_table.geometry().y(), badge_rect.bottom() + 1)
 
     def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
