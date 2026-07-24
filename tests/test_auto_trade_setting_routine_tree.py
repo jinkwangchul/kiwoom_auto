@@ -1203,12 +1203,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertNotIn("과거 종목", [window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["display_name"] for row in range(window.routine_table.rowCount())])
 
         stock_widget = window.routine_table.cellWidget(2, 0)
+        second_stock_widget = window.routine_table.cellWidget(3, 0)
         instance_widget = window.routine_table.cellWidget(1, 0)
         stock_layout_margins = stock_widget.layout().contentsMargins()
+        second_stock_layout_margins = second_stock_widget.layout().contentsMargins()
         self.assertEqual(
             (
                 setting_window.AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X,
-                0,
+                setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
                 setting_window.AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X,
                 0,
             ),
@@ -1219,6 +1221,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 stock_layout_margins.bottom(),
             ),
         )
+        self.assertEqual(0, second_stock_layout_margins.top())
         self.assertEqual(setting_window.AUTO_TRADE_SETTING_STOCK_ROW_SPACING, stock_widget.layout().spacing())
         instance_icon = instance_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeIcon")
         stock_icon = stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeIcon")
@@ -1269,8 +1272,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "autoTradeSettingRoutineTreePerformancePeriodLeftValue",
             ).text(),
         )
-        self.assertEqual(setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT, window.routine_table.rowHeight(2))
-        self.assertLessEqual(window.routine_table.rowHeight(2), window.routine_table.rowHeight(1) - 2)
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT
+            + setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
+            window.routine_table.rowHeight(2),
+        )
+        self.assertEqual(
+            setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT,
+            window.routine_table.rowHeight(3),
+        )
+        self.assertLessEqual(window.routine_table.rowHeight(3), window.routine_table.rowHeight(1) - 2)
         stock_widget.resize(max(stock_widget.sizeHint().width(), 960), stock_widget.sizeHint().height())
         stock_widget.layout().activate()
         previous_x = -1
@@ -1339,6 +1350,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.routine_table.rowHeight(3) - window.routine_table.rowHeight(1),
             )
             self.assertEqual(window.routine_table.rowHeight(2), window.routine_table.rowHeight(4))
+            self.assertEqual(
+                setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
+                window.routine_table.rowHeight(2)
+                - setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT,
+            )
 
             window.routine_table.selectRow(1)
             selected_before_toggle = []

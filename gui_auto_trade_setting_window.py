@@ -2296,7 +2296,10 @@ class AutoTradeSettingWindow(QDialog):
         layout = QHBoxLayout(container)
         top_margin = (
             AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP
-            if is_instance and bool(row_data.get("instance_group_top_gap"))
+            if (
+                (is_instance and bool(row_data.get("instance_group_top_gap")))
+                or (is_stock and bool(row_data.get("first_stock_for_instance")))
+            )
             else 0
         )
         horizontal_margin = AUTO_TRADE_SETTING_STOCK_ROW_MARGIN_X if is_stock else 6
@@ -3150,7 +3153,7 @@ class AutoTradeSettingWindow(QDialog):
                 visible_stocks = list(current_stocks)
                 if stock_data_scope == "all":
                     visible_stocks = current_stocks + historical_stocks
-                for stock in visible_stocks:
+                for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
                     rows.append(
                         {
@@ -3171,6 +3174,7 @@ class AutoTradeSettingWindow(QDialog):
                             ),
                             "stock_code": str(stock.get("stock_code", "") or ""),
                             "stock_path": str(stock.get("stock_path", "") or ""),
+                            "first_stock_for_instance": stock_index == 0,
                             "tree_icon": "\u25aa",
                         }
                     )
@@ -3209,6 +3213,8 @@ class AutoTradeSettingWindow(QDialog):
                 min_row_height = 30
             row_height = min_row_height if row_kind == "stock" else max(row_hint.height(), min_row_height)
             if row_kind == "instance" and bool(row_data.get("instance_group_top_gap")):
+                row_height += AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP
+            elif row_kind == "stock" and bool(row_data.get("first_stock_for_instance")):
                 row_height += AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP
             row_widget.setMinimumHeight(row_height)
             item.setSizeHint(QSize(row_hint.width(), row_height))
