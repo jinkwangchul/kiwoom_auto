@@ -1,5 +1,7 @@
 ﻿import unittest
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import MethodType
 from unittest.mock import patch
 
@@ -328,8 +330,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         self.assertFalse(criteria["period"].isEnabled())
         self.assertTrue(criteria["profit"].isEnabled())
-        self.assertTrue(criteria["average"].isEnabled())
-        self.assertTrue(criteria["efficiency"].isEnabled())
+        self.assertFalse(criteria["average"].isEnabled())
+        self.assertFalse(criteria["efficiency"].isEnabled())
         self.assertIn("color: #16A34A", criteria["profit"].styleSheet())
         self.assertIn("color: #9CA3AF", criteria["period"].styleSheet())
         criteria["period"].click()
@@ -337,15 +339,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         badges["routine"].click()
         self.assertTrue(all(not button.isEnabled() for button in scopes.values()))
         self.assertTrue(criteria["period"].isEnabled())
+        self.assertFalse(criteria["average"].isEnabled())
+        self.assertFalse(criteria["efficiency"].isEnabled())
         criteria["period"].click()
         self.assertEqual("period", window._routine_tree_display_criterion)
         badges["category"].click()
         self.assertEqual("profit", window._routine_tree_display_criterion)
         badges["stock"].click()
-        self.assertTrue(all(button.isEnabled() for button in scopes.values()))
-        self.assertIn("color: #16A34A", scopes["all"].styleSheet())
-        self.assertTrue(all(button.isEnabled() for button in criteria.values()))
-        self.assertEqual("all", window._routine_tree_display_scope)
+        self.assertTrue(all(not button.isEnabled() for button in scopes.values()))
+        self.assertTrue(criteria["period"].isEnabled())
+        self.assertTrue(criteria["profit"].isEnabled())
+        self.assertFalse(criteria["average"].isEnabled())
+        self.assertFalse(criteria["efficiency"].isEnabled())
+        self.assertEqual("", window._routine_tree_display_scope)
+        scopes["all"].click()
+        criteria["average"].click()
+        self.assertEqual("", window._routine_tree_display_scope)
+        self.assertEqual("profit", window._routine_tree_display_criterion)
         self.assertEqual(table_geometry_before, window.routine_table.geometry())
 
         badge_group = window._routine_tree_display_level_badges
@@ -406,7 +416,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertFalse(window.routine_table.isRowHidden(1))
         self.assertTrue(window.routine_table.isRowHidden(2))
 
-    def test_tree_display_scope_and_metric_are_independent_and_preserve_collapse(self) -> None:
+    def test_unsupported_stock_scope_is_disabled_and_preserves_collapse(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
         stocks = [
             {
@@ -443,11 +453,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("profit", window._routine_tree_display_criterion)
 
             window._set_routine_tree_display_level("stock")
-            self.assertEqual("all", window._routine_tree_display_scope)
+            self.assertEqual("", window._routine_tree_display_scope)
             window._toggle_routine_instance_collapsed("inst-a")
             collapsed_before = set(window._collapsed_auto_trade_instance_ids)
             window._set_routine_tree_display_scope("all")
-            self.assertEqual("all", window._routine_tree_display_scope)
+            self.assertEqual("", window._routine_tree_display_scope)
             self.assertEqual("profit", window._routine_tree_display_criterion)
             self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
             self.assertEqual(
@@ -458,26 +468,21 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 ],
             )
             stock_metadata = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
-            self.assertEqual("all", stock_metadata["display_scope"])
+            self.assertEqual("", stock_metadata["display_scope"])
             self.assertEqual("stock", stock_metadata["display_level"])
             self.assertEqual("profit", stock_metadata["display_metric"])
             self.assertTrue(window.routine_table.isRowHidden(2))
 
             window._set_routine_tree_display_scope("current")
-            self.assertEqual("current", window._routine_tree_display_scope)
+            self.assertEqual("", window._routine_tree_display_scope)
             self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
             window._set_routine_tree_display_level("routine")
             self.assertEqual("", window._routine_tree_display_scope)
             window._set_routine_tree_display_level("stock")
-            self.assertEqual("current", window._routine_tree_display_scope)
+            self.assertEqual("", window._routine_tree_display_scope)
 
     def test_routine_period_uses_unique_filled_trade_days_and_excludes_zero_day_stocks(self) -> None:
         window = self._window_harness()
-        stocks = [
-            {"stock_path": "stocks/a"},
-            {"stock_path": "stocks/b"},
-            {"stock_path": "stocks/c"},
-        ]
         orders_by_name = {
             "a": [
                 {"side": "BUY", "filled_qty": 1, "filled_price": 100, "order_time": "2026-07-01 09:00:00"},
@@ -489,19 +494,40 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ],
             "c": [],
         }
-
-        def _orders(path: Path):
-            return orders_by_name.get(path.parent.name, [])
-
-        with patch.object(setting_window, "read_orders_data", side_effect=_orders):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stocks = []
+            for name, orders in orders_by_name.items():
+                stock_dir = root / name
+                stock_dir.mkdir()
+                (stock_dir / "orders.json").write_text(
+                    json.dumps({"orders": orders}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                stocks.append({"stock_path": str(stock_dir), "is_current": name != "c"})
             texts = window._routine_tree_performance_texts(stocks)
-            empty_texts = window._routine_tree_performance_texts([{"stock_path": "stocks/c"}])
+            empty_texts = window._routine_tree_performance_texts([stocks[-1]])
+            source = window._routine_tree_stock_performance_source(stocks[0])
 
         self.assertEqual("기간(1)", texts["performance_period_text"])
         self.assertEqual("수익(10 / -)", texts["performance_profit_text"])
         self.assertEqual("평균(- / -)", texts["performance_average_text"])
         self.assertEqual("효율(-)", texts["performance_efficiency_text"])
         self.assertEqual("기간(-)", empty_texts["performance_period_text"])
+        self.assertEqual(
+            {
+                "trade_days",
+                "realized_profit",
+                "profit_rate",
+                "average",
+                "efficiency",
+                "is_current",
+            },
+            set(source),
+        )
+        self.assertEqual(2, source["trade_days"])
+        self.assertEqual(10.0, source["realized_profit"])
+        self.assertTrue(source["is_current"])
 
     def test_level_and_metric_badges_update_actual_row_values_without_expanding_tree(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -564,6 +590,116 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("10", stock_profit.text())
             self.assertEqual(collapsed_before, window._collapsed_auto_trade_instance_ids)
             self.assertTrue(window.routine_table.isRowHidden(2))
+
+    def test_performance_fixture_changes_group_routine_and_stock_tree_text(self) -> None:
+        instances = [
+            self._instance("inst-a", "A 인스턴스"),
+            self._instance("inst-b", "B 인스턴스"),
+        ]
+        orders_by_code = {
+            "000001": [
+                {"side": "BUY", "filled_qty": 1, "filled_price": 100, "order_time": "2026-07-01 09:00:00"},
+                {"side": "SELL", "filled_qty": 1, "filled_price": 120, "order_time": "2026-07-02 09:00:00"},
+            ],
+            "000002": [],
+            "000003": [
+                {"side": "BUY", "filled_qty": 1, "filled_price": 200, "order_time": "2026-07-03 09:00:00"},
+                {"side": "SELL", "filled_qty": 1, "filled_price": 205, "order_time": "2026-07-03 10:00:00"},
+            ],
+        }
+        assignments = {
+            "000001": "inst-a",
+            "000002": "inst-a",
+            "000003": "inst-b",
+        }
+        window = self._window_harness()
+        window._routine_tree_display_level_buttons = {}
+        window._routine_tree_display_scope_buttons = {}
+        window._routine_tree_display_criterion_buttons = {}
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 2, "running": 0, "stopped": 2, "error": 0},
+            "inst-b": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stocks = []
+            for code, orders in orders_by_code.items():
+                stock_dir = root / code
+                stock_dir.mkdir()
+                (stock_dir / "orders.json").write_text(
+                    json.dumps({"orders": orders}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                stocks.append(
+                    {
+                        "stock_path": str(stock_dir),
+                        "assigned_routine_instance_id": assignments[code],
+                        "code": code,
+                        "name": f"종목{code[-1]}",
+                    }
+                )
+
+            with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                    patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                    patch.object(setting_window, "read_base_stocks", return_value=stocks):
+                window.load_routine_table()
+
+                rows = {}
+                for row in range(window.routine_table.rowCount()):
+                    metadata = window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)
+                    key = (
+                        str(metadata.get("row_kind", "")),
+                        str(metadata.get("instance_id", "")),
+                        str(metadata.get("stock_code", "")),
+                    )
+                    rows[key] = row
+
+                def _left_value(row: int, metric: str) -> str:
+                    widget = window.routine_table.cellWidget(row, 0)
+                    label = widget.findChild(
+                        setting_window.QLabel,
+                        f"autoTradeSettingRoutineTreePerformance{metric.title()}LeftValue",
+                    )
+                    return label.text()
+
+                group_row = rows[("definition", "", "")]
+                instance_a_row = rows[("instance", "inst-a", "")]
+                instance_b_row = rows[("instance", "inst-b", "")]
+                stock_a_row = rows[("stock", "inst-a", "000001")]
+                stock_empty_row = rows[("stock", "inst-a", "000002")]
+                stock_b_row = rows[("stock", "inst-b", "000003")]
+
+                text_changes = 0
+                before = _left_value(group_row, "profit")
+                self.assertEqual("25", before)
+
+                window._set_routine_tree_display_level("routine")
+                after = _left_value(instance_a_row, "profit")
+                text_changes += int(after != before)
+                self.assertEqual("20", after)
+                self.assertEqual("5", _left_value(instance_b_row, "profit"))
+
+                before = _left_value(instance_a_row, "profit")
+                window._set_routine_tree_display_criterion("period")
+                after = _left_value(instance_a_row, "period")
+                text_changes += int(after != before)
+                self.assertEqual("2", after)
+                self.assertEqual("1", _left_value(instance_b_row, "period"))
+
+                window._set_routine_tree_display_level("stock")
+                self.assertEqual("2", _left_value(stock_a_row, "period"))
+                self.assertEqual("-", _left_value(stock_empty_row, "period"))
+                self.assertEqual("1", _left_value(stock_b_row, "period"))
+
+                before = _left_value(stock_a_row, "period")
+                window._set_routine_tree_display_criterion("profit")
+                after = _left_value(stock_a_row, "profit")
+                text_changes += int(after != before)
+                self.assertEqual("20", after)
+                self.assertEqual("-", _left_value(stock_empty_row, "profit"))
+                self.assertEqual("5", _left_value(stock_b_row, "profit"))
+                self.assertGreaterEqual(text_changes, 3)
 
     def test_parent_arrow_click_only_collapses_definition_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -1512,7 +1648,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertEqual({"inst-a"}, window._collapsed_auto_trade_instance_ids)
         stock_row = window.routine_table.item(2, 0).data(setting_window.Qt.UserRole)
-        self.assertEqual("all", stock_row["display_scope"])
+        self.assertEqual("", stock_row["display_scope"])
         self.assertFalse(window.routine_table.isRowHidden(1))
         self.assertTrue(window.routine_table.isRowHidden(2))
 

@@ -379,10 +379,11 @@ AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
 AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED = False
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
-    "category": frozenset({"profit", "average", "efficiency"}),
-    "routine": frozenset({"period", "profit", "average", "efficiency"}),
-    "stock": frozenset({"period", "profit", "average", "efficiency"}),
+    "category": frozenset({"profit"}),
+    "routine": frozenset({"period", "profit"}),
+    "stock": frozenset({"period", "profit"}),
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
@@ -2214,12 +2215,16 @@ class AutoTradeSettingWindow(QDialog):
             for order in filled_orders
             if (parsed := order_datetime(order)) is not None
         }
-        realized_pnl: float | None = None
+        realized_profit: float | None = None
         if filled_orders:
-            realized_pnl = float(summarize_orders(orders).get("realized_pnl", 0.0) or 0.0)
+            realized_profit = float(summarize_orders(orders).get("realized_pnl", 0.0) or 0.0)
         return {
             "trade_days": len(trade_dates) if trade_dates else None,
-            "realized_pnl": realized_pnl,
+            "realized_profit": realized_profit,
+            "profit_rate": None,
+            "average": None,
+            "efficiency": None,
+            "is_current": bool(stock.get("is_current", True)),
         }
 
     def _routine_tree_performance_texts(
@@ -2246,9 +2251,9 @@ class AutoTradeSettingWindow(QDialog):
             period_text = str(safe_int_value(sum(trade_days) / len(trade_days), 0))
 
         realized_values = [
-            float(source["realized_pnl"])
+            float(source["realized_profit"])
             for source in source_rows
-            if source.get("realized_pnl") is not None
+            if source.get("realized_profit") is not None
         ]
         profit_text = "-"
         if realized_values:
@@ -2852,7 +2857,10 @@ class AutoTradeSettingWindow(QDialog):
         selected_scope = str(
             getattr(self, "_routine_tree_display_scope", "") or ""
         )
-        scope_enabled = selected_level == "stock"
+        scope_enabled = (
+            selected_level == "stock"
+            and AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED
+        )
         disabled_style = (
             "QPushButton:disabled, QPushButton:disabled:hover {"
             " background-color: transparent;"
@@ -2908,6 +2916,8 @@ class AutoTradeSettingWindow(QDialog):
     def _set_routine_tree_display_scope(self, scope: str) -> None:
         clean_scope = str(scope or "").strip()
         if clean_scope not in {"all", "current"}:
+            return
+        if not AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
             return
         if str(getattr(self, "_routine_tree_display_level", "category") or "category") != "stock":
             return
@@ -2997,7 +3007,7 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         self._routine_tree_display_level = clean_level
-        if clean_level == "stock":
+        if clean_level == "stock" and AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
             restored_scope = str(
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
@@ -3163,7 +3173,9 @@ class AutoTradeSettingWindow(QDialog):
             getattr(self, "_routine_tree_display_scope", "") or ""
         )
         stock_data_scope = selected_scope
-        if stock_data_scope not in {"all", "current"}:
+        if not AUTO_TRADE_SETTING_ROUTINE_TREE_STOCK_SCOPE_SUPPORTED:
+            stock_data_scope = "current"
+        elif stock_data_scope not in {"all", "current"}:
             stock_data_scope = str(
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
