@@ -68,7 +68,7 @@ from gui_order_utils import (
     order_value,
     order_status_display,
     order_side_display,
-    format_number_value,
+    format_signed_money,
     build_order_rows,
     build_order_timeline_text,
     filter_orders_by_range,
@@ -2231,6 +2231,8 @@ class AutoTradeSettingWindow(QDialog):
         stocks: list[dict[str, object]],
         source_cache: dict[str, dict[str, object]] | None = None,
     ) -> dict[str, str]:
+        from gui_main_table_loader import _format_percent
+
         cache = source_cache if source_cache is not None else {}
         source_rows: list[dict[str, object]] = []
         for stock in stocks:
@@ -2243,7 +2245,7 @@ class AutoTradeSettingWindow(QDialog):
             for source in source_rows
             if int(source.get("trade_days", 0) or 0) > 0
         ]
-        period_text = "-"
+        period_text = "0"
         if len(stocks) == 1 and trade_days:
             period_text = str(trade_days[0])
         elif len(stocks) > 1 and trade_days:
@@ -2254,15 +2256,48 @@ class AutoTradeSettingWindow(QDialog):
             for source in source_rows
             if source.get("realized_profit") is not None
         ]
-        profit_text = "-"
-        if realized_values:
-            profit_text = format_number_value(sum(realized_values))
+        profit_value = sum(realized_values) if realized_values else 0.0
+        profit_amount_text = format_signed_money(profit_value)
+        if profit_value == 0:
+            profit_amount_text = "+0"
+
+        profit_rate_value = (
+            source_rows[0].get("profit_rate")
+            if len(source_rows) == 1
+            else None
+        )
+        profit_rate_text = _format_percent(
+            profit_rate_value if profit_rate_value is not None else 0.0,
+            digits=1,
+            signed=profit_rate_value not in (None, 0, 0.0),
+        )
+        average_amount_text = "+0"
+        average_rate_text = _format_percent(0.0, digits=1)
+        efficiency_value = (
+            source_rows[0].get("efficiency")
+            if len(source_rows) == 1
+            else None
+        )
+        try:
+            efficiency_text = f"{float(efficiency_value):.1f}"
+        except (TypeError, ValueError):
+            efficiency_text = "0.0"
 
         return {
             "performance_period_text": f"기간({period_text})",
-            "performance_profit_text": f"수익({profit_text} / -)",
-            "performance_average_text": "평균(- / -)",
-            "performance_efficiency_text": "효율(-)",
+            "performance_profit_text": (
+                f"수익({profit_amount_text} / {profit_rate_text})"
+            ),
+            "performance_average_text": (
+                f"평균({average_amount_text} / {average_rate_text})"
+            ),
+            "performance_efficiency_text": f"효율({efficiency_text})",
+            "performance_period_value": period_text,
+            "performance_profit_amount": profit_amount_text,
+            "performance_profit_rate": profit_rate_text,
+            "performance_average_amount": average_amount_text,
+            "performance_average_rate": average_rate_text,
+            "performance_efficiency_value": efficiency_text,
         }
 
     def _routine_instance_operation_counts(self) -> dict[str, dict[str, object]]:
@@ -2370,6 +2405,40 @@ class AutoTradeSettingWindow(QDialog):
                     return left.strip() or left_fallback, right.strip() or right_fallback
                 return inside.strip() or left_fallback, right_fallback
         return left_fallback, right_fallback
+
+    def _routine_tree_metric_values(
+        self,
+        row_data: dict[str, object],
+        metric: str,
+        left_fallback: str,
+        right_fallback: str,
+    ) -> tuple[str, str]:
+        value_keys = {
+            "period": ("performance_period_value", ""),
+            "profit": (
+                "performance_profit_amount",
+                "performance_profit_rate",
+            ),
+            "average": (
+                "performance_average_amount",
+                "performance_average_rate",
+            ),
+            "efficiency": ("performance_efficiency_value", ""),
+        }
+        left_key, right_key = value_keys.get(metric, ("", ""))
+        if left_key and left_key in row_data:
+            left_value = str(row_data.get(left_key, "") or "").strip() or left_fallback
+            right_value = (
+                str(row_data.get(right_key, "") or "").strip() or right_fallback
+                if right_key
+                else right_fallback
+            )
+            return left_value, right_value
+        return self._routine_tree_metric_text_parts(
+            row_data.get(f"performance_{metric}_text", ""),
+            left_fallback,
+            right_fallback,
+        )
 
     def _routine_tree_row_widget(self, row_data: dict[str, object], text: str) -> QWidget:
         row_kind = str(row_data.get("row_kind", "") or "")
@@ -2510,7 +2579,7 @@ class AutoTradeSettingWindow(QDialog):
                 "key": "profit",
                 "object_name": "autoTradeSettingRoutineTreePerformanceProfit",
                 "label": "수익",
-                "left_fallback": "0",
+                "left_fallback": "+0",
                 "left_sample": "99,999,999",
                 "right_fallback": "0.0%",
                 "right_sample": "000.0%",
@@ -2519,7 +2588,7 @@ class AutoTradeSettingWindow(QDialog):
                 "key": "average",
                 "object_name": "autoTradeSettingRoutineTreePerformanceAverage",
                 "label": "평균",
-                "left_fallback": "0",
+                "left_fallback": "+0",
                 "left_sample": "99,999,999",
                 "right_fallback": "0.0%",
                 "right_sample": "00.0%",
@@ -2648,8 +2717,9 @@ class AutoTradeSettingWindow(QDialog):
             label_text = str(spec["label"])
             left_sample = str(spec["left_sample"])
             right_sample = str(spec["right_sample"])
-            left_value, right_value = self._routine_tree_metric_text_parts(
-                row_data.get(f"performance_{key}_text", ""),
+            left_value, right_value = self._routine_tree_metric_values(
+                row_data,
+                key,
                 str(spec["left_fallback"]),
                 str(spec["right_fallback"]),
             )
@@ -2938,11 +3008,6 @@ class AutoTradeSettingWindow(QDialog):
         display_metric = str(
             getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
         )
-        target_row_kind = {
-            "category": "definition",
-            "routine": "instance",
-            "stock": "stock",
-        }.get(display_level, "")
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             metadata = item.data(Qt.UserRole) if item is not None else None
@@ -2956,7 +3021,6 @@ class AutoTradeSettingWindow(QDialog):
             row_widget = self.routine_table.cellWidget(row, 0)
             if row_widget is None:
                 continue
-            row_kind = str(updated_metadata.get("row_kind", "") or "")
             for metric in ("period", "profit", "average", "efficiency"):
                 metric_name = metric.title()
                 left_label = row_widget.findChild(
@@ -2969,14 +3033,19 @@ class AutoTradeSettingWindow(QDialog):
                     QLabel,
                     f"autoTradeSettingRoutineTreePerformance{metric_name}RightValue",
                 )
-                if row_kind == target_row_kind and metric == display_metric:
-                    left_value, right_value = self._routine_tree_metric_text_parts(
-                        updated_metadata.get(f"performance_{metric}_text", ""),
-                        "-",
-                        "-",
-                    )
-                else:
-                    left_value, right_value = "-", "-"
+                default_values = {
+                    "period": ("0", ""),
+                    "profit": ("+0", "0.0%"),
+                    "average": ("+0", "0.0%"),
+                    "efficiency": ("0.0", ""),
+                }
+                left_fallback, right_fallback = default_values[metric]
+                left_value, right_value = self._routine_tree_metric_values(
+                    updated_metadata,
+                    metric,
+                    left_fallback,
+                    right_fallback,
+                )
                 left_label.setText(left_value)
                 if right_label is not None:
                     right_label.setText(right_value)
