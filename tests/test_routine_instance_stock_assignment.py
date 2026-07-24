@@ -129,6 +129,128 @@ class RoutineInstanceStockAssignmentTest(unittest.TestCase):
         self.assertEqual("", config["assigned_routine_instance_id"])
         self.assertEqual("", config["routine_instance_name"])
 
+    def test_assignment_history_is_closed_on_unassign_without_changing_runtime_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "003550_LG",
+                {
+                    "orders_marker": {"kept": True},
+                    "state_marker": "kept",
+                },
+            )
+            repository = StockRepository(root)
+            with patch("stock_repository.now_text", side_effect=["2026-07-01 09:00:00", "2026-07-02 15:30:00"]):
+                self.assertTrue(
+                    repository.update_stock_routine_instance(
+                        "003550",
+                        "LG",
+                        instance_id=INSTANCE_B,
+                        instance_name="인스턴스 A",
+                        definition_id="indicator_follow",
+                        routine_type="지표추종매매",
+                    )
+                )
+                self.assertTrue(repository.update_stock_routine("003550", "LG", []))
+
+            config = json.loads((stock / "config.json").read_text(encoding="utf-8"))
+            history = repository.list_routine_assignment_history()
+
+        self.assertEqual("", config["assigned_routine_instance_id"])
+        self.assertEqual({"kept": True}, config["orders_marker"])
+        self.assertEqual("kept", config["state_marker"])
+        self.assertEqual(1, len(history))
+        self.assertEqual(INSTANCE_B, history[0]["instance_id"])
+        self.assertEqual("2026-07-01 09:00:00", history[0]["registered_at"])
+        self.assertEqual("2026-07-02 15:30:00", history[0]["unregistered_at"])
+        self.assertFalse(history[0]["display_hidden"])
+
+    def test_same_stock_can_be_historical_for_one_instance_and_current_for_another(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._stock(root, "003550_LG", {})
+            repository = StockRepository(root)
+            with patch(
+                "stock_repository.now_text",
+                side_effect=[
+                    "2026-07-01 09:00:00",
+                    "2026-07-02 15:30:00",
+                    "2026-07-03 09:00:00",
+                ],
+            ):
+                repository.update_stock_routine_instance(
+                    "003550",
+                    "LG",
+                    instance_id=INSTANCE_B,
+                    instance_name="인스턴스 A",
+                    definition_id="indicator_follow",
+                    routine_type="지표추종매매",
+                )
+                repository.update_stock_routine("003550", "LG", [])
+                repository.update_stock_routine_instance(
+                    "003550",
+                    "LG",
+                    instance_id=INSTANCE_COIN,
+                    instance_name="인스턴스 B",
+                    definition_id="indicator_follow",
+                    routine_type="지표추종매매",
+                )
+
+            history = repository.list_routine_assignment_history()
+            current = repository.find_by_code("003550")
+
+        self.assertEqual([(INSTANCE_B, "003550")], [(item["instance_id"], item["stock_code"]) for item in history])
+        self.assertIsNotNone(current)
+        self.assertEqual(INSTANCE_COIN, current.assigned_routine_instance_id)
+
+    def test_display_hide_preserves_history_and_current_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "003550_LG", {})
+            repository = StockRepository(root)
+            with patch(
+                "stock_repository.now_text",
+                side_effect=[
+                    "2026-07-01 09:00:00",
+                    "2026-07-02 15:30:00",
+                    "2026-07-03 09:00:00",
+                ],
+            ):
+                repository.update_stock_routine_instance(
+                    "003550",
+                    "LG",
+                    instance_id=INSTANCE_B,
+                    instance_name="인스턴스 A",
+                    definition_id="indicator_follow",
+                    routine_type="지표추종매매",
+                )
+                repository.update_stock_routine("003550", "LG", [])
+                repository.update_stock_routine_instance(
+                    "003550",
+                    "LG",
+                    instance_id=INSTANCE_COIN,
+                    instance_name="인스턴스 B",
+                    definition_id="indicator_follow",
+                    routine_type="지표추종매매",
+                )
+            before = repository.list_routine_assignment_history(include_hidden=True)
+
+            hidden = repository.hide_routine_assignment_history(
+                code="003550",
+                instance_id=INSTANCE_B,
+            )
+            visible = repository.list_routine_assignment_history()
+            after = repository.list_routine_assignment_history(include_hidden=True)
+            config = json.loads((stock / "config.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(hidden)
+        self.assertEqual([], visible)
+        self.assertEqual(before[0]["registered_at"], after[0]["registered_at"])
+        self.assertEqual(before[0]["unregistered_at"], after[0]["unregistered_at"])
+        self.assertTrue(after[0]["display_hidden"])
+        self.assertEqual(INSTANCE_COIN, config["assigned_routine_instance_id"])
+
     def test_monitoring_displays_instance_name_and_marks_legacy_as_review_needed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

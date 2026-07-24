@@ -37,6 +37,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCKS_DIR = PROJECT_ROOT / "stocks"
+ROUTINE_ASSIGNMENT_HISTORY_KEY = "routine_assignment_history"
 
 
 def now_text() -> str:
@@ -178,6 +179,144 @@ class StockRepository:
             "routine_type": str(config.get("routine_type", "") or "").strip(),
         }
 
+    @staticmethod
+    def _assignment_history(config: dict[str, Any]) -> list[dict[str, Any]]:
+        history = config.get(ROUTINE_ASSIGNMENT_HISTORY_KEY, [])
+        if not isinstance(history, list):
+            return []
+        return [dict(item) for item in history if isinstance(item, dict)]
+
+    @staticmethod
+    def _close_assignment_history(
+        config: dict[str, Any],
+        *,
+        instance_id: str,
+        instance_name: str,
+        definition_id: str,
+        routine_type: str,
+        changed_at: str,
+    ) -> None:
+        clean_instance_id = str(instance_id or "").strip()
+        if not clean_instance_id:
+            return
+        history = StockRepository._assignment_history(config)
+        open_item = next(
+            (
+                item
+                for item in reversed(history)
+                if str(item.get("instance_id", "") or "").strip() == clean_instance_id
+                and not str(item.get("unregistered_at", "") or "").strip()
+            ),
+            None,
+        )
+        if open_item is None:
+            open_item = {
+                "instance_id": clean_instance_id,
+                "instance_name": str(instance_name or "").strip(),
+                "definition_id": str(definition_id or "").strip(),
+                "routine_type": str(routine_type or "").strip(),
+                "registered_at": "",
+                "display_hidden": False,
+            }
+            history.append(open_item)
+        open_item["unregistered_at"] = changed_at
+        config[ROUTINE_ASSIGNMENT_HISTORY_KEY] = history
+
+    @staticmethod
+    def _open_assignment_history(
+        config: dict[str, Any],
+        *,
+        instance_id: str,
+        instance_name: str,
+        definition_id: str,
+        routine_type: str,
+        changed_at: str,
+    ) -> None:
+        history = StockRepository._assignment_history(config)
+        if any(
+            str(item.get("instance_id", "") or "").strip() == instance_id
+            and not str(item.get("unregistered_at", "") or "").strip()
+            for item in history
+        ):
+            config[ROUTINE_ASSIGNMENT_HISTORY_KEY] = history
+            return
+        history.append(
+            {
+                "instance_id": instance_id,
+                "instance_name": instance_name,
+                "definition_id": definition_id,
+                "routine_type": routine_type,
+                "registered_at": changed_at,
+                "unregistered_at": "",
+                "display_hidden": False,
+            }
+        )
+        config[ROUTINE_ASSIGNMENT_HISTORY_KEY] = history
+
+    def list_routine_assignment_history(
+        self,
+        *,
+        include_hidden: bool = False,
+    ) -> list[dict[str, Any]]:
+        latest_by_instance_stock: dict[tuple[str, str], dict[str, Any]] = {}
+        for path in self.list_stock_dirs():
+            code, name = self.parse_stock_folder(path)
+            config = read_json_dict(path / "config.json")
+            for item in self._assignment_history(config):
+                instance_id = str(item.get("instance_id", "") or "").strip()
+                unregistered_at = str(item.get("unregistered_at", "") or "").strip()
+                if not instance_id or not unregistered_at:
+                    continue
+                record = {
+                    **item,
+                    "instance_id": instance_id,
+                    "stock_code": code,
+                    "stock_name": name,
+                    "stock_path": str(path.relative_to(self.project_root)),
+                }
+                key = (instance_id, code)
+                previous = latest_by_instance_stock.get(key)
+                if previous is None or str(previous.get("unregistered_at", "")) <= unregistered_at:
+                    latest_by_instance_stock[key] = record
+        records = [
+            item
+            for item in latest_by_instance_stock.values()
+            if include_hidden or not bool(item.get("display_hidden", False))
+        ]
+        return sorted(
+            records,
+            key=lambda item: (
+                str(item.get("instance_id", "")),
+                str(item.get("stock_code", "")),
+            ),
+        )
+
+    def hide_routine_assignment_history(
+        self,
+        *,
+        code: str,
+        instance_id: str,
+    ) -> bool:
+        path = self.resolve_stock_dir(code)
+        if not path.exists():
+            return False
+        config_path = path / "config.json"
+        config = read_json_dict(config_path)
+        changed = False
+        history = self._assignment_history(config)
+        for item in history:
+            if (
+                str(item.get("instance_id", "") or "").strip() == str(instance_id or "").strip()
+                and str(item.get("unregistered_at", "") or "").strip()
+            ):
+                item["display_hidden"] = True
+                changed = True
+        if not changed:
+            return False
+        config[ROUTINE_ASSIGNMENT_HISTORY_KEY] = history
+        write_json_dict(config_path, config)
+        return True
+
     def list_from_central_stocks(self) -> list[StockRecord]:
         records: list[StockRecord] = []
         for path in self.list_stock_dirs():
@@ -243,6 +382,15 @@ class StockRepository:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
+        changed_at = now_text()
+        self._close_assignment_history(
+            config,
+            instance_id=str(config.get("assigned_routine_instance_id", "") or ""),
+            instance_name=str(config.get("routine_instance_name", "") or ""),
+            definition_id=str(config.get("routine_definition_id", "") or ""),
+            routine_type=str(config.get("routine_type", "") or ""),
+            changed_at=changed_at,
+        )
 
         # 루틴 연결 정보 일원화
         config["routine"] = routine_name
@@ -258,7 +406,7 @@ class StockRepository:
         config["routine_definition_id"] = ""
         config["routine_type"] = routine_name
 
-        config["updated_at"] = now_text()
+        config["updated_at"] = changed_at
         write_json_dict(config_path, config)
         return True
 
@@ -291,6 +439,27 @@ class StockRepository:
             return False
         config_path = path / "config.json"
         config = read_json_dict(config_path)
+        changed_at = now_text()
+        previous_instance_id = str(
+            config.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        if previous_instance_id and previous_instance_id != clean_instance_id:
+            self._close_assignment_history(
+                config,
+                instance_id=previous_instance_id,
+                instance_name=str(config.get("routine_instance_name", "") or ""),
+                definition_id=str(config.get("routine_definition_id", "") or ""),
+                routine_type=str(config.get("routine_type", "") or ""),
+                changed_at=changed_at,
+            )
+        self._open_assignment_history(
+            config,
+            instance_id=clean_instance_id,
+            instance_name=clean_instance_name,
+            definition_id=clean_definition_id,
+            routine_type=clean_routine_type,
+            changed_at=changed_at,
+        )
         config["routine"] = clean_routine_type
         config["routine_name"] = clean_routine_type
         config["assigned_routine"] = clean_routine_type
@@ -300,7 +469,7 @@ class StockRepository:
         config["routine_instance_name"] = clean_instance_name
         config["routine_definition_id"] = clean_definition_id
         config["routine_type"] = clean_routine_type
-        config["updated_at"] = now_text()
+        config["updated_at"] = changed_at
         write_json_dict(config_path, config)
         return True
 

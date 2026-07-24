@@ -331,6 +331,7 @@ from routine_instance_registry import (
     routine_instance_by_id,
 )
 from routine_instance_repository import RoutineInstanceRepository
+from stock_repository import StockRepository
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_final_send_gate_input_adapter import adapt_final_send_gate_readiness_to_input
 from execution_final_send_gate_orchestrator import orchestrate_final_send_gate_preview
@@ -391,6 +392,7 @@ AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
     "stock": frozenset({"period", "profit", "average", "efficiency"}),
 }
 AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR = "#7E22CE"
+AUTO_TRADE_SETTING_HISTORICAL_STOCK_ROW_TEXT_COLOR = "#9CA3AF"
 AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
     0: 80,    # 코드: 6자리 여유
     1: 205,   # 종목: 13자 기준
@@ -2256,6 +2258,27 @@ class AutoTradeSettingWindow(QDialog):
             stocks.sort(key=lambda item: (str(item.get("stock_name", "")), str(item.get("stock_code", ""))))
         return stocks_by_instance
 
+    def _historical_stocks_by_instance(self) -> dict[str, list[dict[str, object]]]:
+        stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+        for stock in StockRepository(PROJECT_ROOT).list_routine_assignment_history():
+            instance_id = str(stock.get("instance_id", "") or "").strip()
+            if not instance_id:
+                continue
+            stocks_by_instance.setdefault(instance_id, []).append(
+                {
+                    **stock,
+                    "is_historical": True,
+                }
+            )
+        for stocks in stocks_by_instance.values():
+            stocks.sort(
+                key=lambda item: (
+                    str(item.get("stock_name", "")),
+                    str(item.get("stock_code", "")),
+                )
+            )
+        return stocks_by_instance
+
     def _routine_tree_stock_performance_source(
         self,
         stock: dict[str, object],
@@ -2504,6 +2527,7 @@ class AutoTradeSettingWindow(QDialog):
         row_kind = str(row_data.get("row_kind", "") or "")
         is_instance = row_kind == "instance"
         is_stock = row_kind == "stock"
+        is_historical_stock = is_stock and bool(row_data.get("is_historical", False))
         is_definition = row_kind == "definition"
         has_period_metric = is_instance or is_stock
         container = QWidget()
@@ -2538,7 +2562,12 @@ class AutoTradeSettingWindow(QDialog):
             indent_spacer.setFocusPolicy(Qt.NoFocus)
             layout.addWidget(indent_spacer, 0, Qt.AlignVCenter)
             row_data = dict(row_data)
-            row_data["tree_icon"] = "\u25aa"
+            row_data["tree_icon"] = "\u25aa" if is_historical_stock else "\u2713"
+        stock_row_color = (
+            AUTO_TRADE_SETTING_HISTORICAL_STOCK_ROW_TEXT_COLOR
+            if is_historical_stock
+            else AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR
+        )
         icon_label = QLabel(str(row_data.get("tree_icon", "") or ""))
         icon_label.setObjectName("autoTradeSettingRoutineTreeIcon")
         icon_label.setAlignment(Qt.AlignCenter)
@@ -2548,7 +2577,7 @@ class AutoTradeSettingWindow(QDialog):
         icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         icon_label.setStyleSheet(
             "background: transparent;"
-            f" color: {AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else '#6B7280'};"
+            f" color: {stock_row_color if is_stock else '#6B7280'};"
         )
         if is_definition:
             icon_font = QFont(container.font())
@@ -2615,7 +2644,7 @@ class AutoTradeSettingWindow(QDialog):
         title_label.setStyleSheet(
             "background: transparent;"
             " border: none;"
-            f" color: {AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else '#374151'};"
+            f" color: {stock_row_color if is_stock else '#374151'};"
         )
         title_label.setFont(title_font)
         instance_title_width = routine_tree_title_width(QFontMetrics(base_title_font))
@@ -2756,7 +2785,7 @@ class AutoTradeSettingWindow(QDialog):
             label.setFixedWidth(width)
             label.setFocusPolicy(Qt.NoFocus)
             label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            metric_color = AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else "#6B7280"
+            metric_color = stock_row_color if is_stock else "#6B7280"
             label.setStyleSheet(f"background: transparent; color: {metric_color};")
             if is_definition:
                 label.setProperty("autoTradeSettingParentSummaryMetric", True)
@@ -2773,7 +2802,7 @@ class AutoTradeSettingWindow(QDialog):
                 separator.setFixedWidth(separator_width)
                 separator.setFocusPolicy(Qt.NoFocus)
                 separator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-                separator_color = AUTO_TRADE_SETTING_STOCK_ROW_TEXT_COLOR if is_stock else "#9CA3AF"
+                separator_color = stock_row_color if is_stock else "#9CA3AF"
                 separator.setStyleSheet(f"background: transparent; color: {separator_color};")
                 if is_definition:
                     separator.setProperty("autoTradeSettingParentSummaryMetric", True)
@@ -3480,7 +3509,7 @@ class AutoTradeSettingWindow(QDialog):
 
         instance_counts = self._routine_instance_operation_counts()
         current_stocks_by_instance = self._current_stocks_by_instance()
-        historical_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+        historical_stocks_by_instance = self._historical_stocks_by_instance()
         performance_source_cache: dict[str, dict[str, object]] = {}
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
@@ -3503,7 +3532,15 @@ class AutoTradeSettingWindow(QDialog):
             for instance in child_instances:
                 instance_id = str(instance.instance_id)
                 current_stocks = current_stocks_by_instance.get(instance_id, [])
-                historical_stocks = historical_stocks_by_instance.get(instance_id, [])
+                current_codes = {
+                    str(stock.get("stock_code", "") or "").strip()
+                    for stock in current_stocks
+                }
+                historical_stocks = [
+                    stock
+                    for stock in historical_stocks_by_instance.get(instance_id, [])
+                    if str(stock.get("stock_code", "") or "").strip() not in current_codes
+                ]
                 display_stocks = list(current_stocks)
                 if stock_data_scope == "all":
                     display_stocks = current_stocks + historical_stocks
@@ -3511,10 +3548,7 @@ class AutoTradeSettingWindow(QDialog):
             definition_stocks = [
                 stock
                 for instance in child_instances
-                for stock in (
-                    current_stocks_by_instance.get(str(instance.instance_id), [])
-                    + historical_stocks_by_instance.get(str(instance.instance_id), [])
-                )
+                for stock in current_stocks_by_instance.get(str(instance.instance_id), [])
             ]
             definition_performance = self._routine_tree_performance_texts(
                 definition_stocks,
@@ -3537,7 +3571,10 @@ class AutoTradeSettingWindow(QDialog):
                     "tree_icon": "\u25b6" if is_collapsed or not has_definition_children else "\u25bc",
                     "has_toggle_children": has_definition_children,
                     "has_instances": has_definition_children,
-                    "has_stocked_instances": any(display_stocks_by_instance.values()),
+                    "has_stocked_instances": any(
+                        current_stocks_by_instance.get(str(instance.instance_id), [])
+                        for instance in child_instances
+                    ),
                     "instance_count": len(child_instances),
                     "registered": sum(
                         int(instance_counts.get(str(instance.instance_id), {}).get("registered", 0) or 0)
@@ -3569,9 +3606,17 @@ class AutoTradeSettingWindow(QDialog):
                 instance_dir = Path(instance.rules_path).parent if instance.rules_path else Path()
                 instance_id = str(instance.instance_id)
                 current_stocks = current_stocks_by_instance.get(instance_id, [])
-                historical_stocks = historical_stocks_by_instance.get(instance_id, [])
+                current_codes = {
+                    str(stock.get("stock_code", "") or "").strip()
+                    for stock in current_stocks
+                }
+                historical_stocks = [
+                    stock
+                    for stock in historical_stocks_by_instance.get(instance_id, [])
+                    if str(stock.get("stock_code", "") or "").strip() not in current_codes
+                ]
                 instance_performance = self._routine_tree_performance_texts(
-                    current_stocks + historical_stocks,
+                    current_stocks,
                     performance_source_cache,
                 )
                 has_instance_children = bool(current_stocks or historical_stocks)
@@ -3595,7 +3640,7 @@ class AutoTradeSettingWindow(QDialog):
                         "display_name": str(instance.display_name),
                         "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
                         "has_toggle_children": has_instance_children,
-                        "has_displayable_stocks": bool(visible_stocks),
+                        "has_displayable_stocks": bool(current_stocks),
                         "instance_group_top_gap": _index > 0,
                         "instance_count": 0,
                         "registered": int(count.get("registered", 0) or 0),
@@ -3614,9 +3659,21 @@ class AutoTradeSettingWindow(QDialog):
                 )
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
-                    stock_performance = self._routine_tree_performance_texts(
-                        [stock],
-                        performance_source_cache,
+                    is_historical = bool(stock.get("is_historical", False))
+                    stock_performance = (
+                        {
+                            "performance_period_value": "-",
+                            "performance_profit_amount": "-",
+                            "performance_profit_rate": "-",
+                            "performance_average_amount": "-",
+                            "performance_average_rate": "-",
+                            "performance_efficiency_value": "-",
+                        }
+                        if is_historical
+                        else self._routine_tree_performance_texts(
+                            [stock],
+                            performance_source_cache,
+                        )
                     )
                     rows.append(
                         {
@@ -3638,7 +3695,8 @@ class AutoTradeSettingWindow(QDialog):
                             "stock_code": str(stock.get("stock_code", "") or ""),
                             "stock_path": str(stock.get("stock_path", "") or ""),
                             "first_stock_for_instance": stock_index == 0,
-                            "tree_icon": "\u25aa",
+                            "tree_icon": "\u25aa" if is_historical else "\u2713",
+                            "is_historical": is_historical,
                             **stock_performance,
                         }
                     )
@@ -3709,11 +3767,15 @@ class AutoTradeSettingWindow(QDialog):
         metadata = self.current_selected_routine_row_metadata()
         if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
             return ""
+        if bool(metadata.get("is_historical", False)):
+            return ""
         return str(metadata.get("instance_id", "") or "").strip()
 
     def current_selected_instance_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
         if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
+            return None
+        if bool(metadata.get("is_historical", False)):
             return None
         path_text = str(metadata.get("instance_dir", "") or "").strip()
         if not path_text:
@@ -3726,6 +3788,8 @@ class AutoTradeSettingWindow(QDialog):
         if not metadata:
             return ()
         row_kind = str(metadata.get("row_kind", "") or "")
+        if row_kind == "stock" and bool(metadata.get("is_historical", False)):
+            return ()
         if row_kind in {"instance", "stock"}:
             instance_id = str(metadata.get("instance_id", "") or "").strip()
             return (instance_id,) if instance_id else ()
@@ -3743,12 +3807,16 @@ class AutoTradeSettingWindow(QDialog):
         if not metadata:
             return ""
         if str(metadata.get("row_kind", "")) in {"instance", "stock"}:
+            if bool(metadata.get("is_historical", False)):
+                return ""
             return str(metadata.get("instance_name", "") or "").strip()
         return str(metadata.get("definition_name", "") or "").strip()
 
     def current_selected_routine_dir(self) -> Path | None:
         metadata = self.current_selected_routine_row_metadata()
         if not metadata or str(metadata.get("row_kind", "")) not in {"instance", "stock"}:
+            return None
+        if bool(metadata.get("is_historical", False)):
             return None
         path_text = str(metadata.get("package_dir", "") or "").strip()
         if not path_text:
@@ -3833,6 +3901,12 @@ class AutoTradeSettingWindow(QDialog):
             )
             delete_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.delete_routine_instance(target)
+            )
+        elif row_kind == "stock" and bool(metadata.get("is_historical", False)):
+            menu = QMenu(self.routine_table)
+            hide_action = menu.addAction("표시삭제")
+            hide_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.hide_historical_stock_display(target)
             )
         else:
             return
@@ -3992,6 +4066,39 @@ class AutoTradeSettingWindow(QDialog):
             )
             return
         self.refresh_all()
+
+    def hide_historical_stock_display(self, metadata: dict[str, object]) -> None:
+        if (
+            str(metadata.get("row_kind", "") or "") != "stock"
+            or not bool(metadata.get("is_historical", False))
+        ):
+            return
+        instance_id = str(metadata.get("instance_id", "") or "").strip()
+        stock_code = str(metadata.get("stock_code", "") or "").strip()
+        stock_name = str(metadata.get("display_name", "") or "").strip()
+        if not instance_id or not stock_code:
+            return
+        answer = QMessageBox.question(
+            self,
+            "표시삭제",
+            f"'{stock_name or stock_code}' 과거 종목을 실적 화면에서 숨기시겠습니까?\n"
+            "거래·주문·실적·등록 이력 데이터는 삭제되지 않습니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if not StockRepository(PROJECT_ROOT).hide_routine_assignment_history(
+            code=stock_code,
+            instance_id=instance_id,
+        ):
+            QMessageBox.warning(
+                self,
+                "표시삭제",
+                "과거 종목 표시 정보를 갱신하지 못했습니다.",
+            )
+            return
+        self.load_routine_table()
 
     def on_routine_selection_changed(self) -> None:
         self._stock_status_filter = "all"

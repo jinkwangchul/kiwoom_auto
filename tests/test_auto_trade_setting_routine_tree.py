@@ -85,6 +85,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_routine_instance_stock_counts",
             "_current_stock_entries_by_instance",
             "_current_stocks_by_instance",
+            "_historical_stocks_by_instance",
             "_routine_instance_operation_counts",
             "_is_default_operation_instance",
             "_routine_status_text_for_metadata",
@@ -128,6 +129,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "open_routine_instance_settings",
             "rename_routine_instance",
             "delete_routine_instance",
+            "hide_historical_stock_display",
             "on_routine_selection_changed",
             "auto_trade_runtime_state_for_order",
             "update_selection_summary_panel",
@@ -2605,7 +2607,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("▼", instance_icon.text())
         self.assertEqual(setting_window.Qt.PointingHandCursor, instance_icon.cursor().shape())
         self.assertFalse(instance_icon.testAttribute(setting_window.Qt.WA_TransparentForMouseEvents))
-        self.assertEqual("▪", stock_icon.text())
+        self.assertEqual("✓", stock_icon.text())
         self.assertIn("color: #7E22CE", stock_icon.styleSheet())
         self.assertEqual("삼성전자", stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle").text())
         self.assertEqual("삼성전자", stock_title.toolTip())
@@ -2676,6 +2678,244 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
         window.routine_table.selectRow(3)
         self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
+
+    def test_current_and_historical_stocks_are_visually_and_operationally_separate(self) -> None:
+        instances = [
+            self._instance("inst-a", "과거 인스턴스"),
+            self._instance("inst-b", "현재 인스턴스"),
+        ]
+        current_stocks = {
+            "inst-b": [
+                {
+                    "stock_path": "stocks/003550_LG",
+                    "stock_code": "003550",
+                    "stock_name": "LG",
+                }
+            ]
+        }
+        historical_stocks = {
+            "inst-a": [
+                {
+                    "stock_path": "stocks/003550_LG",
+                    "stock_code": "003550",
+                    "stock_name": "LG",
+                    "is_historical": True,
+                },
+                {
+                    "stock_path": "stocks/005930_삼성전자",
+                    "stock_code": "005930",
+                    "stock_name": "삼성전자",
+                    "is_historical": True,
+                },
+            ]
+        }
+        window = self._window_harness()
+        window._current_stocks_by_instance = lambda: current_stocks
+        window._historical_stocks_by_instance = lambda: historical_stocks
+        window._routine_instance_operation_counts = lambda: {}
+        performance_paths = []
+        window._routine_tree_stock_performance_source = lambda stock: (
+            performance_paths.append(str(stock.get("stock_path", "")))
+            or {
+                "trade_days": 0,
+                "realized_profit": 0,
+                "profit_rate": None,
+                "average": None,
+                "average_rate": None,
+                "efficiency": None,
+            }
+        )
+
+        with (
+            patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]),
+            patch.object(setting_window, "load_persisted_routine_instances", return_value=instances),
+        ):
+            window.load_routine_table()
+            window._set_routine_tree_display_level("stock")
+
+            rows = [
+                window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)
+                for row in range(window.routine_table.rowCount())
+            ]
+            stock_rows = [row for row in rows if row["row_kind"] == "stock"]
+            self.assertEqual(
+                [
+                    ("inst-a", "003550", True),
+                    ("inst-a", "005930", True),
+                    ("inst-b", "003550", False),
+                ],
+                [
+                    (
+                        row["instance_id"],
+                        row["stock_code"],
+                        bool(row.get("is_historical", False)),
+                    )
+                    for row in stock_rows
+                ],
+            )
+
+            historical_row = next(
+                row
+                for row in range(window.routine_table.rowCount())
+                if bool(
+                    window.routine_table.item(row, 0)
+                    .data(setting_window.Qt.UserRole)
+                    .get("is_historical", False)
+                )
+            )
+            current_row = next(
+                row
+                for row in range(window.routine_table.rowCount())
+                if window.routine_table.item(row, 0).data(setting_window.Qt.UserRole).get("row_kind")
+                == "stock"
+                and not bool(
+                    window.routine_table.item(row, 0)
+                    .data(setting_window.Qt.UserRole)
+                    .get("is_historical", False)
+                )
+            )
+            historical_widget = window.routine_table.cellWidget(historical_row, 0)
+            current_widget = window.routine_table.cellWidget(current_row, 0)
+            self.assertEqual(
+                "▪",
+                historical_widget.findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreeIcon",
+                ).text(),
+            )
+            self.assertEqual(
+                "✓",
+                current_widget.findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreeIcon",
+                ).text(),
+            )
+            for label in historical_widget.findChildren(setting_window.QLabel):
+                if label.objectName() == "autoTradeSettingRoutineTreeTitle" or label.objectName().startswith(
+                    "autoTradeSettingRoutineTreePerformance"
+                ):
+                    self.assertIn(
+                        setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_ROW_TEXT_COLOR,
+                        label.styleSheet(),
+                    )
+            self.assertEqual(
+                "-",
+                historical_widget.findChild(
+                    setting_window.QLabel,
+                    "autoTradeSettingRoutineTreePerformanceProfitLeftValue",
+                ).text(),
+            )
+            window.routine_table.selectRow(historical_row)
+            self.assertEqual((), window.current_selected_target_instance_ids())
+            self.assertEqual("", window.current_selected_instance_id())
+
+            window._set_routine_tree_display_scope("current")
+            self.assertEqual(
+                [("inst-b", "003550")],
+                [
+                    (row["instance_id"], row["stock_code"])
+                    for row in (
+                        window.routine_table.item(index, 0).data(setting_window.Qt.UserRole)
+                        for index in range(window.routine_table.rowCount())
+                    )
+                    if row["row_kind"] == "stock"
+                ],
+            )
+
+            window._set_routine_tree_display_scope("all")
+            window._set_routine_tree_valid_only(True)
+            self.assertTrue(window.routine_table.isRowHidden(1))
+            self.assertTrue(window.routine_table.isRowHidden(2))
+            self.assertTrue(window.routine_table.isRowHidden(3))
+            self.assertFalse(window.routine_table.isRowHidden(4))
+            self.assertFalse(window.routine_table.isRowHidden(5))
+            self.assertEqual(
+                ["stocks/003550_LG"] * 3,
+                performance_paths,
+            )
+
+    def test_historical_stock_context_menu_only_offers_display_delete(self) -> None:
+        window = self._window_harness()
+        window.routine_table.setRowCount(1)
+        item = QTableWidgetItem()
+        item.setData(
+            Qt.UserRole,
+            {
+                "row_kind": "stock",
+                "instance_id": "inst-a",
+                "stock_code": "005930",
+                "display_name": "삼성전자",
+                "is_historical": True,
+            },
+        )
+        window.routine_table.setItem(0, 0, item)
+        menu = MagicMock()
+        action = MagicMock()
+        callbacks = []
+        action.triggered.connect.side_effect = callbacks.append
+        menu.addAction.return_value = action
+        with (
+            patch.object(window.routine_table, "itemAt", return_value=item),
+            patch.object(setting_window, "QMenu", return_value=menu),
+            patch.object(window, "hide_historical_stock_display") as hide_display,
+        ):
+            window.on_routine_table_context_menu(QPoint(1, 1))
+            callbacks[0](False)
+
+        menu.addAction.assert_called_once_with("표시삭제")
+        hide_display.assert_called_once_with(item.data(Qt.UserRole))
+
+    def test_historical_stock_display_delete_only_updates_history_visibility(self) -> None:
+        window = self._window_harness()
+        window.load_routine_table = MagicMock()
+        repository = MagicMock()
+        repository.hide_routine_assignment_history.return_value = True
+        metadata = {
+            "row_kind": "stock",
+            "instance_id": "inst-a",
+            "stock_code": "005930",
+            "display_name": "삼성전자",
+            "is_historical": True,
+        }
+        with (
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+            patch.object(setting_window, "StockRepository", return_value=repository),
+        ):
+            window.hide_historical_stock_display(metadata)
+
+        repository.hide_routine_assignment_history.assert_called_once_with(
+            code="005930",
+            instance_id="inst-a",
+        )
+        window.load_routine_table.assert_called_once_with()
+
+    def test_historical_stock_display_delete_cancel_is_noop(self) -> None:
+        window = self._window_harness()
+        window.load_routine_table = MagicMock()
+        repository = MagicMock()
+        metadata = {
+            "row_kind": "stock",
+            "instance_id": "inst-a",
+            "stock_code": "005930",
+            "display_name": "삼성전자",
+            "is_historical": True,
+        }
+        with (
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.No,
+            ),
+            patch.object(setting_window, "StockRepository", return_value=repository),
+        ):
+            window.hide_historical_stock_display(metadata)
+
+        repository.hide_routine_assignment_history.assert_not_called()
+        window.load_routine_table.assert_not_called()
 
     def test_instance_arrow_click_collapses_stock_rows_independently(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
