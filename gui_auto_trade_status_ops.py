@@ -27,6 +27,7 @@ from state_policy import (
     normalize_operation_mode,
     normalized_hhmmss_or_empty,
     operation_mode_check_text,
+    operation_mode_change_decision,
     operation_mode_display,
     operation_mode_recalculation_target_status,
     scheduled_status_for_now,
@@ -46,6 +47,9 @@ CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def current_datetime() -> datetime:
+    return datetime.now()
 
 def append_changelog(change_type: str, filename: str, message: str) -> None:
     block = (
@@ -400,7 +404,46 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         config = default_config()
 
     before_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    if before_mode != mode and not clear_manual_ats_runtime_selection(stock_dir):
+    target_config = dict(config)
+    if config_updates:
+        target_config.update(config_updates)
+
+    decision_config = target_config if mode == "SCHEDULED" else config
+    decision_now = current_datetime()
+    decision = operation_mode_change_decision(
+        decision_config,
+        mode,
+        decision_now,
+    )
+    if not decision["allowed"]:
+        scheduled_end_time = str(decision.get("scheduled_end_time") or "")
+        reason = str(decision["reason"])
+        if reason == "BLOCKED_TIME_OPERATION_END_REACHED":
+            message = (
+                f"시간운영 종료시각 {scheduled_end_time[:5]}에 도달하여 "
+                "운영방식을 변경할 수 없습니다."
+            )
+        elif reason == "BLOCKED_TIME_POLICY_MISSING":
+            message = "시간운영 종료시각을 확인할 수 없어 운영방식 변경을 차단했습니다."
+        else:
+            message = "시간운영 설정이 올바르지 않아 운영방식 변경을 차단했습니다."
+        QMessageBox.warning(window, "운영방식 변경 차단", f"{code} {name}\n\n{message}")
+        append_stock_log(
+            stock_dir,
+            "BLOCKED",
+            f"운영방식 변경 차단: {reason} / "
+            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / "
+            f"현재 {decision['current_time']} / 종료 {scheduled_end_time or '-'}",
+        )
+        return False
+
+    if decision["ats_clear_required"] and not clear_manual_ats_runtime_selection(stock_dir):
+        failed_decision = operation_mode_change_decision(
+            decision_config,
+            mode,
+            decision_now,
+            ats_clear_failed=True,
+        )
         QMessageBox.critical(
             window,
             "운영방식 저장 오류",
@@ -410,14 +453,14 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             stock_dir,
             "ERROR",
             f"운영방식 변경 전 ATS 선택 해제 실패: "
-            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
+            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / "
+            f"{failed_decision['reason']}",
         )
         return False
 
+    config = target_config
     config["operation_mode"] = mode
     if config_updates:
-        config.update(config_updates)
-
         start_time = normalized_hhmmss_or_empty(
             config.get("start_time", config.get("trade_start_time", ""))
         )

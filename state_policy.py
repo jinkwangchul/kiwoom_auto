@@ -386,6 +386,141 @@ def effective_schedule_times(config: dict[str, object], global_schedule: dict[st
     return global_schedule["start_time"], global_schedule["end_buy_time"], False
 
 
+def _strict_global_schedule_source() -> tuple[dict[str, object] | None, str]:
+    if OPERATION_POLICY_PATH.exists():
+        try:
+            policy = json.loads(OPERATION_POLICY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None, "INVALID"
+        if not isinstance(policy, dict):
+            return None, "INVALID"
+        scheduled = policy.get("scheduled_operation")
+        if not isinstance(scheduled, dict):
+            return None, "MISSING"
+        return {
+            "start_time": scheduled.get("default_start_time"),
+            "end_buy_time": scheduled.get("default_end_buy_time"),
+        }, "GLOBAL"
+
+    if not GLOBAL_SCHEDULE_PATH.exists():
+        return None, "MISSING"
+    try:
+        schedule = json.loads(GLOBAL_SCHEDULE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None, "INVALID"
+    if not isinstance(schedule, dict):
+        return None, "INVALID"
+    return {
+        "start_time": schedule.get("start_time", schedule.get("buy_start_time")),
+        "end_buy_time": schedule.get("end_buy_time", schedule.get("buy_end_time")),
+    }, "GLOBAL_LEGACY"
+
+
+def operation_mode_change_decision(
+    config: dict[str, object],
+    requested_mode: object,
+    current_datetime: datetime,
+    global_schedule: dict[str, object] | None = None,
+    ats_clear_failed: bool = False,
+) -> dict[str, object]:
+    current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+    target_mode = normalize_operation_mode(requested_mode)
+    current_time = current_datetime.strftime("%H:%M:%S")
+    if current_mode == target_mode:
+        return {
+            "allowed": True,
+            "reason": "ALLOWED_NO_MODE_CHANGE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "ats_clear_required": False,
+            "schedule_source": "",
+        }
+
+    local_start_raw = config.get("start_time", config.get("trade_start_time", ""))
+    local_end_raw = config.get("end_buy_time", config.get("buy_end_time", ""))
+    has_local_schedule = bool(str(local_start_raw or "").strip() or str(local_end_raw or "").strip())
+
+    if has_local_schedule:
+        schedule = {"start_time": local_start_raw, "end_buy_time": local_end_raw}
+        schedule_source = "INDIVIDUAL"
+    elif global_schedule is not None:
+        schedule = global_schedule
+        schedule_source = "GLOBAL"
+    else:
+        schedule, schedule_source = _strict_global_schedule_source()
+
+    if schedule is None:
+        return {
+            "allowed": False,
+            "reason": (
+                "BLOCKED_TIME_POLICY_INVALID"
+                if schedule_source == "INVALID"
+                else "BLOCKED_TIME_POLICY_MISSING"
+            ),
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "ats_clear_required": True,
+            "schedule_source": schedule_source,
+        }
+
+    start_time = normalized_hhmmss_or_empty(schedule.get("start_time", ""))
+    end_time = normalized_hhmmss_or_empty(schedule.get("end_buy_time", ""))
+    if not start_time or not end_time:
+        raw_start = str(schedule.get("start_time") or "").strip()
+        raw_end = str(schedule.get("end_buy_time") or "").strip()
+        return {
+            "allowed": False,
+            "reason": (
+                "BLOCKED_TIME_POLICY_INVALID"
+                if raw_start or raw_end
+                else "BLOCKED_TIME_POLICY_MISSING"
+            ),
+            "scheduled_end_time": end_time,
+            "current_time": current_time,
+            "ats_clear_required": True,
+            "schedule_source": schedule_source,
+        }
+
+    if seconds_from_hhmmss(start_time, start_time) >= seconds_from_hhmmss(end_time, end_time):
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_TIME_POLICY_INVALID",
+            "scheduled_end_time": end_time,
+            "current_time": current_time,
+            "ats_clear_required": True,
+            "schedule_source": schedule_source,
+        }
+
+    if ats_clear_failed:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_ATS_CLEAR_FAILED",
+            "scheduled_end_time": end_time,
+            "current_time": current_time,
+            "ats_clear_required": True,
+            "schedule_source": schedule_source,
+        }
+
+    current_seconds = (
+        current_datetime.hour * 3600
+        + current_datetime.minute * 60
+        + current_datetime.second
+    )
+    allowed = current_seconds < seconds_from_hhmmss(end_time, end_time)
+    return {
+        "allowed": allowed,
+        "reason": (
+            "ALLOWED_BEFORE_TIME_OPERATION_END"
+            if allowed
+            else "BLOCKED_TIME_OPERATION_END_REACHED"
+        ),
+        "scheduled_end_time": end_time,
+        "current_time": current_time,
+        "ats_clear_required": True,
+        "schedule_source": schedule_source,
+    }
+
+
 REGULAR_SESSION_START_TIME = "09:00:00"
 REGULAR_SESSION_END_TIME = "15:20:00"
 
