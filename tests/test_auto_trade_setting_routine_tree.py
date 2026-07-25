@@ -40,6 +40,53 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._app_env_patcher.stop()
 
+    def test_operation_environment_uses_routine_close_display_terms_only(
+        self,
+    ) -> None:
+        import gui_operation_environment as environment
+
+        with patch.object(
+            environment,
+            "read_operation_policy",
+            return_value=environment.default_operation_policy(),
+        ):
+            dialog = environment.OperationEnvironmentSettingsDialog()
+        try:
+            self.assertEqual("루틴마감", dialog.auto_close_signal.text())
+            self.assertEqual("루틴마감", dialog.early_close_signal.text())
+            self.assertEqual("루틴마감", dialog.auto_close_checks[0].text())
+            self.assertEqual("루틴마감", dialog.early_close_checks[0].text())
+            title_texts = {
+                label.text()
+                for label in dialog.findChildren(environment.QLabel)
+            }
+            self.assertTrue(
+                {"4. 자동마감 설정", "5. 조기마감 설정"}.issubset(
+                    title_texts
+                )
+            )
+            self.assertEqual(
+                "루틴매도신호",
+                dialog.auto_close_method.itemText(0),
+            )
+            self.assertEqual(
+                "루틴매도신호",
+                dialog.early_close_method.itemText(0),
+            )
+
+            screenshot_path = os.environ.get(
+                "AUTO_TRADE_ROUTINE_CLOSE_TERMS_SCREENSHOT_PATH",
+                "",
+            ).strip()
+            if screenshot_path:
+                dialog.show()
+                self._app.processEvents()
+                self.assertTrue(dialog.grab().save(screenshot_path))
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            self._app.processEvents()
+
     def _definition(self) -> RoutineDefinitionRecord:
         return RoutineDefinitionRecord(
             definition_id="indicator_follow",

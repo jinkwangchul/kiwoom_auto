@@ -149,7 +149,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.auto_close_method = QComboBox()
         # 체크박스 UI와 저장용 숨김 콤보의 항목은 반드시 1회만 등록한다.
         self.auto_close_method.setVisible(False)
-        self.auto_close_signal = QCheckBox("루틴매도신호")
+        self.auto_close_signal = QCheckBox("루틴마감")
         self.auto_close_market = QCheckBox("시장가")
         self.auto_close_current = QCheckBox("현재가")
         self.auto_close_profit_loss = QCheckBox("익절/손절")
@@ -173,7 +173,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.early_close_method = QComboBox()
         # 체크박스 UI와 저장용 숨김 콤보의 항목은 반드시 1회만 등록한다.
         self.early_close_method.setVisible(False)
-        self.early_close_signal = QCheckBox("루틴매도신호")
+        self.early_close_signal = QCheckBox("루틴마감")
         self.early_close_market = QCheckBox("시장가")
         self.early_close_current = QCheckBox("현재가")
         self.early_close_profit_loss = QCheckBox("익절/손절")
@@ -509,7 +509,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         # 4. 자동마감 설정
         auto_box, auto_layout = make_row_box("4. 자동마감 설정")
         self.auto_close_checks = [
-            QCheckBox("루틴매도"),
+            QCheckBox("루틴마감"),
             QCheckBox("시장가"),
             QCheckBox("현재가"),
             QCheckBox("익절/손절"),
@@ -543,7 +543,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         # 5. 조기마감 설정
         early_box, early_layout = make_row_box("5. 조기마감 설정")
         self.early_close_checks = [
-            QCheckBox("루틴매도"),
+            QCheckBox("루틴마감"),
             QCheckBox("시장가"),
             QCheckBox("현재가"),
             QCheckBox("익절/손절"),

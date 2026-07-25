@@ -1589,7 +1589,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         early_menu = self._FakeMenu.root.submenus[0]
         self.assertEqual("조기마감", early_menu.title)
         self.assertEqual(
-            ["조기마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+            ["루틴마감", "시장가", "현재가", "손/익절", "이월", "취소"],
             [action.text for action in early_menu.actions if not action.separator],
         )
         self.assertEqual("<separator>", early_menu.actions[5].text)
@@ -1598,7 +1598,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
 
         expected = {
-            "조기마감": ("apply_selected_early_close", ("루틴",), {"source": "우클릭"}),
+            "루틴마감": ("apply_selected_early_close", ("루틴",), {"source": "우클릭"}),
             "시장가": ("apply_selected_early_close", ("시장가즉시",), {"source": "우클릭"}),
             "현재가": ("apply_selected_early_close", ("현재가즉시",), {"source": "우클릭"}),
             "손/익절": ("apply_selected_early_close_profit_loss", (), {}),

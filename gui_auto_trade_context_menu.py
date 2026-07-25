@@ -35,7 +35,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
 
     menu.addSeparator()
     early_close_menu = menu.addMenu("조기마감")
-    action_early_routine = early_close_menu.addAction("조기마감")
+    action_early_routine = early_close_menu.addAction("루틴마감")
     action_early_market = early_close_menu.addAction("시장가")
     action_early_current = early_close_menu.addAction("현재가")
     action_early_profit_loss = early_close_menu.addAction("손/익절")
