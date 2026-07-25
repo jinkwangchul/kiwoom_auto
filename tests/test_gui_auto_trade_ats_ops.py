@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -24,6 +25,44 @@ class _AcceptedSellDialog:
 
 
 class GuiAutoTradeAtsOpsTest(unittest.TestCase):
+    def test_apply_selection_writes_runtime_only_and_ignores_legacy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp)
+            config = {
+                "operation_mode": "CONTINUOUS",
+                "manual_ats_sessions": {"extra2": True},
+            }
+            (stock_dir / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                '{"status":"RUNNING"}',
+                encoding="utf-8",
+            )
+            window = MagicMock()
+            selected = [(stock_dir, "005930", "삼성전자")]
+            window.selected_stock_infos.return_value = selected
+            window.capture_stock_table_view_state.return_value = (set(), 0)
+            window.current_runtime_file_signature.return_value = ()
+
+            self.assertEqual(
+                {"extra1": False, "extra2": False, "extra3": False},
+                ats_ops.auto_trade_selected_manual_ats_state(window, selected),
+            )
+            changed = ats_ops.auto_trade_save_selected_manual_ats_state(
+                window,
+                {"extra1": True, "extra2": False, "extra3": False},
+            )
+            state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+            saved_config = json.loads(
+                (stock_dir / "config.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(1, changed)
+        self.assertEqual(["extra1"], state["manual_ats_selection"]["selected_sessions"])
+        self.assertEqual(config, saved_config)
+
     def test_sell_button_executes_without_saving_ats_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = Path(temp)
@@ -55,6 +94,7 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         window.selected_stock_infos.return_value = [
             (Path("C:/temp/005930"), "005930", "삼성전자")
         ]
+        window.save_selected_manual_ats_state.return_value = 1
         preview = {
             "ok": True,
             "code": "005930",
@@ -95,6 +135,7 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         window.selected_stock_infos.return_value = [
             (Path("C:/temp/005930"), "005930", "삼성전자")
         ]
+        window.save_selected_manual_ats_state.return_value = 1
         window.capture_stock_table_view_state.return_value = (["C:/temp/005930"], 7)
         window.current_runtime_file_signature.return_value = ("runtime",)
         window.process_executable_order_for_auto_trade.return_value = {

@@ -31,6 +31,7 @@ from order_queue import append_order_candidates
 from operation_policy_gate import apply_operation_policy_gate_for_order
 from runtime_io import read_json_dict
 from state_policy import normalize_operation_mode
+from manual_ats_runtime import manual_ats_runtime_selected_keys
 
 
 VALID_SESSION_KEYS = ("extra1", "extra2", "extra3")
@@ -125,6 +126,15 @@ def build_manual_ats_liquidation_preview(
 
     if normalize_operation_mode(config.get("operation_mode", "")) != "CONTINUOUS":
         reasons.append("manual ATS liquidation requires CONTINUOUS operation mode")
+    runtime_sessions = manual_ats_runtime_selected_keys(state, now_dt=current)
+    if sessions != runtime_sessions:
+        reasons.append("selected ATS sessions do not match current runtime state")
+    runtime_selection = state.get("manual_ats_selection")
+    runtime_selection = runtime_selection if isinstance(runtime_selection, dict) else {}
+    result["trade_date"] = str(runtime_selection.get("trade_date", "") or "")
+    result["program_session_id"] = str(
+        runtime_selection.get("program_session_id", "") or ""
+    )
     if auto_trade_setting_liquidation_completed_today(state):
         reasons.append("liquidation was already completed today")
 
@@ -192,6 +202,8 @@ def build_manual_ats_liquidation_preview(
             "active_ats_sessions": list(active_sessions),
             "sell_method": method,
             "requested_at": result["requested_at"],
+            "trade_date": result["trade_date"],
+            "program_session_id": result["program_session_id"],
         },
     }
     result["order_candidate"] = candidate
@@ -234,6 +246,8 @@ def commit_manual_ats_liquidation_preview(
         ManualAtsLiquidationOverride(
             sell_method=str(preview.get("sell_method") or ""),
             selected_ats_sessions=tuple(preview.get("selected_ats_sessions") or ()),
+            trade_date=str(preview.get("trade_date") or ""),
+            program_session_id=str(preview.get("program_session_id") or ""),
         ),
     )
     if (

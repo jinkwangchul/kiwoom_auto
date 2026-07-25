@@ -11,12 +11,10 @@ gui_auto_trade_ats_ops.py
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from PyQt5.QtWidgets import QDialog, QMessageBox
 
-from gui_config_utils import default_config
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import ManualAtsSettingsDialog, manual_ats_session_labels
 from gui_auto_trade_policy import auto_trade_setting_liquidation_completed_today
@@ -26,6 +24,10 @@ from manual_ats_liquidation_service import (
 )
 from operation_command_service import OperationCommandService
 from runtime_io import read_json_dict
+from manual_ats_runtime import (
+    manual_ats_runtime_selected_keys,
+    write_manual_ats_runtime_selection,
+)
 from state_policy import normalize_operation_mode
 
 
@@ -54,19 +56,15 @@ def auto_trade_selected_manual_ats_state(
     selected = selected if selected is not None else window.selected_stock_infos()
     result = {"extra1": False, "extra2": False, "extra3": False}
     for stock_dir, _, _ in selected:
-        config = read_json_dict(stock_dir / "config.json")
-        if not isinstance(config, dict):
-            continue
-        sessions = config.get("manual_ats_sessions", {})
-        if not isinstance(sessions, dict):
-            continue
+        state = read_json_dict(stock_dir / "state.json")
+        sessions = manual_ats_runtime_selected_keys(state)
         for key in result:
-            result[key] = result[key] or bool(sessions.get(key, False))
+            result[key] = result[key] or key in sessions
     return result
 
 
 def auto_trade_save_selected_manual_ats_state(window, ats_state: dict[str, bool]) -> int:
-    """선택 수동운영 종목의 ATS 설정값을 한 번에 저장한다."""
+    """선택 수동운영 종목의 현재 프로세스 Runtime ATS 상태를 적용한다."""
     selected = window.selected_stock_infos()
     if not selected:
         QMessageBox.warning(window, "선택 오류", "ATS설정을 변경할 수동운영 종목을 선택하세요.")
@@ -80,27 +78,16 @@ def auto_trade_save_selected_manual_ats_state(window, ats_state: dict[str, bool]
 
     changed_count = 0
     for stock_dir, code, name in selected:
-        config_path = stock_dir / "config.json"
-        config = read_json_dict(config_path)
-        if not isinstance(config, dict):
-            config = default_config()
+        config = read_json_dict(stock_dir / "config.json")
 
         if normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) != "CONTINUOUS":
             continue
 
-        config["manual_ats_sessions"] = dict(normalized)
-        config["manual_ats_updated_at"] = now_text()
-
-        try:
-            config_path.write_text(
-                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        except Exception as exc:
+        if not write_manual_ats_runtime_selection(stock_dir, normalized):
             QMessageBox.critical(
                 window,
-                "ATS설정 저장 오류",
-                f"{code} {name} ATS설정 저장 중 오류가 발생했습니다.\n\n{exc}",
+                "ATS설정 적용 오류",
+                f"{code} {name} 현재 운영세션 ATS 상태를 적용하지 못했습니다.",
             )
             continue
 
@@ -115,7 +102,7 @@ def auto_trade_save_selected_manual_ats_state(window, ats_state: dict[str, bool]
             if normalized.get(key, False)
         ]
         label_text = ", ".join(enabled_labels) if enabled_labels else "없음"
-        append_stock_log(stock_dir, "GUI", f"ATS설정 저장: {label_text}")
+        append_stock_log(stock_dir, "GUI", f"현재 운영세션 ATS 적용: {label_text}")
         changed_count += 1
 
     selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
@@ -169,7 +156,7 @@ def auto_trade_open_selected_manual_ats_settings_dialog(window) -> None:
     new_state = dialog.values()
     changed_count = window.save_selected_manual_ats_state(new_state)
     enabled_count = sum(1 for key in ["extra1", "extra2", "extra3"] if new_state.get(key, False))
-    window.statusBarMessage(f"ATS설정 저장 완료: 활성 {enabled_count}개 / 대상 {changed_count}개")
+    window.statusBarMessage(f"ATS설정 적용 완료: 활성 {enabled_count}개 / 대상 {changed_count}개")
 
 
 def auto_trade_set_selected_manual_ats_flag(window, flag_key: str, enabled: bool, label: str) -> None:
@@ -207,6 +194,19 @@ def auto_trade_execute_selected_manual_ats_liquidation(
         key for key in ("extra1", "extra2", "extra3")
         if bool(ats_state.get(key, False))
     ]
+    if not selected_sessions:
+        QMessageBox.warning(window, "ATS 매도 불가", "현재 운영세션에 적용할 ATS 구간을 선택하세요.")
+        return
+
+    applied_count = window.save_selected_manual_ats_state(ats_state)
+    if applied_count != len(selected):
+        QMessageBox.warning(
+            window,
+            "ATS 매도 불가",
+            "선택한 모든 수동운영 종목에 ATS 상태를 적용하지 못해 청산 요청을 중단했습니다.",
+        )
+        return
+
     previews: list[dict[str, object]] = []
     blocked: list[str] = []
     for stock_dir, code, name in selected:

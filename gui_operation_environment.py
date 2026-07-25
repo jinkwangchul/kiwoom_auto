@@ -584,10 +584,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.manual_use_regular.setText("정규장")
         manual_layout.addWidget(self.manual_use_regular, 0, 1, Qt.AlignLeft | Qt.AlignVCenter)
 
-        for index, checkbox in enumerate(self.manual_extra_checks):
-            checkbox.setMinimumWidth(100)
-            manual_layout.addWidget(checkbox, 0, index + 2, Qt.AlignLeft | Qt.AlignVCenter)
-
         self.manual_liquidation.setText("청산정책 적용")
         self.manual_liquidation.setMinimumWidth(130)
 
@@ -723,8 +719,8 @@ class OperationEnvironmentSettingsDialog(QDialog):
 
         manual = self.policy.get("manual_operation", {}) if isinstance(self.policy.get("manual_operation"), dict) else {}
         self.manual_use_regular.setChecked(bool(manual.get("use_regular_market", True)))
-        for index, checkbox in enumerate(self.manual_extra_checks, start=1):
-            checkbox.setChecked(bool(manual.get(f"use_extra_session_{index}", False)))
+        for checkbox in self.manual_extra_checks:
+            checkbox.setChecked(False)
         self.manual_liquidation.setChecked(bool(manual.get("use_liquidation_policy", False)))
 
         auto = self.policy.get("auto_close", {}) if isinstance(self.policy.get("auto_close"), dict) else {}
@@ -799,9 +795,9 @@ class OperationEnvironmentSettingsDialog(QDialog):
             },
             "manual_operation": {
                 "use_regular_market": self.manual_use_regular.isChecked(),
-                "use_extra_session_1": self.manual_extra_checks[0].isChecked(),
-                "use_extra_session_2": self.manual_extra_checks[1].isChecked(),
-                "use_extra_session_3": self.manual_extra_checks[2].isChecked(),
+                "use_extra_session_1": False,
+                "use_extra_session_2": False,
+                "use_extra_session_3": False,
                 "enabled_status": "매수/매도",
                 "disabled_status": "감시/대기",
                 "use_liquidation_policy": self.manual_liquidation.isChecked(),
@@ -838,4 +834,3 @@ class OperationEnvironmentSettingsDialog(QDialog):
             return
         QMessageBox.information(self, "저장 완료", "환경설정을 저장했습니다.")
         super().accept()
-

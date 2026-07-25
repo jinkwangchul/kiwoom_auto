@@ -28,6 +28,7 @@ from state_policy import (
     read_operation_policy,
     seconds_from_hhmmss,
 )
+from manual_ats_runtime import manual_ats_runtime_selected_keys
 
 
 def manual_ats_session_labels() -> dict[str, str]:
@@ -51,74 +52,39 @@ def manual_ats_session_labels() -> dict[str, str]:
 
 
 
-def manual_ats_global_selected_keys() -> list[str]:
-    """환경설정의 수동운영 ATS 선택값을 읽는다."""
-    policy = read_operation_policy()
-    manual = policy.get("manual_operation", {}) if isinstance(policy, dict) else {}
-    if not isinstance(manual, dict):
-        return []
-
-    selected: list[str] = []
-    for index, key in enumerate(["extra1", "extra2", "extra3"], start=1):
-        if bool(manual.get(f"use_extra_session_{index}", False)):
-            selected.append(key)
-    return selected
-
-
-def manual_ats_individual_selected_keys(config: dict[str, object] | None) -> list[str]:
-    """종목별 개별 ATS 선택값을 읽는다."""
-    if not isinstance(config, dict):
-        return []
-
-    sessions = config.get("manual_ats_sessions", {})
-    if not isinstance(sessions, dict):
-        return []
-
-    selected: list[str] = []
-    for key in ["extra1", "extra2", "extra3"]:
-        if bool(sessions.get(key, False)):
-            selected.append(key)
-    return selected
-
-
-def manual_ats_selected_keys_and_source(config: dict[str, object] | None) -> tuple[list[str], str]:
-    """수동+ATS 표시 출처와 선택 extra 키를 반환한다.
-
-    1차 표시정리 기준:
-    - 시간운영에는 ATS 표시 없음.
-    - 수동운영만 ATS 표시 가능.
-    - 개별 ATS가 1개라도 있으면 개별설정 우선.
-    - 개별 ATS가 없을 때만 환경설정 ATS 표시.
-    """
+def manual_ats_selected_keys_and_source(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+) -> tuple[list[str], str]:
+    """Current-day/current-process manual ATS selection for a stock."""
     if not isinstance(config, dict):
         return [], "none"
 
     if normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) != "CONTINUOUS":
         return [], "none"
 
-    individual_keys = manual_ats_individual_selected_keys(config)
-    if individual_keys:
-        return individual_keys, "individual"
-
-    global_keys = manual_ats_global_selected_keys()
-    if global_keys:
-        return global_keys, "global"
-
-    return [], "none"
+    runtime_keys = list(manual_ats_runtime_selected_keys(state))
+    return (runtime_keys, "runtime") if runtime_keys else ([], "none")
 
 
-def manual_ats_source(config: dict[str, object] | None) -> str:
-    """수동+ATS 표시 출처: individual/global/none."""
-    _keys, source = manual_ats_selected_keys_and_source(config)
+def manual_ats_source(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+) -> str:
+    """수동+ATS 표시 출처: runtime/none."""
+    _keys, source = manual_ats_selected_keys_and_source(config, state)
     return source
 
 
-def manual_ats_enabled_labels(config: dict[str, object] | None) -> list[str]:
+def manual_ats_enabled_labels(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+) -> list[str]:
     """수동운영 종목의 활성 ATS 구간 표시명 목록.
 
     1차에서는 상태판정 없이 운영 컬럼 표시만 담당한다.
     """
-    selected_keys, _source = manual_ats_selected_keys_and_source(config)
+    selected_keys, _source = manual_ats_selected_keys_and_source(config, state)
     if not selected_keys:
         return []
 
@@ -173,6 +139,35 @@ def auto_trade_setting_regular_market_active_now(now_dt: datetime | None = None)
     return seconds_in_range(current_time_in_seconds(now_dt), start_seconds, end_seconds)
 
 
+def manual_ats_market_day_closed(now_dt: datetime | None = None) -> bool:
+    """Return True after the latest configured regular/ATS end time."""
+    policy = read_operation_policy()
+    if not isinstance(policy, dict):
+        return False
+    end_seconds: list[int] = []
+    regular = policy.get("regular_market", {})
+    regular_range = operation_policy_time_range_seconds(
+        regular if isinstance(regular, dict) else {},
+        default_start="09:00:00",
+        default_end="15:20:00",
+    )
+    if regular_range is not None and regular_range[0] < regular_range[1]:
+        end_seconds.append(regular_range[1])
+    sessions = policy.get("extra_sessions", [])
+    if isinstance(sessions, list):
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_range = operation_policy_time_range_seconds(
+                session,
+                default_start="00:00:00",
+                default_end="00:00:00",
+            )
+            if session_range is not None and session_range[0] < session_range[1]:
+                end_seconds.append(session_range[1])
+    return bool(end_seconds) and current_time_in_seconds(now_dt) >= max(end_seconds)
+
+
 def manual_ats_session_definition(key: str) -> dict[str, object]:
     """extra1~3 키에 해당하는 시간외 구간 정의를 읽는다."""
     key_to_index = {"extra1": 0, "extra2": 1, "extra3": 2}
@@ -189,15 +184,17 @@ def manual_ats_session_definition(key: str) -> dict[str, object]:
     return dict(sessions[index])
 
 
-def manual_ats_active_now(config: dict[str, object] | None, now_dt: datetime | None = None) -> bool:
+def manual_ats_active_now(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+    now_dt: datetime | None = None,
+) -> bool:
     """현재 시간이 해당 종목의 수동+ATS 선택 시간 안인지 판단한다.
 
-    - 개별 ATS가 있으면 개별 선택값만 본다.
-    - 개별 ATS가 없으면 환경설정 ATS 선택값을 본다.
-    - 선택 여부는 전역 manual_operation 또는 종목별 manual_ats_sessions에서 판단한다.
+    - 선택 여부는 현재 거래일/프로그램 세션의 Runtime 상태만 본다.
     - extra_sessions는 이름/시작/종료 시간 정의로만 사용한다.
     """
-    selected_keys, source = manual_ats_selected_keys_and_source(config)
+    selected_keys, _source = manual_ats_selected_keys_and_source(config, state)
     if not selected_keys:
         return False
 
@@ -208,10 +205,6 @@ def manual_ats_active_now(config: dict[str, object] | None, now_dt: datetime | N
         if not session:
             continue
 
-        # ATS 사용 여부는 이미 manual_operation.use_extra_session_N 또는
-        # 종목별 manual_ats_sessions에서 판단했다.
-        # extra_sessions.enabled는 환경설정 행 자체의 표시/저장 플래그일 뿐,
-        # 여기서 다시 차단 조건으로 쓰지 않는다.
         seconds = operation_policy_time_range_seconds(
             session,
             default_start="00:00:00",

@@ -11,6 +11,9 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from gui_ats_utils import manual_ats_market_day_closed
+from manual_ats_runtime import reset_expired_manual_ats_runtime_selections
+
 try:
     from routine_signal_probe import probe_selected_routine_once
 except Exception:
@@ -153,6 +156,10 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
         return
 
     window._last_time_policy_minute_key = minute_key
+    reset_expired_manual_ats_runtime_selections(
+        Path(__file__).resolve().parent / "stocks",
+        market_closed=manual_ats_market_day_closed(),
+    )
     result = window.recalculate_all_status_by_operation_policy(
         "시간 경과 자동 재판정",
         silent_unchanged=True,

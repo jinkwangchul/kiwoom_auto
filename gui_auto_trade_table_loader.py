@@ -92,7 +92,6 @@ from gui_ats_utils import (
     manual_ats_active_now,
     manual_ats_enabled_labels,
     manual_ats_session_labels,
-    manual_ats_source,
 )
 
 
@@ -394,13 +393,12 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             else:
                 liquidation_result_policy = "NONE"
 
-            ats_labels = [] if liquidation_completed_today else manual_ats_enabled_labels(config)
+            ats_labels = [] if liquidation_completed_today else manual_ats_enabled_labels(config, state)
             if ats_labels:
-                ats_source = manual_ats_source(config)
                 operation_display_text = "수동+ATS"
-                operation_color = "#D97706" if ats_source == "individual" else "#8A2BE2"
+                operation_color = "#D97706"
                 ats_tooltip_lines = "/".join(str(label) for label in ats_labels if str(label).strip())
-                ats_source_text = "개별설정 ATS" if ats_source == "individual" else "환경설정 ATS"
+                ats_source_text = "현재 운영세션 ATS"
                 operation_tooltip = f"{ats_source_text} 적용 | {ats_tooltip_lines}\n\n※주의:정규장외 시장 거래중"
                 operation_display_tooltip = operation_tooltip
 
@@ -414,7 +412,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
             if ats_labels:
                 regular_active_now = auto_trade_setting_regular_market_active_now()
-                ats_active_now = manual_ats_active_now(config)
+                ats_active_now = manual_ats_active_now(config, state)
                 after_regular_end = auto_trade_setting_is_after_regular_end()
 
                 # ATS는 정규장 외 거래가능시간 확장이다.

@@ -16,11 +16,19 @@ from manual_ats_liquidation_service import (
 from operation_command_service import MANUAL_ATS_LIQUIDATION_REQUEST_KEY
 from operation_command_service import StockOperationCommandResult
 from order_hoga_mapper import map_order_hoga_preview
+from manual_ats_runtime import current_program_session_id
 
 
 class ManualAtsLiquidationServiceTest(unittest.TestCase):
     @staticmethod
-    def _stock(root: Path, *, mode: str = "CONTINUOUS", holding_qty: int = 7) -> Path:
+    def _stock(
+        root: Path,
+        *,
+        mode: str = "CONTINUOUS",
+        holding_qty: int = 7,
+        trade_date: str = "2026-07-25",
+        program_session_id: str | None = None,
+    ) -> Path:
         stock = root / "stocks" / "005930_삼성전자"
         stock.mkdir(parents=True)
         (stock / "config.json").write_text(
@@ -43,6 +51,14 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     "review_required": False,
                     "holding_qty": holding_qty,
                     "operation_sequence": 0,
+                    "manual_ats_selection": {
+                        "selected_sessions": ["extra1"],
+                        "trade_date": trade_date,
+                        "program_session_id": (
+                            program_session_id or current_program_session_id()
+                        ),
+                        "source": "ATS_SETTINGS",
+                    },
                 },
                 ensure_ascii=False,
             ),
@@ -131,6 +147,37 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
             preview["blocked_reasons"],
         )
 
+    def test_preview_rejects_previous_day_or_previous_program_selection(self) -> None:
+        for trade_date, session_id in (
+            ("2026-07-24", current_program_session_id()),
+            ("2026-07-25", "previous-program"),
+        ):
+            with self.subTest(trade_date=trade_date, session_id=session_id):
+                with tempfile.TemporaryDirectory() as temp:
+                    stock = self._stock(
+                        Path(temp),
+                        trade_date=trade_date,
+                        program_session_id=session_id,
+                    )
+                    with patch(
+                        "manual_ats_liquidation_service.manual_ats_session_definition",
+                        side_effect=self._session,
+                    ):
+                        preview = build_manual_ats_liquidation_preview(
+                            stock,
+                            "005930",
+                            "삼성전자",
+                            ["extra1"],
+                            "시장가",
+                            now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
+                            latest_price_reader=lambda _code, _name: 72500,
+                        )
+                self.assertFalse(preview["ok"])
+                self.assertIn(
+                    "selected ATS sessions do not match current runtime state",
+                    preview["blocked_reasons"],
+                )
+
     def test_commit_records_command_then_uses_existing_approval_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -171,9 +218,19 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
         self.assertEqual("APPROVED", committed_candidate["status"])
         self.assertEqual("APPROVED", committed_candidate["approval_status"])
         self.assertEqual("ATS_SETTINGS", committed_candidate["manual_ats_liquidation"]["source"])
+        self.assertEqual(
+            "2026-07-25",
+            committed_candidate["manual_ats_liquidation"]["trade_date"],
+        )
+        self.assertEqual(
+            current_program_session_id(),
+            committed_candidate["manual_ats_liquidation"]["program_session_id"],
+        )
         request = state[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
         self.assertEqual("ORDER_EXECUTABLE", request["status"])
         self.assertEqual("ats-commit-1", request["command_id"])
+        self.assertEqual("2026-07-25", request["trade_date"])
+        self.assertEqual(current_program_session_id(), request["program_session_id"])
 
     def test_runtime_status_readback_failure_blocks_send_order_entry(self) -> None:
         preview = {

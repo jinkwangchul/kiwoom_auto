@@ -83,6 +83,8 @@ class IndividualLiquidationOverride:
 class ManualAtsLiquidationOverride:
     sell_method: str
     selected_ats_sessions: tuple[str, ...] = field(default_factory=tuple)
+    trade_date: str = ""
+    program_session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -488,6 +490,10 @@ class OperationCommandService:
                         {
                             "selected_ats_sessions": list(selected_sessions),
                             "sell_method": sell_method,
+                            "trade_date": str(override.trade_date or "").strip(),
+                            "program_session_id": str(
+                                override.program_session_id or ""
+                            ).strip(),
                         }
                     )
                 next_state[one_shot_request_key] = one_shot_request

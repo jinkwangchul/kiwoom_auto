@@ -435,30 +435,7 @@ def manual_extra_session_enabled_now(
     now_dt: datetime | None = None,
     policy: dict[str, object] | None = None,
 ) -> bool:
-    """전역 운영환경설정의 수동운영 추가시간 사용 여부를 현재 시각 기준으로 판단한다.
-
-    중요:
-    - 시간운영(SCHEDULED)에는 적용하지 않는다.
-    - 수동운영(CONTINUOUS)에만 적용한다.
-    - 추가시간은 기본적으로 매수/매도 가능 구간으로 본다.
-    - 정규장 이후 추가시간은 청산정책과 연결하지 않는다.
-    """
-    policy = policy if isinstance(policy, dict) else read_operation_policy()
-    manual = policy.get("manual_operation", {})
-    if not isinstance(manual, dict):
-        return False
-
-    extra_sessions = policy.get("extra_sessions", [])
-    if not isinstance(extra_sessions, list):
-        return False
-
-    now_seconds = _seconds_for_now(now_dt)
-    for index in range(3):
-        if not bool(manual.get(f"use_extra_session_{index + 1}", False)):
-            continue
-        item = extra_sessions[index] if index < len(extra_sessions) and isinstance(extra_sessions[index], dict) else {}
-        if _time_window_contains(now_seconds, item.get("start_time", ""), item.get("end_time", "")):
-            return True
+    """Environment ATS rows define time ranges, not stock application state."""
     return False
 
 
@@ -468,9 +445,8 @@ def in_manual_trading_session(
 ) -> bool:
     """수동운영 매수/매도 가능 여부.
 
-    전역 운영환경설정 기준:
-    - 정규장 사용 체크 + 정규장 시간 안 = 가능
-    - 추가시간 체크 + 해당 추가시간 안 = 가능
+    환경설정 기준의 정규장만 판정한다.
+    종목별 ATS 확장은 현재 Runtime 선택을 읽는 실행 경계에서 별도 판정한다.
     """
     policy = read_operation_policy()
     manual = policy.get("manual_operation", {}) if isinstance(policy, dict) else {}

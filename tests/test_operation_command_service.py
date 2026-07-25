@@ -594,6 +594,8 @@ class OperationCommandServiceTest(unittest.TestCase):
                 ManualAtsLiquidationOverride(
                     sell_method="CURRENT_PRICE",
                     selected_ats_sessions=("extra1", "extra3"),
+                    trade_date="2026-07-25",
+                    program_session_id="program-session-1",
                 ),
             )
             state = self._state(stock)
@@ -607,6 +609,8 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual(MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED, request["status"])
         self.assertEqual("CURRENT_PRICE", request["sell_method"])
         self.assertEqual(["extra1", "extra3"], request["selected_ats_sessions"])
+        self.assertEqual("2026-07-25", request["trade_date"])
+        self.assertEqual("program-session-1", request["program_session_id"])
         self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, state)
         self.assertNotIn(INDIVIDUAL_LIQUIDATION_REQUEST_KEY, state)
 

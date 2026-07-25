@@ -10,16 +10,21 @@ from __future__ import annotations
 
 import sys
 import traceback
+from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from gui_windows import MainWindow
+from manual_ats_runtime import reset_manual_ats_runtime_selections
 
 
 def main() -> int:
     app = QApplication(sys.argv)
 
     try:
+        reset_manual_ats_runtime_selections(
+            Path(__file__).resolve().parent / "stocks"
+        )
         window = MainWindow()
         window.show()
         return app.exec_()
