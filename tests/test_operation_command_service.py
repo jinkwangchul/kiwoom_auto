@@ -1546,6 +1546,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
     class _FakeMenu:
         root = None
         chosen_text = None
+        chosen_menu_title = None
 
         def __init__(self, _parent=None, title: str = "") -> None:
             self.title = title
@@ -1573,9 +1574,14 @@ class AutoTradeContextMenuTest(unittest.TestCase):
 
         def exec_(self, _pos):
             chosen_text = AutoTradeContextMenuTest._FakeMenu.chosen_text
+            chosen_menu_title = (
+                AutoTradeContextMenuTest._FakeMenu.chosen_menu_title
+            )
             if chosen_text is None:
                 return None
             for menu in [self, *self.submenus]:
+                if chosen_menu_title and menu.title != chosen_menu_title:
+                    continue
                 for action in menu.actions:
                     if action.text == chosen_text:
                         return action
@@ -1583,6 +1589,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
 
     @staticmethod
     def _window() -> Mock:
+        AutoTradeContextMenuTest._FakeMenu.chosen_menu_title = None
         window = Mock()
         item = Mock()
         item.row.return_value = 0
@@ -1600,8 +1607,8 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         with (
             patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
             patch(
-                "gui_auto_trade_context_menu._selected_early_close_menu_label",
-                return_value="",
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={},
             ),
         ):
             show_auto_trade_stock_context_menu(window, object())
@@ -1632,8 +1639,8 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                 with (
                     patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
                     patch(
-                        "gui_auto_trade_context_menu._selected_early_close_menu_label",
-                        return_value="",
+                        "gui_auto_trade_context_menu._context_menu_operation_policy",
+                        return_value={},
                     ),
                 ):
                     show_auto_trade_stock_context_menu(window, object())
@@ -1752,6 +1759,160 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         window.apply_selected_early_close.assert_called_once_with(
             "시장가즉시",
             source="우클릭",
+        )
+
+    def test_individual_liquidation_menu_structure_and_current_method(
+        self,
+    ) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+            ) as policy_path,
+        ):
+            policy_path.read_text.return_value = json.dumps(
+                {
+                    "liquidation": {
+                        "method": "현재가",
+                        "minutes_before_regular_close": "7",
+                    }
+                },
+                ensure_ascii=False,
+            )
+            show_auto_trade_stock_context_menu(window, object())
+
+        individual_menu = self._FakeMenu.root.submenus[1]
+        self.assertEqual("개별청산", individual_menu.title)
+        actions = [
+            action
+            for action in individual_menu.actions
+            if not action.separator
+        ]
+        self.assertEqual(
+            ["시장가", "현재가", "이월"],
+            [action.text for action in actions],
+        )
+        self.assertTrue(all(action.icon is not None for action in actions))
+        selected_actions = [
+            action
+            for action in actions
+            if action.property("individualLiquidationCurrent")
+        ]
+        self.assertEqual(1, len(selected_actions))
+        self.assertEqual("현재가", selected_actions[0].text)
+
+    def test_individual_liquidation_menu_uses_existing_apply_path(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        expected = {
+            "시장가": ("시장가", "7"),
+            "현재가": ("현재가", "7"),
+            "이월": ("이월", ""),
+        }
+        for chosen_text, expected_args in expected.items():
+            with self.subTest(chosen_text=chosen_text):
+                window = self._window()
+                self._FakeMenu.chosen_menu_title = "개별청산"
+                self._FakeMenu.chosen_text = chosen_text
+                with (
+                    patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+                    patch(
+                        "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+                    ) as policy_path,
+                ):
+                    policy_path.read_text.return_value = json.dumps(
+                        {
+                            "liquidation": {
+                                "method": "시장가",
+                                "minutes_before_regular_close": "7",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                    show_auto_trade_stock_context_menu(window, object())
+
+                window.apply_selected_individual_liquidation_method.assert_called_once_with(
+                    *expected_args
+                )
+                window.open_selected_individual_liquidation_settings.assert_not_called()
+
+    def test_individual_liquidation_menu_adapter_reuses_save_backend(self) -> None:
+        import gui_auto_trade_close as close
+
+        cases = {
+            "시장가": {
+                "enabled": True,
+                "minutes_before_regular_close": "7",
+                "method": "시장가",
+            },
+            "현재가": {
+                "enabled": True,
+                "minutes_before_regular_close": "7",
+                "method": "현재가",
+            },
+            "이월": {
+                "enabled": True,
+                "minutes_before_regular_close": "",
+                "method": "이월",
+            },
+        }
+        for method, expected_policy in cases.items():
+            with self.subTest(method=method):
+                window = Mock()
+                window.individual_liquidation_status_text.return_value = method
+                with patch.object(
+                    close,
+                    "auto_trade_save_selected_individual_liquidation_settings",
+                    return_value=2,
+                ) as save_backend:
+                    close.auto_trade_apply_selected_individual_liquidation_method(
+                        window,
+                        method,
+                        "7",
+                    )
+
+                save_backend.assert_called_once_with(
+                    window,
+                    expected_policy,
+                )
+                window.statusBarMessage.assert_called_once_with(
+                    f"개별 청산 저장 완료: {method} / 대상 2개"
+                )
+
+        self.assertFalse(
+            hasattr(close, "IndividualLiquidationSettingsDialog")
+        )
+
+    def test_individual_liquidation_menu_has_no_current_marker_on_read_failure(
+        self,
+    ) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+            ) as policy_path,
+        ):
+            policy_path.read_text.side_effect = OSError("unreadable")
+            show_auto_trade_stock_context_menu(window, object())
+
+        actions = [
+            action
+            for action in self._FakeMenu.root.submenus[1].actions
+            if not action.separator
+        ]
+        self.assertTrue(
+            all(
+                not action.property("individualLiquidationCurrent")
+                for action in actions
+            )
         )
 
     def test_early_close_menu_keeps_plain_labels_when_setting_read_fails(

@@ -201,7 +201,6 @@ from gui_auto_trade_display import (
 from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
     AutoTradeUnregisterConfirmDialog,
-    IndividualLiquidationSettingsDialog,
     ProfitLossEarlyCloseDialog,
     StockPolicyOverrideDialog,
     append_changelog,

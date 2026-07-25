@@ -25,14 +25,20 @@ _EARLY_CLOSE_MENU_LABELS = {
     "취소": "취소",
 }
 
+_INDIVIDUAL_LIQUIDATION_MENU_LABELS = {
+    "시장가": "시장가",
+    "현재가": "현재가",
+    "이월": "이월",
+}
 
-class _EarlyCloseStatusIconEngine(QIconEngine):
+
+class _MenuStatusIconEngine(QIconEngine):
     def __init__(self, selected: bool) -> None:
         super().__init__()
         self._selected = bool(selected)
 
     def clone(self):
-        return _EarlyCloseStatusIconEngine(self._selected)
+        return _MenuStatusIconEngine(self._selected)
 
     def paint(self, painter, rect, mode, state) -> None:
         if not self._selected:
@@ -54,33 +60,51 @@ class _EarlyCloseStatusIconEngine(QIconEngine):
         return pixmap
 
 
-def _early_close_status_icon(selected: bool) -> QIcon:
-    return QIcon(_EarlyCloseStatusIconEngine(selected))
+def _menu_status_icon(selected: bool) -> QIcon:
+    return QIcon(_MenuStatusIconEngine(selected))
 
 
-def _selected_early_close_menu_label() -> str:
+def _context_menu_operation_policy() -> dict[str, object]:
     try:
         policy = json.loads(
             OPERATION_POLICY_PATH.read_text(encoding="utf-8")
         )
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return ""
+        return {}
     if not isinstance(policy, dict):
+        return {}
+    return policy
+
+
+def _selected_policy_menu_label(
+    policy: dict[str, object],
+    section_name: str,
+    labels: dict[str, str],
+) -> str:
+    section = policy.get(section_name)
+    if not isinstance(section, dict):
         return ""
-    early_close = policy.get("early_close")
-    if not isinstance(early_close, dict):
-        return ""
-    method = str(early_close.get("method", "")).strip()
-    return _EARLY_CLOSE_MENU_LABELS.get(method, "")
+    method = str(section.get("method", "")).strip()
+    return labels.get(method, "")
+
+
+def _apply_menu_status(
+    actions: tuple[tuple[str, object], ...],
+    selected_label: str,
+    property_name: str,
+) -> None:
+    for label, action in actions:
+        is_selected = label == selected_label
+        action.setText(label)
+        action.setIcon(_menu_status_icon(is_selected))
+        action.setProperty(property_name, is_selected)
 
 
 def show_auto_trade_stock_context_menu(window, pos) -> None:
     """하단 종목표 우클릭 메뉴.
 
-    1차 정리 범위:
-    - 메뉴 형태만 정리한다.
-    - 개별 청산/추가 시간은 자리만 만든다.
-    - 실제 저장/청산/비정규운영 판정은 다음 단계에서 연결한다.
+    조기마감과 개별청산은 환경설정의 현재 방식을 표시하고,
+    선택한 항목은 기존 실행·저장 경로로 전달한다.
     """
     item = window.stock_table.itemAt(pos)
     if item is not None:
@@ -91,6 +115,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     selected_modes = window.selected_operation_mode_set(selected)
 
     menu = QMenu(window)
+    operation_policy = _context_menu_operation_policy()
 
     action_select_all = menu.addAction("전체 선택")
     action_clear_selection = menu.addAction("전체 해제")
@@ -107,22 +132,48 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     early_close_menu.addSeparator()
     action_early_cancel = early_close_menu.addAction("취소")
     early_close_menu.setEnabled(has_selection)
-    selected_early_close_label = _selected_early_close_menu_label()
-    for label, action in (
-        ("루틴마감", action_early_routine),
-        ("시장가", action_early_market),
-        ("현재가", action_early_current),
-        ("손/익절", action_early_profit_loss),
-        ("이월", action_early_carry),
-        ("취소", action_early_cancel),
-    ):
-        is_selected = label == selected_early_close_label
-        action.setText(label)
-        action.setIcon(_early_close_status_icon(is_selected))
-        action.setProperty("earlyCloseCurrent", is_selected)
+    _apply_menu_status(
+        (
+            ("루틴마감", action_early_routine),
+            ("시장가", action_early_market),
+            ("현재가", action_early_current),
+            ("손/익절", action_early_profit_loss),
+            ("이월", action_early_carry),
+            ("취소", action_early_cancel),
+        ),
+        _selected_policy_menu_label(
+            operation_policy,
+            "early_close",
+            _EARLY_CLOSE_MENU_LABELS,
+        ),
+        "earlyCloseCurrent",
+    )
 
-    action_individual_liquidation = menu.addAction("개별 청산")
-    action_individual_liquidation.setEnabled(has_selection)
+    individual_liquidation_menu = menu.addMenu("개별청산")
+    action_individual_market = individual_liquidation_menu.addAction("시장가")
+    action_individual_current = individual_liquidation_menu.addAction("현재가")
+    action_individual_carry = individual_liquidation_menu.addAction("이월")
+    individual_liquidation_menu.setEnabled(has_selection)
+    _apply_menu_status(
+        (
+            ("시장가", action_individual_market),
+            ("현재가", action_individual_current),
+            ("이월", action_individual_carry),
+        ),
+        _selected_policy_menu_label(
+            operation_policy,
+            "liquidation",
+            _INDIVIDUAL_LIQUIDATION_MENU_LABELS,
+        ),
+        "individualLiquidationCurrent",
+    )
+    liquidation = operation_policy.get("liquidation")
+    if not isinstance(liquidation, dict):
+        liquidation = {}
+    individual_minutes = (
+        str(liquidation.get("minutes_before_regular_close", "5")).strip()
+        or "5"
+    )
 
     action_time_change = None
     action_time_reset = None
@@ -151,8 +202,18 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         window.clear_current_routine_stock_selection()
     elif chosen == action_unregister:
         window.unregister_selected_auto_trade_stocks()
-    elif chosen == action_individual_liquidation:
-        window.open_selected_individual_liquidation_settings()
+    elif chosen == action_individual_market:
+        window.apply_selected_individual_liquidation_method(
+            "시장가",
+            individual_minutes,
+        )
+    elif chosen == action_individual_current:
+        window.apply_selected_individual_liquidation_method(
+            "현재가",
+            individual_minutes,
+        )
+    elif chosen == action_individual_carry:
+        window.apply_selected_individual_liquidation_method("이월", "")
     elif chosen == action_early_routine:
         window.apply_selected_early_close("루틴", source="우클릭")
     elif chosen == action_early_market:

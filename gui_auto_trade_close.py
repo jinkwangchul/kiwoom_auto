@@ -22,8 +22,6 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QVBoxLayout,
     QWidget,
-    QComboBox,
-    QGridLayout,
 )
 
 from gui_common_utils import safe_int_value
@@ -180,148 +178,6 @@ class ProfitLossEarlyCloseDialog(QDialog):
         super().accept()
 
 
-class IndividualLiquidationSettingsDialog(QDialog):
-    """종목별 개별 청산 설정창.
-
-    저장 위치: 각 종목 config.json / individual_liquidation
-    - 환경설정 사용: enabled=False
-    - 개별 청산 사용: enabled=True + minutes/method 저장
-    - 청산 안함(이월): enabled=True + method=이월 저장
-    """
-
-    MODES = ["환경설정 사용", "개별 청산 사용", "청산 안함(이월)"]
-    MINUTES = [str(value) for value in range(1, 101)]
-    METHODS = ["시장가", "현재가"]
-
-    def __init__(
-        self,
-        initial_policy: dict[str, object] | None = None,
-        target_count: int = 1,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("개별 청산")
-        self.resize(310, 145)
-
-        policy = initial_policy if isinstance(initial_policy, dict) else {}
-        enabled = bool(policy.get("enabled", False))
-        method = str(policy.get("method", "시장가")).strip() or "시장가"
-        minutes = str(policy.get("minutes_before_regular_close", "5")).strip() or "5"
-
-        layout = QVBoxLayout()
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
-
-        form = QGridLayout()
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(6)
-
-        label_apply = QLabel("적용")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(self.MODES)
-        mode_width = max(self.mode_combo.fontMetrics().horizontalAdvance(text) for text in self.MODES) + 44
-        self.mode_combo.setFixedWidth(mode_width)
-        self.mode_combo.setMinimumHeight(28)
-        if not enabled:
-            self.mode_combo.setCurrentText("환경설정 사용")
-        elif method == "이월":
-            self.mode_combo.setCurrentText("청산 안함(이월)")
-        else:
-            self.mode_combo.setCurrentText("개별 청산 사용")
-        form.addWidget(label_apply, 0, 0)
-        form.addWidget(self.mode_combo, 0, 1, 1, 3)
-
-        self.label_minutes = QLabel("정규장 종료")
-        self.minutes_combo = QComboBox()
-        self.minutes_combo.addItems(self.MINUTES)
-        if minutes not in self.MINUTES:
-            self.minutes_combo.addItem(minutes)
-        self.minutes_combo.setCurrentText(minutes)
-        self.minutes_combo.setFixedWidth(64)
-        self.minutes_combo.setMinimumHeight(28)
-        self.label_minutes_suffix = QLabel("분전")
-        form.addWidget(self.label_minutes, 1, 0)
-        form.addWidget(self.minutes_combo, 1, 1)
-        form.addWidget(self.label_minutes_suffix, 1, 2)
-
-        self.label_method = QLabel("방식")
-        self.method_combo = QComboBox()
-        self.method_combo.addItems(self.METHODS)
-        method_width = max(self.method_combo.fontMetrics().horizontalAdvance(text) for text in self.METHODS) + 44
-        self.method_combo.setFixedWidth(method_width)
-        self.method_combo.setMinimumHeight(28)
-        if method in self.METHODS:
-            self.method_combo.setCurrentText(method)
-        form.addWidget(self.label_method, 2, 0)
-        form.addWidget(self.method_combo, 2, 1, 1, 2)
-
-        layout.addLayout(form)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("저장")
-        buttons.button(QDialogButtonBox.Cancel).setText("취소")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self.mode_combo.currentTextChanged.connect(self.update_enabled_state)
-        self.setLayout(layout)
-        self.update_enabled_state()
-
-    def update_enabled_state(self) -> None:
-        mode = self.mode_combo.currentText()
-        show_detail = mode == "개별 청산 사용"
-        for widget in [
-            self.label_minutes,
-            self.minutes_combo,
-            self.label_minutes_suffix,
-            self.label_method,
-            self.method_combo,
-        ]:
-            widget.setVisible(show_detail)
-
-    def values(self) -> dict[str, object]:
-        mode = self.mode_combo.currentText()
-        if mode == "환경설정 사용":
-            return {
-                "enabled": False,
-                "minutes_before_regular_close": "",
-                "method": "",
-            }
-        if mode == "청산 안함(이월)":
-            return {
-                "enabled": True,
-                "minutes_before_regular_close": "",
-                "method": "이월",
-            }
-        return {
-            "enabled": True,
-            "minutes_before_regular_close": str(self.minutes_combo.currentText()).strip() or "5",
-            "method": str(self.method_combo.currentText()).strip() or "시장가",
-        }
-
-
-
-def auto_trade_open_selected_individual_liquidation_settings(window) -> None:
-    """선택 종목의 개별 청산 설정을 저장한다."""
-    selected = window.selected_stock_infos()
-    if not selected:
-        QMessageBox.warning(window, "선택 오류", "개별 청산을 설정할 종목을 선택하세요.")
-        return
-
-    first_config = read_json_dict(selected[0][0] / "config.json")
-    initial = first_config.get("individual_liquidation", {}) if isinstance(first_config, dict) else {}
-    dialog = IndividualLiquidationSettingsDialog(initial, len(selected), window)
-    if dialog.exec_() != QDialog.Accepted:
-        return
-
-    policy_values = dialog.values()
-    changed_count = auto_trade_save_selected_individual_liquidation_settings(window, policy_values)
-    mode_text = window.individual_liquidation_status_text(policy_values)
-    window.statusBarMessage(f"개별 청산 저장 완료: {mode_text} / 대상 {changed_count}개")
-
-
-
 def auto_trade_save_selected_individual_liquidation_settings(window, policy_values: dict[str, object]) -> int:
     selected = window.selected_stock_infos()
     if not selected:
@@ -372,6 +228,34 @@ def auto_trade_save_selected_individual_liquidation_settings(window, policy_valu
     window._runtime_file_snapshot = window.current_runtime_file_signature()
     window.update_action_buttons()
     return changed_count
+
+
+def auto_trade_apply_selected_individual_liquidation_method(
+    window,
+    method: str,
+    minutes_before_regular_close: str = "5",
+) -> None:
+    normalized_method = short_close_method_text(method)
+    if normalized_method not in {"시장가", "현재가", "이월"}:
+        return
+
+    policy_values = {
+        "enabled": True,
+        "minutes_before_regular_close": (
+            ""
+            if normalized_method == "이월"
+            else str(minutes_before_regular_close).strip() or "5"
+        ),
+        "method": normalized_method,
+    }
+    changed_count = auto_trade_save_selected_individual_liquidation_settings(
+        window,
+        policy_values,
+    )
+    mode_text = window.individual_liquidation_status_text(policy_values)
+    window.statusBarMessage(
+        f"개별 청산 저장 완료: {mode_text} / 대상 {changed_count}개"
+    )
 
 
 

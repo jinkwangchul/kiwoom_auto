@@ -269,14 +269,12 @@ from gui_auto_trade_selection import (
     selected_stock_rows,
 )
 from gui_auto_trade_close import (
-    IndividualLiquidationSettingsDialog,
     ProfitLossEarlyCloseDialog,
+    auto_trade_apply_selected_individual_liquidation_method,
     auto_trade_apply_selected_early_close,
     auto_trade_apply_selected_early_close_default,
     auto_trade_apply_selected_early_close_profit_loss,
     auto_trade_cancel_selected_early_close,
-    auto_trade_open_selected_individual_liquidation_settings,
-    auto_trade_save_selected_individual_liquidation_settings,
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_open_selected_manual_ats_settings_dialog,
@@ -2156,8 +2154,16 @@ class AutoTradeSettingWindow(QDialog):
     def on_stock_table_context_menu(self, pos) -> None:
         show_auto_trade_stock_context_menu(self, pos)
 
-    def open_selected_individual_liquidation_settings(self) -> None:
-        auto_trade_open_selected_individual_liquidation_settings(self)
+    def apply_selected_individual_liquidation_method(
+        self,
+        method: str,
+        minutes_before_regular_close: str = "5",
+    ) -> None:
+        auto_trade_apply_selected_individual_liquidation_method(
+            self,
+            method,
+            minutes_before_regular_close,
+        )
 
     def individual_liquidation_status_text(self, policy_values: dict[str, object]) -> str:
         if not bool(policy_values.get("enabled", False)):
@@ -2167,9 +2173,6 @@ class AutoTradeSettingWindow(QDialog):
             return "청산 안함(이월)"
         minutes = str(policy_values.get("minutes_before_regular_close", "5")).strip() or "5"
         return f"개별 {minutes}분/{method}"
-
-    def save_selected_individual_liquidation_settings(self, policy_values: dict[str, object]) -> int:
-        return auto_trade_save_selected_individual_liquidation_settings(self, policy_values)
 
     def selected_manual_ats_state(
         self,
