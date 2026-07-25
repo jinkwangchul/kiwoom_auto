@@ -421,19 +421,6 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
     if not decision["allowed"]:
         scheduled_end_time = str(decision.get("scheduled_end_time") or "")
         reason = str(decision["reason"])
-        if reason == "BLOCKED_ATS_RUNTIME_ACTIVE":
-            message = ""
-        elif reason == "BLOCKED_TIME_OPERATION_END_REACHED":
-            message = (
-                f"시간운영 종료시각 {scheduled_end_time[:5]}에 도달하여 "
-                "운영방식을 변경할 수 없습니다."
-            )
-        elif reason == "BLOCKED_TIME_POLICY_MISSING":
-            message = "시간운영 종료시각을 확인할 수 없어 운영방식 변경을 차단했습니다."
-        else:
-            message = "시간운영 설정이 올바르지 않아 운영방식 변경을 차단했습니다."
-        if message:
-            QMessageBox.warning(window, "운영방식 변경 차단", f"{code} {name}\n\n{message}")
         append_stock_log(
             stock_dir,
             "BLOCKED",
@@ -466,21 +453,11 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             encoding="utf-8",
         )
     except Exception as exc:
-        QMessageBox.critical(
-            window,
-            "운영방식 저장 오류",
-            f"{code} {name} 운영방식 저장 중 오류가 발생했습니다.\n\n{exc}",
-        )
         append_stock_log(stock_dir, "ERROR", f"운영방식 저장 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / {exc}")
         return False
 
     saved_config = read_json_dict(config_path)
     if saved_config != config:
-        QMessageBox.critical(
-            window,
-            "운영방식 저장 오류",
-            f"{code} {name} 운영방식 저장 결과를 확인하지 못했습니다.",
-        )
         append_stock_log(
             stock_dir,
             "ERROR",
@@ -570,8 +547,7 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         window.statusBarMessage("선택한 종목을 변경할 수 없습니다.")
         return
 
-    operation_name = "수동운영" if mode == "CONTINUOUS" else "시간운영"
-    window.statusBarMessage(f"선택한 종목이 {operation_name}으로 변경되었습니다.")
+    window.statusBarMessage("선택한 종목의 운영방식이 변경되었습니다.")
 
 
 

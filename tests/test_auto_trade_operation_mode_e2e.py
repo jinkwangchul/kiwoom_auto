@@ -124,7 +124,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         parent.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_called_once()
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목이 수동운영으로 변경되었습니다."
+            "선택한 종목의 운영방식이 변경되었습니다."
         )
 
     def test_active_ats_blocks_mode_change_and_preserves_runtime_selection(self) -> None:
@@ -162,7 +162,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertEqual("CONTINUOUS", config["operation_mode"])
         self.assertNotIn("manual_ats_selection", state)
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목이 수동운영으로 변경되었습니다."
+            "선택한 종목의 운영방식이 변경되었습니다."
         )
 
     def test_multi_selection_is_blocked_before_backend_and_preserves_ats(self) -> None:
@@ -263,7 +263,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 )
 
         self.assertFalse(result)
-        critical.assert_called_once()
+        critical.assert_not_called()
         self.assertIn("read-back 실패", append_stock_log.call_args.args[2])
 
     def test_lifecycle_clear_then_allows_existing_time_contract(self) -> None:
@@ -280,7 +280,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
 
         self.assertEqual("SCHEDULED", config["operation_mode"])
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목이 시간운영으로 변경되었습니다."
+            "선택한 종목의 운영방식이 변경되었습니다."
         )
 
     def test_trade_quantities_do_not_block_change_before_schedule_end(self) -> None:
@@ -332,7 +332,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
                 self.assertEqual(current_mode, saved["operation_mode"])
                 self.assertNotIn("manual_ats_selection", state)
-                self.assertIn("13:30", warning.call_args.args[2])
+                warning.assert_not_called()
                 window.statusBarMessage.assert_called_once_with(
                     "선택한 종목을 변경할 수 없습니다."
                 )
@@ -464,12 +464,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             window, _parent = self._window(stock_dir)
             with (
                 patch.object(status_ops, "append_stock_log"),
-                patch.object(status_ops.QMessageBox, "warning"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
 
         self.assertEqual("CONTINUOUS", config["operation_mode"])
+        warning.assert_not_called()
         window.statusBarMessage.assert_called_once_with(
             "선택한 종목을 변경할 수 없습니다."
         )
@@ -496,7 +497,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.refresh_all.assert_called_once_with()
         parent.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목이 수동운영으로 변경되었습니다."
+            "선택한 종목의 운영방식이 변경되었습니다."
         )
 
     def test_cancelled_schedule_dialog_does_not_write_or_refresh(self) -> None:
