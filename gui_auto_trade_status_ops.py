@@ -519,50 +519,54 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
     selected = window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
 
-    if not selected or not routine_name:
-        QMessageBox.warning(window, "선택 오류", "운영방식을 변경할 종목을 1개 이상 선택하세요.")
+    if len(selected) != 1:
+        QMessageBox.warning(
+            window,
+            "선택 오류",
+            "운영방식 변경은 한 종목만 선택해야 합니다.",
+        )
+        return
+    if not routine_name:
+        QMessageBox.warning(window, "선택 오류", "운영방식을 변경할 종목을 선택하세요.")
         return
 
     mode = normalize_operation_mode(operation_mode)
     display_mode = operation_mode_display(mode)
-    completed: list[str] = []
-    failed: list[str] = []
-    status_changed: list[str] = []
-    status_failed: list[str] = []
-    protected: list[str] = []
-
-    for stock_dir, code, name in selected:
-        if not window.update_stock_operation_mode(stock_dir, code, name, mode, config_updates):
-            failed.append(f"{code} {name}")
-            continue
-
-        completed.append(f"{code} {name}")
-
-        result, before_status, new_status = window.recalculate_stock_status_by_operation_policy(
-            stock_dir,
-            code,
-            name,
-            "운영방식/시간 설정 변경",
-            {"operation_mode_status_applied_at": now_text()},
+    stock_dir, code, name = selected[0]
+    changed = window.update_stock_operation_mode(
+        stock_dir,
+        code,
+        name,
+        mode,
+        config_updates,
+    )
+    status_result = ""
+    before_status = ""
+    new_status = ""
+    if changed:
+        status_result, before_status, new_status = (
+            window.recalculate_stock_status_by_operation_policy(
+                stock_dir,
+                code,
+                name,
+                "운영방식/시간 설정 변경",
+                {"operation_mode_status_applied_at": now_text()},
+            )
         )
-        if result == "changed":
-            status_changed.append(f"{code} {name}({auto_trade_status_display(new_status)})")
-        elif result == "failed":
-            status_failed.append(f"{code} {name}")
-        elif result == "protected":
-            protected.append(f"{code} {name}({auto_trade_status_display(before_status)})")
-
-    if completed:
-        changelog_parts = [f"대상: {' / '.join(completed)}"]
+        changelog_parts = [f"대상: {code} {name}"]
         schedule_log_text = schedule_change_log_text(config_updates)
         if schedule_log_text:
             changelog_parts.append(schedule_log_text)
-        if status_changed:
-            changelog_parts.append(f"상태재판정: {' / '.join(status_changed)}")
-        if status_failed:
-            changelog_parts.append(f"상태재판정실패: {' / '.join(status_failed)}")
-        if protected:
-            changelog_parts.append(f"보호상태유지: {' / '.join(protected)}")
+        if status_result == "changed":
+            changelog_parts.append(
+                f"상태재판정: {code} {name}({auto_trade_status_display(new_status)})"
+            )
+        elif status_result == "failed":
+            changelog_parts.append(f"상태재판정실패: {code} {name}")
+        elif status_result == "protected":
+            changelog_parts.append(
+                f"보호상태유지: {code} {name}({auto_trade_status_display(before_status)})"
+            )
 
         append_changelog(
             "UPDATE",
@@ -576,16 +580,12 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
     if callable(refresh_parent):
         refresh_parent()
 
-    if not completed:
-        window.statusBarMessage("선택한 종목(들)을 변경할 수 없습니다.")
-        return
-
-    if failed:
-        window.statusBarMessage("변경 가능한 종목(들)만 적용하였습니다.")
+    if not changed:
+        window.statusBarMessage("선택한 종목을 변경할 수 없습니다.")
         return
 
     operation_name = "수동운영" if mode == "CONTINUOUS" else "시간운영"
-    window.statusBarMessage(f"선택한 종목(들)이 {operation_name}으로 변경되었습니다.")
+    window.statusBarMessage(f"선택한 종목이 {operation_name}으로 변경되었습니다.")
 
 
 
