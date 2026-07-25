@@ -3190,7 +3190,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.stock_table.geometry().bottom(),
         )
 
-    def test_selected_routine_status_bar_reflects_parent_and_instance_counts(self) -> None:
+    def test_selected_routine_status_bar_omits_parent_routine_count_badge(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
         window = self._window_harness()
         window._setup_selected_routine_status_bar()
@@ -3206,8 +3206,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             self.assertEqual("●", window.selected_routine_signal_label.text())
             self.assertEqual("지표추종매매", window.selected_routine_name_button.text())
-            self.assertEqual("루틴1", window.selected_routine_instance_count_badge.text())
-            self.assertFalse(window.selected_routine_instance_count_badge.isHidden())
+            self.assertEqual("", window.selected_routine_instance_count_badge.text())
+            self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
             self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
             self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
             self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())

@@ -1696,10 +1696,8 @@ class AutoTradeSettingWindow(QDialog):
                     self.selected_routine_instance_count_badge.hide()
                 else:
                     self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
-                    self.selected_routine_instance_count_badge.setText(
-                        f"루틴{int(metadata.get('instance_count', 0) or 0)}"
-                    )
-                    self.selected_routine_instance_count_badge.show()
+                    self.selected_routine_instance_count_badge.setText("")
+                    self.selected_routine_instance_count_badge.hide()
                 counts = {
                     "registered": int(metadata.get("registered", 0) or 0),
                     "running": int(metadata.get("running", 0) or 0),
