@@ -421,18 +421,25 @@ def operation_mode_change_decision(
     requested_mode: object,
     current_datetime: datetime,
     global_schedule: dict[str, object] | None = None,
-    ats_clear_failed: bool = False,
+    ats_runtime_active: bool = False,
 ) -> dict[str, object]:
     current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     target_mode = normalize_operation_mode(requested_mode)
     current_time = current_datetime.strftime("%H:%M:%S")
+    if ats_runtime_active:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_ATS_RUNTIME_ACTIVE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
     if current_mode == target_mode:
         return {
             "allowed": True,
             "reason": "ALLOWED_NO_MODE_CHANGE",
             "scheduled_end_time": "",
             "current_time": current_time,
-            "ats_clear_required": False,
             "schedule_source": "",
         }
 
@@ -459,7 +466,6 @@ def operation_mode_change_decision(
             ),
             "scheduled_end_time": "",
             "current_time": current_time,
-            "ats_clear_required": True,
             "schedule_source": schedule_source,
         }
 
@@ -477,7 +483,6 @@ def operation_mode_change_decision(
             ),
             "scheduled_end_time": end_time,
             "current_time": current_time,
-            "ats_clear_required": True,
             "schedule_source": schedule_source,
         }
 
@@ -487,17 +492,6 @@ def operation_mode_change_decision(
             "reason": "BLOCKED_TIME_POLICY_INVALID",
             "scheduled_end_time": end_time,
             "current_time": current_time,
-            "ats_clear_required": True,
-            "schedule_source": schedule_source,
-        }
-
-    if ats_clear_failed:
-        return {
-            "allowed": False,
-            "reason": "BLOCKED_ATS_CLEAR_FAILED",
-            "scheduled_end_time": end_time,
-            "current_time": current_time,
-            "ats_clear_required": True,
             "schedule_source": schedule_source,
         }
 
@@ -516,7 +510,6 @@ def operation_mode_change_decision(
         ),
         "scheduled_end_time": end_time,
         "current_time": current_time,
-        "ats_clear_required": True,
         "schedule_source": schedule_source,
     }
 

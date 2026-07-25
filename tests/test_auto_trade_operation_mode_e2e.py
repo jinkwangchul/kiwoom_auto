@@ -13,6 +13,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import gui_auto_trade_status_ops as status_ops
 import state_policy
+from manual_ats_runtime import (
+    clear_manual_ats_runtime_selection,
+    current_program_session_id,
+)
 from state_policy import operation_mode_change_decision
 
 
@@ -57,7 +61,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                             "manual_ats_selection": {
                                 "selected_sessions": ["extra1"],
                                 "trade_date": "2026-07-25",
-                                "program_session_id": "program-session",
+                                "program_session_id": current_program_session_id(),
                             }
                         }
                         if with_ats
@@ -123,27 +127,29 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             "선택한 종목이 수동운영으로 변경되었습니다."
         )
 
-    def test_manual_to_scheduled_clears_runtime_ats_selection(self) -> None:
+    def test_active_ats_blocks_mode_change_and_preserves_runtime_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
             window, _parent = self._window(stock_dir)
             with (
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
             state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
 
-        self.assertEqual("SCHEDULED", config["operation_mode"])
-        self.assertNotIn("manual_ats_selection", state)
+        self.assertEqual("CONTINUOUS", config["operation_mode"])
+        self.assertIn("manual_ats_selection", state)
+        warning.assert_not_called()
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목이 시간운영으로 변경되었습니다."
+            "선택한 종목을 변경할 수 없습니다."
         )
 
     def test_scheduled_to_manual_does_not_restore_previous_ats_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            stock_dir = self._stock(Path(temp), mode="SCHEDULED", with_ats=True)
+            stock_dir = self._stock(Path(temp), mode="SCHEDULED")
             window, _parent = self._window(stock_dir)
             with (
                 patch.object(status_ops, "append_stock_log"),
@@ -176,7 +182,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                         "manual_ats_selection": {
                             "selected_sessions": ["extra2"],
                             "trade_date": "2026-07-25",
-                            "program_session_id": "program-session",
+                            "program_session_id": current_program_session_id(),
                         },
                     },
                     ensure_ascii=False,
@@ -243,7 +249,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 patch.object(
                     status_ops,
                     "read_json_dict",
-                    side_effect=[dict(original), dict(original)],
+                    side_effect=[dict(original), {}, dict(original)],
                 ),
                 patch.object(status_ops, "append_stock_log") as append_stock_log,
                 patch.object(status_ops.QMessageBox, "critical") as critical,
@@ -260,27 +266,21 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         critical.assert_called_once()
         self.assertIn("read-back 실패", append_stock_log.call_args.args[2])
 
-    def test_ats_clear_failure_blocks_operation_mode_change(self) -> None:
+    def test_lifecycle_clear_then_allows_existing_time_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
             window, _parent = self._window(stock_dir)
+            self.assertTrue(clear_manual_ats_runtime_selection(stock_dir))
             with (
-                patch.object(
-                    status_ops,
-                    "clear_manual_ats_runtime_selection",
-                    return_value=False,
-                ),
-                patch.object(status_ops, "append_stock_log") as append_stock_log,
-                patch.object(status_ops.QMessageBox, "critical") as critical,
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
 
-        self.assertEqual("CONTINUOUS", config["operation_mode"])
-        critical.assert_called_once()
-        self.assertIn("ATS 선택 해제 실패", append_stock_log.call_args.args[2])
+        self.assertEqual("SCHEDULED", config["operation_mode"])
         window.statusBarMessage.assert_called_once_with(
-            "선택한 종목을 변경할 수 없습니다."
+            "선택한 종목이 시간운영으로 변경되었습니다."
         )
 
     def test_trade_quantities_do_not_block_change_before_schedule_end(self) -> None:
@@ -305,7 +305,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 self.assertEqual("SCHEDULED", saved["operation_mode"])
 
-    def test_exact_schedule_end_and_after_block_both_directions_before_ats_clear(self) -> None:
+    def test_exact_schedule_end_and_after_block_both_directions(self) -> None:
         scenarios = (
             ("CONTINUOUS", "SCHEDULED", datetime(2026, 7, 25, 13, 30, 0)),
             ("CONTINUOUS", "SCHEDULED", datetime(2026, 7, 25, 13, 30, 1)),
@@ -317,11 +317,10 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 self.subTest(current_mode=current_mode, requested_mode=requested_mode, now_dt=now_dt),
                 tempfile.TemporaryDirectory() as temp,
             ):
-                stock_dir = self._stock(Path(temp), mode=current_mode, with_ats=True)
+                stock_dir = self._stock(Path(temp), mode=current_mode)
                 window, _parent = self._window(stock_dir)
                 with (
                     patch.object(status_ops, "current_datetime", return_value=now_dt),
-                    patch.object(status_ops, "clear_manual_ats_runtime_selection") as clear_ats,
                     patch.object(status_ops, "append_stock_log"),
                     patch.object(status_ops.QMessageBox, "warning") as warning,
                 ):
@@ -332,9 +331,38 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
                 self.assertEqual(current_mode, saved["operation_mode"])
-                self.assertIn("manual_ats_selection", state)
-                clear_ats.assert_not_called()
+                self.assertNotIn("manual_ats_selection", state)
                 self.assertIn("13:30", warning.call_args.args[2])
+                window.statusBarMessage.assert_called_once_with(
+                    "선택한 종목을 변경할 수 없습니다."
+                )
+
+    def test_active_ats_blocks_before_and_during_session_regardless_of_holdings(self) -> None:
+        scenarios = (
+            (datetime(2026, 7, 25, 7, 30, 0), 0),
+            (datetime(2026, 7, 25, 8, 20, 0), 0),
+            (datetime(2026, 7, 25, 8, 20, 0), 10),
+        )
+        for now_dt, holding_qty in scenarios:
+            with self.subTest(now_dt=now_dt, holding_qty=holding_qty), tempfile.TemporaryDirectory() as temp:
+                stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
+                state_path = stock_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["holding_qty"] = holding_qty
+                state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                window, _parent = self._window(stock_dir)
+                with (
+                    patch.object(status_ops, "current_datetime", return_value=now_dt),
+                    patch.object(status_ops, "append_stock_log"),
+                    patch.object(status_ops.QMessageBox, "warning") as warning,
+                ):
+                    status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+                config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+
+                self.assertEqual("CONTINUOUS", config["operation_mode"])
+                self.assertIn("manual_ats_selection", state)
+                warning.assert_not_called()
                 window.statusBarMessage.assert_called_once_with(
                     "선택한 종목을 변경할 수 없습니다."
                 )
@@ -375,6 +403,17 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             now_dt,
             global_schedule,
         )
+        active_ats = operation_mode_change_decision(
+            {
+                "operation_mode": "CONTINUOUS",
+                "start_time": "invalid",
+                "end_buy_time": "invalid",
+            },
+            "SCHEDULED",
+            now_dt,
+            global_schedule,
+            ats_runtime_active=True,
+        )
 
         self.assertEqual("INDIVIDUAL", individual["schedule_source"])
         self.assertEqual("12:30:00", individual["scheduled_end_time"])
@@ -382,6 +421,8 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertEqual("15:20:00", fallback["scheduled_end_time"])
         self.assertEqual("BLOCKED_TIME_POLICY_MISSING", missing["reason"])
         self.assertEqual("BLOCKED_TIME_POLICY_INVALID", invalid["reason"])
+        self.assertEqual("BLOCKED_ATS_RUNTIME_ACTIVE", active_ats["reason"])
+        self.assertEqual("", active_ats["schedule_source"])
 
         with tempfile.TemporaryDirectory() as temp:
             policy_path = Path(temp) / "operation_policy.json"

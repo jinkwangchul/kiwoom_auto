@@ -20,7 +20,7 @@ from gui_schedule_utils import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
-from manual_ats_runtime import clear_manual_ats_runtime_selection
+from manual_ats_runtime import manual_ats_runtime_selected_keys
 from state_policy import (
     auto_trade_status_display,
     normalize_operation_mode,
@@ -409,15 +409,21 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
 
     decision_config = target_config if mode == "SCHEDULED" else config
     decision_now = current_datetime()
+    runtime_state = read_json_dict(stock_dir / "state.json")
     decision = operation_mode_change_decision(
         decision_config,
         mode,
         decision_now,
+        ats_runtime_active=bool(
+            manual_ats_runtime_selected_keys(runtime_state, now_dt=decision_now)
+        ),
     )
     if not decision["allowed"]:
         scheduled_end_time = str(decision.get("scheduled_end_time") or "")
         reason = str(decision["reason"])
-        if reason == "BLOCKED_TIME_OPERATION_END_REACHED":
+        if reason == "BLOCKED_ATS_RUNTIME_ACTIVE":
+            message = ""
+        elif reason == "BLOCKED_TIME_OPERATION_END_REACHED":
             message = (
                 f"시간운영 종료시각 {scheduled_end_time[:5]}에 도달하여 "
                 "운영방식을 변경할 수 없습니다."
@@ -426,34 +432,14 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             message = "시간운영 종료시각을 확인할 수 없어 운영방식 변경을 차단했습니다."
         else:
             message = "시간운영 설정이 올바르지 않아 운영방식 변경을 차단했습니다."
-        QMessageBox.warning(window, "운영방식 변경 차단", f"{code} {name}\n\n{message}")
+        if message:
+            QMessageBox.warning(window, "운영방식 변경 차단", f"{code} {name}\n\n{message}")
         append_stock_log(
             stock_dir,
             "BLOCKED",
             f"운영방식 변경 차단: {reason} / "
             f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / "
             f"현재 {decision['current_time']} / 종료 {scheduled_end_time or '-'}",
-        )
-        return False
-
-    if decision["ats_clear_required"] and not clear_manual_ats_runtime_selection(stock_dir):
-        failed_decision = operation_mode_change_decision(
-            decision_config,
-            mode,
-            decision_now,
-            ats_clear_failed=True,
-        )
-        QMessageBox.critical(
-            window,
-            "운영방식 저장 오류",
-            f"{code} {name} 운영방식 변경 전 ATS 선택을 해제하지 못했습니다.",
-        )
-        append_stock_log(
-            stock_dir,
-            "ERROR",
-            f"운영방식 변경 전 ATS 선택 해제 실패: "
-            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / "
-            f"{failed_decision['reason']}",
         )
         return False
 
