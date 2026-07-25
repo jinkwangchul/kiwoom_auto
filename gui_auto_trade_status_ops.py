@@ -17,7 +17,6 @@ from gui_config_utils import default_config, default_state
 from gui_review_utils import review_reason_summary
 from gui_schedule_utils import (
     schedule_change_log_text,
-    schedule_status_suffix,
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
@@ -578,22 +577,15 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         refresh_parent()
 
     if not completed:
-        window.statusBarMessage(f"운영방식 변경 실패: {display_mode} / 실패 {len(failed)}개")
+        window.statusBarMessage("선택한 종목(들)을 변경할 수 없습니다.")
         return
 
-    status_text = f"운영방식 변경 완료: {display_mode} {len(completed)}개"
     if failed:
-        status_text += f" / 실패 {len(failed)}개"
-    schedule_suffix = schedule_status_suffix(config_updates)
-    if schedule_suffix:
-        status_text += schedule_suffix
-    if status_changed:
-        status_text += f" / 상태재판정 {len(status_changed)}개"
-    if status_failed:
-        status_text += f" / 상태재판정 실패 {len(status_failed)}개"
-    if protected:
-        status_text += f" / 보호상태유지 {len(protected)}개"
-    window.statusBarMessage(status_text)
+        window.statusBarMessage("변경 가능한 종목(들)만 적용하였습니다.")
+        return
+
+    operation_name = "수동운영" if mode == "CONTINUOUS" else "시간운영"
+    window.statusBarMessage(f"선택한 종목(들)이 {operation_name}으로 변경되었습니다.")
 
 
 
