@@ -385,7 +385,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             self.assertEqual("REVIEW_REQUIRED", result["status"])
             self.assertIn("SIG_1", " ".join(result["review_reasons"]))
 
-    def test_start_and_timer_do_nothing_before_recovery_approval(self) -> None:
+    def test_start_is_blocked_but_timer_normalizes_status_before_recovery_approval(self) -> None:
         class StartWindow:
             def __init__(self) -> None:
                 self.selected_stock_infos = Mock()
@@ -401,11 +401,25 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         class TimerWindow:
             def __init__(self) -> None:
-                self.recalculate_all_status_by_operation_policy = Mock()
+                self._last_time_policy_minute_key = ""
+                self.recalculate_all_status_by_operation_policy = Mock(
+                    return_value={"changed": 1, "failed": 0}
+                )
+                self.refresh_all = Mock()
+                self.restore_stock_table_view_state = Mock()
                 self.update_controls_calls = 0
 
             def isVisible(self) -> bool:
                 return True
+
+            def current_time_policy_minute_key(self) -> str:
+                return "2026-07-25 19:00"
+
+            def capture_stock_table_view_state(self) -> tuple[set[str], int]:
+                return set(), 0
+
+            def parent(self):
+                return None
 
             def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
                 return False
@@ -415,9 +429,20 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         timer_window = TimerWindow()
 
-        auto_trade_on_time_policy_timer_tick(timer_window)
+        with (
+            patch("gui_auto_trade_timer.reset_expired_manual_ats_runtime_selections") as reset_ats,
+            patch("gui_auto_trade_timer.probe_selected_routine_once") as probe,
+        ):
+            auto_trade_on_time_policy_timer_tick(timer_window)
 
-        timer_window.recalculate_all_status_by_operation_policy.assert_not_called()
+        timer_window.recalculate_all_status_by_operation_policy.assert_called_once_with(
+            "시간 경과 자동 재판정",
+            silent_unchanged=True,
+            write_changelog_when_unchanged=False,
+        )
+        timer_window.refresh_all.assert_called_once_with()
+        reset_ats.assert_not_called()
+        probe.assert_not_called()
         self.assertEqual(1, timer_window.update_controls_calls)
 
     def test_real_auto_trade_state_allows_pending_signal_consumer(self) -> None:

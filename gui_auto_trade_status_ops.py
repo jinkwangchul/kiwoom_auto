@@ -217,6 +217,28 @@ def auto_trade_operation_policy_protected_status(window, status: object) -> bool
     }
 
 
+def _operation_policy_status_read_back_matches(
+    stock_dir: Path,
+    expected_status: str,
+    expected_metadata: dict[str, object],
+) -> bool:
+    saved_state = read_json_dict(stock_dir / "state.json")
+    if not saved_state:
+        append_stock_log(stock_dir, "ERROR", "운영정책 재판정 read-back 실패: state.json 읽기 실패")
+        return False
+    if str(saved_state.get("status", "")).strip().upper() != expected_status:
+        append_stock_log(
+            stock_dir,
+            "ERROR",
+            f"운영정책 재판정 read-back 실패: status={saved_state.get('status', '')} / expected={expected_status}",
+        )
+        return False
+    if any(saved_state.get(key) != value for key, value in expected_metadata.items()):
+        append_stock_log(stock_dir, "ERROR", "운영정책 재판정 read-back 실패: metadata 불일치")
+        return False
+    return True
+
+
 
 def auto_trade_recalculate_stock_status_by_operation_policy(
     window,
@@ -235,7 +257,14 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
     - protected: 긴급정지/검토종목/조기마감 등 보호상태라 미변경
     - failed: 저장 실패
     """
-    state = read_json_dict(stock_dir / "state.json")
+    state_path = stock_dir / "state.json"
+    if not state_path.exists():
+        append_stock_log(stock_dir, "ERROR", f"운영정책 재판정 실패: Runtime 파일 없음 / {reason}")
+        return "failed", "", ""
+    state = read_json_dict(state_path)
+    if not state:
+        append_stock_log(stock_dir, "ERROR", f"운영정책 재판정 실패: Runtime 파일 손상 / {reason}")
+        return "failed", "", ""
     before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
 
     if bool(state.get("review_required", False)):
@@ -271,7 +300,12 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
                 probe_metadata,
                 "신호평가 전용 상태 보호",
             ):
-                return "protected", before_status, "MONITORING"
+                if _operation_policy_status_read_back_matches(
+                    stock_dir,
+                    "MONITORING",
+                    probe_metadata,
+                ):
+                    return "protected", before_status, "MONITORING"
             return "failed", before_status, "MONITORING"
 
         if not silent_unchanged:
@@ -328,7 +362,12 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
                 f"{operation_mode_display(mode)} / {auto_trade_status_display(before_status)} / {reason}"
             )
             if window.update_stock_status(stock_dir, code, name, new_status, metadata, log_suffix):
-                return "unchanged", before_status, new_status
+                if _operation_policy_status_read_back_matches(
+                    stock_dir,
+                    new_status,
+                    metadata,
+                ):
+                    return "unchanged", before_status, new_status
             return "failed", before_status, new_status
 
         if not silent_unchanged:
@@ -344,7 +383,12 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         f"{auto_trade_status_display(before_status)} -> {auto_trade_status_display(new_status)} / {reason}"
     )
     if window.update_stock_status(stock_dir, code, name, new_status, metadata, log_suffix):
-        return "changed", before_status, new_status
+        if _operation_policy_status_read_back_matches(
+            stock_dir,
+            new_status,
+            metadata,
+        ):
+            return "changed", before_status, new_status
     return "failed", before_status, new_status
 
 

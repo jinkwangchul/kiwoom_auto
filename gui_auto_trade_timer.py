@@ -144,22 +144,11 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     if not window.isVisible():
         return
 
-    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
-    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
-        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
-        if callable(update_controls):
-            update_controls(window)
-        return
-
     minute_key = window.current_time_policy_minute_key()
     if minute_key == window._last_time_policy_minute_key:
         return
 
     window._last_time_policy_minute_key = minute_key
-    reset_expired_manual_ats_runtime_selections(
-        Path(__file__).resolve().parent / "stocks",
-        market_closed=manual_ats_market_day_closed(),
-    )
     result = window.recalculate_all_status_by_operation_policy(
         "시간 경과 자동 재판정",
         silent_unchanged=True,
@@ -180,6 +169,18 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
             refresh_all()
         except Exception as exc:
             window.statusBarMessage(f"메인 화면 자동 갱신 실패: {exc}")
+
+    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
+    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
+        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
+        if callable(update_controls):
+            update_controls(window)
+        return
+
+    reset_expired_manual_ats_runtime_selections(
+        Path(__file__).resolve().parent / "stocks",
+        market_closed=manual_ats_market_day_closed(),
+    )
 
     # STEP 3: 루틴 evaluate() 연결 확인용 안전 프로브.
     # - 로그만 기록한다.

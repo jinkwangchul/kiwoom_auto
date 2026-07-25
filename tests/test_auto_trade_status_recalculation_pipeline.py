@@ -135,12 +135,22 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertEqual("SCHEDULED", config["operation_mode"])
         self.assertEqual("immediate", unregister["category"])
 
-    def test_first_timer_tick_after_recovery_reconciles_stale_running(self) -> None:
+    def test_first_timer_tick_before_recovery_reconciles_stale_running(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            window = self._window()
+            base_window = self._window()
+
+            class RecoveryBlockedWindow:
+                def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                    return False
+
+                def update_startup_recovery_controls(self) -> None:
+                    self.update_startup_recovery_controls_mock()
+
+            window = RecoveryBlockedWindow()
+            window.__dict__.update(base_window.__dict__)
             window.isVisible = lambda: True
-            window.startup_recovery_session_ready = lambda refresh=True: True
+            window.update_startup_recovery_controls_mock = Mock()
             window.current_time_policy_minute_key = lambda: "2026-07-25 18:00"
             window._last_time_policy_minute_key = ""
             window.capture_stock_table_view_state = lambda: (set(), 0)
@@ -174,6 +184,46 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertEqual("MONITORING", state["status"])
         self.assertEqual("2026-07-25 18:00", window._last_time_policy_minute_key)
         window.refresh_all.assert_called_once_with()
+        window.update_startup_recovery_controls_mock.assert_called_once_with()
+
+    def test_missing_runtime_state_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
+            (stock_dir / "state.json").unlink()
+            window = self._window()
+            with (
+                patch.object(status_ops, "ROUTINES_DIR", routines_dir),
+                patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                result = status_ops.auto_trade_recalculate_all_status_by_operation_policy(
+                    window,
+                    "test reconciliation",
+                )
+
+        self.assertEqual(1, result["failed"])
+        self.assertFalse((stock_dir / "state.json").exists())
+
+    def test_write_without_matching_read_back_is_reported_as_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
+            window = self._window()
+            with (
+                patch.object(status_ops, "ROUTINES_DIR", routines_dir),
+                patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
+                patch.object(status_ops, "write_state_json", return_value=True),
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                result = status_ops.auto_trade_recalculate_all_status_by_operation_policy(
+                    window,
+                    "test reconciliation",
+                )
+            state = read_json_dict(stock_dir / "state.json")
+
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("RUNNING", state["status"])
 
 
 if __name__ == "__main__":
