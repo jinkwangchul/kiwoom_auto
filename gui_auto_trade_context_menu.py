@@ -7,7 +7,37 @@ gui_auto_trade_context_menu.py
 
 from __future__ import annotations
 
+import json
+
 from PyQt5.QtWidgets import QMenu
+
+from gui_operation_environment import OPERATION_POLICY_PATH
+
+
+_EARLY_CLOSE_MENU_LABELS = {
+    "루틴매도신호": "루틴마감",
+    "시장가": "시장가",
+    "현재가": "현재가",
+    "익절/손절": "손/익절",
+    "이월": "이월",
+    "취소": "취소",
+}
+
+
+def _selected_early_close_menu_label() -> str:
+    try:
+        policy = json.loads(
+            OPERATION_POLICY_PATH.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(policy, dict):
+        return ""
+    early_close = policy.get("early_close")
+    if not isinstance(early_close, dict):
+        return ""
+    method = str(early_close.get("method", "")).strip()
+    return _EARLY_CLOSE_MENU_LABELS.get(method, "")
 
 
 def show_auto_trade_stock_context_menu(window, pos) -> None:
@@ -43,6 +73,18 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     early_close_menu.addSeparator()
     action_early_cancel = early_close_menu.addAction("취소")
     early_close_menu.setEnabled(has_selection)
+    selected_early_close_label = _selected_early_close_menu_label()
+    for label, action in (
+        ("루틴마감", action_early_routine),
+        ("시장가", action_early_market),
+        ("현재가", action_early_current),
+        ("손/익절", action_early_profit_loss),
+        ("이월", action_early_carry),
+        ("취소", action_early_cancel),
+    ):
+        action.setText(
+            f"▪ {label}" if label == selected_early_close_label else label
+        )
 
     action_individual_liquidation = menu.addAction("개별 청산")
     action_individual_liquidation.setEnabled(has_selection)

@@ -1529,6 +1529,9 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = bool(enabled)
 
+        def setText(self, text: str) -> None:
+            self.text = str(text)
+
     class _FakeMenu:
         root = None
         chosen_text = None
@@ -1583,7 +1586,13 @@ class AutoTradeContextMenuTest(unittest.TestCase):
 
         window = self._window()
         self._FakeMenu.chosen_text = None
-        with patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu):
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._selected_early_close_menu_label",
+                return_value="",
+            ),
+        ):
             show_auto_trade_stock_context_menu(window, object())
 
         early_menu = self._FakeMenu.root.submenus[0]
@@ -1609,9 +1618,135 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             with self.subTest(chosen_text=chosen_text):
                 window = self._window()
                 self._FakeMenu.chosen_text = chosen_text
-                with patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu):
+                with (
+                    patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+                    patch(
+                        "gui_auto_trade_context_menu._selected_early_close_menu_label",
+                        return_value="",
+                    ),
+                ):
                     show_auto_trade_stock_context_menu(window, object())
                 getattr(window, method_name).assert_called_once_with(*args, **kwargs)
+
+    def test_early_close_menu_marks_only_current_environment_method(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        cases = {
+            "루틴매도신호": "루틴마감",
+            "시장가": "시장가",
+            "현재가": "현재가",
+            "익절/손절": "손/익절",
+            "이월": "이월",
+            "취소": "취소",
+        }
+        for method, selected_label in cases.items():
+            with self.subTest(method=method):
+                window = self._window()
+                self._FakeMenu.chosen_text = None
+                with (
+                    patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+                    patch(
+                        "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+                    ) as policy_path,
+                ):
+                    policy_path.read_text.return_value = json.dumps(
+                        {"early_close": {"method": method}},
+                        ensure_ascii=False,
+                    )
+                    show_auto_trade_stock_context_menu(window, object())
+
+                labels = [
+                    action.text
+                    for action in self._FakeMenu.root.submenus[0].actions
+                    if not action.separator
+                ]
+                self.assertEqual(1, sum(label.startswith("▪ ") for label in labels))
+                self.assertIn(f"▪ {selected_label}", labels)
+
+    def test_early_close_menu_refreshes_marker_without_duplication(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        policies = [
+            {"early_close": {"method": "루틴매도신호"}},
+            {"early_close": {"method": "시장가"}},
+        ]
+        rendered_labels = []
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+            ) as policy_path,
+        ):
+            policy_path.read_text.side_effect = [
+                json.dumps(policy, ensure_ascii=False)
+                for policy in policies
+            ]
+            for _ in policies:
+                window = self._window()
+                self._FakeMenu.chosen_text = None
+                show_auto_trade_stock_context_menu(window, object())
+                rendered_labels.append(
+                    [
+                        action.text
+                        for action in self._FakeMenu.root.submenus[0].actions
+                        if not action.separator
+                    ]
+                )
+
+        self.assertIn("▪ 루틴마감", rendered_labels[0])
+        self.assertIn("▪ 시장가", rendered_labels[1])
+        self.assertFalse(
+            any(
+                label.startswith("▪ ▪ ")
+                for labels in rendered_labels
+                for label in labels
+            )
+        )
+
+    def test_marked_early_close_action_keeps_existing_click_behavior(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_text = "▪ 시장가"
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+            ) as policy_path,
+        ):
+            policy_path.read_text.return_value = json.dumps(
+                {"early_close": {"method": "시장가"}},
+                ensure_ascii=False,
+            )
+            show_auto_trade_stock_context_menu(window, object())
+
+        window.apply_selected_early_close.assert_called_once_with(
+            "시장가즉시",
+            source="우클릭",
+        )
+
+    def test_early_close_menu_keeps_plain_labels_when_setting_read_fails(
+        self,
+    ) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
+            ) as policy_path,
+        ):
+            policy_path.read_text.side_effect = OSError("unreadable")
+            show_auto_trade_stock_context_menu(window, object())
+
+        labels = [
+            action.text
+            for action in self._FakeMenu.root.submenus[0].actions
+            if not action.separator
+        ]
+        self.assertFalse(any(label.startswith("▪ ") for label in labels))
 
 
 if __name__ == "__main__":
