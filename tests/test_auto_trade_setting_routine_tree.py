@@ -607,12 +607,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("color: #111827", badges["routine"].styleSheet())
         scopes = window._routine_tree_display_scope_buttons
         self.assertEqual(
-            ["전체", "현재"],
-            [scopes[key].text() for key in ("all", "current")],
+            ["전체", "현재", "과거"],
+            [
+                scopes[key].text()
+                for key in ("all", "current", "historical")
+            ],
         )
         self.assertTrue(all(not button.isEnabled() for button in scopes.values()))
         self.assertIn("color: #9CA3AF", scopes["all"].styleSheet())
         self.assertIn("color: #9CA3AF", scopes["current"].styleSheet())
+        self.assertIn("color: #9CA3AF", scopes["historical"].styleSheet())
         scopes["current"].click()
         self.assertEqual("", window._routine_tree_display_scope)
         criteria = window._routine_tree_display_criterion_buttons
@@ -642,6 +646,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("color: #16A34A", scopes["all"].styleSheet())
         self.assertTrue(all(button.isEnabled() for button in criteria.values()))
         self.assertEqual("all", window._routine_tree_display_scope)
+        scopes["historical"].click()
+        self.assertEqual("historical", window._routine_tree_display_scope)
+        self.assertIn(
+            "color: #16A34A",
+            scopes["historical"].styleSheet(),
+        )
+        self.assertIn("color: #111827", scopes["all"].styleSheet())
         selected_state = (
             window._routine_tree_display_level,
             window._routine_tree_display_scope,
@@ -775,6 +786,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     {"definition": 1, "instance": 1, "stock": 1},
                     visible_counts(),
                 )
+            window._set_routine_tree_display_scope("historical")
+            self.assertEqual(
+                {"definition": 0, "instance": 0, "stock": 0},
+                visible_counts(),
+            )
+            window._set_routine_tree_display_scope("all")
 
             window.load_routine_table()
             self.assertTrue(window._routine_tree_valid_only)
@@ -3427,11 +3444,31 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 ],
             )
 
+            window._set_routine_tree_display_scope("historical")
+            self.assertEqual(
+                [
+                    ("inst-a", "003550"),
+                    ("inst-a", "005930"),
+                ],
+                [
+                    (row["instance_id"], row["stock_code"])
+                    for row in (
+                        window.routine_table.item(index, 0).data(
+                            setting_window.Qt.UserRole
+                        )
+                        for index in range(window.routine_table.rowCount())
+                    )
+                    if row["row_kind"] == "stock"
+                ],
+            )
+            self.assertFalse(window.routine_table.isRowHidden(1))
+            self.assertTrue(window.routine_table.isRowHidden(4))
+
             window._set_routine_tree_display_scope("all")
             window._set_routine_tree_valid_only(True)
-            self.assertTrue(window.routine_table.isRowHidden(1))
-            self.assertTrue(window.routine_table.isRowHidden(2))
-            self.assertTrue(window.routine_table.isRowHidden(3))
+            self.assertFalse(window.routine_table.isRowHidden(1))
+            self.assertFalse(window.routine_table.isRowHidden(2))
+            self.assertFalse(window.routine_table.isRowHidden(3))
             self.assertFalse(window.routine_table.isRowHidden(4))
             self.assertFalse(window.routine_table.isRowHidden(5))
             self.assertIn("stocks/003550_LG", performance_paths)
@@ -3596,7 +3633,96 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     window._routine_tree_stock_performance_sort_active
                 )
                 self.assertEqual(["000001", "000002"], stock_codes())
+                current_expected_by_criterion = {
+                    "period": ["000002", "000001"],
+                    "profit": ["000001", "000002"],
+                    "average": ["000002", "000001"],
+                    "efficiency": ["000002", "000001"],
+                }
+                for criterion, expected_codes in (
+                    current_expected_by_criterion.items()
+                ):
+                    window._set_routine_tree_display_criterion(criterion)
+                    self.assertEqual(expected_codes, stock_codes())
 
+                window._set_routine_tree_display_scope("current")
+                self.assertFalse(
+                    window._routine_tree_stock_performance_sort_active
+                )
+                self.assertEqual(["000001", "000002"], stock_codes())
+
+                window._set_routine_tree_display_scope("all")
+                self.assertEqual(
+                    ["000001", "000002", "100001", "100002"],
+                    stock_codes(),
+                )
+
+                window._set_routine_tree_display_scope("historical")
+                self.assertEqual(["100001", "100002"], stock_codes())
+                historical_stock_rows = [
+                    row
+                    for row in range(window.routine_table.rowCount())
+                    if window.routine_table.item(row, 0)
+                    .data(Qt.UserRole)
+                    .get("row_kind")
+                    == "stock"
+                ]
+                self.assertTrue(
+                    all(
+                        window.routine_table.item(row, 0)
+                        .data(Qt.UserRole)
+                        .get("is_historical")
+                        for row in historical_stock_rows
+                    )
+                )
+                self.assertEqual(
+                    ["▪", "▪"],
+                    [
+                        window.routine_table.cellWidget(row, 0)
+                        .findChild(
+                            setting_window.QLabel,
+                            "autoTradeSettingRoutineTreeIcon",
+                        )
+                        .text()
+                        for row in historical_stock_rows
+                    ],
+                )
+                historical_expected_by_criterion = {
+                    "period": ["100001", "100002"],
+                    "profit": ["100002", "100001"],
+                    "average": ["100002", "100001"],
+                    "efficiency": ["100001", "100002"],
+                }
+                for criterion, expected_codes in (
+                    historical_expected_by_criterion.items()
+                ):
+                    window._set_routine_tree_display_criterion(criterion)
+                    self.assertEqual(expected_codes, stock_codes())
+
+                historical_screenshot_path = os.environ.get(
+                    "AUTO_TRADE_HISTORICAL_SCOPE_SCREENSHOT_PATH",
+                    "",
+                ).strip()
+                if historical_screenshot_path:
+                    window._set_routine_tree_parent_summary_visible(
+                        window.routine_table.cellWidget(0, 0),
+                        False,
+                    )
+                    window.resize(1880, 720)
+                    window.show()
+                    self._app.processEvents()
+                    self.assertTrue(
+                        window.grab().save(historical_screenshot_path)
+                    )
+
+                window._set_routine_tree_display_scope("current")
+                window._set_routine_tree_display_scope("historical")
+                self.assertFalse(
+                    window._routine_tree_stock_performance_sort_active
+                )
+                self.assertEqual(["100001", "100002"], stock_codes())
+
+                window._set_routine_tree_display_scope("current")
                 window._set_routine_tree_display_scope("all")
                 self.assertEqual(
                     ["000001", "000002", "100001", "100002"],

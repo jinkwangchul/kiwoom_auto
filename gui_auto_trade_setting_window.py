@@ -3209,6 +3209,7 @@ class AutoTradeSettingWindow(QDialog):
         for scope, text, object_name in (
             ("all", "전체", "autoTradeSettingRoutineTreeAllScopeBadge"),
             ("current", "현재", "autoTradeSettingRoutineTreeCurrentScopeBadge"),
+            ("historical", "과거", "autoTradeSettingRoutineTreeHistoricalScopeBadge"),
         ):
             button = QPushButton(text, container)
             button.setObjectName(object_name)
@@ -3406,12 +3407,22 @@ class AutoTradeSettingWindow(QDialog):
 
     def _set_routine_tree_display_scope(self, scope: str) -> None:
         clean_scope = str(scope or "").strip()
-        if clean_scope not in {"all", "current"}:
+        if clean_scope not in {"all", "current", "historical"}:
             return
         if str(getattr(self, "_routine_tree_display_level", "category") or "category") != "stock":
             return
-        if clean_scope == str(
+        current_scope = str(
             getattr(self, "_routine_tree_display_scope", "") or ""
+        )
+        if clean_scope == current_scope and not (
+            clean_scope == "current"
+            and bool(
+                getattr(
+                    self,
+                    "_routine_tree_stock_performance_sort_active",
+                    False,
+                )
+            )
         ):
             return
 
@@ -3491,7 +3502,10 @@ class AutoTradeSettingWindow(QDialog):
         self._routine_tree_display_criterion = clean_criterion
         should_sort_stocks = (
             str(getattr(self, "_routine_tree_display_level", "") or "") == "stock"
-            and str(getattr(self, "_routine_tree_display_scope", "") or "") == "all"
+            and str(
+                getattr(self, "_routine_tree_display_scope", "") or ""
+            )
+            in {"all", "current", "historical"}
         )
         self._routine_tree_stock_performance_sort_active = should_sort_stocks
         self._update_routine_tree_display_level_badges()
@@ -3553,13 +3567,15 @@ class AutoTradeSettingWindow(QDialog):
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
             self._routine_tree_display_scope = (
-                restored_scope if restored_scope in {"all", "current"} else "all"
+                restored_scope
+                if restored_scope in {"all", "current", "historical"}
+                else "all"
             )
         else:
             current_scope = str(
                 getattr(self, "_routine_tree_display_scope", "") or ""
             )
-            if current_scope in {"all", "current"}:
+            if current_scope in {"all", "current", "historical"}:
                 self._routine_tree_last_stock_scope = current_scope
             self._routine_tree_display_scope = ""
         supported_criteria = AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA[clean_level]
@@ -3660,6 +3676,12 @@ class AutoTradeSettingWindow(QDialog):
         display_level = str(
             getattr(self, "_routine_tree_display_level", "category") or "category"
         )
+        display_scope = str(
+            getattr(self, "_routine_tree_display_scope", "") or ""
+        )
+        historical_scope = (
+            display_level == "stock" and display_scope == "historical"
+        )
         current_definition_collapsed = False
         current_definition_filtered = False
         current_instance_id = ""
@@ -3683,7 +3705,9 @@ class AutoTradeSettingWindow(QDialog):
                     definition_valid = bool(metadata.get("has_instances", has_toggle_children))
                 else:
                     definition_valid = bool(metadata.get("has_stocked_instances", False))
-                current_definition_filtered = valid_only and not definition_valid
+                current_definition_filtered = (
+                    valid_only or historical_scope
+                ) and not definition_valid
                 if not has_toggle_children:
                     collapsed_definitions.discard(definition_id)
                 current_definition_collapsed = has_toggle_children and definition_id in collapsed_definitions
@@ -3706,7 +3730,7 @@ class AutoTradeSettingWindow(QDialog):
             if row_kind == "instance":
                 has_toggle_children = bool(metadata.get("has_toggle_children", True))
                 current_instance_filtered = (
-                    valid_only
+                    (valid_only or historical_scope)
                     and display_level in {"routine", "stock"}
                     and not bool(metadata.get("has_displayable_stocks", False))
                 )
@@ -3768,11 +3792,11 @@ class AutoTradeSettingWindow(QDialog):
             getattr(self, "_routine_tree_display_scope", "") or ""
         )
         stock_data_scope = selected_scope
-        if stock_data_scope not in {"all", "current"}:
+        if stock_data_scope not in {"all", "current", "historical"}:
             stock_data_scope = str(
                 getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
             )
-        if stock_data_scope not in {"all", "current"}:
+        if stock_data_scope not in {"all", "current", "historical"}:
             stock_data_scope = "all"
         rows: list[dict[str, object]] = []
 
@@ -3792,91 +3816,94 @@ class AutoTradeSettingWindow(QDialog):
                     for stock in historical_stocks_by_instance.get(instance_id, [])
                     if str(stock.get("stock_code", "") or "").strip() not in current_codes
                 ]
-                display_stocks = list(current_stocks)
-                if stock_data_scope == "all":
+                if stock_data_scope == "historical":
+                    display_stocks = list(historical_stocks)
+                elif stock_data_scope == "all":
                     display_stocks = current_stocks + historical_stocks
-                    if bool(
+                else:
+                    display_stocks = list(current_stocks)
+                if bool(
+                    getattr(
+                        self,
+                        "_routine_tree_stock_performance_sort_active",
+                        False,
+                    )
+                ):
+                    display_criterion = str(
                         getattr(
                             self,
-                            "_routine_tree_stock_performance_sort_active",
-                            False,
+                            "_routine_tree_display_criterion",
+                            "profit",
                         )
-                    ):
-                        display_criterion = str(
-                            getattr(
-                                self,
-                                "_routine_tree_display_criterion",
-                                "profit",
-                            )
-                            or "profit"
-                        )
-                        source_key_by_criterion = {
-                            "period": "trade_days",
-                            "profit": "realized_profit",
-                            "average": "average",
-                            "efficiency": "profit_factor",
-                        }
-                        source_key = source_key_by_criterion.get(
-                            display_criterion,
-                            "realized_profit",
-                        )
+                        or "profit"
+                    )
+                    source_key_by_criterion = {
+                        "period": "trade_days",
+                        "profit": "realized_profit",
+                        "average": "average",
+                        "efficiency": "profit_factor",
+                    }
+                    source_key = source_key_by_criterion.get(
+                        display_criterion,
+                        "realized_profit",
+                    )
 
-                        def _performance_sort_value(
-                            stock: dict[str, object],
-                        ) -> float:
-                            stock_path_key = str(
-                                stock.get("stock_path", "") or ""
-                            ).strip()
-                            is_historical = bool(
-                                stock.get("is_historical", False)
-                            )
-                            cache_key = stock_path_key
-                            if is_historical or not cache_key:
-                                cache_key = "|".join(
+                    def _performance_sort_value(
+                        stock: dict[str, object],
+                    ) -> float:
+                        stock_path_key = str(
+                            stock.get("stock_path", "") or ""
+                        ).strip()
+                        is_historical = bool(
+                            stock.get("is_historical", False)
+                        )
+                        cache_key = stock_path_key
+                        if is_historical or not cache_key:
+                            cache_key = "|".join(
+                                (
+                                    str(
+                                        stock.get("instance_id", "")
+                                        or instance_id
+                                    ).strip(),
+                                    str(
+                                        stock.get("stock_code", "") or ""
+                                    ).strip(),
+                                    stock_path_key,
                                     (
-                                        str(
-                                            stock.get("instance_id", "")
-                                            or instance_id
-                                        ).strip(),
-                                        str(
-                                            stock.get("stock_code", "") or ""
-                                        ).strip(),
-                                        stock_path_key,
-                                        (
-                                            "historical"
-                                            if is_historical
-                                            else "current"
-                                        ),
-                                    )
+                                        "historical"
+                                        if is_historical
+                                        else "current"
+                                    ),
                                 )
-                            if cache_key not in performance_source_cache:
-                                performance_source_cache[cache_key] = (
-                                    self._routine_tree_stock_performance_source(
-                                        stock
-                                    )
-                                )
-                            raw_value = performance_source_cache[cache_key].get(
-                                source_key
                             )
-                            if (
-                                source_key == "profit_factor"
-                                and raw_value is None
-                            ):
-                                raw_value = performance_source_cache[
-                                    cache_key
-                                ].get("efficiency")
-                            if source_key == "profit_factor":
-                                return normalize_profit_factor(raw_value)
-                            try:
-                                return float(raw_value)
-                            except (TypeError, ValueError):
-                                return 0.0
-
-                        display_stocks = sorted(
-                            display_stocks,
-                            key=_performance_sort_value,
-                            reverse=True,
+                        if cache_key not in performance_source_cache:
+                            performance_source_cache[cache_key] = (
+                                self._routine_tree_stock_performance_source(
+                                    stock
+                                )
+                            )
+                        raw_value = performance_source_cache[cache_key].get(
+                            source_key
                         )
+                        if (
+                            source_key == "profit_factor"
+                            and raw_value is None
+                        ):
+                            raw_value = performance_source_cache[
+                                cache_key
+                            ].get("efficiency")
+                        if source_key == "profit_factor":
+                            return normalize_profit_factor(raw_value)
+                        try:
+                            return float(raw_value)
+                        except (TypeError, ValueError):
+                            return 0.0
+
+                    display_stocks = sorted(
+                        display_stocks,
+                        key=_performance_sort_value,
+                        reverse=True,
+                    )
                 display_stocks_by_instance[instance_id] = display_stocks
             definition_stocks = [
                 stock
@@ -3905,7 +3932,17 @@ class AutoTradeSettingWindow(QDialog):
                     "has_toggle_children": has_definition_children,
                     "has_instances": has_definition_children,
                     "has_stocked_instances": any(
-                        current_stocks_by_instance.get(str(instance.instance_id), [])
+                        (
+                            display_stocks_by_instance.get(
+                                str(instance.instance_id),
+                                [],
+                            )
+                            if selected_scope
+                            else current_stocks_by_instance.get(
+                                str(instance.instance_id),
+                                [],
+                            )
+                        )
                         for instance in child_instances
                     ),
                     "instance_count": len(child_instances),
@@ -3973,7 +4010,9 @@ class AutoTradeSettingWindow(QDialog):
                         "display_name": str(instance.display_name),
                         "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
                         "has_toggle_children": has_instance_children,
-                        "has_displayable_stocks": bool(current_stocks),
+                        "has_displayable_stocks": bool(
+                            visible_stocks if selected_scope else current_stocks
+                        ),
                         "instance_group_top_gap": _index > 0,
                         "instance_count": 0,
                         "registered": int(count.get("registered", 0) or 0),
