@@ -242,9 +242,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     policy_values = {
         "enabled": True,
         "minutes_before_regular_close": (
-            ""
-            if normalized_method == "이월"
-            else str(minutes_before_regular_close).strip() or "5"
+            str(minutes_before_regular_close).strip() or "5"
         ),
         "method": normalized_method,
     }
@@ -252,6 +250,8 @@ def auto_trade_apply_selected_individual_liquidation_method(
         window,
         policy_values,
     )
+    if changed_count <= 0:
+        return
     mode_text = window.individual_liquidation_status_text(policy_values)
     window.statusBarMessage(
         f"개별 청산 저장 완료: {mode_text} / 대상 {changed_count}개"

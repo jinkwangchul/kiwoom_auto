@@ -8,12 +8,15 @@ gui_auto_trade_context_menu.py
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
+from gui_auto_trade_policy import effective_liquidation_policy_for_config
 from gui_operation_environment import OPERATION_POLICY_PATH
+from runtime_io import read_json_dict
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -30,6 +33,16 @@ _INDIVIDUAL_LIQUIDATION_MENU_LABELS = {
     "현재가": "현재가",
     "이월": "이월",
 }
+
+_INDIVIDUAL_LIQUIDATION_MINUTES = (
+    "1",
+    "3",
+    "5",
+    "10",
+    "15",
+    "20",
+    "30",
+)
 
 
 class _MenuStatusIconEngine(QIconEngine):
@@ -100,6 +113,17 @@ def _apply_menu_status(
         action.setProperty(property_name, is_selected)
 
 
+def _selected_individual_liquidation_policy(
+    selected: list[tuple[Path, str, str]],
+) -> dict[str, object]:
+    config = None
+    if selected:
+        stock_dir = selected[0][0]
+        config = read_json_dict(stock_dir / "config.json")
+    policy, _is_individual = effective_liquidation_policy_for_config(config)
+    return policy if isinstance(policy, dict) else {}
+
+
 def show_auto_trade_stock_context_menu(window, pos) -> None:
     """하단 종목표 우클릭 메뉴.
 
@@ -167,12 +191,42 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ),
         "individualLiquidationCurrent",
     )
-    liquidation = operation_policy.get("liquidation")
-    if not isinstance(liquidation, dict):
-        liquidation = {}
+    individual_policy = _selected_individual_liquidation_policy(selected)
     individual_minutes = (
-        str(liquidation.get("minutes_before_regular_close", "5")).strip()
+        str(
+            individual_policy.get(
+                "minutes_before_regular_close",
+                "5",
+            )
+        ).strip()
         or "5"
+    )
+    individual_method = str(
+        individual_policy.get("method", "이월")
+    ).strip() or "이월"
+
+    individual_liquidation_menu.addSeparator()
+    individual_time_menu = individual_liquidation_menu.addMenu("시간")
+    minute_values = list(_INDIVIDUAL_LIQUIDATION_MINUTES)
+    if individual_minutes not in minute_values:
+        minute_values.append(individual_minutes)
+    individual_time_actions = tuple(
+        (
+            minute,
+            individual_time_menu.addAction(f"{minute}분"),
+        )
+        for minute in minute_values
+    )
+    _apply_menu_status(
+        tuple(
+            (f"{minute}분", action)
+            for minute, action in individual_time_actions
+        ),
+        f"{individual_minutes}분",
+        "individualLiquidationMinutesCurrent",
+    )
+    individual_time_menu.setEnabled(
+        has_selection and individual_method != "이월"
     )
 
     action_time_change = None
@@ -196,6 +250,14 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     if chosen is None:
         return
 
+    for minute, action in individual_time_actions:
+        if chosen == action:
+            window.apply_selected_individual_liquidation_method(
+                individual_method,
+                minute,
+            )
+            return
+
     if chosen == action_select_all:
         window.select_all_current_routine_stocks()
     elif chosen == action_clear_selection:
@@ -213,7 +275,10 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
             individual_minutes,
         )
     elif chosen == action_individual_carry:
-        window.apply_selected_individual_liquidation_method("이월", "")
+        window.apply_selected_individual_liquidation_method(
+            "이월",
+            individual_minutes,
+        )
     elif chosen == action_early_routine:
         window.apply_selected_early_close("루틴", source="우클릭")
     elif chosen == action_early_market:

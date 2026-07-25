@@ -1550,6 +1550,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
 
         def __init__(self, _parent=None, title: str = "") -> None:
             self.title = title
+            self.enabled = True
             self.actions: list[AutoTradeContextMenuTest._FakeAction] = []
             self.submenus: list[AutoTradeContextMenuTest._FakeMenu] = []
             if not title:
@@ -1569,8 +1570,8 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             self.actions.append(AutoTradeContextMenuTest._FakeAction("<separator>", separator=True))
             return None
 
-        def setEnabled(self, _enabled: bool) -> None:
-            return None
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = bool(enabled)
 
         def exec_(self, _pos):
             chosen_text = AutoTradeContextMenuTest._FakeMenu.chosen_text
@@ -1579,7 +1580,12 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             )
             if chosen_text is None:
                 return None
-            for menu in [self, *self.submenus]:
+            menus = [self]
+            for menu in menus:
+                menus.extend(menu.submenus)
+            for menu in menus:
+                if not menu.enabled:
+                    continue
                 if chosen_menu_title and menu.title != chosen_menu_title:
                     continue
                 for action in menu.actions:
@@ -1749,6 +1755,13 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             patch(
                 "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
             ) as policy_path,
+            patch(
+                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
+                return_value={
+                    "method": "현재가",
+                    "minutes_before_regular_close": "7",
+                },
+            ),
         ):
             policy_path.read_text.return_value = json.dumps(
                 {"early_close": {"method": "시장가"}},
@@ -1773,6 +1786,13 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             patch(
                 "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
             ) as policy_path,
+            patch(
+                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
+                return_value={
+                    "method": "현재가",
+                    "minutes_before_regular_close": "7",
+                },
+            ),
         ):
             policy_path.read_text.return_value = json.dumps(
                 {
@@ -1804,6 +1824,25 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(selected_actions))
         self.assertEqual("현재가", selected_actions[0].text)
+        time_menu = individual_menu.submenus[0]
+        self.assertEqual("시간", time_menu.title)
+        time_actions = [
+            action
+            for action in time_menu.actions
+            if not action.separator
+        ]
+        self.assertEqual(
+            ["1분", "3분", "5분", "10분", "15분", "20분", "30분", "7분"],
+            [action.text for action in time_actions],
+        )
+        selected_time_actions = [
+            action
+            for action in time_actions
+            if action.property("individualLiquidationMinutesCurrent")
+        ]
+        self.assertEqual(1, len(selected_time_actions))
+        self.assertEqual("7분", selected_time_actions[0].text)
+        self.assertTrue(time_menu.enabled)
 
     def test_individual_liquidation_menu_uses_existing_apply_path(self) -> None:
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
@@ -1811,7 +1850,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         expected = {
             "시장가": ("시장가", "7"),
             "현재가": ("현재가", "7"),
-            "이월": ("이월", ""),
+            "이월": ("이월", "7"),
         }
         for chosen_text, expected_args in expected.items():
             with self.subTest(chosen_text=chosen_text):
@@ -1823,6 +1862,13 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     patch(
                         "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
                     ) as policy_path,
+                    patch(
+                        "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
+                        return_value={
+                            "method": "시장가",
+                            "minutes_before_regular_close": "7",
+                        },
+                    ),
                 ):
                     policy_path.read_text.return_value = json.dumps(
                         {
@@ -1856,7 +1902,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             },
             "이월": {
                 "enabled": True,
-                "minutes_before_regular_close": "",
+                "minutes_before_regular_close": "7",
                 "method": "이월",
             },
         }
@@ -1886,6 +1932,125 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         self.assertFalse(
             hasattr(close, "IndividualLiquidationSettingsDialog")
         )
+
+    def test_individual_liquidation_time_keeps_current_method(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_menu_title = "시간"
+        self._FakeMenu.chosen_text = "15분"
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={
+                    "liquidation": {
+                        "method": "시장가",
+                        "minutes_before_regular_close": "5",
+                    }
+                },
+            ),
+            patch(
+                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
+                return_value={
+                    "method": "현재가",
+                    "minutes_before_regular_close": "10",
+                },
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        window.apply_selected_individual_liquidation_method.assert_called_once_with(
+            "현재가",
+            "15",
+        )
+
+    def test_individual_liquidation_time_is_disabled_for_carry(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        self._FakeMenu.chosen_menu_title = "시간"
+        self._FakeMenu.chosen_text = "15분"
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={
+                    "liquidation": {
+                        "method": "이월",
+                        "minutes_before_regular_close": "10",
+                    }
+                },
+            ),
+            patch(
+                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
+                return_value={
+                    "method": "이월",
+                    "minutes_before_regular_close": "10",
+                },
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        time_menu = self._FakeMenu.root.submenus[1].submenus[0]
+        self.assertFalse(time_menu.enabled)
+        window.apply_selected_individual_liquidation_method.assert_not_called()
+
+    def test_individual_liquidation_policy_reuses_existing_priority_helper(
+        self,
+    ) -> None:
+        from gui_auto_trade_context_menu import (
+            _selected_individual_liquidation_policy,
+        )
+
+        selected = [(Path("stocks/005930_Samsung"), "005930", "Samsung")]
+        config = {
+            "individual_liquidation": {
+                "enabled": True,
+                "method": "현재가",
+                "minutes_before_regular_close": "12",
+            }
+        }
+        expected = {
+            "method": "현재가",
+            "minutes_before_regular_close": "12",
+        }
+        with (
+            patch(
+                "gui_auto_trade_context_menu.read_json_dict",
+                return_value=config,
+            ) as config_reader,
+            patch(
+                "gui_auto_trade_context_menu.effective_liquidation_policy_for_config",
+                return_value=(expected, True),
+            ) as policy_reader,
+        ):
+            actual = _selected_individual_liquidation_policy(selected)
+
+        config_reader.assert_called_once_with(
+            Path("stocks/005930_Samsung") / "config.json"
+        )
+        policy_reader.assert_called_once_with(config)
+        self.assertEqual(expected, actual)
+
+    def test_individual_liquidation_save_failure_has_no_success_message(
+        self,
+    ) -> None:
+        import gui_auto_trade_close as close
+
+        window = Mock()
+        with patch.object(
+            close,
+            "auto_trade_save_selected_individual_liquidation_settings",
+            return_value=0,
+        ):
+            close.auto_trade_apply_selected_individual_liquidation_method(
+                window,
+                "시장가",
+                "15",
+            )
+
+        window.statusBarMessage.assert_not_called()
 
     def test_individual_liquidation_menu_has_no_current_marker_on_read_failure(
         self,
