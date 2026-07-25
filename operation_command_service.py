@@ -30,6 +30,18 @@ IMMEDIATE_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
 COMMAND_INDIVIDUAL_LIQUIDATION = "INDIVIDUAL_LIQUIDATION"
 INDIVIDUAL_LIQUIDATION_REQUEST_KEY = "individual_liquidation_request"
 INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
+COMMAND_MANUAL_ATS_LIQUIDATION = "MANUAL_ATS_LIQUIDATION"
+MANUAL_ATS_LIQUIDATION_REQUEST_KEY = "manual_ats_liquidation_request"
+MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
+MANUAL_ATS_LIQUIDATION_RESULT_STATUSES = frozenset(
+    {
+        "ORDER_BLOCKED",
+        "ORDER_EXECUTABLE",
+        "SEND_CALL_ACCEPTED",
+        "SEND_CALL_REJECTED",
+        "SEND_CALL_UNCERTAIN",
+    }
+)
 
 STOCK_APPLIED = "APPLIED"
 STOCK_IGNORED_STALE = "IGNORED_STALE_COMMAND"
@@ -65,6 +77,12 @@ class EarlyCloseCompatibility:
 class IndividualLiquidationOverride:
     method: str
     minutes_before_regular_close: str
+
+
+@dataclass(frozen=True)
+class ManualAtsLiquidationOverride:
+    sell_method: str
+    selected_ats_sessions: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -120,6 +138,7 @@ class OperationCommandService:
             request,
             early_close_compatibility=None,
             individual_liquidation_override=None,
+            manual_ats_liquidation_override=None,
         )
 
     def apply_early_close(
@@ -138,6 +157,7 @@ class OperationCommandService:
             request,
             early_close_compatibility=compatibility,
             individual_liquidation_override=None,
+            manual_ats_liquidation_override=None,
         )
 
     def apply_individual_liquidation(
@@ -156,7 +176,111 @@ class OperationCommandService:
             request,
             early_close_compatibility=None,
             individual_liquidation_override=override,
+            manual_ats_liquidation_override=None,
         )
+
+    def apply_manual_ats_liquidation(
+        self,
+        request: OperationCommandRequest,
+        override: ManualAtsLiquidationOverride,
+    ) -> OperationCommandResult:
+        if str(request.command or "").strip().upper() != COMMAND_MANUAL_ATS_LIQUIDATION:
+            command_id = str(request.command_id or "").strip() or str(self._id_factory()).lower()
+            return OperationCommandResult(
+                RESULT_FAILED,
+                command_id,
+                error="manual ATS liquidation requires a MANUAL_ATS_LIQUIDATION command",
+            )
+        return self._apply(
+            request,
+            early_close_compatibility=None,
+            individual_liquidation_override=None,
+            manual_ats_liquidation_override=override,
+        )
+
+    def record_manual_ats_liquidation_status(
+        self,
+        stock_target: str,
+        command_id: str,
+        status: str,
+        *,
+        order_id: str = "",
+        detail: str = "",
+    ) -> StockOperationCommandResult:
+        targets, error = self._resolve_targets(SCOPE_STOCK, stock_target)
+        if error or len(targets) != 1:
+            return StockOperationCommandResult(
+                str(stock_target or ""),
+                "",
+                STOCK_FAILED,
+                error=error or "stock target was not resolved uniquely",
+            )
+        normalized_status = str(status or "").strip().upper()
+        if normalized_status not in MANUAL_ATS_LIQUIDATION_RESULT_STATUSES:
+            return self._stock_failure(
+                targets[0],
+                "manual ATS liquidation result status is invalid",
+            )
+
+        stock_dir = targets[0]
+        with self._stock_lock(stock_dir):
+            state_path = stock_dir / "state.json"
+            state = self._read_state(state_path)
+            if state is None:
+                return self._stock_failure(stock_dir, "state.json is missing or invalid")
+            request = state.get(MANUAL_ATS_LIQUIDATION_REQUEST_KEY)
+            request = request if isinstance(request, dict) else {}
+            if str(request.get("command_id", "") or "").strip() != str(command_id or "").strip():
+                return self._stock_failure(
+                    stock_dir,
+                    "manual ATS liquidation command_id does not match Runtime request",
+                )
+
+            recorded_at = self._now_factory().isoformat(timespec="seconds")
+            next_request = dict(request)
+            next_request.update(
+                {
+                    "status": normalized_status,
+                    "order_id": str(order_id or "").strip(),
+                    "result_recorded_at": recorded_at,
+                    "result_detail": str(detail or "").strip(),
+                }
+            )
+            next_state = dict(state)
+            next_state[MANUAL_ATS_LIQUIDATION_REQUEST_KEY] = next_request
+            next_state["updated_at"] = recorded_at
+            try:
+                write_result = self._atomic_writer(state_path, next_state)
+            except Exception as exc:
+                return self._stock_failure(
+                    stock_dir,
+                    f"atomic state writer raised: {exc}",
+                )
+            if not isinstance(write_result, dict) or write_result.get("status") != STATUS_OK:
+                write_error = (
+                    write_result.get("error", "atomic state write failed")
+                    if isinstance(write_result, dict)
+                    else "atomic state write failed"
+                )
+                return self._stock_failure(stock_dir, str(write_error))
+
+            saved = self._read_state(state_path)
+            saved_request = (
+                saved.get(MANUAL_ATS_LIQUIDATION_REQUEST_KEY)
+                if isinstance(saved, dict)
+                else None
+            )
+            if saved_request != next_request:
+                return self._stock_failure(
+                    stock_dir,
+                    "manual ATS liquidation result read-back verification failed",
+                )
+            return StockOperationCommandResult(
+                self._stock_code(stock_dir),
+                str(stock_dir),
+                STOCK_APPLIED,
+                self._nonnegative_int(saved.get("operation_sequence")),
+            )
 
     def _apply(
         self,
@@ -164,6 +288,7 @@ class OperationCommandService:
         *,
         early_close_compatibility: EarlyCloseCompatibility | None,
         individual_liquidation_override: IndividualLiquidationOverride | None,
+        manual_ats_liquidation_override: ManualAtsLiquidationOverride | None,
     ) -> OperationCommandResult:
         error = self._validate_request(request)
         command_id = str(request.command_id or "").strip() or str(self._id_factory()).lower()
@@ -185,6 +310,7 @@ class OperationCommandService:
                     command_id,
                     early_close_compatibility=early_close_compatibility,
                     individual_liquidation_override=individual_liquidation_override,
+                    manual_ats_liquidation_override=manual_ats_liquidation_override,
                 )
             )
 
@@ -206,10 +332,12 @@ class OperationCommandService:
             *PERSISTENT_MODES,
             COMMAND_IMMEDIATE_LIQUIDATION,
             COMMAND_INDIVIDUAL_LIQUIDATION,
+            COMMAND_MANUAL_ATS_LIQUIDATION,
         }:
             return (
                 "command must be NORMAL, EARLY_CLOSE, CARRY_OVER, "
-                "IMMEDIATE_LIQUIDATION, or INDIVIDUAL_LIQUIDATION"
+                "IMMEDIATE_LIQUIDATION, INDIVIDUAL_LIQUIDATION, or "
+                "MANUAL_ATS_LIQUIDATION"
             )
         if not str(request.source or "").strip():
             return "source is required"
@@ -252,6 +380,7 @@ class OperationCommandService:
         *,
         early_close_compatibility: EarlyCloseCompatibility | None,
         individual_liquidation_override: IndividualLiquidationOverride | None,
+        manual_ats_liquidation_override: ManualAtsLiquidationOverride | None,
     ) -> StockOperationCommandResult:
         lock = self._stock_lock(stock_dir)
         with lock:
@@ -263,11 +392,14 @@ class OperationCommandService:
             command = str(request.command).strip().upper()
             is_immediate_liquidation = command == COMMAND_IMMEDIATE_LIQUIDATION
             is_individual_liquidation = command == COMMAND_INDIVIDUAL_LIQUIDATION
+            is_manual_ats_liquidation = command == COMMAND_MANUAL_ATS_LIQUIDATION
             one_shot_request_key = (
                 IMMEDIATE_LIQUIDATION_REQUEST_KEY
                 if is_immediate_liquidation
                 else INDIVIDUAL_LIQUIDATION_REQUEST_KEY
                 if is_individual_liquidation
+                else MANUAL_ATS_LIQUIDATION_REQUEST_KEY
+                if is_manual_ats_liquidation
                 else ""
             )
             if one_shot_request_key:
@@ -306,6 +438,8 @@ class OperationCommandService:
                         IMMEDIATE_LIQUIDATION_STATUS_REQUESTED
                         if is_immediate_liquidation
                         else INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED
+                        if is_individual_liquidation
+                        else MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED
                     ),
                 }
                 if is_individual_liquidation:
@@ -322,6 +456,38 @@ class OperationCommandService:
                             "minutes_before_regular_close": str(
                                 override.minutes_before_regular_close or ""
                             ).strip(),
+                        }
+                    )
+                if is_manual_ats_liquidation:
+                    override = manual_ats_liquidation_override
+                    if override is None:
+                        return self._stock_failure(
+                            stock_dir,
+                            "manual ATS liquidation override is required",
+                            sequence=next_sequence,
+                        )
+                    sell_method = str(override.sell_method or "").strip().upper()
+                    selected_sessions = tuple(
+                        str(value or "").strip()
+                        for value in override.selected_ats_sessions
+                        if str(value or "").strip()
+                    )
+                    if sell_method not in {"MARKET", "CURRENT_PRICE"}:
+                        return self._stock_failure(
+                            stock_dir,
+                            "manual ATS liquidation sell_method must be MARKET or CURRENT_PRICE",
+                            sequence=next_sequence,
+                        )
+                    if not selected_sessions:
+                        return self._stock_failure(
+                            stock_dir,
+                            "manual ATS liquidation selected_ats_sessions is required",
+                            sequence=next_sequence,
+                        )
+                    one_shot_request.update(
+                        {
+                            "selected_ats_sessions": list(selected_sessions),
+                            "sell_method": sell_method,
                         }
                     )
                 next_state[one_shot_request_key] = one_shot_request

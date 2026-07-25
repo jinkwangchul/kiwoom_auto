@@ -277,11 +277,11 @@ from gui_auto_trade_close import (
     auto_trade_cancel_selected_early_close,
 )
 from gui_auto_trade_ats_ops import (
+    auto_trade_execute_selected_manual_ats_liquidation,
     auto_trade_open_selected_manual_ats_settings_dialog,
     auto_trade_save_selected_manual_ats_state,
     auto_trade_selected_manual_ats_state,
     auto_trade_set_selected_manual_ats_flag,
-    auto_trade_show_selected_ats_immediate_sell_placeholder,
 )
 from gui_auto_trade_timer import (
     auto_trade_current_runtime_file_signature,
@@ -2317,8 +2317,12 @@ class AutoTradeSettingWindow(QDialog):
     def set_selected_manual_ats_flag(self, flag_key: str, enabled: bool, label: str) -> None:
         auto_trade_set_selected_manual_ats_flag(self, flag_key, enabled, label)
 
-    def show_selected_ats_immediate_sell_placeholder(self, method: str) -> None:
-        auto_trade_show_selected_ats_immediate_sell_placeholder(self, method)
+    def execute_selected_manual_ats_liquidation(
+        self,
+        method: str,
+        ats_state: dict[str, bool],
+    ) -> None:
+        auto_trade_execute_selected_manual_ats_liquidation(self, method, ats_state)
 
     def selected_operation_mode_set(
         self,

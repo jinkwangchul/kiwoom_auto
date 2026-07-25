@@ -16,11 +16,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from operation_command_service import (
     COMMAND_INDIVIDUAL_LIQUIDATION,
     COMMAND_IMMEDIATE_LIQUIDATION,
+    COMMAND_MANUAL_ATS_LIQUIDATION,
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
     IMMEDIATE_LIQUIDATION_REQUEST_KEY,
     IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
     IndividualLiquidationOverride,
+    MANUAL_ATS_LIQUIDATION_REQUEST_KEY,
+    MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED,
+    ManualAtsLiquidationOverride,
     MODE_CARRY_OVER,
     MODE_EARLY_CLOSE,
     MODE_NORMAL,
@@ -565,6 +569,74 @@ class OperationCommandServiceTest(unittest.TestCase):
                 "broker_order_no",
             }.isdisjoint(state)
         )
+
+    def test_manual_ats_liquidation_records_distinct_one_shot_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "operation_command_mode": MODE_NORMAL,
+                    "operation_sequence": 4,
+                },
+            )
+
+            result = self._service(root).apply_manual_ats_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_MANUAL_ATS_LIQUIDATION,
+                    "ATS_SETTINGS",
+                    command_id="ats-command-1",
+                ),
+                ManualAtsLiquidationOverride(
+                    sell_method="CURRENT_PRICE",
+                    selected_ats_sessions=("extra1", "extra3"),
+                ),
+            )
+            state = self._state(stock)
+            request = state[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertEqual(STOCK_APPLIED, result.stock_results[0].status)
+        self.assertEqual(MODE_NORMAL, state["operation_command_mode"])
+        self.assertEqual(5, state["operation_sequence"])
+        self.assertEqual("ats-command-1", request["command_id"])
+        self.assertEqual(MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED, request["status"])
+        self.assertEqual("CURRENT_PRICE", request["sell_method"])
+        self.assertEqual(["extra1", "extra3"], request["selected_ats_sessions"])
+        self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, state)
+        self.assertNotIn(INDIVIDUAL_LIQUIDATION_REQUEST_KEY, state)
+
+    def test_manual_ats_liquidation_result_status_is_read_back_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "005930_Samsung")
+            service = self._service(root)
+            service.apply_manual_ats_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_MANUAL_ATS_LIQUIDATION,
+                    "ATS_SETTINGS",
+                    command_id="ats-command-2",
+                ),
+                ManualAtsLiquidationOverride("MARKET", ("extra1",)),
+            )
+
+            status_result = service.record_manual_ats_liquidation_status(
+                str(stock),
+                "ats-command-2",
+                "SEND_CALL_ACCEPTED",
+                order_id="ATS_ORDER_1",
+            )
+            request = self._state(stock)[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
+
+        self.assertEqual(STOCK_APPLIED, status_result.status)
+        self.assertEqual("SEND_CALL_ACCEPTED", request["status"])
+        self.assertEqual("ATS_ORDER_1", request["order_id"])
 
     def test_runtime_individual_liquidation_override_precedes_environment_policy(
         self,
