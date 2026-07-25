@@ -21,6 +21,7 @@ from gui_schedule_utils import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
+from manual_ats_runtime import clear_manual_ats_runtime_selection
 from state_policy import (
     auto_trade_status_display,
     normalize_operation_mode,
@@ -399,6 +400,20 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         config = default_config()
 
     before_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+    if before_mode != mode and not clear_manual_ats_runtime_selection(stock_dir):
+        QMessageBox.critical(
+            window,
+            "운영방식 저장 오류",
+            f"{code} {name} 운영방식 변경 전 ATS 선택을 해제하지 못했습니다.",
+        )
+        append_stock_log(
+            stock_dir,
+            "ERROR",
+            f"운영방식 변경 전 ATS 선택 해제 실패: "
+            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
+        )
+        return False
+
     config["operation_mode"] = mode
     if config_updates:
         config.update(config_updates)

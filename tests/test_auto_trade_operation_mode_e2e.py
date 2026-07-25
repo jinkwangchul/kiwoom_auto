@@ -14,15 +14,32 @@ import gui_auto_trade_status_ops as status_ops
 
 
 class AutoTradeOperationModeE2ETest(unittest.TestCase):
-    def _stock(self, root: Path) -> Path:
+    def _stock(self, root: Path, *, mode: str = "SCHEDULED", with_ats: bool = False) -> Path:
         stock_dir = root / "stocks" / "111111_테스트종목"
         stock_dir.mkdir(parents=True)
         (stock_dir / "config.json").write_text(
-            json.dumps({"operation_mode": "SCHEDULED"}, ensure_ascii=False),
+            json.dumps({"operation_mode": mode}, ensure_ascii=False),
             encoding="utf-8",
         )
         (stock_dir / "state.json").write_text(
-            json.dumps({"status": "STOPPED", "trade_enabled": False}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "status": "STOPPED",
+                    "trade_enabled": False,
+                    **(
+                        {
+                            "manual_ats_selection": {
+                                "selected_sessions": ["extra1"],
+                                "trade_date": "2026-07-25",
+                                "program_session_id": "program-session",
+                            }
+                        }
+                        if with_ats
+                        else {}
+                    ),
+                },
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
         return stock_dir
@@ -78,6 +95,77 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.statusBarMessage.assert_called_once()
         self.assertIn("변경 완료", window.statusBarMessage.call_args.args[0])
 
+    def test_manual_to_scheduled_clears_runtime_ats_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+            config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+            state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("SCHEDULED", config["operation_mode"])
+        self.assertNotIn("manual_ats_selection", state)
+
+    def test_scheduled_to_manual_does_not_restore_previous_ats_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp), mode="SCHEDULED", with_ats=True)
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
+            config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+            state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("CONTINUOUS", config["operation_mode"])
+        self.assertNotIn("manual_ats_selection", state)
+
+    def test_multi_selection_clears_each_stock_runtime_ats_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = self._stock(root, mode="CONTINUOUS", with_ats=True)
+            second = root / "stocks" / "222222_두번째종목"
+            second.mkdir(parents=True)
+            (second / "config.json").write_text(
+                '{"operation_mode":"CONTINUOUS"}',
+                encoding="utf-8",
+            )
+            (second / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "STOPPED",
+                        "manual_ats_selection": {
+                            "selected_sessions": ["extra2"],
+                            "trade_date": "2026-07-25",
+                            "program_session_id": "program-session",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            window, _parent = self._window(first)
+            window.selected_stock_infos = lambda: [
+                (first, "111111", "테스트종목"),
+                (second, "222222", "두번째종목"),
+            ]
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+            states = [
+                json.loads((path / "state.json").read_text(encoding="utf-8"))
+                for path in (first, second)
+            ]
+
+        self.assertTrue(all("manual_ats_selection" not in state for state in states))
+
     def test_write_failure_does_not_report_success_and_reloads_runtime_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = self._stock(Path(temp))
@@ -120,6 +208,33 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertFalse(result)
         critical.assert_called_once()
         self.assertIn("read-back 실패", append_stock_log.call_args.args[2])
+
+    def test_ats_clear_failure_blocks_operation_mode_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(
+                    status_ops,
+                    "clear_manual_ats_runtime_selection",
+                    return_value=False,
+                ),
+                patch.object(status_ops, "append_stock_log") as append_stock_log,
+                patch.object(status_ops.QMessageBox, "critical") as critical,
+            ):
+                result = status_ops.auto_trade_update_stock_operation_mode(
+                    window,
+                    stock_dir,
+                    "111111",
+                    "테스트종목",
+                    "SCHEDULED",
+                )
+            config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        self.assertFalse(result)
+        self.assertEqual("CONTINUOUS", config["operation_mode"])
+        critical.assert_called_once()
+        self.assertIn("ATS 선택 해제 실패", append_stock_log.call_args.args[2])
 
     def test_status_recalculation_failure_is_reported_after_mode_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
