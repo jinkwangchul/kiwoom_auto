@@ -531,7 +531,6 @@ def auto_trade_set_selected_schedule_operation_mode(window) -> None:
 
 def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_updates: dict[str, object] | None = None) -> None:
     selected = window.selected_stock_infos()
-    routine_name = window.current_selected_routine_name()
 
     if len(selected) != 1:
         QMessageBox.warning(
@@ -540,13 +539,16 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
             "운영방식 변경은 한 종목만 선택해야 합니다.",
         )
         return
-    if not routine_name:
-        QMessageBox.warning(window, "선택 오류", "운영방식을 변경할 종목을 선택하세요.")
-        return
 
     mode = normalize_operation_mode(operation_mode)
     display_mode = operation_mode_display(mode)
     stock_dir, code, name = selected[0]
+    routine_name = window.current_selected_routine_name()
+    routine_context = routine_name or (
+        "전체"
+        if bool(getattr(window, "_all_stocks_scope_active", False))
+        else "선택 종목"
+    )
     changed = window.update_stock_operation_mode(
         stock_dir,
         code,
@@ -585,7 +587,7 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         append_changelog(
             "UPDATE",
             "config.json/state.json",
-            f"종목별 운영방식 변경: {routine_name} -> {display_mode}: {' | '.join(changelog_parts)}",
+            f"종목별 운영방식 변경: {routine_context} -> {display_mode}: {' | '.join(changelog_parts)}",
         )
 
     window.refresh_all()

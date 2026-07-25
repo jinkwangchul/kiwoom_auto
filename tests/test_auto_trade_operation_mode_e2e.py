@@ -128,6 +128,45 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_not_called()
 
+    def test_all_stocks_scope_changes_single_selected_stock_without_routine_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, parent = self._window(stock_dir)
+            window._all_stocks_scope_active = True
+            window.current_selected_routine_name = lambda: ""
+
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog") as append_changelog,
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
+
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("CONTINUOUS", saved["operation_mode"])
+        self.assertIn("종목별 운영방식 변경: 전체 -> 수동", append_changelog.call_args.args[2])
+        window.refresh_all.assert_called_once_with()
+        parent.refresh_all.assert_called_once_with()
+        warning.assert_not_called()
+
+    def test_no_stock_selection_keeps_single_selection_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, _parent = self._window(stock_dir)
+            window.selected_stock_infos = lambda: []
+            window.update_stock_operation_mode = Mock()
+
+            with patch.object(status_ops.QMessageBox, "warning") as warning:
+                status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
+
+        window.update_stock_operation_mode.assert_not_called()
+        warning.assert_called_once_with(
+            window,
+            "선택 오류",
+            "운영방식 변경은 한 종목만 선택해야 합니다.",
+        )
+
     def test_active_ats_blocks_mode_change_and_preserves_runtime_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = self._stock(Path(temp), mode="CONTINUOUS", with_ats=True)
