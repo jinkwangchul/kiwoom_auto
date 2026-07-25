@@ -281,7 +281,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 patch.object(
                     status_ops,
                     "read_json_dict",
-                    side_effect=[dict(original), {}, dict(original)],
+                    side_effect=[dict(original), {"status": "STOPPED"}, dict(original)],
                 ),
                 patch.object(status_ops, "append_stock_log") as append_stock_log,
                 patch.object(status_ops.QMessageBox, "critical") as critical,
@@ -316,29 +316,53 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_not_called()
 
-    def test_trade_quantities_do_not_block_change_before_schedule_end(self) -> None:
-        scenarios = (
-            {"holding_qty": 10},
-            {"buy_pending_qty": 3},
-            {"sell_pending_qty": 4},
-        )
-        for state_values in scenarios:
-            with self.subTest(state_values=state_values), tempfile.TemporaryDirectory() as temp:
+    def test_holding_quantity_alone_does_not_block_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp), mode="CONTINUOUS")
+            state_path = stock_dir / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["holding_qty"] = 10
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual("SCHEDULED", saved["operation_mode"])
+
+    def test_after_schedule_end_allows_monitoring_and_completed_states(self) -> None:
+        for runtime_status in (
+            "MONITORING",
+            "WAIT_BUY",
+            "AUTO_CLOSED",
+            "EARLY_CLOSED",
+            "LIQUIDATED",
+        ):
+            with self.subTest(runtime_status=runtime_status), tempfile.TemporaryDirectory() as temp:
                 stock_dir = self._stock(Path(temp), mode="CONTINUOUS")
                 state_path = stock_dir / "state.json"
                 state = json.loads(state_path.read_text(encoding="utf-8"))
-                state.update(state_values)
+                state["status"] = runtime_status
                 state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
                 window, _parent = self._window(stock_dir)
                 with (
+                    patch.object(
+                        status_ops,
+                        "current_datetime",
+                        return_value=datetime(2026, 7, 25, 17, 0, 0),
+                    ),
                     patch.object(status_ops, "append_stock_log"),
                     patch.object(status_ops, "append_changelog"),
+                    patch.object(status_ops.QMessageBox, "warning") as warning,
                 ):
                     status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 self.assertEqual("SCHEDULED", saved["operation_mode"])
+                warning.assert_not_called()
 
-    def test_exact_schedule_end_and_after_block_both_directions(self) -> None:
+    def test_schedule_end_and_after_allow_idle_states(self) -> None:
         scenarios = (
             ("CONTINUOUS", "SCHEDULED", datetime(2026, 7, 25, 13, 30, 0)),
             ("CONTINUOUS", "SCHEDULED", datetime(2026, 7, 25, 13, 30, 1)),
@@ -363,15 +387,81 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                     )
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
-                self.assertEqual(current_mode, saved["operation_mode"])
+                self.assertEqual(requested_mode, saved["operation_mode"])
                 self.assertNotIn("manual_ats_selection", state)
+                warning.assert_not_called()
+                window.statusBarMessage.assert_not_called()
+                window.showAutoTradePopupMessage.assert_not_called()
+
+    def test_idle_scheduled_stock_can_return_to_manual_with_invalid_old_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(
+                Path(temp),
+                mode="SCHEDULED",
+                config_values={"end_buy_time": "invalid"},
+            )
+            window, _parent = self._window(stock_dir)
+            with (
+                patch.object(
+                    status_ops,
+                    "current_datetime",
+                    return_value=datetime(2026, 7, 25, 17, 0, 0),
+                ),
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual("CONTINUOUS", saved["operation_mode"])
+            warning.assert_not_called()
+
+    def test_active_trading_order_and_close_states_block_change(self) -> None:
+        scenarios = (
+            ("RUNNING", {}, None),
+            ("STOPPED", {}, {"status": "OPEN", "side": "BUY", "order_qty": 3}),
+            ("AUTO_CLOSING", {}, None),
+            ("EARLY_CLOSING", {}, None),
+            ("LIQUIDATING", {}, None),
+            (
+                "MONITORING",
+                {
+                    "liquidation_policy_forced": True,
+                    "liquidation_policy_reason": "EARLY_CLOSE",
+                },
+                None,
+            ),
+        )
+        for runtime_status, state_values, order in scenarios:
+            with self.subTest(runtime_status=runtime_status), tempfile.TemporaryDirectory() as temp:
+                stock_dir = self._stock(Path(temp), mode="CONTINUOUS")
+                state_path = stock_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state.update({"status": runtime_status, **state_values})
+                state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                if order is not None:
+                    (stock_dir / "orders.json").write_text(
+                        json.dumps({"orders": [order]}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                window, _parent = self._window(stock_dir)
+                with (
+                    patch.object(
+                        status_ops,
+                        "current_datetime",
+                        return_value=datetime(2026, 7, 25, 17, 0, 0),
+                    ),
+                    patch.object(status_ops, "append_stock_log"),
+                    patch.object(status_ops.QMessageBox, "warning") as warning,
+                ):
+                    status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+                saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual("CONTINUOUS", saved["operation_mode"])
                 warning.assert_called_once_with(
                     window,
                     "운영방식 변경",
                     "선택한 종목을 변경할 수 없습니다.",
                 )
-                window.statusBarMessage.assert_not_called()
-                window.showAutoTradePopupMessage.assert_not_called()
 
     def test_active_ats_blocks_before_and_during_session_regardless_of_holdings(self) -> None:
         scenarios = (

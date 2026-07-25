@@ -422,6 +422,10 @@ def operation_mode_change_decision(
     current_datetime: datetime,
     global_schedule: dict[str, object] | None = None,
     ats_runtime_active: bool = False,
+    runtime_status: object = "STOPPED",
+    pending_order_active: bool = False,
+    close_or_liquidation_active: bool = False,
+    runtime_state_available: bool = True,
 ) -> dict[str, object]:
     current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     target_mode = normalize_operation_mode(requested_mode)
@@ -434,10 +438,60 @@ def operation_mode_change_decision(
             "current_time": current_time,
             "schedule_source": "",
         }
+    if not runtime_state_available:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_RUNTIME_STATE_UNAVAILABLE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
+    status = str(runtime_status or "STOPPED").strip().upper() or "STOPPED"
+    if status in {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_TRADING_ACTIVE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
+    if pending_order_active:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_ORDER_ACTIVE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
+    if close_or_liquidation_active or status in {
+        "AUTO_CLOSE",
+        "AUTO_CLOSING",
+        "EARLY_CLOSE",
+        "EARLY_CLOSING",
+        "FORCE_CLOSE",
+        "FORCE_LIQUIDATION",
+        "LIQUIDATION",
+        "LIQUIDATING",
+    }:
+        return {
+            "allowed": False,
+            "reason": "BLOCKED_CLOSE_OR_LIQUIDATION_ACTIVE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
     if current_mode == target_mode:
         return {
             "allowed": True,
             "reason": "ALLOWED_NO_MODE_CHANGE",
+            "scheduled_end_time": "",
+            "current_time": current_time,
+            "schedule_source": "",
+        }
+    if target_mode != "SCHEDULED":
+        return {
+            "allowed": True,
+            "reason": "ALLOWED_RUNTIME_STATE_IDLE",
             "scheduled_end_time": "",
             "current_time": current_time,
             "schedule_source": "",
@@ -495,19 +549,9 @@ def operation_mode_change_decision(
             "schedule_source": schedule_source,
         }
 
-    current_seconds = (
-        current_datetime.hour * 3600
-        + current_datetime.minute * 60
-        + current_datetime.second
-    )
-    allowed = current_seconds < seconds_from_hhmmss(end_time, end_time)
     return {
-        "allowed": allowed,
-        "reason": (
-            "ALLOWED_BEFORE_TIME_OPERATION_END"
-            if allowed
-            else "BLOCKED_TIME_OPERATION_END_REACHED"
-        ),
+        "allowed": True,
+        "reason": "ALLOWED_RUNTIME_STATE_IDLE",
         "scheduled_end_time": end_time,
         "current_time": current_time,
         "schedule_source": schedule_source,

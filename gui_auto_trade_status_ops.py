@@ -20,6 +20,7 @@ from gui_schedule_utils import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
+from gui_order_utils import pending_order_side_quantities
 from manual_ats_runtime import manual_ats_runtime_selected_keys
 from state_policy import (
     auto_trade_status_display,
@@ -410,6 +411,24 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
     decision_config = target_config if mode == "SCHEDULED" else config
     decision_now = current_datetime()
     runtime_state = read_json_dict(stock_dir / "state.json")
+    buy_pending_qty, sell_pending_qty = pending_order_side_quantities(
+        stock_dir,
+        runtime_state,
+    )
+    pending_order_active = (
+        buy_pending_qty == "?"
+        or sell_pending_qty == "?"
+        or int(buy_pending_qty) > 0
+        or int(sell_pending_qty) > 0
+    )
+    runtime_status = str(runtime_state.get("status", "STOPPED")).strip().upper()
+    close_or_liquidation_active = (
+        bool(runtime_state.get("close_routine_final_sell_ordered", False))
+        or (
+            bool(runtime_state.get("liquidation_policy_forced", False))
+            and runtime_status not in {"AUTO_CLOSED", "EARLY_CLOSED", "LIQUIDATED"}
+        )
+    )
     decision = operation_mode_change_decision(
         decision_config,
         mode,
@@ -417,6 +436,10 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         ats_runtime_active=bool(
             manual_ats_runtime_selected_keys(runtime_state, now_dt=decision_now)
         ),
+        runtime_status=runtime_status,
+        pending_order_active=pending_order_active,
+        close_or_liquidation_active=close_or_liquidation_active,
+        runtime_state_available=bool(runtime_state),
     )
     if not decision["allowed"]:
         scheduled_end_time = str(decision.get("scheduled_end_time") or "")
