@@ -1246,8 +1246,30 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
         self.btn_early_close = QPushButton("조기마감")
         self.btn_early_close.setStyleSheet("color: #2563eb; font-weight: bold;")
-        self.btn_all_stocks = QPushButton("전체종목")
-        self.btn_all_stocks.setStyleSheet(self.btn_early_close.styleSheet())
+        self.btn_all_stocks = QPushButton("전체")
+        self.btn_all_stocks.setFocusPolicy(Qt.NoFocus)
+        self.btn_all_stocks.setCursor(Qt.PointingHandCursor)
+        self.btn_all_stocks.setFixedSize(
+            64,
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+        )
+        self.all_stocks_command_separator = QLabel("|")
+        self.all_stocks_command_separator.setObjectName(
+            "autoTradeSettingAllStocksCommandSeparator"
+        )
+        self.all_stocks_command_separator.setAlignment(Qt.AlignCenter)
+        self.all_stocks_command_separator.setFixedSize(
+            12,
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+        )
+        self.all_stocks_command_separator.setFocusPolicy(Qt.NoFocus)
+        self.all_stocks_command_separator.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.all_stocks_command_separator.setStyleSheet(
+            "background: transparent; color: #9CA3AF;"
+        )
         self.btn_preview_order_candidates = QPushButton("주문후보검증")
         self.btn_execution_enable = QPushButton("수동 실주문 후보 활성화")
         self.btn_real_ready_preflight = QPushButton("REAL_READY 수동 점검")
@@ -1257,7 +1279,6 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_modify_pending_order = QPushButton("Manual Modify")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
-        self.btn_all_stocks.setMinimumHeight(28)
         self.btn_early_close.setMinimumHeight(28)
         self.btn_stop.setMinimumHeight(28)
         self.btn_preview_order_candidates.setMinimumHeight(28)
@@ -1411,6 +1432,11 @@ class AutoTradeSettingWindow(QDialog):
         selected_routine_header_layout.addWidget(self.btn_manual_cancel_pending_order)
         selected_routine_header_layout.addWidget(self.btn_manual_modify_pending_order)
         selected_routine_header_layout.addWidget(self.btn_all_stocks, 0, Qt.AlignVCenter)
+        selected_routine_header_layout.addWidget(
+            self.all_stocks_command_separator,
+            0,
+            Qt.AlignVCenter,
+        )
         selected_routine_header_layout.addWidget(self.btn_early_close, 0, Qt.AlignVCenter)
         selected_routine_header_layout.addWidget(self.btn_stop, 0, Qt.AlignVCenter)
 
@@ -1619,7 +1645,24 @@ class AutoTradeSettingWindow(QDialog):
     def update_selected_routine_status_bar(self) -> None:
         if not hasattr(self, "selected_routine_status_bar"):
             return
-        if bool(getattr(self, "_all_stocks_scope_active", False)):
+        all_stocks_scope_active = bool(
+            getattr(self, "_all_stocks_scope_active", False)
+        )
+        all_stocks_badge_color = (
+            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+            if all_stocks_scope_active
+            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+        )
+        all_stocks_button = getattr(self, "btn_all_stocks", None)
+        if all_stocks_button is not None:
+            all_stocks_button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=all_stocks_badge_color,
+                    border_color=all_stocks_badge_color,
+                )
+            )
+        if all_stocks_scope_active:
             counts = self._all_stocks_scope_summary()
             self.selected_routine_signal_label.hide()
             self.selected_routine_name_button.setText("전체")

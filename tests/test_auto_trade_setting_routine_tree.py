@@ -3059,6 +3059,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.selected_routine_instance_count_badge,
             *window.selected_routine_status_buttons.values(),
             window.btn_all_stocks,
+            window.all_stocks_command_separator,
             window.btn_early_close,
             window.btn_stop,
         )
@@ -3066,27 +3067,78 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with self.subTest(control=control.objectName()):
                 control_center_y = control.mapTo(window, control.rect().center()).y()
                 self.assertLessEqual(abs(control_center_y - status_center_y), 1)
-        self.assertEqual("전체종목", window.btn_all_stocks.text())
+        self.assertEqual("전체", window.btn_all_stocks.text())
+        self.assertNotIn(
+            "전체종목",
+            [button.text() for button in window.findChildren(setting_window.QPushButton)],
+        )
         self.assertEqual("조기마감", window.btn_early_close.text())
         self.assertEqual("강제종료", window.btn_stop.text())
-        self.assertEqual(window.btn_all_stocks.height(), window.btn_early_close.height())
         self.assertEqual(window.btn_early_close.height(), window.btn_stop.height())
         self.assertEqual(
-            window.btn_all_stocks.sizeHint().width(),
-            window.btn_early_close.sizeHint().width(),
+            (64, setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT),
+            (window.btn_all_stocks.width(), window.btn_all_stocks.height()),
         )
         self.assertEqual(
+            window._routine_tree_display_scope_buttons["all"].font(),
+            window.btn_all_stocks.font(),
+        )
+        expected_inactive_badge_style = setting_window.auto_trade_setting_badge_stylesheet(
+            "QPushButton",
+            text_color=setting_window.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+            border_color=setting_window.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+        )
+        self.assertEqual(
+            expected_inactive_badge_style,
             window.btn_all_stocks.styleSheet(),
-            window.btn_early_close.styleSheet(),
+        )
+        self.assertTrue(
+            window._routine_tree_display_scope_buttons["all"].styleSheet().startswith(
+                expected_inactive_badge_style
+            )
+        )
+        self.assertEqual("|", window.all_stocks_command_separator.text())
+        self.assertEqual(
+            (12, setting_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT),
+            (
+                window.all_stocks_command_separator.width(),
+                window.all_stocks_command_separator.height(),
+            ),
+        )
+        self.assertEqual(
+            setting_window.Qt.NoFocus,
+            window.all_stocks_command_separator.focusPolicy(),
+        )
+        self.assertTrue(
+            window.all_stocks_command_separator.testAttribute(
+                setting_window.Qt.WA_TransparentForMouseEvents
+            )
+        )
+        all_stocks_x = window.btn_all_stocks.mapTo(
+            window,
+            window.btn_all_stocks.rect().topLeft(),
+        ).x()
+        separator_x = window.all_stocks_command_separator.mapTo(
+            window,
+            window.all_stocks_command_separator.rect().topLeft(),
+        ).x()
+        early_close_x = window.btn_early_close.mapTo(
+            window,
+            window.btn_early_close.rect().topLeft(),
+        ).x()
+        stop_x = window.btn_stop.mapTo(
+            window,
+            window.btn_stop.rect().topLeft(),
+        ).x()
+        self.assertLess(
+            all_stocks_x,
+            separator_x,
         )
         self.assertLess(
-            window.btn_all_stocks.mapTo(window, window.btn_all_stocks.rect().topLeft()).x(),
-            window.btn_early_close.mapTo(window, window.btn_early_close.rect().topLeft()).x(),
+            separator_x,
+            early_close_x,
         )
-        self.assertLess(
-            window.btn_early_close.mapTo(window, window.btn_early_close.rect().topLeft()).x(),
-            window.btn_stop.mapTo(window, window.btn_stop.rect().topLeft()).x(),
-        )
+        self.assertLess(early_close_x, stop_x)
         self.assertGreaterEqual(window.btn_early_close.height(), 28)
         self.assertGreater(
             window.btn_early_close.height(),
@@ -3229,6 +3281,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("실행(5)", window.selected_routine_status_buttons["running"].text())
         self.assertEqual("정지(7)", window.selected_routine_status_buttons["stopped"].text())
         self.assertEqual("검토(2)", window.selected_routine_status_buttons["error"].text())
+        self.assertEqual(
+            setting_window.auto_trade_setting_badge_stylesheet(
+                "QPushButton",
+                text_color=setting_window.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+                border_color=setting_window.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+            ),
+            window.btn_all_stocks.styleSheet(),
+        )
         stock_loader.assert_called_once_with()
 
         window.routine_table.selectRow(1)
