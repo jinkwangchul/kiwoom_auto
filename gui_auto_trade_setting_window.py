@@ -1345,7 +1345,8 @@ class AutoTradeSettingWindow(QDialog):
         self._collapsed_auto_trade_definition_ids: set[str] = set()
         self._default_operation_instance_by_definition: dict[str, str] = {}
         self._routine_operation_status_by_instance: dict[str, str] = {}
-        self._last_time_policy_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Run one policy reconciliation as soon as startup recovery permits it.
+        self._last_time_policy_minute_key = ""
         self._time_policy_timer = QTimer(self)
         self._time_policy_timer.setInterval(10_000)
         self._time_policy_timer.timeout.connect(self.on_time_policy_timer_tick)

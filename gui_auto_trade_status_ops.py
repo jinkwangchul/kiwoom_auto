@@ -19,7 +19,7 @@ from gui_schedule_utils import (
     schedule_change_log_text,
 )
 from runtime_io import read_json_dict
-from gui_auto_trade_runtime import write_state_json
+from gui_auto_trade_runtime import get_stock_dirs_in_routine, write_state_json
 from gui_order_utils import pending_order_side_quantities
 from manual_ats_runtime import manual_ats_runtime_selected_keys
 from state_policy import (
@@ -87,22 +87,6 @@ def get_routine_dirs() -> list[Path]:
         for path in sorted(ROUTINES_DIR.iterdir(), key=lambda item: item.name)
         if path.is_dir() and not path.name.startswith(".") and not path.name.startswith("__")
     ]
-
-
-def get_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """루틴 폴더 아래 실제 종목 폴더 목록을 반환한다."""
-    if not routine_dir.exists() or not routine_dir.is_dir():
-        return []
-    result: list[Path] = []
-    for child in sorted(routine_dir.iterdir(), key=lambda item: item.name):
-        if (
-            child.is_dir()
-            and not child.name.startswith(".")
-            and not child.name.startswith("__")
-            and (child / "config.json").exists()
-        ):
-            result.append(child)
-    return result
 
 
 def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
