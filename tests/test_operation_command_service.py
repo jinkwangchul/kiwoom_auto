@@ -1524,6 +1524,8 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         def __init__(self, text: str, separator: bool = False) -> None:
             self.text = text
             self.enabled = True
+            self.icon = None
+            self.properties = {}
             self.separator = separator
 
         def setEnabled(self, enabled: bool) -> None:
@@ -1531,6 +1533,15 @@ class AutoTradeContextMenuTest(unittest.TestCase):
 
         def setText(self, text: str) -> None:
             self.text = str(text)
+
+        def setIcon(self, icon) -> None:
+            self.icon = icon
+
+        def setProperty(self, name: str, value) -> None:
+            self.properties[str(name)] = value
+
+        def property(self, name: str):
+            return self.properties.get(str(name))
 
     class _FakeMenu:
         root = None
@@ -1660,8 +1671,23 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     for action in self._FakeMenu.root.submenus[0].actions
                     if not action.separator
                 ]
-                self.assertEqual(1, sum(label.startswith("▪ ") for label in labels))
-                self.assertIn(f"▪ {selected_label}", labels)
+                actions = [
+                    action
+                    for action in self._FakeMenu.root.submenus[0].actions
+                    if not action.separator
+                ]
+                self.assertEqual(
+                    ["루틴마감", "시장가", "현재가", "손/익절", "이월", "취소"],
+                    labels,
+                )
+                self.assertTrue(all(action.icon is not None for action in actions))
+                selected_actions = [
+                    action
+                    for action in actions
+                    if action.property("earlyCloseCurrent")
+                ]
+                self.assertEqual(1, len(selected_actions))
+                self.assertEqual(selected_label, selected_actions[0].text)
 
     def test_early_close_menu_refreshes_marker_without_duplication(self) -> None:
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
@@ -1670,7 +1696,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             {"early_close": {"method": "루틴매도신호"}},
             {"early_close": {"method": "시장가"}},
         ]
-        rendered_labels = []
+        rendered_states = []
         with (
             patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
             patch(
@@ -1685,21 +1711,24 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                 window = self._window()
                 self._FakeMenu.chosen_text = None
                 show_auto_trade_stock_context_menu(window, object())
-                rendered_labels.append(
+                rendered_states.append(
                     [
-                        action.text
+                        (
+                            action.text,
+                            action.property("earlyCloseCurrent"),
+                        )
                         for action in self._FakeMenu.root.submenus[0].actions
                         if not action.separator
                     ]
                 )
 
-        self.assertIn("▪ 루틴마감", rendered_labels[0])
-        self.assertIn("▪ 시장가", rendered_labels[1])
-        self.assertFalse(
-            any(
-                label.startswith("▪ ▪ ")
-                for labels in rendered_labels
-                for label in labels
+        self.assertIn(("루틴마감", True), rendered_states[0])
+        self.assertIn(("시장가", True), rendered_states[1])
+        self.assertTrue(
+            all(
+                not label.startswith("▪")
+                for states in rendered_states
+                for label, _selected in states
             )
         )
 
@@ -1707,7 +1736,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
 
         window = self._window()
-        self._FakeMenu.chosen_text = "▪ 시장가"
+        self._FakeMenu.chosen_text = "시장가"
         with (
             patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
             patch(
@@ -1742,11 +1771,14 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             show_auto_trade_stock_context_menu(window, object())
 
         labels = [
-            action.text
+            (
+                action.text,
+                action.property("earlyCloseCurrent"),
+            )
             for action in self._FakeMenu.root.submenus[0].actions
             if not action.separator
         ]
-        self.assertFalse(any(label.startswith("▪ ") for label in labels))
+        self.assertTrue(all(not selected for _label, selected in labels))
 
 
 if __name__ == "__main__":

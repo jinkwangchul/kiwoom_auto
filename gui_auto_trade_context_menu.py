@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
 from gui_operation_environment import OPERATION_POLICY_PATH
@@ -22,6 +24,38 @@ _EARLY_CLOSE_MENU_LABELS = {
     "이월": "이월",
     "취소": "취소",
 }
+
+
+class _EarlyCloseStatusIconEngine(QIconEngine):
+    def __init__(self, selected: bool) -> None:
+        super().__init__()
+        self._selected = bool(selected)
+
+    def clone(self):
+        return _EarlyCloseStatusIconEngine(self._selected)
+
+    def paint(self, painter, rect, mode, state) -> None:
+        if not self._selected:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#6B7280"))
+        center = rect.center()
+        painter.drawEllipse(center, 3, 3)
+        painter.restore()
+
+    def pixmap(self, size, mode, state):
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        self.paint(painter, pixmap.rect(), mode, state)
+        painter.end()
+        return pixmap
+
+
+def _early_close_status_icon(selected: bool) -> QIcon:
+    return QIcon(_EarlyCloseStatusIconEngine(selected))
 
 
 def _selected_early_close_menu_label() -> str:
@@ -82,9 +116,10 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ("이월", action_early_carry),
         ("취소", action_early_cancel),
     ):
-        action.setText(
-            f"▪ {label}" if label == selected_early_close_label else label
-        )
+        is_selected = label == selected_early_close_label
+        action.setText(label)
+        action.setIcon(_early_close_status_icon(is_selected))
+        action.setProperty("earlyCloseCurrent", is_selected)
 
     action_individual_liquidation = menu.addAction("개별 청산")
     action_individual_liquidation.setEnabled(has_selection)
