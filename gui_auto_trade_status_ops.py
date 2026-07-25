@@ -544,7 +544,11 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
         refresh_parent()
 
     if not changed:
-        window.showAutoTradePopupMessage("선택한 종목을 변경할 수 없습니다.")
+        QMessageBox.warning(
+            window,
+            "운영방식 변경",
+            "선택한 종목을 변경할 수 없습니다.",
+        )
         return
 
 

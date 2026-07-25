@@ -110,6 +110,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             with (
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
 
@@ -125,6 +126,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         parent.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_not_called()
 
     def test_active_ats_blocks_mode_change_and_preserves_runtime_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -141,11 +143,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
 
         self.assertEqual("CONTINUOUS", config["operation_mode"])
         self.assertIn("manual_ats_selection", state)
-        warning.assert_not_called()
-        window.statusBarMessage.assert_not_called()
-        window.showAutoTradePopupMessage.assert_called_once_with(
-            "선택한 종목을 변경할 수 없습니다."
+        warning.assert_called_once_with(
+            window,
+            "운영방식 변경",
+            "선택한 종목을 변경할 수 없습니다.",
         )
+        window.statusBarMessage.assert_not_called()
+        window.showAutoTradePopupMessage.assert_not_called()
 
     def test_scheduled_to_manual_does_not_restore_previous_ats_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -154,6 +158,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             with (
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
@@ -163,6 +168,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertNotIn("manual_ats_selection", state)
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_not_called()
 
     def test_multi_selection_is_blocked_before_backend_and_preserves_ats(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -234,11 +240,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         item = Mock()
         item.column.return_value = 1
 
-        AutoTradeSettingWindow.on_stock_table_item_double_clicked(window, item)
+        with patch.object(status_ops.QMessageBox, "warning") as warning:
+            AutoTradeSettingWindow.on_stock_table_item_double_clicked(window, item)
 
         window.operation_stock_dir_from_row.assert_not_called()
         window.set_selected_operation_mode.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_not_called()
 
     def test_write_failure_does_not_report_success_and_reloads_runtime_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -246,15 +254,21 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             window, parent = self._window(stock_dir)
             window.update_stock_operation_mode = Mock(return_value=False)
 
-            with patch.object(status_ops, "append_changelog") as append_changelog:
+            with (
+                patch.object(status_ops, "append_changelog") as append_changelog,
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
 
         append_changelog.assert_not_called()
         window.refresh_all.assert_called_once_with()
         parent.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_not_called()
-        window.showAutoTradePopupMessage.assert_called_once_with(
-            "선택한 종목을 변경할 수 없습니다."
+        window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_called_once_with(
+            window,
+            "운영방식 변경",
+            "선택한 종목을 변경할 수 없습니다.",
         )
 
     def test_read_back_mismatch_is_rejected(self) -> None:
@@ -292,6 +306,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             with (
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
@@ -299,6 +314,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         self.assertEqual("SCHEDULED", config["operation_mode"])
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_not_called()
 
     def test_trade_quantities_do_not_block_change_before_schedule_end(self) -> None:
         scenarios = (
@@ -349,11 +365,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
                 self.assertEqual(current_mode, saved["operation_mode"])
                 self.assertNotIn("manual_ats_selection", state)
-                warning.assert_not_called()
-                window.statusBarMessage.assert_not_called()
-                window.showAutoTradePopupMessage.assert_called_once_with(
-                    "선택한 종목을 변경할 수 없습니다."
+                warning.assert_called_once_with(
+                    window,
+                    "운영방식 변경",
+                    "선택한 종목을 변경할 수 없습니다.",
                 )
+                window.statusBarMessage.assert_not_called()
+                window.showAutoTradePopupMessage.assert_not_called()
 
     def test_active_ats_blocks_before_and_during_session_regardless_of_holdings(self) -> None:
         scenarios = (
@@ -380,11 +398,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
 
                 self.assertEqual("CONTINUOUS", config["operation_mode"])
                 self.assertIn("manual_ats_selection", state)
-                warning.assert_not_called()
-                window.statusBarMessage.assert_not_called()
-                window.showAutoTradePopupMessage.assert_called_once_with(
-                    "선택한 종목을 변경할 수 없습니다."
+                warning.assert_called_once_with(
+                    window,
+                    "운영방식 변경",
+                    "선택한 종목을 변경할 수 없습니다.",
                 )
+                window.statusBarMessage.assert_not_called()
+                window.showAutoTradePopupMessage.assert_not_called()
 
     def test_schedule_policy_resolution_is_strict_and_individual_first(self) -> None:
         now_dt = datetime(2026, 7, 25, 12, 0, 0)
@@ -489,11 +509,13 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
 
         self.assertEqual("CONTINUOUS", config["operation_mode"])
-        warning.assert_not_called()
-        window.statusBarMessage.assert_not_called()
-        window.showAutoTradePopupMessage.assert_called_once_with(
-            "선택한 종목을 변경할 수 없습니다."
+        warning.assert_called_once_with(
+            window,
+            "운영방식 변경",
+            "선택한 종목을 변경할 수 없습니다.",
         )
+        window.statusBarMessage.assert_not_called()
+        window.showAutoTradePopupMessage.assert_not_called()
 
     def test_status_recalculation_failure_is_reported_after_mode_save(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -508,6 +530,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             with (
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
             ):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
 
@@ -518,6 +541,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         parent.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
+        warning.assert_not_called()
 
     def test_cancelled_schedule_dialog_does_not_write_or_refresh(self) -> None:
         from PyQt5.QtWidgets import QDialog
