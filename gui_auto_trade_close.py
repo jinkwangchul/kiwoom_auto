@@ -43,12 +43,13 @@ from gui_auto_trade_policy import (
     auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
     close_method_from_state_or_policy,
-    effective_liquidation_policy_for_config,
     auto_trade_setting_liquidation_text,
     short_close_method_text,
 )
 from operation_command_service import (
+    COMMAND_INDIVIDUAL_LIQUIDATION,
     EarlyCloseCompatibility,
+    IndividualLiquidationOverride,
     MODE_EARLY_CLOSE,
     MODE_NORMAL,
     OperationCommandRequest,
@@ -178,58 +179,6 @@ class ProfitLossEarlyCloseDialog(QDialog):
         super().accept()
 
 
-def auto_trade_save_selected_individual_liquidation_settings(window, policy_values: dict[str, object]) -> int:
-    selected = window.selected_stock_infos()
-    if not selected:
-        return 0
-
-    normalized = {
-        "enabled": bool(policy_values.get("enabled", False)),
-        "minutes_before_regular_close": str(policy_values.get("minutes_before_regular_close", "")).strip(),
-        "method": str(policy_values.get("method", "")).strip(),
-        "updated_at": now_text(),
-    }
-    if not normalized["enabled"]:
-        normalized["minutes_before_regular_close"] = ""
-        normalized["method"] = ""
-    elif normalized["method"] == "이월":
-        normalized["minutes_before_regular_close"] = normalized["minutes_before_regular_close"] or "5"
-    else:
-        normalized["minutes_before_regular_close"] = normalized["minutes_before_regular_close"] or "5"
-        normalized["method"] = short_close_method_text(normalized["method"]) or "시장가"
-
-    changed_count = 0
-    for stock_dir, code, name in selected:
-        config_path = stock_dir / "config.json"
-        config = read_json_dict(config_path)
-        if not isinstance(config, dict):
-            config = default_config()
-
-        config["individual_liquidation"] = dict(normalized)
-        try:
-            config_path.write_text(
-                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                window,
-                "개별 청산 저장 오류",
-                f"{code} {name} 개별 청산 저장 중 오류가 발생했습니다.\n\n{exc}",
-            )
-            continue
-
-        append_stock_log(stock_dir, "GUI", f"개별 청산 저장: {window.individual_liquidation_status_text(normalized)}")
-        changed_count += 1
-
-    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.load_selected_routine_stocks()
-    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    window._runtime_file_snapshot = window.current_runtime_file_signature()
-    window.update_action_buttons()
-    return changed_count
-
-
 def auto_trade_apply_selected_individual_liquidation_method(
     window,
     method: str,
@@ -239,23 +188,68 @@ def auto_trade_apply_selected_individual_liquidation_method(
     if normalized_method not in {"시장가", "현재가", "이월"}:
         return
 
-    policy_values = {
-        "enabled": True,
-        "minutes_before_regular_close": (
-            str(minutes_before_regular_close).strip() or "5"
-        ),
-        "method": normalized_method,
-    }
-    changed_count = auto_trade_save_selected_individual_liquidation_settings(
-        window,
-        policy_values,
-    )
-    if changed_count <= 0:
+    selected = window.selected_stock_infos()
+    if not selected:
         return
-    mode_text = window.individual_liquidation_status_text(policy_values)
+
+    minutes = str(minutes_before_regular_close).strip() or "5"
+    command_service = OperationCommandService(PROJECT_ROOT)
+    completed: list[str] = []
+    failed: list[str] = []
+    for stock_dir, code, name in selected:
+        result = command_service.apply_individual_liquidation(
+            OperationCommandRequest(
+                target_scope=SCOPE_STOCK,
+                target_id=str(stock_dir.resolve()),
+                command=COMMAND_INDIVIDUAL_LIQUIDATION,
+                source="우클릭",
+            ),
+            IndividualLiquidationOverride(
+                method=normalized_method,
+                minutes_before_regular_close=minutes,
+            ),
+        )
+        if (
+            result.status == RESULT_SUCCESS
+            and result.stock_results
+            and result.stock_results[0].status == STOCK_APPLIED
+        ):
+            completed.append(f"{code} {name}")
+            append_stock_log(
+                stock_dir,
+                "GUI",
+                f"개별청산 요청: {minutes}분/{normalized_method}",
+            )
+        else:
+            reason = result.error
+            if result.stock_results:
+                reason = result.stock_results[0].error or reason
+            failed.append(f"{code} {name}({reason or '요청 실패'})")
+
+    if not completed:
+        if failed:
+            QMessageBox.critical(
+                window,
+                "개별청산 요청 오류",
+                "개별청산 요청을 Runtime에 반영하지 못했습니다.\n\n"
+                + "\n".join(failed),
+            )
+        return
+
+    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
+    window.refresh_all()
+    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
+    window._runtime_file_snapshot = window.current_runtime_file_signature()
+    window.update_action_buttons()
     window.statusBarMessage(
-        f"개별 청산 저장 완료: {mode_text} / 대상 {changed_count}개"
+        f"개별청산 요청 완료: {minutes}분/{normalized_method} / 대상 {len(completed)}개"
     )
+    if failed:
+        QMessageBox.warning(
+            window,
+            "개별청산 일부 실패",
+            "\n".join(failed),
+        )
 
 
 

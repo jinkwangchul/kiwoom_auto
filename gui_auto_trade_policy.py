@@ -29,6 +29,10 @@ from state_policy import (
 from gui_operation_environment import read_operation_policy
 from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
 from gui_auto_trade_runtime import now_text
+from operation_command_service import (
+    INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
+    INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
+)
 
 
 
@@ -566,14 +570,53 @@ def individual_liquidation_policy_from_config(config: dict[str, object] | None) 
     }
 
 
-def effective_liquidation_policy_for_config(config: dict[str, object] | None) -> tuple[dict[str, object], bool]:
+def individual_liquidation_policy_from_state(
+    state: dict[str, object] | None,
+    *,
+    active_only: bool = True,
+) -> dict[str, object]:
+    """Return the one-shot individual-liquidation override recorded in Runtime."""
+    if not isinstance(state, dict):
+        return {}
+    raw = state.get(INDIVIDUAL_LIQUIDATION_REQUEST_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    if str(raw.get("status", "")).strip().upper() != INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED:
+        return {}
+    requested_at = str(raw.get("requested_at", "") or "").strip()
+    if active_only:
+        if requested_at and not requested_at.startswith(auto_trade_setting_today_date_text()):
+            return {}
+        if auto_trade_setting_liquidation_completed_today(state):
+            return {}
+
+    method = short_close_method_text(raw.get("method", "이월"))
+    if method not in {"시장가", "현재가", "이월"}:
+        return {}
+    minutes_text = str(raw.get("minutes_before_regular_close", "5")).strip() or "5"
+    try:
+        minutes = int(minutes_text)
+    except Exception:
+        minutes = 5
+    minutes = max(1, min(100, minutes))
+    return {
+        "enabled": True,
+        "minutes_before_regular_close": str(minutes),
+        "method": method,
+    }
+
+
+def effective_liquidation_policy_for_config(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+) -> tuple[dict[str, object], bool]:
     """실제 적용할 청산정책을 반환한다.
 
     우선순위:
-    1. 종목별 individual_liquidation
+    1. Runtime의 일회성 individual_liquidation_request
     2. 환경설정 operation_policy.json / liquidation
     """
-    individual = individual_liquidation_policy_from_config(config)
+    individual = individual_liquidation_policy_from_state(state)
     if individual:
         return individual, True
 
@@ -604,18 +647,18 @@ def auto_trade_setting_liquidation_text(
     """청산정책 표시 텍스트.
 
     우선순위:
-    1. 종목별 개별 청산 설정(config.json / individual_liquidation)
+    1. Runtime의 일회성 개별청산 요청(individual_liquidation_request)
     2. 환경설정 청산정책(operation_policy.json / liquidation)
 
     수동운영 평상시에는 환경설정의 수동 청산정책 적용 여부를 따른다.
-    단, 종목별 개별 청산 설정이 있으면 해당 종목 예외값을 우선 표시한다.
+    단, 유효한 일회성 개별청산 요청이 있으면 해당 Command 값을 우선 표시한다.
     조기마감 상태에서는 청산정책 표시가 가능하다.
     """
     policy = read_operation_policy()
     status_text = auto_trade_setting_display_status(display_status)
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     early_close_forced = auto_trade_setting_early_close_requested(state)
-    individual_policy = individual_liquidation_policy_from_config(config)
+    individual_policy = individual_liquidation_policy_from_state(state)
     has_individual = bool(individual_policy)
 
     manual = policy.get("manual_operation", {}) if isinstance(policy.get("manual_operation"), dict) else {}
@@ -656,7 +699,7 @@ def auto_trade_setting_liquidation_text(
         if method == "이월":
             return "이월"
 
-    liquidation, _is_individual = effective_liquidation_policy_for_config(config)
+    liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
     method = short_close_method_text(liquidation.get("method", "이월"))
     minutes = str(liquidation.get("minutes_before_regular_close", "5")).strip() or "5"
 
@@ -775,9 +818,15 @@ def auto_trade_setting_liquidation_completed_today(state: dict[str, object] | No
     return False
 
 
-def auto_trade_setting_effective_liquidation_method(config: dict[str, object] | None) -> str:
+def auto_trade_setting_effective_liquidation_method(
+    config: dict[str, object] | None,
+    state: dict[str, object] | None = None,
+) -> str:
     """청산 결과 판정용 실제 청산 방식."""
-    liquidation, _is_individual = effective_liquidation_policy_for_config(config)
+    individual = individual_liquidation_policy_from_state(state, active_only=False)
+    if individual:
+        return short_close_method_text(individual.get("method", "이월")) or "이월"
+    liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
     return short_close_method_text(liquidation.get("method", "이월")) or "이월"
 
 
@@ -805,7 +854,7 @@ def auto_trade_setting_liquidation_result_policy(
     if buy_pending_qty == "?":
         return "RED_STOP"
 
-    method = auto_trade_setting_effective_liquidation_method(config)
+    method = auto_trade_setting_effective_liquidation_method(config, state)
 
     has_sell_residue = False
     if holding_qty > 0:
@@ -932,7 +981,7 @@ def auto_trade_setting_liquidation_active(
         if close_method == "이월":
             return False
 
-    liquidation, _is_individual = effective_liquidation_policy_for_config(config)
+    liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
     method = short_close_method_text(liquidation.get("method", "이월"))
     if method == "이월":
         return False

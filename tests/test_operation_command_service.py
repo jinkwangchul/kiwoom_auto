@@ -14,9 +14,13 @@ from uuid import UUID
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from operation_command_service import (
+    COMMAND_INDIVIDUAL_LIQUIDATION,
     COMMAND_IMMEDIATE_LIQUIDATION,
+    INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
+    INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
     IMMEDIATE_LIQUIDATION_REQUEST_KEY,
     IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
+    IndividualLiquidationOverride,
     MODE_CARRY_OVER,
     MODE_EARLY_CLOSE,
     MODE_NORMAL,
@@ -37,6 +41,7 @@ from operation_command_service import (
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_early_close_requested,
+    effective_liquidation_policy_for_config,
 )
 
 
@@ -495,6 +500,145 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertTrue(auto_trade_setting_early_close_requested(state))
         self.assertTrue(auto_trade_setting_close_routine_mode_active(state))
         self.assertEqual("legacy_early_close", state["early_close_source"])
+
+    def test_individual_liquidation_records_one_shot_override_without_changing_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "operation_command_mode": MODE_NORMAL,
+                    "operation_sequence": 2,
+                },
+            )
+
+            result = self._service(root).apply_individual_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_INDIVIDUAL_LIQUIDATION,
+                    "auto_trade_setting_context_menu",
+                    command_id="individual-1",
+                ),
+                IndividualLiquidationOverride("현재가", "15"),
+            )
+            state = self._state(stock)
+            request = state[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]
+            config = json.loads((stock / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertEqual(STOCK_APPLIED, result.stock_results[0].status)
+        self.assertEqual(MODE_NORMAL, state["operation_command_mode"])
+        self.assertEqual("individual-1", request["command_id"])
+        self.assertEqual(3, request["operation_sequence"])
+        self.assertEqual(INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED, request["status"])
+        self.assertEqual("현재가", request["method"])
+        self.assertEqual("15", request["minutes_before_regular_close"])
+        self.assertNotIn("individual_liquidation", config)
+
+    def test_individual_liquidation_does_not_create_order_or_send_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "005930_Samsung")
+
+            result = self._service(root).apply_individual_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_INDIVIDUAL_LIQUIDATION,
+                    "auto_trade_setting_context_menu",
+                ),
+                IndividualLiquidationOverride("시장가", "10"),
+            )
+            state = self._state(stock)
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertTrue(
+            {
+                "order_queue",
+                "ORDER_QUEUED",
+                "send_order",
+                "send_order_status",
+                "chejan",
+                "broker_order_no",
+            }.isdisjoint(state)
+        )
+
+    def test_runtime_individual_liquidation_override_precedes_environment_policy(
+        self,
+    ) -> None:
+        state = {
+            INDIVIDUAL_LIQUIDATION_REQUEST_KEY: {
+                "status": INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
+                "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "method": "현재가",
+                "minutes_before_regular_close": "15",
+            }
+        }
+        with patch(
+            "gui_auto_trade_policy.read_operation_policy",
+            return_value={
+                "liquidation": {
+                    "method": "시장가",
+                    "minutes_before_regular_close": "5",
+                }
+            },
+        ):
+            policy, is_override = effective_liquidation_policy_for_config({}, state)
+
+        self.assertTrue(is_override)
+        self.assertEqual("현재가", policy["method"])
+        self.assertEqual("15", policy["minutes_before_regular_close"])
+
+    def test_legacy_config_override_is_not_an_execution_policy(self) -> None:
+        config = {
+            "individual_liquidation": {
+                "enabled": True,
+                "method": "현재가",
+                "minutes_before_regular_close": "15",
+            }
+        }
+        with patch(
+            "gui_auto_trade_policy.read_operation_policy",
+            return_value={
+                "liquidation": {
+                    "method": "시장가",
+                    "minutes_before_regular_close": "5",
+                }
+            },
+        ):
+            policy, is_override = effective_liquidation_policy_for_config(config)
+
+        self.assertFalse(is_override)
+        self.assertEqual("시장가", policy["method"])
+        self.assertEqual("5", policy["minutes_before_regular_close"])
+
+    def test_completed_individual_liquidation_override_is_discarded(self) -> None:
+        now_text = datetime.now().astimezone().isoformat(timespec="seconds")
+        state = {
+            INDIVIDUAL_LIQUIDATION_REQUEST_KEY: {
+                "status": INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
+                "requested_at": now_text,
+                "method": "현재가",
+                "minutes_before_regular_close": "15",
+            },
+            "liquidation_completed_at": now_text,
+        }
+        with patch(
+            "gui_auto_trade_policy.read_operation_policy",
+            return_value={
+                "liquidation": {
+                    "method": "시장가",
+                    "minutes_before_regular_close": "5",
+                }
+            },
+        ):
+            policy, is_override = effective_liquidation_policy_for_config({}, state)
+
+        self.assertFalse(is_override)
+        self.assertEqual("시장가", policy["method"])
 
     def test_immediate_liquidation_records_requested_without_changing_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1755,13 +1899,6 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             patch(
                 "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
             ) as policy_path,
-            patch(
-                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
-                return_value={
-                    "method": "현재가",
-                    "minutes_before_regular_close": "7",
-                },
-            ),
         ):
             policy_path.read_text.return_value = json.dumps(
                 {"early_close": {"method": "시장가"}},
@@ -1786,13 +1923,6 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             patch(
                 "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
             ) as policy_path,
-            patch(
-                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
-                return_value={
-                    "method": "현재가",
-                    "minutes_before_regular_close": "7",
-                },
-            ),
         ):
             policy_path.read_text.return_value = json.dumps(
                 {
@@ -1862,13 +1992,6 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     patch(
                         "gui_auto_trade_context_menu.OPERATION_POLICY_PATH"
                     ) as policy_path,
-                    patch(
-                        "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
-                        return_value={
-                            "method": "시장가",
-                            "minutes_before_regular_close": "7",
-                        },
-                    ),
                 ):
                     policy_path.read_text.return_value = json.dumps(
                         {
@@ -1886,51 +2009,39 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                 )
                 window.open_selected_individual_liquidation_settings.assert_not_called()
 
-    def test_individual_liquidation_menu_adapter_reuses_save_backend(self) -> None:
+    def test_individual_liquidation_menu_adapter_records_runtime_without_config_write(
+        self,
+    ) -> None:
         import gui_auto_trade_close as close
 
-        cases = {
-            "시장가": {
-                "enabled": True,
-                "minutes_before_regular_close": "7",
-                "method": "시장가",
-            },
-            "현재가": {
-                "enabled": True,
-                "minutes_before_regular_close": "7",
-                "method": "현재가",
-            },
-            "이월": {
-                "enabled": True,
-                "minutes_before_regular_close": "7",
-                "method": "이월",
-            },
-        }
-        for method, expected_policy in cases.items():
-            with self.subTest(method=method):
-                window = Mock()
-                window.individual_liquidation_status_text.return_value = method
-                with patch.object(
-                    close,
-                    "auto_trade_save_selected_individual_liquidation_settings",
-                    return_value=2,
-                ) as save_backend:
-                    close.auto_trade_apply_selected_individual_liquidation_method(
-                        window,
-                        method,
-                        "7",
-                    )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = OperationCommandServiceTest._stock(root, "005930_Samsung")
+            config_path = stock / "config.json"
+            before = config_path.read_bytes()
+            window = Mock()
+            window.selected_stock_infos.return_value = [
+                (stock, "005930", "Samsung")
+            ]
+            window.capture_stock_table_view_state.return_value = ([str(stock)], 0)
 
-                save_backend.assert_called_once_with(
+            with patch.object(close, "PROJECT_ROOT", root):
+                close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
-                    expected_policy,
-                )
-                window.statusBarMessage.assert_called_once_with(
-                    f"개별 청산 저장 완료: {method} / 대상 2개"
+                    "현재가",
+                    "7",
                 )
 
-        self.assertFalse(
-            hasattr(close, "IndividualLiquidationSettingsDialog")
+            after = config_path.read_bytes()
+            state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(before, after)
+        request = state[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]
+        self.assertEqual("현재가", request["method"])
+        self.assertEqual("7", request["minutes_before_regular_close"])
+        window.refresh_all.assert_called_once_with()
+        window.statusBarMessage.assert_called_once_with(
+            "개별청산 요청 완료: 7분/현재가 / 대상 1개"
         )
 
     def test_individual_liquidation_time_keeps_current_method(self) -> None:
@@ -1950,18 +2061,11 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     }
                 },
             ),
-            patch(
-                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
-                return_value={
-                    "method": "현재가",
-                    "minutes_before_regular_close": "10",
-                },
-            ),
         ):
             show_auto_trade_stock_context_menu(window, object())
 
         window.apply_selected_individual_liquidation_method.assert_called_once_with(
-            "현재가",
+            "시장가",
             "15",
         )
 
@@ -1982,13 +2086,6 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     }
                 },
             ),
-            patch(
-                "gui_auto_trade_context_menu._selected_individual_liquidation_policy",
-                return_value={
-                    "method": "이월",
-                    "minutes_before_regular_close": "10",
-                },
-            ),
         ):
             show_auto_trade_stock_context_menu(window, object())
 
@@ -1996,53 +2093,24 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         self.assertFalse(time_menu.enabled)
         window.apply_selected_individual_liquidation_method.assert_not_called()
 
-    def test_individual_liquidation_policy_reuses_existing_priority_helper(
-        self,
-    ) -> None:
-        from gui_auto_trade_context_menu import (
-            _selected_individual_liquidation_policy,
-        )
-
-        selected = [(Path("stocks/005930_Samsung"), "005930", "Samsung")]
-        config = {
-            "individual_liquidation": {
-                "enabled": True,
-                "method": "현재가",
-                "minutes_before_regular_close": "12",
-            }
-        }
-        expected = {
-            "method": "현재가",
-            "minutes_before_regular_close": "12",
-        }
-        with (
-            patch(
-                "gui_auto_trade_context_menu.read_json_dict",
-                return_value=config,
-            ) as config_reader,
-            patch(
-                "gui_auto_trade_context_menu.effective_liquidation_policy_for_config",
-                return_value=(expected, True),
-            ) as policy_reader,
-        ):
-            actual = _selected_individual_liquidation_policy(selected)
-
-        config_reader.assert_called_once_with(
-            Path("stocks/005930_Samsung") / "config.json"
-        )
-        policy_reader.assert_called_once_with(config)
-        self.assertEqual(expected, actual)
-
-    def test_individual_liquidation_save_failure_has_no_success_message(
+    def test_individual_liquidation_command_failure_has_no_success_message(
         self,
     ) -> None:
         import gui_auto_trade_close as close
 
         window = Mock()
-        with patch.object(
-            close,
-            "auto_trade_save_selected_individual_liquidation_settings",
-            return_value=0,
+        window.selected_stock_infos.return_value = [
+            (Path("stocks/005930_Samsung"), "005930", "Samsung")
+        ]
+        service = Mock()
+        service.apply_individual_liquidation.return_value = OperationCommandResult(
+            RESULT_FAILED,
+            "failed-command",
+            error="injected failure",
+        )
+        with (
+            patch.object(close, "OperationCommandService", return_value=service),
+            patch.object(close.QMessageBox, "critical") as critical,
         ):
             close.auto_trade_apply_selected_individual_liquidation_method(
                 window,
@@ -2051,6 +2119,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             )
 
         window.statusBarMessage.assert_not_called()
+        critical.assert_called_once()
 
     def test_individual_liquidation_menu_has_no_current_marker_on_read_failure(
         self,

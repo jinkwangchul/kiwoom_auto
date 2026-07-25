@@ -27,6 +27,9 @@ PERSISTENT_MODES = frozenset({MODE_NORMAL, MODE_EARLY_CLOSE, MODE_CARRY_OVER})
 COMMAND_IMMEDIATE_LIQUIDATION = "IMMEDIATE_LIQUIDATION"
 IMMEDIATE_LIQUIDATION_REQUEST_KEY = "immediate_liquidation_request"
 IMMEDIATE_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
+COMMAND_INDIVIDUAL_LIQUIDATION = "INDIVIDUAL_LIQUIDATION"
+INDIVIDUAL_LIQUIDATION_REQUEST_KEY = "individual_liquidation_request"
+INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
 
 STOCK_APPLIED = "APPLIED"
 STOCK_IGNORED_STALE = "IGNORED_STALE_COMMAND"
@@ -56,6 +59,12 @@ class EarlyCloseCompatibility:
     method: str = "루틴"
     policy: dict[str, Any] = field(default_factory=dict)
     has_close_progress_quantity: bool = True
+
+
+@dataclass(frozen=True)
+class IndividualLiquidationOverride:
+    method: str
+    minutes_before_regular_close: str
 
 
 @dataclass(frozen=True)
@@ -107,7 +116,11 @@ class OperationCommandService:
         self._atomic_writer = atomic_writer
 
     def apply(self, request: OperationCommandRequest) -> OperationCommandResult:
-        return self._apply(request, early_close_compatibility=None)
+        return self._apply(
+            request,
+            early_close_compatibility=None,
+            individual_liquidation_override=None,
+        )
 
     def apply_early_close(
         self,
@@ -121,13 +134,36 @@ class OperationCommandService:
                 command_id,
                 error="early-close compatibility requires an EARLY_CLOSE command",
             )
-        return self._apply(request, early_close_compatibility=compatibility)
+        return self._apply(
+            request,
+            early_close_compatibility=compatibility,
+            individual_liquidation_override=None,
+        )
+
+    def apply_individual_liquidation(
+        self,
+        request: OperationCommandRequest,
+        override: IndividualLiquidationOverride,
+    ) -> OperationCommandResult:
+        if str(request.command or "").strip().upper() != COMMAND_INDIVIDUAL_LIQUIDATION:
+            command_id = str(request.command_id or "").strip() or str(self._id_factory()).lower()
+            return OperationCommandResult(
+                RESULT_FAILED,
+                command_id,
+                error="individual liquidation requires an INDIVIDUAL_LIQUIDATION command",
+            )
+        return self._apply(
+            request,
+            early_close_compatibility=None,
+            individual_liquidation_override=override,
+        )
 
     def _apply(
         self,
         request: OperationCommandRequest,
         *,
         early_close_compatibility: EarlyCloseCompatibility | None,
+        individual_liquidation_override: IndividualLiquidationOverride | None,
     ) -> OperationCommandResult:
         error = self._validate_request(request)
         command_id = str(request.command_id or "").strip() or str(self._id_factory()).lower()
@@ -148,6 +184,7 @@ class OperationCommandService:
                     request,
                     command_id,
                     early_close_compatibility=early_close_compatibility,
+                    individual_liquidation_override=individual_liquidation_override,
                 )
             )
 
@@ -168,8 +205,12 @@ class OperationCommandService:
         if str(request.command or "").strip().upper() not in {
             *PERSISTENT_MODES,
             COMMAND_IMMEDIATE_LIQUIDATION,
+            COMMAND_INDIVIDUAL_LIQUIDATION,
         }:
-            return "command must be NORMAL, EARLY_CLOSE, CARRY_OVER, or IMMEDIATE_LIQUIDATION"
+            return (
+                "command must be NORMAL, EARLY_CLOSE, CARRY_OVER, "
+                "IMMEDIATE_LIQUIDATION, or INDIVIDUAL_LIQUIDATION"
+            )
         if not str(request.source or "").strip():
             return "source is required"
         return ""
@@ -210,6 +251,7 @@ class OperationCommandService:
         command_id: str,
         *,
         early_close_compatibility: EarlyCloseCompatibility | None,
+        individual_liquidation_override: IndividualLiquidationOverride | None,
     ) -> StockOperationCommandResult:
         lock = self._stock_lock(stock_dir)
         with lock:
@@ -220,8 +262,16 @@ class OperationCommandService:
 
             command = str(request.command).strip().upper()
             is_immediate_liquidation = command == COMMAND_IMMEDIATE_LIQUIDATION
-            if is_immediate_liquidation:
-                current_request = state.get(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
+            is_individual_liquidation = command == COMMAND_INDIVIDUAL_LIQUIDATION
+            one_shot_request_key = (
+                IMMEDIATE_LIQUIDATION_REQUEST_KEY
+                if is_immediate_liquidation
+                else INDIVIDUAL_LIQUIDATION_REQUEST_KEY
+                if is_individual_liquidation
+                else ""
+            )
+            if one_shot_request_key:
+                current_request = state.get(one_shot_request_key)
                 current_request = current_request if isinstance(current_request, dict) else {}
                 current_command_id = str(current_request.get("command_id", "") or "").strip()
             else:
@@ -242,8 +292,8 @@ class OperationCommandService:
             next_state = dict(state)
             next_state["operation_sequence"] = next_sequence
             next_state["updated_at"] = applied_at
-            if is_immediate_liquidation:
-                next_state[IMMEDIATE_LIQUIDATION_REQUEST_KEY] = {
+            if one_shot_request_key:
+                one_shot_request = {
                     "command_id": command_id,
                     "operation_sequence": next_sequence,
                     "requested_at": applied_at,
@@ -252,8 +302,29 @@ class OperationCommandService:
                         "scope": str(request.target_scope).strip().upper(),
                         "id": str(request.target_id).strip(),
                     },
-                    "status": IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
+                    "status": (
+                        IMMEDIATE_LIQUIDATION_STATUS_REQUESTED
+                        if is_immediate_liquidation
+                        else INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED
+                    ),
                 }
+                if is_individual_liquidation:
+                    override = individual_liquidation_override
+                    if override is None:
+                        return self._stock_failure(
+                            stock_dir,
+                            "individual liquidation override is required",
+                            sequence=next_sequence,
+                        )
+                    one_shot_request.update(
+                        {
+                            "method": str(override.method or "").strip(),
+                            "minutes_before_regular_close": str(
+                                override.minutes_before_regular_close or ""
+                            ).strip(),
+                        }
+                    )
+                next_state[one_shot_request_key] = one_shot_request
             else:
                 next_state.update(
                     {
@@ -293,8 +364,8 @@ class OperationCommandService:
                     sequence=next_sequence,
                 )
             saved_sequence = self._nonnegative_int(saved.get("operation_sequence"))
-            if is_immediate_liquidation:
-                saved_request = saved.get(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
+            if one_shot_request_key:
+                saved_request = saved.get(one_shot_request_key)
                 saved_request = saved_request if isinstance(saved_request, dict) else {}
                 saved_command_id = str(saved_request.get("command_id", "") or "").strip()
             else:
@@ -310,14 +381,14 @@ class OperationCommandService:
                     STOCK_IGNORED_STALE,
                     saved_sequence,
                 )
-            if is_immediate_liquidation:
-                expected_request = next_state[IMMEDIATE_LIQUIDATION_REQUEST_KEY]
-                saved_request = saved.get(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
+            if one_shot_request_key:
+                expected_request = next_state[one_shot_request_key]
+                saved_request = saved.get(one_shot_request_key)
                 mismatches = []
                 if saved.get("operation_sequence") != next_sequence:
                     mismatches.append("operation_sequence")
                 if saved_request != expected_request:
-                    mismatches.append(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
+                    mismatches.append(one_shot_request_key)
                 if saved.get("operation_command_mode") != state.get("operation_command_mode"):
                     mismatches.append("operation_command_mode")
             else:

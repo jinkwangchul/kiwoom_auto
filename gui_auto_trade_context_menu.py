@@ -8,15 +8,12 @@ gui_auto_trade_context_menu.py
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
-from gui_auto_trade_policy import effective_liquidation_policy_for_config
 from gui_operation_environment import OPERATION_POLICY_PATH
-from runtime_io import read_json_dict
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -113,17 +110,6 @@ def _apply_menu_status(
         action.setProperty(property_name, is_selected)
 
 
-def _selected_individual_liquidation_policy(
-    selected: list[tuple[Path, str, str]],
-) -> dict[str, object]:
-    config = None
-    if selected:
-        stock_dir = selected[0][0]
-        config = read_json_dict(stock_dir / "config.json")
-    policy, _is_individual = effective_liquidation_policy_for_config(config)
-    return policy if isinstance(policy, dict) else {}
-
-
 def show_auto_trade_stock_context_menu(window, pos) -> None:
     """하단 종목표 우클릭 메뉴.
 
@@ -191,7 +177,9 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ),
         "individualLiquidationCurrent",
     )
-    individual_policy = _selected_individual_liquidation_policy(selected)
+    individual_policy = operation_policy.get("liquidation", {})
+    if not isinstance(individual_policy, dict):
+        individual_policy = {}
     individual_minutes = (
         str(
             individual_policy.get(
@@ -201,9 +189,11 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ).strip()
         or "5"
     )
-    individual_method = str(
-        individual_policy.get("method", "이월")
-    ).strip() or "이월"
+    individual_method = _selected_policy_menu_label(
+        operation_policy,
+        "liquidation",
+        _INDIVIDUAL_LIQUIDATION_MENU_LABELS,
+    ) or "이월"
 
     individual_liquidation_menu.addSeparator()
     individual_time_menu = individual_liquidation_menu.addMenu("시간")

@@ -83,7 +83,6 @@ from gui_auto_trade_policy import (
     close_method_from_state_or_policy,
     compact_operation_time_range,
     effective_liquidation_policy_for_config,
-    individual_liquidation_policy_from_config,
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
@@ -456,7 +455,9 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 and display_status not in ("감시/대기", "-", "")
             )
             liquidation_has_policy = str(liquidation_text).strip() not in ("", "-")
-            _liquidation_policy_for_style, liquidation_is_individual = effective_liquidation_policy_for_config(config)
+            _liquidation_policy_for_style, liquidation_is_individual = (
+                effective_liquidation_policy_for_config(config, state)
+            )
             liquidation_cell_active = (
                 current_session_trade_started
                 and has_holding
