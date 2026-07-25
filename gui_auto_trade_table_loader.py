@@ -100,7 +100,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def _selected_instance_stock_dirs(window) -> list[Path]:
-    instance_ids_getter = getattr(window, "current_selected_target_instance_ids", None)
+    if bool(getattr(window, "_all_stocks_scope_active", False)):
+        instance_ids_getter = getattr(window, "all_registered_instance_ids", None)
+    else:
+        instance_ids_getter = getattr(window, "current_selected_target_instance_ids", None)
     if not callable(instance_ids_getter):
         return []
     target_instance_ids = {

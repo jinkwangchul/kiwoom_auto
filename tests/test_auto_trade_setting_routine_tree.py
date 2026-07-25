@@ -3058,6 +3058,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.selected_routine_name_button,
             window.selected_routine_instance_count_badge,
             *window.selected_routine_status_buttons.values(),
+            window.btn_all_stocks,
             window.btn_early_close,
             window.btn_stop,
         )
@@ -3065,9 +3066,27 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with self.subTest(control=control.objectName()):
                 control_center_y = control.mapTo(window, control.rect().center()).y()
                 self.assertLessEqual(abs(control_center_y - status_center_y), 1)
+        self.assertEqual("전체종목", window.btn_all_stocks.text())
         self.assertEqual("조기마감", window.btn_early_close.text())
         self.assertEqual("강제종료", window.btn_stop.text())
+        self.assertEqual(window.btn_all_stocks.height(), window.btn_early_close.height())
         self.assertEqual(window.btn_early_close.height(), window.btn_stop.height())
+        self.assertEqual(
+            window.btn_all_stocks.sizeHint().width(),
+            window.btn_early_close.sizeHint().width(),
+        )
+        self.assertEqual(
+            window.btn_all_stocks.styleSheet(),
+            window.btn_early_close.styleSheet(),
+        )
+        self.assertLess(
+            window.btn_all_stocks.mapTo(window, window.btn_all_stocks.rect().topLeft()).x(),
+            window.btn_early_close.mapTo(window, window.btn_early_close.rect().topLeft()).x(),
+        )
+        self.assertLess(
+            window.btn_early_close.mapTo(window, window.btn_early_close.rect().topLeft()).x(),
+            window.btn_stop.mapTo(window, window.btn_stop.rect().topLeft()).x(),
+        )
         self.assertGreaterEqual(window.btn_early_close.height(), 28)
         self.assertGreater(
             window.btn_early_close.height(),
@@ -3158,6 +3177,94 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
             self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())
             self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
+
+    def test_all_stocks_button_selects_all_view_scope_and_restores_row_scope(self) -> None:
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+        stock_loader = MagicMock()
+        window.load_selected_routine_stocks = stock_loader
+        window.routine_table.setRowCount(2)
+        rows = (
+            {
+                "row_kind": "definition",
+                "definition_id": "indicator_follow",
+                "definition_name": "지표추종매매",
+                "instance_count": 2,
+                "registered": 7,
+                "running": 3,
+                "stopped": 4,
+                "error": 1,
+            },
+            {
+                "row_kind": "definition",
+                "definition_id": "registration_review",
+                "definition_name": "등록확인루틴",
+                "instance_count": 1,
+                "registered": 5,
+                "running": 2,
+                "stopped": 3,
+                "error": 1,
+            },
+        )
+        for row, metadata in enumerate(rows):
+            item = QTableWidgetItem(str(metadata["definition_name"]))
+            item.setData(Qt.UserRole, metadata)
+            window.routine_table.setItem(row, 0, item)
+
+        window.routine_table.selectRow(0)
+        stock_loader.reset_mock()
+        window.btn_all_stocks.click()
+
+        self.assertTrue(window._all_stocks_scope_active)
+        self.assertIsNone(window.current_selected_routine_row_metadata())
+        self.assertEqual("all", window._stock_status_filter)
+        self.assertEqual("전체", window.selected_routine_name_button.text())
+        self.assertTrue(window.selected_routine_signal_label.isHidden())
+        self.assertEqual("그룹(2)", window.selected_routine_group_count_badge.text())
+        self.assertEqual("루틴(3)", window.selected_routine_instance_count_badge.text())
+        self.assertEqual("종목(12)", window.selected_routine_status_buttons["all"].text())
+        self.assertEqual("실행(5)", window.selected_routine_status_buttons["running"].text())
+        self.assertEqual("정지(7)", window.selected_routine_status_buttons["stopped"].text())
+        self.assertEqual("검토(2)", window.selected_routine_status_buttons["error"].text())
+        stock_loader.assert_called_once_with()
+
+        window.routine_table.selectRow(1)
+        self.assertFalse(window._all_stocks_scope_active)
+        self.assertEqual("등록확인루틴", window.selected_routine_name_button.text())
+        self.assertTrue(window.selected_routine_group_count_badge.isHidden())
+        self.assertFalse(window.selected_routine_signal_label.isHidden())
+
+    def test_all_stocks_view_scope_loads_every_persisted_instance(self) -> None:
+        window = SimpleNamespace(
+            _all_stocks_scope_active=True,
+            all_registered_instance_ids=lambda: ("inst-a", "inst-b"),
+            current_selected_target_instance_ids=lambda: ("inst-a",),
+        )
+        stocks = [
+            {
+                "stock_path": "stocks/111111_A",
+                "assigned_routine_instance_id": "inst-a",
+            },
+            {
+                "stock_path": "stocks/222222_B",
+                "assigned_routine_instance_id": "inst-b",
+            },
+            {
+                "stock_path": "stocks/333333_C",
+                "assigned_routine_instance_id": "inst-c",
+            },
+        ]
+
+        with patch.object(table_loader, "read_base_stocks", return_value=stocks):
+            result = table_loader._selected_instance_stock_dirs(window)
+
+        self.assertEqual(
+            ["111111_A", "222222_B"],
+            [path.name for path in result],
+        )
 
     def test_instance_renders_current_stock_rows_without_internal_scope_badges(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]

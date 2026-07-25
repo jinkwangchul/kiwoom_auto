@@ -1246,6 +1246,8 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
         self.btn_early_close = QPushButton("조기마감")
         self.btn_early_close.setStyleSheet("color: #2563eb; font-weight: bold;")
+        self.btn_all_stocks = QPushButton("전체종목")
+        self.btn_all_stocks.setStyleSheet(self.btn_early_close.styleSheet())
         self.btn_preview_order_candidates = QPushButton("주문후보검증")
         self.btn_execution_enable = QPushButton("수동 실주문 후보 활성화")
         self.btn_real_ready_preflight = QPushButton("REAL_READY 수동 점검")
@@ -1255,6 +1257,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_modify_pending_order = QPushButton("Manual Modify")
         self.btn_manual_queue_commit = QPushButton("수동 Queue 저장")
         self.btn_fetch_minute_candles = QPushButton("분봉조회")
+        self.btn_all_stocks.setMinimumHeight(28)
         self.btn_early_close.setMinimumHeight(28)
         self.btn_stop.setMinimumHeight(28)
         self.btn_preview_order_candidates.setMinimumHeight(28)
@@ -1290,6 +1293,7 @@ class AutoTradeSettingWindow(QDialog):
             (self.btn_start, "autoTradeSettingStartButton"),
             (self.btn_stop, "autoTradeSettingStopButton"),
             (self.btn_early_close, "autoTradeSettingEarlyCloseButton"),
+            (self.btn_all_stocks, "autoTradeSettingAllStocksButton"),
             (self.btn_preview_order_candidates, "autoTradeSettingPreviewOrderCandidatesButton"),
             (self.btn_execution_enable, "autoTradeSettingExecutionEnableButton"),
             (self.btn_real_ready_preflight, "autoTradeSettingRealReadyPreflightButton"),
@@ -1347,6 +1351,7 @@ class AutoTradeSettingWindow(QDialog):
         self._routine_tree_stock_performance_sort_active = False
         self._routine_tree_valid_only = False
         self._hidden_historical_stock_fixture_keys: set[tuple[str, str]] = set()
+        self._all_stocks_scope_active = False
         self._fixed_signals_connected = False
 
         self._setup_ui()
@@ -1405,6 +1410,7 @@ class AutoTradeSettingWindow(QDialog):
         selected_routine_header_layout.addWidget(self.btn_manual_send_order)
         selected_routine_header_layout.addWidget(self.btn_manual_cancel_pending_order)
         selected_routine_header_layout.addWidget(self.btn_manual_modify_pending_order)
+        selected_routine_header_layout.addWidget(self.btn_all_stocks, 0, Qt.AlignVCenter)
         selected_routine_header_layout.addWidget(self.btn_early_close, 0, Qt.AlignVCenter)
         selected_routine_header_layout.addWidget(self.btn_stop, 0, Qt.AlignVCenter)
 
@@ -1556,6 +1562,19 @@ class AutoTradeSettingWindow(QDialog):
         self.selected_routine_name_button.clicked.connect(lambda: self.set_stock_status_filter("all"))
         layout.addWidget(self.selected_routine_name_button, 0, Qt.AlignVCenter)
 
+        self.selected_routine_group_count_badge = QLabel("")
+        self.selected_routine_group_count_badge.setObjectName(
+            "autoTradeSettingSelectedRoutineGroupCount"
+        )
+        self.selected_routine_group_count_badge.setAlignment(Qt.AlignCenter)
+        self.selected_routine_group_count_badge.setFixedWidth(64)
+        self.selected_routine_group_count_badge.setStyleSheet(
+            "background-color: transparent; color: #7E22CE; border: 1px solid #C084FC; "
+            "border-radius: 3px; padding: 0 3px;"
+        )
+        self.selected_routine_group_count_badge.hide()
+        layout.addWidget(self.selected_routine_group_count_badge, 0, Qt.AlignVCenter)
+
         self.selected_routine_instance_count_badge = QLabel("")
         self.selected_routine_instance_count_badge.setObjectName("autoTradeSettingSelectedRoutineInstanceCount")
         self.selected_routine_instance_count_badge.setAlignment(Qt.AlignCenter)
@@ -1600,32 +1619,50 @@ class AutoTradeSettingWindow(QDialog):
     def update_selected_routine_status_bar(self) -> None:
         if not hasattr(self, "selected_routine_status_bar"):
             return
-        metadata = self.current_selected_routine_row_metadata()
-        if not metadata:
-            self.selected_routine_signal_label.setText("●")
-            self.selected_routine_name_button.setText("-")
-            self.selected_routine_instance_count_badge.setText("")
-            self.selected_routine_instance_count_badge.hide()
-            counts = {"registered": 0, "running": 0, "stopped": 0, "error": 0}
+        if bool(getattr(self, "_all_stocks_scope_active", False)):
+            counts = self._all_stocks_scope_summary()
+            self.selected_routine_signal_label.hide()
+            self.selected_routine_name_button.setText("전체")
+            self.selected_routine_group_count_badge.setText(
+                f"그룹({counts['groups']})"
+            )
+            self.selected_routine_group_count_badge.show()
+            self.selected_routine_instance_count_badge.setText(
+                f"루틴({counts['routines']})"
+            )
+            self.selected_routine_instance_count_badge.show()
         else:
-            row_kind = str(metadata.get("row_kind", "") or "")
-            self.selected_routine_signal_label.setText("●")
-            if row_kind in {"instance", "stock"}:
-                self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
+            self.selected_routine_signal_label.show()
+            self.selected_routine_group_count_badge.setText("")
+            self.selected_routine_group_count_badge.hide()
+            counts = None
+        if counts is None:
+            metadata = self.current_selected_routine_row_metadata()
+            if not metadata:
+                self.selected_routine_signal_label.setText("●")
+                self.selected_routine_name_button.setText("-")
                 self.selected_routine_instance_count_badge.setText("")
                 self.selected_routine_instance_count_badge.hide()
+                counts = {"registered": 0, "running": 0, "stopped": 0, "error": 0}
             else:
-                self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
-                self.selected_routine_instance_count_badge.setText(
-                    f"루틴{int(metadata.get('instance_count', 0) or 0)}"
-                )
-                self.selected_routine_instance_count_badge.show()
-            counts = {
-                "registered": int(metadata.get("registered", 0) or 0),
-                "running": int(metadata.get("running", 0) or 0),
-                "stopped": int(metadata.get("stopped", 0) or 0),
-                "error": int(metadata.get("error", 0) or 0),
-            }
+                row_kind = str(metadata.get("row_kind", "") or "")
+                self.selected_routine_signal_label.setText("●")
+                if row_kind in {"instance", "stock"}:
+                    self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
+                    self.selected_routine_instance_count_badge.setText("")
+                    self.selected_routine_instance_count_badge.hide()
+                else:
+                    self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
+                    self.selected_routine_instance_count_badge.setText(
+                        f"루틴{int(metadata.get('instance_count', 0) or 0)}"
+                    )
+                    self.selected_routine_instance_count_badge.show()
+                counts = {
+                    "registered": int(metadata.get("registered", 0) or 0),
+                    "running": int(metadata.get("running", 0) or 0),
+                    "stopped": int(metadata.get("stopped", 0) or 0),
+                    "error": int(metadata.get("error", 0) or 0),
+                }
         button_texts = {
             "all": f"종목({counts['registered']})",
             "running": f"실행({counts['running']})",
@@ -1642,6 +1679,48 @@ class AutoTradeSettingWindow(QDialog):
                 f"font-weight: {'600' if is_active else '400'}; padding: 0 2px; }}"
                 "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
             )
+
+    def _all_stocks_scope_summary(self) -> dict[str, int]:
+        summary = {
+            "groups": 0,
+            "routines": 0,
+            "registered": 0,
+            "running": 0,
+            "stopped": 0,
+            "error": 0,
+        }
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict):
+                continue
+            if str(metadata.get("row_kind", "") or "") != "definition":
+                continue
+            summary["groups"] += 1
+            summary["routines"] += int(metadata.get("instance_count", 0) or 0)
+            for key in ("registered", "running", "stopped", "error"):
+                summary[key] += int(metadata.get(key, 0) or 0)
+        return summary
+
+    def all_registered_instance_ids(self) -> tuple[str, ...]:
+        return tuple(
+            str(instance.instance_id)
+            for instance in load_persisted_routine_instances()
+            if str(instance.instance_id or "").strip()
+        )
+
+    def show_all_registered_stocks(self) -> None:
+        """전체 그룹/루틴의 등록 종목을 조회하는 전용 Production Caller."""
+        was_blocked = self.routine_table.blockSignals(True)
+        try:
+            self.routine_table.clearSelection()
+        finally:
+            self.routine_table.blockSignals(was_blocked)
+        self._all_stocks_scope_active = True
+        self._stock_status_filter = "all"
+        self.update_selection_summary_panel()
+        self.update_selected_routine_status_bar()
+        self.load_selected_routine_stocks()
 
     def update_selection_summary_panel(self) -> None:
         return
@@ -1854,6 +1933,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_manual_send_order.clicked.connect(self.send_order_for_order_queued_manually)
         self.btn_manual_cancel_pending_order.clicked.connect(self.cancel_pending_order_manually)
         self.btn_manual_modify_pending_order.clicked.connect(self.modify_pending_order_manually)
+        self.btn_all_stocks.clicked.connect(self.show_all_registered_stocks)
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
         self.btn_delete.clicked.connect(self.unregister_selected_auto_trade_stocks)
@@ -1940,12 +2020,19 @@ class AutoTradeSettingWindow(QDialog):
         normalize_base_stock_single_routine_file()
         ensure_single_real_trade_routine_for_all_stocks()
         selected_routine_metadata = self.current_selected_routine_row_metadata()
+        all_stocks_scope_active = bool(
+            getattr(self, "_all_stocks_scope_active", False)
+        )
         self.load_routine_table()
 
         if selected_routine_metadata:
             self.restore_routine_selection_metadata(selected_routine_metadata)
 
-        if self.current_selected_routine_row_metadata() is None and self.routine_table.rowCount() > 0:
+        if (
+            not all_stocks_scope_active
+            and self.current_selected_routine_row_metadata() is None
+            and self.routine_table.rowCount() > 0
+        ):
             self.routine_table.selectRow(0)
 
         self.load_selected_routine_stocks()
@@ -4478,6 +4565,8 @@ class AutoTradeSettingWindow(QDialog):
         self.load_routine_table()
 
     def on_routine_selection_changed(self) -> None:
+        if self.current_selected_routine_row_metadata() is not None:
+            self._all_stocks_scope_active = False
         self._stock_status_filter = "all"
         self.update_selection_summary_panel()
         self.update_selected_routine_status_bar()
