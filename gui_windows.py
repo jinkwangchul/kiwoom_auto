@@ -22,11 +22,12 @@ import json
 from pathlib import Path
 
 from PyQt5 import sip
-from PyQt5.QtCore import QEvent, QObject, QRect, Qt
+from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt
 from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QFrame,
     QGroupBox,
     QGridLayout,
     QHeaderView,
@@ -41,7 +42,6 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QStyle,
     QStyledItemDelegate,
-    QStyleOptionButton,
     QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
@@ -61,9 +61,7 @@ from gui_main_emergency_ops import (
 )
 from gui_main_table_loader import (
     ROUTINE_DEFINITION_ID_ROLE,
-    ROUTINE_CHECKBOX_HIT_PADDING,
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
-    ROUTINE_CHECKBOX_SIZE,
     ROUTINE_CHILD_COLLAPSED_ROLE,
     ROUTINE_CHILD_CHECKBOX_OFFSET,
     ROUTINE_CHILD_HAS_STOCKS_ROLE,
@@ -86,7 +84,6 @@ from gui_main_table_loader import (
     ROUTINE_PROFIT_LED_BOX_SIZE,
     ROUTINE_PROFIT_LED_GAP,
     ROUTINE_PROFIT_LED_SIZE,
-    ROUTINE_STOCK_CHECKBOX_OFFSET,
     MAIN_STOCK_METRIC_LAYOUT_PREVIEW,
     ROUTINE_STOCK_METRICS_ROLE,
     ROUTINE_STOCK_PATH_ROLE,
@@ -117,7 +114,11 @@ from gui_auto_trade_display import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_setting_window import (
+    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+    AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+    AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
+    auto_trade_setting_badge_stylesheet,
     get_routine_dirs,
     get_stock_dirs_in_routine,
     handle_kiwoom_raw_chejan_event,
@@ -131,11 +132,7 @@ from routine_instance_repository import RoutineInstanceRepository
 from stock_repository import now_text as stock_now_text
 from gui_main_routine_selection import (
     routine_definition_enabled,
-    routine_instance_checkbox_enabled,
     routine_instance_checked,
-    selected_routine_instance_ids,
-    toggle_routine_definition,
-    toggle_routine_instance,
 )
 from kiwoom_api import KiwoomApi
 from operator_reconciliation_service import assess_startup_recovery
@@ -152,6 +149,7 @@ from operation_command_service import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
+MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR = "#404040"
 ROUTINE_INLINE_EDIT_STYLE = """
 QLineEdit {
     border: none;
@@ -502,8 +500,8 @@ def _create_routine_operation_confirmation(
     return dialog
 
 
-class _RoutineCheckBoxController(QObject):
-    """Apply window-local checkbox selection without touching persisted state."""
+class _RoutineTreeInteractionController(QObject):
+    """Handle routine tree hover, expansion, editing, and metric interactions."""
 
     def __init__(self, window) -> None:
         super().__init__(window.routine_table)
@@ -527,8 +525,6 @@ class _RoutineCheckBoxController(QObject):
         text_left = (
             cell_rect.left()
             + ROUTINE_PARENT_CHECKBOX_OFFSET
-            + ROUTINE_CHECKBOX_SIZE
-            + 6
         )
         name_left = text_left + metrics.horizontalAdvance(prefix)
         return QRect(
@@ -545,8 +541,6 @@ class _RoutineCheckBoxController(QObject):
         text_left = (
             cell_rect.left()
             + ROUTINE_CHILD_CHECKBOX_OFFSET
-            + ROUTINE_CHECKBOX_SIZE
-            + ROUTINE_PROFIT_LED_GAP
             + ROUTINE_PROFIT_LED_BOX_SIZE
             + ROUTINE_PROFIT_LED_GAP
         )
@@ -569,8 +563,6 @@ class _RoutineCheckBoxController(QObject):
         expand_left = (
             cell_rect.left()
             + ROUTINE_CHILD_CHECKBOX_OFFSET
-            + ROUTINE_CHECKBOX_SIZE
-            + ROUTINE_PROFIT_LED_GAP
             + ROUTINE_PROFIT_LED_BOX_SIZE
             + ROUTINE_PROFIT_LED_GAP
         )
@@ -644,20 +636,6 @@ class _RoutineCheckBoxController(QObject):
                 cell_rect = self.table.visualRect(index)
                 row_kind = str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
                 if row_kind == ROUTINE_ROW_STOCK:
-                    checkbox_left = cell_rect.left() + ROUTINE_STOCK_CHECKBOX_OFFSET
-                    checkbox_right = (
-                        checkbox_left
-                        + ROUTINE_CHECKBOX_SIZE
-                        + ROUTINE_CHECKBOX_HIT_PADDING
-                    )
-                    if checkbox_left <= event.pos().x() <= checkbox_right:
-                        if (
-                            event.type() == QEvent.MouseButtonPress
-                            and event.button() == Qt.LeftButton
-                        ):
-                            self.window.toggle_routine_stock_check_state(index.row())
-                        event.accept()
-                        return True
                     if (
                         event.type() == QEvent.MouseButtonDblClick
                         and event.button() == Qt.LeftButton
@@ -669,35 +647,6 @@ class _RoutineCheckBoxController(QObject):
                     return super().eventFilter(watched, event)
                 if row_kind not in {ROUTINE_ROW_PARENT, ROUTINE_ROW_CHILD}:
                     return super().eventFilter(watched, event)
-                checkbox_offset = (
-                    ROUTINE_CHILD_CHECKBOX_OFFSET
-                    if row_kind == ROUTINE_ROW_CHILD
-                    else ROUTINE_PARENT_CHECKBOX_OFFSET
-                )
-                checkbox_left = cell_rect.left() + checkbox_offset
-                checkbox_right = (
-                    checkbox_left
-                    + ROUTINE_CHECKBOX_SIZE
-                    + ROUTINE_CHECKBOX_HIT_PADDING
-                )
-                if checkbox_left <= event.pos().x() <= checkbox_right:
-                    if (
-                        event.type() == QEvent.MouseButtonPress
-                        and event.button() == Qt.LeftButton
-                    ):
-                        instance_id = str(
-                            index.data(ROUTINE_INSTANCE_ID_ROLE) or ""
-                        ).strip()
-                        if row_kind == ROUTINE_ROW_PARENT or (
-                            row_kind == ROUTINE_ROW_CHILD
-                            and routine_instance_checkbox_enabled(
-                                self.window,
-                                instance_id,
-                            )
-                        ):
-                            self.window.toggle_routine_check_state(index.row())
-                    event.accept()
-                    return True
                 expand_left = cell_rect.left() + ROUTINE_PARENT_EXPAND_OFFSET
                 expand_right = expand_left + ROUTINE_PARENT_EXPAND_WIDTH
                 if (
@@ -830,27 +779,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
             painter.save()
             painter.setFont(option.font)
             visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
-            checkbox_rect = QRect(
-                option.rect.left() + ROUTINE_STOCK_CHECKBOX_OFFSET,
-                option.rect.top() + (option.rect.height() - ROUTINE_CHECKBOX_SIZE) // 2,
-                ROUTINE_CHECKBOX_SIZE,
-                ROUTINE_CHECKBOX_SIZE,
-            )
-            checkbox_option = QStyleOptionButton()
-            checkbox_option.rect = checkbox_rect
-            checked = index.data(Qt.CheckStateRole) == Qt.Checked
-            checkbox_option.state = (
-                QStyle.State_Enabled if visually_enabled else QStyle.State_None
-            ) | (QStyle.State_On if checked else QStyle.State_Off)
-            if not visually_enabled:
-                painter.setOpacity(0.45)
-            style.drawPrimitive(
-                QStyle.PE_IndicatorCheckBox,
-                checkbox_option,
-                painter,
-                option.widget,
-            )
-            painter.setOpacity(1.0)
             if not visually_enabled:
                 painter.setPen(QColor("#9ca3af"))
             elif option.state & QStyle.State_Selected:
@@ -964,7 +892,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     stock_metric_label_hint = {
                         6: "보유",
                         7: "가격",
-                        8: "손익",
+                        8: "수익",
                         9: "미체결",
                     }.get(column)
                     metric_index = column - 6
@@ -1020,44 +948,16 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                 x += width
             painter.restore()
             return
-        checkbox_offset = (
+        content_offset = (
             ROUTINE_CHILD_CHECKBOX_OFFSET
             if row_kind == ROUTINE_ROW_CHILD
             else ROUTINE_PARENT_CHECKBOX_OFFSET
         )
-        checkbox_rect = QRect(
-            option.rect.left() + checkbox_offset,
-            option.rect.top() + (option.rect.height() - ROUTINE_CHECKBOX_SIZE) // 2,
-            ROUTINE_CHECKBOX_SIZE,
-            ROUTINE_CHECKBOX_SIZE,
-        )
-        checkbox_option = QStyleOptionButton()
-        checkbox_option.rect = checkbox_rect
-        checked = index.data(Qt.CheckStateRole) == Qt.Checked
         visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
-        checkbox_option.state = (
-            QStyle.State_Enabled if visually_enabled else QStyle.State_None
-        ) | (QStyle.State_On if checked else QStyle.State_Off)
-        painter.save()
-        if not visually_enabled:
-            painter.setOpacity(0.45)
-        style.drawPrimitive(
-            QStyle.PE_IndicatorCheckBox,
-            checkbox_option,
-            painter,
-            option.widget,
-        )
-        painter.restore()
-
-        text_left_offset = checkbox_offset + ROUTINE_CHECKBOX_SIZE + 6
+        text_left_offset = content_offset
         if row_kind == ROUTINE_ROW_CHILD:
             led_state = str(index.data(ROUTINE_CHILD_PROFIT_LED_ROLE) or "gray")
-            led_box_left = (
-                option.rect.left()
-                + checkbox_offset
-                + ROUTINE_CHECKBOX_SIZE
-                + ROUTINE_PROFIT_LED_GAP
-            )
+            led_box_left = option.rect.left() + content_offset
             _draw_routine_profit_led(
                 painter,
                 row_rect=option.rect,
@@ -1066,9 +966,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                 visually_enabled=visually_enabled,
             )
             text_left_offset = (
-                checkbox_offset
-                + ROUTINE_CHECKBOX_SIZE
-                + ROUTINE_PROFIT_LED_GAP
+                content_offset
                 + ROUTINE_PROFIT_LED_BOX_SIZE
                 + ROUTINE_PROFIT_LED_GAP
             )
@@ -1241,7 +1139,14 @@ class MainWindow(QMainWindow):
         self._routine_instance_name_editor_original = ""
         self._routine_instance_name_editor_item = None
         self._routine_instance_name_edit_finishing = False
-        self._routine_dummy_tab_buttons: list[QPushButton] = []
+        self._main_routine_valid_only = False
+        self._main_routine_display_level = "group"
+        self._main_routine_display_level_applied = False
+        self._main_routine_metric_sort_key = ""
+        self._main_routine_metric_sort_active = False
+        self._main_routine_valid_button = None
+        self._main_routine_level_buttons: dict[str, QPushButton] = {}
+        self._main_routine_metric_buttons: dict[str, QPushButton] = {}
         self._routine_buy_limit_edit_filter = _RoutineBuyLimitValueEditFilter(self)
         self._routine_instance_buy_limit_editor = None
         self._routine_instance_buy_limit_editor_instance_id = ""
@@ -1408,7 +1313,7 @@ class MainWindow(QMainWindow):
         routine_content_layout = QHBoxLayout()
         routine_content_layout.setContentsMargins(0, 0, 0, 0)
         routine_content_layout.setSpacing(6)
-        routine_content_layout.addWidget(self._create_routine_dummy_tab_area())
+        routine_content_layout.addWidget(self._create_routine_filter_badge_area())
         routine_content_layout.addWidget(self.routine_table, 1)
         routine_layout.addLayout(routine_content_layout)
         routine_box.setLayout(routine_layout)
@@ -1420,34 +1325,276 @@ class MainWindow(QMainWindow):
 
         return layout
 
-    def _create_routine_dummy_tab_area(self) -> QWidget:
-        tab_area = QWidget()
-        tab_area.setObjectName("routineDummyTabArea")
-        tab_area.setFixedWidth(46)
-        layout = QVBoxLayout(tab_area)
+    def _create_routine_filter_badge_area(self) -> QWidget:
+        badge_area = QWidget()
+        badge_area.setObjectName("mainRoutineFilterBadgeArea")
+        badge_area.setFixedWidth(68)
+        layout = QVBoxLayout(badge_area)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._routine_dummy_tab_buttons = []
-        for index, title in enumerate(("전체", "루틴", "운용", "종목")):
-            button = QPushButton(title)
-            button.setObjectName("routineDummyTabButton")
-            button.setCheckable(True)
-            button.setFixedSize(38, 30)
-            button.clicked.connect(
-                lambda _checked=False, selected=button: self._select_routine_dummy_tab(selected)
+        valid_button = self._create_main_routine_filter_badge(
+            "유효",
+            "mainRoutineValidBadge",
+        )
+        valid_button.setCheckable(True)
+        valid_button.clicked.connect(self._set_main_routine_valid_only)
+        self._main_routine_valid_button = valid_button
+        layout.addWidget(valid_button, 0, Qt.AlignHCenter)
+        layout.addSpacing(8)
+        layout.addWidget(
+            self._create_main_routine_filter_separator("mainRoutineValidSeparator"),
+            0,
+            Qt.AlignHCenter,
+        )
+        layout.addSpacing(8)
+
+        self._main_routine_level_buttons = {}
+        for level, title in (
+            ("group", "그룹"),
+            ("routine", "루틴"),
+            ("stock", "종목"),
+        ):
+            button = self._create_main_routine_filter_badge(
+                title,
+                f"mainRoutine{level.title()}LevelBadge",
             )
-            if index == 0:
-                button.setChecked(True)
-            self._routine_dummy_tab_buttons.append(button)
-            layout.addWidget(button)
+            button.clicked.connect(
+                lambda _checked=False, target_level=level:
+                self._set_main_routine_display_level(target_level)
+            )
+            self._main_routine_level_buttons[level] = button
+            layout.addWidget(button, 0, Qt.AlignHCenter)
+
+        layout.addSpacing(8)
+        layout.addWidget(
+            self._create_main_routine_filter_separator("mainRoutineMetricSeparator"),
+            0,
+            Qt.AlignHCenter,
+        )
+        layout.addSpacing(8)
+
+        self._main_routine_metric_buttons = {}
+        for metric, title in (
+            ("holding", "보유"),
+            ("price", "가격"),
+            ("profit", "수익"),
+            ("pending", "미결"),
+            ("limit", "한도"),
+        ):
+            button = self._create_main_routine_filter_badge(
+                title,
+                f"mainRoutine{metric.title()}MetricBadge",
+            )
+            button.clicked.connect(
+                lambda _checked=False, target_metric=metric:
+                self._set_main_routine_metric_sort(target_metric)
+            )
+            self._main_routine_metric_buttons[metric] = button
+            layout.addWidget(button, 0, Qt.AlignHCenter)
 
         layout.addStretch(1)
-        return tab_area
+        self._update_main_routine_filter_badges()
+        return badge_area
 
-    def _select_routine_dummy_tab(self, selected_button: QPushButton) -> None:
-        for button in self._routine_dummy_tab_buttons:
-            button.setChecked(button is selected_button)
+    def _create_main_routine_filter_badge(
+        self,
+        text: str,
+        object_name: str,
+    ) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName(object_name)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        return button
+
+    def _create_main_routine_filter_separator(self, object_name: str) -> QFrame:
+        separator = QFrame()
+        separator.setObjectName(object_name)
+        separator.setFrameShape(QFrame.NoFrame)
+        separator.setFixedSize(52, 2)
+        separator.setFocusPolicy(Qt.NoFocus)
+        separator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        separator.setAttribute(Qt.WA_StyledBackground, True)
+        separator.setStyleSheet(
+            f"QFrame#{object_name} {{"
+            " background-color: #64748B;"
+            " border: none;"
+            " min-height: 2px;"
+            " max-height: 2px;"
+            "}"
+        )
+        return separator
+
+    @staticmethod
+    def _main_routine_filter_badge_style(
+        text_color: str,
+        border_color: str | None = None,
+    ) -> str:
+        return (
+            auto_trade_setting_badge_stylesheet(
+                "QPushButton",
+                text_color=text_color,
+                border_color=border_color or text_color,
+            )
+            + (
+                "QPushButton {"
+                f" min-height: {AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT - 2}px;"
+                f" max-height: {AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT - 2}px;"
+                "}"
+            )
+        )
+
+    def _update_main_routine_filter_badges(self) -> None:
+        disabled_style = (
+            "QPushButton:disabled, QPushButton:disabled:hover {"
+            " background-color: transparent;"
+            " border: 1px solid #D1D5DB;"
+            " border-radius: 4px;"
+            " color: #9CA3AF;"
+            " font-weight: 600;"
+            " padding: 0 6px;"
+            "}"
+        )
+        valid_only = bool(self._main_routine_valid_only)
+        if self._main_routine_valid_button is not None:
+            self._main_routine_valid_button.setChecked(valid_only)
+            valid_text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if valid_only
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            self._main_routine_valid_button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    valid_text_color,
+                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                    if valid_only
+                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+            )
+
+        for level, button in self._main_routine_level_buttons.items():
+            active = level == self._main_routine_display_level
+            text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    text_color,
+                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                    if active
+                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+            )
+
+        for metric, button in self._main_routine_metric_buttons.items():
+            enabled = self._main_routine_display_level != "group"
+            button.setEnabled(enabled)
+            button.setCursor(
+                Qt.PointingHandCursor if enabled else Qt.ArrowCursor
+            )
+            active = (
+                enabled
+                and self._main_routine_metric_sort_active
+                and metric == self._main_routine_metric_sort_key
+            )
+            text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    text_color,
+                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                    if active
+                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+                + disabled_style
+            )
+
+    def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str], ...]:
+        selected_keys: list[tuple[str, str, str, str]] = []
+        for index in self.routine_table.selectionModel().selectedRows():
+            item = self.routine_table.item(index.row(), 0)
+            if item is None:
+                continue
+            selected_keys.append(
+                (
+                    str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
+                    str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
+                    str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
+                    str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
+                )
+            )
+        return tuple(selected_keys)
+
+    def _reload_main_routine_table_preserving_view(self) -> None:
+        selected_keys = self._main_routine_selected_row_keys()
+        scroll_value = self.routine_table.verticalScrollBar().value()
+        self.load_routine_table()
+        wanted = set(selected_keys)
+        selection_model = self.routine_table.selectionModel()
+        selection_model.clearSelection()
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            if item is None:
+                continue
+            key = (
+                str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
+                str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
+                str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
+                str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
+            )
+            if key in wanted:
+                selection_model.select(
+                    self.routine_table.model().index(row, 0),
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+        self.routine_table.verticalScrollBar().setValue(scroll_value)
+
+    def _set_main_routine_valid_only(self, enabled: bool) -> None:
+        self._main_routine_valid_only = bool(enabled)
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
+
+    def _set_main_routine_display_level(self, level: str) -> None:
+        clean_level = str(level or "").strip()
+        if clean_level not in {"group", "routine", "stock"}:
+            return
+        definition_ids = set(self._routine_instance_ids_by_definition)
+        instance_ids = {
+            instance_id
+            for values in self._routine_instance_ids_by_definition.values()
+            for instance_id in values
+        }
+        if clean_level == "group":
+            self._collapsed_routine_definition_ids.update(definition_ids)
+        elif clean_level == "routine":
+            self._collapsed_routine_definition_ids.difference_update(definition_ids)
+            self._collapsed_routine_instance_ids.update(instance_ids)
+        else:
+            self._collapsed_routine_definition_ids.difference_update(definition_ids)
+            self._collapsed_routine_instance_ids.difference_update(instance_ids)
+        if clean_level == "group":
+            self._main_routine_metric_sort_key = ""
+            self._main_routine_metric_sort_active = False
+        self._main_routine_display_level = clean_level
+        self._main_routine_display_level_applied = True
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
+
+    def _set_main_routine_metric_sort(self, metric: str) -> None:
+        clean_metric = str(metric or "").strip()
+        if clean_metric not in {"holding", "price", "profit", "pending", "limit"}:
+            return
+        self._main_routine_metric_sort_key = clean_metric
+        self._main_routine_metric_sort_active = True
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
 
     def _create_button_area(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -1625,27 +1772,8 @@ class MainWindow(QMainWindow):
                 background: #f8fafc;
                 color: #334155;
             }
-            QWidget#mainDashboardRoot QWidget#routineDummyTabArea {
+            QWidget#mainDashboardRoot QWidget#mainRoutineFilterBadgeArea {
                 background: transparent;
-            }
-            QWidget#mainDashboardRoot QPushButton#routineDummyTabButton {
-                min-width: 38px;
-                max-width: 38px;
-                min-height: 30px;
-                max-height: 30px;
-                padding: 0px;
-                background: #f8fafc;
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
-                color: #334155;
-                font-size: 9pt;
-                font-weight: 500;
-            }
-            QWidget#mainDashboardRoot QPushButton#routineDummyTabButton:checked {
-                background: #2563eb;
-                border-color: #1d4ed8;
-                color: #ffffff;
-                font-weight: 700;
             }
             QWidget#mainDashboardRoot QTableWidget {
                 background: #ffffff;
@@ -1679,10 +1807,11 @@ class MainWindow(QMainWindow):
         self.btn_log_view.clicked.connect(self.not_implemented)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
-        self.routine_table.itemChanged.connect(self.on_routine_check_item_changed)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
-        self._routine_checkbox_controller = _RoutineCheckBoxController(self)
-        self.routine_table.viewport().installEventFilter(self._routine_checkbox_controller)
+        self._routine_tree_interaction_controller = _RoutineTreeInteractionController(self)
+        self.routine_table.viewport().installEventFilter(
+            self._routine_tree_interaction_controller
+        )
         self.running_stock_table.horizontalHeader().sectionClicked.connect(self.sort_main_running_table_by_column)
 
     def startup_recovery_stock_state_paths(self) -> list[Path]:
@@ -2124,47 +2253,6 @@ class MainWindow(QMainWindow):
         )
         dialog.exec_()
 
-    def toggle_routine_check_state(self, row: int) -> None:
-        item = self.routine_table.item(row, 0)
-        if item is None:
-            return
-        row_kind = str(item.data(ROUTINE_ROW_KIND_ROLE) or "")
-        definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-        instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        if row_kind == ROUTINE_ROW_PARENT and definition_id:
-            enabled = toggle_routine_definition(self, definition_id)
-            if enabled:
-                self._collapsed_routine_definition_ids.discard(definition_id)
-            else:
-                self._collapsed_routine_definition_ids.add(definition_id)
-        elif row_kind == ROUTINE_ROW_CHILD and instance_id:
-            toggle_routine_instance(self, instance_id)
-        else:
-            return
-        self.load_routine_table()
-
-    def on_routine_check_item_changed(self, item) -> None:
-        if item is None or item.column() != 0:
-            return
-        row_kind = str(item.data(ROUTINE_ROW_KIND_ROLE) or "")
-        definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-        instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        requested = item.checkState() == Qt.Checked
-        if row_kind == ROUTINE_ROW_PARENT and definition_id:
-            current = routine_definition_enabled(self, definition_id)
-        elif row_kind == ROUTINE_ROW_CHILD and instance_id:
-            current = routine_instance_checked(self, instance_id)
-            if not routine_instance_checkbox_enabled(self, instance_id):
-                if requested != current:
-                    self.refresh_routine_check_states()
-                return
-        elif row_kind == ROUTINE_ROW_STOCK:
-            return
-        else:
-            return
-        if requested != current:
-            self.toggle_routine_check_state(item.row())
-
     def toggle_routine_expansion(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
         if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
@@ -2177,18 +2265,6 @@ class MainWindow(QMainWindow):
         else:
             self._collapsed_routine_definition_ids.add(definition_id)
         self.load_routine_table()
-
-    def toggle_routine_stock_check_state(self, row: int) -> None:
-        item = self.routine_table.item(row, 0)
-        if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_STOCK:
-            return
-        stock_path = str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
-        if not stock_path:
-            return
-        checked = item.checkState() != Qt.Checked
-        self._routine_stock_selection[stock_path] = checked
-        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-        self.routine_table.viewport().update()
 
     def toggle_routine_instance_expansion(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
@@ -2203,53 +2279,6 @@ class MainWindow(QMainWindow):
             self._collapsed_routine_instance_ids.add(instance_id)
         self.load_routine_table()
 
-    def refresh_routine_check_states(self) -> None:
-        for row in range(self.routine_table.rowCount()):
-            first_item = self.routine_table.item(row, 0)
-            if first_item is None:
-                continue
-            row_kind = str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "")
-            definition_id = str(first_item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-            instance_id = str(first_item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-            group_enabled = routine_definition_enabled(self, definition_id)
-            if row_kind == ROUTINE_ROW_PARENT:
-                checked = group_enabled
-                row_visually_enabled = group_enabled
-                first_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            elif row_kind == ROUTINE_ROW_CHILD:
-                checked = routine_instance_checked(self, instance_id)
-                row_visually_enabled = group_enabled and checked
-                first_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            elif row_kind == ROUTINE_ROW_STOCK:
-                stock_path = str(first_item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
-                checked = first_item.checkState() == Qt.Checked
-                if stock_path and stock_path in self._routine_stock_selection:
-                    checked = bool(self._routine_stock_selection.get(stock_path))
-                row_visually_enabled = group_enabled and routine_instance_checked(
-                    self,
-                    instance_id,
-                )
-                first_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            else:
-                continue
-            first_item.setData(
-                ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
-                row_visually_enabled,
-            )
-            for column in range(self.routine_table.columnCount()):
-                item = self.routine_table.item(row, column)
-                if item is not None:
-                    item.setForeground(
-                        QBrush() if row_visually_enabled else QColor("#9ca3af")
-                    )
-                widget = self.routine_table.cellWidget(row, column)
-                if widget is not None:
-                    widget.setEnabled(row_visually_enabled)
-        self.routine_table.viewport().update()
-
-    def selected_routine_instance_ids(self) -> tuple[str, ...]:
-        return selected_routine_instance_ids(self)
-
     def start_routine_instance_name_edit(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
         if item is None:
@@ -2262,7 +2291,7 @@ class MainWindow(QMainWindow):
 
         self.finish_routine_instance_name_edit(save=True)
         index = self.routine_table.model().index(row, 0)
-        name_rect = self._routine_checkbox_controller._child_name_rect(index)
+        name_rect = self._routine_tree_interaction_controller._child_name_rect(index)
         cell_rect = self.routine_table.visualRect(index)
         max_width = max(80, cell_rect.right() - name_rect.left() - 4)
         editor_width = min(max_width, max(name_rect.width() + 24, 96))
@@ -2390,7 +2419,10 @@ class MainWindow(QMainWindow):
         index = self.routine_table.model().index(row, 0)
         if not index.isValid():
             return QRect()
-        metric_rect = self._routine_checkbox_controller._stock_metric_rect(index, 10)
+        metric_rect = self._routine_tree_interaction_controller._stock_metric_rect(
+            index,
+            10,
+        )
         if metric_rect.isNull():
             return QRect()
         component_rects = _main_stock_metric_component_rects(
@@ -2620,7 +2652,7 @@ class MainWindow(QMainWindow):
         row_kind = str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "")
         if row_kind == ROUTINE_ROW_PARENT:
             index = self.routine_table.model().index(item.row(), 0)
-            if not self._routine_checkbox_controller._parent_name_rect(index).contains(
+            if not self._routine_tree_interaction_controller._parent_name_rect(index).contains(
                 position
             ):
                 return

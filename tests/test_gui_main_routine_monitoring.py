@@ -10,7 +10,16 @@ from unittest.mock import MagicMock, call, patch
 from PyQt5.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt, QTimer
 from PyQt5.QtGui import QFont, QFontMetrics, QMouseEvent
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QDialog, QHeaderView, QLabel, QLineEdit, QMainWindow, QWidget
+from PyQt5.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QWidget,
+)
 
 import gui_main_table_loader
 import gui_windows
@@ -850,8 +859,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
         table = FakeTable()
         index = FakeIndex()
-        controller = gui_windows._RoutineCheckBoxController.__new__(
-            gui_windows._RoutineCheckBoxController
+        controller = gui_windows._RoutineTreeInteractionController.__new__(
+            gui_windows._RoutineTreeInteractionController
         )
         controller.table = table
         legacy_holding_rect = controller._stock_legacy_metric_rect(index, 6)
@@ -898,13 +907,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
         index = FakeIndex()
         table = FakeTable(index)
-        controller = gui_windows._RoutineCheckBoxController.__new__(
-            gui_windows._RoutineCheckBoxController
+        controller = gui_windows._RoutineTreeInteractionController.__new__(
+            gui_windows._RoutineTreeInteractionController
         )
         controller.table = table
         window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
         window.routine_table = table
-        window._routine_checkbox_controller = controller
+        window._routine_tree_interaction_controller = controller
 
         limit_rect = controller._stock_metric_rect(index, 10)
         component_rects = gui_windows._main_stock_metric_component_rects(
@@ -1036,7 +1045,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
         metrics = row["stock_metrics"]
         self.assertEqual(
-            ["보유", "가격", "손익", "미체결", None],
+            ["보유", "가격", "수익", "미체결", None],
             [getattr(metric, "label", None) for metric in metrics],
         )
         self.assertEqual("120주", metrics[0].value1)
@@ -1469,8 +1478,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual(28, table.row_heights[1])
         self.assertEqual("▼ 지표추종매매", table.item(0, 0).text())
         self.assertEqual("대형주 추세형", table.item(1, 0).text())
-        self.assertEqual(Qt.Checked, table.item(0, 0).checkState())
-        self.assertEqual(Qt.Checked, table.item(1, 0).checkState())
+        self.assertFalse(table.item(0, 0).flags() & Qt.ItemIsUserCheckable)
+        self.assertFalse(table.item(1, 0).flags() & Qt.ItemIsUserCheckable)
+        self.assertIsNone(table.item(0, 0).data(Qt.CheckStateRole))
+        self.assertIsNone(table.item(1, 0).data(Qt.CheckStateRole))
         self.assertEqual("", table.item(0, 1).text())
         self.assertEqual("", table.item(1, 1).text())
         self.assertEqual("", table.item(1, 2).text())
@@ -1566,8 +1577,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_ROLE
             ),
         )
-        self.assertTrue(table.item(0, 0).flags() & Qt.ItemIsUserCheckable)
-        self.assertTrue(table.item(1, 0).flags() & Qt.ItemIsUserCheckable)
         self.assertEqual("", table.item(0, 7).text())
         self.assertEqual("", table.item(1, 7).text())
         self.assertEqual("", table.item(0, 8).text())
@@ -1577,7 +1586,268 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             table.item(1, 0).toolTip(),
         )
 
-    def test_actual_main_window_renders_and_toggles_parent_child_rows(self) -> None:
+    def test_parent_instance_and_stock_rows_have_no_checkboxes(self) -> None:
+        table = FakeRoutineTable()
+        window = SimpleNamespace(
+            routine_table=table,
+            _main_routine_sort_column=-1,
+            _main_routine_sort_order=0,
+            _collapsed_routine_definition_ids=set(),
+            _collapsed_routine_instance_ids=set(),
+        )
+        definition = RoutineDefinitionRecord(
+            definition_id="definition-a",
+            display_name="Parent",
+            package_dir=Path("routine-path"),
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="Parent",
+        )
+        instance = RoutineInstanceRecord(
+            instance_id="instance-a",
+            definition_id="definition-a",
+            display_name="Instance",
+            source_routine_name="Parent",
+            persisted=True,
+            source="PERSISTED",
+            enabled=True,
+            real_trade_allowed=False,
+            description="",
+            buy_limit_enabled=False,
+            buy_limit_amount=None,
+            rules_path=Path("instance-rules.json"),
+        )
+        count = {
+            "registered": 1,
+            "running": 0,
+            "stopped": 1,
+            "error": 0,
+            "consumed_amount": 0,
+            "consumed_unknown": False,
+            "profit_amount": 0,
+            "profit_cost_basis": 0,
+            "profit_unknown": False,
+            "stocks": [
+                {
+                    "code": "000001",
+                    "name": "Stock",
+                    "enabled": True,
+                    "stock_path": "stocks/000001_Stock",
+                    "state": {},
+                    "config": {},
+                }
+            ],
+        }
+
+        with (
+            patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
+            patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
+            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
+            patch.object(
+                gui_main_table_loader,
+                "_instance_stock_counts",
+                return_value={instance.instance_id: count},
+            ),
+        ):
+            gui_main_table_loader.main_load_routine_table(window)
+
+        self.assertEqual(3, table.row_count)
+        self.assertEqual(
+            [
+                gui_main_table_loader.ROUTINE_ROW_PARENT,
+                gui_main_table_loader.ROUTINE_ROW_CHILD,
+                gui_main_table_loader.ROUTINE_ROW_STOCK,
+            ],
+            [
+                table.item(row, 0).data(gui_main_table_loader.ROUTINE_ROW_KIND_ROLE)
+                for row in range(3)
+            ],
+        )
+        for row in range(3):
+            item = table.item(row, 0)
+            self.assertFalse(item.flags() & Qt.ItemIsUserCheckable)
+            self.assertIsNone(item.data(Qt.CheckStateRole))
+
+    def test_stock_metric_badge_sort_keeps_hierarchy_and_sorts_within_instance(
+        self,
+    ) -> None:
+        table = FakeRoutineTable()
+        window = SimpleNamespace(
+            routine_table=table,
+            _main_routine_sort_column=-1,
+            _main_routine_sort_order=Qt.AscendingOrder,
+            _collapsed_routine_definition_ids=set(),
+            _collapsed_routine_instance_ids=set(),
+            _main_routine_display_level="stock",
+            _main_routine_display_level_applied=True,
+            _main_routine_valid_only=False,
+            _main_routine_metric_sort_active=True,
+            _main_routine_metric_sort_key="profit",
+        )
+        definition = RoutineDefinitionRecord(
+            definition_id="definition-a",
+            display_name="Parent",
+            package_dir=Path("routine-path"),
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="Parent",
+        )
+        instance = RoutineInstanceRecord(
+            instance_id="instance-a",
+            definition_id="definition-a",
+            display_name="Instance",
+            source_routine_name="Parent",
+            persisted=True,
+            source="PERSISTED",
+            enabled=True,
+            real_trade_allowed=False,
+            description="",
+            buy_limit_enabled=False,
+            buy_limit_amount=None,
+            rules_path=Path("instance-rules.json"),
+        )
+        stocks = [
+            {
+                "code": "000001",
+                "name": "Low",
+                "enabled": True,
+                "stock_path": "stocks/000001_Low",
+            },
+            {
+                "code": "000002",
+                "name": "High",
+                "enabled": True,
+                "stock_path": "stocks/000002_High",
+            },
+        ]
+
+        def metric_values(_window, stock):
+            profit = 10 if stock["name"] == "High" else -5
+            return (
+                (),
+                "gray",
+                "한도(0)",
+                None,
+                {
+                    "holding": 0,
+                    "price": 0,
+                    "profit": profit,
+                    "pending": 0,
+                    "limit": 0,
+                },
+            )
+
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_routine_definitions",
+                return_value=[definition],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=[instance],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_stock_counts_from_base_stocks",
+                return_value={},
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_instance_stock_counts",
+                return_value={
+                    instance.instance_id: {
+                        "registered": 2,
+                        "running": 0,
+                        "stopped": 2,
+                        "error": 0,
+                        "consumed_amount": 0,
+                        "consumed_unknown": False,
+                        "profit_amount": 0,
+                        "profit_cost_basis": 0,
+                        "profit_unknown": False,
+                        "stocks": stocks,
+                    }
+                },
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_tree_stock_display_values",
+                side_effect=lambda _window, stock: [stock["name"]],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_tree_stock_metric_values",
+                side_effect=metric_values,
+            ),
+        ):
+            gui_main_table_loader.main_load_routine_table(window)
+            hierarchical_kinds = [
+                table.item(row, 0).data(
+                    gui_main_table_loader.ROUTINE_ROW_KIND_ROLE
+                )
+                for row in range(4)
+            ]
+            hierarchical_names = [
+                table.item(row, 0).data(
+                    gui_main_table_loader.ROUTINE_STOCK_NAME_ROLE
+                )
+                for row in (2, 3)
+            ]
+            window._main_routine_valid_only = True
+            gui_main_table_loader.main_load_routine_table(window)
+            flat_valid_kinds = [
+                table.item(row, 0).data(
+                    gui_main_table_loader.ROUTINE_ROW_KIND_ROLE
+                )
+                for row in range(table.row_count)
+            ]
+            flat_valid_names = [
+                table.item(row, 0).data(
+                    gui_main_table_loader.ROUTINE_STOCK_NAME_ROLE
+                )
+                for row in range(table.row_count)
+            ]
+
+        self.assertEqual(
+            [
+                gui_main_table_loader.ROUTINE_ROW_PARENT,
+                gui_main_table_loader.ROUTINE_ROW_CHILD,
+                gui_main_table_loader.ROUTINE_ROW_STOCK,
+                gui_main_table_loader.ROUTINE_ROW_STOCK,
+            ],
+            hierarchical_kinds,
+        )
+        self.assertEqual(
+            ["High | 한도(0)", "Low | 한도(0)"],
+            hierarchical_names,
+        )
+        self.assertEqual(
+            [
+                gui_main_table_loader.ROUTINE_ROW_STOCK,
+                gui_main_table_loader.ROUTINE_ROW_STOCK,
+            ],
+            flat_valid_kinds,
+        )
+        self.assertEqual(
+            ["High | 한도(0)", "Low | 한도(0)"],
+            flat_valid_names,
+        )
+
+    def test_actual_main_window_renders_parent_child_rows_without_checkboxes(self) -> None:
         import gui_windows
 
         definition = RoutineDefinitionRecord(
@@ -1631,11 +1901,40 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 window.show()
                 self.app.processEvents()
 
+                self.assertEqual(1, window.routine_table.rowCount())
+                self.assertTrue(
+                    all(
+                        not button.isEnabled()
+                        for button in window._main_routine_metric_buttons.values()
+                    )
+                )
+                window._main_routine_metric_buttons["profit"].click()
+                self.assertFalse(window._main_routine_metric_sort_active)
+                window._main_routine_level_buttons["routine"].click()
+                self.app.processEvents()
                 self.assertEqual(2, window.routine_table.rowCount())
+                self.assertTrue(
+                    all(
+                        button.isEnabled()
+                        for button in window._main_routine_metric_buttons.values()
+                    )
+                )
                 self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
                 self.assertEqual("대형주 추세형", window.routine_table.item(1, 0).text())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Checked, window.routine_table.item(1, 0).checkState())
+                self.assertFalse(
+                    window.routine_table.item(0, 0).flags()
+                    & Qt.ItemIsUserCheckable
+                )
+                self.assertFalse(
+                    window.routine_table.item(1, 0).flags()
+                    & Qt.ItemIsUserCheckable
+                )
+                self.assertIsNone(
+                    window.routine_table.item(0, 0).data(Qt.CheckStateRole)
+                )
+                self.assertIsNone(
+                    window.routine_table.item(1, 0).data(Qt.CheckStateRole)
+                )
                 self.assertEqual(
                     "기본운영",
                     window.routine_table.cellWidget(1, 1)
@@ -1724,7 +2023,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         parent_index, window.routine_table
                     ),
                 )
-                parent_name_rect = window._routine_checkbox_controller._parent_name_rect(
+                parent_name_rect = window._routine_tree_interaction_controller._parent_name_rect(
                     parent_index
                 )
                 def move_routine_pointer(point: QPoint) -> None:
@@ -1735,7 +2034,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         Qt.NoButton,
                         Qt.NoModifier,
                     )
-                    window._routine_checkbox_controller.eventFilter(
+                    window._routine_tree_interaction_controller.eventFilter(
                         window.routine_table.viewport(), event
                     )
 
@@ -1824,7 +2123,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
                 child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
                 child_index = window.routine_table.model().index(1, 0)
-                child_name_rect = window._routine_checkbox_controller._child_name_rect(
+                child_name_rect = window._routine_tree_interaction_controller._child_name_rect(
                     child_index
                 )
 
@@ -1836,7 +2135,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         Qt.LeftButton,
                         Qt.NoModifier,
                     )
-                    window._routine_checkbox_controller.eventFilter(
+                    window._routine_tree_interaction_controller.eventFilter(
                         window.routine_table.viewport(),
                         event,
                     )
@@ -2171,244 +2470,161 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     .text(),
                 )
 
-                window.routine_table.item(0, 0).setCheckState(Qt.Unchecked)
+                parent_rect = window.routine_table.visualItemRect(
+                    window.routine_table.item(0, 0)
+                )
+                QTest.mouseClick(
+                    window.routine_table.viewport(),
+                    Qt.LeftButton,
+                    pos=parent_rect.topLeft()
+                    + QPoint(
+                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
+                        parent_rect.height() // 2,
+                    ),
+                )
                 self.app.processEvents()
                 self.assertEqual(1, window.routine_table.rowCount())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-                collapsed_parent_index = window.routine_table.model().index(0, 0)
+                parent_rect = window.routine_table.visualItemRect(
+                    window.routine_table.item(0, 0)
+                )
+                QTest.mouseClick(
+                    window.routine_table.viewport(),
+                    Qt.LeftButton,
+                    pos=parent_rect.topLeft()
+                    + QPoint(
+                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
+                        parent_rect.height() // 2,
+                    ),
+                )
+                self.app.processEvents()
+                self.assertEqual(2, window.routine_table.rowCount())
                 self.assertEqual(
-                    "▶ 지표추종매매    등록(0) | 실행(0) | 정지(0) | 오류(0)",
-                    window._routine_tree_item_delegate.display_text(
-                        collapsed_parent_index, window.routine_table
-                    ),
+                    ["유효", "그룹", "루틴", "종목", "보유", "가격", "수익", "미결", "한도"],
+                    [
+                        window._main_routine_valid_button.text(),
+                        *[
+                            button.text()
+                            for button in window._main_routine_level_buttons.values()
+                        ],
+                        *[
+                            button.text()
+                            for button in window._main_routine_metric_buttons.values()
+                        ],
+                    ],
                 )
-                window.routine_table.item(0, 0).setCheckState(Qt.Checked)
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(
-                    "매매완료",
-                    window.routine_table.cellWidget(1, 1)
-                    .findChild(QLabel, "routineInstanceStatusText")
-                    .text(),
+                self.assertIsNotNone(
+                    window.findChild(QWidget, "mainRoutineFilterBadgeArea")
                 )
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft() + QPoint(70, parent_rect.height() // 2),
+                self.assertIsNone(
+                    window.findChild(QWidget, "routineDummyTabArea")
                 )
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
-
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft() + QPoint(8, parent_rect.height() // 2),
-                )
-                self.app.processEvents()
-                self.assertEqual(1, window.routine_table.rowCount())
-                self.assertEqual("▶ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-                self.assertFalse(
-                    window.routine_table.item(0, 0).data(
-                        gui_main_table_loader.ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE
-                    )
-                )
-                self.assertEqual("#9ca3af", window.routine_table.item(0, 0).foreground().color().name())
-                for column in range(window.routine_table.columnCount()):
+                all_badges = [
+                    window._main_routine_valid_button,
+                    *window._main_routine_level_buttons.values(),
+                    *window._main_routine_metric_buttons.values(),
+                ]
+                for button in all_badges:
+                    self.assertEqual(64, button.width())
                     self.assertEqual(
-                        "#9ca3af",
-                        window.routine_table.item(0, column).foreground().color().name(),
+                        gui_windows.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+                        button.height(),
                     )
-                self.assertIsNone(window.routine_table.cellWidget(0, 9))
-                self.assertEqual((instance.instance_id,), window.selected_routine_instance_ids())
-                disabled_screenshot_path = os.environ.get(
-                    "ROUTINE_UI_DISABLED_SCREENSHOT_PATH",
-                    "",
-                ).strip()
-                if disabled_screenshot_path:
-                    self.assertTrue(window.grab().save(disabled_screenshot_path))
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
-                        parent_rect.height() // 2,
-                    ),
-                )
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Checked, window.routine_table.item(1, 0).checkState())
-                self.assertIsNone(window.routine_table.cellWidget(1, 9))
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
-                        parent_rect.height() // 2,
-                    ),
-                )
-                self.app.processEvents()
-                self.assertEqual(1, window.routine_table.rowCount())
-                self.assertEqual("▶ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft() + QPoint(8, parent_rect.height() // 2),
-                )
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Checked, window.routine_table.item(1, 0).checkState())
-                self.assertIsNone(window.routine_table.cellWidget(0, 9))
-                self.assertIsNone(window.routine_table.cellWidget(1, 9))
-
-                child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=child_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_CHILD_CHECKBOX_OFFSET + 8,
-                        child_rect.height() // 2,
-                    ),
-                )
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
-                self.assertNotEqual(
-                    "#9ca3af",
-                    window.routine_table.item(0, 0).foreground().color().name(),
-                )
-                for column in range(window.routine_table.columnCount()):
-                    self.assertEqual(
-                        "#9ca3af",
-                        window.routine_table.item(1, column).foreground().color().name(),
-                    )
-                self.assertFalse(
-                    window.routine_table.item(1, 0).data(
-                        gui_main_table_loader.ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE
+                separators = [
+                    window.findChild(QFrame, "mainRoutineValidSeparator"),
+                    window.findChild(QFrame, "mainRoutineMetricSeparator"),
+                ]
+                self.assertTrue(all(separator is not None for separator in separators))
+                self.assertTrue(
+                    all(
+                        separator.testAttribute(Qt.WA_TransparentForMouseEvents)
+                        for separator in separators
                     )
                 )
-                self.assertIsNone(window.routine_table.cellWidget(1, 9))
-                self.assertEqual((), window.selected_routine_instance_ids())
-
-                child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=child_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_CHILD_CHECKBOX_OFFSET + 8,
-                        child_rect.height() // 2,
+                for separator in separators:
+                    self.assertEqual((52, 2), (separator.width(), separator.height()))
+                    self.assertTrue(
+                        separator.testAttribute(Qt.WA_StyledBackground)
+                    )
+                    self.assertIn("#64748B", separator.styleSheet())
+                separator_neighbors = (
+                    (
+                        window._main_routine_valid_button,
+                        separators[0],
+                        window._main_routine_level_buttons["group"],
+                    ),
+                    (
+                        window._main_routine_level_buttons["stock"],
+                        separators[1],
+                        window._main_routine_metric_buttons["holding"],
                     ),
                 )
+                for upper, separator, lower in separator_neighbors:
+                    upper_gap = (
+                        separator.geometry().top()
+                        - upper.geometry().bottom()
+                        - 1
+                    )
+                    lower_gap = (
+                        lower.geometry().top()
+                        - separator.geometry().bottom()
+                        - 1
+                    )
+                    self.assertEqual(upper_gap, lower_gap)
+                    self.assertGreaterEqual(upper_gap, 12)
+                self.assertIn(
+                    gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+                    window._main_routine_level_buttons["routine"].styleSheet(),
+                )
+                self.assertIn(
+                    "color: " + gui_windows.MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR,
+                    window._main_routine_valid_button.styleSheet(),
+                )
+                self.assertIn(
+                    "color: " + gui_windows.MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR,
+                    window._main_routine_level_buttons["group"].styleSheet(),
+                )
+                self.assertIn(
+                    "border: 1px solid "
+                    + gui_windows.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                    window._main_routine_level_buttons["group"].styleSheet(),
+                )
+
+                window._main_routine_valid_button.click()
                 self.app.processEvents()
-                self.assertEqual(Qt.Checked, window.routine_table.item(1, 0).checkState())
-                self.assertNotEqual(
-                    "#9ca3af",
-                    window.routine_table.item(1, 0).foreground().color().name(),
-                )
-
-                child_rect = window.routine_table.visualItemRect(window.routine_table.item(1, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=child_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_CHILD_CHECKBOX_OFFSET + 8,
-                        child_rect.height() // 2,
-                    ),
-                )
+                self.assertEqual(0, window.routine_table.rowCount())
+                self.assertEqual("routine", window._main_routine_display_level)
+                window._main_routine_valid_button.click()
                 self.app.processEvents()
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
+                self.assertEqual(2, window.routine_table.rowCount())
 
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
-                        parent_rect.height() // 2,
-                    ),
-                )
+                window._main_routine_level_buttons["group"].click()
                 self.app.processEvents()
                 self.assertEqual(1, window.routine_table.rowCount())
-                self.assertEqual("▶ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual((), window.selected_routine_instance_ids())
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
-                        parent_rect.height() // 2,
-                    ),
-                )
+                window._main_routine_level_buttons["stock"].click()
                 self.app.processEvents()
                 self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft() + QPoint(8, parent_rect.height() // 2),
-                )
+                for metric in ("holding", "price", "profit", "pending", "limit"):
+                    window._main_routine_metric_buttons[metric].click()
+                    self.app.processEvents()
+                    self.assertTrue(window._main_routine_metric_sort_active)
+                    self.assertEqual(metric, window._main_routine_metric_sort_key)
+                window._main_routine_level_buttons["group"].click()
                 self.app.processEvents()
-                self.assertEqual(1, window.routine_table.rowCount())
-                self.assertEqual("▶ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual((), window.selected_routine_instance_ids())
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft()
-                    + QPoint(
-                        gui_main_table_loader.ROUTINE_PARENT_EXPAND_OFFSET + 8,
-                        parent_rect.height() // 2,
-                    ),
-                )
+                self.assertFalse(window._main_routine_metric_sort_active)
+                self.assertEqual("", window._main_routine_metric_sort_key)
+                for button in window._main_routine_metric_buttons.values():
+                    self.assertFalse(button.isEnabled())
+                    self.assertEqual(Qt.ArrowCursor, button.cursor().shape())
+                    self.assertIn("#9CA3AF", button.styleSheet())
+                window._main_routine_level_buttons["routine"].click()
                 self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual("▼ 지표추종매매", window.routine_table.item(0, 0).text())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
-
-                parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
-                QTest.mouseClick(
-                    window.routine_table.viewport(),
-                    Qt.LeftButton,
-                    pos=parent_rect.topLeft() + QPoint(8, parent_rect.height() // 2),
+                self.assertTrue(
+                    all(
+                        button.isEnabled()
+                        for button in window._main_routine_metric_buttons.values()
+                    )
                 )
-                self.app.processEvents()
-                self.assertEqual(2, window.routine_table.rowCount())
-                self.assertEqual(Qt.Checked, window.routine_table.item(0, 0).checkState())
-                self.assertEqual(Qt.Unchecked, window.routine_table.item(1, 0).checkState())
+                return
             finally:
                 window.close()
                 window.deleteLater()
@@ -2526,6 +2742,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window = gui_windows.MainWindow()
             try:
                 gui_main_table_loader.main_load_routine_table(window)
+                window._main_routine_level_buttons["routine"].click()
                 window.resize(1280, 720)
                 window.show()
                 self.app.processEvents()

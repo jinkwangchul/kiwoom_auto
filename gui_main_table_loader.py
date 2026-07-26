@@ -14,6 +14,7 @@ gui_main_table_loader.py
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -75,7 +76,6 @@ from routine_instance_registry import (
 )
 from gui_main_routine_selection import (
     routine_definition_enabled,
-    routine_instance_checkbox_enabled,
     routine_instance_checked,
     sync_routine_selection_state,
 )
@@ -157,7 +157,7 @@ ROUTINE_ROW_STOCK = "stock"
 ROUTINE_PARENT_CHECKBOX_OFFSET = 4
 ROUTINE_CHILD_CHECKBOX_OFFSET = 24
 ROUTINE_STOCK_CHECKBOX_OFFSET = 45
-ROUTINE_STOCK_TEXT_OFFSET = 68
+ROUTINE_STOCK_TEXT_OFFSET = ROUTINE_STOCK_CHECKBOX_OFFSET
 ROUTINE_STOCK_BASE_COLUMN_WIDTHS = (214, 116, 34, 104, 58, 120)
 MAIN_STOCK_METRIC_LAYOUT_PREVIEW = False
 ROUTINE_CHECKBOX_SIZE = 16
@@ -277,7 +277,7 @@ def routine_stock_position_value_widths(font: QFont | None = None) -> dict[str, 
             max(metrics.horizontalAdvance("9,999,999"), metrics.horizontalAdvance("-")),
             max(metrics.horizontalAdvance("9,999,999"), metrics.horizontalAdvance("-")),
         ),
-        "손익": (
+        "수익": (
             money_width,
             rate_width,
         ),
@@ -301,7 +301,7 @@ def routine_stock_column_widths(font: QFont | None = None) -> tuple[int, ...]:
             font=font,
             outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
         )
-        for label in ("보유", "가격", "손익", "미체결")
+        for label in ("보유", "가격", "수익", "미체결")
     )
     instance_widths = routine_instance_grid_columns(font)
     return (
@@ -794,7 +794,7 @@ def create_routine_instance_status_widget(
     container.setEnabled(bool(enabled))
     return container
 ROUTINE_CHECKBOX_HIT_PADDING = 4
-ROUTINE_PARENT_EXPAND_OFFSET = 25
+ROUTINE_PARENT_EXPAND_OFFSET = ROUTINE_PARENT_CHECKBOX_OFFSET
 ROUTINE_PARENT_EXPAND_WIDTH = 20
 def main_sort_routine_table_by_column(window, column: int) -> None:
     """메인 관제창 좌측 루틴표 헤더 정렬."""
@@ -850,6 +850,9 @@ def _clear_routine_table_cell_widgets(table) -> None:
             widget = table.cellWidget(row, column)
             if widget is None:
                 continue
+            hide_widget = getattr(widget, "hide", None)
+            if callable(hide_widget):
+                hide_widget()
             if callable(remove_cell_widget):
                 remove_cell_widget(row, column)
             delete_later = getattr(widget, "deleteLater", None)
@@ -1050,7 +1053,7 @@ def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list
 def _routine_tree_stock_metric_values(
     window,
     stock: dict[str, object],
-) -> tuple[tuple[object, ...], str, str, str | None]:
+) -> tuple[tuple[object, ...], str, str, str | None, dict[str, int]]:
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
     state = (
@@ -1074,7 +1077,7 @@ def _routine_tree_stock_metric_values(
         )
     )
     current_price = current_price_from_state(state)
-    holding_metric, price_metric, profit_metric, pending_metric, _profit_amount, profit_rate = (
+    holding_metric, price_metric, profit_metric, pending_metric, profit_amount, profit_rate = (
         stock_position_metric_values(
             holding_qty=holding_qty,
             avg_price=avg_price,
@@ -1083,6 +1086,7 @@ def _routine_tree_stock_metric_values(
             sell_pending_qty=sell_pending_qty,
         )
     )
+    profit_metric = replace(profit_metric, label="수익")
     buy_limit_enabled, buy_limit_amount = stock_buy_limit_config(stock)
     limit_text = routine_instance_buy_limit_text(
         enabled=buy_limit_enabled,
@@ -1117,7 +1121,27 @@ def _routine_tree_stock_metric_values(
     ]
     if consumed_metric is not None:
         metrics.append(consumed_metric)
-    return tuple(metrics), routine_profit_led_state_from_signal(signal), limit_text, consumed_text
+    sort_values = {
+        "holding": holding_qty,
+        "price": current_price,
+        "profit": int(round(profit_amount)),
+        "pending": buy_pending_qty + sell_pending_qty,
+        "limit": (
+            safe_int_value(buy_limit_amount)
+            if routine_instance_buy_limit_configured(
+                enabled=buy_limit_enabled,
+                amount=buy_limit_amount,
+            )
+            else 0
+        ),
+    }
+    return (
+        tuple(metrics),
+        routine_profit_led_state_from_signal(signal),
+        limit_text,
+        consumed_text,
+        sort_values,
+    )
 
 
 def _routine_tree_stock_row(
@@ -1128,10 +1152,13 @@ def _routine_tree_stock_row(
     stock: dict[str, object],
 ) -> dict[str, object]:
     stock_values = _routine_tree_stock_display_values(window, stock)
-    stock_metrics, stock_profit_led, limit_text, consumed_text = _routine_tree_stock_metric_values(
-        window,
-        stock,
-    )
+    (
+        stock_metrics,
+        stock_profit_led,
+        limit_text,
+        consumed_text,
+        sort_values,
+    ) = _routine_tree_stock_metric_values(window, stock)
     stock_values = [
         *stock_values,
         limit_text,
@@ -1146,6 +1173,7 @@ def _routine_tree_stock_row(
         "stock_values": stock_values,
         "stock_metrics": stock_metrics,
         "stock_profit_led": stock_profit_led,
+        "sort_metrics": sort_values,
         "stock_path": str(stock.get("stock_path", "") or ""),
         "enabled": bool(stock.get("enabled", True)),
         "description": "",
@@ -1192,6 +1220,35 @@ def main_load_routine_table(window) -> None:
         for instance in instances
     }
     sync_routine_selection_state(window, definitions, instances)
+    display_level = str(
+        getattr(window, "_main_routine_display_level", "") or ""
+    ).strip()
+    if (
+        display_level in {"group", "routine", "stock"}
+        and not bool(
+            getattr(window, "_main_routine_display_level_applied", False)
+        )
+    ):
+        definition_ids = {
+            str(definition.definition_id) for definition in definitions
+        }
+        instance_ids = {str(instance.instance_id) for instance in instances}
+        if display_level == "group":
+            window._collapsed_routine_definition_ids.update(definition_ids)
+        elif display_level == "routine":
+            window._collapsed_routine_definition_ids.difference_update(
+                definition_ids
+            )
+            window._collapsed_routine_instance_ids.update(instance_ids)
+        else:
+            window._collapsed_routine_definition_ids.difference_update(
+                definition_ids
+            )
+            window._collapsed_routine_instance_ids.difference_update(
+                instance_ids
+            )
+        window._main_routine_display_level_applied = True
+
     by_definition: dict[str, list[object]] = {}
     for instance in instances:
         by_definition.setdefault(instance.definition_id, []).append(instance)
@@ -1275,6 +1332,17 @@ def main_load_routine_table(window) -> None:
                 }
             )
 
+        if bool(getattr(window, "_main_routine_valid_only", False)):
+            if display_level == "group":
+                if not children:
+                    continue
+            else:
+                children = [
+                    child for child in children if child.get("stocks")
+                ]
+                if not children:
+                    continue
+
         parent_registered = sum(int(item["registered"]) for item in children)
         parent_running = sum(int(item["running"]) for item in children)
         parent_error = sum(int(item["error"]) for item in children)
@@ -1311,8 +1379,38 @@ def main_load_routine_table(window) -> None:
                 reverse=reverse,
             )
 
+    metric_sort_key = str(
+        getattr(window, "_main_routine_metric_sort_key", "") or ""
+    ).strip()
+    if (
+        display_level == "stock"
+        and bool(getattr(window, "_main_routine_metric_sort_active", False))
+        and metric_sort_key
+        in {"holding", "price", "profit", "pending", "limit"}
+    ):
+        for group in groups:
+            for child in group["children"]:
+                child["stocks"].sort(
+                    key=lambda stock: int(
+                        stock.get("sort_metrics", {}).get(
+                            metric_sort_key,
+                            0,
+                        )
+                        or 0
+                    ),
+                    reverse=True,
+                )
+
     rows: list[dict[str, object]] = []
+    flat_valid_stock_list = (
+        display_level == "stock"
+        and bool(getattr(window, "_main_routine_valid_only", False))
+    )
     for group in groups:
+        if flat_valid_stock_list:
+            for child in group["children"]:
+                rows.extend(child.get("stocks", []))
+            continue
         rows.append(group)
         if not group["collapsed"]:
             for child in group["children"]:
@@ -1406,12 +1504,7 @@ def main_load_routine_table(window) -> None:
             item.setData(ROUTINE_STOCK_PROFIT_LED_ROLE, row_data.get("stock_profit_led", "gray"))
             item.setData(ROUTINE_STOCK_PATH_ROLE, row_data.get("stock_path", ""))
             if col == 0:
-                if is_parent or is_child:
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                else:
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, row_visually_enabled)
                 if is_parent:
                     item.setData(ROUTINE_PARENT_NAME_ROLE, str(row_data["name"]))
