@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -144,6 +146,108 @@ class AutoTradeGuiE2ESyncTest(unittest.TestCase):
         stock_register.refresh_stock_table.assert_called_once_with()
         main.refresh_all.assert_called_once_with()
         auto_trade_setting.refresh_all.assert_called_once_with()
+
+    def test_emergency_stop_refreshes_monitoring_and_open_settings(self) -> None:
+        import gui_main_emergency_ops as emergency
+
+        status_bar = SimpleNamespace(showMessage=Mock())
+        main = SimpleNamespace(
+            all_runtime_stock_dirs=lambda: [],
+            refresh_auto_trade_assignment_views=Mock(),
+            refresh_all=Mock(),
+            statusBar=lambda: status_bar,
+        )
+
+        with (
+            patch.object(emergency, "append_changelog"),
+            patch.object(emergency, "show_toast") as toast,
+            patch.object(emergency.QMessageBox, "information") as information,
+        ):
+            emergency.execute_emergency_stop(main)
+
+        main.refresh_auto_trade_assignment_views.assert_called_once_with()
+        main.refresh_all.assert_not_called()
+        toast.assert_called_once_with(
+            parent=main,
+            message="긴급정지 완료 | 대상종목 : 0개 | 매수/매도 : 차단",
+            duration_ms=2500,
+            position="center",
+        )
+        information.assert_not_called()
+
+    def test_emergency_release_refreshes_monitoring_and_open_settings(self) -> None:
+        import gui_main_emergency_ops as emergency
+
+        status_bar = SimpleNamespace(showMessage=Mock())
+        main = SimpleNamespace(
+            all_runtime_stock_dirs=lambda: [],
+            refresh_auto_trade_assignment_views=Mock(),
+            refresh_all=Mock(),
+            statusBar=lambda: status_bar,
+        )
+
+        with (
+            patch.object(emergency, "append_changelog"),
+            patch.object(emergency, "show_toast") as toast,
+            patch.object(emergency.QMessageBox, "information") as information,
+        ):
+            emergency.release_emergency_stop(main)
+
+        main.refresh_auto_trade_assignment_views.assert_called_once_with()
+        main.refresh_all.assert_not_called()
+        toast.assert_called_once_with(
+            parent=main,
+            message="정지해제 완료 | 감시/대기 전환 : 0종목 | 검토관리 : 0종목",
+            duration_ms=2500,
+            position="center",
+        )
+        information.assert_not_called()
+
+    def test_emergency_release_does_not_count_existing_review_as_moved(self) -> None:
+        import gui_main_emergency_ops as emergency
+
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "000660_SK하이닉스"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "EMERGENCY_STOPPED",
+                        "review_required": True,
+                        "review_status": "PENDING",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status_bar = SimpleNamespace(showMessage=Mock())
+            main = SimpleNamespace(
+                all_runtime_stock_dirs=lambda: [stock_dir],
+                routine_name_for_stock_dir=lambda _stock_dir: "루틴",
+                production_recovery_stock_is_review_required=lambda _code: True,
+                refresh_auto_trade_assignment_views=Mock(),
+                statusBar=lambda: status_bar,
+            )
+
+            with (
+                patch.object(
+                    emergency,
+                    "emergency_review_reason_for_stock",
+                    return_value=(True, "검토 유지"),
+                ),
+                patch.object(
+                    emergency,
+                    "update_runtime_stock_status",
+                    return_value=True,
+                ),
+                patch.object(emergency, "append_changelog"),
+                patch.object(emergency, "show_toast") as toast,
+            ):
+                emergency.release_emergency_stop(main)
+
+        self.assertEqual(
+            "정지해제 완료 | 감시/대기 전환 : 0종목 | 검토관리 : 0종목",
+            toast.call_args.kwargs["message"],
+        )
 
 
 if __name__ == "__main__":

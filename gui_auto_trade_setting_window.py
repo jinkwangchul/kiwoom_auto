@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 from copy import deepcopy
@@ -58,6 +59,8 @@ from PyQt5.QtWidgets import (
     QWidget,
     QHeaderView,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 from gui_styles import (
     apply_plain_table_header,
@@ -142,6 +145,7 @@ from runtime_io import (
     write_json_if_missing,
 )
 from gui_auto_trade_runtime import (
+    all_registered_stock_dirs,
     now_text,
     parse_stock_folder_name,
     get_stock_dirs_in_routine,
@@ -209,6 +213,7 @@ from gui_auto_trade_display import (
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_policy import (
     auto_trade_setting_ats_after_regular_blocked,
+    auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_no_next_step_notice,
@@ -289,6 +294,10 @@ from gui_auto_trade_timer import (
     auto_trade_on_runtime_file_timer_tick,
     auto_trade_on_time_policy_timer_tick,
 )
+from production_recovery_timer_lifecycle import (
+    start_recovery_bound_timers,
+    stop_recovery_bound_timers,
+)
 from gui_auto_trade_status_ops import (
     auto_trade_operation_policy_protected_status,
     auto_trade_recalculate_all_status_by_operation_policy,
@@ -302,7 +311,9 @@ from gui_auto_trade_status_ops import (
 )
 from gui_auto_trade_run_control import (
     auto_trade_start_selected_auto_trades,
+    auto_trade_start_status_indicator,
     auto_trade_stop_selected_auto_trades,
+    startup_recovery_operation_block_message,
 )
 from gui_auto_trade_review_ops import (
     auto_trade_open_review_required_window,
@@ -1057,7 +1068,6 @@ def default_operation_policy() -> dict[str, object]:
         "scheduled_operation": {
             "default_start_time": "09:00:00",
             "default_end_buy_time": "13:30:00",
-            "after_buy_end_status": "감시/매도",
         },
         "manual_operation": {
             "use_regular_market": True,
@@ -1104,6 +1114,9 @@ def read_operation_policy() -> dict[str, object]:
             merged[key].update(value)  # type: ignore[index]
         else:
             merged[key] = value
+    scheduled = merged.get("scheduled_operation")
+    if isinstance(scheduled, dict):
+        scheduled.pop("after_buy_end_status", None)
     return merged
 
 
@@ -1241,7 +1254,7 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table = QTableWidget()
         self.stock_table.setObjectName("autoTradeSettingStockTable")
 
-        self.btn_start = QPushButton("매매시작")
+        self.btn_start = QPushButton("▶ 운영시작")
         self.btn_stop = QPushButton("강제종료")
         self.btn_stop.setStyleSheet("color: #dc2626; font-weight: bold;")
         self.btn_early_close = QPushButton("조기마감")
@@ -1304,7 +1317,7 @@ class AutoTradeSettingWindow(QDialog):
         ):
             button.setVisible(False)
         self.btn_set_schedule = QPushButton("환경설정")
-        self.btn_delete = QPushButton("등록 해제")
+        self.btn_stock_register = QPushButton("종목등록")
         self.btn_order_view = QPushButton("주문상태 보기")
         self.btn_log_view = QPushButton("로그 보기")
         self.btn_review_view = QPushButton("검토관리")
@@ -1325,7 +1338,7 @@ class AutoTradeSettingWindow(QDialog):
             (self.btn_manual_queue_commit, "autoTradeSettingManualQueueCommitButton"),
             (self.btn_fetch_minute_candles, "autoTradeSettingFetchMinuteCandlesButton"),
             (self.btn_set_schedule, "autoTradeSettingScheduleButton"),
-            (self.btn_delete, "autoTradeSettingDeleteButton"),
+            (self.btn_stock_register, "autoTradeSettingStockRegisterButton"),
             (self.btn_order_view, "autoTradeSettingOrderViewButton"),
             (self.btn_log_view, "autoTradeSettingLogViewButton"),
             (self.btn_review_view, "autoTradeSettingReviewViewButton"),
@@ -1395,8 +1408,6 @@ class AutoTradeSettingWindow(QDialog):
         self._set_routine_tree_display_level(self._routine_tree_display_level)
         self.update_startup_recovery_controls()
         self._runtime_file_snapshot = self.current_runtime_file_signature()
-        self._time_policy_timer.start()
-        self._runtime_file_timer.start()
 
     def _setup_ui(self) -> None:
         main_layout = QVBoxLayout()
@@ -1468,7 +1479,7 @@ class AutoTradeSettingWindow(QDialog):
         buttons = [
             self.btn_start,
             self.btn_set_schedule,
-            self.btn_delete,
+            self.btn_stock_register,
             self.btn_order_view,
             self.btn_log_view,
             self.btn_review_view,
@@ -1961,6 +1972,9 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.horizontalHeader().sectionClicked.connect(self.sort_stock_table_by_column)
         self.stock_table.itemDoubleClicked.connect(self.on_stock_table_item_double_clicked)
+        self.stock_table.itemDoubleClicked.connect(
+            self.on_stock_table_name_item_double_clicked
+        )
         self.stock_table.customContextMenuRequested.connect(self.on_stock_table_context_menu)
         self.btn_refresh.clicked.connect(self.run_current_routine_stability_check)
         self.btn_close.clicked.connect(self.close)
@@ -1978,7 +1992,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_all_stocks.clicked.connect(self.show_all_registered_stocks)
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
-        self.btn_delete.clicked.connect(self.unregister_selected_auto_trade_stocks)
+        self.btn_stock_register.clicked.connect(self.open_stock_register_window)
         self.btn_order_view.clicked.connect(self.open_order_status_window)
         self.btn_log_view.clicked.connect(self.open_log_view_window)
         self.btn_review_view.clicked.connect(self.open_review_required_window)
@@ -2056,7 +2070,7 @@ class AutoTradeSettingWindow(QDialog):
 
     def refresh_all(self) -> None:
         # 자동매매설정 창 전체 갱신 전 하단 종목표 위치를 보존한다.
-        # 시간변경/매매시작/강제종료 후 종목표가 맨 위로 튀는 문제를 막는다.
+        # 시간변경/운영시작/강제종료 후 종목표가 맨 위로 튀는 문제를 막는다.
         selected_stock_paths, stock_scroll_value = self.capture_stock_table_view_state()
 
         normalize_base_stock_single_routine_file()
@@ -2092,17 +2106,25 @@ class AutoTradeSettingWindow(QDialog):
         previous_snapshot = self._runtime_file_snapshot
         try:
             auto_trade_on_runtime_file_timer_tick(self)
-        except Exception as exc:
+        except Exception:
+            LOGGER.exception("Runtime file timer refresh failed")
             self._runtime_file_snapshot = previous_snapshot
-            self.statusBarMessage(f"runtime 파일 자동 갱신 실패: {exc}")
+            self.statusBarMessage(
+                "Runtime 상태를 갱신하지 못했습니다. "
+                "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
+            )
 
     def on_time_policy_timer_tick(self) -> None:
         previous_minute_key = self._last_time_policy_minute_key
         try:
             auto_trade_on_time_policy_timer_tick(self)
-        except Exception as exc:
+        except Exception:
+            LOGGER.exception("Time policy timer refresh failed")
             self._last_time_policy_minute_key = previous_minute_key
-            self.statusBarMessage(f"시간정책 자동 갱신 실패: {exc}")
+            self.statusBarMessage(
+                "시간정책 상태를 갱신하지 못했습니다. "
+                "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
+            )
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         parent = self.parent()
@@ -2114,8 +2136,23 @@ class AutoTradeSettingWindow(QDialog):
         except Exception:
             return False
 
+    def rebind_startup_recovery_after_trusted_runtime_update(self) -> bool:
+        parent = self.parent()
+        rebind = getattr(
+            parent,
+            "rebind_startup_recovery_after_trusted_runtime_update",
+            None,
+        )
+        if not callable(rebind):
+            return False
+        try:
+            return bool(rebind())
+        except Exception:
+            return False
+
     def require_startup_recovery_session(self, action: str) -> bool:
         if self.startup_recovery_session_ready(refresh=True):
+            self._last_operation_block_reason = ""
             return True
         parent = self.parent()
         reason_getter = getattr(parent, "startup_recovery_block_reason", None)
@@ -2125,12 +2162,64 @@ class AutoTradeSettingWindow(QDialog):
                 reason = str(reason_getter() or "").strip()
             except Exception:
                 reason = ""
-        message = f"{action} 차단: Startup Recovery 운영 재개 확인이 필요합니다."
-        if reason:
-            message += f" ({reason})"
+        self._last_operation_block_reason = reason or "RECOVERY_NOT_READY"
+        message = startup_recovery_operation_block_message(action, reason)
         self.statusBarMessage(message)
         self.update_startup_recovery_controls()
         return False
+
+    def start_target_is_review_isolated(
+        self,
+        stock_dir: Path,
+        stock_code: str,
+    ) -> bool:
+        if is_review_required_stock_dir(stock_dir):
+            return True
+        parent = self.parent()
+        checker = getattr(
+            parent,
+            "production_recovery_stock_is_review_required",
+            None,
+        )
+        return bool(checker(stock_code)) if callable(checker) else False
+
+    def filter_start_targets_by_recovery(
+        self,
+        targets: list[tuple[Path, str, str]],
+        *,
+        action: str,
+    ) -> dict[str, object]:
+        parent = self.parent()
+        filter_targets = getattr(
+            parent,
+            "filter_start_targets_by_production_recovery",
+            None,
+        )
+        if callable(filter_targets):
+            result = filter_targets(targets, caller_name=action)
+            if result.get("allowed") is not True:
+                reason = str(result.get("reason") or "RECOVERY_NOT_READY")
+                user_message = str(result.get("user_message") or "").strip()
+                self._last_operation_block_reason = reason
+                self._last_operation_user_message = (
+                    user_message
+                    or startup_recovery_operation_block_message(action, reason)
+                )
+                self.statusBarMessage(self._last_operation_user_message)
+            return result
+        if self.require_startup_recovery_session(action):
+            return {
+                "allowed": True,
+                "reason": "RECOVERY_COMPLETED",
+                "eligible": tuple(targets),
+                "excluded_review": (),
+            }
+        return {
+            "allowed": False,
+            "reason": self._last_operation_block_reason or "RECOVERY_NOT_READY",
+            "eligible": (),
+            "excluded_review": (),
+        }
 
     def update_startup_recovery_controls(self) -> None:
         ready = self.startup_recovery_session_ready(refresh=False)
@@ -2147,19 +2236,27 @@ class AutoTradeSettingWindow(QDialog):
             self.update_manual_queue_commit_button_state()
         else:
             self.btn_manual_queue_commit.setEnabled(False)
-            self.btn_start.setEnabled(False)
+        self.update_global_operation_button_state()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if not self._time_policy_timer.isActive():
-            self._time_policy_timer.start()
-        if not self._runtime_file_timer.isActive():
-            self._runtime_file_timer.start()
+
+    def start_periodic_timers_after_recovery(self, identity) -> dict[str, object]:
+        """Start existing timers only through the approved Recovery lifecycle."""
+        return start_recovery_bound_timers(
+            identity=identity,
+            timers=(self._time_policy_timer, self._runtime_file_timer),
+        )
+
+    def stop_periodic_timers_for_recovery(self) -> dict[str, object]:
+        """Stop existing timers when login/account/day Recovery context changes."""
+        return stop_recovery_bound_timers(
+            (self._time_policy_timer, self._runtime_file_timer)
+        )
 
     def closeEvent(self, event) -> None:
         """창을 닫을 때 주기 갱신 타이머를 정리한다."""
-        self._time_policy_timer.stop()
-        self._runtime_file_timer.stop()
+        self.stop_periodic_timers_for_recovery()
         super().closeEvent(event)
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
@@ -2220,19 +2317,100 @@ class AutoTradeSettingWindow(QDialog):
         has_stock = self.has_selected_stock()
         single_stock = self.has_single_selected_stock()
 
-        recovery_ready = self.startup_recovery_session_ready(refresh=False)
-        self.btn_start.setEnabled(has_stock and recovery_ready)
         self.btn_stop.setEnabled(has_stock)
         self.btn_early_close.setEnabled(has_stock)
         self.btn_set_schedule.setEnabled(True)
-        self.btn_delete.setEnabled(has_stock)
+        self.btn_stock_register.setEnabled(True)
         self.btn_order_view.setEnabled(single_stock)
         self.btn_log_view.setEnabled(single_stock)
         self.btn_review_view.setEnabled(True)
         self.update_startup_recovery_controls()
 
+    def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
+        targets: list[tuple[Path, str, str]] = []
+        for stock_dir in all_registered_stock_dirs():
+            code, name = parse_stock_folder_name(stock_dir.name)
+            if code:
+                targets.append((stock_dir, code, name))
+        return targets
+
+    def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
+        running: list[tuple[Path, str, str]] = []
+        for target in self.registered_operation_targets():
+            state = read_json_dict(target[0] / "state.json")
+            persisted_started = auto_trade_setting_trade_started(state)
+            if auto_trade_setting_current_session_trade_started(
+                self,
+                persisted_started,
+            ):
+                running.append(target)
+        return running
+
+    def update_global_operation_button_state(self) -> None:
+        registered = self.registered_operation_targets()
+        running = self.running_registered_operation_targets()
+        if running:
+            text = "■ 운영중지"
+            foreground = "#B91C1C"
+            background = "#FEF2F2"
+            hover_background = "#FEE2E2"
+        else:
+            text = "▶ 운영시작"
+            foreground = "#15803D"
+            background = "#F0FDF4"
+            hover_background = "#DCFCE7"
+
+        self.btn_start.setText(text)
+        self.btn_start.setStyleSheet(
+            "QPushButton {"
+            f"color: {foreground};"
+            f"border: 1px solid {foreground};"
+            f"background-color: {background};"
+            "font-weight: 600;"
+            "}"
+            "QPushButton:hover {"
+            f"color: {foreground};"
+            f"border-color: {foreground};"
+            f"background-color: {hover_background};"
+            "}"
+            "QPushButton:pressed {"
+            f"color: {foreground};"
+            f"border-color: {foreground};"
+            f"background-color: {hover_background};"
+            "}"
+            "QPushButton:disabled {"
+            "color: #9CA3AF;"
+            "border-color: #D1D5DB;"
+            "background-color: #F3F4F6;"
+            "}"
+        )
+        self.btn_start.setEnabled(bool(running or registered))
+
     def on_stock_selection_changed(self) -> None:
         self.update_action_buttons()
+
+    def stock_info_from_row(self, row: int) -> tuple[Path, str, str] | None:
+        stock_dir = self.operation_stock_dir_from_row(row)
+        code_item = self.stock_table.item(row, 0)
+        name_item = self.stock_table.item(row, 1)
+        if stock_dir is None or code_item is None or name_item is None:
+            return None
+        return stock_dir, code_item.text().strip(), name_item.text().strip()
+
+    def on_stock_table_name_item_double_clicked(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        if item.column() != 1:
+            return
+        target = self.stock_info_from_row(item.row())
+        if target is None:
+            return
+        auto_trade_start_status_indicator(
+            self,
+            target,
+            source="auto_trade_stock_name_double_click",
+        )
 
     def operation_stock_dir_from_row(self, row: int) -> Path | None:
         code_item = self.stock_table.item(row, 0)
@@ -6789,6 +6967,190 @@ class AutoTradeSettingWindow(QDialog):
             },
         }
 
+    def queue_pending_order_cancellations_for_stock_automatically(
+        self,
+        code: str,
+        routine_instance_id: str,
+        *,
+        trading_day: str,
+        started_at: str,
+    ) -> dict[str, object]:
+        """Queue and dispatch cancel requests through the existing final gate."""
+
+        clean_code = str(code or "").strip()
+        clean_routine_id = str(routine_instance_id or "").strip()
+        clean_trading_day = str(trading_day or "").strip()
+        clean_started_at = str(started_at or "").strip()
+        result: dict[str, object] = {
+            "ok": False,
+            "code": clean_code,
+            "routine_instance_id": clean_routine_id,
+            "trading_day": clean_trading_day,
+            "started_at": clean_started_at,
+            "cancel_requested": 0,
+            "cancel_pending": 0,
+            "blocked_reasons": [],
+            "results": [],
+        }
+        blocked = result["blocked_reasons"]
+        if not clean_code:
+            blocked.append("stock code is required")
+        if not clean_routine_id:
+            blocked.append("routine instance id is required")
+        if blocked:
+            return result
+
+        queue_path = ORDER_QUEUE_PATH
+        _data, orders, issues = self._queue_data_for_manual_order_action(
+            queue_path
+        )
+        if issues:
+            blocked.extend(issues)
+            return result
+
+        pending_statuses = {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}
+        matching_code_orders = [
+            item
+            for item in orders
+            if isinstance(item, dict)
+            and str(item.get("code") or "").strip() == clean_code
+            and str(item.get("status") or "").strip().upper()
+            in pending_statuses
+        ]
+        if not matching_code_orders:
+            result["ok"] = True
+            return result
+
+        try:
+            scope_started_at = datetime.fromisoformat(clean_started_at)
+        except ValueError:
+            blocked.append(
+                "matching stock pending order cannot be scoped without trade_started_at"
+            )
+            return result
+        if scope_started_at.date().isoformat() != clean_trading_day:
+            blocked.append(
+                "matching stock pending order trading day and start time do not match"
+            )
+            return result
+
+        sources: list[dict[str, object]] = []
+        for record in matching_code_orders:
+            if str(record.get("routine") or "").strip() != clean_routine_id:
+                blocked.append(
+                    "matching stock pending order lacks the required routine instance identity"
+                )
+                continue
+            try:
+                created_at = datetime.fromisoformat(
+                    str(record.get("created_at") or "").strip()
+                )
+            except ValueError:
+                blocked.append(
+                    "matching stock pending order lacks a valid created_at identity"
+                )
+                continue
+            if created_at.date().isoformat() != clean_trading_day:
+                continue
+            if created_at < scope_started_at:
+                continue
+            order_action = str(record.get("order_action") or "").strip().upper()
+            if order_action not in {"NEW", "MODIFY"}:
+                blocked.append(
+                    "matching stock pending order lacks a valid order action"
+                )
+                continue
+            if str(record.get("side") or "").strip().upper() not in {
+                "BUY",
+                "SELL",
+            }:
+                blocked.append(
+                    "matching stock pending order lacks a valid order side"
+                )
+                continue
+            sources.append(deepcopy(record))
+
+        if blocked:
+            return result
+        if not sources:
+            result["ok"] = True
+            return result
+
+        for source_order in sources:
+            broker_order_no = str(
+                source_order.get("broker_order_no") or ""
+            ).strip()
+            try:
+                remaining_quantity = int(
+                    source_order.get("remaining_quantity") or 0
+                )
+            except (TypeError, ValueError):
+                remaining_quantity = 0
+            if not broker_order_no or remaining_quantity <= 0:
+                blocked.append(
+                    "cancelable order requires broker_order_no and positive remaining_quantity"
+                )
+                continue
+            if self._pending_cancel_duplicate_reason(orders, broker_order_no):
+                result["cancel_pending"] = int(result["cancel_pending"]) + 1
+                continue
+
+            snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
+            preview = self._build_manual_cancel_order_queued_preview(
+                source_order,
+                queue_revision=snapshot.get("revision"),
+            )
+            current_snapshot = AutoTradeSettingWindow.queue_file_snapshot(
+                queue_path
+            )
+            if snapshot.get("sha256") != current_snapshot.get("sha256"):
+                blocked.append("queue file changed before cancel commit")
+                continue
+            commit_result = commit_execution_queue_write(
+                preview,
+                queue_path,
+                context={
+                    "manual_queue_write_confirmed": True,
+                    "manual_pending_cancel_confirmed": True,
+                },
+                expected_revision=current_snapshot.get("revision"),
+            )
+            if (
+                commit_result.get("committed") is not True
+                or commit_result.get("post_write_verified") is not True
+            ):
+                blocked.extend(
+                    list(
+                        commit_result.get("blocked_reasons")
+                        or ["cancel queue commit failed"]
+                    )
+                )
+                continue
+
+            cancel_record = preview["order_queued_record_preview"]
+            send_result = self.send_order_for_order_queued_automatically(
+                str(cancel_record.get("id") or ""),
+                queue_path=queue_path,
+                source_order=source_order,
+            )
+            result["results"].append(send_result)
+            if (
+                send_result.get("queue_result_recorded") is True
+                or send_result.get("send_order_called") is True
+            ):
+                result["cancel_requested"] = int(result["cancel_requested"]) + 1
+            else:
+                blocked.extend(
+                    list(
+                        send_result.get("blocked_reasons")
+                        or send_result.get("issues")
+                        or ["cancel SendOrder pipeline blocked"]
+                    )
+                )
+
+        result["ok"] = not blocked
+        return result
+
     def _build_manual_modify_order_queued_preview(
         self,
         source_order: dict[str, object],
@@ -7451,8 +7813,33 @@ class AutoTradeSettingWindow(QDialog):
         state = runtime.get("state")
         state_dict = state if isinstance(state, dict) else {}
         status = str(state_dict.get("status") or "").strip().upper()
+        execution_request = order.get("execution_request")
+        execution_request_dict = (
+            execution_request if isinstance(execution_request, dict) else {}
+        )
+        request_preview = execution_request_dict.get("request_preview")
+        request_preview_dict = (
+            request_preview if isinstance(request_preview, dict) else {}
+        )
+        side = str(
+            request_preview_dict.get("side") or order.get("side") or ""
+        ).strip().upper()
+        order_action = str(
+            request_preview_dict.get("order_action")
+            or order.get("order_action")
+            or "NEW"
+        ).strip().upper()
+        close_sell_status = (
+            (side == "SELL" or order_action == "CANCEL")
+            and status in {
+                "EARLY_CLOSE",
+                "EARLY_CLOSING",
+                "AUTO_CLOSE",
+                "AUTO_CLOSING",
+            }
+        )
         reasons: list[str] = []
-        if status != "RUNNING":
+        if status != "RUNNING" and not close_sell_status:
             reasons.append("auto trade status is not RUNNING")
         if state_dict.get("trade_enabled") is not True:
             reasons.append("trade_enabled is not true")
@@ -8132,6 +8519,16 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("환경설정 저장 완료")
             self.refresh_all()
 
+    def open_stock_register_window(self) -> None:
+        """관제창과 동일한 중앙 종목 등록 창을 연다."""
+        from gui_stock_register_window import StockRegisterWindow
+
+        self.stock_register_window = StockRegisterWindow(self)
+        self.stock_register_window.finished.connect(
+            lambda _result: self.refresh_all()
+        )
+        self.stock_register_window.show()
+
     def open_selected_stock_policy_settings(self) -> None:
         """종목 우클릭용 개별종목 설정 창."""
         selected = self.selected_stock_info()
@@ -8212,12 +8609,12 @@ class AutoTradeSettingWindow(QDialog):
         selected: list[tuple[Path, str, str]],
     ) -> tuple[list[tuple[Path, str, str]], list[str]]:
         """
-        매매시작 대상과 제외 대상을 분리한다.
+        운영시작 대상과 제외 대상을 분리한다.
 
         정책:
-        - STOPPED: 강제종료/정지 상태이므로 매매시작 가능
+        - STOPPED: 강제종료/정지 상태이므로 운영시작 가능
         - MONITORING/WATCHING/WATCH/WATCH_BUY: 화면상 감시/대기지만 주문 비활성 상태이므로
-          매매시작 버튼으로 현재 시간/운영방식에 맞게 재판정 가능
+          운영시작 버튼으로 현재 시간/운영방식에 맞게 재판정 가능
         - RUNNING/SELL_ONLY/REVIEW_REQUIRED/EMERGENCY 계열은 보호 상태로 제외
         """
         targets: list[tuple[Path, str, str]] = []
@@ -8236,6 +8633,9 @@ class AutoTradeSettingWindow(QDialog):
         }
 
         for stock_dir, code, name in selected:
+            if self.start_target_is_review_isolated(stock_dir, code):
+                skipped.append(f"{code} {name}(검토종목)")
+                continue
             state = read_json_dict(stock_dir / "state.json")
             status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
             if status in start_allowed_statuses:
@@ -8404,7 +8804,29 @@ class AutoTradeSettingWindow(QDialog):
         dialog.exec_()
 
     def start_selected_auto_trades(self) -> None:
-        auto_trade_start_selected_auto_trades(self)
+        running_targets = self.running_registered_operation_targets()
+        if running_targets:
+            auto_trade_stop_selected_auto_trades(
+                self,
+                selected_targets=running_targets,
+                source="auto_trade_global_stop_button",
+            )
+        else:
+            auto_trade_start_selected_auto_trades(
+                self,
+                request_scope="multiple",
+                selected_targets=self.registered_operation_targets(),
+                source="auto_trade_global_start_button",
+            )
+        self.update_global_operation_button_state()
+
+    def start_selected_rows_auto_trades(self) -> None:
+        auto_trade_start_selected_auto_trades(
+            self,
+            request_scope="multiple",
+            selected_targets=self.selected_stock_infos(),
+            source="auto_trade_context_menu",
+        )
 
 
     def apply_selected_early_close_default(self, checked: bool = False) -> None:

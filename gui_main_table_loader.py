@@ -15,8 +15,10 @@ gui_main_table_loader.py
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 import json
 from pathlib import Path
+from typing import Callable
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QFontMetrics
@@ -25,6 +27,7 @@ from PyQt5.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QStacke
 from gui_table_utils import next_sort_order
 from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
+from execution_fill_recorder import read_execution_fill_records
 from gui_stock_data import stock_runtime_dir_for_routine
 from gui_order_utils import (
     directional_value_color,
@@ -117,7 +120,9 @@ def main_monitoring_cell_font() -> QFont:
     return _main_monitoring_font(MAIN_MONITORING_CELL_FONT_FAMILY)
 
 
-ROUTINE_STATUS_DEFAULT = "기본운영"
+ROUTINE_STATUS_RUNNING = "운  영"
+ROUTINE_STATUS_STOPPED = "정  지"
+ROUTINE_STATUS_DEFAULT = ROUTINE_STATUS_STOPPED
 ROUTINE_STATUS_EARLY_CLOSE = "조기마감"
 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION = "즉시청산"
 ROUTINE_STATUS_COMPLETED = "매매완료"
@@ -126,11 +131,8 @@ ROUTINE_COMPLETION_STATUSES = frozenset(
     {ROUTINE_STATUS_COMPLETED, ROUTINE_STATUS_PARTIAL_COMPLETION}
 )
 ROUTINE_STATUS_STAMP_COLORS = {
-    ROUTINE_STATUS_DEFAULT: "#2563EB",
-    ROUTINE_STATUS_IMMEDIATE_LIQUIDATION: "#DC2626",
-    ROUTINE_STATUS_EARLY_CLOSE: "#D97706",
-    ROUTINE_STATUS_COMPLETED: "#16A34A",
-    ROUTINE_STATUS_PARTIAL_COMPLETION: "#7C3AED",
+    ROUTINE_STATUS_RUNNING: "#16A34A",
+    ROUTINE_STATUS_STOPPED: "#DC2626",
 }
 
 ROUTINE_ROW_KIND_ROLE = Qt.UserRole + 201
@@ -151,6 +153,7 @@ ROUTINE_STOCK_VALUES_ROLE = Qt.UserRole + 215
 ROUTINE_STOCK_PATH_ROLE = Qt.UserRole + 216
 ROUTINE_STOCK_METRICS_ROLE = Qt.UserRole + 217
 ROUTINE_STOCK_PROFIT_LED_ROLE = Qt.UserRole + 218
+ROUTINE_STOCK_INITIAL_BUY_ROLE = Qt.UserRole + 219
 ROUTINE_ROW_PARENT = "definition"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
@@ -158,7 +161,7 @@ ROUTINE_PARENT_CHECKBOX_OFFSET = 4
 ROUTINE_CHILD_CHECKBOX_OFFSET = 24
 ROUTINE_STOCK_CHECKBOX_OFFSET = 45
 ROUTINE_STOCK_TEXT_OFFSET = ROUTINE_STOCK_CHECKBOX_OFFSET
-ROUTINE_STOCK_BASE_COLUMN_WIDTHS = (214, 116, 34, 104, 58, 120)
+ROUTINE_STOCK_BASE_COLUMN_WIDTHS = (214, 176, 116, 34, 104, 58, 120)
 MAIN_STOCK_METRIC_LAYOUT_PREVIEW = False
 ROUTINE_CHECKBOX_SIZE = 16
 ROUTINE_PROFIT_LED_BOX_SIZE = 18
@@ -281,7 +284,7 @@ def routine_stock_position_value_widths(font: QFont | None = None) -> dict[str, 
             money_width,
             rate_width,
         ),
-        "미체결": (
+        "매매": (
             metrics.horizontalAdvance("9999"),
             metrics.horizontalAdvance("9999"),
         ),
@@ -301,7 +304,7 @@ def routine_stock_column_widths(font: QFont | None = None) -> tuple[int, ...]:
             font=font,
             outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
         )
-        for label in ("보유", "가격", "수익", "미체결")
+        for label in ("보유", "가격", "수익", "매매")
     )
     instance_widths = routine_instance_grid_columns(font)
     return (
@@ -313,6 +316,130 @@ def routine_stock_column_widths(font: QFont | None = None) -> tuple[int, ...]:
 
 
 ROUTINE_STOCK_COLUMN_WIDTHS = (*ROUTINE_STOCK_BASE_COLUMN_WIDTHS, 174, 154, 174, 110, 148, 226)
+RUNTIME_FILLS_PATH = Path(__file__).resolve().parent / "runtime" / "fills.json"
+
+
+def stock_trade_counts_by_code(
+    fill_records: object,
+    *,
+    trading_day: str,
+) -> dict[str, tuple[int, int]]:
+    """Count distinct filled BUY/SELL orders per stock for one trading day."""
+
+    identities_by_code: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    records = fill_records if isinstance(fill_records, (list, tuple)) else ()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        received_at = str(
+            record.get("received_at") or record.get("recorded_at") or ""
+        ).strip()
+        if received_at[:10] != trading_day:
+            continue
+        if str(record.get("event_type") or "").strip().upper() not in {
+            "PARTIAL_FILL",
+            "FULL_FILL",
+        }:
+            continue
+        code = str(record.get("code") or "").strip().lstrip("A")
+        side = str(record.get("side") or "").strip().upper()
+        if not code or side not in {"BUY", "SELL"}:
+            continue
+        identity = next(
+            (
+                str(record.get(field) or "").strip()
+                for field in (
+                    "broker_order_no",
+                    "order_id",
+                    "order_queued_id",
+                    "execution_id",
+                    "fill_id",
+                )
+                if str(record.get(field) or "").strip()
+            ),
+            "",
+        )
+        if not identity:
+            continue
+        account_no = str(record.get("account_no") or "").strip()
+        side_identities = identities_by_code.setdefault(
+            code,
+            {"BUY": set(), "SELL": set()},
+        )
+        side_identities[side].add((account_no, identity))
+
+    return {
+        code: (len(sides["BUY"]), len(sides["SELL"]))
+        for code, sides in identities_by_code.items()
+    }
+
+
+def current_stock_trade_counts_by_code(
+    fills_path: str | Path = RUNTIME_FILLS_PATH,
+    *,
+    now: datetime | None = None,
+) -> dict[str, tuple[int, int]]:
+    snapshot = read_execution_fill_records(fills_path)
+    if snapshot.get("ok") is not True:
+        return {}
+    trading_day = (now or datetime.now().astimezone()).date().isoformat()
+    return stock_trade_counts_by_code(
+        snapshot.get("records"),
+        trading_day=trading_day,
+    )
+
+
+def normalize_initial_buy_mode(value: object) -> str:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return "QUANTITY"
+    if normalized in {"QUANTITY", "QTY", "SHARES", "SHARE", "주수"}:
+        return "QUANTITY"
+    return "AMOUNT"
+
+
+def stock_initial_buy_display(config: dict[str, object]) -> dict[str, object]:
+    mode = normalize_initial_buy_mode(config.get("trade_amount_type"))
+    if mode == "QUANTITY":
+        value = max(1, safe_int_value(config.get("buy_qty"), 1))
+        return {
+            "mode": mode,
+            "badge": "주수",
+            "value": value,
+            "value_text": f"{value:,}주",
+        }
+    value = max(0, safe_int_value(config.get("buy_amount"), 0))
+    return {
+        "mode": mode,
+        "badge": "금액",
+        "value": value,
+        "value_text": f"{value:,}원",
+    }
+
+
+def routine_stock_initial_buy_mode_sort_value(
+    stock_row: dict[str, object],
+    preferred_mode: str,
+) -> bool:
+    initial_buy = stock_row.get("initial_buy")
+    if not isinstance(initial_buy, dict):
+        return False
+    return str(initial_buy.get("mode", "") or "").upper() == str(
+        preferred_mode or ""
+    ).upper()
+
+
+def sort_routine_stock_rows_by_initial_buy_mode(
+    stock_rows: list[dict[str, object]],
+    preferred_mode: str,
+) -> None:
+    stock_rows.sort(
+        key=lambda stock: routine_stock_initial_buy_mode_sort_value(
+            stock,
+            preferred_mode,
+        ),
+        reverse=True,
+    )
 
 
 ROUTINE_INSTANCE_GRID_COLUMNS = {
@@ -619,6 +746,30 @@ def routine_instance_profit_text(
     return f"수익({amount_text} / {rate_text})", color
 
 
+class RoutineInstanceStatusStamp(QWidget):
+    def __init__(
+        self,
+        *,
+        on_click: Callable[[], None] | None = None,
+        on_double_click: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self._on_click = on_click
+        self._on_double_click = on_double_click
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._on_click is not None:
+            self._on_click()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._on_double_click is not None:
+            self._on_double_click()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 def create_routine_instance_status_widget(
     status: object,
     *,
@@ -633,6 +784,8 @@ def create_routine_instance_status_widget(
     profit_color: str = "",
     buy_limit_configured: bool = False,
     enabled: bool = True,
+    on_status_click: Callable[[], None] | None = None,
+    on_status_double_click: Callable[[], None] | None = None,
 ) -> QWidget:
     display_status, color = routine_status_stamp_spec(status)
     container = QWidget()
@@ -644,11 +797,15 @@ def create_routine_instance_status_widget(
     layout.setContentsMargins(8, 0, 4, 0)
     layout.setSpacing(0)
 
-    stamp = QWidget()
+    stamp = RoutineInstanceStatusStamp(
+        on_click=on_status_click,
+        on_double_click=on_status_double_click,
+    )
     stamp.setObjectName("routineInstanceStatusStamp")
     stamp.setFixedSize(ROUTINE_STATUS_STAMP_WIDTH, ROUTINE_STATUS_STAMP_HEIGHT)
     stamp.setFocusPolicy(Qt.NoFocus)
-    stamp.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    stamp.setAttribute(Qt.WA_StyledBackground, True)
+    stamp.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
     stamp.setStyleSheet(
         "QWidget#routineInstanceStatusStamp {"
         " background-color: #FFFFFF;"
@@ -924,6 +1081,8 @@ def _instance_stock_counts() -> dict[str, dict[str, object]]:
         instance_id = str(config.get("assigned_routine_instance_id", "") or "").strip()
         if not instance_id or instance_id not in valid_instance_ids:
             continue
+        if is_review_required_state(state):
+            continue
         item = counts.setdefault(
             instance_id,
             {
@@ -988,7 +1147,12 @@ def _instance_stock_counts() -> dict[str, dict[str, object]]:
     return counts
 
 
-def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list[str]:
+def _routine_tree_stock_display_values(
+    window,
+    stock: dict[str, object],
+    *,
+    trade_counts: tuple[int, int] = (0, 0),
+) -> list[str]:
     code = str(stock.get("code", "") or "").strip()
     name = str(stock.get("name", "") or "").strip()
     stock_path = str(stock.get("stock_path", "") or "").strip()
@@ -1024,9 +1188,14 @@ def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list
     operation_text, _operation_color, _operation_tooltip = operation_text_and_color(config)
     operation_display_text = compact_operation_time_range(operation_text)
     method_text = auto_trade_setting_method_text(display_status, config, state)
-    liquidation_text = auto_trade_setting_liquidation_text(config, display_status, state)
+    liquidation_text = auto_trade_setting_liquidation_text(
+        config,
+        display_status,
+        state,
+        holding_qty=holding_qty,
+    )
     current_price = current_price_from_state(state)
-    holding_text, price_text, profit_text, pending_text, _profit_amount, _profit_rate = (
+    holding_text, price_text, profit_text, _pending_text, _profit_amount, _profit_rate = (
         stock_position_display_values(
             holding_qty=holding_qty,
             avg_price=avg_price,
@@ -1035,8 +1204,12 @@ def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list
             sell_pending_qty=sell_pending_qty,
         )
     )
+    buy_trade_count, sell_trade_count = trade_counts
+    trade_text = f"매매({buy_trade_count:,} / {sell_trade_count:,})"
+    initial_buy = stock_initial_buy_display(config)
     values = [
         f"{code} {name}".strip(),
+        f"{initial_buy['badge']} {initial_buy['value_text']}",
         operation_display_text,
         "●",
         display_status,
@@ -1045,7 +1218,7 @@ def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list
         holding_text,
         price_text,
         profit_text,
-        pending_text,
+        trade_text,
     ]
     return [str(value or "-") for value in values]
 
@@ -1053,6 +1226,8 @@ def _routine_tree_stock_display_values(window, stock: dict[str, object]) -> list
 def _routine_tree_stock_metric_values(
     window,
     stock: dict[str, object],
+    *,
+    trade_counts: tuple[int, int] = (0, 0),
 ) -> tuple[tuple[object, ...], str, str, str | None, dict[str, int]]:
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
@@ -1077,7 +1252,7 @@ def _routine_tree_stock_metric_values(
         )
     )
     current_price = current_price_from_state(state)
-    holding_metric, price_metric, profit_metric, pending_metric, profit_amount, profit_rate = (
+    holding_metric, price_metric, profit_metric, _pending_metric, profit_amount, profit_rate = (
         stock_position_metric_values(
             holding_qty=holding_qty,
             avg_price=avg_price,
@@ -1087,6 +1262,14 @@ def _routine_tree_stock_metric_values(
         )
     )
     profit_metric = replace(profit_metric, label="수익")
+    buy_trade_count, sell_trade_count = trade_counts
+    trade_metric = RatioMetricDisplay(
+        label="매매",
+        value1=f"{buy_trade_count:,}",
+        value2=f"{sell_trade_count:,}",
+        value1_sample="99",
+        value2_sample="99",
+    )
     buy_limit_enabled, buy_limit_amount = stock_buy_limit_config(stock)
     limit_text = routine_instance_buy_limit_text(
         enabled=buy_limit_enabled,
@@ -1116,16 +1299,16 @@ def _routine_tree_stock_metric_values(
         holding_metric,
         price_metric,
         profit_metric,
-        pending_metric,
+        trade_metric,
         None,
     ]
     if consumed_metric is not None:
         metrics.append(consumed_metric)
     sort_values = {
         "holding": holding_qty,
-        "price": current_price,
+        "price": safe_float_value(current_price, 0.0),
         "profit": int(round(profit_amount)),
-        "pending": buy_pending_qty + sell_pending_qty,
+        "trade": buy_trade_count + sell_trade_count,
         "limit": (
             safe_int_value(buy_limit_amount)
             if routine_instance_buy_limit_configured(
@@ -1150,15 +1333,29 @@ def _routine_tree_stock_row(
     definition_id: str,
     instance_id: str,
     stock: dict[str, object],
+    trade_counts: tuple[int, int] = (0, 0),
 ) -> dict[str, object]:
-    stock_values = _routine_tree_stock_display_values(window, stock)
+    stock_values = _routine_tree_stock_display_values(
+        window,
+        stock,
+        trade_counts=trade_counts,
+    )
+    stock_path = str(stock.get("stock_path", "") or "").strip()
+    stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
+    stock_config = read_json_dict(stock_dir / "config.json") if stock_dir is not None else {}
+    if not isinstance(stock_config, dict) or not stock_config:
+        stock_config = default_config()
     (
         stock_metrics,
         stock_profit_led,
         limit_text,
         consumed_text,
         sort_values,
-    ) = _routine_tree_stock_metric_values(window, stock)
+    ) = _routine_tree_stock_metric_values(
+        window,
+        stock,
+        trade_counts=trade_counts,
+    )
     stock_values = [
         *stock_values,
         limit_text,
@@ -1172,6 +1369,7 @@ def _routine_tree_stock_row(
         "name": " | ".join(stock_values),
         "stock_values": stock_values,
         "stock_metrics": stock_metrics,
+        "initial_buy": stock_initial_buy_display(stock_config),
         "stock_profit_led": stock_profit_led,
         "sort_metrics": sort_values,
         "stock_path": str(stock.get("stock_path", "") or ""),
@@ -1187,6 +1385,24 @@ def _routine_tree_stock_row(
         "profit_display": "",
         "profit_color": "",
     }
+
+
+def routine_instance_operation_status(running_count: object) -> str:
+    """Project Runtime-backed instance operation state."""
+    return (
+        ROUTINE_STATUS_RUNNING
+        if safe_int_value(running_count, 0) > 0
+        else ROUTINE_STATUS_STOPPED
+    )
+
+
+def routine_instance_operation_badge_enabled(
+    *,
+    definition_enabled: object,
+    registered_count: object,
+) -> bool:
+    """Keep operation control independent from the removed checkbox selection."""
+    return bool(definition_enabled) and safe_int_value(registered_count, 0) > 0
 
 
 def _routine_monitor_sort_value(row: dict[str, object], column: int):
@@ -1213,6 +1429,7 @@ def main_load_routine_table(window) -> None:
     instance_counts = _instance_stock_counts()
     definitions = load_routine_definitions()
     instances = load_persisted_routine_instances()
+    trade_counts_by_code = current_stock_trade_counts_by_code()
     window._routine_assigned_stock_count_by_instance = {
         instance.instance_id: int(
             instance_counts.get(instance.instance_id, {}).get("registered", 0) or 0
@@ -1292,6 +1509,20 @@ def main_load_routine_table(window) -> None:
                 cost_basis=count.get("profit_cost_basis", 0),
                 unknown=bool(count.get("profit_unknown")),
             )
+            stock_rows = [
+                _routine_tree_stock_row(
+                    window,
+                    definition_id=definition.definition_id,
+                    instance_id=instance.instance_id,
+                    stock=stock,
+                    trade_counts=trade_counts_by_code.get(
+                        str(stock.get("code", "") or "").strip().lstrip("A"),
+                        (0, 0),
+                    ),
+                )
+                for stock in count.get("stocks", [])
+                if isinstance(stock, dict)
+            ]
             children.append(
                 {
                     "kind": ROUTINE_ROW_CHILD,
@@ -1299,11 +1530,8 @@ def main_load_routine_table(window) -> None:
                     "instance_id": instance.instance_id,
                     "name": instance.display_name,
                     "description": instance.description,
-                    "operation_status": str(
-                        getattr(window, "_routine_operation_status_by_instance", {}).get(
-                            instance.instance_id,
-                            ROUTINE_STATUS_DEFAULT,
-                        )
+                    "operation_status": routine_instance_operation_status(
+                        count["running"],
                     ),
                     "registered": int(count["registered"]),
                     "running": int(count["running"]),
@@ -1315,20 +1543,15 @@ def main_load_routine_table(window) -> None:
                     "buy_limit_display": buy_limit_text,
                     "consumed_display": consumed_text,
                     "profit_display": profit_text,
+                    "profit_amount": safe_int_value(
+                        count.get("profit_amount"),
+                        0,
+                    ),
                     "profit_color": profit_color,
                     "rules_path": instance.rules_path,
                     "collapsed": instance.instance_id
                     in getattr(window, "_collapsed_routine_instance_ids", set()),
-                    "stocks": [
-                        _routine_tree_stock_row(
-                            window,
-                            definition_id=definition.definition_id,
-                            instance_id=instance.instance_id,
-                            stock=stock,
-                        )
-                        for stock in count.get("stocks", [])
-                        if isinstance(stock, dict)
-                    ],
+                    "stocks": stock_rows,
                 }
             )
 
@@ -1382,11 +1605,29 @@ def main_load_routine_table(window) -> None:
     metric_sort_key = str(
         getattr(window, "_main_routine_metric_sort_key", "") or ""
     ).strip()
+    initial_buy_sort_mode = str(
+        getattr(window, "_main_routine_initial_buy_sort_mode", "") or ""
+    ).strip().upper()
+    flat_valid_stock_list = (
+        display_level == "stock"
+        and bool(getattr(window, "_main_routine_valid_only", False))
+    )
     if (
+        display_level == "stock"
+        and initial_buy_sort_mode in {"AMOUNT", "QUANTITY"}
+        and not flat_valid_stock_list
+    ):
+        for group in groups:
+            for child in group["children"]:
+                sort_routine_stock_rows_by_initial_buy_mode(
+                    child["stocks"],
+                    initial_buy_sort_mode,
+                )
+    elif (
         display_level == "stock"
         and bool(getattr(window, "_main_routine_metric_sort_active", False))
         and metric_sort_key
-        in {"holding", "price", "profit", "pending", "limit"}
+        in {"holding", "price", "profit", "trade", "limit"}
     ):
         for group in groups:
             for child in group["children"]:
@@ -1400,12 +1641,26 @@ def main_load_routine_table(window) -> None:
                     ),
                     reverse=True,
                 )
+    elif (
+        display_level == "routine"
+        and bool(getattr(window, "_main_routine_metric_sort_active", False))
+        and metric_sort_key in {"profit", "limit"}
+    ):
+        routine_sort_field = (
+            "profit_amount"
+            if metric_sort_key == "profit"
+            else "buy_limit_amount"
+        )
+        for group in groups:
+            group["children"].sort(
+                key=lambda child: safe_int_value(
+                    child.get(routine_sort_field),
+                    0,
+                ),
+                reverse=True,
+            )
 
     rows: list[dict[str, object]] = []
-    flat_valid_stock_list = (
-        display_level == "stock"
-        and bool(getattr(window, "_main_routine_valid_only", False))
-    )
     for group in groups:
         if flat_valid_stock_list:
             for child in group["children"]:
@@ -1417,6 +1672,15 @@ def main_load_routine_table(window) -> None:
                 rows.append(child)
                 if not child.get("collapsed"):
                     rows.extend(child.get("stocks", []))
+
+    if (
+        flat_valid_stock_list
+        and initial_buy_sort_mode in {"AMOUNT", "QUANTITY"}
+    ):
+        sort_routine_stock_rows_by_initial_buy_mode(
+            rows,
+            initial_buy_sort_mode,
+        )
 
     _clear_routine_table_cell_widgets(window.routine_table)
     clear_spans = getattr(window.routine_table, "clearSpans", None)
@@ -1503,6 +1767,7 @@ def main_load_routine_table(window) -> None:
             item.setData(ROUTINE_STOCK_METRICS_ROLE, row_data.get("stock_metrics", ()))
             item.setData(ROUTINE_STOCK_PROFIT_LED_ROLE, row_data.get("stock_profit_led", "gray"))
             item.setData(ROUTINE_STOCK_PATH_ROLE, row_data.get("stock_path", ""))
+            item.setData(ROUTINE_STOCK_INITIAL_BUY_ROLE, row_data.get("initial_buy", {}))
             if col == 0:
                 item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, row_visually_enabled)
@@ -1559,6 +1824,10 @@ def main_load_routine_table(window) -> None:
             set_span = getattr(window.routine_table, "setSpan", None)
             if callable(set_span):
                 set_span(row, 1, 1, window.routine_table.columnCount() - 1)
+            operation_badge_enabled = routine_instance_operation_badge_enabled(
+                definition_enabled=group_enabled,
+                registered_count=row_data.get("registered", 0),
+            )
             window.routine_table.setCellWidget(
                 row,
                 1,
@@ -1574,7 +1843,13 @@ def main_load_routine_table(window) -> None:
                     profit_text=str(row_data.get("profit_display", "")),
                     profit_color=str(row_data.get("profit_color", "")),
                     buy_limit_configured=bool(row_data.get("buy_limit_configured")),
-                    enabled=row_visually_enabled,
+                    enabled=operation_badge_enabled,
+                    on_status_click=lambda row=row: window.routine_table.selectRow(row),
+                    on_status_double_click=(
+                        lambda instance_id=str(row_data.get("instance_id", "")): (
+                            window.toggle_routine_instance_operation(instance_id)
+                        )
+                    ),
                 ),
             )
 

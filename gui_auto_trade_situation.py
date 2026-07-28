@@ -21,7 +21,10 @@ from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     auto_trade_setting_server_mismatch_detected,
 )
-from gui_auto_trade_policy import auto_trade_setting_no_next_step_notice
+from gui_auto_trade_policy import (
+    auto_trade_setting_early_close_progress_text,
+    auto_trade_setting_no_next_step_notice,
+)
 
 
 def create_auto_trade_situation_item(
@@ -51,6 +54,7 @@ def create_auto_trade_situation_item(
     item.setTextAlignment(Qt.AlignCenter)
 
     mismatch_reasons = auto_trade_setting_data_inconsistency_reasons(state)
+    early_close_progress = auto_trade_setting_early_close_progress_text(state)
 
     # 1. 데이터 신뢰 불가는 최우선이다. 시작 OFF여도 빨강을 유지한다.
     if auto_trade_setting_server_mismatch_detected(state):
@@ -80,12 +84,20 @@ def create_auto_trade_situation_item(
 
     if auto_trade_setting_no_next_step_notice(state) and not has_next_target:
         item.setForeground(QColor("#F59E0B"))
-        item.setToolTip("현황: 정상이나 다음 절차 진행 대상 없음")
+        item.setToolTip(
+            "조기마감: 조건 미충족"
+            if early_close_progress == "조건 미충족"
+            else "현황: 정상이나 다음 절차 진행 대상 없음"
+        )
         item.setData(SORT_ROLE, 2)
         return item
 
     # 4. 그 외 매매시작 ON 상태는 운영방식/시간정책에 따른 정상 운영 상태다.
     item.setForeground(QColor("#16A34A"))
-    item.setToolTip("현황: 정상 운영 중")
+    item.setToolTip(
+        f"조기마감: {early_close_progress}"
+        if early_close_progress
+        else "현황: 정상 운영 중"
+    )
     item.setData(SORT_ROLE, 1)
     return item

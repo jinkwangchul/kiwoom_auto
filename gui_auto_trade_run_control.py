@@ -2,20 +2,25 @@
 """
 gui_auto_trade_run_control.py
 
-자동매매설정창의 매매시작/정지 처리 헬퍼.
+자동매매설정창의 운영시작/정지 처리 헬퍼.
 """
 
 from __future__ import annotations
 
+import math
+import re
+import logging
 from pathlib import Path
 from datetime import datetime
 
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QWidget
 
+from gui_toast import show_toast
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
+from gui_auto_trade_integrity import is_review_required_stock_dir
+from gui_auto_trade_policy import auto_trade_setting_trade_started
 from gui_review_utils import review_required_for_start
-from gui_config_utils import default_config
 from state_policy import (
     operation_mode_display,
     real_trade_enabled,
@@ -28,10 +33,504 @@ from state_policy import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
+LOGGER = logging.getLogger(__name__)
+START_REQUEST_SINGLE = "single"
+START_REQUEST_MULTIPLE = "multiple"
+
+
+def startup_recovery_operation_block_message(action: str, reason: str = "") -> str:
+    message = (
+        f"{action}할 수 없습니다. "
+        "로그인, 계좌 선택 및 Recovery 완료 상태를 확인하십시오."
+    )
+    _code, separator, detail = str(reason or "").partition(":")
+    clean_detail = detail.strip() if separator else ""
+    if clean_detail and not _is_internal_reason_code(clean_detail):
+        message += f"\n\n원인: {clean_detail}"
+    return message
+
+
+def _show_operation_warning(window, title: str, message: str) -> None:
+    setattr(window, "_last_operation_failure_dialog_shown", True)
+    setattr(window, "_last_operation_failure_dialog_title", title)
+    setattr(window, "_last_operation_failure_dialog_message", message)
+    parent_getter = getattr(window, "operation_message_parent", None)
+    parent = parent_getter() if callable(parent_getter) else window
+    if not isinstance(parent, QWidget):
+        return
+    QMessageBox.warning(parent, title, message)
+
+
+def _show_operation_start_failure_toast(window, message: str) -> None:
+    setattr(window, "_last_operation_failure_dialog_shown", True)
+    setattr(window, "_last_operation_failure_dialog_title", "운영 시작 불가")
+    setattr(window, "_last_operation_failure_dialog_message", message)
+    parent_getter = getattr(window, "operation_message_parent", None)
+    parent = parent_getter() if callable(parent_getter) else window
+    if not isinstance(parent, QWidget):
+        return
+    show_toast(
+        parent=parent,
+        message=message,
+        duration_ms=2500,
+        position="center",
+    )
+
+
+def _target_identity_lines(targets) -> list[str]:
+    lines: list[str] = []
+    for target in targets or ():
+        code = str(getattr(target, "code", "") or "").strip()
+        name = str(getattr(target, "name", "") or "").strip()
+        identity = " ".join(part for part in (code, name) if part)
+        if identity and identity not in lines:
+            lines.append(identity)
+    return lines
+
+
+def _is_internal_reason_code(reason: str) -> bool:
+    code = str(reason or "").split(":", 1)[0].strip()
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", code))
+
+
+def format_auto_trade_operation_failure_dialog(
+    window,
+    action: str,
+    result: dict[str, object] | None,
+    targets=(),
+) -> tuple[str, str] | None:
+    result = result if isinstance(result, dict) else {}
+    reason = str(result.get("reason") or "").strip()
+    if reason == "CANCELLED":
+        return None
+
+    user_message = str(result.get("user_message") or "").strip()
+    if not user_message:
+        user_message = str(
+            getattr(window, "_last_operation_user_message", "") or ""
+        ).strip()
+    if user_message:
+        title = "운영 시작 불가" if action == "운영시작" else "운영 정지 불가"
+        return title, user_message
+
+    if reason in {
+        "RECOVERY_NOT_READY",
+        "BLOCKED_RECOVERY",
+        "PRODUCTION_RECOVERY_BLOCKED",
+        "REVIEW_REQUIRED",
+        "EMERGENCY_STOPPED",
+    } or any(
+        token in reason
+        for token in ("INVALID_RUNTIME", "REVIEW_REQUIRED", "EMERGENCY_STOPPED")
+    ):
+        title = "운영 시작 불가" if action == "운영시작" else "운영 정지 불가"
+        message = startup_recovery_operation_block_message(action, reason)
+        if reason == "REVIEW_REQUIRED":
+            details: list[str] = []
+            for target in targets or ():
+                stock_dir = getattr(target, "stock_dir", None)
+                if stock_dir is None:
+                    continue
+                state = read_json_dict(Path(stock_dir) / "state.json")
+                review_reason = str(state.get("review_reason") or "").strip()
+                code = str(getattr(target, "code", "") or "").strip()
+                name = str(getattr(target, "name", "") or "").strip()
+                identity = " ".join(part for part in (code, name) if part)
+                if review_reason:
+                    details.append(f"{identity}\n사유: {review_reason}")
+            if details:
+                message = (
+                    f"{action} 불가\n\n복구 검토가 완료되지 않은 종목이 있습니다.\n\n"
+                    + "\n\n".join(details)
+                    + "\n\n검토관리에서 해당 종목을 처리한 후 다시 시도하십시오."
+                )
+        return title, message
+
+    identities = _target_identity_lines(targets)
+    if reason == "NO_TARGETS":
+        return "선택 오류", (
+            "감시를 시작할 종목을 1개 이상 선택하세요."
+            if action == "운영시작"
+            else "감시를 종료할 종목을 1개 이상 선택하세요."
+        )
+    if reason in {"NO_STARTABLE_TARGETS", "NO_STOPPABLE_TARGETS"}:
+        message = (
+            "운영 시작 가능한 종목이 없습니다."
+            if action == "운영시작"
+            else "운영 정지 가능한 종목이 없습니다."
+        )
+        if identities:
+            message += "\n\n" + "\n".join(identities)
+        return (
+            "운영 시작 불가" if action == "운영시작" else "운영 정지 불가",
+            message,
+        )
+    if reason:
+        message = f"{action}을 처리하지 못했습니다."
+        if not _is_internal_reason_code(reason):
+            message += f"\n\n사유: {reason}"
+        else:
+            message += "\n\n로그인, 계좌 및 운영 상태를 확인한 후 다시 시도하십시오."
+        if identities:
+            message += "\n\n대상:\n" + "\n".join(identities)
+        return (
+            "운영 시작 불가" if action == "운영시작" else "운영 정지 불가",
+            message,
+        )
+    return None
+
+
+def show_auto_trade_operation_failure_dialog(
+    window,
+    action: str,
+    result: dict[str, object] | None,
+    targets=(),
+) -> bool:
+    if bool(getattr(window, "_last_operation_failure_dialog_shown", False)):
+        return False
+    dialog = format_auto_trade_operation_failure_dialog(
+        window,
+        action,
+        result,
+        targets,
+    )
+    if dialog is None:
+        return False
+    title, message = dialog
+    if action == "운영시작":
+        _show_operation_start_failure_toast(window, message)
+    else:
+        _show_operation_warning(window, title, message)
+    return True
+
+
+def _start_failure_user_message(
+    failure_reasons: list[str],
+    *,
+    all_emergency: bool = False,
+    all_review: bool = False,
+    all_already_running: bool = False,
+) -> str:
+    reasons = {str(item or "").strip() for item in failure_reasons if str(item or "").strip()}
+    if all_emergency or (
+        reasons
+        and reasons <= {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
+    ):
+        return "모든 종목이 긴급정지 상태입니다."
+    if all_review:
+        return (
+            "모든 등록 종목이 검토 대상으로 분리되어 있습니다.\n"
+            "검토관리에서 처리한 뒤 다시 시도하십시오."
+        )
+    if all_already_running:
+        return "선택한 인스턴스는 이미 운영 중입니다."
+    if reasons and reasons <= {"PREVIOUS_CLOSE_UNAVAILABLE"}:
+        return (
+            "전일 종가를 확인할 수 없어 초회 매수 금액을 검증할 수 없습니다.\n"
+            "시세 정보를 확인한 뒤 다시 시도하십시오."
+        )
+    if reasons and reasons <= {"INITIAL_BUY_AMOUNT_BELOW_MINIMUM"}:
+        return (
+            "초회 매수 금액이 최소 거래금액보다 작습니다.\n"
+            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오."
+        )
+    if reasons and reasons <= {"INVALID_INITIAL_BUY_QUANTITY"}:
+        return (
+            "초회 매수 주수가 설정되지 않았습니다.\n"
+            "자동매매 설정에서 1주 이상으로 설정하십시오."
+        )
+    if reasons and reasons <= {"MISSING_REQUIRED_SETTINGS"}:
+        return (
+            "모든 등록 종목의 필수 설정이 완료되지 않았습니다.\n"
+            "자동매매 설정을 확인하십시오."
+        )
+    if reasons and reasons <= {"REVIEW_REQUIRED"}:
+        return (
+            "모든 등록 종목이 검토 대상으로 분리되었습니다.\n"
+            "검토관리에서 처리한 뒤 다시 시도하십시오."
+        )
+    if reasons & {"RUNTIME_MISSING", "RUNTIME_DAMAGED"}:
+        return (
+            "종목의 운영 상태 데이터를 읽을 수 없습니다.\n"
+            "검토관리에서 Runtime 상태를 확인하십시오."
+        )
+    if reasons & {"STATE_SAVE_FAILED", "REVIEW_STATE_SAVE_FAILED"}:
+        return (
+            "종목의 운영 상태를 저장하지 못했습니다.\n"
+            "로그를 확인한 뒤 다시 시도하십시오."
+        )
+    if "INTERNAL_EXCEPTION" in reasons:
+        return (
+            "운영 상태를 확인하는 중 오류가 발생했습니다.\n"
+            "로그를 확인한 뒤 다시 시도하십시오."
+        )
+    return (
+        "현재 운영을 시작할 수 있는 종목이 없습니다.\n"
+        "검토관리와 자동매매 설정을 확인하십시오."
+    )
+
+
+def _all_start_targets_emergency_stopped(
+    targets: list[tuple[Path, str, str]],
+) -> bool:
+    emergency_statuses = {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
+    return bool(targets) and all(
+        str(read_json_dict(Path(stock_dir) / "state.json").get("status") or "")
+        .strip()
+        .upper()
+        in emergency_statuses
+        for stock_dir, _code, _name in targets
+    )
+
+
+def _start_target_identity(
+    target: tuple[Path, str, str] | None,
+) -> tuple[str, str, str]:
+    if target is None:
+        return "", "", ""
+    _stock_dir, code, name = target
+    code = str(code or "").strip()
+    name = str(name or "").strip()
+    return code, name, " ".join(part for part in (code, name) if part) or "선택 대상"
+
+
+def _subject_text(label: str) -> str:
+    last_character = str(label or "").strip()[-1:]
+    if last_character and "\uac00" <= last_character <= "\ud7a3":
+        particle = "은" if (ord(last_character) - ord("\uac00")) % 28 else "는"
+    else:
+        particle = "는"
+    return f"{label}{particle}"
+
+
+def _single_start_failure_user_message(
+    target: tuple[Path, str, str],
+    reason: str,
+) -> str:
+    stock_dir, _code, _name = target
+    code, name, label = _start_target_identity(target)
+    reason = str(reason or "").strip()
+    state = read_json_dict(Path(stock_dir) / "state.json")
+    status = str(state.get("status") or "").strip().upper()
+    review_reason = str(state.get("review_reason") or "").strip()
+    subject = _subject_text(label)
+
+    if reason in {"REVIEW_REQUIRED", "RECOVERY_STOCK_REVIEW_REQUIRED"}:
+        if status.startswith("EMERGENCY") or "긴급" in review_reason:
+            return f"{subject} 긴급정지 상태입니다."
+        return (
+            f"{subject} 검토관리 대상입니다.\n"
+            "검토관리에서 처리한 뒤 다시 시도하십시오."
+        )
+    if reason == "ALREADY_RUNNING":
+        return f"{subject} 이미 운영 중입니다."
+    if reason == "MISSING_REQUIRED_SETTINGS":
+        return (
+            f"{label}의 필수 운영 설정이 완료되지 않았습니다.\n"
+            "자동매매 설정을 확인한 뒤 다시 시도하십시오."
+        )
+    if reason == "PREVIOUS_CLOSE_UNAVAILABLE":
+        return (
+            f"{label}의 전일 종가를 확인할 수 없습니다.\n"
+            "시세 정보를 확인한 뒤 다시 시도하십시오."
+        )
+    if reason == "INITIAL_BUY_AMOUNT_BELOW_MINIMUM":
+        return (
+            f"{label}의 초회 매수 금액이 최소 거래금액보다 작습니다.\n"
+            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오."
+        )
+    if reason == "INVALID_INITIAL_BUY_QUANTITY":
+        return (
+            f"{label}의 초회 매수 주수가 설정되지 않았습니다.\n"
+            "자동매매 설정에서 1주 이상으로 설정하십시오."
+        )
+    if reason in {"RUNTIME_MISSING", "RUNTIME_DAMAGED"}:
+        return (
+            f"{label}의 운영 상태 데이터를 읽을 수 없습니다.\n"
+            "검토관리에서 Runtime 상태를 확인하십시오."
+        )
+    if reason in {
+        "STATE_SAVE_FAILED",
+        "REVIEW_STATE_SAVE_FAILED",
+        "STATE_READBACK_FAILED",
+    }:
+        return (
+            f"{label}의 운영 상태를 저장하거나 다시 확인하지 못했습니다.\n"
+            "로그를 확인한 뒤 다시 시도하십시오."
+        )
+    if reason == "RECOVERY_STOCK_PENDING":
+        return (
+            f"{label}의 Recovery가 아직 완료되지 않았습니다.\n"
+            "복구가 완료된 뒤 다시 시도하십시오."
+        )
+    if reason == "RECOVERY_STOCK_FAILED":
+        return (
+            f"{label}의 Recovery에 실패했습니다.\n"
+            "검토관리에서 상태를 확인하십시오."
+        )
+    if reason in {"TARGET_CLASSIFICATION_FAILED", "INTERNAL_EXCEPTION"}:
+        return (
+            f"{label}의 운영 상태를 확인하는 중 오류가 발생했습니다.\n"
+            "로그를 확인한 뒤 다시 시도하십시오."
+        )
+    if status.startswith("EMERGENCY"):
+        return f"{subject} 긴급정지 상태입니다."
+    return (
+        f"{subject} 현재 운영을 시작할 수 없는 상태입니다.\n"
+        "자동매매 설정과 검토관리 상태를 확인하십시오."
+    )
+
+
+def _apply_start_request_context(
+    result: dict[str, object],
+    *,
+    request_scope: str,
+    selected: list[tuple[Path, str, str]],
+    request_source: str = "",
+    stock_failure_reason: str = "",
+    global_failure: bool = False,
+) -> dict[str, object]:
+    normalized_scope = (
+        START_REQUEST_SINGLE
+        if request_scope == START_REQUEST_SINGLE
+        else START_REQUEST_MULTIPLE
+    )
+    result["request_scope"] = normalized_scope
+    result["source"] = str(request_source or "").strip()
+    result.setdefault("requested_count", len(selected))
+    result["global_failure"] = bool(global_failure)
+
+    target = (
+        selected[0]
+        if len(selected) == 1
+        and (
+            normalized_scope == START_REQUEST_SINGLE
+            or result.get("ok") is not True
+        )
+        else None
+    )
+    code, name, _label = _start_target_identity(target)
+    result["target_stock_code"] = code
+    result["target_stock_name"] = name
+
+    if target is None or global_failure:
+        return result
+    if result.get("ok") is True:
+        result["user_message"] = f"{name or code} 운영을 시작했습니다."
+        return result
+
+    reason = str(stock_failure_reason or result.get("reason") or "").strip()
+    result["user_message"] = _single_start_failure_user_message(target, reason)
+    result["stock_failure"] = reason
+    return result
+
+
+def _start_result_summary(
+    *,
+    started_count: int,
+    excluded_review_count: int,
+    excluded_validation_count: int,
+    failed_count: int,
+) -> str:
+    parts = [f"운영 시작 {started_count}개"]
+    if excluded_review_count:
+        parts.append(f"검토 제외 {excluded_review_count}개")
+    if excluded_validation_count:
+        parts.append(f"설정 제외 {excluded_validation_count}개")
+    if failed_count:
+        parts.append(f"실패 {failed_count}개")
+    return " · ".join(parts)
+
+
+def _show_start_failure_once(window, result: dict[str, object]) -> None:
+    message = str(result.get("user_message") or "").strip()
+    status_message = getattr(window, "statusBarMessage", None)
+    if message and callable(status_message):
+        status_message(message)
+    show_auto_trade_operation_failure_dialog(
+        window,
+        "운영시작",
+        result,
+    )
 
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _positive_price(source: dict[str, object], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = source.get(key)
+        try:
+            price = abs(float(str(value).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def initial_buy_start_validation(
+    config: dict[str, object],
+    state: dict[str, object],
+) -> dict[str, object]:
+    mode = str(config.get("trade_amount_type", "QUANTITY") or "").strip().upper()
+    if mode in {"QUANTITY", "QTY", "SHARES", "SHARE", "주수"}:
+        try:
+            quantity = int(config.get("buy_qty", 1) or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        return {
+            "allowed": quantity >= 1,
+            "reason": "" if quantity >= 1 else "INVALID_INITIAL_BUY_QUANTITY",
+            "mode": "QUANTITY",
+            "configured_value": quantity,
+        }
+
+    previous_close = _positive_price(
+        state,
+        (
+            "previous_close",
+            "prev_close",
+            "yesterday_close",
+            "previous_close_price",
+        ),
+    )
+    if previous_close is None:
+        previous_close = _positive_price(
+            config,
+            (
+                "previous_close",
+                "prev_close",
+                "yesterday_close",
+                "previous_close_price",
+            ),
+        )
+    if previous_close is None:
+        return {
+            "allowed": False,
+            "reason": "PREVIOUS_CLOSE_UNAVAILABLE",
+            "mode": "AMOUNT",
+            "configured_value": max(0, int(config.get("buy_amount", 0) or 0)),
+        }
+
+    try:
+        configured_amount = max(0, int(config.get("buy_amount", 0) or 0))
+    except (TypeError, ValueError):
+        configured_amount = 0
+    minimum_amount = int(math.ceil(previous_close * 1.5))
+    return {
+        "allowed": configured_amount >= minimum_amount,
+        "reason": (
+            ""
+            if configured_amount >= minimum_amount
+            else "INITIAL_BUY_AMOUNT_BELOW_MINIMUM"
+        ),
+        "mode": "AMOUNT",
+        "configured_value": configured_amount,
+        "previous_close": previous_close,
+        "minimum_amount": minimum_amount,
+    }
 
 
 def append_changelog(change_type: str, filename: str, message: str) -> None:
@@ -165,128 +664,666 @@ def stop_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
     return {"stopped": stopped, "failed": failed, "count": len(stopped)}
 
 
-def auto_trade_start_selected_auto_trades(window) -> None:
-    recovery_check = getattr(type(window), "require_startup_recovery_session", None)
-    if callable(recovery_check) and recovery_check(window, "매매시작") is not True:
-        return
+def auto_trade_start_selected_auto_trades(
+    window,
+    *,
+    request_scope: str = START_REQUEST_MULTIPLE,
+    selected_targets: list[tuple[Path, str, str]] | None = None,
+    source: str = "",
+) -> dict[str, object]:
+    setattr(window, "_last_operation_failure_dialog_shown", False)
+    request_scope = (
+        START_REQUEST_SINGLE
+        if request_scope == START_REQUEST_SINGLE
+        else START_REQUEST_MULTIPLE
+    )
+    try:
+        selected = (
+            list(selected_targets)
+            if selected_targets is not None
+            else window.selected_stock_infos()
+        )
+    except Exception:
+        LOGGER.exception("운영 시작 대상 수집 실패")
+        result = {
+            "ok": False,
+            "reason": "TARGET_COLLECTION_FAILED",
+            "user_message": (
+                "운영 시작 대상을 확인하는 중 오류가 발생했습니다.\n"
+                "화면을 새로고침한 뒤 다시 시도하십시오."
+            ),
+            "requested": (),
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=[],
+            request_source=source,
+            global_failure=True,
+        )
+        _show_start_failure_once(window, result)
+        return result
 
-    selected = window.selected_stock_infos()
-    routine_name = window.current_selected_routine_name()
+    unique_selected: list[tuple[Path, str, str]] = []
+    seen_stock_keys: set[str] = set()
+    for stock_dir, code, name in selected:
+        key = str(code or "").strip() or str(Path(stock_dir).resolve())
+        if key in seen_stock_keys:
+            continue
+        seen_stock_keys.add(key)
+        unique_selected.append((Path(stock_dir), str(code), str(name)))
+    selected = unique_selected
 
-    if not selected or not routine_name:
-        QMessageBox.warning(window, "선택 오류", "감시를 시작할 종목을 1개 이상 선택하세요.")
-        return
+    if request_scope == START_REQUEST_SINGLE and len(selected) != 1:
+        request_scope = START_REQUEST_MULTIPLE
 
-    start_targets, skipped = window.split_start_targets(selected)
-    if not start_targets:
-        if skipped:
-            window.statusBarMessage(f"매매시작 대상 없음: 이미 감시 중/보호 상태 {len(skipped)}개 제외")
+    if not selected:
+        result = {
+            "ok": False,
+            "reason": "NO_TARGETS",
+            "user_message": "운영을 시작할 종목을 1개 이상 선택하십시오.",
+            "requested": (),
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=[],
+            request_source=source,
+        )
+        _show_start_failure_once(window, result)
+        return result
+
+    requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+    review_checker = getattr(window, "start_target_is_review_isolated", None)
+    candidate_targets: list[tuple[Path, str, str]] = []
+    excluded_review: list[str] = []
+    for stock_dir, code, name in selected:
+        isolated = (
+            bool(review_checker(stock_dir, code))
+            if callable(review_checker)
+            else is_review_required_stock_dir(stock_dir)
+        )
+        if isolated:
+            excluded_review.append(f"{code} {name}")
         else:
-            window.statusBarMessage("매매시작 대상 없음")
-        return
+            candidate_targets.append((stock_dir, code, name))
 
+    try:
+        start_targets, skipped = window.split_start_targets(candidate_targets)
+    except Exception:
+        LOGGER.exception("운영 시작 대상 분류 실패")
+        result = {
+            "ok": False,
+            "reason": "TARGET_CLASSIFICATION_FAILED",
+            "user_message": (
+                "운영 시작 대상을 확인하는 중 오류가 발생했습니다.\n"
+                "화면을 새로고침한 뒤 다시 시도하십시오."
+            ),
+            "requested": requested,
+            "excluded_review": tuple(excluded_review),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            stock_failure_reason="TARGET_CLASSIFICATION_FAILED",
+        )
+        _show_start_failure_once(window, result)
+        return result
+    if not start_targets:
+        all_review = bool(excluded_review) and not skipped
+        all_already_running = bool(skipped) and all(
+            auto_trade_setting_trade_started(
+                read_json_dict(stock_dir / "state.json")
+            )
+            for stock_dir, _code, _name in candidate_targets
+        )
+        result = {
+            "ok": False,
+            "reason": "NO_STARTABLE_TARGETS",
+            "user_message": _start_failure_user_message(
+                [],
+                all_emergency=_all_start_targets_emergency_stopped(selected),
+                all_review=all_review,
+                all_already_running=all_already_running,
+            ),
+            "requested": requested,
+            "excluded_review": tuple(excluded_review),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+            "skipped": tuple(skipped),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            stock_failure_reason=(
+                "REVIEW_REQUIRED"
+                if all_review
+                else ("ALREADY_RUNNING" if all_already_running else "NOT_STARTABLE")
+            ),
+        )
+        _show_start_failure_once(window, result)
+        return result
+
+    recovery_filter = getattr(window, "filter_start_targets_by_recovery", None)
+    if callable(recovery_filter):
+        try:
+            recovery_result = recovery_filter(start_targets, action="운영시작")
+        except Exception:
+            LOGGER.exception("운영 시작 Recovery 판정 실패")
+            result = {
+                "ok": False,
+                "reason": "RECOVERY_CHECK_FAILED",
+                "user_message": (
+                    "복구 상태를 확인하는 중 오류가 발생했습니다.\n"
+                    "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
+                ),
+                "requested": requested,
+                "excluded_review": tuple(excluded_review),
+                "eligible": (),
+                "completed": (),
+                "blocked_validation": (),
+                "failed": (),
+                "skipped": tuple(skipped),
+            }
+            _apply_start_request_context(
+                result,
+                request_scope=request_scope,
+                selected=selected,
+                request_source=source,
+                global_failure=True,
+            )
+            _show_start_failure_once(window, result)
+            return result
+        excluded_review.extend(
+            str(item)
+            for item in recovery_result.get("excluded_review", ())
+            if str(item) and str(item) not in excluded_review
+        )
+        if recovery_result.get("allowed") is not True:
+            result = {
+                "ok": False,
+                "reason": str(
+                    recovery_result.get("reason")
+                    or getattr(window, "_last_operation_block_reason", "")
+                    or "RECOVERY_NOT_READY"
+                ),
+                "user_message": str(
+                    recovery_result.get("user_message") or ""
+                ).strip(),
+                "requested": requested,
+                "excluded_review": tuple(excluded_review),
+                "eligible": (),
+                "completed": (),
+                "blocked_validation": (),
+                "failed": (),
+                "skipped": tuple(skipped),
+            }
+            recovery_reason = str(result["reason"])
+            _apply_start_request_context(
+                result,
+                request_scope=request_scope,
+                selected=selected,
+                request_source=source,
+                stock_failure_reason=recovery_reason,
+                global_failure=not recovery_reason.startswith("RECOVERY_STOCK_"),
+            )
+            _show_start_failure_once(window, result)
+            return result
+        start_targets = list(recovery_result.get("eligible", ()))
+    else:
+        recovery_check = getattr(
+            type(window),
+            "require_startup_recovery_session",
+            None,
+        )
+        if callable(recovery_check) and recovery_check(window, "운영시작") is not True:
+            result = {
+                "ok": False,
+                "reason": str(
+                    getattr(window, "_last_operation_block_reason", "")
+                    or "RECOVERY_NOT_READY"
+                ),
+                "requested": requested,
+                "excluded_review": tuple(excluded_review),
+                "eligible": (),
+                "completed": (),
+                "blocked_validation": (),
+                "failed": (),
+                "skipped": tuple(skipped),
+            }
+            result["user_message"] = str(
+                getattr(window, "_last_operation_user_message", "") or ""
+            ).strip() or startup_recovery_operation_block_message("운영시작")
+            _apply_start_request_context(
+                result,
+                request_scope=request_scope,
+                selected=selected,
+                request_source=source,
+                global_failure=True,
+            )
+            _show_start_failure_once(window, result)
+            return result
+
+    if not start_targets:
+        result = {
+            "ok": False,
+            "reason": "NO_STARTABLE_TARGETS",
+            "user_message": _start_failure_user_message(
+                [],
+                all_emergency=_all_start_targets_emergency_stopped(selected),
+                all_review=bool(excluded_review),
+            ),
+            "requested": requested,
+            "excluded_review": tuple(excluded_review),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+            "skipped": tuple(skipped),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            stock_failure_reason="REVIEW_REQUIRED",
+        )
+        _show_start_failure_once(window, result)
+        return result
+
+    eligible = tuple(f"{code} {name}" for _stock_dir, code, name in start_targets)
     completed: list[str] = []
     review_required: list[str] = []
+    failed: list[str] = []
+    validation_blocked: list[str] = []
+    failure_reasons: list[str] = []
+    routine_names: list[str] = []
 
+    previous_batch_flag = bool(
+        getattr(window, "_operation_start_batch_active", False)
+    )
+    setattr(window, "_operation_start_batch_active", True)
     for stock_dir, code, name in start_targets:
-        review_item = window.pre_start_review_check(routine_name, stock_dir, code, name)
+        config_path = stock_dir / "config.json"
+        config = read_json_dict(config_path)
+        if not config_path.exists() or not config:
+            failed.append(f"{code} {name}")
+            validation_blocked.append(f"{code} {name}")
+            failure_reasons.append("MISSING_REQUIRED_SETTINGS")
+            continue
+        instance_id = str(
+            config.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        routine_name = str(
+            config.get("routine_instance_name")
+            or config.get("routine")
+            or config.get("routine_name")
+            or ""
+        ).strip()
+        if not instance_id or not routine_name:
+            failed.append(f"{code} {name}")
+            validation_blocked.append(f"{code} {name}")
+            failure_reasons.append("MISSING_REQUIRED_SETTINGS")
+            continue
+        if routine_name not in routine_names:
+            routine_names.append(routine_name)
 
-        if review_required_for_start(review_item):
-            if window.mark_review_required(stock_dir, code, name, review_item, source="매매시작"):
-                review_required.append(f"{code} {name}")
+        state_path = stock_dir / "state.json"
+        state = read_json_dict(state_path)
+        if not state_path.exists():
+            failed.append(f"{code} {name}")
+            failure_reasons.append("RUNTIME_MISSING")
+            continue
+        if not state:
+            failed.append(f"{code} {name}")
+            failure_reasons.append("RUNTIME_DAMAGED")
+            continue
+        try:
+            validation = initial_buy_start_validation(config, state)
+        except Exception:
+            LOGGER.exception("초회 매수 기준 검증 실패: %s %s", code, name)
+            failed.append(f"{code} {name}")
+            failure_reasons.append("INTERNAL_EXCEPTION")
+            continue
+        if validation.get("allowed") is not True:
+            failed.append(f"{code} {name}")
+            validation_blocked.append(f"{code} {name}")
+            failure_reasons.append(
+                str(validation.get("reason") or "MISSING_REQUIRED_SETTINGS")
+            )
             continue
 
-        config = read_json_dict(stock_dir / "config.json")
-        if not config:
-            config = default_config()
+        try:
+            review_item = window.pre_start_review_check(
+                routine_name,
+                stock_dir,
+                code,
+                name,
+            )
+        except Exception:
+            LOGGER.exception("운영 시작 전 Runtime 검토 실패: %s %s", code, name)
+            failed.append(f"{code} {name}")
+            failure_reasons.append("INTERNAL_EXCEPTION")
+            continue
+
+        if review_required_for_start(review_item):
+            if window.mark_review_required(stock_dir, code, name, review_item, source="운영시작"):
+                review_required.append(f"{code} {name}")
+                failure_reasons.append("REVIEW_REQUIRED")
+            else:
+                failed.append(f"{code} {name}")
+                failure_reasons.append("REVIEW_STATE_SAVE_FAILED")
+            continue
 
         operation_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
         start_status = status_after_operation_mode_change(operation_mode, config)
-        status_display = auto_trade_status_display(start_status)
         mode_display = operation_mode_display(operation_mode)
         trade_permission_text, _, _ = trade_permission_display(config)
+        started_at = now_text()
 
         metadata = {
             "review_required": False,
             "review_status": "",
             "review_reason": "",
-            "resumed_at": now_text(),
-            "ignore_signals_before": now_text(),
+            "resumed_at": started_at,
+            "ignore_signals_before": started_at,
             # operation_mode는 config.json만 원본으로 사용한다.
             # state.json에는 저장하지 않는다.
             "real_trade_enabled": real_trade_enabled(config),
             "trade_enabled": True,
-            "trade_started_at": now_text(),
+            "trade_started_at": started_at,
             "startup_reset_reason": "",
-            "startup_reset_cleared_at": now_text(),
+            "startup_reset_cleared_at": started_at,
             "operation_notice": "",
             "operation_notice_reason": "",
             "operation_notice_at": "",
             "start_policy_status": start_status,
-            "start_policy_checked_at": now_text(),
+            "start_policy_checked_at": started_at,
         }
-        result, _, applied_status = window.recalculate_stock_status_by_operation_policy(
-            stock_dir,
-            code,
-            name,
-            "매매시작",
-            metadata,
-        )
+        try:
+            result, _, applied_status = (
+                window.recalculate_stock_status_by_operation_policy(
+                    stock_dir,
+                    code,
+                    name,
+                    "운영시작",
+                    metadata,
+                )
+            )
+        except Exception:
+            LOGGER.exception("운영 상태 저장 실패: %s %s", code, name)
+            failed.append(f"{code} {name}")
+            failure_reasons.append("INTERNAL_EXCEPTION")
+            continue
         if result in ("changed", "unchanged"):
             completed.append(f"{code} {name}({mode_display}/{trade_permission_text}/{auto_trade_status_display(applied_status)})")
+        else:
+            failed.append(f"{code} {name}")
+            failure_reasons.append(
+                "STATE_SAVE_FAILED" if result == "failed" else "REVIEW_REQUIRED"
+            )
+    setattr(window, "_operation_start_batch_active", previous_batch_flag)
 
-    if completed or review_required:
+    if completed or review_required or failed:
         changelog_parts: list[str] = []
         if completed:
             changelog_parts.append(f"시작: {' / '.join(completed)}")
         if review_required:
             changelog_parts.append(f"검토종목: {' / '.join(review_required)}")
+        if failed:
+            changelog_parts.append(f"실패: {' / '.join(failed)}")
         if skipped:
             changelog_parts.append(f"제외: {' / '.join(skipped)}")
 
-        append_changelog(
-            "UPDATE",
-            "state.json",
-            f"매매시작 전 안정성검사 및 operation_mode 반영: {routine_name} -> {' | '.join(changelog_parts)}",
-        )
+        try:
+            append_changelog(
+                "UPDATE",
+                "state.json",
+                f"운영시작 전 안전검사 및 operation_mode 반영: "
+                f"{' / '.join(routine_names) or '종목별 소속 확인 실패'} -> {' | '.join(changelog_parts)}",
+            )
+        except Exception:
+            LOGGER.exception("운영 시작 결과 로그 기록 실패")
 
-    window.refresh_all()
-    window.stock_table.viewport().update()
-    window.stock_table.repaint()
+    try:
+        window.refresh_all()
+        window.stock_table.viewport().update()
+        window.stock_table.repaint()
+    except Exception:
+        LOGGER.exception("운영 시작 후 화면 새로고침 실패")
+    if completed or review_required:
+        rebind_recovery = getattr(
+            window,
+            "rebind_startup_recovery_after_trusted_runtime_update",
+            None,
+        )
+        if callable(rebind_recovery):
+            rebind_recovery()
 
     result_lines = [
-        f"매매시작: {len(completed)}개",
+        f"운영시작: {len(completed)}개",
         f"기운영중: {len(skipped)}개",
-        f"검토관리: {len(review_required)}개",
+        f"검토 대상 제외: {len(excluded_review)}개",
+        f"검토관리 이동: {len(review_required)}개",
+        f"실패: {len(failed)}개",
     ]
 
-    window.show_auto_trade_result_dialog("안정성검사 완료", "안정성검사 결과", result_lines)
+    excluded_review_count = len(excluded_review) + len(review_required)
+    excluded_validation_count = len(validation_blocked)
+    non_validation_failed_count = max(0, len(failed) - excluded_validation_count)
+    result = {
+        "ok": bool(completed),
+        "reason": (
+            "STARTED"
+            if completed
+            else ("REVIEW_REQUIRED" if review_required else "START_FAILED")
+        ),
+        "requested": requested,
+        "excluded_review": tuple(excluded_review),
+        "eligible": eligible,
+        "completed": tuple(completed),
+        "blocked_validation": tuple(validation_blocked),
+        "review_required": tuple(review_required),
+        "failed": tuple(failed),
+        "skipped": tuple(skipped),
+        "operation": "START",
+        "requested_count": len(requested),
+        "started_count": len(completed),
+        "excluded_review_count": excluded_review_count,
+        "excluded_validation_count": excluded_validation_count,
+        "failed_count": non_validation_failed_count,
+        "global_failure_reason": "",
+        "internal_reason": tuple(dict.fromkeys(failure_reasons)),
+    }
+    _apply_start_request_context(
+        result,
+        request_scope=request_scope,
+        selected=selected,
+        request_source=source,
+        stock_failure_reason=(failure_reasons[0] if failure_reasons else ""),
+    )
+    if completed:
+        if request_scope != START_REQUEST_SINGLE:
+            result["user_message"] = _start_result_summary(
+                started_count=len(completed),
+                excluded_review_count=excluded_review_count,
+                excluded_validation_count=excluded_validation_count,
+                failed_count=non_validation_failed_count,
+            )
+        result["user_action"] = ""
+        if request_scope == START_REQUEST_SINGLE:
+            window.statusBarMessage(str(result["user_message"]))
+        elif excluded_review_count or excluded_validation_count or non_validation_failed_count or skipped:
+            window.statusBarMessage(str(result["user_message"]))
+        else:
+            window.show_auto_trade_result_dialog(
+                "운영시작 처리 완료",
+                "운영시작 결과",
+                result_lines,
+            )
+    else:
+        if request_scope != START_REQUEST_SINGLE:
+            result["user_message"] = _start_failure_user_message(
+                failure_reasons,
+                all_emergency=_all_start_targets_emergency_stopped(selected),
+                all_review=bool(review_required) and not failed,
+            )
+        result["user_action"] = str(result["user_message"]).splitlines()[-1]
+        result["global_failure_reason"] = str(result["reason"])
+        _show_start_failure_once(window, result)
     if review_required:
         window.open_review_required_window()
+    return result
+
+
+def auto_trade_start_status_indicator(
+    window,
+    target: tuple[Path, str, str],
+    *,
+    source: str = "auto_trade_status_indicator",
+) -> dict[str, object]:
+    stock_dir, code, _name = target
+    inflight = getattr(window, "_operation_start_inflight_stock_codes", set())
+    if code in inflight:
+        return {
+            "ok": False,
+            "reason": "REQUEST_IN_PROGRESS",
+            "request_scope": START_REQUEST_SINGLE,
+            "source": source,
+            "target_stock_code": code,
+        }
+
+    state = read_json_dict(Path(stock_dir) / "state.json")
+    if auto_trade_setting_trade_started(state):
+        result: dict[str, object] = {
+            "ok": False,
+            "reason": "ALREADY_RUNNING",
+            "requested": (f"{code} {target[2]}",),
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=START_REQUEST_SINGLE,
+            selected=[target],
+            request_source=source,
+            stock_failure_reason="ALREADY_RUNNING",
+        )
+        setattr(window, "_last_operation_failure_dialog_shown", False)
+        _show_start_failure_once(window, result)
+        return result
+
+    inflight.add(code)
+    setattr(window, "_operation_start_inflight_stock_codes", inflight)
+    try:
+        result = auto_trade_start_selected_auto_trades(
+            window,
+            request_scope=START_REQUEST_SINGLE,
+            selected_targets=[target],
+            source=source,
+        )
+        state_after = read_json_dict(Path(stock_dir) / "state.json")
+        if result.get("ok") is not True or auto_trade_setting_trade_started(state_after):
+            return result
+
+        failed_result: dict[str, object] = {
+            "ok": False,
+            "reason": "STATE_READBACK_FAILED",
+            "requested": (f"{code} {target[2]}",),
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": (f"{code} {target[2]}",),
+        }
+        _apply_start_request_context(
+            failed_result,
+            request_scope=START_REQUEST_SINGLE,
+            selected=[target],
+            request_source=source,
+            stock_failure_reason="STATE_READBACK_FAILED",
+        )
+        _show_start_failure_once(window, failed_result)
+        return failed_result
+    finally:
+        inflight.discard(code)
 
 
 
-def auto_trade_stop_selected_auto_trades(window) -> None:
-    selected = window.selected_stock_infos()
+def auto_trade_stop_selected_auto_trades(
+    window,
+    *,
+    selected_targets=None,
+    source: str = "",
+) -> dict[str, object]:
+    selected = (
+        list(selected_targets)
+        if selected_targets is not None
+        else window.selected_stock_infos()
+    )
     routine_name = window.current_selected_routine_name()
 
-    if not selected or not routine_name:
-        QMessageBox.warning(window, "선택 오류", "감시를 종료할 종목을 1개 이상 선택하세요.")
-        return
+    if not selected or (selected_targets is None and not routine_name):
+        _show_operation_warning(
+            window,
+            "선택 오류",
+            "감시를 종료할 종목을 1개 이상 선택하세요.",
+        )
+        return {"ok": False, "reason": "NO_TARGETS", "completed": ()}
 
     stop_targets, skipped = window.split_stop_targets(selected)
     if not stop_targets:
         window.statusBarMessage("강제종료 대상 없음: 이미 중지된 종목")
-        return
+        return {
+            "ok": False,
+            "reason": "NO_STOPPABLE_TARGETS",
+            "completed": (),
+            "skipped": tuple(skipped),
+        }
 
     if not window.confirm_stop_targets_once(stop_targets):
         window.statusBarMessage("강제종료 취소")
-        return
+        return {"ok": False, "reason": "CANCELLED", "completed": ()}
 
     completed: list[str] = []
     review_moved: list[str] = []
+    affected_routine_names: list[str] = []
 
     for stock_dir, code, name in stop_targets:
+        config = read_json_dict(stock_dir / "config.json")
+        target_routine_name = str(
+            config.get("routine_instance_name")
+            or config.get("routine")
+            or config.get("routine_name")
+            or config.get("assigned_routine_instance_id")
+            or routine_name
+            or "전체 등록 대상"
+        ).strip()
+        if target_routine_name not in affected_routine_names:
+            affected_routine_names.append(target_routine_name)
         risk_parts = window.stop_risk_parts(stock_dir)
 
         if risk_parts:
@@ -298,7 +1335,7 @@ def auto_trade_stop_selected_auto_trades(window) -> None:
                 "review_reason": reason_text,
                 "review_entered_at": now_text(),
                 "review_checked_at": now_text(),
-                "review_routine": routine_name,
+                "review_routine": target_routine_name,
                 "review_detail": f"{code} {name} / {reason_text}",
                 "trade_enabled": False,
                 "trade_stopped_at": now_text(),
@@ -342,7 +1379,9 @@ def auto_trade_stop_selected_auto_trades(window) -> None:
         append_changelog(
             "UPDATE",
             "state.json",
-            f"강제종료 상태 변경: {routine_name} -> {' | '.join(changelog_parts)}",
+            "강제종료 상태 변경: "
+            f"{' / '.join(affected_routine_names) or routine_name} -> "
+            f"{' | '.join(changelog_parts)}",
         )
 
     window.refresh_all()
@@ -358,3 +1397,11 @@ def auto_trade_stop_selected_auto_trades(window) -> None:
 
     if review_moved:
         window.open_review_required_window()
+    return {
+        "ok": bool(completed or review_moved),
+        "reason": "STOPPED" if completed or review_moved else "STOP_FAILED",
+        "completed": tuple(completed),
+        "review_required": tuple(review_moved),
+        "skipped": tuple(skipped),
+        "request_source": str(source or ""),
+    }

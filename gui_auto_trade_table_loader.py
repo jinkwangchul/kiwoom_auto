@@ -60,6 +60,7 @@ from gui_auto_trade_policy import (
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
     auto_trade_setting_early_close_metadata_is_stale,
+    auto_trade_setting_early_close_progress_text,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_effective_liquidation_method,
     auto_trade_setting_has_close_progress_quantity,
@@ -86,6 +87,7 @@ from gui_auto_trade_policy import (
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
+    is_review_required_state,
 )
 from gui_ats_utils import (
     auto_trade_setting_regular_market_active_now,
@@ -229,6 +231,9 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     "NO_CLOSE_TARGET",
                     "AUTO_CLOSE_NO_TARGET",
                     "EARLY_CLOSE_NO_TARGET",
+                    "EARLY_CLOSE_WAITING",
+                    "EARLY_CLOSE_ORDER_PROGRESS",
+                    "EARLY_CLOSE_COMPLETED",
                 }:
                     state["operation_notice"] = ""
                     state["operation_notice_reason"] = ""
@@ -519,7 +524,18 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             ]
 
             for col, value in enumerate(values):
-                if col == 3:
+                if col == 1:
+                    item = SortableTableWidgetItem(value)
+                    if is_review_required_state(state) or display_status in {
+                        "긴급정지",
+                        "검토종목",
+                    }:
+                        item.setToolTip("검토관리에서 먼저 처리해야 합니다.")
+                    elif trade_started:
+                        item.setToolTip("현재 운영 중입니다.")
+                    else:
+                        item.setToolTip("더블클릭하면 이 종목의 운영을 시작합니다.")
+                elif col == 3:
                     item = create_auto_trade_situation_item(
                         state,
                         current_session_trade_started,
@@ -527,6 +543,11 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     )
                 elif col == 4:
                     item = create_auto_trade_setting_status_item(display_status)
+                    early_close_progress = (
+                        auto_trade_setting_early_close_progress_text(state)
+                    )
+                    if early_close_progress:
+                        item.setToolTip(f"조기마감: {early_close_progress}")
                 else:
                     item = SortableTableWidgetItem(value)
                     item.setToolTip(value)

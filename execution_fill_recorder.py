@@ -199,6 +199,37 @@ def _read_fills_for_lookup(path: Path) -> list[dict[str, Any]]:
     return [dict(item) for item in fills if isinstance(item, dict)] if isinstance(fills, list) else []
 
 
+def read_execution_fill_records(fills_path: str | Path) -> dict[str, Any]:
+    """Return a validated, detached Fill snapshot without mutation."""
+
+    target_path = Path(fills_path)
+    if not target_path.exists():
+        return {
+            "ok": False,
+            "path": str(target_path),
+            "records": (),
+            "error": _blocked("read_fills", "fills file does not exist"),
+        }
+    data, blocked = _read_fills(target_path)
+    if blocked is not None:
+        return {
+            "ok": False,
+            "path": str(target_path),
+            "records": (),
+            "error": deepcopy(blocked),
+        }
+    fills = data.get("fills", [])
+    return {
+        "ok": True,
+        "path": str(target_path),
+        "version": data.get("version", 1),
+        "records": tuple(
+            deepcopy(item) for item in fills if isinstance(item, dict)
+        ),
+        "error": None,
+    }
+
+
 def _validate_event_record_result(result_value: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
     result = _as_dict(result_value)
     if not isinstance(result_value, dict):

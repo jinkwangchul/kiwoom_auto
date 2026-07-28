@@ -420,6 +420,27 @@ class OperationCommandService:
                     STOCK_IGNORED_DUPLICATE,
                     current_sequence,
                 )
+            if is_immediate_liquidation:
+                holding_qty = self._nonnegative_int(state.get("holding_qty"))
+                if holding_qty is None or holding_qty <= 0:
+                    return self._stock_failure(
+                        stock_dir,
+                        "immediate liquidation requires a positive holding quantity",
+                        sequence=current_sequence,
+                    )
+                status = str(state.get("status", "") or "").strip().upper()
+                if status in {
+                    "EMERGENCY_STOPPED",
+                    "EMERGENCY_STOP",
+                    "EMERGENCY",
+                    "REVIEW_REQUIRED",
+                    "REVIEW",
+                }:
+                    return self._stock_failure(
+                        stock_dir,
+                        "immediate liquidation is blocked by the current runtime status",
+                        sequence=current_sequence,
+                    )
 
             next_sequence = current_sequence + 1
             applied_at = self._now_factory().isoformat(timespec="seconds")
@@ -653,11 +674,6 @@ class OperationCommandService:
                     "close_routine_final_sell_ordered_at": "",
                     "close_routine_final_sell_source": "",
                     "close_routine_final_sell_reason": "",
-                    "review_returned_at": "",
-                    "resumed_at": "",
-                    "trade_started_at": "",
-                    "startup_reset_at": "",
-                    "trade_stopped_at": "",
                 }
             )
             if str(state.get("status", "")).strip().upper() not in {

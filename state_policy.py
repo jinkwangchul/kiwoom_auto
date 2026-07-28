@@ -257,7 +257,6 @@ def default_operation_policy() -> dict[str, object]:
         "scheduled_operation": {
             "default_start_time": "09:00:00",
             "default_end_buy_time": "13:30:00",
-            "after_buy_end_status": "감시/매도",
         },
         "manual_operation": {
             "use_regular_market": True,
@@ -304,6 +303,9 @@ def read_operation_policy() -> dict[str, object]:
             merged[key].update(value)  # type: ignore[index]
         else:
             merged[key] = value
+    scheduled = merged.get("scheduled_operation")
+    if isinstance(scheduled, dict):
+        scheduled.pop("after_buy_end_status", None)
     return merged
 
 

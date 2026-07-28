@@ -7,7 +7,9 @@ gui_auto_trade_context_menu.py
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
+from typing import Callable
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
@@ -40,6 +42,16 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
     "20",
     "30",
 )
+
+
+@dataclass(frozen=True)
+class StockContextMenuCallbacks:
+    select_all: Callable[[], None]
+    clear_selection: Callable[[], None]
+    early_close: Callable[[str], None]
+    early_close_profit_loss: Callable[[], None]
+    early_close_cancel: Callable[[], None]
+    individual_liquidation: Callable[[str, str], None]
 
 
 class _MenuStatusIconEngine(QIconEngine):
@@ -110,29 +122,20 @@ def _apply_menu_status(
         action.setProperty(property_name, is_selected)
 
 
-def show_auto_trade_stock_context_menu(window, pos) -> None:
-    """하단 종목표 우클릭 메뉴.
+def _new_stock_context_menu(parent) -> QMenu:
+    menu = QMenu(parent)
+    set_tooltips_visible = getattr(menu, "setToolTipsVisible", None)
+    if callable(set_tooltips_visible):
+        set_tooltips_visible(True)
+    return menu
 
-    조기마감과 개별청산은 환경설정의 현재 방식을 표시하고,
-    선택한 항목은 기존 실행·저장 경로로 전달한다.
-    """
-    item = window.stock_table.itemAt(pos)
-    if item is not None:
-        window.ensure_context_row_selected(item.row())
 
-    selected = window.selected_stock_infos()
-    has_selection = bool(selected)
-    selected_modes = window.selected_operation_mode_set(selected)
-
-    menu = QMenu(window)
-    operation_policy = _context_menu_operation_policy()
-
-    action_select_all = menu.addAction("전체 선택")
-    action_clear_selection = menu.addAction("전체 해제")
-    action_unregister = menu.addAction("등록 해제")
-    action_unregister.setEnabled(has_selection)
-
-    menu.addSeparator()
+def _add_early_close_menu(
+    menu: QMenu,
+    *,
+    has_selection: bool,
+    operation_policy: dict[str, object],
+):
     early_close_menu = menu.addMenu("조기마감")
     action_early_routine = early_close_menu.addAction("루틴마감")
     action_early_market = early_close_menu.addAction("시장가")
@@ -158,7 +161,48 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         ),
         "earlyCloseCurrent",
     )
+    return {
+        "routine": action_early_routine,
+        "market": action_early_market,
+        "current": action_early_current,
+        "profit_loss": action_early_profit_loss,
+        "carry": action_early_carry,
+        "cancel": action_early_cancel,
+        "menu": early_close_menu,
+    }
 
+
+def _dispatch_early_close_action(
+    chosen,
+    actions: dict[str, object],
+    *,
+    apply_method: Callable[[str], None],
+    apply_profit_loss: Callable[[], None],
+    cancel: Callable[[], None],
+) -> bool:
+    if chosen == actions["routine"]:
+        apply_method("루틴")
+    elif chosen == actions["market"]:
+        apply_method("시장가즉시")
+    elif chosen == actions["current"]:
+        apply_method("현재가즉시")
+    elif chosen == actions["profit_loss"]:
+        apply_profit_loss()
+    elif chosen == actions["carry"]:
+        apply_method("이월")
+    elif chosen == actions["cancel"]:
+        cancel()
+    else:
+        return False
+    return True
+
+
+def _add_individual_liquidation_menu(
+    menu: QMenu,
+    *,
+    has_selection: bool,
+    operation_policy: dict[str, object],
+):
     individual_liquidation_menu = menu.addMenu("개별청산")
     action_individual_market = individual_liquidation_menu.addAction("시장가")
     action_individual_current = individual_liquidation_menu.addAction("현재가")
@@ -218,6 +262,110 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     individual_time_menu.setEnabled(
         has_selection and individual_method != "이월"
     )
+    return {
+        "market": action_individual_market,
+        "current": action_individual_current,
+        "carry": action_individual_carry,
+        "time_actions": individual_time_actions,
+        "method": individual_method,
+        "minutes": individual_minutes,
+        "time_menu": individual_time_menu,
+    }
+
+
+def show_monitor_stock_context_menu(
+    parent,
+    global_pos,
+    *,
+    has_selection: bool,
+    callbacks: StockContextMenuCallbacks,
+) -> None:
+    """Show the monitoring stock-row profile with the shared menu form."""
+
+    menu = _new_stock_context_menu(parent)
+    operation_policy = _context_menu_operation_policy()
+
+    action_select_all = menu.addAction("전체 선택")
+    action_clear_selection = menu.addAction("전체 해제")
+
+    menu.addSeparator()
+    early_close = _add_early_close_menu(
+        menu,
+        has_selection=has_selection,
+        operation_policy=operation_policy,
+    )
+
+    individual = _add_individual_liquidation_menu(
+        menu,
+        has_selection=has_selection,
+        operation_policy=operation_policy,
+    )
+
+    chosen = menu.exec_(global_pos)
+    if chosen is None:
+        return
+    if chosen == action_select_all:
+        callbacks.select_all()
+    elif chosen == action_clear_selection:
+        callbacks.clear_selection()
+    elif _dispatch_early_close_action(
+        chosen,
+        early_close,
+        apply_method=callbacks.early_close,
+        apply_profit_loss=callbacks.early_close_profit_loss,
+        cancel=callbacks.early_close_cancel,
+    ):
+        return
+    elif chosen == individual["market"]:
+        callbacks.individual_liquidation("시장가", individual["minutes"])
+    elif chosen == individual["current"]:
+        callbacks.individual_liquidation("현재가", individual["minutes"])
+    elif chosen == individual["carry"]:
+        callbacks.individual_liquidation("이월", individual["minutes"])
+    else:
+        for minute, action in individual["time_actions"]:
+            if chosen == action:
+                callbacks.individual_liquidation(individual["method"], minute)
+                return
+
+
+def show_auto_trade_stock_context_menu(window, pos) -> None:
+    """하단 종목표 우클릭 메뉴.
+
+    조기마감과 개별청산은 환경설정의 현재 방식을 표시하고,
+    선택한 항목은 기존 실행·저장 경로로 전달한다.
+    """
+    item = window.stock_table.itemAt(pos)
+    if item is not None:
+        window.ensure_context_row_selected(item.row())
+
+    selected = window.selected_stock_infos()
+    has_selection = bool(selected)
+    selected_modes = window.selected_operation_mode_set(selected)
+
+    menu = _new_stock_context_menu(window)
+    operation_policy = _context_menu_operation_policy()
+
+    action_start = menu.addAction("운영시작")
+    action_start.setEnabled(has_selection)
+    menu.addSeparator()
+    action_select_all = menu.addAction("전체 선택")
+    action_clear_selection = menu.addAction("전체 해제")
+    action_unregister = menu.addAction("등록 해제")
+    action_unregister.setEnabled(has_selection)
+
+    menu.addSeparator()
+    early_close = _add_early_close_menu(
+        menu,
+        has_selection=has_selection,
+        operation_policy=operation_policy,
+    )
+
+    individual = _add_individual_liquidation_menu(
+        menu,
+        has_selection=has_selection,
+        operation_policy=operation_policy,
+    )
 
     action_time_change = None
     action_time_reset = None
@@ -240,47 +388,48 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     if chosen is None:
         return
 
-    for minute, action in individual_time_actions:
+    for minute, action in individual["time_actions"]:
         if chosen == action:
             window.apply_selected_individual_liquidation_method(
-                individual_method,
+                individual["method"],
                 minute,
             )
             return
 
-    if chosen == action_select_all:
+    if chosen == action_start:
+        window.start_selected_rows_auto_trades()
+    elif chosen == action_select_all:
         window.select_all_current_routine_stocks()
     elif chosen == action_clear_selection:
         window.clear_current_routine_stock_selection()
     elif chosen == action_unregister:
         window.unregister_selected_auto_trade_stocks()
-    elif chosen == action_individual_market:
+    elif chosen == individual["market"]:
         window.apply_selected_individual_liquidation_method(
             "시장가",
-            individual_minutes,
+            individual["minutes"],
         )
-    elif chosen == action_individual_current:
+    elif chosen == individual["current"]:
         window.apply_selected_individual_liquidation_method(
             "현재가",
-            individual_minutes,
+            individual["minutes"],
         )
-    elif chosen == action_individual_carry:
+    elif chosen == individual["carry"]:
         window.apply_selected_individual_liquidation_method(
             "이월",
-            individual_minutes,
+            individual["minutes"],
         )
-    elif chosen == action_early_routine:
-        window.apply_selected_early_close("루틴", source="우클릭")
-    elif chosen == action_early_market:
-        window.apply_selected_early_close("시장가즉시", source="우클릭")
-    elif chosen == action_early_current:
-        window.apply_selected_early_close("현재가즉시", source="우클릭")
-    elif chosen == action_early_profit_loss:
-        window.apply_selected_early_close_profit_loss()
-    elif chosen == action_early_carry:
-        window.apply_selected_early_close("이월", source="우클릭")
-    elif chosen == action_early_cancel:
-        window.cancel_selected_early_close()
+    elif _dispatch_early_close_action(
+        chosen,
+        early_close,
+        apply_method=lambda method: window.apply_selected_early_close(
+            method,
+            source="우클릭",
+        ),
+        apply_profit_loss=window.apply_selected_early_close_profit_loss,
+        cancel=window.cancel_selected_early_close,
+    ):
+        return
     elif action_time_change is not None and chosen == action_time_change:
         window.set_selected_individual_schedule_time()
     elif action_time_reset is not None and chosen == action_time_reset:

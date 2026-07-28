@@ -17,7 +17,9 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import QMessageBox
 
+from gui_toast import show_toast
 from gui_common_utils import safe_int_value
+from gui_auto_trade_integrity import is_review_required_state
 from gui_config_utils import default_state
 from gui_order_utils import pending_order_side_quantities
 from runtime_io import read_json_dict, read_orders_data
@@ -157,16 +159,18 @@ def execute_emergency_stop(window) -> None:
 
     append_changelog("UPDATE", "state.json", f"긴급정지 실행: {changed_count}개 종목")
     window.statusBar().showMessage(f"긴급정지 실행 완료: {changed_count}개 종목")
-    window.refresh_all()
-    QMessageBox.information(
-        window,
-        "긴급정지 완료",
-        "긴급정지 처리 완료\n\n"
-        f"대상 종목: {changed_count}개\n"
-        "신규 매수/매도: 차단\n"
-        "자동판단/자동청산: 중지\n"
-        "보유 종목: 자동 매도하지 않음\n\n"
-        "버튼은 정지해제로 전환됩니다.",
+    refresh_views = getattr(window, "refresh_auto_trade_assignment_views", None)
+    if callable(refresh_views):
+        refresh_views()
+    else:
+        window.refresh_all()
+    show_toast(
+        parent=window,
+        message=(
+            f"긴급정지 완료 | 대상종목 : {changed_count}개 | 매수/매도 : 차단"
+        ),
+        duration_ms=2500,
+        position="center",
     )
 
 
@@ -177,6 +181,15 @@ def release_emergency_stop(window) -> None:
     for stock_dir in window.all_runtime_stock_dirs():
         code, name = parse_stock_folder_name(stock_dir.name)
         routine_name = window.routine_name_for_stock_dir(stock_dir)
+        state_before = read_json_dict(stock_dir / "state.json")
+        registry_checker = getattr(
+            window,
+            "production_recovery_stock_is_review_required",
+            None,
+        )
+        already_in_review = is_review_required_state(state_before) or (
+            bool(registry_checker(code)) if callable(registry_checker) else False
+        )
         has_problem, reason = emergency_review_reason_for_stock(stock_dir)
         if has_problem:
             metadata = {
@@ -189,7 +202,15 @@ def release_emergency_stop(window) -> None:
                 "review_routine": routine_name,
                 "review_detail": f"{code} {name} / {reason}",
             }
-            if update_runtime_stock_status(window, stock_dir, code, name, "REVIEW_REQUIRED", metadata, reason):
+            if update_runtime_stock_status(
+                window,
+                stock_dir,
+                code,
+                name,
+                "REVIEW_REQUIRED",
+                metadata,
+                reason,
+            ) and not already_in_review:
                 review_count += 1
         else:
             metadata = {
@@ -231,14 +252,19 @@ def release_emergency_stop(window) -> None:
     window.statusBar().showMessage(
         f"정지해제 완료: 정상 {normal_count}개 / 검토관리 {review_count}개"
     )
-    window.refresh_all()
-    QMessageBox.information(
-        window,
-        "정지해제 완료",
-        "무결성 검사 완료\n\n"
-        f"정상 → 감시/대기: {normal_count}개\n"
-        f"검토관리 이동: {review_count}개\n\n"
-        "상세 내용은 검토종목 관리창에서 확인하세요.",
+    refresh_views = getattr(window, "refresh_auto_trade_assignment_views", None)
+    if callable(refresh_views):
+        refresh_views()
+    else:
+        window.refresh_all()
+    show_toast(
+        parent=window,
+        message=(
+            f"정지해제 완료 | 감시/대기 전환 : {normal_count}종목"
+            f" | 검토관리 : {review_count}종목"
+        ),
+        duration_ms=2500,
+        position="center",
     )
 
 

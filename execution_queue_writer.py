@@ -355,6 +355,31 @@ def _read_queue_file(queue_path: Path) -> tuple[dict[str, Any], dict[str, Any] |
     return data, None
 
 
+def read_execution_queue_records(queue_path: str | Path) -> dict[str, Any]:
+    """Return a validated, detached Queue snapshot without mutation."""
+
+    target_path = Path(queue_path)
+    data, blocked = _read_queue_file(target_path)
+    if blocked is not None:
+        return {
+            "ok": False,
+            "path": str(target_path),
+            "records": (),
+            "error": deepcopy(blocked),
+        }
+    orders = data.get("orders", [])
+    return {
+        "ok": True,
+        "path": str(target_path),
+        "version": data.get("version", 1),
+        "revision": data.get("revision"),
+        "records": tuple(
+            deepcopy(item) for item in orders if isinstance(item, dict)
+        ),
+        "error": None,
+    }
+
+
 def _write_json_atomic(queue_path: Path, data: dict[str, Any]) -> str:
     tmp_path = queue_path.with_name(f".{queue_path.name}.{uuid4().hex}.tmp")
     try:

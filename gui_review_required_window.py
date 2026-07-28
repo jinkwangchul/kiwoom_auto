@@ -59,6 +59,12 @@ ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
 
+def review_entered_at_display(state: dict[str, object]) -> str:
+    """Read the persisted review transition time without inferring one."""
+    entered_at = str(state.get("review_entered_at", "") or "").strip()
+    return entered_at or "미기록"
+
+
 def get_routine_dirs() -> list[Path]:
     """
     호환용 루틴 path 조회.
@@ -420,7 +426,7 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             "name": name,
             "review_location": str(state.get("review_location", "") or "-").strip() or "-",
             "review_reason": str(state.get("review_reason", "") or state.get("review_detail", "") or "-").strip() or "-",
-            "review_entered_at": str(state.get("review_entered_at", "") or state.get("review_checked_at", "") or "-").strip() or "-",
+            "review_entered_at": review_entered_at_display(state),
             "last_checked_at": str(state.get("review_checked_at", "") or state.get("updated_at", "") or "-").strip() or "-",
             "holding_qty": holding_qty,
             "avg_price": avg_price,
@@ -466,12 +472,12 @@ class GlobalReviewRequiredWindow(QDialog):
             "종목",
             "위치",
             "상태",
+            "검토 전환 시각",
             "사유",
             "검출",
             "보유",
             "미수",
             "미도",
-            "발생시간",
         ]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -485,12 +491,12 @@ class GlobalReviewRequiredWindow(QDialog):
         self.table.setColumnWidth(1, 180)   # 종목
         self.table.setColumnWidth(2, 140)   # 위치
         self.table.setColumnWidth(3, 75)    # 상태
-        self.table.setColumnWidth(4, 350)   # 사유
-        self.table.setColumnWidth(5, 130)   # 검출
-        self.table.setColumnWidth(6, 100)    # 보유
-        self.table.setColumnWidth(7, 75)    # 미수
-        self.table.setColumnWidth(8, 75)    # 미도
-        self.table.setColumnWidth(9, 180)   # 발생시간
+        self.table.setColumnWidth(4, 180)   # 검토 전환 시각
+        self.table.setColumnWidth(5, 350)   # 사유
+        self.table.setColumnWidth(6, 130)   # 검출
+        self.table.setColumnWidth(7, 100)   # 보유
+        self.table.setColumnWidth(8, 75)    # 미수
+        self.table.setColumnWidth(9, 75)    # 미도
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -634,7 +640,7 @@ class GlobalReviewRequiredWindow(QDialog):
             f"미도: {sell_pending_qty}\n"
             f"상태: {return_availability}\n"
             f"사유: {reason}\n"
-            f"발생시간: {entered_at}"
+            f"검토 전환 시각: {entered_at}"
         )
 
 
@@ -721,7 +727,7 @@ class GlobalReviewRequiredWindow(QDialog):
                     "name": name,
                     "review_location": str(state.get("review_location", "") or "-").strip() or "-",
                     "review_reason": str(state.get("review_reason", "") or state.get("review_detail", "") or "-").strip() or "-",
-                    "review_entered_at": str(state.get("review_entered_at", "") or state.get("review_checked_at", "") or "-").strip() or "-",
+                    "review_entered_at": review_entered_at_display(state),
                     "last_checked_at": str(state.get("review_checked_at", "") or state.get("updated_at", "") or "-").strip() or "-",
                     "holding_qty": holding_qty,
                     "avg_price": avg_price,
@@ -743,12 +749,12 @@ class GlobalReviewRequiredWindow(QDialog):
             self._set_item(row_index, 1, row.get("name", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
             self._set_item(row_index, 2, row.get("routine_name", "-"), tooltip=tooltip)
             self._set_item(row_index, 3, row.get("return_availability", "-"), tooltip=tooltip)
-            self._set_item(row_index, 4, row.get("review_reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 5, row.get("review_location", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 6, row.get("holding_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 7, row.get("buy_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 8, row.get("sell_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 9, row.get("review_entered_at", "-"), tooltip=tooltip)
+            self._set_item(row_index, 4, row.get("review_entered_at", "미기록"), tooltip=tooltip)
+            self._set_item(row_index, 5, row.get("review_reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_item(row_index, 6, row.get("review_location", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_item(row_index, 7, row.get("holding_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
+            self._set_item(row_index, 8, row.get("buy_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
+            self._set_item(row_index, 9, row.get("sell_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
 
             first_item = self.table.item(row_index, 0)
             if first_item is not None:

@@ -17,9 +17,9 @@ from runtime_io import write_json_if_missing
 def default_config() -> dict[str, object]:
     return {
         "timeframe": "1m",
-        "trade_amount_type": "AMOUNT",
-        "buy_amount": 100000,
-        "buy_qty": 0,
+        "trade_amount_type": "QUANTITY",
+        "buy_amount": 0,
+        "buy_qty": 1,
         "buy_signal_bar": 1,
         "sell_signal_bar": 1,
         "buy_amount_mode": "ADD",

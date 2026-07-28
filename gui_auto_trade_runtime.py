@@ -63,6 +63,28 @@ def _central_stocks_available() -> bool:
         return False
 
 
+def all_registered_stock_dirs() -> list[Path]:
+    """Return every registered stock directory from the central store."""
+    if not _central_stocks_available():
+        return []
+    try:
+        result = [
+            stock_dir
+            for stock_dir in CENTRAL_STOCKS_DIR.iterdir()
+            if (
+                stock_dir.is_dir()
+                and not stock_dir.name.startswith(".")
+                and not stock_dir.name.startswith("__")
+                and (stock_dir / "config.json").exists()
+                and (stock_dir / "state.json").exists()
+            )
+        ]
+    except Exception:
+        return []
+    result.sort(key=lambda path: path.name)
+    return result
+
+
 def _routine_display_name_from_dir(routine_dir: Path) -> str:
     """루틴 원본 경로에서 화면 표시 루틴명을 만든다."""
     if routine_dir is None:

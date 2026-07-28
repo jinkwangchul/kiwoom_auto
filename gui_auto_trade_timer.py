@@ -8,21 +8,25 @@ gui_auto_trade_timer.py
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
 from gui_ats_utils import manual_ats_market_day_closed
 from manual_ats_runtime import reset_expired_manual_ats_runtime_selections
+from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
 
 try:
-    from routine_signal_probe import probe_selected_routine_once
+    from routine_signal_probe import probe_all_enabled_routine_stocks_once
 except Exception:
-    probe_selected_routine_once = None
+    probe_all_enabled_routine_stocks_once = None
 
 try:
     from routine_signal_consumer import consume_pending_routine_signals_dry_run
 except Exception:
     consume_pending_routine_signals_dry_run = None
+
+LOGGER = logging.getLogger(__name__)
 
 
 def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
@@ -52,15 +56,11 @@ def _read_json_dict(path: Path) -> dict:
 
 
 def auto_trade_signal_probe_only_active(window) -> bool:
-    routine_dir = window.current_selected_routine_dir()
-    if routine_dir is None:
-        return False
-
     try:
-        from gui_auto_trade_runtime import get_stock_dirs_in_routine
-        stock_dirs = get_stock_dirs_in_routine(Path(routine_dir))
+        from gui_auto_trade_runtime import all_registered_stock_dirs
+        stock_dirs = all_registered_stock_dirs()
     except Exception:
-        stock_dirs = assigned_stock_dirs_in_routine(Path(routine_dir))
+        stock_dirs = []
 
     for stock_dir in stock_dirs:
         state = _read_json_dict(Path(stock_dir) / "state.json")
@@ -70,21 +70,25 @@ def auto_trade_signal_probe_only_active(window) -> bool:
 
 
 def auto_trade_real_execution_active(window) -> bool:
-    routine_dir = window.current_selected_routine_dir()
-    if routine_dir is None:
-        return False
-
     try:
-        from gui_auto_trade_runtime import get_stock_dirs_in_routine
-        stock_dirs = get_stock_dirs_in_routine(Path(routine_dir))
+        from gui_auto_trade_runtime import all_registered_stock_dirs
+        stock_dirs = all_registered_stock_dirs()
     except Exception:
-        stock_dirs = assigned_stock_dirs_in_routine(Path(routine_dir))
+        stock_dirs = []
 
     for stock_dir in stock_dirs:
         state = _read_json_dict(Path(stock_dir) / "state.json")
         if state.get("signal_probe_only") is True:
             continue
         if state.get("review_required") is True:
+            continue
+        if str(state.get("status") or "").strip().upper() in {
+            "REVIEW_REQUIRED",
+            "REVIEW",
+            "EMERGENCY_STOPPED",
+            "EMERGENCY_STOP",
+            "EMERGENCY",
+        }:
             continue
         if state.get("trade_enabled") is True and state.get("real_trade_enabled") is True:
             return True
@@ -98,13 +102,16 @@ def auto_trade_current_time_policy_minute_key(window) -> str:
 
 
 def auto_trade_current_runtime_file_signature(window) -> dict[str, int]:
-    """현재 선택 루틴의 runtime 파일 변경 여부를 판단하는 간단한 스냅샷."""
-    routine_dir = window.current_selected_routine_dir()
-    if routine_dir is None:
-        return {}
+    """중앙 등록 종목의 runtime 파일 변경 여부를 판단하는 스냅샷."""
+    try:
+        from gui_auto_trade_runtime import all_registered_stock_dirs
+
+        stock_dirs = all_registered_stock_dirs()
+    except Exception:
+        stock_dirs = []
 
     signature: dict[str, int] = {}
-    for stock_dir in assigned_stock_dirs_in_routine(routine_dir):
+    for stock_dir in stock_dirs:
         for filename in ("state.json", "config.json", "orders.json"):
             path = stock_dir / filename
             try:
@@ -144,6 +151,16 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     if not window.isVisible():
         return
 
+    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
+    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
+        stop_timers = getattr(type(window), "stop_periodic_timers_for_recovery", None)
+        if callable(stop_timers):
+            stop_timers(window)
+        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
+        if callable(update_controls):
+            update_controls(window)
+        return
+
     minute_key = window.current_time_policy_minute_key()
     if minute_key == window._last_time_policy_minute_key:
         return
@@ -167,27 +184,44 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     if callable(refresh_all):
         try:
             refresh_all()
-        except Exception as exc:
-            window.statusBarMessage(f"메인 화면 자동 갱신 실패: {exc}")
+        except Exception:
+            LOGGER.exception("Main monitoring refresh failed")
+            window.statusBarMessage(
+                "관제창 상태를 갱신하지 못했습니다. "
+                "로그를 확인한 뒤 화면을 새로고침하십시오."
+            )
 
-    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
-    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
-        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
-        if callable(update_controls):
-            update_controls(window)
-        return
+    rebind_recovery = getattr(
+        window,
+        "rebind_startup_recovery_after_trusted_runtime_update",
+        None,
+    )
+    if callable(rebind_recovery):
+        rebind_recovery()
 
     reset_expired_manual_ats_runtime_selections(
         Path(__file__).resolve().parent / "stocks",
         market_closed=manual_ats_market_day_closed(),
     )
 
+    close_result = auto_trade_continue_pending_close_liquidations(
+        window,
+        limit=5,
+    )
+    close_processed = int(close_result.get("processed", 0) or 0)
+    close_blocked = int(close_result.get("blocked", 0) or 0)
+    if close_processed > 0 or close_blocked > 0:
+        window.statusBarMessage(
+            "마감·청산 Command 처리: "
+            f"진행 {close_processed} / 차단 {close_blocked}"
+        )
+
     # STEP 3: 루틴 evaluate() 연결 확인용 안전 프로브.
     # - 로그만 기록한다.
     # - 주문/예산/청산/state 변경 없음.
-    if callable(probe_selected_routine_once):
+    if callable(probe_all_enabled_routine_stocks_once):
         try:
-            probe_result = probe_selected_routine_once(window, minute_key)
+            probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
             logged_count = int(probe_result.get("logged", 0) or 0)
             error_count = int(probe_result.get("error", 0) or 0)
             if logged_count > 0 or error_count > 0:
@@ -232,10 +266,21 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
                                 window.statusBarMessage(
                                     f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
                                 )
-                except Exception as exc:
-                    window.statusBarMessage(f"주문후보검증 실패: {exc}")
-        except Exception as exc:
-            window.statusBarMessage(f"루틴 신호 자동 점검 실패: {exc}")
+                except Exception:
+                    LOGGER.exception("Routine signal consumer failed")
+                    window.statusBarMessage(
+                        "주문 후보를 검증하는 중 오류가 발생했습니다. "
+                        "로그를 확인하십시오."
+                    )
+        except Exception:
+            LOGGER.exception("Routine signal probe failed")
+            window.statusBarMessage(
+                "루틴 신호를 점검하는 중 오류가 발생했습니다. "
+                "로그를 확인하십시오."
+            )
+
+    if callable(rebind_recovery):
+        rebind_recovery()
 
     if changed_count > 0 or failed_count > 0:
         window.statusBarMessage(

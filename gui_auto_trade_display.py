@@ -603,8 +603,12 @@ def stock_position_metric_values(
         sell_pending_value = 0
 
     total_buy_amount = int(round(holding_value * avg_value)) if holding_value > 0 and avg_value > 0 else 0
-    avg_text = _format_plain_number(avg_value) if avg_value > 0 else "-"
-    current_text = _format_plain_number(current_value) if current_value is not None else "-"
+    avg_text = _format_plain_number(avg_value) if avg_value > 0 else "0"
+    current_text = (
+        _format_plain_number(current_value)
+        if current_value is not None and current_value > 0
+        else "0"
+    )
 
     profit_amount = 0.0
     profit_rate = 0.0
@@ -628,16 +632,8 @@ def stock_position_metric_values(
         value1_sample=STOCK_POSITION_METRIC_SAMPLES["가격"][0],
         value2_sample=STOCK_POSITION_METRIC_SAMPLES["가격"][1],
         force_slot_render=True,
-        value1_alignment=(
-            Qt.AlignCenter | Qt.AlignVCenter
-            if avg_text == "-"
-            else Qt.AlignRight | Qt.AlignVCenter
-        ),
-        value2_alignment=(
-            Qt.AlignCenter | Qt.AlignVCenter
-            if current_text == "-"
-            else Qt.AlignRight | Qt.AlignVCenter
-        ),
+        value1_alignment=Qt.AlignRight | Qt.AlignVCenter,
+        value2_alignment=Qt.AlignRight | Qt.AlignVCenter,
     )
     profit_metric = RatioMetricDisplay(
         label="손익",

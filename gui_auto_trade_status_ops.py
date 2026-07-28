@@ -8,6 +8,7 @@ gui_auto_trade_status_ops.py
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,11 @@ from runtime_io import read_json_dict
 from gui_auto_trade_runtime import get_stock_dirs_in_routine, write_state_json
 from gui_order_utils import pending_order_side_quantities
 from manual_ats_runtime import manual_ats_runtime_selected_keys
+from auto_close_runtime_policy_snapshot import (
+    AUTO_CLOSE_RUNTIME_STATUSES,
+    auto_close_runtime_snapshot_metadata,
+)
+from close_liquidation_transition_service import DOMAIN_CLOSE
 from state_policy import (
     auto_trade_status_display,
     normalize_operation_mode,
@@ -30,6 +36,7 @@ from state_policy import (
     operation_mode_change_decision,
     operation_mode_display,
     operation_mode_recalculation_target_status,
+    read_operation_policy,
     scheduled_status_for_now,
     start_status_by_operation_mode,
     status_after_operation_mode_change,
@@ -39,17 +46,41 @@ from gui_auto_trade_policy import (
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_trade_started,
 )
+from transition_evidence_reader import TIME_POLICY_SCOPE, TransitionEvidenceScope
+from transition_production_guard import evaluate_production_transition
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ROUTINES_DIR = PROJECT_ROOT / "routines"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
+ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
+LOGGER = logging.getLogger(__name__)
+EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
+    {
+        "RECOVERY_CONTEXT_MISSING",
+        "RECOVERY_NOT_STARTED",
+        "RECOVERY_IN_PROGRESS",
+    }
+)
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def current_datetime() -> datetime:
     return datetime.now()
+
+
+def _production_recovery_gate(window, code: str, caller_name: str):
+    try:
+        parent = window.parent()
+    except Exception:
+        return None
+    checker = getattr(type(parent), "production_recovery_gate_for_stock", None)
+    if not callable(checker):
+        return None
+    return checker(parent, code, caller_name=caller_name)
+
 
 def append_changelog(change_type: str, filename: str, message: str) -> None:
     block = (
@@ -169,19 +200,36 @@ def auto_trade_update_stock_status(
     state_path = stock_dir / "state.json"
     state = read_json_dict(state_path)
     before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+    previous_review_entered_at = str(
+        state.get("review_entered_at", "") or ""
+    ).strip()
+    requested_review_entered_at = (
+        str(extra_state.get("review_entered_at", "") or "").strip()
+        if isinstance(extra_state, dict)
+        else ""
+    )
+    new_status_key = str(new_status or "").strip().upper()
+    updated_at = now_text()
 
     state["status"] = new_status
-    state["updated_at"] = now_text()
+    state["updated_at"] = updated_at
 
     if extra_state:
         state.update(extra_state)
 
+    if new_status_key in {"REVIEW_REQUIRED", "REVIEW"}:
+        if before_status not in {"REVIEW_REQUIRED", "REVIEW"}:
+            state["review_entered_at"] = requested_review_entered_at or updated_at
+        else:
+            state["review_entered_at"] = previous_review_entered_at
+
     if not write_state_json(stock_dir, state):
-        QMessageBox.critical(
-            window,
-            "상태 저장 오류",
-            f"{code} {name} 상태 저장 중 오류가 발생했습니다.",
-        )
+        if not bool(getattr(window, "_operation_start_batch_active", False)):
+            QMessageBox.critical(
+                window,
+                "상태 저장 오류",
+                f"{code} {name} 상태 저장 중 오류가 발생했습니다.",
+            )
         append_stock_log(stock_dir, "ERROR", f"상태 저장 실패: {before_status} -> {new_status}")
         return False
 
@@ -344,11 +392,124 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     new_status = status_after_operation_mode_change(mode, config)
 
+    recalculated_at = now_text()
     metadata = {
-        "operation_policy_recalculated_at": now_text(),
+        "operation_policy_recalculated_at": recalculated_at,
         "operation_policy_reason": reason,
         "operation_policy_mode": mode,
     }
+    operation_policy = read_operation_policy()
+    auto_close_policy = operation_policy.get("auto_close", {})
+    snapshot_metadata = auto_close_runtime_snapshot_metadata(
+        state=state,
+        before_status=before_status,
+        after_status=new_status,
+        auto_close_policy=(
+            auto_close_policy if isinstance(auto_close_policy, dict) else {}
+        ),
+        captured_at=recalculated_at,
+    )
+    if (
+        new_status in AUTO_CLOSE_RUNTIME_STATUSES
+        and (
+            before_status not in AUTO_CLOSE_RUNTIME_STATUSES
+            or bool(snapshot_metadata)
+        )
+    ):
+        recovery = _production_recovery_gate(
+            window,
+            code,
+            "AUTO_CLOSE_TIME_POLICY",
+        )
+        if recovery is not None and recovery.allowed is not True:
+            reason_code = str(
+                getattr(recovery, "reason_code", "") or ""
+            ).strip()
+            evidence = tuple(getattr(recovery, "evidence", ()) or ())
+            has_internal_error_evidence = any(
+                str(item).startswith(("registry_error=", "gate_exception="))
+                for item in evidence
+            )
+            if (
+                reason_code in EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS
+                and not has_internal_error_evidence
+            ):
+                return "protected", before_status, before_status
+            try:
+                parent = window.parent()
+            except Exception:
+                parent = None
+            api = getattr(parent, "kiwoom_api", None)
+            login_session_reader = getattr(api, "login_session_id", None)
+            login_session_present = False
+            if callable(login_session_reader):
+                try:
+                    login_session_present = bool(
+                        str(login_session_reader() or "").strip()
+                    )
+                except Exception:
+                    login_session_present = False
+            account_reader = getattr(parent, "selected_account_no", None)
+            account_selected = False
+            if callable(account_reader):
+                try:
+                    account_selected = bool(str(account_reader() or "").strip())
+                except Exception:
+                    account_selected = False
+            LOGGER.warning(
+                "Auto-close blocked by Production Recovery: "
+                "caller=%s routine_instance=%s stock=%s reason=%s evidence=%s "
+                "login_session_present=%s account_selected=%s requested_at=%s",
+                "AUTO_CLOSE_TIME_POLICY",
+                str(config.get("assigned_routine_instance_id") or "").strip(),
+                code,
+                reason_code,
+                evidence,
+                login_session_present,
+                account_selected,
+                recalculated_at,
+            )
+            return "protected", before_status, before_status
+        snapshot_state = {**state, **snapshot_metadata}
+        snapshot_method = str(
+            snapshot_state.get("auto_close_method") or ""
+        ).strip()
+        snapshot_requested_at = str(
+            snapshot_state.get("auto_close_requested_at") or ""
+        ).strip()
+        snapshot_source = str(
+            snapshot_state.get("auto_close_source") or ""
+        ).strip()
+        routine_instance_id = str(
+            config.get("assigned_routine_instance_id") or ""
+        ).strip()
+        transition = evaluate_production_transition(
+            policy_domain=DOMAIN_CLOSE,
+            current_policy=snapshot_method,
+            requested_policy=snapshot_method,
+            queue_path=ORDER_QUEUE_PATH,
+            fills_path=FILLS_PATH,
+            runtime_state=snapshot_state,
+            runtime_routine_instance_id=routine_instance_id,
+            scope=TransitionEvidenceScope(
+                scope_type=TIME_POLICY_SCOPE,
+                stock_code=code,
+                trade_date=snapshot_requested_at[:10],
+                routine_instance_id=routine_instance_id,
+                auto_close_requested_at=snapshot_requested_at,
+                source=snapshot_source,
+            ),
+        )
+        if not transition.allowed:
+            append_stock_log(
+                stock_dir,
+                "BLOCKED",
+                "자동마감 정책 전환 차단: "
+                f"{transition.reason_code} / "
+                f"evidence={transition.evidence_status}",
+            )
+            return "protected", before_status, before_status
+    metadata.update(snapshot_metadata)
     if extra_state:
         metadata.update(extra_state)
 
@@ -356,7 +517,7 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         # 상태가 같아도 매매시작/강제종료 계열의 메타값은 반드시 저장한다.
         # 예: 감시/대기 -> 감시/대기 상태유지여도 trade_enabled=True가 저장되어야
         # 현황 컬럼이 즉시 켜지고 이후 시간정책 자동판정 대상이 된다.
-        if extra_state:
+        if extra_state or snapshot_metadata:
             log_suffix = (
                 f"운영정책 재판정 상태유지/메타갱신: "
                 f"{operation_mode_display(mode)} / {auto_trade_status_display(before_status)} / {reason}"

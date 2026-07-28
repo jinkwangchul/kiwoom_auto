@@ -28,6 +28,39 @@ _BROKER_HOLDING_THREAD_LOCK = threading.RLock()
 _LOCK_POLL_SECONDS = 0.02
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 _MAX_EVENT_IDENTITIES_PER_HOLDING = 20
+PRODUCTION_RECOVERY_REVIEW_SOURCE = "PRODUCTION_RECOVERY"
+PRODUCTION_RECOVERY_REVIEW_FIELD = "production_recovery_reviews"
+PRODUCTION_RECOVERY_REVIEW_OPEN = "OPEN"
+PRODUCTION_RECOVERY_REVIEW_RESOLVED = "RESOLVED"
+PRODUCTION_RECOVERY_REVIEW_WRITTEN = "WRITTEN"
+PRODUCTION_RECOVERY_REVIEW_DUPLICATE = "DUPLICATE_IGNORED"
+PRODUCTION_RECOVERY_REVIEW_INVALID = "INVALID_INPUT"
+PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED = "STORAGE_FAILED"
+PRODUCTION_RECOVERY_REVIEW_READ_BACK_FAILED = "READ_BACK_FAILED"
+_PRODUCTION_RECOVERY_REASON_CODES = {
+    "LOGIN_NOT_READY",
+    "ACCOUNT_NOT_SELECTED",
+    "BROKER_ONLY_HOLDING",
+    "RUNTIME_ONLY_HOLDING",
+    "HOLDING_QUANTITY_MISMATCH",
+    "AVAILABLE_QUANTITY_MISMATCH",
+    "AVERAGE_PRICE_MISMATCH",
+    "BROKER_ONLY_ORDER",
+    "RUNTIME_ONLY_ORDER",
+    "ORDER_IDENTITY_CONFLICT",
+    "DUPLICATE_ORDER_RISK",
+    "INCOMPLETE_BROKER_SNAPSHOT",
+    "DAMAGED_RUNTIME",
+    "RUNTIME_DAMAGED",
+    "ACCOUNT_MISMATCH",
+    "STALE_RECOVERY_SESSION",
+    "HOLDING_SNAPSHOT_FAILED",
+    "OPEN_ORDER_SNAPSHOT_FAILED",
+    "SNAPSHOT_INCOMPLETE",
+    "ROUTINE_INSTANCE_MISSING",
+    "RECOVERY_FAILED",
+    "RECOVERY_PARTIAL",
+}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -363,7 +396,253 @@ def _read_holdings(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
     for item in holdings:
         if not isinstance(item, dict):
             return {}, _blocked("read_broker_holdings", "holdings must contain only objects")
+    reviews = data.get(PRODUCTION_RECOVERY_REVIEW_FIELD, [])
+    if not isinstance(reviews, list):
+        return {}, _blocked(
+            "read_broker_holdings",
+            f"{PRODUCTION_RECOVERY_REVIEW_FIELD} must be a list",
+        )
+    for item in reviews:
+        if not isinstance(item, dict):
+            return {}, _blocked(
+                "read_broker_holdings",
+                f"{PRODUCTION_RECOVERY_REVIEW_FIELD} must contain only objects",
+            )
     return data, None
+
+
+def _recovery_review_result(
+    status: str,
+    *,
+    dedup_key: str = "",
+    record: dict[str, Any] | None = None,
+    reason: str = "",
+    file_write: bool = False,
+    post_write_verified: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "review_source": PRODUCTION_RECOVERY_REVIEW_SOURCE,
+        "dedup_key": dedup_key,
+        "record": deepcopy(record) if isinstance(record, dict) else None,
+        "changed": status == PRODUCTION_RECOVERY_REVIEW_WRITTEN,
+        "file_write": file_write,
+        "post_write_verified": post_write_verified,
+        "reason": reason,
+    }
+
+
+def _normalize_recovery_evidence(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            _clean_text(key): _normalize_recovery_evidence(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if _clean_text(key)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_recovery_evidence(item) for item in value]
+    if isinstance(value, set):
+        return [
+            _normalize_recovery_evidence(item)
+            for item in sorted(value, key=lambda item: str(item))
+        ]
+    return _clean_text(value)
+
+
+def _production_recovery_review_record(value: Any) -> tuple[dict[str, Any] | None, str]:
+    source = _as_dict(value)
+    account_no = _clean_text(source.get("account_no"))
+    trading_day = _clean_text(source.get("trading_day"))
+    login_session_id = _clean_text(source.get("login_session_id"))
+    recovery_session_id = _clean_text(source.get("recovery_session_id"))
+    stock_code = _code_from_fid(source.get("stock_code"))
+    reason_code = _clean_text(source.get("reason_code")).upper()
+    detected_at = _clean_text(source.get("detected_at"))
+    status = _clean_text(source.get("status") or PRODUCTION_RECOVERY_REVIEW_OPEN).upper()
+
+    required = {
+        "account_no": account_no,
+        "trading_day": trading_day,
+        "login_session_id": login_session_id,
+        "recovery_session_id": recovery_session_id,
+        "reason_code": reason_code,
+        "detected_at": detected_at,
+    }
+    missing = [name for name, item in required.items() if not item]
+    if missing:
+        return None, f"required fields missing: {', '.join(missing)}"
+    try:
+        datetime.strptime(trading_day, "%Y-%m-%d")
+    except ValueError:
+        return None, "trading_day must be YYYY-MM-DD"
+    if _parse_received_at(detected_at) is None:
+        return None, "detected_at must be comparable"
+    if reason_code not in _PRODUCTION_RECOVERY_REASON_CODES:
+        return None, f"unsupported reason_code: {reason_code}"
+    if status not in {
+        PRODUCTION_RECOVERY_REVIEW_OPEN,
+        PRODUCTION_RECOVERY_REVIEW_RESOLVED,
+    }:
+        return None, f"unsupported status: {status}"
+
+    dedup_payload = {
+        "review_source": PRODUCTION_RECOVERY_REVIEW_SOURCE,
+        "account_no": account_no,
+        "trading_day": trading_day,
+        "recovery_session_id": recovery_session_id,
+        "stock_code": stock_code,
+        "reason_code": reason_code,
+    }
+    dedup_key = hashlib.sha256(
+        json.dumps(
+            dedup_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest().upper()
+    record = {
+        "review_source": PRODUCTION_RECOVERY_REVIEW_SOURCE,
+        "account_no": account_no,
+        "trading_day": trading_day,
+        "login_session_id": login_session_id,
+        "recovery_session_id": recovery_session_id,
+        "stock_code": stock_code,
+        "reason_code": reason_code,
+        "detected_at": detected_at,
+        "broker_evidence": _normalize_recovery_evidence(
+            source.get("broker_evidence")
+        ),
+        "runtime_evidence": _normalize_recovery_evidence(
+            source.get("runtime_evidence")
+        ),
+        "status": status,
+        "dedup_key": dedup_key,
+    }
+    return record, ""
+
+
+def write_production_recovery_review(
+    review: Any,
+    broker_holdings_path: str | Path,
+    *,
+    lock_timeout_sec: float = _DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Persist one Recovery review without creating Queue or execution records."""
+    record, error = _production_recovery_review_record(review)
+    if record is None:
+        return _recovery_review_result(
+            PRODUCTION_RECOVERY_REVIEW_INVALID,
+            reason=error,
+        )
+
+    target_path = Path(broker_holdings_path)
+    if not target_path.exists():
+        return _recovery_review_result(
+            PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
+            dedup_key=record["dedup_key"],
+            record=record,
+            reason="existing broker_holdings.json is required",
+        )
+
+    try:
+        timeout = max(0.0, float(lock_timeout_sec))
+    except (TypeError, ValueError):
+        timeout = _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+    try:
+        with _BROKER_HOLDING_THREAD_LOCK:
+            with _BrokerHoldingFileLock(target_path, timeout):
+                data, blocked = _read_holdings(target_path)
+                if blocked is not None:
+                    return _recovery_review_result(
+                        PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
+                        dedup_key=record["dedup_key"],
+                        record=record,
+                        reason=blocked["blocked_reasons"][0],
+                    )
+                reviews = list(data.get(PRODUCTION_RECOVERY_REVIEW_FIELD) or [])
+                duplicate_index = next(
+                    (
+                        index
+                        for index, item in enumerate(reviews)
+                        if _clean_text(item.get("dedup_key")) == record["dedup_key"]
+                    ),
+                    -1,
+                )
+                if duplicate_index >= 0 and (
+                    _clean_text(reviews[duplicate_index].get("status")).upper()
+                    == record["status"]
+                    or record["status"] != PRODUCTION_RECOVERY_REVIEW_RESOLVED
+                ):
+                    return _recovery_review_result(
+                        PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
+                        dedup_key=record["dedup_key"],
+                        record=reviews[duplicate_index],
+                        post_write_verified=True,
+                    )
+
+                updated = deepcopy(data)
+                if duplicate_index >= 0:
+                    reviews[duplicate_index] = record
+                else:
+                    reviews.append(record)
+                updated[PRODUCTION_RECOVERY_REVIEW_FIELD] = reviews
+                updated["updated_at"] = _now_text()
+                temp_path = None
+                try:
+                    temp_path = _write_json_temp(target_path, updated)
+                    os.replace(temp_path, target_path)
+                    temp_path = None
+                except Exception as exc:
+                    _cleanup_temp(temp_path)
+                    return _recovery_review_result(
+                        PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
+                        dedup_key=record["dedup_key"],
+                        record=record,
+                        reason=str(exc),
+                    )
+
+                read_back, read_back_blocked = _read_holdings(target_path)
+                if read_back_blocked is not None:
+                    return _recovery_review_result(
+                        PRODUCTION_RECOVERY_REVIEW_READ_BACK_FAILED,
+                        dedup_key=record["dedup_key"],
+                        record=record,
+                        reason=read_back_blocked["blocked_reasons"][0],
+                        file_write=True,
+                    )
+                saved = [
+                    item
+                    for item in read_back.get(PRODUCTION_RECOVERY_REVIEW_FIELD, [])
+                    if _clean_text(item.get("dedup_key")) == record["dedup_key"]
+                ]
+                if len(saved) != 1 or saved[0] != record:
+                    return _recovery_review_result(
+                        PRODUCTION_RECOVERY_REVIEW_READ_BACK_FAILED,
+                        dedup_key=record["dedup_key"],
+                        record=record,
+                        reason="saved recovery review did not match read-back",
+                        file_write=True,
+                    )
+                return _recovery_review_result(
+                    PRODUCTION_RECOVERY_REVIEW_WRITTEN,
+                    dedup_key=record["dedup_key"],
+                    record=record,
+                    file_write=True,
+                    post_write_verified=True,
+                )
+    except TimeoutError:
+        return _recovery_review_result(
+            PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
+            dedup_key=record["dedup_key"],
+            record=record,
+            reason="broker holdings lock timeout",
+        )
 
 
 def _read_positions_for_compare(path: Path) -> tuple[list[dict[str, Any]], str]:

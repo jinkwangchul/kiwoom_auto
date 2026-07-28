@@ -89,6 +89,8 @@ def selected_stock_infos(window) -> list[tuple[Path, str, str]]:
     for row in selected_stock_rows(window):
         if row in seen_rows:
             continue
+        if window.stock_table.isRowHidden(row):
+            continue
         seen_rows.add(row)
 
         code_item = window.stock_table.item(row, 0)

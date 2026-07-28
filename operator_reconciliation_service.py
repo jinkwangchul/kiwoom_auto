@@ -400,6 +400,56 @@ def _broker_holding_rows(holdings_data: dict[str, Any] | None) -> list[dict[str,
     return rows
 
 
+def _production_recovery_rows(
+    holdings_data: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    reviews = _as_dict(holdings_data).get("production_recovery_reviews")
+    if not isinstance(reviews, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in reviews:
+        record = _as_dict(item)
+        if _clean_text(record.get("review_source")).upper() != "PRODUCTION_RECOVERY":
+            continue
+        if _clean_text(record.get("status")).upper() != "OPEN":
+            continue
+        reason_code = _clean_text(record.get("reason_code"))
+        recovery_session_id = _clean_text(record.get("recovery_session_id"))
+        rows.append(
+            {
+                "item_id": f"PRODUCTION_RECOVERY::{_clean_text(record.get('dedup_key'))}",
+                "source_type": "PRODUCTION_RECOVERY",
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "occurrence_type": reason_code or "PRODUCTION_RECOVERY",
+                "account_no": _clean_text(record.get("account_no")),
+                "code": _clean_text(record.get("stock_code")),
+                "name": "",
+                "order_id": "",
+                "order_queued_id": "",
+                "broker_order_no": _clean_text(
+                    _as_dict(record.get("broker_evidence")).get("broker_order_no")
+                ),
+                "original_order_no": _clean_text(
+                    _as_dict(record.get("broker_evidence")).get("original_order_no")
+                ),
+                "event_identity": recovery_session_id,
+                "queue_status": "",
+                "fill_applied": False,
+                "position_applied": False,
+                "broker_reconciliation_status": reason_code,
+                "reason": reason_code or "Production Recovery review is required",
+                "recommended_action": "manual_review",
+                "last_checked_at": _clean_text(record.get("detected_at")),
+                "retryable": False,
+                "recovery_session_id": recovery_session_id,
+                "trading_day": _clean_text(record.get("trading_day")),
+                "broker_evidence": deepcopy(record.get("broker_evidence")),
+                "runtime_evidence": deepcopy(record.get("runtime_evidence")),
+            }
+        )
+    return rows
+
+
 def collect_operator_reconciliation_items(
     *,
     queue_path: str | Path = DEFAULT_QUEUE_PATH,
@@ -433,12 +483,16 @@ def collect_operator_reconciliation_items(
                 rows.append(_manual_order_row(record))
 
     rows.extend(_broker_holding_rows(holdings_data))
+    rows.extend(_production_recovery_rows(holdings_data))
     summary = {
         "total": len(rows),
         "retryable": sum(1 for row in rows if row.get("retryable") is True),
         "manual_review_required": sum(1 for row in rows if row.get("status") == "MANUAL_REVIEW_REQUIRED"),
         "chejan_reconciliation": sum(1 for row in rows if row.get("source_type") == "CHEJAN_RECONCILIATION"),
         "broker_holding_reconciliation": sum(1 for row in rows if row.get("source_type") == "BROKER_HOLDING_RECONCILIATION"),
+        "production_recovery": sum(
+            1 for row in rows if row.get("source_type") == "PRODUCTION_RECOVERY"
+        ),
     }
     errors = [error for error in (queue_error, positions_error, holdings_error) if error]
     return {

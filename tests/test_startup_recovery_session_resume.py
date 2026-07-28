@@ -385,10 +385,14 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             self.assertEqual("REVIEW_REQUIRED", result["status"])
             self.assertIn("SIG_1", " ".join(result["review_reasons"]))
 
-    def test_start_is_blocked_but_timer_normalizes_status_before_recovery_approval(self) -> None:
+    def test_start_and_timer_are_blocked_before_recovery_completion(self) -> None:
         class StartWindow:
             def __init__(self) -> None:
-                self.selected_stock_infos = Mock()
+                self.selected = [(Path("stocks/005930_삼성전자"), "005930", "삼성전자")]
+                self.selected_stock_infos = Mock(return_value=list(self.selected))
+                self.split_start_targets = Mock(
+                    return_value=(list(self.selected), [])
+                )
 
             def require_startup_recovery_session(self, _action: str) -> bool:
                 return False
@@ -397,7 +401,10 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         auto_trade_start_selected_auto_trades(start_window)
 
-        start_window.selected_stock_infos.assert_not_called()
+        start_window.selected_stock_infos.assert_called_once()
+        start_window.split_start_targets.assert_called_once_with(
+            start_window.selected
+        )
 
         class TimerWindow:
             def __init__(self) -> None:
@@ -431,16 +438,12 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         with (
             patch("gui_auto_trade_timer.reset_expired_manual_ats_runtime_selections") as reset_ats,
-            patch("gui_auto_trade_timer.probe_selected_routine_once") as probe,
+            patch("gui_auto_trade_timer.probe_all_enabled_routine_stocks_once") as probe,
         ):
             auto_trade_on_time_policy_timer_tick(timer_window)
 
-        timer_window.recalculate_all_status_by_operation_policy.assert_called_once_with(
-            "시간 경과 자동 재판정",
-            silent_unchanged=True,
-            write_changelog_when_unchanged=False,
-        )
-        timer_window.refresh_all.assert_called_once_with()
+        timer_window.recalculate_all_status_by_operation_policy.assert_not_called()
+        timer_window.refresh_all.assert_not_called()
         reset_ats.assert_not_called()
         probe.assert_not_called()
         self.assertEqual(1, timer_window.update_controls_calls)
@@ -511,13 +514,13 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             window = TimerWindow(routine_dir)
             consumer = Mock(return_value={"summary": {"signals_checked": 1, "orders_created": 1}})
 
-            with patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+            with patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
                 self.assertTrue(auto_trade_real_execution_active(window))
-            with patch.object(gui_auto_trade_timer, "probe_selected_routine_once", return_value={"logged": 0, "error": 0}), patch.object(
+            with patch.object(gui_auto_trade_timer, "probe_all_enabled_routine_stocks_once", return_value={"logged": 0, "error": 0}), patch.object(
                 gui_auto_trade_timer,
                 "consume_pending_routine_signals_dry_run",
                 consumer,
-            ), patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+            ), patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
                 auto_trade_on_time_policy_timer_tick(window)
 
             consumer.assert_called_once_with(
@@ -553,7 +556,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("gui_auto_trade_runtime.get_stock_dirs_in_routine", return_value=[stock_dir]):
+            with patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
                 self.assertFalse(auto_trade_real_execution_active(Window(routine_dir)))
 
     def test_persisted_trade_enabled_does_not_mark_current_session_started_before_recovery(self) -> None:

@@ -4,8 +4,8 @@
 STEP 6-B: 루틴 evaluate() 연결 확인용 안전 프로브 + 신호큐 저장본.
 
 역할:
-- 현재 선택 루틴의 routine.py를 import한다.
-- 연결 종목별로 evaluate(context)를 호출한다.
+- 중앙 stocks/의 운영 대상별 routine.py를 import한다.
+- 종목에 연결된 루틴 인스턴스 기준으로 evaluate(context)를 호출한다.
 - 결과를 runtime/routine_signal_probe.log에 기록한다.
 - BUY/SELL 신호만 runtime/routine_signals.json 큐에 저장한다.
 
@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from gui_auto_trade_runtime import all_registered_stock_dirs
+from routine_instance_registry import load_routine_definitions
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -119,7 +121,15 @@ def _is_trade_watch_target(state: dict[str, Any]) -> bool:
         return False
 
     status = str(state.get("status", "") or "").upper()
-    if status in {"REVIEW_REQUIRED", "STOPPED", "UNREGISTERED"}:
+    if status in {
+        "REVIEW_REQUIRED",
+        "REVIEW",
+        "EMERGENCY_STOPPED",
+        "EMERGENCY_STOP",
+        "EMERGENCY",
+        "STOPPED",
+        "UNREGISTERED",
+    }:
         return False
 
     return True
@@ -284,3 +294,95 @@ def probe_selected_routine_once(window: Any, tick_key: str = "") -> dict[str, in
             queued += 1
 
     return {"checked": checked, "logged": logged, "error": error, "skip": skip, "queued": queued}
+
+
+def probe_all_enabled_routine_stocks_once(
+    _window: Any = None,
+    tick_key: str = "",
+) -> dict[str, int]:
+    """Probe all enabled central stocks using each stock's own routine."""
+    definitions = {
+        definition.definition_id: definition
+        for definition in load_routine_definitions()
+        if definition.package_enabled
+    }
+    module_cache: dict[str, Any] = {}
+    checked = 0
+    logged = 0
+    error = 0
+    skip = 0
+    queued = 0
+
+    for stock_dir in all_registered_stock_dirs():
+        state = _read_json_dict(stock_dir / "state.json")
+        if not _is_trade_watch_target(state):
+            continue
+
+        checked += 1
+        config = _read_json_dict(stock_dir / "config.json")
+        instance_id = str(
+            config.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        definition_id = str(
+            config.get("routine_definition_id", "") or ""
+        ).strip()
+        routine_name = str(
+            config.get("routine_instance_name")
+            or config.get("routine")
+            or config.get("routine_name")
+            or ""
+        ).strip()
+        definition = definitions.get(definition_id)
+
+        if not instance_id or definition is None:
+            code, name = _parse_stock_folder_name(stock_dir)
+            _append_log(
+                f"[{now_text()}] tick={tick_key} routine={routine_name or definition_id} "
+                f"stock={code} {name} ERROR routine assignment unresolved"
+            )
+            error += 1
+            logged += 1
+            continue
+
+        if not routine_name:
+            routine_name = definition.display_name
+
+        try:
+            routine_module = module_cache.get(definition_id)
+            if routine_module is None:
+                routine_module = _load_routine_module(definition.package_dir)
+                module_cache[definition_id] = routine_module
+        except Exception as exc:
+            code, name = _parse_stock_folder_name(stock_dir)
+            _append_log(
+                f"[{now_text()}] tick={tick_key} routine={routine_name} "
+                f"stock={code} {name} ERROR routine load: {exc}"
+            )
+            error += 1
+            logged += 1
+            continue
+
+        result = probe_routine_for_stock(
+            routine_module,
+            routine_name,
+            stock_dir,
+            tick_key,
+        )
+        signal = str(result.get("signal", "") or "").upper()
+        if signal == "SKIP":
+            skip += 1
+        elif signal == "ERROR":
+            error += 1
+            logged += 1
+        else:
+            logged += 1
+        if result.get("queue_status") == "queued":
+            queued += 1
+
+    return {
+        "checked": checked,
+        "logged": logged,
+        "error": error,
+        "skip": skip,
+        "queued": queued,
+    }

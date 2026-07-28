@@ -30,6 +30,8 @@ from gui_operation_environment import read_operation_policy
 from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
 from gui_auto_trade_runtime import now_text
 from operation_command_service import (
+    IMMEDIATE_LIQUIDATION_REQUEST_KEY,
+    IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
 )
@@ -170,7 +172,18 @@ def auto_trade_setting_display_status_for_current_session(
         else:
             raw_display_status = display_status_text_for_gui(policy_status)
 
-    return auto_trade_setting_display_status(raw_display_status)
+    display_status = auto_trade_setting_display_status(raw_display_status)
+    if (
+        auto_trade_setting_immediate_liquidation_requested(state, holding_qty)
+        and display_status != "자동마감"
+        and not auto_trade_setting_liquidation_phase_active(
+            config,
+            holding_qty,
+            state=state,
+        )
+    ):
+        return "즉시청산"
+    return display_status
 
 
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:
@@ -196,7 +209,18 @@ def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], stat
         # 조기마감은 상태 고정값이 아니다.
         # 운영자가 시작시킨 자동마감성 명령이며, 화면 상태는 감시/대기 흐름을 사용한다.
         # 따라서 과거 EARLY_CLOSE 상태값은 시간정책/감시대기 표시를 막지 않는다.
-        return False
+        has_current_metadata = bool(
+            str(state.get("early_close_requested_at") or "").strip()
+            or str(state.get("early_close_source") or "").strip()
+            or bool(state.get("liquidation_policy_forced", False))
+            or str(state.get("liquidation_policy_reason") or "").strip().upper()
+            == "EARLY_CLOSE"
+        )
+        return (
+            raw in {"EARLY_CLOSING", "EARLY_CLOSED"}
+            and has_current_metadata
+            and not auto_trade_setting_early_close_metadata_is_stale(state)
+        )
 
     return False
 
@@ -318,6 +342,15 @@ def clear_early_close_runtime_metadata_only(state: dict[str, object]) -> dict[st
     if str(state.get("liquidation_policy_reason", "")).strip().upper() == "EARLY_CLOSE":
         state["liquidation_policy_reason"] = ""
     state["liquidation_policy_forced"] = False
+    if str(state.get("operation_notice") or "").strip().upper() in {
+        "EARLY_CLOSE_NO_TARGET",
+        "EARLY_CLOSE_WAITING",
+        "EARLY_CLOSE_ORDER_PROGRESS",
+        "EARLY_CLOSE_COMPLETED",
+    }:
+        state["operation_notice"] = ""
+        state["operation_notice_reason"] = ""
+        state["operation_notice_at"] = ""
     state = clear_close_routine_final_sell_metadata(state)
     state["updated_at"] = now_text()
     return state
@@ -345,6 +378,50 @@ def auto_trade_setting_early_close_requested(state: dict[str, object] | None) ->
     return raw_status in {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}
 
 
+def auto_trade_setting_early_close_progress_text(
+    state: dict[str, object] | None,
+) -> str:
+    """Return the operator-facing progress of the current early-close request."""
+    if not isinstance(state, dict):
+        return ""
+    notice = str(state.get("operation_notice") or "").strip().upper()
+    if notice == "EARLY_CLOSE_NO_TARGET":
+        return "조건 미충족"
+    if notice == "EARLY_CLOSE_EXECUTION_FAILED":
+        return "실패"
+    if notice == "EARLY_CLOSE_COMPLETED":
+        return "완료"
+    if notice == "EARLY_CLOSE_ORDER_PROGRESS":
+        return "주문 진행"
+
+    raw_status = str(state.get("status") or "").strip().upper()
+    has_current_metadata = bool(
+        str(state.get("early_close_requested_at") or "").strip()
+        or str(state.get("early_close_source") or "").strip()
+        or bool(state.get("liquidation_policy_forced", False))
+        or str(state.get("liquidation_policy_reason") or "").strip().upper()
+        == "EARLY_CLOSE"
+    )
+    if not has_current_metadata:
+        return ""
+    if raw_status == "EARLY_CLOSED":
+        return "완료"
+    if raw_status == "EARLY_CLOSING":
+        return "주문 진행"
+    if auto_trade_setting_early_close_requested(state):
+        method = short_close_method_text(
+            close_method_from_state_or_policy(
+                state,
+                "early_close_method",
+                "early_close_policy",
+                "early_close",
+                "루틴",
+            )
+        )
+        return "대기" if method in {"루틴", "이월"} else "실행 예정"
+    return ""
+
+
 def clear_auto_close_runtime_metadata(state: dict[str, object]) -> dict[str, object]:
     """보유/미체결이 없는 마감 상태를 감시/대기로 되돌릴 때 잔여 메타를 제거한다."""
     state["status"] = "WAIT_BUY"
@@ -353,6 +430,8 @@ def clear_auto_close_runtime_metadata(state: dict[str, object]) -> dict[str, obj
     state["early_close_source"] = ""
     state["early_close_method"] = ""
     state["early_close_policy"] = {}
+    state["auto_close_requested_at"] = ""
+    state["auto_close_source"] = ""
     state["auto_close_method"] = ""
     state["auto_close_policy"] = {}
     state = clear_close_routine_final_sell_metadata(state)
@@ -513,6 +592,12 @@ def auto_trade_setting_method_text(
 ) -> str:
     """상태의 보조표시로 사용할 현재 방식 텍스트."""
     status = auto_trade_setting_display_status(display_status)
+    holding_qty = _safe_nonnegative_int((state or {}).get("holding_qty"))
+    if (
+        status != "자동마감"
+        and auto_trade_setting_immediate_liquidation_requested(state, holding_qty)
+    ):
+        return "시장가"
     if auto_trade_setting_early_close_requested(state):
         method = close_method_from_state_or_policy(
             state,
@@ -606,6 +691,32 @@ def individual_liquidation_policy_from_state(
     }
 
 
+def _safe_nonnegative_int(value: object) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, result)
+
+
+def auto_trade_setting_immediate_liquidation_requested(
+    state: dict[str, object] | None,
+    holding_qty: int,
+) -> bool:
+    """Return whether the current Runtime has an executable immediate request."""
+    if not isinstance(state, dict) or holding_qty <= 0:
+        return False
+    raw = state.get(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
+    if not isinstance(raw, dict):
+        return False
+    if str(raw.get("status", "")).strip().upper() != IMMEDIATE_LIQUIDATION_STATUS_REQUESTED:
+        return False
+    requested_at = str(raw.get("requested_at", "") or "").strip()
+    if requested_at and not requested_at.startswith(auto_trade_setting_today_date_text()):
+        return False
+    return not auto_trade_setting_liquidation_completed_today(state)
+
+
 def effective_liquidation_policy_for_config(
     config: dict[str, object] | None,
     state: dict[str, object] | None = None,
@@ -643,6 +754,8 @@ def auto_trade_setting_liquidation_text(
     config: dict[str, object],
     display_status: str = "",
     state: dict[str, object] | None = None,
+    *,
+    holding_qty: int | None = None,
 ) -> str:
     """청산정책 표시 텍스트.
 
@@ -660,6 +773,31 @@ def auto_trade_setting_liquidation_text(
     early_close_forced = auto_trade_setting_early_close_requested(state)
     individual_policy = individual_liquidation_policy_from_state(state)
     has_individual = bool(individual_policy)
+    effective_holding_qty = _safe_nonnegative_int(
+        (state or {}).get("holding_qty")
+        if holding_qty is None
+        else holding_qty
+    )
+    immediate_requested = auto_trade_setting_immediate_liquidation_requested(
+        state,
+        effective_holding_qty,
+    )
+
+    if immediate_requested and status_text != "자동마감":
+        if auto_trade_setting_liquidation_phase_active(
+            config,
+            effective_holding_qty,
+            state=state,
+        ):
+            liquidation, _is_individual = effective_liquidation_policy_for_config(
+                config,
+                state,
+            )
+            minutes = str(
+                liquidation.get("minutes_before_regular_close", "5")
+            ).strip() or "5"
+            return f"{minutes}분/시장가"
+        return "시장가"
 
     manual = policy.get("manual_operation", {}) if isinstance(policy.get("manual_operation"), dict) else {}
     if (

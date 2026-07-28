@@ -19,11 +19,14 @@ Windows GUI 창 클래스 정의 파일.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5 import sip
 from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt
-from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter
+from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -46,6 +49,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 from gui_order_utils import directional_value_color
 from gui_stock_register_window import StockRegisterWindow
@@ -85,6 +90,7 @@ from gui_main_table_loader import (
     ROUTINE_PROFIT_LED_GAP,
     ROUTINE_PROFIT_LED_SIZE,
     MAIN_STOCK_METRIC_LAYOUT_PREVIEW,
+    ROUTINE_STOCK_INITIAL_BUY_ROLE,
     ROUTINE_STOCK_METRICS_ROLE,
     ROUTINE_STOCK_PATH_ROLE,
     ROUTINE_STOCK_PROFIT_LED_ROLE,
@@ -107,11 +113,18 @@ from gui_main_table_loader import (
     routine_instance_buy_limit_configured,
 )
 from gui_main_budget_panel import update_main_budget_panel
+from gui_main_stock_context_menu import (
+    MainMonitoringStockOperationAdapter,
+    MainMonitoringStockTarget,
+    show_main_monitoring_stock_context_menu,
+)
 from gui_auto_trade_display import (
     draw_limit_metric,
     draw_stock_position_metric,
     draw_stock_position_metric_display,
 )
+from gui_auto_trade_run_control import show_auto_trade_operation_failure_dialog
+from gui_toast import show_toast
 from runtime_io import read_json_dict
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
@@ -134,8 +147,35 @@ from gui_main_routine_selection import (
     routine_definition_enabled,
     routine_instance_checked,
 )
+from gui_auto_trade_policy import auto_trade_setting_trade_started
 from kiwoom_api import KiwoomApi
 from operator_reconciliation_service import assess_startup_recovery
+from broker_holding_recorder import write_production_recovery_review
+from production_recovery_contract import (
+    ACCOUNT_COMPLETED,
+    ACCOUNT_REVIEW_REQUIRED,
+    BrokerSnapshotPart,
+    combine_account_snapshot,
+    create_recovery_session_identity,
+)
+from production_recovery_state_registry import (
+    RECOVERY_ACCOUNT_FAILED,
+    RECOVERY_ACCOUNT_REVIEW_REQUIRED,
+    RECOVERY_CONTEXT_MISSING,
+    RECOVERY_IDENTITY_MISMATCH,
+    RECOVERY_IN_PROGRESS,
+    RECOVERY_NOT_STARTED,
+    RECOVERY_STALE_SESSION,
+    RECOVERY_STOCK_FAILED,
+    RECOVERY_STOCK_PENDING,
+    RECOVERY_STOCK_REVIEW_REQUIRED,
+    check_production_recovery_gate,
+    production_recovery_registry,
+    recovery_account_allows_isolated_stock_operation,
+    recovery_stock_is_review_required,
+    reconcile_production_recovery_snapshot,
+)
+from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import (
     COMMAND_IMMEDIATE_LIQUIDATION,
     MODE_EARLY_CLOSE,
@@ -149,7 +189,22 @@ from operation_command_service import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
+RECOVERY_ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+RECOVERY_POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
+RECOVERY_BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
+EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
+    {
+        RECOVERY_CONTEXT_MISSING,
+        RECOVERY_NOT_STARTED,
+        RECOVERY_IN_PROGRESS,
+    }
+)
 MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR = "#404040"
+MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL = {
+    "group": frozenset(),
+    "routine": frozenset(("profit", "limit")),
+    "stock": frozenset(("holding", "price", "profit", "trade", "limit")),
+}
 ROUTINE_INLINE_EDIT_STYLE = """
 QLineEdit {
     border: none;
@@ -188,6 +243,7 @@ def _draw_routine_profit_led(
     led_box_left: int,
     led_state: object,
     visually_enabled: bool,
+    square: bool = False,
 ) -> None:
     led_box_top = (
         row_rect.top()
@@ -205,54 +261,66 @@ def _draw_routine_profit_led(
         painter.setOpacity(0.45)
     painter.setPen(Qt.NoPen)
     painter.setBrush(QColor(_routine_profit_led_color(led_state)))
-    painter.drawEllipse(led_rect)
+    if square:
+        square_size = max(8, ROUTINE_PROFIT_LED_SIZE - 2)
+        square_rect = QRect(
+            led_rect.center().x() - square_size // 2,
+            led_rect.center().y() - square_size // 2,
+            square_size,
+            square_size,
+        )
+        painter.drawRect(square_rect)
+    else:
+        painter.drawEllipse(led_rect)
     painter.restore()
 
 
 MAIN_STOCK_METRIC_LAYOUT = {
-    "separator_gap": 5,
-    "separator_width": 9,
+    "separator_spacing": 6,
     "metrics": (
         {
             "key": "holding",
             "max_text": "\ubcf4\uc720(99999\uc8fc / 999,999,999)",
-            "slot_width": 232,
         },
         {
             "key": "price",
             "max_text": "\uac00\uaca9(9,999,999 / 9,999,999)",
-            "slot_width": 226,
         },
         {
             "key": "profit",
-            "max_text": "\uc190\uc775(-99,999,999 / -00.00%)",
-            "slot_width": 232,
+            "max_text": "\uc218\uc775(-99,999,999 / -00.00%)",
         },
         {
-            "key": "unfilled",
-            "max_text": "\ubbf8\uccb4\uacb0(99 / 99)",
-            "slot_width": 120,
+            "key": "trade",
+            "max_text": "\ub9e4\ub9e4(99 / 99)",
         },
         {
             "key": "limit",
             "max_text": "\ud55c\ub3c4(999,999,999)",
-            "slot_width": 146,
         },
         {
             "key": "consumed",
             "max_text": "\uc18c\ubaa8(999,999,999 / 00.0%)",
-            "slot_width": 214,
         },
     ),
 }
-ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(MAIN_STOCK_METRIC_LAYOUT["separator_gap"])
-ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH = int(MAIN_STOCK_METRIC_LAYOUT["separator_width"])
+ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(
+    MAIN_STOCK_METRIC_LAYOUT["separator_spacing"]
+)
 MAIN_STOCK_METRIC_MAX_TEXTS = tuple(
     str(metric["max_text"]) for metric in MAIN_STOCK_METRIC_LAYOUT["metrics"]
 )
-MAIN_STOCK_METRIC_SLOT_WIDTHS = tuple(
-    int(metric["slot_width"]) for metric in MAIN_STOCK_METRIC_LAYOUT["metrics"]
-)
+ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH = 4
+
+
+def _main_stock_metric_slot_widths(metrics: QFontMetrics) -> tuple[int, ...]:
+    return tuple(
+        metrics.horizontalAdvance(str(metric["max_text"]))
+        for metric in MAIN_STOCK_METRIC_LAYOUT["metrics"]
+    )
+
+
+MAIN_STOCK_METRIC_SLOT_WIDTHS = (231, 221, 226, 105, 144, 210)
 
 
 def _routine_stock_metric_display_text(metric: object) -> str:
@@ -264,6 +332,68 @@ def _routine_stock_metric_display_text(metric: object) -> str:
     return f"{label}({value1} / {value2})"
 
 
+INITIAL_BUY_BADGE_WIDTH = 64
+INITIAL_BUY_BADGE_HEIGHT = AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT
+INITIAL_BUY_BADGE_GAP = 4
+INITIAL_BUY_AMOUNT_COLOR = "#B98200"
+INITIAL_BUY_QUANTITY_COLOR = "#6F52B5"
+
+
+def _initial_buy_component_rects(cell_rect: QRect) -> dict[str, QRect]:
+    badge_rect = QRect(
+        cell_rect.left(),
+        cell_rect.top() + max(0, (cell_rect.height() - INITIAL_BUY_BADGE_HEIGHT) // 2),
+        INITIAL_BUY_BADGE_WIDTH,
+        min(INITIAL_BUY_BADGE_HEIGHT, cell_rect.height()),
+    )
+    value_left = badge_rect.right() + 1 + INITIAL_BUY_BADGE_GAP
+    value_right = cell_rect.right() - 1
+    value_rect = QRect(
+        value_left,
+        cell_rect.top(),
+        max(0, value_right - value_left + 1),
+        cell_rect.height(),
+    )
+    return {"badge": badge_rect, "value": value_rect}
+
+
+def _initial_buy_badge_font() -> QFont:
+    font = QApplication.font("QPushButton")
+    font.setWeight(QFont.DemiBold)
+    return font
+
+
+def _draw_initial_buy_display(
+    painter: QPainter,
+    cell_rect: QRect,
+    initial_buy: dict[str, object],
+    *,
+    hide_value: bool = False,
+) -> None:
+    components = _initial_buy_component_rects(cell_rect)
+    mode = str(initial_buy.get("mode", "QUANTITY") or "QUANTITY").upper()
+    badge_text = "금액" if mode == "AMOUNT" else "주수"
+    badge_color = INITIAL_BUY_AMOUNT_COLOR if mode == "AMOUNT" else INITIAL_BUY_QUANTITY_COLOR
+
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    outline_color = QColor(badge_color)
+    painter.setPen(QPen(outline_color, 1))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRoundedRect(components["badge"], 4, 4)
+    painter.setPen(outline_color)
+    painter.setFont(_initial_buy_badge_font())
+    painter.drawText(components["badge"], Qt.AlignCenter, badge_text)
+    painter.restore()
+
+    if not hide_value:
+        painter.drawText(
+            components["value"],
+            Qt.AlignRight | Qt.AlignVCenter,
+            str(initial_buy.get("value_text", "") or ""),
+        )
+
+
 def _routine_stock_metric_texts_legacy_unused(values: list[object], metrics_data: tuple[object, ...]) -> list[str]:
     if MAIN_STOCK_METRIC_LAYOUT_PREVIEW:
         return list(MAIN_STOCK_METRIC_MAX_TEXTS)
@@ -272,14 +402,21 @@ def _routine_stock_metric_texts_legacy_unused(values: list[object], metrics_data
         metric_text = _routine_stock_metric_display_text(metric)
         if metric_text:
             texts.append(metric_text)
-    if len(values) > 10:
-        texts.append(str(values[10] or "").strip())
+    initial_buy_offset = (
+        1
+        if len(values) > 1 and str(values[1] or "").startswith(("금액 ", "주수 "))
+        else 0
+    )
+    limit_index = 10 + initial_buy_offset
+    consumed_index = 11 + initial_buy_offset
+    if len(values) > limit_index:
+        texts.append(str(values[limit_index] or "").strip())
     if len(metrics_data) > 5:
         consumed_text = _routine_stock_metric_display_text(metrics_data[5])
         if consumed_text:
             texts.append(consumed_text)
-    elif len(values) > 11:
-        texts.append(str(values[11] or "").strip())
+    elif len(values) > consumed_index:
+        texts.append(str(values[consumed_index] or "").strip())
     else:
         texts.append("소모(0 / 0.0%)")
     return [text for text in texts if text]
@@ -294,14 +431,21 @@ def _routine_stock_metric_texts(values: list[object], metrics_data: tuple[object
         metric_text = _routine_stock_metric_display_text(metric)
         if metric_text:
             texts.append(metric_text)
-    if len(values) > 10:
-        texts.append(str(values[10] or "").strip())
+    initial_buy_offset = (
+        1
+        if len(values) > 1 and str(values[1] or "").startswith(("금액 ", "주수 "))
+        else 0
+    )
+    limit_index = 10 + initial_buy_offset
+    consumed_index = 11 + initial_buy_offset
+    if len(values) > limit_index:
+        texts.append(str(values[limit_index] or "").strip())
     if len(metrics_data) > 5:
         consumed_text = _routine_stock_metric_display_text(metrics_data[5])
         if consumed_text:
             texts.append(consumed_text)
-    elif len(values) > 11:
-        texts.append(str(values[11] or "").strip())
+    elif len(values) > consumed_index:
+        texts.append(str(values[consumed_index] or "").strip())
     return [text for text in texts if text]
 
 
@@ -310,13 +454,23 @@ def _routine_stock_metric_layout_rects(
     row_rect: QRect,
     start_x: int,
     count: int,
+    metrics: QFontMetrics | None = None,
 ) -> tuple[list[QRect], list[QRect], int]:
     metric_rects: list[QRect] = []
     separator_rects: list[QRect] = []
     x = start_x
     gap = ROUTINE_STOCK_METRIC_SEPARATOR_GAP
-    separator_width = ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH
-    for index, slot_width in enumerate(MAIN_STOCK_METRIC_SLOT_WIDTHS[:count]):
+    slot_widths = (
+        _main_stock_metric_slot_widths(metrics)
+        if metrics is not None
+        else MAIN_STOCK_METRIC_SLOT_WIDTHS
+    )
+    separator_width = (
+        max(1, metrics.horizontalAdvance("|"))
+        if metrics is not None
+        else ROUTINE_STOCK_METRIC_SEPARATOR_WIDTH
+    )
+    for index, slot_width in enumerate(slot_widths[:count]):
         metric_rect = QRect(x, row_rect.top(), slot_width, row_rect.height())
         metric_rects.append(metric_rect)
         x += slot_width
@@ -434,6 +588,7 @@ def _draw_routine_stock_metric_text_sequence(
         row_rect=row_rect,
         start_x=start_x,
         count=len(texts),
+        metrics=painter.fontMetrics(),
     )
     component_rects = _main_stock_metric_component_layouts(painter.fontMetrics(), metric_rects)
     layout_rows: list[tuple[str, int, int, int, int]] = []
@@ -563,8 +718,6 @@ class _RoutineTreeInteractionController(QObject):
         expand_left = (
             cell_rect.left()
             + ROUTINE_CHILD_CHECKBOX_OFFSET
-            + ROUTINE_PROFIT_LED_BOX_SIZE
-            + ROUTINE_PROFIT_LED_GAP
         )
         return QRect(
             expand_left,
@@ -574,20 +727,21 @@ class _RoutineTreeInteractionController(QObject):
         )
 
     def _stock_metric_rect(self, index, target_column: int) -> QRect:
-        if target_column == 10:
+        if target_column == 11:
             return self._stock_main_metric_rect(index, 4)
         return self._stock_legacy_metric_rect(index, target_column)
 
     def _stock_main_metric_rect(self, index, metric_index: int) -> QRect:
         if metric_index < 0 or metric_index >= len(MAIN_STOCK_METRIC_SLOT_WIDTHS):
             return QRect()
-        base_metric_rect = self._stock_legacy_metric_rect(index, 6)
+        base_metric_rect = self._stock_legacy_metric_rect(index, 7)
         if base_metric_rect.isNull():
             return QRect()
         metric_rects, _separator_rects, _end_x = _routine_stock_metric_layout_rects(
             row_rect=self.table.visualRect(index),
             start_x=base_metric_rect.left() + ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
             count=metric_index + 1,
+            metrics=QFontMetrics(self.table.font()),
         )
         return metric_rects[metric_index] if metric_index < len(metric_rects) else QRect()
 
@@ -601,7 +755,7 @@ class _RoutineTreeInteractionController(QObject):
         x = cell_rect.left() + ROUTINE_STOCK_TEXT_OFFSET
         separator_width = routine_instance_separator_width(self.table.font())
         for column, width in enumerate(routine_stock_column_widths(self.table.font())[: len(values)]):
-            if column > 0:
+            if column > 0 and column != 1:
                 x += separator_width
             rect = QRect(x, cell_rect.top(), width, cell_rect.height())
             if column == target_column:
@@ -639,11 +793,22 @@ class _RoutineTreeInteractionController(QObject):
                     if (
                         event.type() == QEvent.MouseButtonDblClick
                         and event.button() == Qt.LeftButton
-                        and self._stock_metric_rect(index, 10).contains(event.pos())
+                        and self.window._main_routine_initial_buy_badge_enabled()
                     ):
-                        self.window.handle_routine_stock_buy_limit_double_click(index.row())
-                        event.accept()
-                        return True
+                        initial_buy_rect = self._stock_legacy_metric_rect(index, 1)
+                        initial_buy_parts = _initial_buy_component_rects(initial_buy_rect)
+                        if initial_buy_parts["badge"].contains(event.pos()):
+                            self.window.toggle_routine_stock_initial_buy_mode(index.row())
+                            event.accept()
+                            return True
+                        if initial_buy_parts["value"].contains(event.pos()):
+                            self.window.start_routine_stock_initial_buy_edit(index.row())
+                            event.accept()
+                            return True
+                        if self._stock_metric_rect(index, 11).contains(event.pos()):
+                            self.window.handle_routine_stock_buy_limit_double_click(index.row())
+                            event.accept()
+                            return True
                     return super().eventFilter(watched, event)
                 if row_kind not in {ROUTINE_ROW_PARENT, ROUTINE_ROW_CHILD}:
                     return super().eventFilter(watched, event)
@@ -746,6 +911,18 @@ class _RoutineBuyLimitValueEditFilter(QObject):
                     return True
             if event.type() == QEvent.FocusOut:
                 self.window.finish_routine_stock_buy_limit_edit(save=True)
+        if object_name == "routineStockInitialBuyEditor":
+            if event.type() == QEvent.KeyPress:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    self.window.finish_routine_stock_initial_buy_edit(save=True)
+                    event.accept()
+                    return True
+                if event.key() == Qt.Key_Escape:
+                    self.window.finish_routine_stock_initial_buy_edit(save=False)
+                    event.accept()
+                    return True
+            if event.type() == QEvent.FocusOut:
+                self.window.finish_routine_stock_initial_buy_edit(save=True)
         return super().eventFilter(watched, event)
 
 
@@ -798,7 +975,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
             visible_stock_column_widths = stock_column_widths[: len(values)]
             for column, width in enumerate(visible_stock_column_widths):
                 text = str(values[column] if column < len(values) else "")
-                if column > 0:
+                if column > 0 and column != 1:
                     separator_rect = QRect(
                         x,
                         option.rect.top(),
@@ -844,7 +1021,29 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     )
                     x += width
                     continue
-                if column == 2:
+                if column == 1:
+                    initial_buy = index.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
+                    if not isinstance(initial_buy, dict):
+                        initial_buy = {}
+                    _draw_initial_buy_display(
+                        painter,
+                        cell_rect,
+                        initial_buy,
+                        hide_value=(
+                            str(
+                                getattr(
+                                    option.widget,
+                                    "_editing_stock_initial_buy_path",
+                                    "",
+                                )
+                                or ""
+                            )
+                            == str(index.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
+                        ),
+                    )
+                    x += width
+                    continue
+                if column == 3:
                     led_size = min(
                         ROUTINE_PROFIT_LED_SIZE,
                         ROUTINE_PROFIT_LED_BOX_SIZE,
@@ -871,8 +1070,8 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         if column == 0
                         else Qt.AlignCenter
                 )
-                if column >= 6:
-                    if column == 6:
+                if column >= 7:
+                    if column == 7:
                         metric_texts = _routine_stock_metric_texts(list(values), tuple(metrics_data))
                         hidden_value_indexes: set[int] = set()
                         if (
@@ -890,12 +1089,12 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         painter.restore()
                         return
                     stock_metric_label_hint = {
-                        6: "보유",
-                        7: "가격",
-                        8: "수익",
-                        9: "미체결",
+                        7: "보유",
+                        8: "가격",
+                        9: "수익",
+                        10: "매매",
                     }.get(column)
-                    metric_index = column - 6
+                    metric_index = column - 7
                     metric = (
                         metrics_data[metric_index]
                         if metric_index < len(metrics_data)
@@ -910,7 +1109,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     ):
                         x += width
                         continue
-                    if column == 10 and draw_limit_metric(
+                    if column == 11 and draw_limit_metric(
                         painter,
                         cell_rect,
                         text,
@@ -956,20 +1155,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
         text_left_offset = content_offset
         if row_kind == ROUTINE_ROW_CHILD:
-            led_state = str(index.data(ROUTINE_CHILD_PROFIT_LED_ROLE) or "gray")
-            led_box_left = option.rect.left() + content_offset
-            _draw_routine_profit_led(
-                painter,
-                row_rect=option.rect,
-                led_box_left=led_box_left,
-                led_state=led_state,
-                visually_enabled=visually_enabled,
-            )
-            text_left_offset = (
-                content_offset
-                + ROUTINE_PROFIT_LED_BOX_SIZE
-                + ROUTINE_PROFIT_LED_GAP
-            )
             if bool(index.data(ROUTINE_CHILD_HAS_STOCKS_ROLE)):
                 collapsed = bool(index.data(ROUTINE_CHILD_COLLAPSED_ROLE))
                 arrow = "▶" if collapsed else "▼"
@@ -994,6 +1179,20 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                 )
                 painter.restore()
                 text_left_offset += QFontMetrics(option.font).horizontalAdvance("▶") + 4
+            led_state = str(index.data(ROUTINE_CHILD_PROFIT_LED_ROLE) or "gray")
+            led_box_left = option.rect.left() + text_left_offset
+            _draw_routine_profit_led(
+                painter,
+                row_rect=option.rect,
+                led_box_left=led_box_left,
+                led_state=led_state,
+                visually_enabled=visually_enabled,
+                square=True,
+            )
+            text_left_offset += (
+                ROUTINE_PROFIT_LED_BOX_SIZE
+                + ROUTINE_PROFIT_LED_GAP
+            )
 
         text_rect = option.rect.adjusted(
             text_left_offset,
@@ -1133,20 +1332,22 @@ class MainWindow(QMainWindow):
         self._routine_instance_ids_by_definition: dict[str, tuple[str, ...]] = {}
         self._routine_definition_by_instance: dict[str, str] = {}
         self._routine_assigned_stock_count_by_instance: dict[str, int] = {}
-        self._routine_operation_status_by_instance: dict[str, str] = {}
         self._routine_instance_name_editor = None
         self._routine_instance_name_editor_instance_id = ""
         self._routine_instance_name_editor_original = ""
         self._routine_instance_name_editor_item = None
         self._routine_instance_name_edit_finishing = False
-        self._main_routine_valid_only = False
-        self._main_routine_display_level = "group"
+        self._main_routine_valid_only = True
+        self._main_routine_display_level = "stock"
         self._main_routine_display_level_applied = False
         self._main_routine_metric_sort_key = ""
         self._main_routine_metric_sort_active = False
+        self._main_routine_initial_buy_sort_mode = ""
+        self._main_routine_initial_buy_sort_next_mode = "AMOUNT"
         self._main_routine_valid_button = None
         self._main_routine_level_buttons: dict[str, QPushButton] = {}
         self._main_routine_metric_buttons: dict[str, QPushButton] = {}
+        self._main_routine_initial_buy_sort_button = None
         self._routine_buy_limit_edit_filter = _RoutineBuyLimitValueEditFilter(self)
         self._routine_instance_buy_limit_editor = None
         self._routine_instance_buy_limit_editor_instance_id = ""
@@ -1156,16 +1357,20 @@ class MainWindow(QMainWindow):
         self._routine_stock_buy_limit_editor_config_path = ""
         self._routine_stock_buy_limit_edit_finishing = False
         self.routine_table._editing_stock_buy_limit_path = ""
+        self._routine_stock_initial_buy_editor = None
+        self._routine_stock_initial_buy_editor_config_path = ""
+        self._routine_stock_initial_buy_editor_mode = "QUANTITY"
+        self._routine_stock_initial_buy_edit_finishing = False
+        self.routine_table._editing_stock_initial_buy_path = ""
         self._main_running_sort_column = -1
         self._main_running_sort_order = Qt.AscendingOrder
         self._startup_recovery_result: dict[str, object] = {}
         self._startup_recovery_approved = False
         self._startup_recovery_approved_snapshot = ""
+        self._production_recovery_identity = None
+        self._production_recovery_parts: dict[str, BrokerSnapshotPart] = {}
 
-        self.btn_stock_register = QPushButton("종목등록설정")
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
-        self.btn_stop_all = QPushButton("전체 자동매매 정지")
-        self.btn_restart = QPushButton("운영 재개")
         self.btn_initialize = QPushButton("초기화")
         self.btn_log_view = QPushButton("로그 보기")
         self.btn_review_required = QPushButton("검토관리종목")
@@ -1379,7 +1584,7 @@ class MainWindow(QMainWindow):
             ("holding", "보유"),
             ("price", "가격"),
             ("profit", "수익"),
-            ("pending", "미결"),
+            ("trade", "매매"),
             ("limit", "한도"),
         ):
             button = self._create_main_routine_filter_badge(
@@ -1392,6 +1597,26 @@ class MainWindow(QMainWindow):
             )
             self._main_routine_metric_buttons[metric] = button
             layout.addWidget(button, 0, Qt.AlignHCenter)
+
+        layout.addSpacing(8)
+        layout.addWidget(
+            self._create_main_routine_filter_separator(
+                "mainRoutineInitialBuySeparator"
+            ),
+            0,
+            Qt.AlignHCenter,
+        )
+        layout.addSpacing(8)
+
+        initial_buy_sort_button = self._create_main_routine_filter_badge(
+            "금액",
+            "mainRoutineInitialBuySortBadge",
+        )
+        initial_buy_sort_button.clicked.connect(
+            self._toggle_main_routine_initial_buy_sort_mode
+        )
+        self._main_routine_initial_buy_sort_button = initial_buy_sort_button
+        layout.addWidget(initial_buy_sort_button, 0, Qt.AlignHCenter)
 
         layout.addStretch(1)
         self._update_main_routine_filter_badges()
@@ -1490,8 +1715,12 @@ class MainWindow(QMainWindow):
                 )
             )
 
+        available_metrics = MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL.get(
+            self._main_routine_display_level,
+            frozenset(),
+        )
         for metric, button in self._main_routine_metric_buttons.items():
-            enabled = self._main_routine_display_level != "group"
+            enabled = metric in available_metrics
             button.setEnabled(enabled)
             button.setCursor(
                 Qt.PointingHandCursor if enabled else Qt.ArrowCursor
@@ -1512,6 +1741,29 @@ class MainWindow(QMainWindow):
                     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                     if active
                     else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+                + disabled_style
+            )
+
+        initial_buy_button = self._main_routine_initial_buy_sort_button
+        if initial_buy_button is not None:
+            initial_buy_enabled = self._main_routine_initial_buy_badge_enabled()
+            next_mode = self._main_routine_initial_buy_sort_next_mode
+            badge_text = "금액" if next_mode == "AMOUNT" else "주수"
+            badge_color = (
+                INITIAL_BUY_AMOUNT_COLOR
+                if next_mode == "AMOUNT"
+                else INITIAL_BUY_QUANTITY_COLOR
+            )
+            initial_buy_button.setText(badge_text)
+            initial_buy_button.setEnabled(initial_buy_enabled)
+            initial_buy_button.setCursor(
+                Qt.PointingHandCursor if initial_buy_enabled else Qt.ArrowCursor
+            )
+            initial_buy_button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    badge_color,
+                    badge_color,
                 )
                 + disabled_style
             )
@@ -1579,7 +1831,11 @@ class MainWindow(QMainWindow):
         else:
             self._collapsed_routine_definition_ids.difference_update(definition_ids)
             self._collapsed_routine_instance_ids.difference_update(instance_ids)
-        if clean_level == "group":
+        available_metrics = MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL[clean_level]
+        if (
+            self._main_routine_metric_sort_active
+            and self._main_routine_metric_sort_key not in available_metrics
+        ):
             self._main_routine_metric_sort_key = ""
             self._main_routine_metric_sort_active = False
         self._main_routine_display_level = clean_level
@@ -1589,10 +1845,30 @@ class MainWindow(QMainWindow):
 
     def _set_main_routine_metric_sort(self, metric: str) -> None:
         clean_metric = str(metric or "").strip()
-        if clean_metric not in {"holding", "price", "profit", "pending", "limit"}:
+        if clean_metric not in {"holding", "price", "profit", "trade", "limit"}:
             return
+        available_metrics = MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL.get(
+            self._main_routine_display_level,
+            frozenset(),
+        )
+        if clean_metric not in available_metrics:
+            return
+        self._main_routine_initial_buy_sort_mode = ""
         self._main_routine_metric_sort_key = clean_metric
         self._main_routine_metric_sort_active = True
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
+
+    def _toggle_main_routine_initial_buy_sort_mode(self) -> None:
+        if not self._main_routine_initial_buy_badge_enabled():
+            return
+        target_mode = self._main_routine_initial_buy_sort_next_mode
+        self._main_routine_initial_buy_sort_mode = target_mode
+        self._main_routine_initial_buy_sort_next_mode = (
+            "QUANTITY" if target_mode == "AMOUNT" else "AMOUNT"
+        )
+        self._main_routine_metric_sort_key = ""
+        self._main_routine_metric_sort_active = False
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
 
@@ -1601,10 +1877,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         buttons = [
-            self.btn_stock_register,
             self.btn_auto_trade_setting,
-            self.btn_stop_all,
-            self.btn_restart,
             self.btn_initialize,
             self.btn_log_view,
             self.btn_review_required,
@@ -1615,8 +1888,6 @@ class MainWindow(QMainWindow):
             button.setMinimumHeight(32)
             layout.addWidget(button)
 
-        self.btn_stop_all.setObjectName("warningButton")
-        self.btn_restart.setObjectName("successButton")
         self.btn_exit.setObjectName("secondaryButton")
         return layout
 
@@ -1798,11 +2069,11 @@ class MainWindow(QMainWindow):
     def _connect_events(self) -> None:
         self.btn_exit.clicked.connect(self.close)
         self.btn_kiwoom_login.clicked.connect(self.login_kiwoom_manually)
+        account_changed = getattr(self.account_combo, "currentTextChanged", None)
+        if account_changed is not None:
+            account_changed.connect(self.on_kiwoom_account_changed)
         self.btn_emergency_stop.clicked.connect(self.on_emergency_stop_clicked)
-        self.btn_stop_all.clicked.connect(self.on_stop_all_clicked)
-        self.btn_stock_register.clicked.connect(self.open_stock_register_window)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
-        self.btn_restart.clicked.connect(self.review_startup_recovery)
         self.btn_initialize.clicked.connect(self.not_implemented)
         self.btn_log_view.clicked.connect(self.not_implemented)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
@@ -1817,9 +2088,573 @@ class MainWindow(QMainWindow):
     def startup_recovery_stock_state_paths(self) -> list[Path]:
         return [stock_dir / "state.json" for stock_dir in self.all_runtime_stock_dirs()]
 
+    def _production_recovery_required(self) -> bool:
+        api = getattr(self, "kiwoom_api", None)
+        checker = getattr(api, "is_connected", None)
+        if not callable(checker):
+            return False
+        try:
+            return checker() is True
+        except Exception:
+            return False
+
+    def _stop_production_recovery_timers(self) -> None:
+        window = getattr(self, "auto_trade_setting_window", None)
+        stopper = getattr(window, "stop_periodic_timers_for_recovery", None)
+        if callable(stopper):
+            stopper()
+
+    def _production_recovery_status_result(self) -> dict[str, object]:
+        context = production_recovery_registry.snapshot()
+        status = context.account_status if context is not None else "NOT_STARTED"
+        reasons: list[str] = []
+        if context is not None:
+            for stock in context.stocks:
+                reasons.extend(stock.reason_codes)
+            api = getattr(self, "kiwoom_api", None)
+            login_session_id = str(
+                getattr(api, "login_session_id", lambda: "")() or ""
+            ).strip()
+            if (
+                context.identity.login_session_id != login_session_id
+                or context.identity.account_no != self.selected_account_no()
+                or context.identity.trading_day != datetime.now().date().isoformat()
+            ):
+                status = "STALE"
+                reasons.append("STALE_RECOVERY_SESSION")
+        labels = {
+            "NOT_STARTED": "복구 대기",
+            "COLLECTING": "Broker 상태 수집",
+            "RECONCILING": "Runtime 대조",
+            "REVIEW_REQUIRED": "검토 필요",
+            "COMPLETED": "복구 완료",
+            "FAILED": "복구 실패",
+            "STALE": "복구 세션 만료",
+        }
+        self.auto_status_label.setText(
+            f"전체 자동매매 상태: {labels.get(status, status)}"
+        )
+        return {
+            "status": status,
+            "operator_approval_allowed": status in {
+                ACCOUNT_COMPLETED,
+                ACCOUNT_REVIEW_REQUIRED,
+            },
+            "review_reasons": list(dict.fromkeys(reasons)),
+            "production_recovery": True,
+        }
+
+    @staticmethod
+    def _read_recovery_runtime_list(path: Path, field: str) -> list[dict[str, object]]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get(field), list):
+            raise ValueError(f"{path.name}.{field} must be a list")
+        return [dict(item) for item in data[field] if isinstance(item, dict)]
+
+    def _registered_recovery_stock_runtime(
+        self,
+        *,
+        account_no: str,
+    ) -> list[tuple[str, dict[str, object] | None]]:
+        positions = self._read_recovery_runtime_list(
+            RECOVERY_POSITIONS_PATH,
+            "positions",
+        )
+        result: list[tuple[str, dict[str, object] | None]] = []
+        from gui_auto_trade_runtime import all_registered_stock_dirs
+
+        for stock_dir in all_registered_stock_dirs():
+            code = stock_dir.name.split("_", 1)[0].strip()
+            if not code:
+                continue
+            matches = [
+                item
+                for item in positions
+                if str(item.get("account_no") or "").strip() == account_no
+                and str(item.get("code") or item.get("stock_code") or "").strip()
+                == code
+            ]
+            if len(matches) > 1:
+                raise ValueError(f"duplicate Runtime position: {code}")
+            result.append((code, matches[0] if matches else None))
+        return result
+
+    def _record_production_recovery_review(
+        self,
+        identity,
+        *,
+        stock_code: str,
+        reason_code: str,
+        broker_evidence: object = None,
+        runtime_evidence: object = None,
+    ) -> None:
+        canonical_reason = {
+            "HOLDINGS_SNAPSHOT_FAILED": "HOLDING_SNAPSHOT_FAILED",
+            "OPEN_ORDERS_SNAPSHOT_FAILED": "OPEN_ORDER_SNAPSHOT_FAILED",
+            "RECOVERY_IDENTITY_MISMATCH": "STALE_RECOVERY_SESSION",
+            "INVALID_STOCK_CODE": "RECOVERY_FAILED",
+            "DUPLICATE_BROKER_HOLDING": "RECOVERY_PARTIAL",
+            "HOLDINGS_SNAPSHOT_ADAPTER_MISSING": "RECOVERY_FAILED",
+            "OPEN_ORDERS_SNAPSHOT_ADAPTER_MISSING": "RECOVERY_FAILED",
+        }.get(reason_code, reason_code)
+        write_production_recovery_review(
+            {
+                "account_no": identity.account_no,
+                "trading_day": identity.trading_day,
+                "login_session_id": identity.login_session_id,
+                "recovery_session_id": identity.recovery_session_id,
+                "stock_code": stock_code,
+                "reason_code": canonical_reason,
+                "detected_at": datetime.now().isoformat(timespec="seconds"),
+                "broker_evidence": broker_evidence or {},
+                "runtime_evidence": {
+                    "original_reason_code": reason_code,
+                    "evidence": runtime_evidence or {},
+                },
+                "status": "OPEN",
+            },
+            RECOVERY_BROKER_HOLDINGS_PATH,
+        )
+
+    def _fail_production_recovery(
+        self,
+        identity,
+        reason_code: str,
+        *,
+        broker_evidence: object = None,
+    ) -> None:
+        self._production_recovery_failure_reason_code = str(reason_code or "")
+        production_recovery_registry.fail_account(identity)
+        self._stop_production_recovery_timers()
+        self._record_production_recovery_review(
+            identity,
+            stock_code="",
+            reason_code=reason_code,
+            broker_evidence=broker_evidence,
+        )
+        self._production_recovery_status_result()
+
+    def _finish_production_recovery(self, identity) -> None:
+        holdings = self._production_recovery_parts.get("HOLDINGS")
+        open_orders = self._production_recovery_parts.get("OPEN_ORDERS")
+        if not isinstance(holdings, BrokerSnapshotPart) or not isinstance(
+            open_orders,
+            BrokerSnapshotPart,
+        ):
+            return
+        if (
+            holdings.recovery_session_id != identity.recovery_session_id
+            or open_orders.recovery_session_id != identity.recovery_session_id
+        ):
+            self._fail_production_recovery(identity, "RECOVERY_IDENTITY_MISMATCH")
+            return
+
+        snapshot = combine_account_snapshot(identity, holdings, open_orders)
+        if not snapshot.is_complete:
+            self._fail_production_recovery(
+                identity,
+                "INCOMPLETE_BROKER_SNAPSHOT",
+                broker_evidence={"errors": list(snapshot.errors)},
+            )
+            return
+        try:
+            runtime_orders = self._read_recovery_runtime_list(
+                RECOVERY_ORDER_QUEUE_PATH,
+                "orders",
+            )
+            stock_runtime = self._registered_recovery_stock_runtime(
+                account_no=identity.account_no,
+            )
+        except Exception as exc:
+            self._fail_production_recovery(
+                identity,
+                "DAMAGED_RUNTIME",
+                broker_evidence={"error": str(exc)},
+            )
+            return
+
+        result = reconcile_production_recovery_snapshot(
+            identity=identity,
+            snapshot=snapshot,
+            stock_runtime=stock_runtime,
+            runtime_orders=runtime_orders,
+        )
+        for stock_result in result.get("stock_results", ()):
+            if not stock_result.review_required:
+                continue
+            broker_items = [
+                asdict(item)
+                for item in (*snapshot.holdings, *snapshot.open_orders)
+                if item.stock_code == stock_result.stock_code
+            ]
+            runtime_position = next(
+                (
+                    position
+                    for code, position in stock_runtime
+                    if code == stock_result.stock_code
+                ),
+                None,
+            )
+            for reason_code in stock_result.reason_codes:
+                self._record_production_recovery_review(
+                    identity,
+                    stock_code=stock_result.stock_code,
+                    reason_code=reason_code,
+                    broker_evidence={"items": broker_items},
+                    runtime_evidence={"position": runtime_position or {}},
+                )
+
+        context = production_recovery_registry.snapshot()
+        if recovery_account_allows_isolated_stock_operation(context):
+            window = getattr(self, "auto_trade_setting_window", None)
+            starter = getattr(window, "start_periodic_timers_after_recovery", None)
+            if callable(starter):
+                timer_result = starter(identity)
+                self._production_recovery_timer_start_result = timer_result
+                if (
+                    not isinstance(timer_result, dict)
+                    or timer_result.get("started") is not True
+                ):
+                    reason_code = (
+                        str(timer_result.get("reason_code") or "")
+                        if isinstance(timer_result, dict)
+                        else ""
+                    )
+                    LOGGER.error(
+                        "Recovery timer start failed: %s",
+                        reason_code or "RECOVERY_TIMER_START_FAILED",
+                    )
+                    self._fail_production_recovery(
+                        identity,
+                        reason_code or "RECOVERY_TIMER_START_FAILED",
+                    )
+                    return
+        else:
+            self._stop_production_recovery_timers()
+        self._production_recovery_status_result()
+        window = getattr(self, "auto_trade_setting_window", None)
+        updater = getattr(window, "update_startup_recovery_controls", None)
+        if callable(updater):
+            updater()
+        self.update_review_required_button_text()
+
+    def _on_production_recovery_snapshot(
+        self,
+        identity,
+        kind: str,
+        result: object,
+    ) -> None:
+        current = self._production_recovery_identity
+        if (
+            current is None
+            or current.recovery_session_id != identity.recovery_session_id
+        ):
+            return
+        payload = result if isinstance(result, dict) else {}
+        snapshot = payload.get("snapshot")
+        if (
+            payload.get("ok") is not True
+            or not isinstance(snapshot, BrokerSnapshotPart)
+            or snapshot.is_complete is not True
+        ):
+            self._fail_production_recovery(
+                identity,
+                f"{kind}_SNAPSHOT_FAILED",
+                broker_evidence={
+                    "errors": list(payload.get("errors") or []),
+                    "error": str(payload.get("error") or ""),
+                },
+            )
+            return
+        self._production_recovery_parts[kind] = snapshot
+        if kind == "HOLDINGS" and "OPEN_ORDERS" not in self._production_recovery_parts:
+            self._request_production_recovery_snapshot(identity, "OPEN_ORDERS")
+            return
+        self._finish_production_recovery(identity)
+
+    def _request_production_recovery_snapshot(self, identity, kind: str) -> bool:
+        api = getattr(self, "kiwoom_api", None)
+        requester_name = {
+            "HOLDINGS": "request_account_holdings_snapshot",
+            "OPEN_ORDERS": "request_open_orders_snapshot",
+        }.get(kind, "")
+        requester = getattr(api, requester_name, None)
+        if not callable(requester):
+            self._fail_production_recovery(
+                identity,
+                f"{kind}_SNAPSHOT_ADAPTER_MISSING",
+            )
+            return False
+        response = requester(
+            identity,
+            callback=lambda result: self._on_production_recovery_snapshot(
+                identity,
+                kind,
+                result,
+            ),
+        )
+        return not (
+            isinstance(response, dict)
+            and response.get("ok") is False
+        )
+
+    def start_production_recovery(self) -> bool:
+        self._stop_production_recovery_timers()
+        production_recovery_registry.invalidate("new login/account recovery")
+        self._production_recovery_parts = {}
+        self._production_recovery_identity = None
+        self._production_recovery_failure_reason_code = ""
+        self._production_recovery_timer_start_result = None
+
+        api = getattr(self, "kiwoom_api", None)
+        account_no = self.selected_account_no()
+        login_session_id = str(
+            getattr(api, "login_session_id", lambda: "")() or ""
+        ).strip()
+        if not account_no or not login_session_id:
+            self._production_recovery_status_result()
+            return False
+        identity = create_recovery_session_identity(
+            login_session_id=login_session_id,
+            account_no=account_no,
+            trading_day=datetime.now().date().isoformat(),
+            requested_at=datetime.now().isoformat(timespec="microseconds"),
+        )
+        self._production_recovery_identity = identity
+        production_recovery_registry.begin_recovery(identity)
+        production_recovery_registry.mark_collecting(identity)
+        self._production_recovery_status_result()
+        return self._request_production_recovery_snapshot(identity, "HOLDINGS")
+
+    def production_recovery_gate_for_stock(
+        self,
+        stock_code: str,
+        *,
+        caller_name: str,
+    ):
+        api = getattr(self, "kiwoom_api", None)
+        context = production_recovery_registry.snapshot()
+        return check_production_recovery_gate(
+            login_session_id=str(
+                getattr(api, "login_session_id", lambda: "")() or ""
+            ).strip(),
+            account_no=self.selected_account_no(),
+            trading_day=datetime.now().date().isoformat(),
+            stock_code=stock_code,
+            recovery_session_id=(
+                context.identity.recovery_session_id if context is not None else ""
+            ),
+            caller_name=caller_name,
+        )
+
+    def production_recovery_stock_is_review_required(self, stock_code: str) -> bool:
+        return recovery_stock_is_review_required(stock_code)
+
+    def routine_recovery_block_message(self, action: str) -> str:
+        """Format a routine-operation block without exposing recovery internals."""
+        title = f"{str(action or '루틴 작업').strip()} 불가"
+        api = getattr(self, "kiwoom_api", None)
+        checker = getattr(api, "is_connected", None)
+        try:
+            connected = callable(checker) and checker() is True
+        except Exception:
+            connected = False
+
+        if not connected:
+            return "키움 서버에 로그인되어 있지 않습니다."
+        elif not self.selected_account_no():
+            detail = (
+                "사용할 계좌 정보가 아직 확인되지 않았습니다.\n"
+                "로그인과 계좌 선택 상태를 확인해 주세요."
+            )
+        else:
+            context = production_recovery_registry.snapshot()
+            status = str(
+                getattr(context, "account_status", "NOT_STARTED") or "NOT_STARTED"
+            ).strip()
+            if status in {"COLLECTING", "RECONCILING"}:
+                detail = (
+                    "프로그램 시작 후 기존 운영 상태를 확인하고 있습니다.\n"
+                    "확인이 끝난 뒤 다시 시도해 주세요."
+                )
+            elif status in {"FAILED", "STALE"}:
+                detail = (
+                    "이전 운영 상태를 확인하지 못했습니다.\n"
+                    "운영 상태와 로그를 확인해 주세요."
+                )
+            elif status == "REVIEW_REQUIRED":
+                detail = (
+                    "확인이 필요한 운영 항목이 남아 있습니다.\n"
+                    "검토관리에서 상태를 확인해 주세요."
+                )
+            else:
+                detail = (
+                    "프로그램 시작 후 운영 상태 확인이 아직 완료되지 않았습니다.\n"
+                    "잠시 후 다시 시도해 주세요."
+                )
+        return f"{title}\n\n{detail}"
+
+    def show_routine_recovery_block_toast(self, action: str) -> None:
+        show_toast(
+            parent=self,
+            message=self.routine_recovery_block_message(action),
+            duration_ms=2500,
+            position="center",
+        )
+
+    def production_recovery_block_user_message(self, decision) -> str:
+        reason_code = str(getattr(decision, "reason_code", "") or "").strip()
+        api = getattr(self, "kiwoom_api", None)
+        connected = False
+        checker = getattr(api, "is_connected", None)
+        if callable(checker):
+            try:
+                connected = checker() is True
+            except Exception:
+                connected = False
+
+        if reason_code == RECOVERY_CONTEXT_MISSING:
+            if not connected:
+                return "키움 서버에 로그인되어 있지 않습니다."
+            login_session_id = str(
+                getattr(api, "login_session_id", lambda: "")() or ""
+            ).strip()
+            if not login_session_id:
+                return (
+                    "로그인 세션 정보를 확인할 수 없습니다. "
+                    "키움 서버에 다시 로그인하십시오."
+                )
+            if not self.selected_account_no():
+                return "운영할 계좌를 선택하십시오."
+            evidence = tuple(getattr(decision, "evidence", ()) or ())
+            if any(str(item).startswith("registry_error=") for item in evidence):
+                return (
+                    "Recovery 데이터를 읽을 수 없습니다. "
+                    "복구를 다시 실행한 후 운영을 시작하십시오."
+                )
+            return (
+                "운영 시작에 필요한 Recovery 정보를 확인할 수 없습니다. "
+                "로그인과 계좌 선택 상태를 확인한 후 Recovery를 다시 실행하십시오."
+            )
+
+        messages = {
+            RECOVERY_NOT_STARTED: (
+                "운영 시작 전에 Recovery가 완료되지 않았습니다. "
+                "로그인과 계좌 선택 후 Recovery를 완료하십시오."
+            ),
+            RECOVERY_IN_PROGRESS: (
+                "Recovery가 진행 중입니다. 복구가 완료된 후 다시 시도하십시오."
+            ),
+            RECOVERY_ACCOUNT_REVIEW_REQUIRED: (
+                "복구가 필요한 종목이 남아 있습니다. "
+                "검토관리에서 해당 종목을 처리하십시오."
+            ),
+            RECOVERY_IDENTITY_MISMATCH: (
+                "현재 로그인 또는 계좌와 Recovery 정보가 일치하지 않습니다. "
+                "Recovery를 다시 실행하십시오."
+            ),
+            RECOVERY_STALE_SESSION: (
+                "이전 Recovery 정보는 현재 세션에서 사용할 수 없습니다. "
+                "Recovery를 다시 실행하십시오."
+            ),
+            RECOVERY_STOCK_PENDING: (
+                "선택한 종목의 Recovery가 아직 완료되지 않았습니다."
+            ),
+            RECOVERY_STOCK_REVIEW_REQUIRED: (
+                "선택한 종목은 복구 검토 대상입니다. "
+                "검토관리에서 해당 종목을 처리하십시오."
+            ),
+            RECOVERY_STOCK_FAILED: (
+                "선택한 종목의 Recovery에 실패했습니다. "
+                "검토관리에서 상태를 확인하십시오."
+            ),
+        }
+        if reason_code == RECOVERY_ACCOUNT_FAILED:
+            failure_reason = str(
+                getattr(self, "_production_recovery_failure_reason_code", "") or ""
+            ).strip()
+            if failure_reason == "DAMAGED_RUNTIME":
+                return (
+                    "Runtime 데이터를 읽을 수 없어 Recovery에 실패했습니다. "
+                    "검토관리에서 Runtime 상태를 확인하십시오."
+                )
+            if failure_reason in {
+                "INCOMPLETE_BROKER_SNAPSHOT",
+                "HOLDINGS_SNAPSHOT_FAILED",
+                "OPEN_ORDERS_SNAPSHOT_FAILED",
+                "HOLDINGS_SNAPSHOT_ADAPTER_MISSING",
+                "OPEN_ORDERS_SNAPSHOT_ADAPTER_MISSING",
+            }:
+                return (
+                    "계좌의 보유 또는 미체결 정보를 확인하지 못했습니다. "
+                    "키움 연결 상태를 확인한 후 Recovery를 다시 실행하십시오."
+                )
+            if failure_reason == "RECOVERY_TIMER_START_FAILED":
+                return (
+                    "운영 주기 실행을 시작하지 못했습니다. "
+                    "로그를 확인한 후 Recovery를 다시 실행하십시오."
+                )
+            if failure_reason == "RECOVERY_NO_RESTORED_STOCK":
+                return (
+                    "Recovery가 완료된 운영 대상 종목이 없습니다. "
+                    "검토관리에서 종목 상태를 확인하십시오."
+                )
+            return (
+                "계좌 Recovery에 실패했습니다. "
+                "로그인과 계좌 상태를 확인한 후 Recovery를 다시 실행하십시오."
+            )
+        return messages.get(
+            reason_code,
+            "운영 시작에 필요한 복구 상태를 확인할 수 없습니다. "
+            "로그인, 계좌 선택 및 Recovery 상태를 확인하십시오.",
+        )
+
+    def filter_start_targets_by_production_recovery(
+        self,
+        targets: list[tuple[Path, str, str]],
+        *,
+        caller_name: str,
+    ) -> dict[str, object]:
+        eligible: list[tuple[Path, str, str]] = []
+        excluded_review: list[str] = []
+        for stock_dir, code, name in targets:
+            decision = self.production_recovery_gate_for_stock(
+                code,
+                caller_name=caller_name,
+            )
+            if decision.allowed:
+                eligible.append((stock_dir, code, name))
+                continue
+            if decision.reason_code == RECOVERY_STOCK_REVIEW_REQUIRED:
+                excluded_review.append(f"{code} {name}")
+                continue
+            return {
+                "allowed": False,
+                "reason": decision.reason_code,
+                "user_message": self.production_recovery_block_user_message(
+                    decision
+                ),
+                "eligible": tuple(eligible),
+                "excluded_review": tuple(excluded_review),
+            }
+        return {
+            "allowed": True,
+            "reason": "RECOVERY_COMPLETED",
+            "eligible": tuple(eligible),
+            "excluded_review": tuple(excluded_review),
+        }
+
     def refresh_startup_recovery_status(self) -> dict[str, object]:
+        if self._production_recovery_required():
+            result = self._production_recovery_status_result()
+            self._startup_recovery_result = result
+            return result
+        stock_state_paths = self.startup_recovery_stock_state_paths()
+        self._startup_runtime_initialization_result = (
+            initialize_pristine_startup_runtime()
+        )
         result = assess_startup_recovery(
-            stock_state_paths=self.startup_recovery_stock_state_paths(),
+            stock_state_paths=stock_state_paths,
         )
         self._startup_recovery_result = result
         status = str(result.get("status") or "INVALID_RUNTIME")
@@ -1832,7 +2667,6 @@ class MainWindow(QMainWindow):
 
         if self._startup_recovery_approved:
             self.auto_status_label.setText("전체 자동매매 상태: 운영 재개 승인")
-            self.btn_restart.setText("운영 재개 확인 완료")
         else:
             labels = {
                 "RESUME_READY": "재개 가능",
@@ -1843,10 +2677,27 @@ class MainWindow(QMainWindow):
             self.auto_status_label.setText(
                 f"전체 자동매매 상태: {labels.get(status, status)}"
             )
-            self.btn_restart.setText("운영 재개")
         return result
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+        if self._production_recovery_required():
+            if refresh:
+                self._production_recovery_status_result()
+            context = production_recovery_registry.snapshot()
+            identity = self._production_recovery_identity
+            api = getattr(self, "kiwoom_api", None)
+            login_session_id = str(
+                getattr(api, "login_session_id", lambda: "")() or ""
+            ).strip()
+            return bool(
+                context is not None
+                and identity is not None
+                and context.identity == identity
+                and recovery_account_allows_isolated_stock_operation(context)
+                and identity.login_session_id == login_session_id
+                and identity.account_no == self.selected_account_no()
+                and identity.trading_day == datetime.now().date().isoformat()
+            )
         if refresh:
             self.refresh_startup_recovery_status()
         return bool(
@@ -1855,6 +2706,21 @@ class MainWindow(QMainWindow):
             and self._startup_recovery_approved_snapshot
             == self._startup_recovery_result.get("snapshot_hash")
         )
+
+    def rebind_startup_recovery_after_trusted_runtime_update(self) -> bool:
+        """Bind an approved session to a verified in-session Runtime mutation."""
+        if self._startup_recovery_approved is not True:
+            return False
+        result = self.refresh_startup_recovery_status()
+        if result.get("operator_approval_allowed") is not True:
+            return False
+        snapshot_hash = str(result.get("snapshot_hash") or "")
+        if not snapshot_hash:
+            return False
+        self._startup_recovery_approved = True
+        self._startup_recovery_approved_snapshot = snapshot_hash
+        self.refresh_startup_recovery_status()
+        return self.startup_recovery_session_ready(refresh=False)
 
     def startup_recovery_block_reason(self) -> str:
         result = self._startup_recovery_result
@@ -1934,7 +2800,11 @@ class MainWindow(QMainWindow):
         api = getattr(self, "kiwoom_api", None)
         if api is None:
             reason = getattr(self, "kiwoom_api_unavailable_reason", "") or "KiwoomApi is not initialized"
-            message = f"키움 로그인 사용불가: {reason}"
+            LOGGER.error("Kiwoom login unavailable: %s", reason)
+            message = (
+                "키움 OpenAPI를 사용할 수 없습니다. "
+                "설치 상태와 32비트 실행 환경을 확인하십시오."
+            )
             self.login_status_label.setText(message)
             self.statusBar().showMessage(message)
             return
@@ -1942,7 +2812,11 @@ class MainWindow(QMainWindow):
         try:
             if not api.is_available():
                 reason = api.unavailable_reason() or getattr(self, "kiwoom_api_unavailable_reason", "") or "kiwoom api unavailable"
-                message = f"키움 로그인 사용불가: {reason}"
+                LOGGER.error("Kiwoom login unavailable: %s", reason)
+                message = (
+                    "키움 OpenAPI를 사용할 수 없습니다. "
+                    "설치 상태와 32비트 실행 환경을 확인하십시오."
+                )
                 self.login_status_label.setText(message)
                 self.statusBar().showMessage(message)
                 return
@@ -1953,8 +2827,12 @@ class MainWindow(QMainWindow):
                 return
 
             result = api.login()
-        except Exception as exc:
-            message = f"키움 로그인 요청 실패: {exc}"
+        except Exception:
+            LOGGER.exception("Kiwoom login request failed")
+            message = (
+                "키움 로그인 요청 중 오류가 발생했습니다. "
+                "키움 OpenAPI 상태를 확인한 뒤 다시 시도하십시오."
+            )
             self.login_status_label.setText(message)
             self.statusBar().showMessage(message)
             return
@@ -1966,7 +2844,11 @@ class MainWindow(QMainWindow):
             message = "로그인 상태: 연결됨"
         else:
             reason = result.get("error") or result.get("message") or status or "unknown error"
-            message = f"키움 로그인 요청 실패: {reason}"
+            LOGGER.error("Kiwoom login request failed: %s", reason)
+            message = (
+                "키움 로그인 요청을 완료하지 못했습니다. "
+                "키움 OpenAPI 상태를 확인한 뒤 다시 시도하십시오."
+            )
 
         self.login_status_label.setText(message)
         self.refresh_kiwoom_accounts()
@@ -1985,7 +2867,24 @@ class MainWindow(QMainWindow):
 
         self.login_status_label.setText(label_text)
         self.refresh_kiwoom_accounts()
+        if connected:
+            self.start_production_recovery()
+        else:
+            self._stop_production_recovery_timers()
+            production_recovery_registry.invalidate("login disconnected")
+            self._production_recovery_identity = None
+            self._production_recovery_parts = {}
+            self._production_recovery_status_result()
         self.statusBar().showMessage(status_message)
+
+    def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
+        if self._production_recovery_required():
+            self.start_production_recovery()
+            return
+        self._stop_production_recovery_timers()
+        production_recovery_registry.invalidate("account changed")
+        self._production_recovery_identity = None
+        self._production_recovery_parts = {}
 
     def kiwoom_account_numbers(self) -> list[str]:
         api = getattr(self, "kiwoom_api", None)
@@ -2156,28 +3055,6 @@ class MainWindow(QMainWindow):
 
     def on_emergency_stop_clicked(self) -> None:
         emergency_on_emergency_stop_clicked(self)
-
-    def on_stop_all_clicked(self) -> None:
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("전체 자동매매 정지")
-        box.setText(
-            "전체 자동매매를 정지하시겠습니까?\n\n"
-            "보유 종목은 자동 매도하지 않습니다."
-        )
-        proceed_button = box.addButton("진행", QMessageBox.AcceptRole)
-        box.addButton("취소", QMessageBox.RejectRole)
-        box.setDefaultButton(proceed_button)
-        box.exec_()
-
-        if box.clickedButton() == proceed_button:
-            self.statusBar().showMessage("전체 자동매매 정지 요청됨")
-            QMessageBox.information(
-                self,
-                "전체 자동매매 정지",
-                "현재 단계에서는 실제 자동매매가 연결되어 있지 않습니다.\n"
-                "GUI 버튼 동작만 확인했습니다.",
-            )
 
     def open_routine_settings_from_main_table(self, item=None) -> None:
         """Open a definition template or persisted instance settings dialog."""
@@ -2406,6 +3283,28 @@ class MainWindow(QMainWindow):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _write_stock_initial_buy_config(
+        config_path: Path,
+        *,
+        mode: str,
+        value: int,
+    ) -> None:
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        normalized_mode = "AMOUNT" if str(mode).upper() == "AMOUNT" else "QUANTITY"
+        config["trade_amount_type"] = normalized_mode
+        if normalized_mode == "AMOUNT":
+            config["buy_amount"] = max(0, int(value))
+        else:
+            config["buy_qty"] = max(1, int(value))
+        config["updated_at"] = stock_now_text()
+        config_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     def _stock_config_path_for_routine_row(self, row: int) -> Path | None:
         item = self.routine_table.item(row, 0)
         if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_STOCK:
@@ -2415,13 +3314,131 @@ class MainWindow(QMainWindow):
             return None
         return PROJECT_ROOT / stock_path / "config.json"
 
+    def _routine_stock_initial_buy_value_rect(self, row: int) -> QRect:
+        index = self.routine_table.model().index(row, 0)
+        if not index.isValid():
+            return QRect()
+        cell_rect = self._routine_tree_interaction_controller._stock_legacy_metric_rect(
+            index,
+            1,
+        )
+        value_rect = _initial_buy_component_rects(cell_rect)["value"]
+        return QRect(
+            value_rect.left(),
+            value_rect.top() + 2,
+            value_rect.width(),
+            max(20, value_rect.height() - 4),
+        )
+
+    def _main_routine_initial_buy_badge_enabled(self) -> bool:
+        return self._main_routine_display_level == "stock"
+
+    def toggle_routine_stock_initial_buy_mode(self, row: int) -> None:
+        if not self._main_routine_initial_buy_badge_enabled():
+            return
+        config_path = self._stock_config_path_for_routine_row(row)
+        if config_path is None:
+            return
+        self.finish_routine_stock_initial_buy_edit(save=True)
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        current_mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
+        next_mode = "QUANTITY" if current_mode == "AMOUNT" else "AMOUNT"
+        next_value = 1 if next_mode == "QUANTITY" else 0
+        self._write_stock_initial_buy_config(
+            config_path,
+            mode=next_mode,
+            value=next_value,
+        )
+        self.load_routine_table()
+
+    def start_routine_stock_initial_buy_edit(self, row: int) -> None:
+        if not self._main_routine_initial_buy_badge_enabled():
+            return
+        item = self.routine_table.item(row, 0)
+        stock_path = (
+            str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
+            if item is not None
+            else ""
+        )
+        config_path = self._stock_config_path_for_routine_row(row)
+        if config_path is None:
+            return
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
+        if mode != "AMOUNT":
+            mode = "QUANTITY"
+        value = config.get("buy_amount", 0) if mode == "AMOUNT" else config.get("buy_qty", 1)
+        try:
+            value_text = str(max(0 if mode == "AMOUNT" else 1, int(value or 0)))
+        except (TypeError, ValueError):
+            value_text = "0" if mode == "AMOUNT" else "1"
+
+        self.finish_routine_stock_initial_buy_edit(save=True)
+        self.finish_routine_stock_buy_limit_edit(save=True)
+        editor_rect = self._routine_stock_initial_buy_value_rect(row)
+        if editor_rect.isNull():
+            return
+        editor = QLineEdit(self.routine_table.viewport())
+        editor.setObjectName("routineStockInitialBuyEditor")
+        _apply_routine_inline_edit_style(editor, self.routine_table)
+        editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        editor.setText(value_text)
+        editor.setGeometry(editor_rect)
+        editor.installEventFilter(self._routine_buy_limit_edit_filter)
+        self.routine_table._editing_stock_initial_buy_path = stock_path
+        self.routine_table.viewport().update(
+            self.routine_table.visualRect(self.routine_table.model().index(row, 0))
+        )
+        editor.selectAll()
+        editor.show()
+        editor.setFocus(Qt.MouseFocusReason)
+        self._routine_stock_initial_buy_editor = editor
+        self._routine_stock_initial_buy_editor_config_path = str(config_path)
+        self._routine_stock_initial_buy_editor_mode = mode
+
+    def finish_routine_stock_initial_buy_edit(self, *, save: bool) -> None:
+        editor = self._routine_stock_initial_buy_editor
+        if editor is None or self._routine_stock_initial_buy_edit_finishing:
+            return
+        self._routine_stock_initial_buy_edit_finishing = True
+        config_path_text = self._routine_stock_initial_buy_editor_config_path
+        mode = self._routine_stock_initial_buy_editor_mode
+        normalized = str(editor.text() or "").replace(",", "").replace("원", "").replace("주", "").strip()
+        value = int(normalized) if normalized.isdigit() else None
+
+        self._routine_stock_initial_buy_editor = None
+        self._routine_stock_initial_buy_editor_config_path = ""
+        self._routine_stock_initial_buy_editor_mode = "QUANTITY"
+        self.routine_table._editing_stock_initial_buy_path = ""
+        editor.hide()
+        editor.deleteLater()
+        self._routine_stock_initial_buy_edit_finishing = False
+
+        if not save or value is None:
+            self.routine_table.viewport().update()
+            return
+        if mode == "QUANTITY" and value < 1:
+            self.routine_table.viewport().update()
+            return
+        config_path = Path(config_path_text)
+        self._write_stock_initial_buy_config(
+            config_path,
+            mode=mode,
+            value=value,
+        )
+        self.load_routine_table()
+
     def _routine_stock_buy_limit_value_rect(self, row: int) -> QRect:
         index = self.routine_table.model().index(row, 0)
         if not index.isValid():
             return QRect()
         metric_rect = self._routine_tree_interaction_controller._stock_metric_rect(
             index,
-            10,
+            11,
         )
         if metric_rect.isNull():
             return QRect()
@@ -2634,6 +3651,234 @@ class MainWindow(QMainWindow):
             self._routine_assigned_stock_count_by_instance.get(instance_id, 0) or 0
         ) > 0
 
+    def _routine_instance_stock_dirs(self, instance_id: str) -> list[Path]:
+        result: list[Path] = []
+        stocks_root = PROJECT_ROOT / "stocks"
+        if not stocks_root.exists():
+            return result
+        for stock_dir in sorted(path for path in stocks_root.iterdir() if path.is_dir()):
+            config = read_json_dict(stock_dir / "config.json")
+            if (
+                str(config.get("assigned_routine_instance_id") or "").strip()
+                == str(instance_id or "").strip()
+            ):
+                result.append(stock_dir)
+        return result
+
+    def toggle_routine_instance_operation(self, instance_id: str) -> None:
+        instance = routine_instance_by_id(instance_id)
+        if instance is None:
+            result = {
+                "ok": False,
+                "reason": "INSTANCE_NOT_FOUND",
+                "user_message": (
+                    "선택한 인스턴스 정보를 읽을 수 없습니다.\n"
+                    "화면을 새로고침한 뒤 다시 시도하십시오."
+                ),
+            }
+            self.statusBar().showMessage(str(result["user_message"]))
+            show_auto_trade_operation_failure_dialog(
+                self,
+                "운영시작",
+                result,
+            )
+            return
+
+        targets: list[MainMonitoringStockTarget] = []
+        operational_targets: list[MainMonitoringStockTarget] = []
+        any_running = False
+        for stock_dir in self._routine_instance_stock_dirs(instance_id):
+            code, separator, name = stock_dir.name.partition("_")
+            if not separator or not code or not name:
+                continue
+            state = read_json_dict(stock_dir / "state.json")
+            target = MainMonitoringStockTarget(
+                stock_dir=stock_dir,
+                code=code,
+                name=name,
+                routine_instance_id=instance_id,
+            )
+            targets.append(target)
+            registry_review_checker = getattr(
+                self,
+                "production_recovery_stock_is_review_required",
+                None,
+            )
+            if (
+                is_review_required_state(state)
+                or (
+                    callable(registry_review_checker)
+                    and registry_review_checker(code)
+                )
+            ):
+                continue
+            operational_targets.append(target)
+            any_running = any_running or auto_trade_setting_trade_started(state)
+
+        if not targets:
+            result = {
+                "ok": False,
+                "reason": "NO_REGISTERED_STOCKS",
+                "user_message": (
+                    "선택한 인스턴스에 등록된 종목이 없습니다.\n"
+                    "자동매매 설정에서 종목을 등록하십시오."
+                ),
+            }
+            self.statusBar().showMessage(str(result["user_message"]))
+            show_auto_trade_operation_failure_dialog(
+                self,
+                "운영시작",
+                result,
+            )
+            return
+
+        if not operational_targets:
+            self._reload_main_routine_table_preserving_view()
+            return
+
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            operational_targets,
+            request_scope="multiple",
+            recovery_action_label="" if any_running else "루틴 재시작",
+        )
+        self._main_monitoring_stock_operation_adapter = adapter
+        requested_action = "운영정지" if any_running else "운영시작"
+        try:
+            if any_running:
+                operation_result = adapter.stop_selected_auto_trades()
+            else:
+                operation_result = adapter.start_selected_auto_trades()
+        except Exception:
+            LOGGER.exception(
+                "인스턴스 %s %s 처리 오류",
+                instance_id,
+                requested_action,
+            )
+            self._reload_main_routine_table_preserving_view()
+            message = (
+                "운영 상태를 변경하는 중 오류가 발생했습니다.\n"
+                "로그를 확인한 뒤 다시 시도하십시오."
+            )
+            self.statusBar().showMessage(
+                message
+            )
+            QMessageBox.critical(
+                self,
+                f"{requested_action} 오류",
+                message,
+            )
+            return
+
+        running_after = any(
+            auto_trade_setting_trade_started(
+                read_json_dict(stock_dir / "state.json")
+            )
+            for stock_dir in self._routine_instance_stock_dirs(instance_id)
+        )
+        transition_succeeded = (
+            not running_after if any_running else running_after
+        )
+        self._reload_main_routine_table_preserving_view()
+        if transition_succeeded:
+            user_message = (
+                str(operation_result.get("user_message") or "").strip()
+                if isinstance(operation_result, dict)
+                else ""
+            )
+            self.statusBar().showMessage(
+                user_message
+                or (
+                    f"{instance.display_name} {requested_action} 완료 "
+                    f"(대상 {len(targets)}종목)"
+                )
+            )
+            return
+
+        user_message = ""
+        if isinstance(operation_result, dict):
+            user_message = str(
+                operation_result.get("user_message") or ""
+            ).strip()
+        if not user_message:
+            user_message = str(
+                getattr(adapter, "_last_operation_user_message", "") or ""
+            ).strip()
+        self.statusBar().showMessage(
+            f"{instance.display_name} {requested_action} 실패: "
+            f"{user_message or '로그인, 계좌 및 운영 상태를 확인하십시오.'}"
+        )
+        adapter.show_operation_failure_dialog(requested_action, operation_result)
+
+    def _production_recovery_allows_routine_operation(
+        self,
+        instance_id: str,
+        *,
+        command: str,
+        caller_name: str,
+    ) -> bool:
+        for stock_dir in self._routine_instance_stock_dirs(instance_id):
+            code, _, _name = stock_dir.name.partition("_")
+            try:
+                decision = self.production_recovery_gate_for_stock(
+                    code,
+                    caller_name=caller_name,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Routine operation Recovery Gate failed: "
+                    "command=%s caller=%s instance=%s stock=%s",
+                    command,
+                    caller_name,
+                    instance_id,
+                    code,
+                )
+                return False
+            if getattr(decision, "allowed", None) is True:
+                continue
+            api = getattr(self, "kiwoom_api", None)
+            login_session_reader = getattr(api, "login_session_id", None)
+            login_session_present = False
+            if callable(login_session_reader):
+                try:
+                    login_session_present = bool(
+                        str(login_session_reader() or "").strip()
+                    )
+                except Exception:
+                    login_session_present = False
+            account_selected = False
+            try:
+                account_selected = bool(str(self.selected_account_no() or "").strip())
+            except Exception:
+                account_selected = False
+            reason_code = str(getattr(decision, "reason_code", "") or "").strip()
+            evidence = tuple(getattr(decision, "evidence", ()) or ())
+            has_internal_error_evidence = any(
+                str(item).startswith(("registry_error=", "gate_exception="))
+                for item in evidence
+            )
+            if (
+                reason_code not in EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS
+                or has_internal_error_evidence
+            ):
+                LOGGER.warning(
+                    "Routine operation blocked by Production Recovery: "
+                    "command=%s caller=%s instance=%s stock=%s reason=%s "
+                    "evidence=%s login_session_present=%s account_selected=%s "
+                    "requested_at=%s",
+                    command,
+                    caller_name,
+                    instance_id,
+                    code,
+                    reason_code,
+                    evidence,
+                    login_session_present,
+                    account_selected,
+                    datetime.now().isoformat(timespec="seconds"),
+                )
+            return False
+        return True
+
     @staticmethod
     def _set_routine_operation_actions_enabled(actions, enabled: bool) -> None:
         unavailable_reason = "등록된 종목이 없어 실행할 수 없습니다."
@@ -2650,6 +3895,9 @@ class MainWindow(QMainWindow):
         if first_item is None:
             return
         row_kind = str(first_item.data(ROUTINE_ROW_KIND_ROLE) or "")
+        if row_kind == ROUTINE_ROW_STOCK:
+            show_main_monitoring_stock_context_menu(self, position)
+            return
         if row_kind == ROUTINE_ROW_PARENT:
             index = self.routine_table.model().index(item.row(), 0)
             if not self._routine_tree_interaction_controller._parent_name_rect(index).contains(
@@ -2790,7 +4038,21 @@ class MainWindow(QMainWindow):
         applied_count = 0
         partial_count = 0
         failed_count = 0
+        recovery_blocked_count = 0
+        command_failed_count = 0
         for instance_id in instance_ids:
+            if not self._production_recovery_allows_routine_operation(
+                instance_id,
+                command=command,
+                caller_name=(
+                    "EARLY_CLOSE_ROUTINE_DEFINITION"
+                    if command == MODE_EARLY_CLOSE
+                    else "IMMEDIATE_LIQUIDATION_ROUTINE_DEFINITION"
+                ),
+            ):
+                failed_count += 1
+                recovery_blocked_count += 1
+                continue
             result = service.apply(
                 OperationCommandRequest(
                     target_scope=SCOPE_ROUTINE_INSTANCE,
@@ -2801,8 +4063,8 @@ class MainWindow(QMainWindow):
             )
             if result.status == RESULT_FAILED or not result.stock_results:
                 failed_count += 1
+                command_failed_count += 1
                 continue
-            self._routine_operation_status_by_instance[instance_id] = display_status
             if result.status == RESULT_PARTIAL_SUCCESS:
                 partial_count += 1
             else:
@@ -2810,14 +4072,18 @@ class MainWindow(QMainWindow):
 
         self.load_routine_table()
         self.update_review_required_button_text()
-        if partial_count or failed_count:
+        if recovery_blocked_count:
+            self.show_routine_recovery_block_toast(
+                f"카테고리 {command_label}"
+            )
+        if partial_count or command_failed_count:
             QMessageBox.warning(
                 self,
                 f"카테고리 {command_label} 일부 적용"
                 if applied_count or partial_count
                 else f"카테고리 {command_label} 실패",
                 f"성공 {applied_count}개 / 일부 적용 {partial_count}개 / "
-                f"실패 {failed_count}개입니다. 검토관리 상태를 확인하세요.",
+                f"실패 {command_failed_count}개입니다.",
             )
         self.statusBar().showMessage(
             f"카테고리 {command_label}: {display_name} / 성공 {applied_count} / "
@@ -2844,6 +4110,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
             return
 
+        if not self._production_recovery_allows_routine_operation(
+            instance_id,
+            command=command,
+            caller_name=(
+                "EARLY_CLOSE_ROUTINE_INSTANCE"
+                if command == MODE_EARLY_CLOSE
+                else "IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE"
+            ),
+        ):
+            self.load_routine_table()
+            self.update_review_required_button_text()
+            self.show_routine_recovery_block_toast(
+                f"루틴 {command_label}"
+            )
+            return
+
         result = OperationCommandService(PROJECT_ROOT).apply(
             OperationCommandRequest(
                 target_scope=SCOPE_ROUTINE_INSTANCE,
@@ -2861,7 +4143,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._routine_operation_status_by_instance[instance_id] = display_status
         self.load_routine_table()
         self.update_review_required_button_text()
         if result.status == RESULT_PARTIAL_SUCCESS:
@@ -2887,7 +4168,6 @@ class MainWindow(QMainWindow):
             return False
         if routine_instance_by_id(instance_id) is None:
             return False
-        self._routine_operation_status_by_instance[instance_id] = completion_status
         self.load_routine_table()
         return True
 
@@ -2903,12 +4183,30 @@ class MainWindow(QMainWindow):
         if window is None:
             window = AutoTradeSettingWindow(self)
             self.auto_trade_setting_window = window
+            identity = self._production_recovery_identity
+            if identity is not None and self.startup_recovery_session_ready(refresh=False):
+                window.start_periodic_timers_after_recovery(identity)
         if window.isMinimized():
             window.showNormal()
         else:
             window.show()
         window.raise_()
         window.activateWindow()
+
+    def main_monitoring_auto_trade_operation_host(self) -> AutoTradeSettingWindow:
+        """Return the existing production execution host without showing it."""
+
+        window = getattr(self, "auto_trade_setting_window", None)
+        if window is not None and sip.isdeleted(window):
+            self.auto_trade_setting_window = None
+            window = None
+        if window is None:
+            window = AutoTradeSettingWindow(self)
+            self.auto_trade_setting_window = window
+            identity = getattr(self, "_production_recovery_identity", None)
+            if identity is not None and self.startup_recovery_session_ready(refresh=False):
+                window.start_periodic_timers_after_recovery(identity)
+        return window
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(

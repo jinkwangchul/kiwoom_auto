@@ -21,6 +21,7 @@ from operation_command_service import (
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
     IMMEDIATE_LIQUIDATION_REQUEST_KEY,
     IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
+    EarlyCloseCompatibility,
     IndividualLiquidationOverride,
     MANUAL_ATS_LIQUIDATION_REQUEST_KEY,
     MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED,
@@ -44,7 +45,10 @@ from operation_command_service import (
 )
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
+    auto_trade_setting_display_status_for_current_session,
     auto_trade_setting_early_close_requested,
+    auto_trade_setting_liquidation_text,
+    auto_trade_setting_method_text,
     effective_liquidation_policy_for_config,
 )
 
@@ -110,6 +114,38 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual("monitoring_window", state["operation_command_source"])
         self.assertEqual("EARLY_CLOSE", state["status"])
         self.assertTrue(state["liquidation_policy_forced"])
+
+    def test_early_close_preserves_operation_start_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "trade_enabled": True,
+                    "trade_started_at": "2026-07-19 09:00:00",
+                },
+            )
+            result = self._service(root).apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    MODE_EARLY_CLOSE,
+                    "monitoring_window",
+                ),
+                EarlyCloseCompatibility(
+                    method="시장가",
+                    has_close_progress_quantity=True,
+                ),
+            )
+            state = self._state(stock)
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertEqual(
+            "2026-07-19 09:00:00",
+            state["trade_started_at"],
+        )
 
     def test_duplicate_command_id_does_not_increment_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -724,6 +760,7 @@ class OperationCommandServiceTest(unittest.TestCase):
                 "005930_Samsung",
                 state={
                     "status": "RUNNING",
+                    "holding_qty": 5,
                     "operation_command_mode": MODE_CARRY_OVER,
                     "operation_sequence": 4,
                 },
@@ -758,7 +795,11 @@ class OperationCommandServiceTest(unittest.TestCase):
             stock = self._stock(
                 root,
                 "005930_Samsung",
-                state={"status": "RUNNING", "operation_command_mode": MODE_NORMAL},
+                state={
+                    "status": "RUNNING",
+                    "holding_qty": 5,
+                    "operation_command_mode": MODE_NORMAL,
+                },
             )
             service = self._service(root)
             request = OperationCommandRequest(
@@ -782,7 +823,15 @@ class OperationCommandServiceTest(unittest.TestCase):
     def test_immediate_liquidation_does_not_create_order_or_send_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            stock = self._stock(root, "005930_Samsung")
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "holding_qty": 5,
+                    "trade_enabled": True,
+                },
+            )
 
             result = self._service(root).apply(
                 OperationCommandRequest(
@@ -813,7 +862,11 @@ class OperationCommandServiceTest(unittest.TestCase):
             stock = self._stock(
                 root,
                 "005930_Samsung",
-                state={"status": "RUNNING", "operation_command_mode": MODE_EARLY_CLOSE},
+                state={
+                    "status": "RUNNING",
+                    "holding_qty": 5,
+                    "operation_command_mode": MODE_EARLY_CLOSE,
+                },
             )
 
             def writer(_path, _data):
@@ -840,7 +893,11 @@ class OperationCommandServiceTest(unittest.TestCase):
             stock = self._stock(
                 root,
                 "005930_Samsung",
-                state={"status": "RUNNING", "operation_command_mode": MODE_NORMAL},
+                state={
+                    "status": "RUNNING",
+                    "holding_qty": 5,
+                    "operation_command_mode": MODE_NORMAL,
+                },
             )
 
             def lying_writer(_path, _data):
@@ -861,6 +918,209 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertIn("read-back verification failed", result.stock_results[0].error)
         self.assertEqual(MODE_NORMAL, state["operation_command_mode"])
         self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, state)
+
+    def test_immediate_liquidation_applies_only_to_holding_stocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            holding = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "RUNNING",
+                    "holding_qty": 3,
+                    "operation_command_mode": MODE_NORMAL,
+                },
+            )
+            empty = self._stock(
+                root,
+                "000660_SKHynix",
+                state={
+                    "status": "WAIT_BUY",
+                    "holding_qty": 0,
+                    "operation_command_mode": MODE_NORMAL,
+                },
+            )
+
+            result = self._service(root).apply(
+                OperationCommandRequest(
+                    SCOPE_ROUTINE_INSTANCE,
+                    "instance-1",
+                    COMMAND_IMMEDIATE_LIQUIDATION,
+                    "main_routine_context_menu",
+                    command_id="holding-only",
+                )
+            )
+            holding_state = self._state(holding)
+            empty_state = self._state(empty)
+
+        self.assertEqual(RESULT_PARTIAL_SUCCESS, result.status)
+        self.assertEqual(
+            {STOCK_APPLIED, STOCK_FAILED},
+            {item.status for item in result.stock_results},
+        )
+        self.assertIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, holding_state)
+        self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, empty_state)
+        self.assertEqual(MODE_NORMAL, holding_state["operation_command_mode"])
+        self.assertEqual(MODE_NORMAL, empty_state["operation_command_mode"])
+
+    def test_immediate_liquidation_rejects_protected_runtime_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(
+                root,
+                "005930_Samsung",
+                state={
+                    "status": "REVIEW_REQUIRED",
+                    "holding_qty": 3,
+                    "operation_command_mode": MODE_NORMAL,
+                },
+            )
+
+            result = self._service(root).apply(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_IMMEDIATE_LIQUIDATION,
+                    "main_routine_context_menu",
+                    command_id="protected-runtime",
+                )
+            )
+            state = self._state(stock)
+
+        self.assertEqual(RESULT_FAILED, result.status)
+        self.assertEqual(STOCK_FAILED, result.stock_results[0].status)
+        self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, state)
+
+    def test_immediate_liquidation_monitoring_display_contract(self) -> None:
+        requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        state = {
+            "status": "RUNNING",
+            "holding_qty": 5,
+            "trade_enabled": True,
+            "operation_command_mode": MODE_NORMAL,
+            IMMEDIATE_LIQUIDATION_REQUEST_KEY: {
+                "status": IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
+                "requested_at": requested_at,
+            },
+        }
+        config = {"operation_mode": "CONTINUOUS"}
+
+        with patch(
+            "gui_auto_trade_policy.auto_trade_setting_liquidation_phase_active",
+            return_value=False,
+        ):
+            display_status = auto_trade_setting_display_status_for_current_session(
+                state,
+                config,
+                holding_qty=5,
+                current_session_trade_started=True,
+                persisted_trade_started=True,
+            )
+            method = auto_trade_setting_method_text(display_status, config, state)
+            liquidation = auto_trade_setting_liquidation_text(
+                config,
+                display_status,
+                state,
+                holding_qty=5,
+            )
+
+        self.assertEqual("즉시청산", display_status)
+        self.assertEqual("시장가", method)
+        self.assertEqual("시장가", liquidation)
+
+        zero_state = dict(state, holding_qty=0)
+        with patch(
+            "gui_auto_trade_policy.auto_trade_setting_liquidation_phase_active",
+            return_value=False,
+        ):
+            zero_status = auto_trade_setting_display_status_for_current_session(
+                zero_state,
+                config,
+                holding_qty=0,
+                current_session_trade_started=True,
+                persisted_trade_started=True,
+            )
+        self.assertNotEqual("즉시청산", zero_status)
+        self.assertEqual("루틴", auto_trade_setting_method_text(zero_status, config, zero_state))
+
+    def test_immediate_liquidation_preserves_close_display_and_forces_market_in_liquidation(self) -> None:
+        requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        base_state = {
+            "status": "RUNNING",
+            "holding_qty": 5,
+            "trade_enabled": True,
+            IMMEDIATE_LIQUIDATION_REQUEST_KEY: {
+                "status": IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
+                "requested_at": requested_at,
+            },
+        }
+        close_state = {
+            **base_state,
+            "auto_close_method": "이월",
+            "auto_close_policy": {"method": "이월"},
+        }
+        config = {"operation_mode": "SCHEDULED"}
+
+        self.assertEqual(
+            "이월",
+            auto_trade_setting_method_text("자동마감", config, close_state),
+        )
+        self.assertEqual(
+            "이월",
+            auto_trade_setting_liquidation_text(
+                config,
+                "자동마감",
+                close_state,
+                holding_qty=5,
+            ),
+        )
+
+        liquidation_state = {
+            **base_state,
+            "early_close_requested_at": requested_at,
+            "early_close_method": "현재가",
+            "early_close_policy": {"method": "현재가"},
+            "liquidation_policy_forced": True,
+            "liquidation_policy_reason": "EARLY_CLOSE",
+        }
+        with (
+            patch(
+                "gui_auto_trade_policy.auto_trade_setting_liquidation_phase_active",
+                return_value=True,
+            ),
+            patch(
+                "gui_auto_trade_policy.read_operation_policy",
+                return_value={
+                    "liquidation": {
+                        "method": "현재가",
+                        "minutes_before_regular_close": "10",
+                    }
+                },
+            ),
+        ):
+            display_status = auto_trade_setting_display_status_for_current_session(
+                liquidation_state,
+                config,
+                holding_qty=5,
+                current_session_trade_started=True,
+                persisted_trade_started=True,
+            )
+            method = auto_trade_setting_method_text(
+                display_status,
+                config,
+                liquidation_state,
+            )
+            liquidation = auto_trade_setting_liquidation_text(
+                config,
+                display_status,
+                liquidation_state,
+                holding_qty=5,
+            )
+
+        self.assertEqual("감시/대기", display_status)
+        self.assertNotEqual("조기마감", display_status)
+        self.assertEqual("시장가", method)
+        self.assertEqual("10분/시장가", liquidation)
 
 
 class EarlyCloseProductionCallerTest(unittest.TestCase):
@@ -987,6 +1247,14 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                 patch("gui_auto_trade_close.OperationCommandService", return_value=service),
                 patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
                 patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch(
+                    "gui_auto_trade_close.evaluate_production_transition",
+                    return_value=Mock(allowed=True),
+                ),
+                patch(
+                    "gui_auto_trade_close._start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "send_order"},
+                ),
                 patch("gui_auto_trade_close.append_changelog") as append_changelog,
                 patch("gui_auto_trade_close.append_stock_log") as append_stock_log,
             ):
@@ -1008,6 +1276,65 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         append_changelog.assert_called_once()
         window.refresh_all.assert_called_once()
         window.statusBarMessage.assert_called_with("조기마감 적용: 1개 / 제외 1개")
+
+    def test_all_view_does_not_require_selected_routine_name(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            window = self._window(selected)
+            window.current_selected_routine_name.return_value = ""
+            self._MessageBox.proceed = True
+            service = Mock()
+            service.apply_early_close.return_value = OperationCommandResult(
+                RESULT_SUCCESS,
+                "command-a",
+                (
+                    StockOperationCommandResult(
+                        "005930",
+                        str(selected[0][0]),
+                        STOCK_APPLIED,
+                        1,
+                    ),
+                ),
+            )
+            with (
+                patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                patch(
+                    "gui_auto_trade_close.OperationCommandService",
+                    return_value=service,
+                ),
+                patch(
+                    "gui_auto_trade_close.pending_order_side_quantities",
+                    return_value=(0, 0),
+                ),
+                patch(
+                    "gui_auto_trade_close.auto_trade_setting_liquidation_phase_active",
+                    return_value=False,
+                ),
+                patch(
+                    "gui_auto_trade_close.evaluate_production_transition",
+                    return_value=Mock(allowed=True),
+                ),
+                patch(
+                    "gui_auto_trade_close._start_close_liquidation_execution",
+                    return_value={
+                        "ok": True,
+                        "stage": "send_order",
+                        "runtime_status": "EARLY_CLOSING",
+                    },
+                ),
+                patch(
+                    "gui_auto_trade_close._persist_early_close_execution_result",
+                    return_value=True,
+                ),
+                patch("gui_auto_trade_close.append_changelog"),
+                patch("gui_auto_trade_close.append_stock_log"),
+            ):
+                auto_trade_apply_selected_early_close(window, "시장가")
+
+        service.apply_early_close.assert_called_once()
+        window.statusBarMessage.assert_called_with("조기마감 적용: 1개")
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
@@ -1295,7 +1622,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         test_font = window.stock_table.font()
         samples = [
             ("보유", "0주 / 0", "120주 / 3,450,000"),
-            ("가격", "- / -", "28,750 / 29,100"),
+            ("가격", "0 / 0", "28,750 / 29,100"),
             ("손익", "0 / 0.00%", "+42,000 / +1.22%"),
             ("미체결", "0 / 0", "10 / 0"),
         ]
@@ -2101,7 +2428,19 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             ]
             window.capture_stock_table_view_state.return_value = ([str(stock)], 0)
 
-            with patch.object(close, "PROJECT_ROOT", root):
+            with (
+                patch.object(close, "PROJECT_ROOT", root),
+                patch.object(
+                    close,
+                    "evaluate_production_transition",
+                    return_value=Mock(allowed=True),
+                ),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "send_order"},
+                ),
+            ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
                     "현재가",
