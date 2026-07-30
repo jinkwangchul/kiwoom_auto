@@ -160,6 +160,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_setup_routine_tree_display_level_badges",
             "_position_routine_tree_display_level_badges",
             "_update_routine_tree_display_level_badges",
+            "_routine_tree_scope_filter_available",
             "_set_routine_tree_valid_only",
             "_set_routine_tree_display_scope",
             "_refresh_routine_tree_display_state",
@@ -985,6 +986,51 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(set(), window._collapsed_auto_trade_instance_ids)
         self.assertFalse(window.routine_table.isRowHidden(1))
         self.assertFalse(window.routine_table.isRowHidden(2))
+
+    def test_scope_badges_follow_visible_stock_rows_in_routine_level(self) -> None:
+        instances = [self._instance("inst-a", "A 인스턴스")]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+        ]
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
+        }
+
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks), \
+                patch.object(setting_window, "read_orders_data", return_value=[]):
+            window.load_routine_table()
+            window.show()
+            self._app.processEvents()
+
+            scope_buttons = window._routine_tree_display_scope_buttons
+            level_buttons = window._routine_tree_display_level_buttons
+
+            level_buttons["routine"].click()
+            self._app.processEvents()
+            self.assertTrue(window.routine_table.isRowHidden(2))
+            self.assertTrue(all(not button.isEnabled() for button in scope_buttons.values()))
+
+            window._toggle_routine_instance_collapsed("inst-a")
+            self._app.processEvents()
+            self.assertFalse(window.routine_table.isRowHidden(2))
+            self.assertTrue(all(button.isEnabled() for button in scope_buttons.values()))
+
+            window._toggle_routine_instance_collapsed("inst-a")
+            self._app.processEvents()
+            self.assertTrue(window.routine_table.isRowHidden(2))
+            self.assertTrue(all(not button.isEnabled() for button in scope_buttons.values()))
 
     def test_level_badges_apply_once_and_arrows_remain_authoritative(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
@@ -2878,6 +2924,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             dirs,
         )
 
+    def test_performance_tree_keeps_review_required_current_stock_records(self) -> None:
+        window = self._window_harness()
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+        ]
+
+        with patch.object(setting_window, "read_base_stocks", return_value=stocks), \
+                patch.object(setting_window, "is_review_required_stock_dir", return_value=True):
+            result = window._current_stocks_by_instance()
+
+        self.assertEqual(["005930"], [stock["stock_code"] for stock in result["inst-a"]])
+
     def test_runtime_state_for_order_uses_selected_assignment_scope(self) -> None:
         window = self._window_harness()
         window.current_selected_target_instance_ids = lambda: ("inst-a",)
@@ -4335,6 +4398,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "실행"},
             {"stock_path": "stocks/222222_STOP", "assigned_routine_instance_id": "inst-a", "code": "222222", "name": "정지"},
             {"stock_path": "stocks/333333_ERR", "assigned_routine_instance_id": "inst-a", "code": "333333", "name": "검토"},
+            {"stock_path": "stocks/444444_REVIEW", "assigned_routine_instance_id": "inst-a", "code": "444444", "name": "격리"},
         ]
 
         def fake_read_json(path: Path):
@@ -4345,13 +4409,19 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return {"status": "RUNNING", "trade_enabled": True}
             if "333333_ERR" in text:
                 return {"status": "ERROR", "trade_enabled": False}
+            if "444444_REVIEW" in text:
+                return {"status": "REVIEW_REQUIRED", "review_required": True, "trade_enabled": False}
             return {"status": "STOPPED", "trade_enabled": False}
 
         with patch.object(table_loader, "read_base_stocks", return_value=stocks), \
                 patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(3, window.stock_table.rowCount())
+            self.assertEqual(2, window.stock_table.rowCount())
+            self.assertNotIn(
+                "444444",
+                [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())],
+            )
 
             window._stock_status_filter = "running"
             table_loader.auto_trade_load_selected_routine_stocks(window)
@@ -4360,13 +4430,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window._stock_status_filter = "stopped"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(
-                ["222222", "333333"],
+                ["222222"],
                 [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())],
             )
 
             window._stock_status_filter = "error"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(["333333"], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
+            self.assertEqual([], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
 
     def test_maximized_workspace_reserves_stock_table_required_width(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \

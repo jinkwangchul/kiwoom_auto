@@ -209,6 +209,9 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             state = read_json_dict(stock_dir / "state.json")
 
             # 검토종목은 자동매매설정 창에서 완전 제외한다.
+            if is_review_required_state(state):
+                continue
+
             config = read_json_dict(stock_dir / "config.json")
             if not config:
                 config = default_config()
@@ -526,12 +529,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             for col, value in enumerate(values):
                 if col == 1:
                     item = SortableTableWidgetItem(value)
-                    if is_review_required_state(state) or display_status in {
-                        "긴급정지",
-                        "검토종목",
-                    }:
-                        item.setToolTip("검토관리에서 먼저 처리해야 합니다.")
-                    elif trade_started:
+                    if trade_started:
                         item.setToolTip("현재 운영 중입니다.")
                     else:
                         item.setToolTip("더블클릭하면 이 종목의 운영을 시작합니다.")
