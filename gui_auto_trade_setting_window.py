@@ -702,11 +702,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
         repo = StockRepository(PROJECT_ROOT)
         stock_dir = repo.resolve_stock_dir(code, name)
-        previous_config = (
-            read_json_dict(stock_dir / "config.json")
-            if isinstance(stock_dir, Path) and stock_dir.exists()
-            else {}
-        )
 
         if not update_base_stock_routine_instance(
             code,
@@ -720,15 +715,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
         try:
             stock_dir = repo.ensure_stock_folder(code, name, routine=routine_type)
-            from gui_routine_assign_window import (
-                apply_default_operation_exclusion_for_new_running_assignment,
-            )
-
-            apply_default_operation_exclusion_for_new_running_assignment(
-                self,
-                stock_dir,
-                previous_config,
-            )
             ensure_single_real_trade_routine_for_stock(code, name, routine_type)
         except Exception:
             LOGGER.exception("Failed to prepare stock assignment files")
@@ -1065,7 +1051,6 @@ from gui_auto_trade_display import (
     draw_stock_position_metric,
     yes_no_display,
     display_status_text_for_gui,
-    profit_loss_value_color,
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
@@ -1168,7 +1153,6 @@ from gui_auto_trade_status_ops import (
     auto_trade_set_selected_stocks_buy_end,
     auto_trade_update_stock_operation_mode,
     auto_trade_update_stock_status,
-    handle_auto_trade_operation_mode_double_click,
 )
 from gui_auto_trade_run_control import (
     auto_trade_start_selected_auto_trades,
@@ -2691,9 +2675,9 @@ class AutoTradeSettingWindow(QDialog):
             "groups": 0,
             "routines": 0,
             "registered": 0,
-            "running": 0,
-            "stopped": 0,
-            "error": 0,
+            "normal": 0,
+            "excluded": 0,
+            "review": 0,
         }
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
@@ -2704,8 +2688,19 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             summary["groups"] += 1
             summary["routines"] += int(metadata.get("instance_count", 0) or 0)
-            for key in ("registered", "running", "stopped", "error"):
-                summary[key] += int(metadata.get(key, 0) or 0)
+            summary["registered"] += int(metadata.get("registered", 0) or 0)
+            summary["normal"] += int(
+                metadata.get(
+                    "normal",
+                    int(metadata.get("running", 0) or 0)
+                    + int(metadata.get("stopped", 0) or 0),
+                )
+                or 0
+            )
+            summary["excluded"] += int(metadata.get("excluded", 0) or 0)
+            summary["review"] += int(
+                metadata.get("review", metadata.get("error", 0)) or 0
+            )
         return summary
 
     def all_registered_instance_ids(self) -> tuple[str, ...]:
@@ -2973,7 +2968,6 @@ class AutoTradeSettingWindow(QDialog):
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_routine_table_by_column)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.horizontalHeader().sectionClicked.connect(self.sort_stock_table_by_column)
-        self.stock_table.itemDoubleClicked.connect(self.on_stock_table_item_double_clicked)
         self.stock_table.itemDoubleClicked.connect(
             self.on_stock_table_name_item_double_clicked
         )
@@ -3643,21 +3637,6 @@ class AutoTradeSettingWindow(QDialog):
             return None
         return stock_dir
 
-    def on_stock_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
-        """운영 칸 더블클릭 시 시간/수동을 빠르게 전환한다."""
-        if item.column() != 2:
-            return
-
-        stock_dir = self.operation_stock_dir_from_row(item.row())
-        if stock_dir is None:
-            return
-
-        self.stock_table.selectRow(item.row())
-        target = self.stock_info_from_row(item.row())
-        if target is None:
-            return
-        handle_auto_trade_operation_mode_double_click(self, target)
-
     def ensure_context_row_selected(self, row: int) -> None:
         ensure_context_row_selected(self, row)
 
@@ -4163,10 +4142,10 @@ class AutoTradeSettingWindow(QDialog):
             "performance_period_value": period_text,
             "performance_profit_amount": profit_amount_text,
             "performance_profit_rate": profit_rate_text,
-            "performance_profit_color": profit_loss_value_color(profit_value),
+            "performance_profit_color": directional_value_color(profit_value),
             "performance_average_amount": average_amount_text,
             "performance_average_rate": average_rate_text,
-            "performance_average_color": profit_loss_value_color(
+            "performance_average_color": directional_value_color(
                 average_value if average_values else None
             ),
             "performance_efficiency_value": efficiency_text,
@@ -6352,7 +6331,6 @@ class AutoTradeSettingWindow(QDialog):
             settings_action = menu.addAction("루틴수정")
             delete_action = menu.addAction("루틴삭제")
             rename_action = menu.addAction("이름변경")
-            stock_register_action = menu.addAction("종목등록")
             settings_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.open_routine_instance_settings(target)
             )
@@ -6361,9 +6339,6 @@ class AutoTradeSettingWindow(QDialog):
             )
             rename_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.rename_routine_instance(target)
-            )
-            stock_register_action.triggered.connect(
-                lambda _checked=False, target=dict(metadata): self.open_instance_stock_search_register_window(target)
             )
         elif row_kind == "stock" and bool(metadata.get("is_historical", False)):
             menu = QMenu(self.routine_table)
@@ -6607,18 +6582,6 @@ class AutoTradeSettingWindow(QDialog):
             )
             return
         self.refresh_all()
-
-    def open_instance_stock_search_register_window(
-        self,
-        metadata: dict[str, object],
-    ) -> None:
-        if str(metadata.get("row_kind", "") or "") != "instance":
-            return
-        self.instance_stock_search_register_window = InstanceStockSearchRegisterDialog(
-            self,
-            instance_metadata=dict(metadata),
-        )
-        self.instance_stock_search_register_window.show()
 
     def hide_historical_stock_display(self, metadata: dict[str, object]) -> None:
         if (
@@ -10794,37 +10757,6 @@ class AutoTradeSettingWindow(QDialog):
             if callable(status_message):
                 status_message("정상 운영시작 되었습니다.")
         self.update_global_operation_button_state()
-
-    def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
-        selected_targets = self.selected_stock_infos()
-        if not selected_targets:
-            return {
-                "changed": (),
-                "skipped": (),
-                "changed_count": 0,
-                "skipped_count": 0,
-            }
-        from gui_main_emergency_ops import execute_selected_emergency_stop
-
-        return execute_selected_emergency_stop(self, selected_targets)
-
-    def release_selected_emergency_stopped_auto_trade_stocks(self) -> dict[str, object]:
-        selected_targets = self.selected_stock_infos()
-        if not selected_targets:
-            return {
-                "normal": (),
-                "review": (),
-                "skipped": (),
-                "failed": (),
-                "normal_count": 0,
-                "review_count": 0,
-                "skipped_count": 0,
-                "failed_count": 0,
-            }
-        from gui_main_emergency_ops import execute_selected_emergency_release
-
-        return execute_selected_emergency_release(self, selected_targets)
-
 
     def apply_selected_early_close_default(self, checked: bool = False) -> None:
         # QPushButton.clicked may pass a checked(bool) argument.

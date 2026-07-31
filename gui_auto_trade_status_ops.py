@@ -690,25 +690,6 @@ def auto_trade_set_selected_schedule_operation_mode(window) -> None:
 
 
 
-def handle_auto_trade_operation_mode_double_click(
-    window,
-    target: tuple[Path, str, str],
-) -> None:
-    """Toggle the selected stock's operation mode from the operation-mode cell."""
-    stock_dir, _code, _name = target
-    config = read_json_dict(Path(stock_dir) / "config.json")
-    if not isinstance(config, dict) or not config:
-        QMessageBox.warning(
-            window,
-            "운영방식 변경",
-            "선택한 종목의 운영방식 설정을 읽을 수 없습니다.",
-        )
-        return
-    current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    next_mode = "SCHEDULED" if current_mode == "CONTINUOUS" else "CONTINUOUS"
-    auto_trade_set_selected_operation_mode(window, next_mode)
-
-
 def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_updates: dict[str, object] | None = None) -> None:
     selected = window.selected_stock_infos()
 

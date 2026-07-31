@@ -54,18 +54,6 @@ ROUTINE_PROFIT_SIGNAL_COLORS = {
 }
 
 
-def profit_loss_value_color(value: object) -> str:
-    try:
-        numeric_value = float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return DIRECTIONAL_NEUTRAL_COLOR
-    if numeric_value > 0:
-        return DIRECTIONAL_NEGATIVE_COLOR
-    if numeric_value < 0:
-        return DIRECTIONAL_POSITIVE_COLOR
-    return DIRECTIONAL_NEUTRAL_COLOR
-
-
 def _format_plain_number(value: object) -> str:
     try:
         number = float(str(value).replace(",", "").strip())

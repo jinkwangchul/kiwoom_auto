@@ -327,7 +327,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "finish_routine_instance_name_edit",
             "delete_routine_instance",
             "open_stock_register_window",
-            "open_instance_stock_search_register_window",
             "convert_historical_stock_to_registered",
             "hide_historical_stock_display",
             "on_routine_selection_changed",
@@ -369,7 +368,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         for row_kind, expected_labels in (
             ("definition", ["루틴등록"]),
-            ("instance", ["루틴수정", "루틴삭제", "이름변경", "종목등록"]),
+            ("instance", ["루틴수정", "루틴삭제", "이름변경"]),
         ):
             item.setData(Qt.UserRole, metadata_by_kind[row_kind])
             menu = MagicMock()
@@ -443,17 +442,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 2,
                 True,
             ),
-            (
-                {
-                    "row_kind": "instance",
-                    "definition_id": "indicator_follow",
-                    "instance_id": "inst-a",
-                    "instance_name": "A 인스턴스",
-                },
-                "open_instance_stock_search_register_window",
-                3,
-                True,
-            ),
         )
         for case in cases:
             if len(case) == 3:
@@ -463,7 +451,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 metadata, method_name, action_index, expects_metadata = case
             item.setData(Qt.UserRole, metadata)
             menu = MagicMock()
-            action_count = 1 if metadata["row_kind"] == "definition" else 4
+            action_count = 1 if metadata["row_kind"] == "definition" else 3
             actions = [MagicMock() for _index in range(action_count)]
             callbacks = []
             for action in actions:
@@ -480,37 +468,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 target_method.assert_called_once_with(metadata)
             else:
                 target_method.assert_called_once_with()
-
-    def test_instance_stock_register_context_uses_search_dialog_not_legacy_window(self) -> None:
-        window = self._window_harness()
-        metadata = {
-            "row_kind": "instance",
-            "definition_id": "indicator_follow",
-            "instance_id": "inst-a",
-            "instance_name": "A 인스턴스",
-        }
-        item = QTableWidgetItem()
-        item.setData(Qt.UserRole, metadata)
-        window.routine_table.setRowCount(1)
-        window.routine_table.setItem(0, 0, item)
-        menu = MagicMock()
-        actions = [MagicMock() for _index in range(4)]
-        callbacks = []
-        for action in actions:
-            action.triggered.connect.side_effect = callbacks.append
-        menu.addAction.side_effect = actions
-
-        with (
-            patch.object(window.routine_table, "itemAt", return_value=item),
-            patch.object(setting_window, "QMenu", return_value=menu),
-            patch.object(window, "open_stock_register_window") as legacy_open,
-            patch.object(window, "open_instance_stock_search_register_window") as search_open,
-        ):
-            window.on_routine_table_context_menu(QPoint(1, 1))
-            callbacks[3](False)
-
-        legacy_open.assert_not_called()
-        search_open.assert_called_once_with(metadata)
 
     def test_instance_stock_search_dialog_filters_library_and_keeps_instance_metadata(self) -> None:
         metadata = {
@@ -797,7 +754,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast"),
         ):
             self.assertTrue(dialog.register_or_assign_result_row(1))
@@ -1132,7 +1088,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_selected_result_rows())
@@ -1180,7 +1135,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_selected_result_rows())
@@ -1241,7 +1195,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment") as apply_exclusion,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -1261,7 +1214,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             routine="지표추종매매",
         )
         ensure_routine.assert_called_once_with("005930", "삼성전자", "지표추종매매")
-        apply_exclusion.assert_called_once()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(dialog, "종목 등록 및 지정이 완료됐습니다.")
 
@@ -1285,7 +1237,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -1337,7 +1288,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -3153,10 +3103,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "performance_period_value": "125",
                     "performance_profit_amount": "+123,456",
                     "performance_profit_rate": "+12.30%",
-                    "performance_profit_color": "#DC2626",
+                    "performance_profit_color": "#2563EB",
                     "performance_average_amount": "+62,500",
                     "performance_average_rate": "+1.63%",
-                    "performance_average_color": "#DC2626",
+                    "performance_average_color": "#2563EB",
                     "performance_efficiency_value": "123.4",
                 },
             ),
@@ -3175,10 +3125,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "performance_period_value": "1",
                     "performance_profit_amount": "-2,500",
                     "performance_profit_rate": "-4.20%",
-                    "performance_profit_color": "#2563EB",
+                    "performance_profit_color": "#DC2626",
                     "performance_average_amount": "-24,000",
                     "performance_average_rate": "-0.70%",
-                    "performance_average_color": "#2563EB",
+                    "performance_average_color": "#DC2626",
                     "performance_efficiency_value": "0.0",
                 },
             ),
@@ -5127,9 +5077,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "definition_name": "지표추종매매",
                 "instance_count": 2,
                 "registered": 7,
-                "running": 3,
-                "stopped": 4,
-                "error": 1,
+                "normal": 4,
+                "excluded": 2,
+                "review": 1,
             },
             {
                 "row_kind": "definition",
@@ -5137,9 +5087,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "definition_name": "등록확인루틴",
                 "instance_count": 1,
                 "registered": 5,
-                "running": 2,
-                "stopped": 3,
-                "error": 1,
+                "normal": 1,
+                "excluded": 3,
+                "review": 1,
             },
         )
         for row, metadata in enumerate(rows):
@@ -5159,8 +5109,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("그룹(2)", window.selected_routine_group_count_badge.text())
         self.assertEqual("루틴(3)", window.selected_routine_instance_count_badge.text())
         self.assertEqual("종목(12)", window.selected_routine_status_buttons["all"].text())
-        self.assertEqual("실행(5)", window.selected_routine_status_buttons["running"].text())
-        self.assertEqual("정지(7)", window.selected_routine_status_buttons["stopped"].text())
+        self.assertEqual("정지(5)", window.selected_routine_status_buttons["running"].text())
+        self.assertEqual("제외(5)", window.selected_routine_status_buttons["excluded"].text())
         self.assertEqual("검토(2)", window.selected_routine_status_buttons["error"].text())
         self.assertEqual(
             setting_window.auto_trade_setting_badge_stylesheet(
@@ -7276,7 +7226,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
-            patch("gui_routine_assign_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(

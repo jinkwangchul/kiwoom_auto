@@ -16,7 +16,6 @@ from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
 from gui_operation_environment import OPERATION_POLICY_PATH
-from runtime_io import read_json_dict
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -43,9 +42,6 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
     "20",
     "30",
 )
-
-_EMERGENCY_STATUSES = {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
-
 
 @dataclass(frozen=True)
 class StockContextMenuCallbacks:
@@ -131,52 +127,6 @@ def _new_stock_context_menu(parent) -> QMenu:
     if callable(set_tooltips_visible):
         set_tooltips_visible(True)
     return menu
-
-
-def _selected_emergency_state(selected: list[tuple[object, str, str]]) -> tuple[bool, bool]:
-    has_emergency = False
-    has_non_emergency = False
-    for stock_dir, _code, _name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        status = str(state.get("status", "") or "").strip().upper()
-        if status in _EMERGENCY_STATUSES:
-            has_emergency = True
-        else:
-            has_non_emergency = True
-    return has_emergency, has_non_emergency
-
-
-
-def _stock_register_context_instance_metadata(window) -> dict[str, object] | None:
-    if bool(getattr(window, "_all_stocks_scope_active", False)):
-        return None
-    metadata_getter = getattr(window, "current_selected_routine_row_metadata", None)
-    if not callable(metadata_getter):
-        return None
-    metadata = metadata_getter()
-    if not isinstance(metadata, dict):
-        return None
-    row_kind = str(metadata.get("row_kind", "") or "")
-    if row_kind not in {"instance", "stock"}:
-        return None
-
-    instance_id = str(metadata.get("instance_id", "") or "").strip()
-    if not instance_id:
-        return None
-    target = {
-        "row_kind": "instance",
-        "definition_id": str(metadata.get("definition_id", "") or "").strip(),
-        "definition_name": str(metadata.get("definition_name", "") or "").strip(),
-        "instance_id": instance_id,
-        "instance_name": str(metadata.get("instance_name", "") or "").strip(),
-    }
-    return target
-
-
-
-def _stock_register_context_action_visible(window) -> bool:
-    return _stock_register_context_instance_metadata(window) is not None
-
 
 
 def _add_early_close_menu(
@@ -391,7 +341,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     selected = window.selected_stock_infos()
     has_selection = bool(selected)
     selected_modes = window.selected_operation_mode_set(selected)
-    has_emergency, has_non_emergency = _selected_emergency_state(selected)
     status_filter = str(getattr(window, "_stock_status_filter", "") or "").strip().lower()
     excluded_view = status_filter == "excluded"
     running_view = status_filter in {"running", "stopped"}
@@ -401,17 +350,9 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
 
     action_start = menu.addAction("운영시작")
     action_start.setEnabled(has_selection)
-    action_emergency_stop = None
-    if has_non_emergency:
-        action_emergency_stop = menu.addAction("긴급정지")
-        action_emergency_stop.setEnabled(has_selection)
-    action_emergency_release = None
-    if has_emergency:
-        action_emergency_release = menu.addAction("정지해제")
-        action_emergency_release.setEnabled(has_selection)
     menu.addSeparator()
-    action_select_all = menu.addAction("전체선택")
-    action_clear_selection = menu.addAction("전체해제")
+    action_select_all = menu.addAction("전체 선택")
+    action_clear_selection = menu.addAction("전체 해제")
     action_set_exclusion = None
     action_unregister = None
     action_clear_exclusion = None
@@ -422,12 +363,8 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         if running_view:
             action_set_exclusion = menu.addAction("제외지정")
             action_set_exclusion.setEnabled(has_selection)
-        action_unregister = menu.addAction("등록해제")
+        action_unregister = menu.addAction("등록 해제")
         action_unregister.setEnabled(has_selection)
-    action_stock_register = None
-    stock_register_target = _stock_register_context_instance_metadata(window)
-    if not excluded_view and stock_register_target is not None:
-        action_stock_register = menu.addAction("종목등록")
 
     menu.addSeparator()
     early_close = _add_early_close_menu(
@@ -446,13 +383,18 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     action_time_reset = None
     action_ats_settings = None
 
-    if selected_modes == {"SCHEDULED"}:
-        menu.addSeparator()
-        action_time_change = menu.addAction("시간변경")
-        action_time_reset = menu.addAction("변경리셋")
+    menu.addSeparator()
+    if not has_selection:
+        action_header = menu.addAction("운영방식별 설정: 종목 선택 필요")
+        action_header.setEnabled(False)
+    elif selected_modes == {"SCHEDULED"}:
+        action_time_change = menu.addAction("시간 변경")
+        action_time_reset = menu.addAction("변경 리셋")
     elif selected_modes == {"CONTINUOUS"}:
-        menu.addSeparator()
         action_ats_settings = menu.addAction("ATS설정")
+    else:
+        action_header = menu.addAction("혼합 선택: 공통 메뉴만 사용")
+        action_header.setEnabled(False)
 
     chosen = menu.exec_(window.stock_table.viewport().mapToGlobal(pos))
     if chosen is None:
@@ -468,10 +410,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
 
     if chosen == action_start:
         window.start_selected_rows_auto_trades()
-    elif action_emergency_stop is not None and chosen == action_emergency_stop:
-        window.emergency_stop_selected_auto_trade_stocks()
-    elif action_emergency_release is not None and chosen == action_emergency_release:
-        window.release_selected_emergency_stopped_auto_trade_stocks()
     elif chosen == action_select_all:
         window.select_all_current_routine_stocks()
     elif chosen == action_clear_selection:
@@ -482,8 +420,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         window.unregister_selected_auto_trade_stocks()
     elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
         window.clear_selected_stock_operation_exclusions()
-    elif action_stock_register is not None and chosen == action_stock_register:
-        window.open_instance_stock_search_register_window(stock_register_target)
     elif chosen == individual["market"]:
         window.apply_selected_individual_liquidation_method(
             "시장가",
