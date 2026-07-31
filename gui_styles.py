@@ -10,8 +10,12 @@ GUI 공통 스타일 헬퍼.
 from __future__ import annotations
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont, QPainter
+from PyQt5.QtGui import QColor, QFont, QPainter, QPalette
 from PyQt5.QtWidgets import QLabel, QHeaderView, QTableWidget
+
+
+PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY = "plain_header_use_table_body_background"
+PLAIN_HEADER_GRID_COLOR_PROPERTY = "plain_header_grid_color"
 
 
 class PlainHorizontalHeader(QHeaderView):
@@ -34,14 +38,39 @@ class PlainHorizontalHeader(QHeaderView):
         font.setWeight(QFont.Normal)
         self.setFont(font)
 
+    def _section_background(self):
+        if self.property(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY) is True:
+            table = self.parent()
+            if table is not None and hasattr(table, "viewport"):
+                viewport = table.viewport()
+                if viewport is not None:
+                    return viewport.palette().color(QPalette.Base)
+            if table is not None and hasattr(table, "palette"):
+                return table.palette().color(QPalette.Base)
+            return self.palette().color(QPalette.Base)
+        return self.palette().button()
+
+    def _section_grid_color(self):
+        value = self.property(PLAIN_HEADER_GRID_COLOR_PROPERTY)
+        if value:
+            color = QColor(str(value))
+            if color.isValid():
+                return color
+        return self.palette().mid().color()
+
     def paintSection(self, painter: QPainter, rect, logicalIndex: int) -> None:  # type: ignore[override]
         if not rect.isValid():
             return
 
         painter.save()
-        painter.fillRect(rect, self.palette().button())
-        painter.setPen(self.palette().mid().color())
-        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.fillRect(rect, self._section_background())
+        painter.setPen(self._section_grid_color())
+        if self.property(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY) is True:
+            painter.drawLine(rect.topLeft(), rect.topRight())
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+        else:
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
         font = QFont(self.font())
         font.setBold(False)

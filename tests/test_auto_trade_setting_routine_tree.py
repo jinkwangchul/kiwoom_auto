@@ -270,6 +270,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         for name in (
             "_setup_routine_table",
             "_setup_stock_table",
+            "_sync_stock_table_header_background_to_body",
             "_apply_stock_table_column_widths",
             "_routine_instance_stock_counts",
             "_current_stock_entries_by_instance",
@@ -335,6 +336,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_setup_selected_routine_status_bar",
             "set_stock_status_filter",
             "update_selected_routine_status_bar",
+            "_stock_operation_status_label",
             "load_selected_routine_stocks",
         ):
             setattr(harness, name, MethodType(getattr(AutoTradeSettingWindow, name), harness))
@@ -4012,7 +4014,33 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("selection-background-color: #dbeafe", style)
         self.assertIn("selection-color: #111827", style)
         self.assertIn("QTableWidget::item:selected:!active", style)
+        self.assertIn("gridline-color: #D1D5DB", style)
         self.assertIn("outline: 0", style)
+        self.assertIn("QHeaderView::section:vertical", style)
+        self.assertIn("QTableCornerButton::section", style)
+        self.assertTrue(window.stock_table.showGrid())
+        self.assertEqual(setting_window.Qt.SolidLine, window.stock_table.gridStyle())
+        self.assertTrue(
+            window.stock_table.horizontalHeader().property(
+                setting_window.PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY
+            )
+        )
+        self.assertEqual(
+            "#D1D5DB",
+            window.stock_table.horizontalHeader().property(
+                setting_window.PLAIN_HEADER_GRID_COLOR_PROPERTY
+            ),
+        )
+        body_color = window.stock_table.viewport().palette().color(setting_window.QPalette.Base)
+        vertical_header = window.stock_table.verticalHeader()
+        self.assertEqual(setting_window.Qt.AlignCenter, vertical_header.defaultAlignment())
+        for role in (
+            setting_window.QPalette.Button,
+            setting_window.QPalette.Window,
+            setting_window.QPalette.Base,
+        ):
+            self.assertEqual(body_color, vertical_header.palette().color(role))
+            self.assertEqual(body_color, vertical_header.viewport().palette().color(role))
         self.assertEqual(
             setting_window.QAbstractItemView.ExtendedSelection,
             window.stock_table.selectionMode(),
@@ -4573,6 +4601,128 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             dirs,
         )
 
+    def test_plain_header_body_background_is_stock_table_opt_in_only(self) -> None:
+        normal_table = QTableWidget(0, 1)
+        setting_window.apply_plain_table_header(normal_table)
+        normal_header = normal_table.horizontalHeader()
+        self.assertFalse(
+            bool(
+                normal_header.property(
+                    setting_window.PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY
+                )
+            )
+        )
+        self.assertEqual(normal_header.palette().button(), normal_header._section_background())
+        self.assertEqual(normal_header.palette().mid().color(), normal_header._section_grid_color())
+
+        stock_table = QTableWidget(0, 1)
+        setting_window.apply_plain_table_header(stock_table)
+        stock_header = stock_table.horizontalHeader()
+        stock_header.setProperty(
+            setting_window.PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY,
+            True,
+        )
+        stock_header.setProperty(setting_window.PLAIN_HEADER_GRID_COLOR_PROPERTY, "#D1D5DB")
+        body_color = stock_table.viewport().palette().color(setting_window.QPalette.Base)
+        self.assertEqual(body_color, stock_header._section_background())
+        self.assertEqual("#D1D5DB", stock_header._section_grid_color().name().upper())
+
+
+    def test_stock_selection_uses_parent_instance_status_scope(self) -> None:
+        instances = [
+            self._instance("inst-a", "A 인스턴스"),
+            self._instance("inst-b", "B 인스턴스"),
+        ]
+        stocks = [
+            {
+                "stock_path": "stocks/005930_A",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005930",
+                "name": "삼성전자",
+            },
+            {
+                "stock_path": "stocks/005380_B",
+                "assigned_routine_instance_id": "inst-a",
+                "code": "005380",
+                "name": "현대차",
+            },
+            {
+                "stock_path": "stocks/035420_C",
+                "assigned_routine_instance_id": "inst-b",
+                "code": "035420",
+                "name": "NAVER",
+            },
+        ]
+        counts = {
+            "inst-a": {
+                "registered": 2,
+                "running": 1,
+                "stopped": 1,
+                "error": 0,
+                "normal": 1,
+                "excluded": 1,
+                "review": 0,
+            },
+            "inst-b": {
+                "registered": 1,
+                "running": 0,
+                "stopped": 0,
+                "error": 1,
+                "normal": 0,
+                "excluded": 0,
+                "review": 1,
+            },
+        }
+        window = self._window_harness()
+        window._setup_selected_routine_status_bar()
+        window._routine_instance_operation_counts = lambda: counts
+        with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
+                patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
+                patch.object(setting_window, "read_base_stocks", return_value=stocks):
+            window.load_routine_table()
+
+        def status_texts() -> tuple[str, str, str, str]:
+            return (
+                window.selected_routine_status_buttons["all"].text(),
+                window.selected_routine_status_buttons["running"].text(),
+                window.selected_routine_status_buttons["excluded"].text(),
+                window.selected_routine_status_buttons["error"].text(),
+            )
+
+        window.routine_table.selectRow(1)
+        window.update_selected_routine_status_bar()
+        instance_texts = status_texts()
+        instance_target_ids = window.current_selected_target_instance_ids()
+
+        window.routine_table.selectRow(2)
+        window.update_selected_routine_status_bar()
+        first_stock_texts = status_texts()
+        first_stock_target_ids = window.current_selected_target_instance_ids()
+
+        window.routine_table.selectRow(3)
+        window.update_selected_routine_status_bar()
+        second_stock_texts = status_texts()
+        second_stock_target_ids = window.current_selected_target_instance_ids()
+
+        self.assertEqual(("inst-a",), instance_target_ids)
+        self.assertEqual(instance_target_ids, first_stock_target_ids)
+        self.assertEqual(instance_target_ids, second_stock_target_ids)
+        self.assertEqual(
+            ("종목(2)", "정지(1)", "제외(1)", "검토(0)"),
+            instance_texts,
+        )
+        self.assertEqual(instance_texts, first_stock_texts)
+        self.assertEqual(instance_texts, second_stock_texts)
+
+        window.routine_table.selectRow(5)
+        window.update_selected_routine_status_bar()
+        self.assertEqual(("inst-b",), window.current_selected_target_instance_ids())
+        self.assertEqual(
+            ("종목(1)", "정지(0)", "제외(0)", "검토(1)"),
+            status_texts(),
+        )
+
+
     def test_performance_tree_keeps_review_required_current_stock_records(self) -> None:
         window = self._window_harness()
         stocks = [
@@ -4916,7 +5066,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window = self._window_harness()
         window._setup_selected_routine_status_bar()
         window.load_selected_routine_stocks = lambda: None
-        counts = {"inst-a": {"registered": 7, "running": 3, "stopped": 4, "error": 1}}
+        counts = {
+            "inst-a": {
+                "registered": 7,
+                "running": 3,
+                "stopped": 4,
+                "error": 1,
+                "normal": 3,
+                "excluded": 3,
+                "review": 1,
+            }
+        }
         window._routine_instance_operation_counts = lambda: counts
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
@@ -4930,8 +5090,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("", window.selected_routine_instance_count_badge.text())
             self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
             self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
-            self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
-            self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())
+            self.assertEqual("정지(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("제외(3)", window.selected_routine_status_buttons["excluded"].text())
             self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
 
             calls = []
@@ -4947,8 +5107,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("A 인스턴스", window.selected_routine_name_button.text())
             self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
             self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
-            self.assertEqual("실행(3)", window.selected_routine_status_buttons["running"].text())
-            self.assertEqual("정지(4)", window.selected_routine_status_buttons["stopped"].text())
+            self.assertEqual("정지(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("제외(3)", window.selected_routine_status_buttons["excluded"].text())
             self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
 
     def test_all_stocks_button_selects_all_view_scope_and_restores_row_scope(self) -> None:
@@ -7631,20 +7791,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window._stock_visual_order = []
 
         stocks = [
-            {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "실행"},
-            {"stock_path": "stocks/222222_STOP", "assigned_routine_instance_id": "inst-a", "code": "222222", "name": "정지"},
-            {"stock_path": "stocks/333333_ERR", "assigned_routine_instance_id": "inst-a", "code": "333333", "name": "검토"},
+            {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "정상1"},
+            {"stock_path": "stocks/222222_STOP", "assigned_routine_instance_id": "inst-a", "code": "222222", "name": "제외"},
+            {"stock_path": "stocks/333333_NORMAL", "assigned_routine_instance_id": "inst-a", "code": "333333", "name": "정상2"},
             {"stock_path": "stocks/444444_REVIEW", "assigned_routine_instance_id": "inst-a", "code": "444444", "name": "격리"},
         ]
 
         def fake_read_json(path: Path):
             text = str(path)
             if text.endswith("config.json"):
+                if "222222_STOP" in text:
+                    return {
+                        "assigned_routine_instance_id": "inst-a",
+                        "operation_mode": "SCHEDULED",
+                        "operation_excluded": True,
+                    }
                 return {"assigned_routine_instance_id": "inst-a", "operation_mode": "SCHEDULED"}
             if "111111_RUN" in text:
                 return {"status": "RUNNING", "trade_enabled": True}
-            if "333333_ERR" in text:
-                return {"status": "ERROR", "trade_enabled": False}
             if "444444_REVIEW" in text:
                 return {"status": "REVIEW_REQUIRED", "review_required": True, "trade_enabled": False}
             return {"status": "STOPPED", "trade_enabled": False}
@@ -7653,17 +7817,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(2, window.stock_table.rowCount())
-            self.assertNotIn(
-                "444444",
-                [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())],
-            )
+            self.assertEqual(4, window.stock_table.rowCount())
 
             window._stock_status_filter = "running"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(["111111"], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
+            self.assertEqual(
+                ["111111", "333333"],
+                [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())],
+            )
 
-            window._stock_status_filter = "stopped"
+            window._stock_status_filter = "excluded"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(
                 ["222222"],
@@ -7672,7 +7835,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             window._stock_status_filter = "error"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual([], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
+            self.assertEqual(["444444"], [window.stock_table.item(row, 0).text() for row in range(window.stock_table.rowCount())])
 
     def test_maximized_workspace_reserves_stock_table_required_width(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
@@ -7715,7 +7878,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         left_width, right_width = window.strategy_workspace_splitter.sizes()
         self.assertGreaterEqual(left_width, window.routine_box.minimumWidth())
         self.assertGreaterEqual(right_width, right_required_width)
-        self.assertEqual(setting_window.Qt.ScrollBarAlwaysOff, window.stock_table.horizontalScrollBarPolicy())
+        self.assertEqual(setting_window.Qt.ScrollBarAlwaysOn, window.stock_table.horizontalScrollBarPolicy())
         self.assertEqual(setting_window.QHeaderView.Fixed, header.sectionResizeMode(0))
 
     def test_routine_tree_does_not_render_default_operation_stamp_buttons(self) -> None:

@@ -97,6 +97,25 @@ from gui_ats_utils import (
 )
 
 
+
+OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
+
+
+def apply_auto_trade_operation_excluded_row_style(
+    item: SortableTableWidgetItem,
+    excluded: bool,
+) -> None:
+    if not excluded:
+        return
+    original_flags = item.flags()
+    apply_auto_trade_setting_activity_style(item, False)
+    item.setFlags(original_flags)
+    tooltip = item.toolTip().strip()
+    if tooltip:
+        item.setToolTip(f"{tooltip}\n?? ??")
+    else:
+        item.setToolTip("?? ??")
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -208,12 +227,29 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             code, name = parse_stock_folder_name(stock_dir.name)
             state = read_json_dict(stock_dir / "state.json")
 
-            # 검토종목은 자동매매설정 창에서 완전 제외한다.
-            if is_review_required_state(state):
-                continue
-
             config = read_json_dict(stock_dir / "config.json")
             if not config:
+                config = default_config()
+            operation_excluded = bool(config.get(OPERATION_EXCLUDED_CONFIG_KEY, False))
+            review_required = is_review_required_state(state)
+
+            stock_status_filter = str(getattr(window, "_stock_status_filter", "running") or "running").strip().lower()
+            if stock_status_filter == "stopped":
+                stock_status_filter = "running"
+            if stock_status_filter == "all":
+                pass
+            elif stock_status_filter == "running":
+                if review_required or operation_excluded:
+                    continue
+            elif stock_status_filter == "excluded":
+                if review_required or not operation_excluded:
+                    continue
+            elif stock_status_filter == "error":
+                if not review_required:
+                    continue
+            else:
+                if review_required or operation_excluded:
+                    continue
                 config = default_config()
 
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
@@ -369,14 +405,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 current_session_trade_started=current_session_trade_started,
                 persisted_trade_started=trade_started,
             )
-
-            stock_status_filter = str(getattr(window, "_stock_status_filter", "all") or "all").strip().lower()
-            if stock_status_filter == "running" and not auto_trade_setting_trade_started(state):
-                continue
-            if stock_status_filter == "stopped" and auto_trade_setting_trade_started(state):
-                continue
-            if stock_status_filter == "error" and raw_status_key != "ERROR":
-                continue
 
             window.stock_table.insertRow(row)
 
@@ -583,6 +611,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     apply_auto_trade_setting_activity_style(item, status_cell_active)
                 if col == 9:
                     item.setForeground(QColor(directional_value_color(profit_amount)))
+                apply_auto_trade_operation_excluded_row_style(
+                    item,
+                    operation_excluded,
+                )
 
                 if col in (0, 2, 3, 5, 6, 7, 8, 9, 10):
                     item.setTextAlignment(Qt.AlignCenter)

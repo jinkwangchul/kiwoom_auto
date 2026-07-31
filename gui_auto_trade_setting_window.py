@@ -85,6 +85,8 @@ def _today_global_operation_status(operation_state: dict[str, object]) -> str:
     return str(operation_state.get("operation_status") or "").strip().upper()
 
 from gui_styles import (
+    PLAIN_HEADER_GRID_COLOR_PROPERTY,
+    PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY,
     apply_plain_table_header,
 )
 from gui_toast import show_toast
@@ -2545,7 +2547,7 @@ class AutoTradeSettingWindow(QDialog):
         for filter_key, object_name in (
             ("all", "autoTradeSettingSelectedRoutineRegistered"),
             ("running", "autoTradeSettingSelectedRoutineRunning"),
-            ("stopped", "autoTradeSettingSelectedRoutineStopped"),
+            ("excluded", "autoTradeSettingSelectedRoutineExcluded"),
             ("error", "autoTradeSettingSelectedRoutineError"),
         ):
             button = QPushButton()
@@ -2566,8 +2568,10 @@ class AutoTradeSettingWindow(QDialog):
 
     def set_stock_status_filter(self, filter_key: str) -> None:
         normalized = str(filter_key or "all").strip().lower()
-        if normalized not in {"all", "running", "stopped", "error"}:
-            normalized = "all"
+        if normalized == "stopped":
+            normalized = "running"
+        if normalized not in {"all", "running", "excluded", "error"}:
+            normalized = "running"
         self._stock_status_filter = normalized
         self.update_selected_routine_status_bar()
         self.load_selected_routine_stocks()
@@ -2616,7 +2620,7 @@ class AutoTradeSettingWindow(QDialog):
                 self.selected_routine_name_button.setText("-")
                 self.selected_routine_instance_count_badge.setText("")
                 self.selected_routine_instance_count_badge.hide()
-                counts = {"registered": 0, "running": 0, "stopped": 0, "error": 0}
+                counts = {"registered": 0, "normal": 0, "excluded": 0, "review": 0}
             else:
                 row_kind = str(metadata.get("row_kind", "") or "")
                 self.selected_routine_signal_label.setText("●")
@@ -2624,23 +2628,54 @@ class AutoTradeSettingWindow(QDialog):
                     self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
                     self.selected_routine_instance_count_badge.setText("")
                     self.selected_routine_instance_count_badge.hide()
+                    if row_kind == "stock":
+                        instance_id = str(metadata.get("instance_id", "") or "").strip()
+                        instance_counts = self._routine_instance_operation_counts().get(
+                            instance_id,
+                            {
+                                "registered": 0,
+                                "normal": 0,
+                                "excluded": 0,
+                                "review": 0,
+                            },
+                        )
+                        counts = {
+                            "registered": int(instance_counts.get("registered", 0) or 0),
+                            "normal": int(instance_counts.get("normal", instance_counts.get("running", 0)) or 0),
+                            "excluded": int(instance_counts.get("excluded", 0) or 0),
+                            "review": int(instance_counts.get("review", instance_counts.get("error", 0)) or 0),
+                        }
+                    else:
+                        counts = None
                 else:
                     self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
                     self.selected_routine_instance_count_badge.setText("")
                     self.selected_routine_instance_count_badge.hide()
-                counts = {
-                    "registered": int(metadata.get("registered", 0) or 0),
-                    "running": int(metadata.get("running", 0) or 0),
-                    "stopped": int(metadata.get("stopped", 0) or 0),
-                    "error": int(metadata.get("error", 0) or 0),
-                }
+                    counts = None
+                if counts is None:
+                    counts = {
+                        "registered": int(metadata.get("registered", 0) or 0),
+                        "normal": int(metadata.get("normal", metadata.get("running", 0)) or 0),
+                        "excluded": int(metadata.get("excluded", 0) or 0),
+                        "review": int(metadata.get("review", metadata.get("error", 0)) or 0),
+                    }
+        counts = {
+            "registered": int(counts.get("registered", 0) or 0),
+            "normal": int(counts.get("normal", counts.get("running", 0)) or 0),
+            "excluded": int(counts.get("excluded", 0) or 0),
+            "review": int(counts.get("review", counts.get("error", 0)) or 0),
+        }
+        status_label_getter = getattr(self, "_stock_operation_status_label", None)
+        operation_label = status_label_getter() if callable(status_label_getter) else "정지"
         button_texts = {
             "all": f"종목({counts['registered']})",
-            "running": f"실행({counts['running']})",
-            "stopped": f"정지({counts['stopped']})",
-            "error": f"검토({counts['error']})",
+            "running": f"{operation_label}({counts['normal']})",
+            "excluded": f"제외({counts['excluded']})",
+            "error": f"검토({counts['review']})",
         }
         current_filter = str(getattr(self, "_stock_status_filter", "all") or "all")
+        if current_filter == "stopped":
+            current_filter = "running"
         for key, button in self.selected_routine_status_buttons.items():
             button.setText(button_texts[key])
             is_active = key == current_filter
@@ -2692,6 +2727,14 @@ class AutoTradeSettingWindow(QDialog):
         self.update_selection_summary_panel()
         self.update_selected_routine_status_bar()
         self.load_selected_routine_stocks()
+
+    def _stock_operation_status_label(self) -> str:
+        try:
+            operation_status = _today_global_operation_status(read_operation_state())
+        except Exception:
+            operation_status = ""
+        return "운영" if operation_status in {"RUNNING", "CLOSING"} else "정지"
+
 
     def reset_default_filters_for_open(self) -> None:
         """창을 열 때마다 자동매매설정 기본 필터 계약을 적용한다."""
@@ -2844,11 +2887,23 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.stock_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.stock_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.stock_table.setStyleSheet(
             """
             QTableWidget {
+                gridline-color: #D1D5DB;
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
+            }
+            QHeaderView::section:vertical {
+                qproperty-alignment: AlignCenter;
+                border-right: 1px solid #D1D5DB;
+                border-bottom: 1px solid #D1D5DB;
+            }
+            QTableCornerButton::section {
+                border-right: 1px solid #D1D5DB;
+                border-bottom: 1px solid #D1D5DB;
             }
             QTableWidget::item:selected,
             QTableWidget::item:selected:active,
@@ -2874,6 +2929,7 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
         self.stock_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.stock_table.setSortingEnabled(False)
+        self._sync_stock_table_header_background_to_body()
         QTimer.singleShot(0, self._apply_stock_table_column_widths)
 
     def _apply_stock_table_column_widths(self) -> None:
@@ -2888,6 +2944,25 @@ class AutoTradeSettingWindow(QDialog):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
             header.resizeSection(col, width)
             self.stock_table.setColumnWidth(col, width)
+
+    def _sync_stock_table_header_background_to_body(self) -> None:
+        """등록종목상태 표의 header 빈 영역을 body 배경과 맞춘다."""
+        body_color = self.stock_table.viewport().palette().color(QPalette.Base)
+
+        header = self.stock_table.horizontalHeader()
+        header.setProperty(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY, True)
+        header.setProperty(PLAIN_HEADER_GRID_COLOR_PROPERTY, "#D1D5DB")
+        header.viewport().update()
+
+        vertical_header = self.stock_table.verticalHeader()
+        vertical_header.setDefaultAlignment(Qt.AlignCenter)
+        vertical_palette = QPalette(vertical_header.palette())
+        for role in (QPalette.Button, QPalette.Window, QPalette.Base):
+            vertical_palette.setColor(role, body_color)
+        vertical_header.setPalette(vertical_palette)
+        vertical_header.viewport().setPalette(vertical_palette)
+        vertical_header.viewport().update()
+
 
     def _connect_events(self) -> None:
         if self._fixed_signals_connected:
@@ -3373,6 +3448,52 @@ class AutoTradeSettingWindow(QDialog):
             return
         self.toggle_stock_operation_exclusion(target)
 
+    def set_stock_operation_exclusion(
+        self,
+        target: tuple[Path, str, str],
+        excluded: bool,
+        *,
+        notify: bool = True,
+        refresh: bool = True,
+    ) -> bool:
+        stock_dir, code, name = target
+        config_path = stock_dir / "config.json"
+        config = read_json_dict(config_path)
+        if not config:
+            config = default_config()
+
+        config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
+        config["updated_at"] = now_text()
+
+        try:
+            config_path.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "저장 오류",
+                f"{code} {name} 운영 제외 설정 저장 중 오류가 발생했습니다.\n\n{exc}",
+            )
+            return False
+
+        label = "운영 제외" if excluded else "운영 제외 해제"
+        toast_message = (
+            "운영종목에서 제외됐습니다."
+            if excluded
+            else "운영종목으로 전환됐습니다."
+        )
+        append_stock_log(stock_dir, "GUI", f"{label}: {code} {name}")
+        append_changelog("UPDATE", "config.json", f"{label}: {code} {name}")
+        if notify:
+            self.statusBarMessage(f"{code} {name} {label}")
+            show_toast(self, toast_message)
+        if refresh:
+            self.refresh_all()
+        return True
+
+
     def toggle_stock_operation_exclusion(self, target: tuple[Path, str, str]) -> bool:
         stock_dir, code, name = target
         config_path = stock_dir / "config.json"
@@ -3409,6 +3530,106 @@ class AutoTradeSettingWindow(QDialog):
         show_toast(self, toast_message)
         self.refresh_all()
         return True
+
+    def set_selected_stock_operation_exclusions(self) -> None:
+        selected = self.selected_stock_infos()
+        if not selected:
+            return
+
+        succeeded: list[str] = []
+        failed = 0
+        seen: set[str] = set()
+        for target in selected:
+            stock_dir, code, name = target
+            key = str(Path(stock_dir).resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            state = read_json_dict(stock_dir / "state.json")
+            if is_review_required_state(state):
+                failed += 1
+                continue
+            config = read_json_dict(stock_dir / "config.json")
+            if not config:
+                config = default_config()
+            if bool(config.get(OPERATION_EXCLUDED_CONFIG_KEY, False)):
+                failed += 1
+                continue
+            if self.set_stock_operation_exclusion(
+                target,
+                True,
+                notify=False,
+                refresh=False,
+            ):
+                succeeded.append(name or code)
+            else:
+                failed += 1
+
+        if succeeded:
+            self.refresh_all()
+            if len(succeeded) == 1 and failed == 0:
+                show_toast(self, f"{succeeded[0]}을 제외 지정했습니다.")
+            elif failed:
+                show_toast(
+                    self,
+                    f"{len(succeeded)}개 종목을 제외 지정했습니다. 실패 {failed}개",
+                )
+            else:
+                show_toast(self, f"{len(succeeded)}개 종목을 제외 지정했습니다.")
+        elif failed:
+            show_toast(self, "제외지정에 실패했습니다.")
+
+
+    def clear_selected_stock_operation_exclusions(self) -> None:
+        selected = self.selected_stock_infos()
+        if not selected:
+            return
+
+        succeeded: list[str] = []
+        failed = 0
+        seen: set[str] = set()
+        for target in selected:
+            stock_dir, code, name = target
+            key = str(Path(stock_dir).resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            state = read_json_dict(stock_dir / "state.json")
+            if is_review_required_state(state):
+                failed += 1
+                continue
+            config = read_json_dict(stock_dir / "config.json")
+            if not config:
+                config = default_config()
+            if not bool(config.get(OPERATION_EXCLUDED_CONFIG_KEY, False)):
+                failed += 1
+                continue
+            if self.set_stock_operation_exclusion(
+                target,
+                False,
+                notify=False,
+                refresh=False,
+            ):
+                succeeded.append(name or code)
+            else:
+                failed += 1
+
+        if succeeded:
+            self.refresh_all()
+            if len(succeeded) == 1 and failed == 0:
+                show_toast(self, f"{succeeded[0]}의 제외 상태를 해제했습니다.")
+            elif failed:
+                show_toast(
+                    self,
+                    f"{len(succeeded)}개 종목의 제외 상태를 해제했습니다. 실패 {failed}개",
+                )
+            else:
+                show_toast(self, f"{len(succeeded)}개 종목의 제외 상태를 해제했습니다.")
+        elif failed:
+            show_toast(self, "제외해제에 실패했습니다.")
+
 
     def operation_stock_dir_from_row(self, row: int) -> Path | None:
         code_item = self.stock_table.item(row, 0)
@@ -5695,6 +5916,30 @@ class AutoTradeSettingWindow(QDialog):
                         int(instance_counts.get(str(instance.instance_id), {}).get("error", 0) or 0)
                         for instance in child_instances
                     ),
+                    "normal": sum(
+                        int(
+                            instance_counts.get(str(instance.instance_id), {}).get(
+                                "normal",
+                                instance_counts.get(str(instance.instance_id), {}).get("running", 0),
+                            )
+                            or 0
+                        )
+                        for instance in child_instances
+                    ),
+                    "excluded": sum(
+                        int(instance_counts.get(str(instance.instance_id), {}).get("excluded", 0) or 0)
+                        for instance in child_instances
+                    ),
+                    "review": sum(
+                        int(
+                            instance_counts.get(str(instance.instance_id), {}).get(
+                                "review",
+                                instance_counts.get(str(instance.instance_id), {}).get("error", 0),
+                            )
+                            or 0
+                        )
+                        for instance in child_instances
+                    ),
                     "display_level": str(
                         getattr(self, "_routine_tree_display_level", "category") or "category"
                     ),
@@ -5747,6 +5992,9 @@ class AutoTradeSettingWindow(QDialog):
                         "running": int(count.get("running", 0) or 0),
                         "stopped": int(count.get("stopped", 0) or 0),
                         "error": int(count.get("error", 0) or 0),
+                        "normal": int(count.get("normal", count.get("running", 0)) or 0),
+                        "excluded": int(count.get("excluded", 0) or 0),
+                        "review": int(count.get("review", count.get("error", 0)) or 0),
                         "display_level": str(
                             getattr(self, "_routine_tree_display_level", "category") or "category"
                         ),
