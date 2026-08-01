@@ -594,7 +594,7 @@ class StockRegisterWindow(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
-        self.setWindowTitle("종목등록설정")
+        self.setWindowTitle("종목관리")
         self.resize(860, 560)
 
         self.stock_search_input = QLineEdit()
@@ -640,8 +640,6 @@ class StockRegisterWindow(QDialog):
             button_layout.addWidget(button)
 
         header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel("중앙 종목 관리"))
-        header_layout.addStretch(1)
         header_layout.addWidget(QLabel("검색"))
         header_layout.addWidget(self.stock_search_input)
         self.stock_search_input.setMinimumWidth(360)
@@ -724,12 +722,12 @@ class StockRegisterWindow(QDialog):
         menu = QMenu(self)
 
         action_select_all = menu.addAction("전체 선택")
-        action_select_unassigned = menu.addAction("미등록 선택")
-        action_delete = menu.addAction("선택 삭제")
         action_clear = menu.addAction("선택 해제")
         menu.addSeparator()
-        action_assign = menu.addAction("루틴 지정")
-        action_unassign = menu.addAction("루틴 해제")
+        action_delete = menu.addAction("종목삭제")
+        menu.addSeparator()
+        action_assign = menu.addAction("루틴등록")
+        action_unassign = menu.addAction("루틴해제")
 
         has_selected = selected_count > 0
         action_assign.setEnabled(has_selected)
@@ -748,8 +746,6 @@ class StockRegisterWindow(QDialog):
             self.delete_selected_stock()
         elif selected_action == action_select_all:
             self.select_all_visible_stocks()
-        elif selected_action == action_select_unassigned:
-            self.select_unassigned_visible_stocks()
         elif selected_action == action_clear:
             self.stock_table.clearSelection()
             self.on_stock_selection_changed()
