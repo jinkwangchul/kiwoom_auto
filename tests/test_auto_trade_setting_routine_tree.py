@@ -4006,6 +4006,118 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ],
         )
 
+    def test_stock_register_window_uses_management_title_without_duplicate_heading(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        self.assertEqual("종목관리", window.windowTitle())
+        label_texts = [label.text() for label in window.findChildren(QLabel)]
+        self.assertNotIn("중앙 종목 관리", label_texts)
+        self.assertIn("검색", label_texts)
+        self.assertIs(window.stock_search_input.parent(), window)
+        self.assertIs(window.stock_table.parent(), window)
+        self.assertEqual("수동등록", window.btn_manual_register.text())
+
+    def test_stock_register_context_menu_order_and_labels(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeMenu:
+            last = None
+
+            def __init__(self, _parent=None):
+                FakeMenu.last = self
+                self.entries = []
+                self.actions = []
+
+            def addAction(self, text):
+                action = MagicMock()
+                action.text.return_value = text
+                self.entries.append(text)
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self):
+                self.entries.append("---")
+
+            def exec_(self, _position):
+                return None
+
+        with (
+            patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+            patch.object(stock_register_window, "QMenu", FakeMenu),
+        ):
+            window = stock_register_window.StockRegisterWindow()
+            self.addCleanup(window.close)
+            with patch.object(window, "selected_registered_stocks", return_value=[("005930", "삼성전자")]):
+                window.show_stock_table_context_menu(QPoint(1, 1))
+
+        self.assertEqual(
+            ["전체 선택", "선택 해제", "---", "종목삭제", "---", "루틴등록", "루틴해제"],
+            FakeMenu.last.entries,
+        )
+        self.assertNotIn("미등록 선택", FakeMenu.last.entries)
+        self.assertNotIn("등록대기 선택", FakeMenu.last.entries)
+        self.assertNotIn("등록대기 전환", FakeMenu.last.entries)
+        for action in FakeMenu.last.actions[2:]:
+            action.setEnabled.assert_called_once_with(True)
+
+    def test_stock_register_context_menu_keeps_existing_handlers(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeMenu:
+            next_selected_index = None
+
+            def __init__(self, _parent=None):
+                self.actions = []
+
+            def addAction(self, _text):
+                action = MagicMock()
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self):
+                pass
+
+            def exec_(self, _position):
+                if self.next_selected_index is None:
+                    return None
+                return self.actions[self.next_selected_index]
+
+        handler_names_by_index = {
+            0: "select_all_visible_stocks",
+            1: "clear_selection",
+            2: "delete_selected_stock",
+            3: "confirm_open_routine_assign_from_context_menu",
+            4: "unassign_selected_stock_routines",
+        }
+
+        for selected_index, handler_name in handler_names_by_index.items():
+            with (
+                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+                patch.object(stock_register_window, "QMenu", FakeMenu),
+            ):
+                window = stock_register_window.StockRegisterWindow()
+                self.addCleanup(window.close)
+                FakeMenu.next_selected_index = selected_index
+                window.stock_table.clearSelection = MagicMock()
+                window.on_stock_selection_changed = MagicMock()
+                window.select_all_visible_stocks = MagicMock()
+                window.delete_selected_stock = MagicMock()
+                window.confirm_open_routine_assign_from_context_menu = MagicMock()
+                window.unassign_selected_stock_routines = MagicMock()
+
+                with patch.object(window, "selected_registered_stocks", return_value=[("005930", "삼성전자")]):
+                    window.show_stock_table_context_menu(QPoint(1, 1))
+
+            if handler_name == "clear_selection":
+                window.stock_table.clearSelection.assert_called_once_with()
+                window.on_stock_selection_changed.assert_called_once_with()
+            else:
+                getattr(window, handler_name).assert_called_once_with()
+
     def test_window_uses_standard_minimize_maximize_close_title_buttons(self) -> None:
         window = setting_window.AutoTradeSettingWindow()
         try:
