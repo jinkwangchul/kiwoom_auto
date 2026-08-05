@@ -1131,8 +1131,10 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         AcceptRole = 4
         RejectRole = 5
         proceed = True
+        instances = []
 
         def __init__(self, _parent=None) -> None:
+            type(self).instances.append(self)
             self._proceed_button = None
             self._cancel_button = None
 
@@ -1167,19 +1169,25 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         window = Mock()
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "indicator_follow"
+        parent = Mock()
+        parent.kiwoom_api.is_connected.return_value = True
+        window.parent.return_value = parent
         viewport = Mock()
         window.stock_table.viewport.return_value = viewport
         return window
 
     @staticmethod
-    def _write_stock(root: Path, folder: str, holding_qty: int = 5) -> tuple[Path, str, str]:
+    def _write_stock(
+        root: Path,
+        folder: str,
+        holding_qty: int = 5,
+        state: dict | None = None,
+    ) -> tuple[Path, str, str]:
         stock_dir = root / "stocks" / folder
         stock_dir.mkdir(parents=True)
         code, name = folder.split("_", 1)
-        (stock_dir / "state.json").write_text(
-            json.dumps({"status": "RUNNING", "holding_qty": holding_qty}),
-            encoding="utf-8",
-        )
+        state_data = state if state is not None else {"status": "RUNNING", "holding_qty": holding_qty}
+        (stock_dir / "state.json").write_text(json.dumps(state_data), encoding="utf-8")
         (stock_dir / "config.json").write_text("{}", encoding="utf-8")
         return stock_dir, code, name
 
@@ -1216,6 +1224,29 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
         service_type.assert_not_called()
         window.update_stock_status.assert_not_called()
+
+    def test_disconnected_server_shows_login_toast_and_does_not_apply_backend(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            window = self._window(selected)
+            window.parent.return_value.kiwoom_api.is_connected.return_value = False
+
+            with (
+                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.show_toast") as show_toast,
+            ):
+                auto_trade_apply_selected_early_close(window, "루틴")
+
+        service_type.assert_not_called()
+        window.selected_stock_infos.assert_not_called()
+        show_toast.assert_called_once_with(
+            window,
+            "키움 서버에 로그인되어 있지 않습니다.",
+            duration_ms=2500,
+        )
+        window.statusBarMessage.assert_not_called()
 
     def test_partial_failure_is_reported_and_direct_writer_is_not_called(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
@@ -1257,6 +1288,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                 ),
                 patch("gui_auto_trade_close.append_changelog") as append_changelog,
                 patch("gui_auto_trade_close.append_stock_log") as append_stock_log,
+                patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 auto_trade_apply_selected_early_close(
                     window,
@@ -1276,6 +1308,11 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         append_changelog.assert_called_once()
         window.refresh_all.assert_called_once()
         window.statusBarMessage.assert_called_with("조기마감 적용: 1개 / 제외 1개")
+        show_toast.assert_called_once_with(
+            window,
+            "1종목을 조기마감 적용하였습니다.",
+            duration_ms=2500,
+        )
 
     def test_all_view_does_not_require_selected_routine_name(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
@@ -1330,16 +1367,77 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                 ),
                 patch("gui_auto_trade_close.append_changelog"),
                 patch("gui_auto_trade_close.append_stock_log"),
+                patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 auto_trade_apply_selected_early_close(window, "시장가")
 
         service.apply_early_close.assert_called_once()
         window.statusBarMessage.assert_called_with("조기마감 적용: 1개")
+        show_toast.assert_called_once_with(
+            window,
+            "1종목을 조기마감 적용하였습니다.",
+            duration_ms=2500,
+        )
+
+    def test_no_holding_early_close_result_uses_toast_not_information_messagebox(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [
+                self._write_stock(Path(temp), "111111_A", holding_qty=0),
+                self._write_stock(
+                    Path(temp),
+                    "222222_B",
+                    holding_qty=0,
+                    state={"status": "REVIEW_REQUIRED", "holding_qty": 0},
+                ),
+            ]
+            window = self._window(selected)
+            self._MessageBox.instances = []
+            service = Mock()
+            service.apply_early_close.return_value = OperationCommandResult(
+                RESULT_SUCCESS,
+                "command-a",
+                (
+                    StockOperationCommandResult(
+                        "111111",
+                        str(selected[0][0]),
+                        STOCK_APPLIED,
+                        1,
+                    ),
+                ),
+            )
+            with (
+                patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                patch("gui_auto_trade_close.OperationCommandService", return_value=service),
+                patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
+                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch(
+                    "gui_auto_trade_close.evaluate_production_transition",
+                    return_value=Mock(allowed=True),
+                ),
+                patch("gui_auto_trade_close.append_changelog"),
+                patch("gui_auto_trade_close.append_stock_log"),
+                patch("gui_auto_trade_close.show_toast") as show_toast,
+            ):
+                auto_trade_apply_selected_early_close(window, "루틴")
+
+        service.apply_early_close.assert_called_once()
+        self.assertEqual([], self._MessageBox.instances)
+        show_toast.assert_called_once()
+        toast_args = show_toast.call_args.args
+        self.assertIs(toast_args[0], window)
+        self.assertEqual("조기마감 적용 대상이 없습니다.", toast_args[1])
+        self.assertNotIn("111111", toast_args[1])
+        self.assertNotIn("222222", toast_args[1])
+        self.assertNotIn("\n", toast_args[1])
+        self.assertEqual(2500, show_toast.call_args.kwargs["duration_ms"])
+        self.assertNotIn("position", show_toast.call_args.kwargs)
+        window.statusBarMessage.assert_called_with("조기마감 적용: 1개 / 제외 1개")
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
     def test_unregister_partial_reset_failure_refreshes_completed_changes_and_continues(self) -> None:
-        from PyQt5.QtWidgets import QDialog
         import gui_auto_trade_unregister as unregister
 
         immediate = {
@@ -1374,9 +1472,6 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             (Path("failed"), "222222", "실패종목"),
             (Path("completed"), "333333", "완료종목"),
         ]
-        dialog = Mock()
-        dialog.exec_.return_value = QDialog.Accepted
-        dialog.selected_items.return_value = [failed_force, completed_force]
 
         with (
             patch.object(
@@ -1384,7 +1479,6 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 "auto_trade_unregister_category",
                 side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
             ),
-            patch.object(unregister, "AutoTradeUnregisterConfirmDialog", return_value=dialog),
             patch.object(
                 unregister,
                 "reset_runtime_state_for_force_unregister",
@@ -1393,6 +1487,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
             patch.object(unregister, "append_stock_log"),
             patch.object(unregister.QMessageBox, "warning") as warning,
+            patch.object(unregister, "show_toast") as toast,
         ):
             unregister.unregister_selected_auto_trade_stocks(window)
 
@@ -1402,7 +1497,181 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         )
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
-        warning.assert_called_once()
+        warning.assert_not_called()
+        toast.assert_called_once_with(
+            window,
+            "종목해제 2종목 | 해제불가 1종목",
+        )
+
+    def test_unregister_result_toast_text_contract(self) -> None:
+        import gui_auto_trade_unregister as unregister
+
+        self.assertEqual(
+            "종목해제 10종목 | 해제불가 0종목",
+            unregister.unregister_result_toast_text(10, 0, []),
+        )
+        self.assertEqual(
+            "종목해제 8종목 | 해제불가 2종목",
+            unregister.unregister_result_toast_text(8, 2, ["LG화학", "SK하이닉스"]),
+        )
+        self.assertEqual(
+            "종목해제 0종목 | 해제불가 5종목",
+            unregister.unregister_result_toast_text(
+                0,
+                5,
+                ["LG화학", "SK하이닉스", "카카오게임즈", "셀트리온", "KB금융"],
+            ),
+        )
+        self.assertEqual(
+            "종목해제 0종목 | 해제불가 0종목",
+            unregister.unregister_result_toast_text(0, 0, []),
+        )
+        self.assertEqual(
+            "종목해제 8종목 | 해제불가 1종목",
+            unregister.unregister_result_toast_text(8, 1, ["LG화학"]),
+        )
+        self.assertEqual(
+            "종목해제 8종목 | 해제불가 4종목",
+            unregister.unregister_result_toast_text(
+                8,
+                4,
+                ["LG화학", "SK하이닉스", "카카오게임즈", "셀트리온"],
+            ),
+        )
+        self.assertEqual(
+            "종목해제 12종목 | 해제불가 6종목",
+            unregister.unregister_result_toast_text(
+                12,
+                6,
+                ["LG화학", "SK하이닉스", "카카오게임즈", "셀트리온", "KB금융", "NAVER"],
+            ),
+        )
+
+    def test_unregister_all_scope_allows_empty_routine_name_with_selected_rows(self) -> None:
+        import gui_auto_trade_unregister as unregister
+
+        stock_dir = Path("stocks/005930_Samsung")
+        window = Mock()
+        parent = Mock()
+        window.parent.return_value = parent
+        window._all_stocks_scope_active = True
+        window.current_selected_routine_name.return_value = ""
+        window.selected_stock_infos.return_value = [
+            (stock_dir, "005930", "Samsung"),
+        ]
+
+        with (
+            patch.object(
+                unregister,
+                "auto_trade_unregister_category",
+                return_value={
+                    "category": "immediate",
+                    "code": "005930",
+                    "name": "Samsung",
+                    "runtime_dirs": [],
+                },
+            ) as category,
+            patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(unregister, "append_stock_log"),
+            patch.object(unregister, "append_changelog"),
+            patch.object(unregister.QMessageBox, "warning") as warning,
+            patch.object(unregister, "show_toast") as toast,
+        ):
+            unregister.unregister_selected_auto_trade_stocks(window)
+
+        category.assert_called_once_with("전체", stock_dir, "005930", "Samsung")
+        update_routines.assert_called_once_with("005930", "Samsung", [])
+        warning.assert_not_called()
+        parent.refresh_all.assert_called_once_with()
+        window.refresh_all.assert_called_once_with()
+        toast.assert_called_once_with(window, "종목해제 1종목 | 해제불가 0종목")
+
+    def test_unregister_mixed_selection_sends_only_allowed_items_to_backend(self) -> None:
+        import gui_auto_trade_unregister as unregister
+
+        allowed = {
+            "category": "immediate",
+            "code": "111111",
+            "name": "Allowed",
+            "runtime_dirs": [],
+        }
+        blocked_running = {
+            "category": "blocked",
+            "code": "222222",
+            "name": "Running",
+            "runtime_dirs": [],
+        }
+        blocked_emergency = {
+            "category": "blocked",
+            "code": "333333",
+            "name": "Emergency",
+            "runtime_dirs": [],
+        }
+        blocked_review = {
+            "category": "blocked",
+            "code": "444444",
+            "name": "Review",
+            "runtime_dirs": [],
+        }
+        items_by_code = {
+            "111111": allowed,
+            "222222": blocked_running,
+            "333333": blocked_emergency,
+            "444444": blocked_review,
+        }
+        window = Mock()
+        parent = Mock()
+        window.parent.return_value = parent
+        window.current_selected_routine_name.return_value = "테스트루틴"
+        window.selected_stock_infos.return_value = [
+            (Path("allowed"), "111111", "Allowed"),
+            (Path("running"), "222222", "Running"),
+            (Path("emergency"), "333333", "Emergency"),
+            (Path("review"), "444444", "Review"),
+        ]
+
+        with (
+            patch.object(
+                unregister,
+                "auto_trade_unregister_category",
+                side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
+            ),
+            patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(unregister, "append_stock_log"),
+            patch.object(unregister, "append_changelog"),
+            patch.object(unregister.QMessageBox, "warning") as warning,
+            patch.object(unregister, "show_toast") as toast,
+        ):
+            unregister.unregister_selected_auto_trade_stocks(window)
+
+        update_routines.assert_called_once_with("111111", "Allowed", [])
+        warning.assert_not_called()
+        parent.refresh_all.assert_called_once_with()
+        window.refresh_all.assert_called_once_with()
+        toast.assert_called_once_with(window, "종목해제 1종목 | 해제불가 3종목")
+
+    def test_unregister_empty_selection_still_warns_in_all_scope(self) -> None:
+        import gui_auto_trade_unregister as unregister
+
+        window = Mock()
+        window._all_stocks_scope_active = True
+        window.current_selected_routine_name.return_value = ""
+        window.selected_stock_infos.return_value = []
+
+        with (
+            patch.object(unregister, "auto_trade_unregister_category") as category,
+            patch.object(unregister.QMessageBox, "warning") as warning,
+            patch.object(unregister, "show_toast") as toast,
+        ):
+            unregister.unregister_selected_auto_trade_stocks(window)
+
+        warning.assert_called_once_with(
+            window,
+            "선택 오류",
+            "등록해제할 종목을 1개 이상 선택하세요.",
+        )
+        category.assert_not_called()
+        toast.assert_not_called()
 
     def test_status_bar_message_updates_parent_status_bar_only(self) -> None:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
@@ -2589,6 +2858,83 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             if not action.separator
         ]
         self.assertTrue(all(not selected for _label, selected in labels))
+
+    def test_mixed_operation_modes_hide_all_mode_specific_actions(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {
+            "SCHEDULED",
+            "CONTINUOUS",
+        }
+        self._FakeMenu.chosen_text = "ATS설정"
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={},
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        root_actions = [
+            action.text
+            for action in self._FakeMenu.root.actions
+            if not action.separator
+        ]
+        self.assertNotIn("ATS설정", root_actions)
+        self.assertNotIn("시간변경", root_actions)
+        self.assertNotIn("변경리셋", root_actions)
+        self.assertNotIn("혼합 선택: 공통 메뉴만 사용", root_actions)
+        window.open_selected_manual_ats_settings_dialog.assert_not_called()
+
+    def test_all_manual_selection_shows_only_ats_mode_action(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {"CONTINUOUS"}
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={},
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        root_actions = [
+            action.text
+            for action in self._FakeMenu.root.actions
+            if not action.separator
+        ]
+        self.assertIn("ATS설정", root_actions)
+        self.assertNotIn("시간변경", root_actions)
+        self.assertNotIn("변경리셋", root_actions)
+
+    def test_all_scheduled_selection_shows_only_schedule_mode_actions(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {"SCHEDULED"}
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu._context_menu_operation_policy",
+                return_value={},
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        root_actions = [
+            action.text
+            for action in self._FakeMenu.root.actions
+            if not action.separator
+        ]
+        self.assertNotIn("ATS설정", root_actions)
+        self.assertIn("시간변경", root_actions)
+        self.assertIn("변경리셋", root_actions)
 
 
 if __name__ == "__main__":

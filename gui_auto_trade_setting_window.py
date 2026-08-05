@@ -118,12 +118,6 @@ from gui_order_utils import (
 )
 from gui_order_status_window import OrderStatusWindow
 from gui_log_view_window import LogViewWindow
-from gui_blocked_report_window import (
-    BlockedActionReportViewDialog,
-    blocked_items_preview,
-    latest_blocked_action_report_path,
-    write_blocked_action_report,
-)
 from gui_schedule_utils import (
     schedule_config_updates,
     schedule_change_log_text,
@@ -1708,7 +1702,6 @@ class AutoTradeNotificationPopup(QFrame):
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
-BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 REAL_TRADE_GUARD_PATH = PROJECT_ROOT / "runtime" / "real_trade_guard.json"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"

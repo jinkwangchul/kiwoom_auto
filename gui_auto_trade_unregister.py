@@ -11,7 +11,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -29,20 +28,28 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_auto_trade_utils import auto_trade_unregister_category
-from gui_blocked_report_window import (
-    blocked_items_preview,
-    latest_blocked_action_report_path,
-    write_blocked_action_report,
-)
 from runtime_io import read_json_dict, read_orders_data
 from gui_auto_trade_runtime import write_state_json
 from gui_config_utils import default_orders, default_state
 from gui_common_utils import safe_int_value
 from gui_order_utils import pending_order_side_quantities, format_number_value
 from gui_base_stock_service import update_base_stock_routines as update_base_stock_routines_from_service
+from gui_toast import show_toast
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
+
+
+def unregister_result_toast_text(
+    success_count: int,
+    blocked_count: int,
+    blocked_names: list[str] | None = None,
+) -> str:
+    del blocked_names
+    return (
+        f"종목해제 {max(int(success_count), 0)}종목"
+        f" | 해제불가 {max(int(blocked_count), 0)}종목"
+    )
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
 def now_text() -> str:
@@ -156,8 +163,7 @@ class AutoTradeUnregisterConfirmDialog(QDialog):
 
         notice = QLabel(
             "※ 즉시 등록해제 가능 종목은 바로 처리됩니다.\n"
-            "※ 주의 등록해제 종목은 체크한 항목만 처리됩니다.\n"
-            "※ 등록해제 불가 종목은 처리불가 누적리포트에 기록됩니다."
+            "※ 주의 등록해제 종목은 체크한 항목만 처리됩니다."
         )
         notice.setStyleSheet("color: #555555;")
         main_layout.addWidget(notice)
@@ -313,11 +319,14 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     - 매수/매도, 매도만 등 매매 가능 상태는 등록해제 불가로 표시만 한다.
     """
     selected = window.selected_stock_infos()
-    routine_name = window.current_selected_routine_name()
-
-    if not selected or not routine_name:
+    if not selected:
         QMessageBox.warning(window, "선택 오류", "등록해제할 종목을 1개 이상 선택하세요.")
         return
+    routine_name = window.current_selected_routine_name()
+    if not routine_name and bool(getattr(window, "_all_stocks_scope_active", False)):
+        routine_name = "전체"
+    if not routine_name:
+        routine_name = "-"
 
     immediate_items: list[dict[str, object]] = []
     force_items: list[dict[str, object]] = []
@@ -338,27 +347,21 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         else:
             blocked_items.append(item)
 
-    selected_force_items: list[dict[str, object]] = []
-    if immediate_items or force_items or blocked_items:
-        dialog = AutoTradeUnregisterConfirmDialog(
-            routine_name=routine_name,
-            immediate_items=immediate_items,
-            force_items=force_items,
-            blocked_items=blocked_items,
-            parent=window,
-        )
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        selected_force_items = dialog.selected_items()
-
-    process_items = immediate_items + selected_force_items
+    process_items = immediate_items + force_items
     if not process_items:
-        QMessageBox.information(window, "등록해제 없음", "등록해제 처리할 종목이 선택되지 않았습니다.")
+        show_toast(
+            window,
+            unregister_result_toast_text(
+                0,
+                len(blocked_items),
+                [str(item.get("name", "")) for item in blocked_items],
+            ),
+        )
         return
-
     reset_failed_items: list[str] = []
     completed_items: list[str] = []
-    force_keys = {(str(item.get("code", "")), str(item.get("name", ""))) for item in selected_force_items}
+    force_keys = {(str(item.get("code", "")), str(item.get("name", ""))) for item in force_items}
+    failed_names: list[str] = [str(item.get("name", "")) for item in blocked_items]
 
     for item in process_items:
         code = str(item.get("code", "")).strip()
@@ -371,6 +374,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
             for runtime_routine_name, stock_dir in item.get("runtime_dirs", []):
                 if not reset_runtime_state_for_force_unregister(stock_dir):
                     reset_failed_items.append(f"{code} {name} / {runtime_routine_name}")
+                    failed_names.append(name)
                     item_reset_failed = True
                     continue
                 append_stock_log(
@@ -385,34 +389,16 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if update_base_stock_routines(code, name, []):
             completed_items.append(f"{code},{name}")
 
-    if reset_failed_items:
-        if completed_items:
-            parent = window.parent()
-            if parent is not None and hasattr(parent, "refresh_all"):
-                parent.refresh_all()
-            window.refresh_all()
-        preview_text = "\n".join(reset_failed_items[:10])
-        if len(reset_failed_items) > 10:
-            preview_text += f"\n... 외 {len(reset_failed_items) - 10}개"
-        QMessageBox.warning(
+    if not completed_items:
+        show_toast(
             window,
-            "상태 초기화 오류",
-            "일부 종목의 state.json/orders.json 초기화에 실패했습니다.\n"
-            "해당 종목은 루틴 등록해제를 완료하지 않았습니다.\n\n"
-            f"{preview_text}",
+            unregister_result_toast_text(
+                0,
+                len(blocked_items) + len(reset_failed_items),
+                failed_names,
+            ),
         )
         return
-
-    if not completed_items:
-        QMessageBox.information(window, "등록해제 없음", "기초종목.txt에서 등록해제할 종목을 찾지 못했습니다.")
-        return
-
-    report_path = write_blocked_action_report(
-        "자동매매설정 등록해제",
-        blocked_items,
-        target_routine=routine_name,
-    )
-
     append_changelog(
         "UPDATE",
         "종목 루틴 연결",
@@ -424,10 +410,12 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     if parent is not None and hasattr(parent, "refresh_all"):
         parent.refresh_all()
     window.refresh_all()
-
-    result_lines = [f"등록해제 완료: {len(completed_items)}개"]
-    if blocked_items:
-        result_lines.append(f"등록해제 불가: {len(blocked_items)}개")
-        if report_path is not None:
-            result_lines.append(f"리포트: {report_path.name}")
-    QMessageBox.information(window, "등록해제 결과", "\n".join(result_lines))
+    show_toast(
+        window,
+        unregister_result_toast_text(
+            len(completed_items),
+            len(blocked_items) + len(reset_failed_items),
+            failed_names,
+        ),
+    )
+    return

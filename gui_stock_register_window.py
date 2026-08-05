@@ -102,12 +102,6 @@ from gui_order_utils import (
 )
 from gui_order_status_window import OrderStatusWindow
 from gui_log_view_window import LogViewWindow
-from gui_blocked_report_window import (
-    BlockedActionReportViewDialog,
-    blocked_items_preview,
-    latest_blocked_action_report_path,
-    write_blocked_action_report,
-)
 from gui_schedule_utils import (
     schedule_config_updates,
     schedule_change_log_text,
@@ -307,7 +301,6 @@ STOCK_LIBRARY_PATH = PROJECT_ROOT / "stock_library.json"
 ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
-BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 
 
@@ -961,27 +954,33 @@ class StockRegisterWindow(QDialog):
         self.setWindowTitle("종목관리")
 
         self.stock_search_input = QLineEdit()
-        self.stock_search_input.setPlaceholderText("검색어 입력: 종목코드, 종목명, 연결 루틴, 운영상태")
+        self.stock_search_input.setPlaceholderText("검색어 입력")
         self.stock_table = QTableWidget()
         self._stock_performance_sort_key = "amount"
         self._stock_performance_sort_order = Qt.DescendingOrder
         self._stock_performance_sort_buttons: dict[str, QPushButton] = {}
         self._stock_performance_summary_labels: dict[str, QLabel] = {}
+        self._stock_register_header_required_width = 0
         self._integrity_auto_check_started = False
         self._last_integrity_check_result: dict[str, object] | None = None
         self._last_integrity_toast_message = ""
+        self.integrity_status_icon_label = QLabel("")
+        self.integrity_status_icon_label.setObjectName("stockRegisterIntegrityStatusIconLabel")
+        self.integrity_status_icon_label.setAlignment(Qt.AlignCenter)
+        self.integrity_status_icon_label.setFixedSize(20, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        self.integrity_status_icon_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.integrity_status_label = QLabel("")
         self.integrity_status_label.setObjectName("stockRegisterIntegrityStatusLabel")
-        self.integrity_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.integrity_status_label.setMinimumWidth(220)
+        self.integrity_status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.integrity_status_label.setMinimumWidth(0)
         self.integrity_status_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._integrity_status_container = self._create_integrity_status_container()
 
         self.btn_search_register = QPushButton("검색등록")
         self.btn_search_register.setEnabled(False)
         self.btn_search_register.setToolTip("검색 결과에서 선택한 종목을 등록합니다.")
         self.btn_manual_register = QPushButton("종목등록")
         self.btn_manual_register.setToolTip("종목명 또는 종목코드를 직접 입력하여 등록합니다.")
-        self.btn_blocked_report = QPushButton("처리불가 리포트")
         self.btn_delete_stock = QPushButton("종목삭제")
         self.btn_delete_stock.setEnabled(False)
         self.btn_close = QPushButton("닫기")
@@ -1004,7 +1003,6 @@ class StockRegisterWindow(QDialog):
         buttons = [
             self.btn_search_register,
             self.btn_manual_register,
-            self.btn_blocked_report,
             self.btn_delete_stock,
             self.btn_close,
         ]
@@ -1014,10 +1012,12 @@ class StockRegisterWindow(QDialog):
             button_layout.addWidget(button)
 
         header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
         search_label = QLabel("검색")
         header_layout.addWidget(search_label)
         header_layout.addWidget(self.stock_search_input)
         self._setup_stock_performance_sort_badges()
+        status_width = self._integrity_status_reserved_width()
         button_spacing = max(0, button_layout.spacing())
         button_width = (
             sum(button.sizeHint().width() for button in buttons)
@@ -1027,8 +1027,9 @@ class StockRegisterWindow(QDialog):
         available_search_width = (
             button_width
             - search_label.sizeHint().width()
+            - status_width
             - self._stock_performance_sort_badge_container.width()
-            - (header_spacing * 3)
+            - (header_spacing * 4)
         )
         search_width = (
             self.stock_search_input.fontMetrics().horizontalAdvance(
@@ -1036,9 +1037,16 @@ class StockRegisterWindow(QDialog):
             )
             + 28
         )
-        self.stock_search_input.setFixedWidth(max(360, min(search_width, available_search_width)))
+        self.stock_search_input.setFixedWidth(max(240, min(search_width, available_search_width)))
+        self._stock_register_header_required_width = (
+            search_label.sizeHint().width()
+            + self.stock_search_input.width()
+            + status_width
+            + self._stock_performance_sort_badge_container.width()
+            + (header_spacing * 4)
+        )
+        header_layout.addWidget(self._integrity_status_container, 0, Qt.AlignVCenter)
         header_layout.addStretch(1)
-        header_layout.addWidget(self.integrity_status_label, 0, Qt.AlignVCenter)
         header_layout.addWidget(self._stock_performance_sort_badge_container, 0, Qt.AlignVCenter)
 
         main_layout.addLayout(header_layout)
@@ -1282,7 +1290,6 @@ class StockRegisterWindow(QDialog):
         buttons = [
             self.btn_search_register,
             self.btn_manual_register,
-            self.btn_blocked_report,
             self.btn_delete_stock,
             self.btn_close,
         ]
@@ -1299,7 +1306,8 @@ class StockRegisterWindow(QDialog):
             + max(0, len(buttons) - 1) * max(0, button_spacing)
         )
         border_width = max(0, self.frameGeometry().width() - self.geometry().width())
-        required_width = max(table_width, button_width) + layout_horizontal_margin + border_width
+        header_width = int(getattr(self, "_stock_register_header_required_width", 0) or 0)
+        required_width = max(table_width, button_width, header_width) + layout_horizontal_margin + border_width
         screen = QApplication.primaryScreen()
         if screen is not None:
             available_width = screen.availableGeometry().width()
@@ -1421,16 +1429,73 @@ class StockRegisterWindow(QDialog):
     def _connect_events(self) -> None:
         self.btn_close.clicked.connect(self.close)
         self.btn_manual_register.clicked.connect(self.open_manual_register_dialog)
-        self.btn_blocked_report.clicked.connect(self.open_latest_blocked_report)
         self.btn_delete_stock.clicked.connect(self.delete_selected_stock)
         self.stock_search_input.textChanged.connect(self.refresh_stock_table)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.itemClicked.connect(self.on_stock_table_item_clicked)
         self.stock_table.customContextMenuRequested.connect(self.show_stock_table_context_menu)
 
+    def _create_integrity_status_container(self) -> QWidget:
+        container = QWidget(self)
+        container.setObjectName("stockRegisterIntegrityStatusContainer")
+        container.setFocusPolicy(Qt.NoFocus)
+        container.setAttribute(Qt.WA_StyledBackground, True)
+        container.setStyleSheet("background: transparent; border: 0;")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(18, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.integrity_status_icon_label, 0, Qt.AlignVCenter)
+        layout.addWidget(self.integrity_status_label, 0, Qt.AlignVCenter)
+        container.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        return container
+
+    def _integrity_status_reserved_width(self) -> int:
+        text = "검토관리 005930 삼성전자 외 99종목"
+        margins = self._integrity_status_container.layout().contentsMargins()
+        spacing = self._integrity_status_container.layout().spacing()
+        return (
+            margins.left()
+            + self.integrity_status_icon_label.width()
+            + spacing
+            + self.integrity_status_label.fontMetrics().horizontalAdvance(text)
+            + 12
+        )
+
+    def _integrity_status_icon(self, message: str) -> tuple[str, str]:
+        text = str(message or "").strip()
+        if not text:
+            return "", ""
+        if text.startswith("검토관리"):
+            return "⚠", "#d97706"
+        if text == "검사 대상 종목 없음":
+            return "ⓘ", "#475569"
+        if "실패" in text or "오류" in text:
+            return "✕", "#dc2626"
+        if text.startswith("로컬 무결성 통과"):
+            return "✓", "#15803d"
+        return "", ""
+
     def _set_integrity_status_text(self, message: str) -> None:
-        self.integrity_status_label.setText(message)
-        self.integrity_status_label.setToolTip(message)
+        display_message = str(message or "").strip()
+        icon, color = self._integrity_status_icon(display_message)
+        self.integrity_status_icon_label.setText(icon)
+        self.integrity_status_icon_label.setStyleSheet(
+            f"background: transparent; color: {color}; font-size: 19px; font-weight: 700;"
+            if icon
+            else "background: transparent;"
+        )
+        self.integrity_status_label.setText(display_message)
+        label_width = (
+            self.integrity_status_label.fontMetrics().horizontalAdvance(display_message) + 4
+            if display_message
+            else 0
+        )
+        self.integrity_status_label.setFixedWidth(label_width)
+        self.integrity_status_label.setStyleSheet("background: transparent; color: #202124;")
+        self._integrity_status_container.adjustSize()
+        tooltip = f"{icon} {display_message}".strip()
+        self.integrity_status_icon_label.setToolTip(tooltip)
+        self.integrity_status_label.setToolTip(tooltip)
 
     def _show_integrity_toast(self, message: str) -> None:
         self._last_integrity_toast_message = message
@@ -1710,12 +1775,6 @@ class StockRegisterWindow(QDialog):
             ensure_single_real_trade_routine_for_stock(code, name, selected_routine_type)
             applied_items.append(f"{code},{name}({selected_routine_name})")
 
-        report_path = write_blocked_action_report(
-            "루틴등록",
-            blocked_items,
-            target_routine=selected_routine_name,
-        )
-
         if applied_items:
             append_changelog(
                 "UPDATE",
@@ -1810,8 +1869,6 @@ class StockRegisterWindow(QDialog):
             if update_base_stock_routines(code, name, []):
                 ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}({routine_name})")
-
-        report_path = write_blocked_action_report("루틴해제", blocked_items)
 
         if removed_items:
             append_changelog(
@@ -1916,15 +1973,6 @@ class StockRegisterWindow(QDialog):
             else:
                 blocked_items.append(item)
 
-        blocked_report_items: list[dict[str, object]] = []
-        for item in blocked_items:
-            code = str(item.get("code", "")).strip()
-            name = str(item.get("name", "")).strip()
-            info = routine_action_guard_info(code, name)
-            info["reasons"] = item.get("reasons", [])
-            blocked_report_items.append(info)
-        blocked_report_path = write_blocked_action_report("종목삭제", blocked_report_items)
-
         if blocked_items and not immediate_items and not force_items:
             show_toast(self, f"종목삭제 0종목 | 삭제불가 {len(blocked_items)}종목")
             return
@@ -1932,15 +1980,14 @@ class StockRegisterWindow(QDialog):
         selected_force_items: list[dict[str, object]] = []
         if force_items or blocked_items:
             dialog = ForceUnregisterConfirmDialog(
-                immediate_items=immediate_items,
+                parent=self,
                 force_items=force_items,
                 blocked_items=blocked_items,
-                blocked_report_path=blocked_report_path,
-                parent=self,
+                immediate_count=len(immediate_items),
             )
             if dialog.exec_() != QDialog.Accepted:
                 return
-            selected_force_items = dialog.selected_force_items()
+            selected_force_items = dialog.selected_items()
 
         archive_root = ARCHIVED_STOCKS_DIR
         archive_root.mkdir(exist_ok=True)
@@ -2202,19 +2249,6 @@ class StockRegisterWindow(QDialog):
         )
         dialog.exec_()
         self.refresh_stock_table()
-
-    def open_latest_blocked_report(self) -> None:
-        report_path = latest_blocked_action_report_path()
-        if report_path is None:
-            QMessageBox.information(
-                self,
-                "처리불가 리포트",
-                "아직 생성된 처리불가 리포트가 없습니다.",
-            )
-            return
-
-        dialog = BlockedActionReportViewDialog(report_path, self)
-        dialog.exec_()
 
     def is_duplicate_stock(self, code: str, name: str) -> bool:
         stocks = read_base_stocks()

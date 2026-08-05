@@ -4747,6 +4747,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.addCleanup(window.close)
         window.show()
         QApplication.processEvents()
+        window._set_integrity_status_text("로컬 무결성 통과 | 서버 정합성 미확인")
+        QApplication.processEvents()
         window._position_stock_performance_sort_badges()
         QApplication.processEvents()
 
@@ -4810,6 +4812,32 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(["count", "rate", "amount", "efficiency"], list(sort_buttons.keys()))
         header = window.stock_table.horizontalHeader()
         badge_container = window._stock_performance_sort_badge_container
+        integrity_container = window._integrity_status_container
+        integrity_icon = window.integrity_status_icon_label
+        integrity_label = window.integrity_status_label
+        self.assertIs(integrity_container.parentWidget(), window)
+        self.assertTrue(integrity_container.isVisible())
+        self.assertLess(window.stock_search_input.geometry().right(), integrity_container.x())
+        self.assertLess(integrity_container.geometry().right(), badge_container.x())
+        status_layout = integrity_container.layout()
+        margins = status_layout.contentsMargins()
+        self.assertEqual((18, 0, 0, 0), (margins.left(), margins.top(), margins.right(), margins.bottom()))
+        self.assertEqual(6, status_layout.spacing())
+        self.assertEqual((20, stock_register_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT), (integrity_icon.width(), integrity_icon.height()))
+        self.assertEqual("✓", integrity_icon.text())
+        self.assertIn("#15803d", integrity_icon.styleSheet())
+        icon_x = integrity_icon.mapTo(window, QPoint(0, 0)).x()
+        self.assertLess(icon_x - window.stock_search_input.geometry().right(), 33)
+        self.assertGreaterEqual(icon_x - window.stock_search_input.geometry().right(), 24)
+        self.assertIs(integrity_label.parentWidget(), integrity_container)
+        self.assertTrue(integrity_label.isVisible())
+        self.assertTrue(integrity_label.alignment() & Qt.AlignLeft)
+        self.assertTrue(integrity_label.alignment() & Qt.AlignVCenter)
+        self.assertLess(integrity_icon.geometry().right(), integrity_label.x())
+        self.assertLess(integrity_label.geometry().right(), badge_container.x())
+        label_center_y = integrity_label.mapTo(window, integrity_label.rect().center()).y()
+        self.assertLess(abs(label_center_y - window.stock_search_input.geometry().center().y()), 4)
+        self.assertLess(abs(label_center_y - badge_container.geometry().center().y()), 4)
         self.assertIs(badge_container.parentWidget(), window)
         self.assertLess(window.stock_search_input.geometry().right(), badge_container.x())
         self.assertLess(badge_container.geometry().bottom(), window.stock_table.y())
@@ -4817,7 +4845,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         buttons = [
             window.btn_search_register,
             window.btn_manual_register,
-            window.btn_blocked_report,
             window.btn_delete_stock,
             window.btn_close,
         ]
@@ -4830,7 +4857,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             if label.text() == "검색"
         )
         expected_search_width = max(
-            360,
+            240,
             min(
                 window.stock_search_input.fontMetrics().horizontalAdvance(
                     window.stock_search_input.placeholderText()
@@ -4838,8 +4865,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 + 28,
                 button_width
                 - search_label.sizeHint().width()
+                - window._integrity_status_reserved_width()
                 - badge_container.width()
-                - (window.layout().spacing() * 3),
+                - (window.layout().spacing() * 4),
             ),
         )
         self.assertEqual(expected_search_width, window.stock_search_input.width())
@@ -5373,7 +5401,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
             patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment") as exclusion,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=None),
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5437,7 +5464,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
             patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5449,8 +5475,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(2, update_instance.call_count)
         ensure_single.assert_any_call("111111", "가능1", "지표추종매매")
         ensure_single.assert_any_call("222222", "가능2", "지표추종매매")
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴등록 2종목 | 등록불가 2종목")
 
     def test_stock_register_routine_assign_all_blocked_toasts_without_backend(self) -> None:
@@ -5470,7 +5494,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5482,8 +5505,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         update_instance.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(2, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 2종목")
 
     def test_routine_policy_blocks_emergency_registration_even_when_unassigned(self) -> None:
@@ -5563,7 +5584,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5575,8 +5595,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         update_instance.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
 
     def test_stock_register_routine_assign_blocks_review_before_writer(self) -> None:
@@ -5606,7 +5624,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5618,8 +5635,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         update_instance.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
 
     def test_stock_register_routine_assign_mixed_selection_blocks_emergency_only(self) -> None:
@@ -5668,7 +5683,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
             patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
         ):
@@ -5789,7 +5803,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routines") as update,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -5802,8 +5815,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         update.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
 
     def test_stock_register_unassign_blocks_review_before_writer(self) -> None:
@@ -5830,7 +5841,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routines") as update,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -5843,8 +5853,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         update.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
 
     def test_stock_register_delete_policy_blocks_review_with_common_helper(self) -> None:
@@ -5888,7 +5896,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     [("루틴A", Path("stocks") / "111111_검토")],
                 ),
             ),
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "ForceUnregisterConfirmDialog", return_value=dialog) as confirm_dialog,
             patch.object(stock_register_window, "stock_repository_factory") as repository_factory,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -5903,8 +5910,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             window.delete_selected_stock()
 
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         confirm_dialog.assert_not_called()
         repository_factory.assert_not_called()
         toast.assert_called_once_with(window, "종목삭제 0종목 | 삭제불가 1종목")
@@ -5935,7 +5940,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "routine_action_guard_info", side_effect=guard_info),
             patch.object(stock_register_window, "update_base_stock_routines", return_value=True) as update,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
@@ -5955,9 +5959,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         ensure_single.assert_any_call("111111", "가능1")
         ensure_single.assert_any_call("222222", "가능2")
-        report.assert_called_once()
-        self.assertEqual("루틴해제", report.call_args.args[0])
-        self.assertEqual(3, len(report.call_args.args[1]))
         changelog.assert_called_once()
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 3종목")
@@ -5980,7 +5981,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 side_effect=lambda code, name: {"code": code, "name": name, "routine_name": "루틴A"},
             ),
             patch.object(stock_register_window, "update_base_stock_routines") as update,
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=Path("blocked.txt")) as report,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -5991,8 +5991,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         update.assert_not_called()
-        report.assert_called_once()
-        self.assertEqual(2, len(report.call_args.args[1]))
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 2종목")
 
@@ -6010,7 +6008,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(stock_register_window, "update_base_stock_routines", return_value=True) as update,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock"),
-            patch.object(stock_register_window, "write_blocked_action_report", return_value=None) as report,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
@@ -6022,7 +6019,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         self.assertEqual(2, update.call_count)
-        report.assert_called_once_with("루틴해제", [])
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 0종목")
 
