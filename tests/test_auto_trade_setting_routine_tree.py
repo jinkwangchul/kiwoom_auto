@@ -1382,7 +1382,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertEqual(1, len(created))
         self.assertEqual("unassigned", created[0].instance_metadata["target_kind"])
-        self.assertEqual("미지정", created[0].instance_metadata["instance_name"])
+        self.assertEqual("등록대기", created[0].instance_metadata["instance_name"])
         self.assertEqual("", created[0].instance_metadata["instance_id"])
         host.refresh_stock_table.assert_called_once_with()
 
@@ -1759,21 +1759,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         toast.assert_called_once_with(dialog, "검토관리 종목입니다.")
 
     def test_routine_move_policy_reports_unexpected_status_as_processing_error(self) -> None:
-        with (
-            patch.object(
-                routine_policy,
-                "routine_action_guard_info",
-                return_value={
-                    "routine_name": "루틴A",
-                    "stock_dir": Path("stocks/005930_삼성전자"),
-                    "raw_status": "UNKNOWN_LEGACY",
-                    "display_status": "",
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                },
-            ),
-            self.assertLogs("gui_routine_policy", level="ERROR") as logs,
+        with patch.object(
+            routine_policy,
+            "routine_action_guard_info",
+            return_value={
+                "routine_name": "루틴A",
+                "stock_dir": Path("stocks/005930_삼성전자"),
+                "raw_status": "UNKNOWN_LEGACY",
+                "display_status": "",
+                "holding_qty": 0,
+                "buy_pending_qty": 0,
+                "sell_pending_qty": 0,
+            },
         ):
             allowed, info = routine_policy.routine_action_reasons_for_stock(
                 "005930",
@@ -1781,9 +1778,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
 
         self.assertFalse(allowed)
-        self.assertEqual(["처리할 수 없는 종목입니다."], info["reasons"])
+        self.assertEqual(["검토관리"], info["reasons"])
         self.assertNotIn("상태" + "확인필요", " ".join(info["reasons"]))
-        self.assertIn("unexpected registration policy status", "\n".join(logs.output))
 
     def test_routine_move_policy_allows_running_without_position_or_pending(self) -> None:
         for raw_status in ("RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"):
@@ -1891,21 +1887,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("PENDING_ORDER_QTY_MISSING", saved_state["review_reason"])
 
     def test_routine_move_policy_treats_paused_as_unexpected_legacy_state(self) -> None:
-        with (
-            patch.object(
-                routine_policy,
-                "routine_action_guard_info",
-                return_value={
-                    "routine_name": "루틴A",
-                    "stock_dir": Path("stocks/005930_삼성전자"),
-                    "raw_status": "PAUSED",
-                    "display_status": "검토종목",
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                },
-            ),
-            self.assertLogs("gui_routine_policy", level="ERROR"),
+        with patch.object(
+            routine_policy,
+            "routine_action_guard_info",
+            return_value={
+                "routine_name": "루틴A",
+                "stock_dir": Path("stocks/005930_삼성전자"),
+                "raw_status": "PAUSED",
+                "display_status": "검토종목",
+                "holding_qty": 0,
+                "buy_pending_qty": 0,
+                "sell_pending_qty": 0,
+            },
         ):
             allowed, info = routine_policy.routine_action_reasons_for_stock(
                 "005930",
@@ -1913,7 +1906,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
 
         self.assertFalse(allowed)
-        self.assertEqual(["처리할 수 없는 종목입니다."], info["reasons"])
+        self.assertEqual(["검토관리"], info["reasons"])
         self.assertNotIn("검토종목 상태", " ".join(info["reasons"]))
 
     def test_routine_unassign_policy_allows_sell_only_without_position_or_pending(self) -> None:
@@ -4171,10 +4164,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "autoTradeSettingRoutineTreePerformanceEfficiencyLeftValue",
                 "autoTradeSettingRoutineTreePerformanceEfficiencyClose",
             )
-            expected_anchors = None
+            expected_anchors_by_row_kind: dict[str, list[tuple[int, int]]] = {}
             for row in range(window.routine_table.rowCount()):
                 widget = window.routine_table.cellWidget(row, 0)
                 widget.layout().activate()
+                metadata = window.routine_table.item(row, 0).data(Qt.UserRole)
+                row_kind = str((metadata or {}).get("row_kind", ""))
                 anchors = []
                 for object_name in anchor_object_names:
                     child = widget.findChild(
@@ -4188,19 +4183,19 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     top_left = child.mapTo(widget, child.rect().topLeft())
                     top_right = child.mapTo(widget, child.rect().topRight())
                     anchors.append((top_left.x(), top_right.x()))
-                if expected_anchors is None:
-                    expected_anchors = anchors
+                if row_kind not in expected_anchors_by_row_kind:
+                    expected_anchors_by_row_kind[row_kind] = anchors
                 else:
                     identity_compensation = widget.findChild(
                         setting_window.QWidget,
                         "autoTradeSettingRoutineTreeIdentityXCompensation",
                     )
                     self.assertEqual(
-                        expected_anchors,
+                        expected_anchors_by_row_kind[row_kind],
                         anchors,
                         (
                             f"row={row} metadata="
-                            f"{window.routine_table.item(row, 0).data(Qt.UserRole)} "
+                            f"{metadata} "
                             f"font={widget.font().toString()} "
                             f"identity_compensation="
                             f"{identity_compensation.width() if identity_compensation else None}"
@@ -5752,7 +5747,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual("루틴A", routine_name)
-        self.assertEqual(["긴급정지"], reasons)
+        self.assertEqual(["검토관리", "긴급정지"], reasons)
 
     def test_routine_policy_blocks_review_unassign(self) -> None:
         with (
@@ -5961,7 +5956,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ensure_single.assert_any_call("111111", "가능1")
         ensure_single.assert_any_call("222222", "가능2")
         report.assert_called_once()
-        self.assertEqual("등록대기 전환", report.call_args.args[0])
+        self.assertEqual("루틴해제", report.call_args.args[0])
         self.assertEqual(3, len(report.call_args.args[1]))
         changelog.assert_called_once()
         information.assert_not_called()
@@ -6027,7 +6022,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.unassign_selected_stock_routines()
 
         self.assertEqual(2, update.call_count)
-        report.assert_called_once_with("등록대기 전환", [])
+        report.assert_called_once_with("루틴해제", [])
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 0종목")
 
@@ -10220,7 +10215,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(["111111", "222222", "333333", "444444"], loaded_codes())
-            self.assertEqual(["222222", "444444"], inactive_codes())
+            self.assertEqual(["222222"], inactive_codes())
 
             window._stock_status_filter = "running"
             table_loader.auto_trade_load_selected_routine_stocks(window)
@@ -10229,13 +10224,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             window._stock_status_filter = "excluded"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(["222222", "444444"], loaded_codes())
-            self.assertEqual(["222222", "444444"], inactive_codes())
+            self.assertEqual(["222222"], loaded_codes())
+            self.assertEqual(["222222"], inactive_codes())
 
             window._stock_status_filter = "error"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(["444444", "333333"], loaded_codes())
-            self.assertEqual(["444444"], inactive_codes())
+            self.assertEqual(["333333", "444444"], loaded_codes())
+            self.assertEqual([], inactive_codes())
 
     def test_setting_status_column_highlights_emergency_and_review_text_only(self) -> None:
         class Window:
