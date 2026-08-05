@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 """
 gui_stock_register_window.py
@@ -19,13 +19,14 @@ Windows GUI 창 클래스 정의 파일.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from datetime import date, datetime, timedelta
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QPoint
+from PyQt5.QtGui import QColor, QFont, QPalette
 from PyQt5.QtWidgets import (QFrame, 
     QApplication,
     QAbstractItemView,
@@ -49,6 +50,7 @@ from PyQt5.QtWidgets import (QFrame,
     QMessageBox,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QStyledItemDelegate,
@@ -60,12 +62,16 @@ from PyQt5.QtWidgets import (QFrame,
 )
 
 from integrity_checker import (
-    run_integrity_checks,
-    write_invalid_items_log,
+    LOCAL_STATUS_CHECK_ERROR,
+    LOCAL_STATUS_PASS,
+    LOCAL_STATUS_REVIEW_REQUIRED,
+    apply_integrity_review_required_issues,
+    run_local_stock_integrity_check,
 )
 from gui_table_utils import next_sort_order
 from gui_centered_checkbox_delegate import CenteredCheckBoxDelegate
 from gui_styles import (
+    TABLE_LIGHT_SELECTION_STYLE,
     apply_plain_table_header,
     apply_selected_routine_label_style,
 )
@@ -76,6 +82,7 @@ from gui_stock_data import (
     stock_runtime_dir_for_routine,
 )
 from gui_order_utils import (
+    pending_order_integrity_issue_codes,
     pending_order_side_quantities,
     order_value,
     order_status_display,
@@ -95,7 +102,6 @@ from gui_order_utils import (
 )
 from gui_order_status_window import OrderStatusWindow
 from gui_log_view_window import LogViewWindow
-from gui_integrity_check_window import IntegrityCheckWindow
 from gui_blocked_report_window import (
     BlockedActionReportViewDialog,
     blocked_items_preview,
@@ -117,14 +123,13 @@ from gui_config_utils import (
     default_orders,
     ensure_stock_runtime_files,
 )
-from gui_config_window import show_deferred_config_message
 from gui_force_unregister_dialog import ForceUnregisterConfirmDialog
 from gui_search_stock_register_dialog import SearchStockRegisterDialog
-from gui_routine_assign_window import (
-    RoutineAssignWindow,
-    RoutineUnassignConfirmDialog,
+from gui_auto_trade_utils import (
+    PENDING_INTEGRITY_USER_REASON,
+    auto_trade_unregister_category,
+    mark_pending_order_integrity_review_required,
 )
-from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_review_utils import (
     build_review_required_item,
     compact_time_text,
@@ -145,8 +150,19 @@ from gui_routine_policy import (
     classify_routine_assign_targets,
     can_unassign_active_routine_from_stock,
 )
+from gui_base_stock_service import update_base_stock_routine_instance
+from routine_instance_registry import (
+    load_persisted_routine_instances,
+    routine_definition_by_id,
+    RoutineDefinitionRecord,
+    RoutineInstanceRecord,
+)
 from stock_repository import repository as stock_repository_factory
-from gui_routine_service import ensure_single_real_trade_routine_for_stock
+from gui_routine_service import (
+    apply_default_operation_exclusion_for_new_running_assignment,
+    ensure_single_real_trade_routine_for_stock,
+)
+from gui_toast import show_toast
 from runtime_io import (
     read_json_dict,
     read_orders_data,
@@ -192,15 +208,19 @@ from gui_auto_trade_display import (
     auto_trade_setting_status_color,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
+    profit_loss_value_color,
     yes_no_display,
     display_status_text_for_gui,
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
 )
+from gui_auto_trade_integrity import is_review_protected_stock_dir
 from gui_auto_trade_setting_window import (
+    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+    AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+    AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
-    AutoTradeUnregisterConfirmDialog,
     ProfitLossEarlyCloseDialog,
     StockPolicyOverrideDialog,
     append_changelog,
@@ -209,6 +229,7 @@ from gui_auto_trade_setting_window import (
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
     auto_trade_setting_data_inconsistency_reasons,
+    auto_trade_setting_badge_stylesheet,
     auto_trade_setting_early_close_metadata_is_stale,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_effective_liquidation_method,
@@ -264,14 +285,27 @@ from gui_auto_trade_setting_window import (
     update_base_stock_routines,
     validate_base_stock_record,
 )
+from gui_main_table_loader import ROUTINE_INSTANCE_GRID_COLUMNS
 
-
+LOGGER = logging.getLogger(__name__)
+UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
+STOCK_REGISTER_PERFORMANCE_SORT_ROLES = {
+    "count": Qt.UserRole + 201,
+    "rate": Qt.UserRole + 202,
+    "amount": Qt.UserRole + 203,
+    "efficiency": Qt.UserRole + 204,
+}
+STOCK_REGISTER_PERFORMANCE_SORT_LABELS = {
+    "count": "횟수",
+    "rate": "손익",
+    "amount": "금액",
+    "efficiency": "효율",
+}
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCK_LIBRARY_PATH = PROJECT_ROOT / "stock_library.json"
 ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
-INVALID_ITEMS_LOG_PATH = PROJECT_ROOT / "invalid_items.log"
 GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
 BLOCKED_ACTION_REPORT_DIR = PROJECT_ROOT / "reports" / "blocked_actions"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
@@ -341,8 +375,8 @@ def pending_routine_names_for_stock(
     assigned_routines: list[str],
 ) -> list[str]:
     """
-    중앙 종목관리 에는 현재 루틴 등록이 없지만,
-    루틴 폴더 안에 종목 저장 폴더가 남아 있는 경우 등록대기로 표시한다.
+    중앙 종목관리에는 현재 루틴 등록이 없지만
+    루틴 폴더 안에 종목 대상 폴더가 남아 있는 경우 등록대기로 표시한다.
     """
     assigned_set = {routine.strip() for routine in assigned_routines if routine.strip()}
     pending: list[str] = []
@@ -359,19 +393,11 @@ def pending_routine_names_for_stock(
     return pending
 
 
-
-
-
-
-
-
-
 def stock_runtime_dirs_for_stock(code: str, name: str) -> list[tuple[str, Path]]:
     """
-    해당 종목이 배정된 중앙 runtime 폴더를 반환한다.
+    해당 종목에 배정된 중앙 runtime 폴더를 반환한다.
     """
     return assigned_runtime_dirs_for_stock(code, name)
-
 
 
 def runtime_delete_block_reasons(stock_dir: Path) -> list[str]:
@@ -407,13 +433,11 @@ def runtime_delete_block_reasons(stock_dir: Path) -> list[str]:
     return reasons
 
 
-
-
 def routine_status_color(status: str) -> str:
     """
     루틴별 상태 점 색상을 반환한다.
 
-    자동매매설정 창 상태 색상과 같은 팔레트를 사용해 상태별 식별성을 맞춘다.
+    자동매매설정 창 상태 색상과 같은 팔레트를 사용해 상태별 연결성을 맞춘다.
     """
     normalized = display_status_text_for_gui(status)
     if normalized == "대기":
@@ -425,7 +449,7 @@ def routine_status_color(status: str) -> str:
 
 def create_routine_status_widget(status_lines: list[tuple[str, str]]) -> QWidget:
     """
-    연결 루틴 셀에 넣을 상태 위젯을 생성한다.
+    연결 루틴 목록을 상태 점열로 생성한다.
     색상 점과 루틴명을 분리해 시인성을 높인다.
     """
     container = QWidget()
@@ -499,33 +523,61 @@ def stock_register_unavailable_reason(code: str, name: str) -> tuple[str, str, l
     force_reasons: list[str] = []
     blocked_reasons: list[str] = []
 
-    allowed_statuses = {"STOPPED", "STOP", "MONITORING", "WATCHING", ""}
-    blocked_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+    known_statuses = {
+        "STOPPED",
+        "STOP",
+        "MONITORING",
+        "WATCHING",
+        "",
+        "RUNNING",
+        "STARTED",
+        "AUTO",
+        "TRADING",
+        "SELL_ONLY",
+        "EMERGENCY_STOP",
+        "EMERGENCY_STOPPED",
+    }
 
     for routine_name, stock_dir in runtime_dirs:
         state = read_json_dict(stock_dir / "state.json")
         raw_status = str(state.get("status", "STOPPED")).strip().upper()
-        display_status = display_status_text_for_gui(raw_status)
 
         try:
             holding_qty = int(state.get("holding_qty", 0) or 0)
         except Exception:
             holding_qty = 0
 
-        buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
-
         routine_prefix = f"{routine_name}: "
 
-        if raw_status in blocked_statuses:
-            blocked_reasons.append(f"{routine_prefix}{display_status} 상태")
+        if is_review_protected_stock_dir(stock_dir):
+            blocked_reasons.append(f"{routine_prefix}검토관리")
             continue
 
-        if raw_status not in allowed_statuses:
-            blocked_reasons.append(f"{routine_prefix}{display_status or '상태확인필요'} 상태")
+        buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
+
+        if raw_status not in known_statuses:
+            LOGGER.error(
+                "unexpected stock-register unregister policy status: %s code=%s name=%s routine=%s stock_dir=%s",
+                raw_status,
+                code,
+                name,
+                routine_name,
+                stock_dir,
+            )
+            blocked_reasons.append(f"{routine_prefix}{UNEXPECTED_STATUS_REASON}")
             continue
 
         if buy_pending_qty == "?" or sell_pending_qty == "?":
-            blocked_reasons.append(f"{routine_prefix}미체결 확인 필요")
+            issue_codes = pending_order_integrity_issue_codes(stock_dir, state)
+            mark_pending_order_integrity_review_required(
+                routine_name,
+                stock_dir,
+                code,
+                name,
+                issue_codes,
+                source="종목등록 창 미체결 데이터 무결성 오류",
+            )
+            blocked_reasons.append(f"{routine_prefix}{PENDING_INTEGRITY_USER_REASON}")
             continue
 
         pending_parts: list[str] = []
@@ -535,14 +587,11 @@ def stock_register_unavailable_reason(code: str, name: str) -> tuple[str, str, l
             pending_parts.append(f"매도미결 {sell_pending_qty}")
 
         if holding_qty > 0 or pending_parts:
-            force_reason = f"{routine_prefix}{display_status}"
             details: list[str] = []
             if holding_qty > 0:
                 details.append(f"보유 {holding_qty}")
             details.extend(pending_parts)
-            if details:
-                force_reason += f" / {', '.join(details)}"
-            force_reasons.append(force_reason)
+            force_reasons.append(f"{routine_prefix}{', '.join(details)}")
 
     if blocked_reasons:
         return "blocked", title, blocked_reasons, runtime_dirs
@@ -550,70 +599,396 @@ def stock_register_unavailable_reason(code: str, name: str) -> tuple[str, str, l
     if force_reasons:
         return "force", title, force_reasons, runtime_dirs
 
-    return "immediate", title, ["정지/감시중, 보유·미체결 없음"], runtime_dirs
-
-
-
-
+    return "immediate", title, ["보유·미체결 없음"], runtime_dirs
 
 
 def active_stock_register_status_display(code: str, name: str, routine_name: str) -> str:
     """
-    종목등록설정 창의 운영상태 표시용 문구를 반환한다.
+    종목관리 창의 운영자 관점 운영 단계 표시용 문구를 반환한다.
 
     원칙:
-    - 루틴 미등록 종목은 미지정으로 표시한다.
-    - 루틴 등록 종목은 자동매매설정 창과 동일하게 state.json 상태를 사용자 표시명으로 변환한다.
-    - SELL_ONLY 등 내부값은 화면에 직접 노출하지 않는다.
+    - 루틴 미연결 종목은 미지정으로 표시한다.
+    - 검토관리/긴급정지는 생명주기 보호 상태로 우선 표시한다.
+    - 루틴 등록 종목은 기존 매매시작 판정으로 운영중/운영정지를 표시한다.
     """
     routine_name = str(routine_name).strip()
-    if not routine_name or routine_name == "미등록":
+    if not routine_name or routine_name in {"미등록", "등록대기"}:
         return "미지정"
 
     stock_dir = stock_runtime_dir_for_routine(routine_name, code, name)
     if stock_dir is None:
-        return "미생성"
+        return "운영정지"
 
     state_path = stock_dir / "state.json"
     if not state_path.exists():
-        return auto_trade_status_display("STOPPED")
+        return "검토종목"
 
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
-        return "오류"
+        return "검토종목"
 
-    return auto_trade_status_display(state.get("status", "STOPPED"))
+    display_status = auto_trade_status_display(state.get("status", "STOPPED"))
+    if display_status == "검토종목":
+        return "검토종목"
+    if display_status == "긴급정지":
+        return "긴급정지"
+    if auto_trade_setting_trade_started(state):
+        return "운영중"
+    return "운영정지"
+
+
+def stock_register_operation_status_color(display_status: str) -> str | None:
+    normalized = str(display_status or "").strip()
+    if normalized == "운영중":
+        return auto_trade_status_color("매수/매도")
+    if normalized == "운영정지":
+        return auto_trade_status_color("감시전용")
+    if normalized == "미지정":
+        return None
+    return auto_trade_status_color(normalized)
+
+
+def stock_register_operation_status_renderer_source(display_status: str) -> str | None:
+    normalized = str(display_status or "").strip()
+    if normalized == "미지정":
+        return None
+    if normalized == "운영중":
+        return "매수/매도"
+    if normalized == "운영정지":
+        return "감시/대기"
+    return normalized
+
+
+def stock_register_operation_status_rank(display_status: str) -> int:
+    normalized = str(display_status or "").strip()
+    return {
+        "미지정": 0,
+        "운영정지": 1,
+        "운영중": 2,
+        "긴급정지": 3,
+        "검토종목": 4,
+    }.get(normalized, 99)
+
+class StockRegisterPerformanceAdapter:
+    _routine_tree_stock_performance_source = (
+        AutoTradeSettingWindow._routine_tree_stock_performance_source
+    )
+    _routine_tree_performance_texts = (
+        AutoTradeSettingWindow._routine_tree_performance_texts
+    )
+
+
+_STOCK_REGISTER_PERFORMANCE_ADAPTER = StockRegisterPerformanceAdapter()
+
+
+def _parenthesized_value(text: object) -> str:
+    normalized = str(text or "").strip()
+    if "(" not in normalized or not normalized.endswith(")"):
+        return ""
+    return normalized.split("(", 1)[1][:-1]
+
+
+def _signed_text_numeric_value(text: object) -> float:
+    normalized = str(text or "").strip()
+    for token in (",", "%", "원", "+"):
+        normalized = normalized.replace(token, "")
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def stock_register_performance_value_color(text: object) -> str:
+    value = _signed_text_numeric_value(text)
+    if value == 0:
+        return ""
+    return profit_loss_value_color(value)
+
+
+def _stock_register_performance_text_width(font_metrics, text: str) -> int:
+    return max(
+        font_metrics.horizontalAdvance(text),
+        font_metrics.boundingRect(text).width(),
+    )
+
+
+def stock_register_performance_widths(font_metrics) -> dict[str, int]:
+    return {
+        "count_prefix": _stock_register_performance_text_width(font_metrics, "횟수("),
+        "count_value": _stock_register_performance_text_width(font_metrics, "99,999"),
+        "rate_prefix": _stock_register_performance_text_width(font_metrics, "손익("),
+        "rate_value": _stock_register_performance_text_width(font_metrics, "-999.99%"),
+        "amount_prefix": _stock_register_performance_text_width(font_metrics, "금액("),
+        "amount_value": _stock_register_performance_text_width(font_metrics, "-999,999,999원"),
+        "efficiency_prefix": _stock_register_performance_text_width(font_metrics, "효율("),
+        "efficiency_value": _stock_register_performance_text_width(font_metrics, "999.9"),
+        "close": _stock_register_performance_text_width(font_metrics, ")"),
+        "separator": _stock_register_performance_text_width(font_metrics, " | "),
+    }
+
+
+def stock_register_performance_display_widths(font_metrics) -> dict[str, int]:
+    widths = stock_register_performance_widths(font_metrics)
+    return {
+        **widths,
+        "count_value": _stock_register_performance_text_width(font_metrics, "9,999"),
+        "rate_value": _stock_register_performance_text_width(font_metrics, "-99.99%"),
+        "separator": _stock_register_performance_text_width(font_metrics, " | ") + 8,
+    }
+
+
+def stock_register_performance_slot_widths(font_metrics) -> dict[str, int]:
+    widths = stock_register_performance_display_widths(font_metrics)
+    return {
+        "count": widths["count_prefix"] + widths["count_value"] + widths["close"],
+        "rate": widths["rate_prefix"] + widths["rate_value"] + widths["close"],
+        "amount": widths["amount_prefix"] + widths["amount_value"] + widths["close"],
+        "efficiency": (
+            widths["efficiency_prefix"]
+            + widths["efficiency_value"]
+            + widths["close"]
+        ),
+        "separator": widths["separator"],
+    }
+
+
+def stock_register_performance_column_width(font_metrics) -> int:
+    widths = stock_register_performance_widths(font_metrics)
+    return (
+        widths["count_prefix"]
+        + widths["count_value"]
+        + widths["close"]
+        + widths["separator"]
+        + widths["rate_prefix"]
+        + widths["rate_value"]
+        + widths["close"]
+        + widths["separator"]
+        + widths["amount_prefix"]
+        + widths["amount_value"]
+        + widths["close"]
+        + widths["separator"]
+        + widths["efficiency_prefix"]
+        + widths["efficiency_value"]
+        + widths["close"]
+        + 12
+    )
+
+
+def stock_register_performance_display(stock: dict[str, object]) -> dict[str, object]:
+    code = str(stock.get("code", "") or "").strip()
+    name = str(stock.get("name", "") or "").strip()
+    source_stock = {
+        **stock,
+        "stock_code": code,
+        "stock_name": name,
+        "is_current": True,
+    }
+    texts = _STOCK_REGISTER_PERFORMANCE_ADAPTER._routine_tree_performance_texts(
+        [source_stock],
+        {},
+    )
+    count_text = _parenthesized_value(texts.get("performance_period_text")) or "0"
+    profit_text = _parenthesized_value(texts.get("performance_profit_text"))
+    amount_text = "0"
+    rate_text = "0.00%"
+    if " / " in profit_text:
+        amount_text, rate_text = [part.strip() for part in profit_text.split(" / ", 1)]
+    elif profit_text:
+        amount_text = profit_text
+    efficiency_text = _parenthesized_value(texts.get("performance_efficiency_text")) or "0.0"
+    display_text = (
+        f"횟수({count_text}) | 손익({rate_text}) | "
+        f"금액({amount_text}원) | 효율({efficiency_text})"
+    )
+    tooltip_parts = [
+        str(texts.get("performance_period_text", "") or ""),
+        str(texts.get("performance_profit_text", "") or ""),
+        str(texts.get("performance_average_text", "") or ""),
+        str(texts.get("performance_efficiency_text", "") or ""),
+    ]
+    return {
+        "text": display_text,
+        "tooltip": "\n".join(part for part in tooltip_parts if part),
+        "sort": float(texts.get("performance_profit_sort_value", 0.0) or 0.0),
+        "sort_count": _signed_text_numeric_value(count_text),
+        "sort_rate": _signed_text_numeric_value(rate_text),
+        "sort_amount": _signed_text_numeric_value(amount_text),
+        "sort_efficiency": _signed_text_numeric_value(efficiency_text),
+        "color": str(texts.get("performance_profit_color", "") or ""),
+        "count": count_text,
+        "rate": rate_text,
+        "amount": f"{amount_text}원",
+        "efficiency": efficiency_text,
+    }
+
+
+def stock_register_performance_summary_display(stocks: list[dict[str, object]]) -> dict[str, object]:
+    source_stocks = []
+    for stock in stocks:
+        code = str(stock.get("code", "") or "").strip()
+        name = str(stock.get("name", "") or "").strip()
+        source_stocks.append(
+            {
+                **stock,
+                "stock_code": code,
+                "stock_name": name,
+                "is_current": True,
+            }
+        )
+    texts = _STOCK_REGISTER_PERFORMANCE_ADAPTER._routine_tree_performance_texts(
+        source_stocks,
+        {},
+    )
+    profit_text = _parenthesized_value(texts.get("performance_profit_text"))
+    amount_text = "0"
+    rate_text = "0.00%"
+    if " / " in profit_text:
+        amount_text, rate_text = [part.strip() for part in profit_text.split(" / ", 1)]
+    elif profit_text:
+        amount_text = profit_text
+    efficiency_text = _parenthesized_value(texts.get("performance_efficiency_text")) or "0.0"
+    return {
+        "rate": rate_text,
+        "amount": f"{amount_text}원",
+        "efficiency": efficiency_text,
+        "tooltip": "\n".join(
+            part
+            for part in (
+                str(texts.get("performance_profit_text", "") or ""),
+                str(texts.get("performance_average_text", "") or ""),
+                str(texts.get("performance_efficiency_text", "") or ""),
+            )
+            if part
+        ),
+    }
+
+
+def stock_register_performance_widget(performance: dict[str, object]) -> QWidget:
+    widget = QWidget()
+    widget.setFocusPolicy(Qt.NoFocus)
+    widget.setAttribute(Qt.WA_StyledBackground, True)
+    widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    widget.setToolTip(str(performance.get("tooltip", "") or ""))
+    widget.setStyleSheet("background: transparent;")
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(2, 0, 0, 0)
+    layout.setSpacing(0)
+    widths = stock_register_performance_display_widths(widget.fontMetrics())
+    layout.addStretch(1)
+
+    def add_label(
+        text: str,
+        width: int,
+        alignment: Qt.AlignmentFlag,
+        color: str = "",
+        object_name: str = "",
+    ) -> None:
+        label = QLabel(text)
+        if object_name:
+            label.setObjectName(object_name)
+        label.setAlignment(alignment)
+        label.setWordWrap(False)
+        label.setFixedWidth(width)
+        label.setFocusPolicy(Qt.NoFocus)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setToolTip(str(performance.get("tooltip", "") or ""))
+        if color:
+            label.setStyleSheet(f"background: transparent; color: {color};")
+        else:
+            label.setStyleSheet("background: transparent;")
+        layout.addWidget(label, 0, Qt.AlignVCenter)
+
+    rate = str(performance.get("rate", "") or "")
+    amount = str(performance.get("amount", "") or "")
+    add_label(
+        "횟수(",
+        widths["count_prefix"],
+        Qt.AlignLeft | Qt.AlignVCenter,
+        object_name="stockRegisterPerformanceBlockStart",
+    )
+    add_label(str(performance.get("count", "0")), widths["count_value"], Qt.AlignRight | Qt.AlignVCenter)
+    add_label(")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+    add_label(" | ", widths["separator"], Qt.AlignCenter, object_name="stockRegisterPerformanceSepProfit")
+    add_label("손익(", widths["rate_prefix"], Qt.AlignLeft | Qt.AlignVCenter, object_name="stockRegisterPerformanceRateStart")
+    add_label(rate, widths["rate_value"], Qt.AlignRight | Qt.AlignVCenter, stock_register_performance_value_color(rate))
+    add_label(")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+    add_label(" | ", widths["separator"], Qt.AlignCenter, object_name="stockRegisterPerformanceSepAmount")
+    add_label("금액(", widths["amount_prefix"], Qt.AlignLeft | Qt.AlignVCenter, object_name="stockRegisterPerformanceAmountStart")
+    add_label(amount, widths["amount_value"], Qt.AlignRight | Qt.AlignVCenter, stock_register_performance_value_color(amount))
+    add_label(")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+    add_label(" | ", widths["separator"], Qt.AlignCenter, object_name="stockRegisterPerformanceSepEfficiency")
+    add_label("효율(", widths["efficiency_prefix"], Qt.AlignLeft | Qt.AlignVCenter, object_name="stockRegisterPerformanceEfficiencyStart")
+    add_label(str(performance.get("efficiency", "0.0")), widths["efficiency_value"], Qt.AlignRight | Qt.AlignVCenter)
+    add_label(
+        ")",
+        widths["close"],
+        Qt.AlignLeft | Qt.AlignVCenter,
+        object_name="stockRegisterPerformanceBlockEnd",
+    )
+    return widget
+
+def stock_register_routine_display_name(stock: dict[str, object]) -> str:
+    assigned_instance_id = str(stock.get("assigned_routine_instance_id", "") or "").strip()
+    if assigned_instance_id:
+        for instance in load_persisted_routine_instances():
+            if str(getattr(instance, "instance_id", "") or "").strip() == assigned_instance_id:
+                instance_name = str(getattr(instance, "display_name", "") or "").strip()
+                if instance_name:
+                    return instance_name
+
+        stored_instance_name = str(stock.get("routine_instance_name", "") or "").strip()
+        if stored_instance_name:
+            return stored_instance_name
+
+    routines = stock.get("routines", [])
+    if isinstance(routines, list):
+        routine_list = [str(item).strip() for item in routines if str(item).strip()]
+    else:
+        routine_text_raw = str(routines).strip()
+        routine_list = [routine_text_raw] if routine_text_raw else []
+    return routine_list[0] if routine_list else "등록대기"
 
 
 class StockRegisterWindow(QDialog):
     """
-    종목등록설정 창.
+    종목관리 창.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self.setWindowTitle("종목관리")
-        self.resize(860, 560)
 
         self.stock_search_input = QLineEdit()
-        self.stock_search_input.setPlaceholderText("목록 필터: 코드, 종목명, 루틴명, 상태")
+        self.stock_search_input.setPlaceholderText("검색어 입력: 종목코드, 종목명, 연결 루틴, 운영상태")
         self.stock_table = QTableWidget()
+        self._stock_performance_sort_key = "amount"
+        self._stock_performance_sort_order = Qt.DescendingOrder
+        self._stock_performance_sort_buttons: dict[str, QPushButton] = {}
+        self._stock_performance_summary_labels: dict[str, QLabel] = {}
+        self._integrity_auto_check_started = False
+        self._last_integrity_check_result: dict[str, object] | None = None
+        self._last_integrity_toast_message = ""
+        self.integrity_status_label = QLabel("")
+        self.integrity_status_label.setObjectName("stockRegisterIntegrityStatusLabel")
+        self.integrity_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.integrity_status_label.setMinimumWidth(220)
+        self.integrity_status_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
 
-        self.btn_search_register = QPushButton("검색식등록")
+        self.btn_search_register = QPushButton("검색등록")
         self.btn_search_register.setEnabled(False)
-        self.btn_search_register.setToolTip("키움 조건검색식 연동 단계에서 구현 예정입니다.")
-        self.btn_manual_register = QPushButton("수동등록")
-        self.btn_manual_register.setToolTip("종목 라이브러리에서 직접 선택 등록합니다.")
-        self.btn_routine_assign = QPushButton("매매루틴지정")
-        self.btn_integrity_check = QPushButton("무결성검증")
+        self.btn_search_register.setToolTip("검색 결과에서 선택한 종목을 등록합니다.")
+        self.btn_manual_register = QPushButton("종목등록")
+        self.btn_manual_register.setToolTip("종목명 또는 종목코드를 직접 입력하여 등록합니다.")
         self.btn_blocked_report = QPushButton("처리불가 리포트")
-        self.btn_delete_stock = QPushButton("선택 종목 삭제")
+        self.btn_delete_stock = QPushButton("종목삭제")
         self.btn_delete_stock.setEnabled(False)
         self.btn_close = QPushButton("닫기")
 
         self._setup_ui()
+        self._resize_to_stock_table_columns()
+        QTimer.singleShot(0, self._ensure_stock_table_viewport_width)
         self._connect_events()
         self.refresh_stock_table()
         self.stock_table.clearSelection()
@@ -622,14 +997,13 @@ class StockRegisterWindow(QDialog):
     def _setup_ui(self) -> None:
         main_layout = QVBoxLayout()
         button_layout = QHBoxLayout()
+        self._stock_register_button_layout = button_layout
 
         self._setup_stock_table()
 
         buttons = [
             self.btn_search_register,
             self.btn_manual_register,
-            self.btn_routine_assign,
-            self.btn_integrity_check,
             self.btn_blocked_report,
             self.btn_delete_stock,
             self.btn_close,
@@ -640,14 +1014,359 @@ class StockRegisterWindow(QDialog):
             button_layout.addWidget(button)
 
         header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel("검색"))
+        search_label = QLabel("검색")
+        header_layout.addWidget(search_label)
         header_layout.addWidget(self.stock_search_input)
-        self.stock_search_input.setMinimumWidth(360)
+        self._setup_stock_performance_sort_badges()
+        button_spacing = max(0, button_layout.spacing())
+        button_width = (
+            sum(button.sizeHint().width() for button in buttons)
+            + max(0, len(buttons) - 1) * button_spacing
+        )
+        header_spacing = max(0, header_layout.spacing())
+        available_search_width = (
+            button_width
+            - search_label.sizeHint().width()
+            - self._stock_performance_sort_badge_container.width()
+            - (header_spacing * 3)
+        )
+        search_width = (
+            self.stock_search_input.fontMetrics().horizontalAdvance(
+                self.stock_search_input.placeholderText()
+            )
+            + 28
+        )
+        self.stock_search_input.setFixedWidth(max(360, min(search_width, available_search_width)))
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.integrity_status_label, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self._stock_performance_sort_badge_container, 0, Qt.AlignVCenter)
 
         main_layout.addLayout(header_layout)
         main_layout.addWidget(self.stock_table)
+        self._setup_stock_performance_summary_bar()
+        main_layout.addWidget(self._stock_performance_summary_bar)
         main_layout.addLayout(button_layout)
         self.setLayout(main_layout)
+
+    def _setup_stock_performance_summary_bar(self) -> None:
+        bar = QWidget(self)
+        bar.setObjectName("stockRegisterPerformanceSummaryBar")
+        bar.setFocusPolicy(Qt.NoFocus)
+        bar.setAttribute(Qt.WA_StyledBackground, True)
+        bar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        bar.setMinimumWidth(0)
+        bar.setStyleSheet("background: transparent; border: 0;")
+        content = QWidget(bar)
+        content.setObjectName("stockRegisterPerformanceSummaryContent")
+        content.setFocusPolicy(Qt.NoFocus)
+        content.setAttribute(Qt.WA_StyledBackground, True)
+        content.setStyleSheet("background: transparent; border: 0;")
+        layout = QHBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        labels: dict[str, QLabel] = {}
+        widths = stock_register_performance_display_widths(bar.fontMetrics())
+        slots = stock_register_performance_slot_widths(bar.fontMetrics())
+
+        def add_label(
+            key: str,
+            text: str,
+            width: int,
+            alignment: Qt.AlignmentFlag = Qt.AlignCenter,
+        ) -> QLabel:
+            label = QLabel(text, content)
+            label.setObjectName(f"stockRegisterPerformanceSummary{key.title()}")
+            label.setFocusPolicy(Qt.NoFocus)
+            label.setAlignment(alignment)
+            label.setFixedWidth(width)
+            label.setStyleSheet("background: transparent;")
+            layout.addWidget(label, 0, Qt.AlignVCenter)
+            labels[key] = label
+            return label
+
+        title_slot = QWidget(content)
+        title_slot.setObjectName("stockRegisterPerformanceSummaryTitleSlot")
+        title_slot.setFocusPolicy(Qt.NoFocus)
+        title_slot.setAttribute(Qt.WA_StyledBackground, True)
+        title_slot.setFixedWidth(slots["count"])
+        title_slot.setStyleSheet("background: transparent; border: 0;")
+        title_slot_layout = QHBoxLayout(title_slot)
+        title_slot_layout.setContentsMargins(0, 0, 0, 0)
+        title_slot_layout.setSpacing(0)
+        title_slot_layout.addStretch(1)
+        title_label = QLabel("전체결산", title_slot)
+        title_label.setObjectName("stockRegisterPerformanceSummaryTitle")
+        title_label.setFocusPolicy(Qt.NoFocus)
+        title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_width = max(64, title_label.fontMetrics().horizontalAdvance("전체결산") + 20)
+        title_label.setFixedSize(title_width, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        title_label.setStyleSheet(
+            auto_trade_setting_badge_stylesheet(
+                "QLabel",
+                text_color=AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+                border_color=AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+            )
+        )
+        title_slot_layout.addWidget(title_label, 0, Qt.AlignVCenter)
+        title_slot_layout.addStretch(1)
+        layout.addWidget(title_slot, 0, Qt.AlignVCenter)
+        labels["title"] = title_label
+        labels["title_slot"] = title_slot
+        add_label("sep_profit", "│", widths["separator"], Qt.AlignCenter)
+        add_label("profit_prefix", "손익(", widths["rate_prefix"], Qt.AlignLeft | Qt.AlignVCenter)
+        add_label("profit", "0.00%", widths["rate_value"], Qt.AlignRight | Qt.AlignVCenter)
+        add_label("profit_close", ")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+        add_label("sep_amount", "│", widths["separator"], Qt.AlignCenter)
+        add_label("amount_prefix", "금액(", widths["amount_prefix"], Qt.AlignLeft | Qt.AlignVCenter)
+        add_label("amount", "0원", widths["amount_value"], Qt.AlignRight | Qt.AlignVCenter)
+        add_label("amount_close", ")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+        add_label("sep_efficiency", "│", widths["separator"], Qt.AlignCenter)
+        add_label("efficiency_prefix", "효율(", widths["efficiency_prefix"], Qt.AlignLeft | Qt.AlignVCenter)
+        add_label("efficiency", "0.0", widths["efficiency_value"], Qt.AlignRight | Qt.AlignVCenter)
+        add_label("efficiency_close", ")", widths["close"], Qt.AlignLeft | Qt.AlignVCenter)
+
+        self._stock_performance_summary_bar = bar
+        self._stock_performance_summary_content = content
+        self._stock_performance_summary_labels = labels
+        content.setFixedSize(layout.sizeHint())
+        bar.setFixedHeight(content.height())
+        self._position_stock_performance_summary_content()
+
+    def _update_stock_performance_summary_bar(self, stocks: list[dict[str, object]]) -> None:
+        labels = getattr(self, "_stock_performance_summary_labels", {})
+        if not labels:
+            return
+        summary = stock_register_performance_summary_display(stocks)
+        rate = str(summary.get("rate", "0.00%") or "0.00%")
+        amount = str(summary.get("amount", "0원") or "0원")
+        efficiency = str(summary.get("efficiency", "0.0") or "0.0")
+        tooltip = str(summary.get("tooltip", "") or "")
+        labels["profit"].setText(rate)
+        labels["amount"].setText(amount)
+        labels["efficiency"].setText(efficiency)
+        labels["profit"].setStyleSheet(
+            f"background: transparent; color: {stock_register_performance_value_color(rate)};"
+            if stock_register_performance_value_color(rate)
+            else "background: transparent;"
+        )
+        labels["amount"].setStyleSheet(
+            f"background: transparent; color: {stock_register_performance_value_color(amount)};"
+            if stock_register_performance_value_color(amount)
+            else "background: transparent;"
+        )
+        labels["efficiency"].setStyleSheet("background: transparent;")
+        for label in labels.values():
+            label.setToolTip(tooltip)
+        self._position_stock_performance_summary_content()
+
+    def _position_stock_performance_summary_content(self) -> None:
+        bar = getattr(self, "_stock_performance_summary_bar", None)
+        content = getattr(self, "_stock_performance_summary_content", None)
+        if bar is None or content is None:
+            return
+        x = bar.width() - content.width()
+        labels = getattr(self, "_stock_performance_summary_labels", {})
+        summary_profit_label = labels.get("profit_prefix") if isinstance(labels, dict) else None
+        body_profit_label = None
+        table = getattr(self, "stock_table", None)
+        if table is not None:
+            for row in range(table.rowCount()):
+                widget = table.cellWidget(row, 4)
+                if widget is None:
+                    continue
+                body_profit_label = widget.findChild(QLabel, "stockRegisterPerformanceRateStart")
+                if body_profit_label is not None:
+                    break
+        if body_profit_label is not None and summary_profit_label is not None:
+            body_profit_x = body_profit_label.mapTo(self, QPoint(0, 0)).x()
+            bar_x = bar.mapTo(self, QPoint(0, 0)).x()
+            x = body_profit_x - bar_x - summary_profit_label.x()
+        y = max(0, (bar.height() - content.height()) // 2)
+        content.move(x, y)
+
+    def _setup_stock_performance_sort_badges(self) -> None:
+        container = QWidget(self)
+        container.setObjectName("stockRegisterPerformanceSortBadges")
+        container.setFocusPolicy(Qt.NoFocus)
+        container.setAttribute(Qt.WA_StyledBackground, True)
+        container.setStyleSheet("background: transparent;")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        buttons: dict[str, QPushButton] = {}
+        for key in ("count", "rate", "amount", "efficiency"):
+            button = QPushButton(container)
+            button.setObjectName(f"stockRegisterPerformanceSort{key.title()}Badge")
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            button.setMinimumSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+            button.setMaximumSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+            button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+            button.clicked.connect(
+                lambda _checked=False, target_key=key:
+                self.set_stock_performance_sort(target_key)
+            )
+            layout.addWidget(button, 0, Qt.AlignVCenter)
+            buttons[key] = button
+
+        container.setFixedSize(layout.sizeHint())
+        self._stock_performance_sort_badge_container = container
+        self._stock_performance_sort_buttons = buttons
+        self._update_stock_performance_sort_badges()
+
+    def _position_stock_performance_sort_badges(self) -> None:
+        return
+    def _update_stock_performance_sort_badges(self) -> None:
+        selected_key = str(getattr(self, "_stock_performance_sort_key", "amount") or "amount")
+        for key, button in getattr(self, "_stock_performance_sort_buttons", {}).items():
+            active = key == selected_key
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            label = STOCK_REGISTER_PERFORMANCE_SORT_LABELS.get(key, key)
+            button.setText(label)
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+            )
+
+    def set_stock_performance_sort(self, key: str) -> None:
+        normalized = str(key or "").strip()
+        if normalized not in STOCK_REGISTER_PERFORMANCE_SORT_ROLES:
+            return
+        if normalized == self._stock_performance_sort_key:
+            self._stock_performance_sort_order = (
+                Qt.AscendingOrder
+                if self._stock_performance_sort_order == Qt.DescendingOrder
+                else Qt.DescendingOrder
+            )
+        else:
+            self._stock_performance_sort_key = normalized
+            self._stock_performance_sort_order = Qt.DescendingOrder
+        self._apply_stock_performance_sort_role()
+        self._update_stock_performance_sort_badges()
+        self.stock_table.sortItems(4, self._stock_performance_sort_order)
+        self.stock_table.horizontalHeader().setSortIndicatorShown(False)
+        self._position_stock_performance_sort_badges()
+
+    def _apply_stock_performance_sort_role(self) -> None:
+        source_role = STOCK_REGISTER_PERFORMANCE_SORT_ROLES.get(
+            str(getattr(self, "_stock_performance_sort_key", "amount") or "amount"),
+            STOCK_REGISTER_PERFORMANCE_SORT_ROLES["amount"],
+        )
+        for row in range(self.stock_table.rowCount()):
+            item = self.stock_table.item(row, 4)
+            if item is not None:
+                item.setData(SORT_ROLE, item.data(source_role) or 0.0)
+
+    def _resize_to_stock_table_columns(self) -> None:
+        self._unlock_stock_register_width()
+        table_width = (
+            self.stock_table.verticalHeader().width()
+            + sum(
+                self.stock_table.columnWidth(column)
+                for column in range(self.stock_table.columnCount())
+            )
+            + (self.stock_table.frameWidth() * 2)
+            + self.stock_table.verticalScrollBar().sizeHint().width()
+        )
+        buttons = [
+            self.btn_search_register,
+            self.btn_manual_register,
+            self.btn_blocked_report,
+            self.btn_delete_stock,
+            self.btn_close,
+        ]
+        layout = self.layout()
+        layout_margins = layout.contentsMargins() if layout is not None else None
+        layout_horizontal_margin = (
+            layout_margins.left() + layout_margins.right()
+            if layout_margins is not None
+            else 0
+        )
+        button_spacing = self._stock_register_button_layout.spacing()
+        button_width = (
+            sum(button.sizeHint().width() for button in buttons)
+            + max(0, len(buttons) - 1) * max(0, button_spacing)
+        )
+        border_width = max(0, self.frameGeometry().width() - self.geometry().width())
+        required_width = max(table_width, button_width) + layout_horizontal_margin + border_width
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available_width = screen.availableGeometry().width()
+            if available_width > 0:
+                required_width = min(required_width, available_width)
+        self.resize(required_width, 560)
+        self._position_stock_performance_sort_badges()
+
+    def _ensure_stock_table_viewport_width(self) -> None:
+        if not self.isVisible():
+            QTimer.singleShot(0, self._ensure_stock_table_viewport_width)
+            return
+        self._unlock_stock_register_width()
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        screen = QApplication.primaryScreen()
+        available_width = 0
+        if screen is not None:
+            available_width = screen.availableGeometry().width()
+        column_width = sum(
+            self.stock_table.columnWidth(column)
+            for column in range(self.stock_table.columnCount())
+        )
+        viewport_deficit = column_width - self.stock_table.viewport().width()
+        if viewport_deficit > 0 and (available_width <= 0 or self.width() < available_width):
+            corrected_width = self.width() + viewport_deficit
+            if available_width > 0:
+                corrected_width = min(corrected_width, available_width)
+            self.resize(corrected_width, self.height())
+        self._position_stock_performance_sort_badges()
+        self._lock_stock_register_width()
+
+    def _unlock_stock_register_width(self) -> None:
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(16777215)
+
+    def _lock_stock_register_width(self) -> None:
+        width = self.width()
+        if width > 0:
+            self.setMinimumWidth(width)
+            self.setMaximumWidth(width)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._position_stock_performance_sort_badges()
+        self._position_stock_performance_summary_content()
+        QTimer.singleShot(0, self._position_stock_performance_sort_badges)
+        QTimer.singleShot(0, self._position_stock_performance_summary_content)
+        if not self._integrity_auto_check_started:
+            self._integrity_auto_check_started = True
+            QTimer.singleShot(0, self.run_initial_integrity_check)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_stock_performance_sort_badges()
+        self._position_stock_performance_summary_content()
+
+    def _sync_stock_table_body_background(self) -> str:
+        body_color = self.stock_table.viewport().palette().color(QPalette.Base)
+        for widget in (self.stock_table.verticalHeader(), self.stock_table.verticalHeader().viewport()):
+            palette = widget.palette()
+            for role in (QPalette.Button, QPalette.Window, QPalette.Base):
+                palette.setColor(role, body_color)
+            widget.setPalette(palette)
+            widget.setAutoFillBackground(True)
+        return body_color.name()
 
     def _setup_stock_table(self) -> None:
         headers = [
@@ -655,44 +1374,170 @@ class StockRegisterWindow(QDialog):
             "종목명",
             "연결 루틴",
             "운영상태",
-            "검증상태",
+            "실적",
         ]
 
         self.stock_table.setColumnCount(len(headers))
         self.stock_table.setHorizontalHeaderLabels(headers)
         self.stock_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.stock_table.horizontalHeader().setStretchLastSection(True)
-        self.stock_table.setShowGrid(True)
+        self.stock_table.horizontalHeader().setStretchLastSection(False)
+        self.stock_table.setShowGrid(False)
+        self.stock_table.setFrameShape(QFrame.NoFrame)
         self.stock_table.setColumnWidth(0, 105)
         self.stock_table.setColumnWidth(1, 165)
         self.stock_table.setColumnWidth(2, 250)
         self.stock_table.setColumnWidth(3, 120)
-        self.stock_table.setColumnWidth(4, 120)
+        self.stock_table.setColumnWidth(
+            4,
+            stock_register_performance_column_width(self.stock_table.fontMetrics()),
+        )
         self.stock_table.setWordWrap(False)
         self.stock_table.verticalHeader().setDefaultSectionSize(42)
+        body_background = self._sync_stock_table_body_background()
         self.stock_table.setStyleSheet(
-            "QHeaderView::section { border-bottom: 1px solid #c8c8c8; }"
-            "QTableWidget { gridline-color: #d6d6d6; }"
+            f"QTableWidget {{ background: {body_background}; border: 0; }}"
+            f"QTableWidget::viewport {{ background: {body_background}; border: 0; }}"
+            f"QHeaderView {{ background: {body_background}; border: 0; }}"
+            f"QHeaderView::section {{ background: {body_background}; border: 0; }}"
+            f"QHeaderView::section:vertical {{ "
+            f"background: {body_background}; "
+            "border: 0; "
+            "}"
+            f"QTableCornerButton::section {{ "
+            f"background: {body_background}; "
+            "border: 0; "
+            "}"
+            + TABLE_LIGHT_SELECTION_STYLE
         )
+        self.stock_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stock_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.stock_table.setSortingEnabled(True)
-        self.stock_table.horizontalHeader().setSortIndicatorShown(True)
+        self.stock_table.horizontalHeader().setSortIndicatorShown(False)
         self.stock_table.setContextMenuPolicy(Qt.CustomContextMenu)
 
     def _connect_events(self) -> None:
         self.btn_close.clicked.connect(self.close)
         self.btn_manual_register.clicked.connect(self.open_manual_register_dialog)
-        self.btn_routine_assign.clicked.connect(self.open_routine_assign_window)
-        self.btn_integrity_check.clicked.connect(self.open_integrity_check_window)
         self.btn_blocked_report.clicked.connect(self.open_latest_blocked_report)
         self.btn_delete_stock.clicked.connect(self.delete_selected_stock)
         self.stock_search_input.textChanged.connect(self.refresh_stock_table)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
         self.stock_table.itemClicked.connect(self.on_stock_table_item_clicked)
-        self.stock_table.itemDoubleClicked.connect(self.open_routine_assign_for_stock)
         self.stock_table.customContextMenuRequested.connect(self.show_stock_table_context_menu)
+
+    def _set_integrity_status_text(self, message: str) -> None:
+        self.integrity_status_label.setText(message)
+        self.integrity_status_label.setToolTip(message)
+
+    def _show_integrity_toast(self, message: str) -> None:
+        self._last_integrity_toast_message = message
+        parent = self.parent()
+        popup = getattr(parent, "showAutoTradePopupMessage", None)
+        if callable(popup):
+            popup(message)
+            return
+        show_toast(self, message, duration_ms=2500, position="bottom_right")
+
+    def _review_writer_callback(self):
+        parent = self.parent()
+        writer = getattr(parent, "mark_review_required", None)
+        return writer if callable(writer) else None
+
+    def _review_required_stock_summary(self, result: dict[str, object]) -> str:
+        issues = result.get("issues", [])
+        names: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        if isinstance(issues, list):
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                if issue.get("requires_review") is not True:
+                    continue
+                if str(issue.get("execution_status", "") or "").strip().upper() != LOCAL_STATUS_REVIEW_REQUIRED:
+                    continue
+                code = str(issue.get("stock_code", "") or "").strip()
+                name = str(issue.get("stock_name", "") or "").strip()
+                key = (code, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                title = f"{code} {name}".strip()
+                if title:
+                    names.append(title)
+        if not names:
+            return "검토관리 대상 종목 있음"
+        if len(names) == 1:
+            return f"검토관리 {names[0]}"
+        return f"검토관리 {names[0]} 외 {len(names) - 1}종목"
+
+    def _integrity_writer_failed(self, result: dict[str, object]) -> bool:
+        issues = result.get("issues", [])
+        if not isinstance(issues, list):
+            return False
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            if str(issue.get("issue_code", "") or "").strip() == "CHECK_ERROR" and "Review writer failed" in str(issue.get("message", "") or ""):
+                return True
+        return False
+
+    def run_initial_integrity_check(self) -> None:
+        self._set_integrity_status_text("무결성 검사 중...")
+        try:
+            result = run_local_stock_integrity_check(PROJECT_ROOT)
+            checked_count = int(result.get("checked_stock_count", 0) or 0)
+            local_status = str(result.get("local_status", "") or "").strip().upper()
+
+            if checked_count == 0:
+                self._last_integrity_check_result = result
+                self._set_integrity_status_text("검사 대상 종목 없음")
+                self._show_integrity_toast("검사 대상 종목이 없습니다.")
+                return
+
+            if local_status == LOCAL_STATUS_REVIEW_REQUIRED:
+                writer = self._review_writer_callback()
+                if writer is None:
+                    self._last_integrity_check_result = result
+                    self._set_integrity_status_text("무결성 문제 발견 | 검토관리 반영 실패")
+                    self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
+                    return
+
+                result = apply_integrity_review_required_issues(
+                    result,
+                    project_root=PROJECT_ROOT,
+                    review_writer=writer,
+                    source="무결성검사",
+                )
+                self._last_integrity_check_result = result
+                self.refresh_stock_table()
+                if self._integrity_writer_failed(result):
+                    self._set_integrity_status_text("무결성 문제 발견 | 검토관리 반영 실패")
+                    self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
+                    return
+                self._set_integrity_status_text(self._review_required_stock_summary(result))
+                self._show_integrity_toast("무결성 검사 완료 | 검토관리 대상 종목이 있습니다.")
+                return
+
+            self._last_integrity_check_result = result
+            if local_status == LOCAL_STATUS_CHECK_ERROR:
+                self._set_integrity_status_text("무결성 검사 실패")
+                self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
+                return
+
+            if local_status == LOCAL_STATUS_PASS:
+                self._set_integrity_status_text("로컬 무결성 통과 | 서버 정합성 미확인")
+                self._show_integrity_toast("로컬 무결성 검사 완료 | 서버 정합성 검사는 실행하지 않았습니다.")
+                return
+
+            self._set_integrity_status_text("무결성 검사 실패")
+            self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
+        except Exception:
+            LOGGER.exception("Stock register integrity auto check failed")
+            self._set_integrity_status_text("무결성 검사 실패")
+            self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
 
 
     def on_stock_selection_changed(self) -> None:
@@ -705,7 +1550,7 @@ class StockRegisterWindow(QDialog):
 
         itemClicked 시그널 연결은 유지하되, 실제 삭제 버튼 활성화 여부는
         현재 선택 상태를 기준으로 다시 계산한다.
-        더블클릭으로 매매루틴지정 창을 여는 기존 동작은 변경하지 않는다.
+        더블클릭으로 매매루틴등록 창을 여는 기존 동작은 변경하지 않는다.
         """
         self.on_stock_selection_changed()
 
@@ -726,7 +1571,31 @@ class StockRegisterWindow(QDialog):
         menu.addSeparator()
         action_delete = menu.addAction("종목삭제")
         menu.addSeparator()
-        action_assign = menu.addAction("루틴등록")
+        routine_actions: dict[object, tuple[RoutineInstanceRecord, RoutineDefinitionRecord]] = {}
+        routine_targets = self.available_routine_assign_targets()
+        if routine_targets:
+            action_assign = menu.addMenu("루틴등록")
+            grouped_targets: dict[str, tuple[RoutineDefinitionRecord, list[RoutineInstanceRecord]]] = {}
+            for instance, definition in routine_targets:
+                key = str(definition.definition_id)
+                if key not in grouped_targets:
+                    grouped_targets[key] = (definition, [])
+                grouped_targets[key][1].append(instance)
+
+            for _key, (definition, instances) in sorted(
+                grouped_targets.items(),
+                key=lambda item: str(item[1][0].display_name),
+            ):
+                if routine_actions:
+                    action_assign.addSeparator()
+                group_action = action_assign.addAction(f"● {definition.display_name}")
+                group_action.setEnabled(False)
+                for instance in sorted(instances, key=lambda item: str(item.display_name)):
+                    action = action_assign.addAction(f"    {instance.display_name}")
+                    action.setData(str(instance.instance_id))
+                    routine_actions[action] = (instance, definition)
+        else:
+            action_assign = menu.addAction("루틴등록")
         action_unassign = menu.addAction("루틴해제")
 
         has_selected = selected_count > 0
@@ -738,8 +1607,9 @@ class StockRegisterWindow(QDialog):
         if selected_action is None:
             return
 
-        if selected_action == action_assign:
-            self.confirm_open_routine_assign_from_context_menu()
+        if selected_action in routine_actions:
+            instance, definition = routine_actions[selected_action]
+            self.assign_selected_stocks_to_routine_instance(instance, definition)
         elif selected_action == action_unassign:
             self.unassign_selected_stock_routines()
         elif selected_action == action_delete:
@@ -750,101 +1620,130 @@ class StockRegisterWindow(QDialog):
             self.stock_table.clearSelection()
             self.on_stock_selection_changed()
 
-    def confirm_open_routine_assign_from_context_menu(self) -> None:
-        """
-        종목등록설정 창 우클릭 루틴 지정 진입 전 확인창을 표시한다.
+    def available_routine_assign_targets(self) -> list[tuple[RoutineInstanceRecord, RoutineDefinitionRecord]]:
+        targets: list[tuple[RoutineInstanceRecord, RoutineDefinitionRecord]] = []
+        for instance in load_persisted_routine_instances():
+            definition = routine_definition_by_id(instance.definition_id)
+            if definition is not None:
+                targets.append((instance, definition))
+        return targets
 
-        우클릭으로 선택한 전체 종목 수와 실제 자동 체크 대상 수를 분리해서 안내한다.
-        매매루틴지정 창에는 루틴 지정 가능 종목만 자동 체크 대상으로 전달되므로,
-        확인창에서도 "선택 종목 전체를 넘긴다"는 식의 오해 소지가 없도록 표시한다.
-        """
+    def assign_selected_stocks_to_routine_instance(
+        self,
+        selected_instance: RoutineInstanceRecord,
+        selected_definition: RoutineDefinitionRecord,
+    ) -> None:
         selected_stocks = self.selected_registered_stocks()
         if not selected_stocks:
-            QMessageBox.warning(
-                self,
-                "선택 오류",
-                "루틴 지정할 종목을 1개 이상 선택하세요.",
-            )
+            QMessageBox.warning(self, "선택 오류", "등록할 종목을 1개 이상 선택하세요.")
             return
 
-        assignable_stocks, blocked_items = classify_routine_assign_targets(selected_stocks)
-        selected_count = len(selected_stocks)
-        assignable_count = len(assignable_stocks)
-        blocked_count = len(blocked_items)
+        selected_routine_name = selected_instance.display_name
+        selected_routine_type = selected_definition.display_name
+        applied_items: list[str] = []
+        created_paths: list[str] = []
+        blocked_items: list[dict[str, object]] = []
+        skipped_items: list[str] = []
 
-        def build_stock_preview(stocks: list[tuple[str, str]], limit: int = 10) -> str:
-            if not stocks:
-                return "- 없음"
-            lines = [f"- {code} {name}" for code, name in stocks[:limit]]
-            if len(stocks) > limit:
-                lines.append(f"- ... 외 {len(stocks) - limit}개")
-            return "\n".join(lines)
+        for code, name in selected_stocks:
+            stocks = read_base_stocks()
+            existing_routine_list: list[str] = []
+            for stock in stocks:
+                if str(stock.get("code", "")).strip() == code and str(stock.get("name", "")).strip() == name:
+                    routines = stock.get("routines", [])
+                    if isinstance(routines, list):
+                        existing_routine_list = [str(item).strip() for item in routines if str(item).strip()]
+                    break
 
-        def blocked_reason_text(item: dict[str, object]) -> str:
-            reason = str(item.get("reason", "")).strip()
-            status = str(item.get("status_display", item.get("status", ""))).strip()
-            holding_qty = int(item.get("holding_qty", 0) or 0)
-            pending_qty = int(item.get("pending_qty", 0) or 0)
+            if existing_routine_list:
+                skipped_items.append(f"{code} {name}: 기존 루틴({', '.join(existing_routine_list)})")
+                continue
 
-            details: list[str] = []
-            if reason:
-                details.append(reason)
-            if status:
-                details.append(f"상태: {status}")
-            if holding_qty:
-                details.append(f"보유: {holding_qty}")
-            if pending_qty:
-                details.append(f"미체결: {pending_qty}")
-            return " / ".join(details) if details else "루틴 지정 제한"
+            can_process, guard_info = routine_action_reasons_for_stock(code, name, allow_unassigned=True)
+            if not can_process:
+                blocked_items.append(guard_info)
+                continue
 
-        blocked_preview_lines: list[str] = []
-        for item in blocked_items[:10]:
-            code = str(item.get("code", "")).strip()
-            name = str(item.get("name", "")).strip()
-            blocked_preview_lines.append(f"- {code} {name} ({blocked_reason_text(item)})")
-        if blocked_count > 10:
-            blocked_preview_lines.append(f"- ... 외 {blocked_count - 10}개")
-        blocked_preview = "\n".join(blocked_preview_lines) if blocked_preview_lines else "- 없음"
+            if not is_valid_stock_code(code):
+                skipped_items.append(f"{code} {name}: 종목코드 오류")
+                continue
 
-        if assignable_count <= 0:
-            QMessageBox.information(
-                self,
-                "루틴 지정 대상 없음",
-                f"선택 종목: {selected_count}개\n\n"
-                f"[루틴 지정 가능 종목: 0개]\n"
-                "- 없음\n\n"
-                f"[루틴 지정 제한 종목: {blocked_count}개]\n"
-                f"{blocked_preview}\n\n"
-                "루틴 지정 가능한 종목이 없어 매매루틴지정 창을 열지 않습니다.",
+            library_stock = find_library_stock_by_code(code)
+            if library_stock is None or library_stock.get("name", "").strip() != name:
+                skipped_items.append(f"{code} {name}: 라이브러리 확인 실패")
+                continue
+
+            repo = stock_repository_factory()
+            resolved_stock_dir = repo.resolve_stock_dir(code, name)
+            previous_config = (
+                read_json_dict(resolved_stock_dir / "config.json")
+                if isinstance(resolved_stock_dir, Path)
+                else {}
             )
-            return
+            if not update_base_stock_routine_instance(
+                code,
+                name,
+                instance_id=selected_instance.instance_id,
+                instance_name=selected_instance.display_name,
+                definition_id=selected_definition.definition_id,
+                routine_type=selected_definition.display_name,
+            ):
+                skipped_items.append(f"{code} {name}: 저장 실패")
+                continue
 
-        message = (
-            f"선택 종목: {selected_count}개\n\n"
-            f"[루틴 지정 가능 종목: {assignable_count}개]\n"
-            f"{build_stock_preview(assignable_stocks)}\n\n"
-            f"[루틴 지정 제한 종목: {blocked_count}개]\n"
-            f"{blocked_preview}"
+            try:
+                stock_dir = repo.ensure_stock_folder(
+                    code,
+                    name,
+                    routine=selected_routine_type,
+                )
+                apply_default_operation_exclusion_for_new_running_assignment(
+                    self,
+                    stock_dir,
+                    previous_config,
+                )
+            except Exception:
+                skipped_items.append(f"{code} {name}: stocks 저장 실패")
+                continue
+
+            created_paths.append(str(stock_dir.relative_to(PROJECT_ROOT)))
+            ensure_single_real_trade_routine_for_stock(code, name, selected_routine_type)
+            applied_items.append(f"{code},{name}({selected_routine_name})")
+
+        report_path = write_blocked_action_report(
+            "루틴등록",
+            blocked_items,
+            target_routine=selected_routine_name,
         )
 
-        if blocked_count > 0:
-            message += "\n\n확인 후 창을 열면 제한 종목은 처리불가 리포트에 기록됩니다."
+        if applied_items:
+            append_changelog(
+                "UPDATE",
+                "PROJECT_CHANGELOG.txt",
+                f"종목관리 루틴등록: {' / '.join(applied_items)} -> {selected_routine_name}",
+            )
+        if created_paths:
+            append_changelog(
+                "ADD",
+                "종목 런타임",
+                f"종목 폴더 생성 및 기본 제외 적용: {' / '.join(created_paths)}",
+            )
 
-        message += "\n\n매매루틴지정 창을 여시겠습니까?"
+        self.refresh_stock_table()
+        self.stock_table.clearSelection()
+        self.btn_delete_stock.setEnabled(False)
 
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("루틴 지정 확인")
-        box.setText(message)
-        open_button = box.addButton("열기", QMessageBox.YesRole)
-        box.addButton("취소", QMessageBox.NoRole)
-        box.setDefaultButton(open_button)
-        box.exec_()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
+            parent.refresh_auto_trade_assignment_views()
+        elif parent is not None and hasattr(parent, "refresh_all"):
+            parent.refresh_all()
 
-        if box.clickedButton() != open_button:
-            return
-
-        self.confirm_and_open_routine_assign(selected_stocks)
+        unavailable_count = len(blocked_items) + len(skipped_items)
+        show_toast(
+            self,
+            f"루틴등록 {len(applied_items)}종목 | 등록불가 {unavailable_count}종목",
+        )
 
     def select_all_visible_stocks(self) -> None:
         """현재 화면에 표시된 모든 종목 행을 선택한다."""
@@ -858,7 +1757,7 @@ class StockRegisterWindow(QDialog):
         self.on_stock_selection_changed()
 
     def select_unassigned_visible_stocks(self) -> None:
-        """현재 화면에서 연결 루틴이 미등록인 종목만 선택한다."""
+        """현재 화면에서 연결 루틴이 등록대기인 종목만 선택한다."""
         self.stock_table.clearSelection()
         selection_model = self.stock_table.selectionModel()
         if selection_model is None:
@@ -866,7 +1765,7 @@ class StockRegisterWindow(QDialog):
         for row in range(self.stock_table.rowCount()):
             routine_item = self.stock_table.item(row, 2)
             routine_text = routine_item.text().strip() if routine_item is not None else ""
-            if routine_text != "미등록":
+            if routine_text != "등록대기":
                 continue
             index = self.stock_table.model().index(row, 0)
             selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
@@ -879,7 +1778,7 @@ class StockRegisterWindow(QDialog):
         """
         selected_stocks = self.selected_registered_stocks()
         if not selected_stocks:
-            QMessageBox.warning(self, "선택 오류", "루틴 해제할 종목을 1개 이상 선택하세요.")
+            QMessageBox.warning(self, "선택 오류", "루틴해제할 종목을 1개 이상 선택하세요.")
             return
 
         allowed: list[tuple[str, str, str]] = []
@@ -901,22 +1800,9 @@ class StockRegisterWindow(QDialog):
 
         if not allowed and not blocked_items:
             if skipped_unassigned:
-                QMessageBox.information(self, "루틴 해제 없음", "선택 종목은 이미 미등록 상태입니다.")
+                QMessageBox.information(self, "루틴해제 없음", "선택 종목은 이미 등록대기 상태입니다.")
             else:
-                QMessageBox.information(self, "루틴 해제 없음", "루틴 해제할 종목이 없습니다.")
-            return
-
-        first_routine_name = allowed[0][2] if allowed else ""
-        if not first_routine_name and blocked_items:
-            first_routine_name = str(blocked_items[0].get("routine_name", "")).strip()
-
-        confirm_dialog = RoutineUnassignConfirmDialog(
-            routine_name=first_routine_name or "선택 루틴",
-            removable_items=[(code, name) for code, name, _ in allowed],
-            blocked_items=blocked_items,
-            parent=self,
-        )
-        if confirm_dialog.exec_() != QDialog.Accepted:
+                QMessageBox.information(self, "루틴해제 없음", "루틴해제할 종목이 없습니다.")
             return
 
         removed_items: list[str] = []
@@ -925,13 +1811,13 @@ class StockRegisterWindow(QDialog):
                 ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}({routine_name})")
 
-        report_path = write_blocked_action_report("루틴 해제", blocked_items)
+        report_path = write_blocked_action_report("루틴해제", blocked_items)
 
         if removed_items:
             append_changelog(
                 "UPDATE",
                 "중앙 종목관리",
-                f"종목등록설정 루틴 해제: {' / '.join(removed_items)} / runtime 폴더 유지",
+                f"종목관리 루틴해제: {' / '.join(removed_items)} / runtime 폴더 유지",
             )
 
         self.refresh_stock_table()
@@ -944,26 +1830,14 @@ class StockRegisterWindow(QDialog):
         elif parent is not None and hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
-        result_lines = [f"루틴 해제 완료: {len(removed_items)}개"]
-        if blocked_items:
-            result_lines.append(f"해제 불가: {len(blocked_items)}개")
-            if report_path is not None:
-                result_lines.append(f"리포트: {report_path.name}")
-        if skipped_unassigned:
-            result_lines.append(f"이미 미등록: {len(skipped_unassigned)}개")
-
-        QMessageBox.information(self, "루틴 해제 결과", "\n".join(result_lines))
-
+        show_toast(
+            self,
+            f"루틴해제 {len(removed_items)}종목 | 해제불가 {len(blocked_items)}종목",
+        )
 
     def delete_selected_stock(self) -> None:
         """
-        선택 종목을 중앙 stocks/ 구조에서 등록해제한다.
-
-        정책:
-        - 기초종목 파일을 사용하지 않고 중앙 stocks/ 구조만 사용한다.
-        - 즉시 삭제 가능 종목은 stocks/종목폴더를 archive로 이동한다.
-        - 강제 등록해제 대상은 선택된 경우 state/orders 초기화 후 archive로 이동한다.
-        - 처리불가 종목은 삭제하지 않고 리포트에 기록한다.
+        선택 종목을 중앙 stocks에서 archive로 이동한다.
         """
         selected_rows = self.stock_table.selectionModel().selectedRows()
 
@@ -1000,7 +1874,7 @@ class StockRegisterWindow(QDialog):
             QMessageBox.warning(
                 self,
                 "삭제 오류",
-                "선택한 종목 중 정보를 읽을 수 없는 행이 있습니다.\n\n"
+                "선택한 종목의 코드 또는 이름을 확인할 수 없습니다.\n\n"
                 f"문제 행: {', '.join(str(row) for row in invalid_rows)}",
             )
             return
@@ -1009,11 +1883,10 @@ class StockRegisterWindow(QDialog):
             QMessageBox.warning(
                 self,
                 "선택 오류",
-                "삭제할 종목 정보를 찾지 못했습니다.",
+                "삭제할 종목의 정보를 찾을 수 없습니다.",
             )
             return
 
-        # 같은 종목 행이 중복 선택되는 경우를 방어한다.
         seen_stocks: set[tuple[str, str]] = set()
         unique_stocks: list[tuple[str, str]] = []
         for code, name in selected_stocks:
@@ -1043,7 +1916,6 @@ class StockRegisterWindow(QDialog):
             else:
                 blocked_items.append(item)
 
-        selected_force_items: list[dict[str, object]] = []
         blocked_report_items: list[dict[str, object]] = []
         for item in blocked_items:
             code = str(item.get("code", "")).strip()
@@ -1051,84 +1923,57 @@ class StockRegisterWindow(QDialog):
             info = routine_action_guard_info(code, name)
             info["reasons"] = item.get("reasons", [])
             blocked_report_items.append(info)
-        blocked_report_path = write_blocked_action_report("종목 삭제", blocked_report_items)
+        blocked_report_path = write_blocked_action_report("종목삭제", blocked_report_items)
 
+        if blocked_items and not immediate_items and not force_items:
+            show_toast(self, f"종목삭제 0종목 | 삭제불가 {len(blocked_items)}종목")
+            return
+
+        selected_force_items: list[dict[str, object]] = []
         if force_items or blocked_items:
             dialog = ForceUnregisterConfirmDialog(
-                self,
+                immediate_items=immediate_items,
                 force_items=force_items,
                 blocked_items=blocked_items,
-                immediate_count=len(immediate_items),
+                blocked_report_path=blocked_report_path,
+                parent=self,
             )
-            dialog_result = dialog.exec_()
-            if dialog_result == QDialog.Accepted:
-                selected_force_items = dialog.selected_items()
-            else:
-                selected_force_items = []
-                if not immediate_items and not force_items and blocked_items:
-                    return
-
-        process_items = immediate_items + selected_force_items
-
-        if not process_items:
-            if blocked_items or force_items:
-                QMessageBox.information(
-                    self,
-                    "삭제 없음",
-                    "삭제 처리할 종목이 선택되지 않았습니다.",
-                )
-            return
-
-        try:
-            repo = stock_repository_factory()
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "삭제 오류",
-                "중앙 stocks 종목관리 계층을 불러오지 못했습니다.",
-            )
-            return
+            if dialog.exec_() != QDialog.Accepted:
+                return
+            selected_force_items = dialog.selected_force_items()
 
         archive_root = ARCHIVED_STOCKS_DIR
         archive_root.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        force_targets = {(str(item["code"]), str(item["name"])) for item in selected_force_items}
         deleted_items: list[tuple[str, str]] = []
         delete_failed_items: list[str] = []
-        reset_failed_items: list[str] = []
+        items_to_delete = immediate_items + selected_force_items
+        repo = stock_repository_factory()
 
-        for item in process_items:
+        for item in items_to_delete:
             code = str(item.get("code", "")).strip()
             name = str(item.get("name", "")).strip()
-
-            if (code, name) in force_targets:
-                for routine_name, stock_dir in item.get("runtime_dirs", []):
-                    if not reset_runtime_state_for_force_unregister(stock_dir):
-                        reset_failed_items.append(f"{code} {name} / {routine_name}")
-                        continue
-                    append_stock_log(
-                        stock_dir,
-                        "FORCE_UNREGISTER_RESET",
-                        "강제 삭제로 state.json과 orders.json 현재 표시/판단값 초기화",
-                    )
-
-            if reset_failed_items:
-                continue
+            runtime_dirs = item.get("runtime_dirs", [])
+            if item in selected_force_items:
+                for _routine_name, stock_dir in runtime_dirs:
+                    if isinstance(stock_dir, Path):
+                        if not reset_runtime_state_for_force_unregister(stock_dir):
+                            delete_failed_items.append(f"{code} {name}: state 초기화 실패")
+                            continue
+                        if not reset_runtime_orders_for_force_unregister(stock_dir):
+                            delete_failed_items.append(f"{code} {name}: orders 초기화 실패")
+                            continue
 
             stock_dir = repo.resolve_stock_dir(code, name)
-            if not stock_dir.exists() or not stock_dir.is_dir():
+            if not stock_dir.exists():
                 delete_failed_items.append(f"{code} {name}: 중앙 stocks 폴더 없음")
                 continue
 
-            # 삭제 전 루틴 연결 필드를 먼저 비워 둔다.
             try:
-                repo.update_stock_routine(code, name, [])
-            except Exception:
-                pass
-
-            timestamp = now_text().replace("-", "").replace(":", "").replace(" ", "_")
-            archive_dir = archive_root / f"{stock_dir.name}_{timestamp}"
-            try:
+                if update_base_stock_routines(code, name, []):
+                    ensure_single_real_trade_routine_for_stock(code, name)
+                archive_dir = archive_root / f"{stock_dir.name}_{timestamp}"
                 if archive_dir.exists():
                     archive_dir = archive_root / f"{stock_dir.name}_{timestamp}_{len(deleted_items)+1}"
                 stock_dir.rename(archive_dir)
@@ -1136,39 +1981,21 @@ class StockRegisterWindow(QDialog):
             except Exception as exc:
                 delete_failed_items.append(f"{code} {name}: {exc}")
 
-        if reset_failed_items:
-            preview_text = "\n".join(reset_failed_items[:10])
-            if len(reset_failed_items) > 10:
-                preview_text += f"\n... 외 {len(reset_failed_items) - 10}개"
-            QMessageBox.warning(
-                self,
-                "상태 초기화 오류",
-                "일부 종목의 state.json 초기화에 실패했습니다.\n"
-                "중앙 종목관리 등록해제는 아직 저장하지 않았습니다.\n\n"
-                f"{preview_text}",
-            )
-            return
-
         if delete_failed_items:
             preview_text = "\n".join(delete_failed_items[:10])
             if len(delete_failed_items) > 10:
                 preview_text += f"\n... 외 {len(delete_failed_items) - 10}개"
             QMessageBox.warning(
                 self,
-                "삭제 일부 실패",
+                "종목삭제 일부 실패",
                 "일부 종목을 archive로 이동하지 못했습니다.\n\n"
                 f"{preview_text}",
             )
 
-        try:
+        if deleted_items:
             deleted_text = " / ".join(f"{code},{name}" for code, name in deleted_items)
-            force_text = " / ".join(f"{code},{name}" for code, name in sorted(force_targets))
             message = f"선택 종목 삭제: {deleted_text} / stocks 폴더 archive 이동"
-            if force_text:
-                message += f" / 강제 삭제 상태/주문표시 초기화: {force_text}"
-            append_changelog("UPDATE", "중앙 종목관리", message)
-        except Exception:
-            pass
+            append_changelog("DELETE", "중앙 종목관리", message)
 
         self.refresh_stock_table()
         self.stock_table.clearSelection()
@@ -1180,28 +2007,10 @@ class StockRegisterWindow(QDialog):
         elif parent is not None and hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
-        blocked_count = len(blocked_items)
-        force_skipped_count = len(force_items) - len(selected_force_items)
-        info_lines = [
-            f"삭제 완료: {len(deleted_items)}개",
-        ]
-        if selected_force_items:
-            info_lines.append(f"강제 삭제 및 상태/주문표시 초기화: {len(selected_force_items)}개")
-        if force_skipped_count > 0:
-            info_lines.append(f"선택하지 않아 유지: {force_skipped_count}개")
-        if blocked_count > 0:
-            info_lines.append(f"삭제 불가: {blocked_count}개")
-            if blocked_report_path is not None:
-                info_lines.append("처리불가 리포트 저장")
-        if delete_failed_items:
-            info_lines.append(f"삭제 실패: {len(delete_failed_items)}개")
-
-        result_message = " / ".join(info_lines)
-        if hasattr(parent, "statusBar"):
-            parent.statusBar().showMessage(result_message, 7000)
-        else:
-            QMessageBox.information(self, "등록해제 결과", result_message)
-
+        show_toast(
+            self,
+            f"종목삭제 {len(deleted_items)}종목 | 삭제불가 {len(blocked_items) + len(delete_failed_items)}종목",
+        )
 
     def selected_registered_stocks(self) -> list[tuple[str, str]]:
         """현재 화면에서 선택된 종목을 종목코드/종목명 기준으로 반환한다."""
@@ -1235,18 +2044,18 @@ class StockRegisterWindow(QDialog):
         def stock_matches(stock: dict[str, object], keyword: str) -> bool:
             code = str(stock.get("code", "")).strip().lower()
             name = str(stock.get("name", "")).strip().lower()
-            validation = str(stock.get("validation_status", "")).strip().lower()
             routines = stock.get("routines", [])
             routine_text = ",".join(str(item).strip().lower() for item in routines) if isinstance(routines, list) else str(routines).lower()
             routine_list = [str(item).strip() for item in routines if str(item).strip()] if isinstance(routines, list) else []
-            registered_routine = routine_list[0] if routine_list else "미등록"
-            operation_status = active_stock_register_status_display(code, name, registered_routine).lower()
+            registered_routine = stock_register_routine_display_name(stock).lower()
+            status_routine = routine_list[0] if routine_list else "등록대기"
+            operation_status = active_stock_register_status_display(code, name, status_routine).lower()
 
             searchable_values = [
                 code,
                 name,
-                validation,
                 routine_text,
+                registered_routine,
                 operation_status,
             ]
             return any(keyword in value for value in searchable_values)
@@ -1270,6 +2079,8 @@ class StockRegisterWindow(QDialog):
 
             stocks = filtered
 
+        self._update_stock_performance_summary_bar(stocks)
+
         sort_column = self.stock_table.horizontalHeader().sortIndicatorSection()
         sort_order = self.stock_table.horizontalHeader().sortIndicatorOrder()
 
@@ -1288,117 +2099,109 @@ class StockRegisterWindow(QDialog):
                 routine_text_raw = str(routines).strip()
                 routine_list = [routine_text_raw] if routine_text_raw else []
 
-            # 연결 루틴 컬럼은 중앙 종목관리에 실제 연결된 활성 루틴만 표시한다.
-            # 루틴 폴더에 남아 있는 과거 runtime 폴더나 상태값은 이 창에서 표시하지 않는다.
-            # 종목당 활성 루틴 1개 정책에 따라 첫 번째 루틴만 표시하고, 루틴이 없으면 미등록으로 표시한다.
-            registered_routine = routine_list[0] if routine_list else "미등록"
+            registered_routine = stock_register_routine_display_name(stock)
             routine_tooltip = registered_routine
-            operation_status = active_stock_register_status_display(code, name, registered_routine)
+            status_routine = routine_list[0] if routine_list else "등록대기"
+            operation_status = active_stock_register_status_display(code, name, status_routine)
+            performance = stock_register_performance_display(stock)
 
             values = [
                 code,
                 name,
                 registered_routine,
                 operation_status,
-                str(stock.get("validation_status", "정상")),
+                str(performance.get("text", "")),
             ]
 
             for col, value in enumerate(values):
                 if col == 3:
-                    if value == "미지정":
-                        item = QTableWidgetItem(value)
-                        item.setTextAlignment(Qt.AlignCenter)
-                    elif value in ("미생성", "오류"):
-                        item = QTableWidgetItem(value)
-                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    renderer_source = stock_register_operation_status_renderer_source(value)
+                    if renderer_source is None:
+                        item = SortableTableWidgetItem(value)
                     else:
-                        item = create_auto_trade_status_item(value)
-                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                        item = create_auto_trade_status_item(renderer_source)
+                        item.setText(item.text().replace(renderer_source, value))
+                        status_color = stock_register_operation_status_color(value)
+                        if status_color:
+                            item.setForeground(QColor(status_color))
+                    item.setData(SORT_ROLE, stock_register_operation_status_rank(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif col == 4:
+                    item = SortableTableWidgetItem("")
+                    item.setData(Qt.UserRole, value)
+                    item.setData(
+                        STOCK_REGISTER_PERFORMANCE_SORT_ROLES["count"],
+                        performance.get("sort_count", 0.0),
+                    )
+                    item.setData(
+                        STOCK_REGISTER_PERFORMANCE_SORT_ROLES["rate"],
+                        performance.get("sort_rate", 0.0),
+                    )
+                    item.setData(
+                        STOCK_REGISTER_PERFORMANCE_SORT_ROLES["amount"],
+                        performance.get("sort_amount", performance.get("sort", 0.0)),
+                    )
+                    item.setData(
+                        STOCK_REGISTER_PERFORMANCE_SORT_ROLES["efficiency"],
+                        performance.get("sort_efficiency", 0.0),
+                    )
+                    item.setData(SORT_ROLE, performance.get("sort_amount", performance.get("sort", 0.0)))
+                    item.setTextAlignment(Qt.AlignCenter)
                 else:
                     item = QTableWidgetItem(value)
                     item.setTextAlignment(Qt.AlignCenter)
-                item.setToolTip(routine_tooltip if col == 2 else value)
+                item.setToolTip(
+                    routine_tooltip
+                    if col == 2
+                    else str(performance.get("tooltip", "") or value)
+                    if col == 4
+                    else value
+                )
                 self.stock_table.setItem(row, col, item)
+                if col == 4:
+                    self.stock_table.setCellWidget(
+                        row,
+                        col,
+                        stock_register_performance_widget(performance),
+                    )
 
         self.stock_table.resizeRowsToContents()
+        self._apply_stock_performance_sort_role()
         self.stock_table.setSortingEnabled(True)
+        if sort_column == 4:
+            sort_order = self._stock_performance_sort_order
         if 0 <= sort_column < self.stock_table.columnCount():
             self.stock_table.sortItems(sort_column, sort_order)
+        self.stock_table.horizontalHeader().setSortIndicatorShown(False)
         self.stock_table.blockSignals(False)
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
-
+        self._position_stock_performance_sort_badges()
     def open_search_register_dialog(self) -> None:
         """
-        검색식등록은 현재 단계에서 비활성화한다.
-        이 메서드는 실수로 호출되어도 메시지창이나 검색창을 띄우지 않는다.
+        검색등록은 현재 검색 입력과 수동등록 경로로 통합되어 있다.
         """
         return
 
     def open_manual_register_dialog(self) -> None:
         """
-        수동등록 버튼은 종목 라이브러리에서 직접 선택 등록한다.
-        임의 종목코드/종목명 직접 입력 방식은 제공하지 않는다.
+        종목등록 버튼에서 공식 검색등록 UI를 연다.
         """
-        dialog = SearchStockRegisterDialog(self, title="수동등록")
+        from gui_auto_trade_setting_window import InstanceStockSearchRegisterDialog
+
+        dialog = InstanceStockSearchRegisterDialog(
+            self,
+            instance_metadata={
+                "row_kind": "unassigned",
+                "target_kind": "unassigned",
+                "instance_id": "",
+                "instance_name": "등록대기",
+                "definition_id": "",
+                "definition_name": "등록대기",
+            },
+        )
         dialog.exec_()
         self.refresh_stock_table()
-
-    def confirm_and_open_routine_assign(self, selected_stocks: list[tuple[str, str]]) -> None:
-        """
-        매매루틴지정 창을 연다.
-
-        창 진입은 종목 선택/상태와 무관하게 허용한다.
-        선택 종목이 있으면 루틴 변경 가능한 종목만 자동 체크 대상으로 넘기고,
-        불가능한 종목은 창 진입을 막지 않고 처리불가 리포트만 남긴다.
-        """
-        auto_check_stocks: list[tuple[str, str]] = []
-        blocked_items: list[dict[str, object]] = []
-
-        if selected_stocks:
-            auto_check_stocks, blocked_items = classify_routine_assign_targets(selected_stocks)
-            report_path = write_blocked_action_report("루틴 지정 사전검사", blocked_items)
-
-            if blocked_items:
-                message = (
-                    f"선택 종목 중 루틴 지정 불가: {len(blocked_items)}개"
-                    " / 매매루틴지정 창은 열립니다."
-                )
-                if report_path is not None:
-                    message += " / 처리불가 리포트 저장"
-
-                parent = self.parent()
-                if parent is not None and hasattr(parent, "statusBar"):
-                    parent.statusBar().showMessage(message, 7000)
-                else:
-                    self.show_status(message) if hasattr(self, "show_status") else None
-
-        dialog = RoutineAssignWindow(self, target_stocks=auto_check_stocks)
-        dialog.exec_()
-        self.refresh_stock_table()
-
-    def open_routine_assign_window(self) -> None:
-        selected_stocks = self.selected_registered_stocks()
-        self.confirm_and_open_routine_assign(selected_stocks)
-
-    def open_routine_assign_for_stock(self, item: QTableWidgetItem) -> None:
-        """
-        종목 행 더블클릭 시 해당 종목을 루틴 지정 사전 검사 후 매매루틴지정 창으로 넘긴다.
-        """
-        row = item.row()
-        code_item = self.stock_table.item(row, 0)
-        name_item = self.stock_table.item(row, 1)
-
-        if code_item is None or name_item is None:
-            return
-
-        code = code_item.text().strip()
-        name = name_item.text().strip()
-
-        if not code or not name:
-            return
-
-        self.confirm_and_open_routine_assign([(code, name)])
 
     def open_latest_blocked_report(self) -> None:
         report_path = latest_blocked_action_report_path()
@@ -1406,17 +2209,12 @@ class StockRegisterWindow(QDialog):
             QMessageBox.information(
                 self,
                 "처리불가 리포트",
-                "저장된 처리불가 리포트가 없습니다.",
+                "아직 생성된 처리불가 리포트가 없습니다.",
             )
             return
 
         dialog = BlockedActionReportViewDialog(report_path, self)
         dialog.exec_()
-
-    def open_integrity_check_window(self) -> None:
-        dialog = IntegrityCheckWindow(self)
-        dialog.exec_()
-        self.refresh_stock_table()
 
     def is_duplicate_stock(self, code: str, name: str) -> bool:
         stocks = read_base_stocks()
@@ -1435,5 +2233,5 @@ class StockRegisterWindow(QDialog):
         QMessageBox.information(
             self,
             "안내",
-            "이 기능은 다음 단계에서 구현합니다.",
+            "아직 연결되지 않은 기능입니다.",
         )

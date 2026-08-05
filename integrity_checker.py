@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 """
 integrity_checker.py
@@ -76,87 +76,6 @@ def normalize_routine_name(value: object) -> str:
 
 def is_valid_stock_code(code: str) -> bool:
     return code.isdigit() and len(code) == 6 and code != "000000"
-
-
-def load_stock_library(stock_library_path: Path) -> list[dict[str, str]]:
-    if not stock_library_path.exists():
-        return []
-
-    try:
-        data = json.loads(stock_library_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-    if not isinstance(data, list):
-        return []
-
-    stocks: list[dict[str, str]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-
-        code = str(item.get("code", "")).strip()
-        name = str(item.get("name", "")).strip()
-        market = str(item.get("market", "")).strip()
-        chosung = str(item.get("chosung", "")).strip()
-
-        if not code or not name:
-            continue
-
-        stocks.append(
-            {
-                "code": code,
-                "name": name,
-                "market": market,
-                "chosung": chosung,
-            }
-        )
-
-    return stocks
-
-
-def read_base_stocks_for_check(base_stock_path: Path) -> list[dict[str, object]]:
-    """
-    구형 기초종목.txt 검사 호환용.
-    중앙 stocks 구조가 기준이지만, 사용자가 선택하면 구형 txt도 검사한다.
-    """
-    if not base_stock_path.exists():
-        return []
-
-    stocks: list[dict[str, object]] = []
-    for line_no, raw_line in enumerate(base_stock_path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 2:
-            stocks.append(
-                {
-                    "line_no": line_no,
-                    "raw_line": line,
-                    "code": "",
-                    "name": line,
-                    "routines": [],
-                    "format_error": True,
-                }
-            )
-            continue
-
-        stocks.append(
-            {
-                "line_no": line_no,
-                "raw_line": line,
-                "code": parts[0],
-                "name": parts[1],
-                "routines": [part for part in parts[2:] if part],
-                "format_error": False,
-            }
-        )
-
-    return stocks
-
-
 def read_json_safely(path: Path) -> tuple[bool, object | None, str]:
     try:
         return True, json.loads(path.read_text(encoding="utf-8")), ""
@@ -167,75 +86,6 @@ def read_json_safely(path: Path) -> tuple[bool, object | None, str]:
 def safe_json_dict(path: Path) -> dict[str, Any]:
     ok, data, _ = read_json_safely(path)
     return data if ok and isinstance(data, dict) else {}
-
-
-def make_integrity_issue(
-    category: str,
-    location: str,
-    message: str,
-    action: str,
-    handled: str = "미처리",
-) -> dict[str, str]:
-    return {
-        "category": category,
-        "location": location,
-        "message": message,
-        "action": action,
-        "handled": handled,
-    }
-
-
-def write_invalid_items_log(
-    issues: list[dict[str, str]],
-    invalid_items_log_path: Path,
-) -> None:
-    lines: list[str] = []
-    lines.append("")
-    lines.append(f"[{now_text()}]")
-    lines.append(f"검출항목: {len(issues)}건")
-
-    if not issues:
-        lines.append("내용: 무결성검증 결과 이상 없음")
-    else:
-        for index, issue in enumerate(issues, start=1):
-            lines.append(f"{index}.")
-            lines.append(f"   구분: {issue.get('category', '')}")
-            lines.append(f"   위치: {issue.get('location', '')}")
-            lines.append(f"   문제 내용: {issue.get('message', '')}")
-            lines.append(f"   권장 조치: {issue.get('action', '')}")
-            lines.append(f"   상태: {issue.get('handled', '미처리')}")
-
-    invalid_items_log_path.open("a", encoding="utf-8").write("\n".join(lines) + "\n")
-
-
-def get_registered_routine_names(project_root: Path) -> set[str]:
-    """신규 routines 패키지 기준 루틴명 집합."""
-    names: set[str] = set()
-
-    if routine_names is not None:
-        try:
-            names.update(normalize_routine_name(name) for name in routine_names())  # type: ignore[misc]
-            return {name for name in names if name}
-        except Exception:
-            pass
-
-    routines_root = project_root / "routines"
-    if not routines_root.exists():
-        return set()
-
-    for package_dir in routines_root.iterdir():
-        if not package_dir.is_dir():
-            continue
-        meta_path = package_dir / "routine.json"
-        if not meta_path.exists():
-            continue
-        meta = safe_json_dict(meta_path)
-        name = normalize_routine_name(meta.get("name") or package_dir.name)
-        if name:
-            names.add(name)
-    return names
-
-
 def get_routine_records_for_check(project_root: Path) -> list[dict[str, Any]]:
     """무결성검사용 루틴 레코드. gui_routine_registry가 있으면 그것을 우선한다."""
     records: list[dict[str, Any]] = []
@@ -319,282 +169,532 @@ def extract_routines_from_config(config: dict[str, Any]) -> list[str]:
     return routines
 
 
-def run_integrity_checks(
-    selected_checks: set[str],
+LOCAL_STATUS_PASS = "PASS"
+LOCAL_STATUS_REVIEW_REQUIRED = "REVIEW_REQUIRED"
+LOCAL_STATUS_CHECK_ERROR = "CHECK_ERROR"
+SERVER_STATUS_NOT_CHECKED = "SERVER_NOT_CHECKED"
+
+LOCAL_INTEGRITY_SCOPE = "local_stock_integrity"
+
+REVIEW_REQUIRED_ISSUES = {
+    "STOCK_FOLDER_IDENTITY",
+    "STOCK_CODE_FORMAT",
+    "STOCK_NAME_PRESENT",
+    "REQUIRED_PATH_MISSING",
+    "JSON_ROOT_TYPE_INVALID",
+    "ORDERS_REQUIRED_KEY_MISSING",
+    "ORDER_STRUCTURE_INVALID",
+    "ROUTINE_ASSIGNMENT_INVALID",
+    "ROUTINE_ENTRY_FILE_MISSING",
+}
+
+CHECK_ERROR_ISSUES = {
+    "NO_STOCK_TARGETS",
+    "STOCK_TARGET_ACCESS_ERROR",
+    "JSON_READ_ERROR",
+}
+
+
+def _safe_relative_path(path: Path, project_root: Path) -> str:
+    try:
+        return str(path.relative_to(project_root))
+    except ValueError:
+        return str(path)
+
+
+def _standard_issue(
+    *,
+    issue_code: str,
+    message: str,
+    recommended_action: str,
+    source_path: Path | str,
     project_root: Path,
-    base_stock_path: Path,
-    stock_library_path: Path,
-) -> list[dict[str, str]]:
-    issues: list[dict[str, str]] = []
+    stock_code: str = "",
+    stock_name: str = "",
+    stock_dir: Path | str | None = None,
+    severity: str | None = None,
+    execution_status: str | None = None,
+    checked_at: str,
+) -> dict[str, object]:
+    requires_review = issue_code in REVIEW_REQUIRED_ISSUES
+    if execution_status is None:
+        execution_status = (
+            LOCAL_STATUS_CHECK_ERROR
+            if issue_code in CHECK_ERROR_ISSUES
+            else LOCAL_STATUS_REVIEW_REQUIRED
+        )
+    if severity is None:
+        severity = "ERROR" if execution_status == LOCAL_STATUS_CHECK_ERROR else "REVIEW"
+    path_text = (
+        _safe_relative_path(source_path, project_root)
+        if isinstance(source_path, Path)
+        else str(source_path)
+    )
+    stock_dir_text = ""
+    if stock_dir is not None:
+        stock_dir_text = (
+            _safe_relative_path(stock_dir, project_root)
+            if isinstance(stock_dir, Path)
+            else str(stock_dir)
+        )
+    return {
+        "check_scope": LOCAL_INTEGRITY_SCOPE,
+        "execution_status": execution_status,
+        "stock_code": str(stock_code or ""),
+        "stock_name": str(stock_name or ""),
+        "stock_dir": stock_dir_text,
+        "issue_code": issue_code,
+        "severity": severity,
+        "message": message,
+        "recommended_action": recommended_action,
+        "requires_review": requires_review,
+        "checked_at": checked_at,
+        "source_path": path_text,
+        "server_checked": False,
+    }
 
-    base_stocks = read_base_stocks_for_check(base_stock_path)
-    library = load_stock_library(stock_library_path)
-    library_by_code = {stock.get("code", "").strip(): stock for stock in library}
-    registered_routines = get_registered_routine_names(project_root)
-    routine_records = get_routine_records_for_check(project_root)
-    stock_dirs = get_central_stock_dirs(project_root)
 
-    seen_codes: dict[str, int] = {}
-    seen_names: dict[str, int] = {}
+def _standard_result(
+    *,
+    started_at: str,
+    completed_at: str,
+    checked_stock_count: int,
+    issues: list[dict[str, object]],
+) -> dict[str, object]:
+    review_required_count = sum(1 for issue in issues if issue.get("requires_review") is True)
+    check_error_count = sum(
+        1 for issue in issues
+        if issue.get("execution_status") == LOCAL_STATUS_CHECK_ERROR
+    )
+    if check_error_count:
+        local_status = LOCAL_STATUS_CHECK_ERROR
+    elif review_required_count:
+        local_status = LOCAL_STATUS_REVIEW_REQUIRED
+    else:
+        local_status = LOCAL_STATUS_PASS
+    return {
+        "local_status": local_status,
+        "server_status": SERVER_STATUS_NOT_CHECKED,
+        "checked_stock_count": checked_stock_count,
+        "review_required_count": review_required_count,
+        "check_error_count": check_error_count,
+        "server_not_checked_count": 0,
+        "issues": issues,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    }
 
-    # 1) 구형 기초종목.txt 호환 검사
-    for stock in base_stocks:
-        line_no = int(stock.get("line_no", 0))
-        code = str(stock.get("code", "")).strip()
-        name = str(stock.get("name", "")).strip()
-        routines = [normalize_routine_name(item) for item in stock.get("routines", []) if normalize_routine_name(item)]
 
-        if stock.get("format_error"):
-            issues.append(
-                make_integrity_issue(
-                    "기초종목",
-                    f"기초종목.txt {line_no}행",
-                    "행 형식 오류",
-                    "종목코드,종목명 형식 확인",
-                )
-            )
+def _result_with_recalculated_counts(
+    result: dict[str, object],
+    issues: list[dict[str, object]],
+) -> dict[str, object]:
+    review_required_count = sum(1 for issue in issues if issue.get("requires_review") is True)
+    check_error_count = sum(
+        1 for issue in issues
+        if issue.get("execution_status") == LOCAL_STATUS_CHECK_ERROR
+    )
+    if check_error_count:
+        local_status = LOCAL_STATUS_CHECK_ERROR
+    elif review_required_count:
+        local_status = LOCAL_STATUS_REVIEW_REQUIRED
+    else:
+        local_status = LOCAL_STATUS_PASS
+
+    updated = dict(result)
+    updated["local_status"] = local_status
+    updated["review_required_count"] = review_required_count
+    updated["check_error_count"] = check_error_count
+    updated["issues"] = issues
+    updated["completed_at"] = now_text()
+    return updated
+
+
+def _issue_stock_dir(issue: dict[str, object], project_root: Path) -> Path | None:
+    raw_stock_dir = str(issue.get("stock_dir", "") or "").strip()
+    if raw_stock_dir:
+        stock_dir = Path(raw_stock_dir)
+        return stock_dir if stock_dir.is_absolute() else project_root / stock_dir
+
+    raw_source_path = str(issue.get("source_path", "") or "").strip()
+    if not raw_source_path:
+        return None
+    source_path = Path(raw_source_path)
+    parts = source_path.parts
+    if len(parts) >= 2 and parts[0] == "stocks":
+        return project_root / parts[0] / parts[1]
+    if source_path.is_absolute():
+        try:
+            relative = source_path.relative_to(project_root)
+        except ValueError:
+            return None
+        if len(relative.parts) >= 2 and relative.parts[0] == "stocks":
+            return project_root / relative.parts[0] / relative.parts[1]
+    return None
+
+
+def _integrity_review_reason(issue: dict[str, object]) -> str:
+    issue_code = str(issue.get("issue_code", "") or "").strip()
+    message = str(issue.get("message", "") or "").strip()
+    return f"[{issue_code}] {message}" if message else f"[{issue_code}]"
+
+
+def apply_integrity_review_required_issues(
+    result: dict[str, object],
+    *,
+    project_root: Path,
+    review_writer,
+    source: str = "무결성검사",
+) -> dict[str, object]:
+    """Apply REVIEW_REQUIRED local integrity issues through the official writer.
+
+    The caller supplies the existing review writer, such as
+    AutoTradeSettingWindow.mark_review_required. This adapter does not write
+    files directly and does not touch CHECK_ERROR or SERVER_NOT_CHECKED results.
+    """
+    root = Path(project_root)
+    issues = [dict(issue) for issue in result.get("issues", []) if isinstance(issue, dict)]
+    grouped: dict[Path, dict[str, object]] = {}
+
+    for issue in issues:
+        if issue.get("requires_review") is not True:
+            continue
+        if str(issue.get("execution_status", "") or "").strip().upper() != LOCAL_STATUS_REVIEW_REQUIRED:
+            continue
+        issue_code = str(issue.get("issue_code", "") or "").strip()
+        if not issue_code:
+            continue
+        stock_dir = _issue_stock_dir(issue, root)
+        if stock_dir is None:
             continue
 
-        if "base_duplicate" in selected_checks:
-            if code in seen_codes:
-                issues.append(
-                    make_integrity_issue(
-                        "중복",
-                        f"기초종목.txt {line_no}행",
-                        f"중복 코드: {code}",
-                        f"{seen_codes[code]}행과 중복 여부 확인",
-                    )
-                )
-            else:
-                seen_codes[code] = line_no
+        bucket = grouped.setdefault(
+            stock_dir,
+            {
+                "stock_code": str(issue.get("stock_code", "") or "").strip(),
+                "stock_name": str(issue.get("stock_name", "") or "").strip(),
+                "issues_by_code": {},
+            },
+        )
+        issues_by_code = bucket.get("issues_by_code")
+        if isinstance(issues_by_code, dict) and issue_code not in issues_by_code:
+            issues_by_code[issue_code] = issue
+        if not str(bucket.get("stock_code", "") or "").strip():
+            bucket["stock_code"] = str(issue.get("stock_code", "") or "").strip()
+        if not str(bucket.get("stock_name", "") or "").strip():
+            bucket["stock_name"] = str(issue.get("stock_name", "") or "").strip()
 
-            if name in seen_names:
-                issues.append(
-                    make_integrity_issue(
-                        "중복",
-                        f"기초종목.txt {line_no}행",
-                        f"중복 종목명: {name}",
-                        f"{seen_names[name]}행과 중복 여부 확인",
-                    )
-                )
-            else:
-                seen_names[name] = line_no
+    for stock_dir, bucket in grouped.items():
+        state = safe_json_dict(stock_dir / "state.json")
+        existing_reason = str(
+            state.get("review_reason", "") or state.get("review_detail", "") or ""
+        ).strip()
+        reasons: list[str] = [existing_reason] if existing_reason else []
+        issues_by_code = bucket.get("issues_by_code")
+        if not isinstance(issues_by_code, dict):
+            continue
 
-        if "stock_code" in selected_checks and not is_valid_stock_code(code):
+        for issue_code, issue in issues_by_code.items():
+            if f"[{issue_code}]" in existing_reason:
+                continue
+            if isinstance(issue, dict):
+                reasons.append(_integrity_review_reason(issue))
+
+        if len(reasons) == (1 if existing_reason else 0):
+            continue
+
+        code = str(bucket.get("stock_code", "") or "").strip()
+        name = str(bucket.get("stock_name", "") or "").strip()
+        if not code or not name:
+            parsed_code, parsed_name, folder_ok = parse_stock_folder_name(stock_dir)
+            if folder_ok:
+                code = code or parsed_code
+                name = name or parsed_name
+
+        item = {
+            "routine_name": "",
+            "stock_dir": stock_dir,
+            "code": code,
+            "name": name,
+            "review_reasons": reasons,
+            "review_location": source,
+        }
+
+        try:
+            written = bool(review_writer(stock_dir, code, name, item, source=source))
+        except Exception as exc:
+            written = False
+            error_message = str(exc)
+        else:
+            error_message = "review writer returned false"
+
+        if not written:
             issues.append(
-                make_integrity_issue(
-                    "코드오류",
-                    f"기초종목.txt {line_no}행",
-                    "종목코드 오류",
-                    "6자리 숫자 여부 확인",
+                _standard_issue(
+                    issue_code="CHECK_ERROR",
+                    message=f"Review writer failed for {code} {name}: {error_message}",
+                    recommended_action="Retry review registration from stock management.",
+                    source_path=stock_dir,
+                    project_root=root,
+                    stock_code=code,
+                    stock_name=name,
+                    stock_dir=stock_dir,
+                    execution_status=LOCAL_STATUS_CHECK_ERROR,
+                    severity="ERROR",
+                    checked_at=now_text(),
                 )
             )
 
-        if "stock_name" in selected_checks:
-            if not name:
-                issues.append(
-                    make_integrity_issue(
-                        "종목명오류",
-                        f"기초종목.txt {line_no}행",
-                        "종목명 공백",
-                        "종목명 입력 확인",
-                    )
-                )
-            else:
-                library_stock = library_by_code.get(code)
-                if library_stock is None:
-                    issues.append(
-                        make_integrity_issue(
-                            "라이브러리",
-                            f"기초종목.txt {line_no}행",
-                            "라이브러리 없음",
-                            "stock_library.json 확인",
-                        )
-                    )
-                elif name != str(library_stock.get("name", "")).strip():
-                    issues.append(
-                        make_integrity_issue(
-                            "라이브러리",
-                            f"기초종목.txt {line_no}행",
-                            "종목명 불일치",
-                            "stock_library.json 기준 확인",
-                        )
-                    )
+    return _result_with_recalculated_counts(result, issues)
 
-        if "routine_folder" in selected_checks:
-            for routine_name in routines:
-                if routine_name not in registered_routines:
-                    issues.append(
-                        make_integrity_issue(
-                            "루틴오류",
-                            f"기초종목.txt {line_no}행",
-                            f"루틴 패키지 없음: {routine_name}",
-                            f"routines/{routine_name}/routine.json 확인",
-                        )
-                    )
 
-    # 2) 신규 루틴 패키지 검사. 기존 UI 키 budget_json은 routine.json 검사로 호환 처리한다.
-    if "budget_json" in selected_checks:
-        if not routine_records:
-            issues.append(
-                make_integrity_issue(
-                    "루틴",
-                    "routines/",
-                    "루틴 패키지 없음",
-                    "routines/<루틴명>/routine.json 생성 확인",
-                )
+def _stock_json_targets(stock_dir: Path) -> list[tuple[str, Path]]:
+    return [
+        ("config", stock_dir / "config.json"),
+        ("state", stock_dir / "state.json"),
+        ("orders", stock_dir / "orders.json"),
+    ]
+
+
+def run_local_stock_integrity_check(project_root: Path) -> dict[str, object]:
+    """Run the read-only local stock integrity service.
+
+    This service never writes state, orders, changelog, invalid-items logs, or
+    review metadata. Server/Kiwoom validation is intentionally out of scope.
+    """
+    root = Path(project_root)
+    started_at = now_text()
+    checked_at = started_at
+    issues: list[dict[str, object]] = []
+
+    try:
+        stock_dirs = get_central_stock_dirs(root)
+    except Exception as exc:
+        issues.append(
+            _standard_issue(
+                issue_code="STOCK_TARGET_ACCESS_ERROR",
+                message=f"Unable to read stock target directory: {exc}",
+                recommended_action="Check project_root/stocks access",
+                source_path=root / "stocks",
+                project_root=root,
+                checked_at=checked_at,
             )
+        )
+        return _standard_result(
+            started_at=started_at,
+            completed_at=now_text(),
+            checked_stock_count=0,
+            issues=issues,
+        )
 
-        for record in routine_records:
-            routine_name = str(record.get("name", "")).strip()
-            routine_path = Path(record.get("path"))
-            meta_path = routine_path / "routine.json"
-            entry_file = str(record.get("entry_file") or "routine.py")
-            entry_path = routine_path / entry_file
+    if not stock_dirs:
+        issues.append(
+            _standard_issue(
+                issue_code="NO_STOCK_TARGETS",
+                message="No stock target directories found under project_root/stocks.",
+                recommended_action="Check whether central stock folders exist.",
+                source_path=root / "stocks",
+                project_root=root,
+                checked_at=checked_at,
+            )
+        )
+        return _standard_result(
+            started_at=started_at,
+            completed_at=now_text(),
+            checked_stock_count=0,
+            issues=issues,
+        )
 
-            if not routine_name:
-                issues.append(
-                    make_integrity_issue(
-                        "루틴",
-                        str(routine_path.relative_to(project_root)),
-                        "루틴명 없음",
-                        "routine.json name 확인",
-                    )
-                )
+    routine_records = get_routine_records_for_check(root)
+    routine_by_name = {
+        str(record.get("name", "") or "").strip(): record
+        for record in routine_records
+        if str(record.get("name", "") or "").strip()
+    }
 
-            ok, data, _ = read_json_safely(meta_path)
-            if not ok:
-                issues.append(
-                    make_integrity_issue(
-                        "routine.json",
-                        str(meta_path.relative_to(project_root)),
-                        "routine.json 오류",
-                        "JSON 문법 확인",
-                    )
-                )
-            elif not isinstance(data, dict):
-                issues.append(
-                    make_integrity_issue(
-                        "routine.json",
-                        str(meta_path.relative_to(project_root)),
-                        "routine.json 형식 오류",
-                        "객체 형식 확인",
-                    )
-                )
-
-            if not entry_path.exists():
-                issues.append(
-                    make_integrity_issue(
-                        "루틴파일",
-                        str(entry_path.relative_to(project_root)),
-                        "루틴 진입 파일 없음",
-                        "routine.json entry_file 및 routine.py 존재 확인",
-                    )
-                )
-
-    # 3) 중앙 stocks 구조 검사
     for stock_dir in stock_dirs:
         code, name, folder_ok = parse_stock_folder_name(stock_dir)
+        stock_code = code if folder_ok else ""
+        stock_name = name if folder_ok else ""
 
         if not folder_ok:
             issues.append(
-                make_integrity_issue(
-                    "폴더명",
-                    str(stock_dir.relative_to(project_root)),
-                    "종목 폴더명 형식 오류",
-                    "종목코드_종목명 형식 확인",
+                _standard_issue(
+                    issue_code="STOCK_FOLDER_IDENTITY",
+                    message="Stock folder name must use <code>_<name> format.",
+                    recommended_action="Rename the stock folder or recreate it through stock registration.",
+                    source_path=stock_dir,
+                    project_root=root,
+                    stock_name=name,
+                    stock_dir=stock_dir,
+                    checked_at=checked_at,
                 )
             )
             continue
 
-        if "stock_code" in selected_checks and not is_valid_stock_code(code):
+        if not is_valid_stock_code(code):
             issues.append(
-                make_integrity_issue(
-                    "코드오류",
-                    str(stock_dir.relative_to(project_root)),
-                    f"종목코드 오류: {code}",
-                    "6자리 숫자 여부 확인",
+                _standard_issue(
+                    issue_code="STOCK_CODE_FORMAT",
+                    message=f"Invalid stock code: {code}",
+                    recommended_action="Use a six-digit numeric stock code other than 000000.",
+                    source_path=stock_dir,
+                    project_root=root,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    stock_dir=stock_dir,
+                    checked_at=checked_at,
                 )
             )
 
-        if "stock_name" in selected_checks and not name:
+        if not name.strip():
             issues.append(
-                make_integrity_issue(
-                    "종목명오류",
-                    str(stock_dir.relative_to(project_root)),
-                    "종목명 공백",
-                    "종목 폴더명 확인",
+                _standard_issue(
+                    issue_code="STOCK_NAME_PRESENT",
+                    message="Stock name is empty.",
+                    recommended_action="Use <code>_<name> folder format with a non-empty stock name.",
+                    source_path=stock_dir,
+                    project_root=root,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    stock_dir=stock_dir,
+                    checked_at=checked_at,
                 )
             )
 
-        if "required_files" in selected_checks:
-            required_paths = [
-                stock_dir / "config.json",
-                stock_dir / "state.json",
-                stock_dir / "orders.json",
-                stock_dir / "logs",
-            ]
-            for required_path in required_paths:
-                if not required_path.exists():
-                    issues.append(
-                        make_integrity_issue(
-                            "파일누락",
-                            str(required_path.relative_to(project_root)),
-                            "필수 파일 없음",
-                            "중앙 stocks 종목 구조 확인",
-                        )
-                    )
-
-        json_targets = [
-            ("config_json", "config", stock_dir / "config.json"),
-            ("state_json", "state", stock_dir / "state.json"),
-            ("orders_json", "orders", stock_dir / "orders.json"),
+        required_paths = [
+            stock_dir / "config.json",
+            stock_dir / "state.json",
+            stock_dir / "orders.json",
+            stock_dir / "logs",
         ]
+        for required_path in required_paths:
+            if not required_path.exists():
+                issues.append(
+                    _standard_issue(
+                        issue_code="REQUIRED_PATH_MISSING",
+                        message=f"Required path is missing: {required_path.name}",
+                        recommended_action="Recreate the stock runtime structure through stock registration or recovery.",
+                        source_path=required_path,
+                        project_root=root,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        stock_dir=stock_dir,
+                        checked_at=checked_at,
+                    )
+                )
 
         config_data: dict[str, Any] = {}
-        for check_key, category, json_path in json_targets:
+        for target_name, json_path in _stock_json_targets(stock_dir):
             if not json_path.exists():
                 continue
 
-            ok, data, _ = read_json_safely(json_path)
+            ok, data, error = read_json_safely(json_path)
             if not ok:
-                if check_key in selected_checks:
-                    issues.append(
-                        make_integrity_issue(
-                            category,
-                            str(json_path.relative_to(project_root)),
-                            f"{json_path.name} 오류",
-                            "JSON 문법 확인",
-                        )
+                issues.append(
+                    _standard_issue(
+                        issue_code="JSON_READ_ERROR",
+                        message=f"{json_path.name} could not be read as JSON: {error}",
+                        recommended_action="Fix UTF-8/JSON syntax before retrying integrity checks.",
+                        source_path=json_path,
+                        project_root=root,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        stock_dir=stock_dir,
+                        checked_at=checked_at,
                     )
+                )
                 continue
 
             if not isinstance(data, dict):
-                if check_key in selected_checks:
-                    issues.append(
-                        make_integrity_issue(
-                            category,
-                            str(json_path.relative_to(project_root)),
-                            f"{json_path.name} 형식 오류",
-                            "객체 형식 확인",
-                        )
+                issues.append(
+                    _standard_issue(
+                        issue_code="JSON_ROOT_TYPE_INVALID",
+                        message=f"{json_path.name} root must be an object.",
+                        recommended_action="Rewrite the file as a JSON object.",
+                        source_path=json_path,
+                        project_root=root,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        stock_dir=stock_dir,
+                        checked_at=checked_at,
                     )
+                )
                 continue
 
-            if check_key == "config_json":
+            if target_name == "config":
                 config_data = data
 
-        if "routine_folder" in selected_checks and config_data:
-            assigned_routines = extract_routines_from_config(config_data)
-            for routine_name in assigned_routines:
-                if routine_name not in registered_routines:
+            if target_name == "orders":
+                orders = data.get("orders")
+                if "orders" not in data or not isinstance(orders, list):
                     issues.append(
-                        make_integrity_issue(
-                            "루틴오류",
-                            str((stock_dir / "config.json").relative_to(project_root)),
-                            f"지정 루틴 패키지 없음: {routine_name}",
-                            f"routines/{routine_name}/routine.json 확인 또는 종목 루틴 재지정",
+                        _standard_issue(
+                            issue_code="ORDERS_REQUIRED_KEY_MISSING",
+                            message="orders.json must contain an orders list.",
+                            recommended_action="Restore orders.json with an orders list.",
+                            source_path=json_path,
+                            project_root=root,
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            stock_dir=stock_dir,
+                            checked_at=checked_at,
+                        )
+                    )
+                elif any(not isinstance(order, dict) for order in orders):
+                    issues.append(
+                        _standard_issue(
+                            issue_code="ORDER_STRUCTURE_INVALID",
+                            message="orders.json contains non-object order entries.",
+                            recommended_action="Keep only JSON object entries in the orders list.",
+                            source_path=json_path,
+                            project_root=root,
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            stock_dir=stock_dir,
+                            checked_at=checked_at,
                         )
                     )
 
-    return issues
+        for routine_name in extract_routines_from_config(config_data):
+            record = routine_by_name.get(routine_name)
+            if record is None:
+                issues.append(
+                    _standard_issue(
+                        issue_code="ROUTINE_ASSIGNMENT_INVALID",
+                        message=f"Assigned routine package does not exist: {routine_name}",
+                        recommended_action="Check the stock routine assignment and routines registry.",
+                        source_path=stock_dir / "config.json",
+                        project_root=root,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        stock_dir=stock_dir,
+                        checked_at=checked_at,
+                    )
+                )
+                continue
+
+            routine_path = Path(record.get("path"))
+            entry_file = str(record.get("entry_file") or "routine.py").strip() or "routine.py"
+            entry_path = routine_path / entry_file
+            if not entry_path.exists():
+                issues.append(
+                    _standard_issue(
+                        issue_code="ROUTINE_ENTRY_FILE_MISSING",
+                        message=f"Routine entry file is missing: {routine_name}/{entry_file}",
+                        recommended_action="Restore the routine entry file or update routine.json.",
+                        source_path=entry_path,
+                        project_root=root,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        stock_dir=stock_dir,
+                        checked_at=checked_at,
+                    )
+                )
+
+    return _standard_result(
+        started_at=started_at,
+        completed_at=now_text(),
+        checked_stock_count=len(stock_dirs),
+        issues=issues,
+    )
