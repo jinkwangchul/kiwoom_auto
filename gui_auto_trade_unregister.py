@@ -34,7 +34,7 @@ from gui_blocked_report_window import (
     latest_blocked_action_report_path,
     write_blocked_action_report,
 )
-from runtime_io import read_json_dict
+from runtime_io import read_json_dict, read_orders_data
 from gui_auto_trade_runtime import write_state_json
 from gui_config_utils import default_orders, default_state
 from gui_common_utils import safe_int_value
