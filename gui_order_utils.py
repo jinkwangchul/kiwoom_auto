@@ -89,6 +89,45 @@ def order_current_pending_qty(order: dict[str, object]) -> tuple[int, bool]:
     return 0, False
 
 
+def pending_order_integrity_issue_codes(stock_dir: Path, state: dict[str, object]) -> list[str]:
+    """현재 미체결 판단에 필요한 주문/상태 데이터 무결성 오류 코드를 반환한다."""
+    issues: list[str] = []
+
+    for order in read_orders_data(stock_dir / "orders.json"):
+        status = normalized_order_status(order)
+        if status in CLOSED_ORDER_STATUSES:
+            continue
+
+        pending_qty, unknown = order_current_pending_qty(order)
+        if not unknown and pending_qty <= 0:
+            continue
+
+        side_raw = str(order_value(order, ["side", "order_side", "구분", "매매구분"], "")).strip().upper()
+        is_buy = side_raw in ("BUY", "매수", "B")
+        is_sell = side_raw in ("SELL", "매도", "S")
+        if not is_buy and not is_sell:
+            issues.append("PENDING_ORDER_SIDE_UNKNOWN")
+
+        if unknown:
+            issues.append("PENDING_ORDER_QTY_MISSING")
+
+    state_pending_qty = safe_int_value(state.get("pending_qty"), 0)
+    if bool(state.get("pending_order", False)) and state_pending_qty > 0:
+        buy_qty = safe_int_value(state.get("buy_pending_qty"), 0)
+        sell_qty = safe_int_value(state.get("sell_pending_qty"), 0)
+        if buy_qty <= 0 and sell_qty <= 0:
+            issues.append("LEGACY_PENDING_SUMMARY_ONLY")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for issue in issues:
+        if issue in seen:
+            continue
+        seen.add(issue)
+        result.append(issue)
+    return result
+
+
 def pending_order_side_quantities(stock_dir: Path, state: dict[str, object]) -> tuple[object, object]:
     """
     매수/매도 현재 미체결 수량을 반환한다.

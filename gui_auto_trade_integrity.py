@@ -14,6 +14,7 @@ gui_auto_trade_integrity.py
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from gui_order_utils import (
@@ -22,6 +23,22 @@ from gui_order_utils import (
 )
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
+
+REVIEW_REASON_OPERATION_DATA_MISSING = "운영 데이터 없음"
+REVIEW_REASON_OPERATION_DATA_READ_ERROR = "운영 데이터 읽기 오류"
+_TRUE_TEXT_VALUES = {"TRUE", "1", "YES", "Y", "ON", "검토", "검토필요"}
+_REVIEW_STATUS_VALUES = {
+    "PENDING",
+    "REVIEW_REQUIRED",
+    "NEEDS_REVIEW",
+    "검토",
+    "검토필요",
+}
+_EMERGENCY_STOPPED_STATUS_VALUES = {
+    "EMERGENCY_STOPPED",
+    "EMERGENCY_STOP",
+    "EMERGENCY",
+}
 
 
 def unique_review_reasons(reasons) -> list[str]:
@@ -54,13 +71,39 @@ def is_review_required_state(state: dict[str, object] | None) -> bool:
     if raw_status in {"REVIEW_REQUIRED", "REVIEW"}:
         return True
 
-    if bool(state.get("review_required", False)):
+    review_required_value = state.get("review_required", False)
+    if isinstance(review_required_value, str):
+        if review_required_value.strip().upper() in _TRUE_TEXT_VALUES:
+            return True
+    elif bool(review_required_value):
+        return True
+
+    review_status = str(state.get("review_status", "") or "").strip().upper()
+    if review_status in _REVIEW_STATUS_VALUES:
         return True
 
     try:
         return auto_trade_status_display(raw_status) == "검토종목"
     except Exception:
         return False
+
+
+def is_emergency_stopped_state(state: dict[str, object] | None) -> bool:
+    """Return whether a stock state is in emergency stop, including legacy inputs."""
+    if not isinstance(state, dict):
+        return False
+    raw_status = str(state.get("status", "") or "").strip().upper()
+    return raw_status in _EMERGENCY_STOPPED_STATUS_VALUES
+
+
+def is_operation_excluded(config: dict[str, object] | None) -> bool:
+    """Return the operation-excluded flag from config without mutating it."""
+    if not isinstance(config, dict):
+        return False
+    value = config.get("operation_excluded", False)
+    if isinstance(value, str):
+        return value.strip().upper() in _TRUE_TEXT_VALUES
+    return bool(value)
 
 
 def is_review_required_stock_dir(stock_dir: Path) -> bool:
@@ -70,6 +113,28 @@ def is_review_required_stock_dir(stock_dir: Path) -> bool:
     except Exception:
         return False
     return is_review_required_state(state)
+
+
+def read_review_state_with_issue(state_path: Path) -> tuple[dict[str, object], str]:
+    """Read state.json while preserving missing/corrupt review issue reasons."""
+    if not state_path.exists():
+        return {}, REVIEW_REASON_OPERATION_DATA_MISSING
+
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, REVIEW_REASON_OPERATION_DATA_READ_ERROR
+
+    if not isinstance(data, dict):
+        return {}, REVIEW_REASON_OPERATION_DATA_READ_ERROR
+
+    return data, ""
+
+
+def is_review_protected_stock_dir(stock_dir: Path) -> bool:
+    """Return whether a stock dir is protected by review-required collection rules."""
+    state, state_issue_reason = read_review_state_with_issue(stock_dir / "state.json")
+    return bool(state_issue_reason) or is_review_required_state(state)
 
 
 def auto_trade_setting_data_inconsistency_reasons(state: dict[str, object] | None) -> list[str]:
