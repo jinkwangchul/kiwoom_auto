@@ -117,7 +117,6 @@ from gui_config_utils import (
     default_orders,
     ensure_stock_runtime_files,
 )
-from gui_force_unregister_dialog import ForceUnregisterConfirmDialog
 from gui_search_stock_register_dialog import SearchStockRegisterDialog
 from gui_auto_trade_utils import (
     PENDING_INTEGRITY_USER_REASON,
@@ -209,7 +208,11 @@ from gui_auto_trade_display import (
     SORT_ROLE,
     SortableTableWidgetItem,
 )
-from gui_auto_trade_integrity import is_review_protected_stock_dir
+from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
+    is_review_protected_stock_dir,
+    is_review_required_state,
+)
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
@@ -269,8 +272,6 @@ from gui_auto_trade_setting_window import (
     parse_stock_folder_name,
     read_base_stocks,
     read_operation_policy,
-    reset_runtime_orders_for_force_unregister,
-    reset_runtime_state_for_force_unregister,
     restart_initial_review_reason_for_stock,
     routine_display_name,
     short_close_method_text,
@@ -283,6 +284,30 @@ from gui_main_table_loader import ROUTINE_INSTANCE_GRID_COLUMNS
 
 LOGGER = logging.getLogger(__name__)
 UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
+STOCK_RESET_INITIALIZABLE = "INITIALIZABLE"
+STOCK_RESET_NOT_INITIALIZABLE = "NOT_INITIALIZABLE"
+STOCK_RESET_RUNNING_STATUSES = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+STOCK_RESET_KNOWN_STATUSES = {
+    "STOPPED",
+    "STOP",
+    "MONITORING",
+    "WATCHING",
+    "",
+    *STOCK_RESET_RUNNING_STATUSES,
+    "EMERGENCY",
+    "EMERGENCY_STOP",
+    "EMERGENCY_STOPPED",
+    "REVIEW",
+    "REVIEW_REQUIRED",
+}
+STOCK_RESET_IN_PROGRESS_VALUES = {
+    "PENDING",
+    "REQUESTED",
+    "RUNNING",
+    "IN_PROGRESS",
+    "PROCESSING",
+    "STARTED",
+}
 STOCK_REGISTER_PERFORMANCE_SORT_ROLES = {
     "count": Qt.UserRole + 201,
     "rate": Qt.UserRole + 202,
@@ -298,7 +323,6 @@ STOCK_REGISTER_PERFORMANCE_SORT_LABELS = {
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCK_LIBRARY_PATH = PROJECT_ROOT / "stock_library.json"
-ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 GLOBAL_SCHEDULE_PATH = PROJECT_ROOT / "global_schedule.json"
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
@@ -391,6 +415,208 @@ def stock_runtime_dirs_for_stock(code: str, name: str) -> list[tuple[str, Path]]
     해당 종목에 배정된 중앙 runtime 폴더를 반환한다.
     """
     return assigned_runtime_dirs_for_stock(code, name)
+
+
+def _read_json_dict_for_stock_reset(path: Path) -> tuple[dict[str, object], str]:
+    if not path.exists():
+        return {}, "파일 없음"
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, "JSON 읽기 실패"
+
+    if not isinstance(data, dict):
+        return {}, "JSON 형식 오류"
+
+    return data, ""
+
+
+def _stock_reset_not_initializable(reason: str, stock_dir: Path | None) -> dict[str, object]:
+    return {
+        "status": STOCK_RESET_NOT_INITIALIZABLE,
+        "reason": reason,
+        "stock_dir": stock_dir,
+    }
+
+
+def _stock_reset_initializable(stock_dir: Path) -> dict[str, object]:
+    return {
+        "status": STOCK_RESET_INITIALIZABLE,
+        "reason": "",
+        "stock_dir": stock_dir,
+    }
+
+
+def _safe_stock_reset_int(value: object) -> tuple[int, bool]:
+    try:
+        return int(value or 0), True
+    except Exception:
+        return 0, False
+
+
+def _orders_json_has_integrity_issue(orders_state: dict[str, object]) -> bool:
+    orders = orders_state.get("orders", [])
+    if not isinstance(orders, list):
+        return True
+    return any(not isinstance(order, dict) for order in orders)
+
+
+def _state_has_in_progress_lifecycle(state: dict[str, object]) -> bool:
+    fields = (
+        "command_status",
+        "command_state",
+        "operation_command_status",
+        "transition_status",
+        "lifecycle_status",
+        "close_intent_status",
+        "immediate_liquidation_status",
+        "pending_command_status",
+    )
+    for field in fields:
+        value = str(state.get(field, "") or "").strip().upper()
+        if value in STOCK_RESET_IN_PROGRESS_VALUES:
+            return True
+    return False
+
+
+def stock_reset_eligibility(code: str, name: str) -> dict[str, object]:
+    """
+    종목초기화 가능 여부를 INITIALIZABLE / NOT_INITIALIZABLE로 판정한다.
+
+    이 helper는 초기화 전용 정책 경계이며, 기존 삭제/등록해제 force/archive
+    정책과 섞지 않는다. 판정 중 Runtime이나 주문 파일을 수정하지 않는다.
+    """
+    try:
+        runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+    except Exception as exc:
+        LOGGER.error(
+            "stock reset eligibility failed to resolve runtime dirs: code=%s name=%s error=%s",
+            code,
+            name,
+            exc,
+        )
+        return _stock_reset_not_initializable("종목 저장 위치 확인 실패", None)
+
+    if not runtime_dirs:
+        return _stock_reset_not_initializable("종목 저장 위치 없음", None)
+
+    if len(runtime_dirs) != 1:
+        return _stock_reset_not_initializable("종목 저장 위치 중복", None)
+
+    _routine_name, stock_dir = runtime_dirs[0]
+    stock_dir = Path(stock_dir)
+    if not stock_dir.exists() or not stock_dir.is_dir():
+        return _stock_reset_not_initializable("종목 저장 위치 없음", stock_dir)
+
+    state, state_issue = _read_json_dict_for_stock_reset(stock_dir / "state.json")
+    if state_issue:
+        return _stock_reset_not_initializable(f"state 무결성 오류: {state_issue}", stock_dir)
+
+    if is_review_required_state(state) or is_review_protected_stock_dir(stock_dir):
+        return _stock_reset_not_initializable("검토관리 상태", stock_dir)
+
+    raw_status = str(state.get("status", "STOPPED") or "").strip().upper()
+    if raw_status not in STOCK_RESET_KNOWN_STATUSES:
+        LOGGER.error(
+            "unexpected stock-reset eligibility status: %s code=%s name=%s stock_dir=%s",
+            raw_status,
+            code,
+            name,
+            stock_dir,
+        )
+        return _stock_reset_not_initializable(UNEXPECTED_STATUS_REASON, stock_dir)
+
+    if is_emergency_stopped_state(state):
+        return _stock_reset_not_initializable("긴급정지 상태", stock_dir)
+
+    if raw_status in STOCK_RESET_RUNNING_STATUSES:
+        return _stock_reset_not_initializable("운영 중", stock_dir)
+
+    if _state_has_in_progress_lifecycle(state):
+        return _stock_reset_not_initializable("진행 중인 명령 또는 전환 상태", stock_dir)
+
+    holding_qty, holding_ok = _safe_stock_reset_int(state.get("holding_qty", 0))
+    if not holding_ok:
+        return _stock_reset_not_initializable("보유수량 확인 실패", stock_dir)
+    if holding_qty > 0:
+        return _stock_reset_not_initializable("보유수량 있음", stock_dir)
+
+    orders_state, orders_issue = _read_json_dict_for_stock_reset(stock_dir / "orders.json")
+    if orders_issue:
+        return _stock_reset_not_initializable(f"orders 무결성 오류: {orders_issue}", stock_dir)
+    if _orders_json_has_integrity_issue(orders_state):
+        return _stock_reset_not_initializable("orders 무결성 오류", stock_dir)
+
+    buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
+    if buy_pending_qty == "?" or sell_pending_qty == "?":
+        return _stock_reset_not_initializable(PENDING_INTEGRITY_USER_REASON, stock_dir)
+    if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:
+        return _stock_reset_not_initializable("매수미결 있음", stock_dir)
+    if isinstance(sell_pending_qty, int) and sell_pending_qty > 0:
+        return _stock_reset_not_initializable("매도미결 있음", stock_dir)
+
+    return _stock_reset_initializable(stock_dir)
+
+
+def confirm_stock_reset(parent: QWidget, code: str, name: str) -> bool:
+    dialog = QMessageBox(parent)
+    dialog.setIcon(QMessageBox.Warning)
+    dialog.setWindowTitle("⚠ 종목초기화 확인")
+    dialog.setText(
+        "해당 종목의 모든 기록을 삭제하고\n"
+        "미등록 상태로 초기화합니다.\n\n"
+        "이 작업은 되돌릴 수 없으며\n"
+        "삭제된 데이터는 복구할 수 없습니다.\n\n"
+        f"초기화 대상:\n{code} {name}"
+    )
+    confirm_button = dialog.addButton("확인", QMessageBox.AcceptRole)
+    cancel_button = dialog.addButton("취소", QMessageBox.RejectRole)
+    dialog.setDefaultButton(cancel_button)
+    dialog.setEscapeButton(cancel_button)
+    dialog.exec_()
+    return dialog.clickedButton() is confirm_button
+
+
+def _stock_reset_failure_message() -> str:
+    return "해당 종목은 초기화가 불가능합니다.\n종목 상태를 다시 확인하세요."
+
+
+def _validate_stock_reset_delete_path(code: str, name: str, stock_dir: Path) -> tuple[bool, str]:
+    try:
+        stocks_root = (PROJECT_ROOT / "stocks").resolve(strict=True)
+        project_root = PROJECT_ROOT.resolve(strict=True)
+        raw_stock_dir = Path(stock_dir)
+        if raw_stock_dir.is_symlink():
+            return False, "symlink 경로"
+        stat_result = raw_stock_dir.stat()
+        if getattr(stat_result, "st_file_attributes", 0) & 0x400:
+            return False, "reparse point 경로"
+        resolved_stock_dir = raw_stock_dir.resolve(strict=True)
+    except Exception as exc:
+        return False, f"경로 확인 실패: {exc}"
+
+    if resolved_stock_dir in {project_root, stocks_root}:
+        return False, "프로젝트 또는 stocks 루트 경로"
+
+    if resolved_stock_dir.parent != stocks_root:
+        return False, "stocks 바로 아래 종목 폴더가 아님"
+
+    if not resolved_stock_dir.is_dir():
+        return False, "디렉터리가 아님"
+
+    parsed_code, parsed_name = parse_stock_folder_name(resolved_stock_dir.name)
+    if str(parsed_code).strip() != str(code).strip() or str(parsed_name).strip() != str(name).strip():
+        return False, "종목 폴더 identity 불일치"
+
+    return True, ""
+
+
+def _stock_reset_target_still_exists_in_base_stocks(code: str, name: str) -> bool:
+    for stock in read_base_stocks():
+        if str(stock.get("code", "")).strip() == code and str(stock.get("name", "")).strip() == name:
+            return True
+    return False
 
 
 def runtime_delete_block_reasons(stock_dir: Path) -> list[str]:
@@ -985,8 +1211,10 @@ class StockRegisterWindow(QDialog):
         self.btn_stock_history.setObjectName("stockRegisterStockHistoryButton")
         self.btn_stock_history.setEnabled(False)
         self.btn_stock_history.setToolTip("선택한 종목의 주문 이력을 확인합니다.")
-        self.btn_delete_stock = QPushButton("종목삭제")
+        self.btn_delete_stock = QPushButton("종목초기화")
+        self.btn_delete_stock.setObjectName("stockRegisterResetStockButton")
         self.btn_delete_stock.setEnabled(False)
+        self.btn_delete_stock.setToolTip("선택한 종목을 초기화합니다.")
         self.btn_close = QPushButton("닫기")
 
         self._setup_ui()
@@ -1613,7 +1841,7 @@ class StockRegisterWindow(QDialog):
 
     def on_stock_selection_changed(self) -> None:
         selected_rows = self.stock_table.selectionModel().selectedRows()
-        self.btn_delete_stock.setEnabled(len(selected_rows) >= 1)
+        self.btn_delete_stock.setEnabled(len(selected_rows) == 1)
         self.btn_stock_history.setEnabled(self.can_open_selected_stock_history())
 
     def selected_stock_history_target(self) -> tuple[Path, str, str, str] | None:
@@ -1704,7 +1932,7 @@ class StockRegisterWindow(QDialog):
         action_select_all = menu.addAction("전체 선택")
         action_clear = menu.addAction("선택 해제")
         menu.addSeparator()
-        action_delete = menu.addAction("종목삭제")
+        action_delete = menu.addAction("종목초기화")
         menu.addSeparator()
         routine_actions: dict[object, tuple[RoutineInstanceRecord, RoutineDefinitionRecord]] = {}
         routine_targets = self.available_routine_assign_targets()
@@ -1736,7 +1964,7 @@ class StockRegisterWindow(QDialog):
         has_selected = selected_count > 0
         action_assign.setEnabled(has_selected)
         action_unassign.setEnabled(has_selected)
-        action_delete.setEnabled(has_selected)
+        action_delete.setEnabled(selected_count == 1)
 
         selected_action = menu.exec_(self.stock_table.viewport().mapToGlobal(position))
         if selected_action is None:
@@ -1964,7 +2192,7 @@ class StockRegisterWindow(QDialog):
 
     def delete_selected_stock(self) -> None:
         """
-        선택 종목을 중앙 stocks에서 archive로 이동한다.
+        선택 종목을 영구 초기화한다.
         """
         selected_rows = self.stock_table.selectionModel().selectedRows()
 
@@ -1972,7 +2200,15 @@ class StockRegisterWindow(QDialog):
             QMessageBox.warning(
                 self,
                 "선택 오류",
-                "삭제할 종목을 1개 이상 선택하세요.",
+                "초기화할 종목을 하나 선택하세요.",
+            )
+            return
+
+        if len(selected_rows) != 1:
+            QMessageBox.warning(
+                self,
+                "선택 오류",
+                "초기화할 종목을 하나만 선택하세요.",
             )
             return
 
@@ -2000,7 +2236,7 @@ class StockRegisterWindow(QDialog):
         if invalid_rows:
             QMessageBox.warning(
                 self,
-                "삭제 오류",
+                "초기화 오류",
                 "선택한 종목의 코드 또는 이름을 확인할 수 없습니다.\n\n"
                 f"문제 행: {', '.join(str(row) for row in invalid_rows)}",
             )
@@ -2010,7 +2246,7 @@ class StockRegisterWindow(QDialog):
             QMessageBox.warning(
                 self,
                 "선택 오류",
-                "삭제할 종목의 정보를 찾을 수 없습니다.",
+                "초기화할 종목의 정보를 찾을 수 없습니다.",
             )
             return
 
@@ -2023,100 +2259,116 @@ class StockRegisterWindow(QDialog):
             seen_stocks.add(key)
             unique_stocks.append(key)
 
-        immediate_items: list[dict[str, object]] = []
-        force_items: list[dict[str, object]] = []
-        blocked_items: list[dict[str, object]] = []
-
-        for code, name in unique_stocks:
-            category, title, reasons, runtime_dirs = stock_register_unavailable_reason(code, name)
-            item = {
-                "code": code,
-                "name": name,
-                "title": title,
-                "reasons": reasons,
-                "runtime_dirs": runtime_dirs,
-            }
-            if category == "immediate":
-                immediate_items.append(item)
-            elif category == "force":
-                force_items.append(item)
-            else:
-                blocked_items.append(item)
-
-        if blocked_items and not immediate_items and not force_items:
-            show_toast(self, f"종목삭제 0종목 | 삭제불가 {len(blocked_items)}종목")
-            return
-
-        selected_force_items: list[dict[str, object]] = []
-        if force_items or blocked_items:
-            dialog = ForceUnregisterConfirmDialog(
-                parent=self,
-                force_items=force_items,
-                blocked_items=blocked_items,
-                immediate_count=len(immediate_items),
-            )
-            if dialog.exec_() != QDialog.Accepted:
-                return
-            selected_force_items = dialog.selected_items()
-
-        archive_root = ARCHIVED_STOCKS_DIR
-        archive_root.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        deleted_items: list[tuple[str, str]] = []
-        delete_failed_items: list[str] = []
-        items_to_delete = immediate_items + selected_force_items
-        repo = stock_repository_factory()
-
-        for item in items_to_delete:
-            code = str(item.get("code", "")).strip()
-            name = str(item.get("name", "")).strip()
-            runtime_dirs = item.get("runtime_dirs", [])
-            if item in selected_force_items:
-                for _routine_name, stock_dir in runtime_dirs:
-                    if isinstance(stock_dir, Path):
-                        if not reset_runtime_state_for_force_unregister(stock_dir):
-                            delete_failed_items.append(f"{code} {name}: state 초기화 실패")
-                            continue
-                        if not reset_runtime_orders_for_force_unregister(stock_dir):
-                            delete_failed_items.append(f"{code} {name}: orders 초기화 실패")
-                            continue
-
-            stock_dir = repo.resolve_stock_dir(code, name)
-            if not stock_dir.exists():
-                delete_failed_items.append(f"{code} {name}: 중앙 stocks 폴더 없음")
-                continue
-
-            try:
-                if update_base_stock_routines(code, name, []):
-                    ensure_single_real_trade_routine_for_stock(code, name)
-                archive_dir = archive_root / f"{stock_dir.name}_{timestamp}"
-                if archive_dir.exists():
-                    archive_dir = archive_root / f"{stock_dir.name}_{timestamp}_{len(deleted_items)+1}"
-                stock_dir.rename(archive_dir)
-                deleted_items.append((code, name))
-            except Exception as exc:
-                delete_failed_items.append(f"{code} {name}: {exc}")
-
-        if delete_failed_items:
-            preview_text = "\n".join(delete_failed_items[:10])
-            if len(delete_failed_items) > 10:
-                preview_text += f"\n... 외 {len(delete_failed_items) - 10}개"
+        if len(unique_stocks) != 1:
             QMessageBox.warning(
                 self,
-                "종목삭제 일부 실패",
-                "일부 종목을 archive로 이동하지 못했습니다.\n\n"
-                f"{preview_text}",
+                "선택 오류",
+                "초기화할 종목을 하나만 선택하세요.",
             )
+            return
 
-        if deleted_items:
-            deleted_text = " / ".join(f"{code},{name}" for code, name in deleted_items)
-            message = f"선택 종목 삭제: {deleted_text} / stocks 폴더 archive 이동"
-            append_changelog("DELETE", "중앙 종목관리", message)
+        code, name = unique_stocks[0]
+        eligibility = stock_reset_eligibility(code, name)
+        if eligibility.get("status") != STOCK_RESET_INITIALIZABLE:
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        first_stock_dir = eligibility.get("stock_dir")
+        if not isinstance(first_stock_dir, Path):
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        if not confirm_stock_reset(self, code, name):
+            return
+
+        verified_eligibility = stock_reset_eligibility(code, name)
+        if verified_eligibility.get("status") != STOCK_RESET_INITIALIZABLE:
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        verified_stock_dir = verified_eligibility.get("stock_dir")
+        if not isinstance(verified_stock_dir, Path):
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        try:
+            if first_stock_dir.resolve(strict=True) != verified_stock_dir.resolve(strict=True):
+                show_toast(self, _stock_reset_failure_message())
+                return
+        except Exception:
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        path_ok, path_reason = _validate_stock_reset_delete_path(code, name, verified_stock_dir)
+        if not path_ok:
+            LOGGER.error(
+                "stock reset path validation failed: code=%s name=%s stock_dir=%s reason=%s",
+                code,
+                name,
+                verified_stock_dir,
+                path_reason,
+            )
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        try:
+            shutil.rmtree(verified_stock_dir)
+        except Exception as exc:
+            LOGGER.exception(
+                "stock reset failed to remove stock dir: code=%s name=%s stock_dir=%s error=%s",
+                code,
+                name,
+                verified_stock_dir,
+                exc,
+            )
+            try:
+                self.refresh_stock_table()
+            except Exception:
+                LOGGER.exception("stock reset refresh failed after remove exception")
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        if verified_stock_dir.exists():
+            LOGGER.error(
+                "stock reset delete verification failed: directory still exists code=%s name=%s stock_dir=%s",
+                code,
+                name,
+                verified_stock_dir,
+            )
+            self.refresh_stock_table()
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        try:
+            still_registered = _stock_reset_target_still_exists_in_base_stocks(code, name)
+            remaining_runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+        except Exception as exc:
+            LOGGER.exception(
+                "stock reset post-delete readback failed: code=%s name=%s error=%s",
+                code,
+                name,
+                exc,
+            )
+            self.refresh_stock_table()
+            show_toast(self, _stock_reset_failure_message())
+            return
+
+        if still_registered or remaining_runtime_dirs:
+            LOGGER.error(
+                "stock reset post-delete verification failed: code=%s name=%s still_registered=%s remaining_runtime_dirs=%s",
+                code,
+                name,
+                still_registered,
+                remaining_runtime_dirs,
+            )
+            self.refresh_stock_table()
+            show_toast(self, _stock_reset_failure_message())
+            return
 
         self.refresh_stock_table()
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
+        self.btn_stock_history.setEnabled(False)
 
         parent = self.parent()
         if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
@@ -2124,10 +2376,7 @@ class StockRegisterWindow(QDialog):
         elif parent is not None and hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
-        show_toast(
-            self,
-            f"종목삭제 {len(deleted_items)}종목 | 삭제불가 {len(blocked_items) + len(delete_failed_items)}종목",
-        )
+        show_toast(self, "초기화 완료")
 
     def selected_registered_stocks(self) -> list[tuple[str, str]]:
         """현재 화면에서 선택된 종목을 종목코드/종목명 기준으로 반환한다."""

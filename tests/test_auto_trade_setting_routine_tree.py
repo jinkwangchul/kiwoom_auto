@@ -4474,8 +4474,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("종목이력", window.btn_stock_history.text())
         self.assertEqual("stockRegisterStockHistoryButton", window.btn_stock_history.objectName())
         self.assertFalse(window.btn_stock_history.isEnabled())
+        self.assertEqual("종목초기화", window.btn_delete_stock.text())
+        self.assertEqual("stockRegisterResetStockButton", window.btn_delete_stock.objectName())
 
-    def test_stock_register_window_adds_stock_history_button_between_register_and_delete(self) -> None:
+    def test_stock_register_window_adds_stock_history_button_between_register_and_reset(self) -> None:
         import gui_stock_register_window as stock_register_window
 
         with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
@@ -4496,6 +4498,31 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 for index in range(button_layout.count())
             ],
         )
+
+    def test_stock_register_reset_button_enabled_only_for_single_selection(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        window.stock_table.setRowCount(2)
+        window.stock_table.setSelectionMode(QAbstractItemView.MultiSelection)
+        for row, code in enumerate(("005930", "000660")):
+            window.stock_table.setItem(row, 0, QTableWidgetItem(code))
+            window.stock_table.setItem(row, 1, QTableWidgetItem(f"종목{row}"))
+
+        window.stock_table.clearSelection()
+        window.on_stock_selection_changed()
+        self.assertFalse(window.btn_delete_stock.isEnabled())
+
+        window.stock_table.selectRow(0)
+        window.on_stock_selection_changed()
+        self.assertTrue(window.btn_delete_stock.isEnabled())
+
+        window.stock_table.selectRow(1)
+        window.on_stock_selection_changed()
+        self.assertFalse(window.btn_delete_stock.isEnabled())
 
     def test_stock_register_stock_history_button_enabled_only_for_single_resolved_runtime(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -5365,7 +5392,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "전체 선택",
                 "선택 해제",
                 "---",
-                "종목삭제",
+                "종목초기화",
                 "---",
                 ("루틴등록", assign_submenu),
                 "루틴해제",
@@ -5865,7 +5892,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window.show_stock_table_context_menu(QPoint(1, 1))
 
         self.assertEqual(
-            ["전체 선택", "선택 해제", "---", "종목삭제", "---", "루틴등록", "루틴해제"],
+            ["전체 선택", "선택 해제", "---", "종목초기화", "---", "루틴등록", "루틴해제"],
             FakeMenu.last.entries,
         )
         FakeMenu.last.actions[3].setEnabled.assert_called_once_with(True)
@@ -6001,26 +6028,144 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual([("루틴A", Path("stocks") / "111111_검토")], runtime_dirs)
         pending.assert_not_called()
 
-    def test_stock_register_delete_blocks_review_before_repository_writer_and_archive(self) -> None:
+    def _stock_reset_runtime_dir(
+        self,
+        root: Path,
+        *,
+        status: str = "STOPPED",
+        state_updates: dict[str, object] | None = None,
+        orders: list[dict[str, object]] | None = None,
+    ) -> Path:
+        stock_dir = root / "111111_대상"
+        stock_dir.mkdir(parents=True)
+        state: dict[str, object] = {"status": status, "holding_qty": 0}
+        if state_updates:
+            state.update(state_updates)
+        (stock_dir / "state.json").write_text(
+            json.dumps(state, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (stock_dir / "orders.json").write_text(
+            json.dumps({"orders": orders or []}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return stock_dir
+
+    def test_stock_reset_eligibility_all_clear_initializable(self) -> None:
         import gui_stock_register_window as stock_register_window
 
-        dialog = MagicMock()
-        dialog.exec_.return_value = stock_register_window.QDialog.Rejected
+        with TemporaryDirectory() as tmpdir:
+            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
+            with patch.object(
+                stock_register_window,
+                "stock_runtime_dirs_for_stock",
+                return_value=[("루틴A", stock_dir)],
+            ):
+                result = stock_register_window.stock_reset_eligibility("111111", "대상")
+
+        self.assertEqual(stock_register_window.STOCK_RESET_INITIALIZABLE, result["status"])
+        self.assertEqual("", result["reason"])
+        self.assertEqual(stock_dir, result["stock_dir"])
+
+    def test_stock_reset_eligibility_blocks_unsafe_states(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        cases = [
+            ("holding", "STOPPED", {"holding_qty": 1}, [], "보유수량 있음"),
+            ("buy_pending", "STOPPED", {}, [{"status": "OPEN", "side": "BUY", "pending_qty": 3}], "매수미결 있음"),
+            ("sell_pending", "STOPPED", {}, [{"status": "OPEN", "side": "SELL", "pending_qty": 2}], "매도미결 있음"),
+            ("running", "RUNNING", {}, [], "운영 중"),
+            ("sell_only", "SELL_ONLY", {}, [], "운영 중"),
+            ("review", "STOPPED", {"review_required": True}, [], "검토관리 상태"),
+            ("emergency", "EMERGENCY_STOPPED", {}, [], "긴급정지 상태"),
+            ("in_progress", "STOPPED", {"transition_status": "IN_PROGRESS"}, [], "진행 중인 명령 또는 전환 상태"),
+        ]
+
+        for label, status, state_updates, orders, reason in cases:
+            with self.subTest(label=label):
+                with TemporaryDirectory() as tmpdir:
+                    stock_dir = self._stock_reset_runtime_dir(
+                        Path(tmpdir),
+                        status=status,
+                        state_updates=state_updates,
+                        orders=orders,
+                    )
+                    with patch.object(
+                        stock_register_window,
+                        "stock_runtime_dirs_for_stock",
+                        return_value=[("루틴A", stock_dir)],
+                    ):
+                        result = stock_register_window.stock_reset_eligibility("111111", "대상")
+
+                self.assertEqual(stock_register_window.STOCK_RESET_NOT_INITIALIZABLE, result["status"])
+                self.assertEqual(reason, result["reason"])
+
+    def test_stock_reset_eligibility_blocks_storage_and_integrity_errors(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clean_dir = self._stock_reset_runtime_dir(root / "clean")
+            corrupt_state_dir = root / "corrupt_state" / "111111_대상"
+            corrupt_state_dir.mkdir(parents=True)
+            (corrupt_state_dir / "state.json").write_text("{", encoding="utf-8")
+            (corrupt_state_dir / "orders.json").write_text('{"orders":[]}', encoding="utf-8")
+            corrupt_orders_dir = self._stock_reset_runtime_dir(root / "corrupt_orders")
+            (corrupt_orders_dir / "orders.json").write_text("{", encoding="utf-8")
+            missing_orders_dir = self._stock_reset_runtime_dir(root / "missing_orders")
+            (missing_orders_dir / "orders.json").unlink()
+
+            cases = [
+                ("missing_dir", [], "종목 저장 위치 없음"),
+                ("multiple_dirs", [("루틴A", clean_dir), ("루틴B", clean_dir)], "종목 저장 위치 중복"),
+                ("corrupt_state", [("루틴A", corrupt_state_dir)], "state 무결성 오류: JSON 읽기 실패"),
+                ("corrupt_orders", [("루틴A", corrupt_orders_dir)], "orders 무결성 오류: JSON 읽기 실패"),
+                ("missing_orders", [("루틴A", missing_orders_dir)], "orders 무결성 오류: 파일 없음"),
+            ]
+
+            for label, runtime_dirs, reason in cases:
+                with self.subTest(label=label):
+                    with patch.object(
+                        stock_register_window,
+                        "stock_runtime_dirs_for_stock",
+                        return_value=runtime_dirs,
+                    ):
+                        result = stock_register_window.stock_reset_eligibility("111111", "대상")
+                    self.assertEqual(stock_register_window.STOCK_RESET_NOT_INITIALIZABLE, result["status"])
+                    self.assertEqual(reason, result["reason"])
+
+            with patch.object(
+                stock_register_window,
+                "stock_runtime_dirs_for_stock",
+                side_effect=RuntimeError("boom"),
+            ):
+                result = stock_register_window.stock_reset_eligibility("111111", "대상")
+            self.assertEqual(stock_register_window.STOCK_RESET_NOT_INITIALIZABLE, result["status"])
+            self.assertEqual("종목 저장 위치 확인 실패", result["reason"])
+
+    def test_stock_register_reset_blocks_review_before_legacy_force_and_archive_paths(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        self.assertFalse(hasattr(stock_register_window, "ForceUnregisterConfirmDialog"))
+        self.assertFalse(hasattr(stock_register_window, "reset_runtime_state_for_force_unregister"))
+        self.assertFalse(hasattr(stock_register_window, "reset_runtime_orders_for_force_unregister"))
+        self.assertFalse(hasattr(stock_register_window, "ARCHIVED_STOCKS_DIR"))
 
         with (
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(
                 stock_register_window,
-                "stock_register_unavailable_reason",
-                return_value=(
-                    "blocked",
-                    "111111 검토",
-                    ["검토관리"],
-                    [("루틴A", Path("stocks") / "111111_검토")],
-                ),
+                "stock_reset_eligibility",
+                return_value={
+                    "status": stock_register_window.STOCK_RESET_NOT_INITIALIZABLE,
+                    "reason": "검토관리 상태",
+                    "stock_dir": Path("stocks") / "111111_검토",
+                },
             ),
-            patch.object(stock_register_window, "ForceUnregisterConfirmDialog", return_value=dialog) as confirm_dialog,
+            patch.object(stock_register_window, "confirm_stock_reset") as confirm_dialog,
             patch.object(stock_register_window, "stock_repository_factory") as repository_factory,
+            patch.object(stock_register_window, "append_changelog") as changelog,
+            patch.object(stock_register_window.shutil, "rmtree") as rmtree,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
         ):
@@ -6035,8 +6180,209 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         confirm_dialog.assert_not_called()
         repository_factory.assert_not_called()
-        toast.assert_called_once_with(window, "종목삭제 0종목 | 삭제불가 1종목")
+        rmtree.assert_not_called()
+        changelog.assert_not_called()
+        toast.assert_called_once_with(window, "해당 종목은 초기화가 불가능합니다.\n종목 상태를 다시 확인하세요.")
         information.assert_not_called()
+
+    def test_stock_register_reset_cancel_does_not_delete(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with TemporaryDirectory() as tmpdir:
+            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
+            with (
+                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+                patch.object(
+                    stock_register_window,
+                    "stock_reset_eligibility",
+                    return_value={
+                        "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
+                        "reason": "",
+                        "stock_dir": stock_dir,
+                    },
+                ),
+                patch.object(stock_register_window, "confirm_stock_reset", return_value=False) as confirm_dialog,
+                patch.object(stock_register_window, "stock_repository_factory") as repository_factory,
+                patch.object(stock_register_window, "append_changelog") as changelog,
+                patch.object(stock_register_window.shutil, "rmtree") as rmtree,
+                patch.object(stock_register_window, "show_toast") as toast,
+            ):
+                window = stock_register_window.StockRegisterWindow()
+                self.addCleanup(window.close)
+                window.stock_table.setRowCount(1)
+                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
+                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
+                window.stock_table.selectRow(0)
+
+                window.delete_selected_stock()
+
+            self.assertTrue(stock_dir.exists())
+
+        confirm_dialog.assert_called_once_with(window, "111111", "대상")
+        repository_factory.assert_not_called()
+        rmtree.assert_not_called()
+        changelog.assert_not_called()
+        toast.assert_not_called()
+
+    def test_stock_register_reset_second_check_blocks_changed_stock_dir(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with TemporaryDirectory() as tmpdir:
+            first_dir = self._stock_reset_runtime_dir(Path(tmpdir) / "first")
+            second_dir = self._stock_reset_runtime_dir(Path(tmpdir) / "second")
+            with (
+                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+                patch.object(
+                    stock_register_window,
+                    "stock_reset_eligibility",
+                    side_effect=[
+                        {
+                            "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
+                            "reason": "",
+                            "stock_dir": first_dir,
+                        },
+                        {
+                            "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
+                            "reason": "",
+                            "stock_dir": second_dir,
+                        },
+                    ],
+                ),
+                patch.object(stock_register_window, "confirm_stock_reset", return_value=True),
+                patch.object(stock_register_window.shutil, "rmtree") as rmtree,
+                patch.object(stock_register_window, "show_toast") as toast,
+            ):
+                window = stock_register_window.StockRegisterWindow()
+                self.addCleanup(window.close)
+                window.stock_table.setRowCount(1)
+                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
+                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
+                window.stock_table.selectRow(0)
+
+                window.delete_selected_stock()
+
+            self.assertTrue(first_dir.exists())
+            self.assertTrue(second_dir.exists())
+
+        rmtree.assert_not_called()
+        toast.assert_called_once_with(window, "해당 종목은 초기화가 불가능합니다.\n종목 상태를 다시 확인하세요.")
+
+    def test_stock_register_reset_success_deletes_folder_and_refreshes(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        parent = QWidget()
+        parent.refresh_auto_trade_assignment_views = MagicMock()
+        self.addCleanup(parent.close)
+        with TemporaryDirectory() as tmpdir:
+            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
+            (stock_dir / "logs").mkdir()
+            (stock_dir / "logs" / "trade.log").write_text("log", encoding="utf-8")
+            eligibility = {
+                "status": stock_register_window.STOCK_RESET_INITIALIZABLE,
+                "reason": "",
+                "stock_dir": stock_dir,
+            }
+            with (
+                patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
+                patch.object(stock_register_window, "stock_reset_eligibility", side_effect=[eligibility, eligibility]),
+                patch.object(stock_register_window, "confirm_stock_reset", return_value=True),
+                patch.object(stock_register_window, "_validate_stock_reset_delete_path", return_value=(True, "")),
+                patch.object(stock_register_window, "read_base_stocks", return_value=[]),
+                patch.object(stock_register_window, "stock_runtime_dirs_for_stock", return_value=[]),
+                patch.object(stock_register_window, "append_changelog") as changelog,
+                patch.object(stock_register_window, "show_toast") as toast,
+            ):
+                window = stock_register_window.StockRegisterWindow(parent=parent)
+                self.addCleanup(window.close)
+                window.stock_table.setRowCount(1)
+                window.stock_table.setItem(0, 0, QTableWidgetItem("111111"))
+                window.stock_table.setItem(0, 1, QTableWidgetItem("대상"))
+                window.stock_table.selectRow(0)
+
+                window.delete_selected_stock()
+
+            self.assertFalse(stock_dir.exists())
+
+        changelog.assert_not_called()
+        parent.refresh_auto_trade_assignment_views.assert_called_once_with()
+        toast.assert_called_once_with(window, "초기화 완료")
+
+    def test_stock_register_reset_path_validation_blocks_non_stock_dir(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with TemporaryDirectory() as tmpdir:
+            outside_dir = self._stock_reset_runtime_dir(Path(tmpdir))
+            ok, reason = stock_register_window._validate_stock_reset_delete_path(
+                "111111",
+                "대상",
+                outside_dir,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual("stocks 바로 아래 종목 폴더가 아님", reason)
+
+    def test_stock_register_reset_confirm_dialog_contract(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeMessageBox:
+            Warning = object()
+            AcceptRole = object()
+            RejectRole = object()
+            last = None
+
+            def __init__(self, parent):
+                FakeMessageBox.last = self
+                self.parent = parent
+                self.icon = None
+                self.title = ""
+                self.text = ""
+                self.default_button = None
+                self.escape_button = None
+                self.confirm_button = object()
+                self.cancel_button = object()
+                self.clicked = self.confirm_button
+                self.buttons = []
+
+            def setIcon(self, icon):
+                self.icon = icon
+
+            def setWindowTitle(self, title):
+                self.title = title
+
+            def setText(self, text):
+                self.text = text
+
+            def addButton(self, label, role):
+                button = self.confirm_button if role is self.AcceptRole else self.cancel_button
+                self.buttons.append((label, role, button))
+                return button
+
+            def setDefaultButton(self, button):
+                self.default_button = button
+
+            def setEscapeButton(self, button):
+                self.escape_button = button
+
+            def exec_(self):
+                return 0
+
+            def clickedButton(self):
+                return self.clicked
+
+        parent = QWidget()
+        self.addCleanup(parent.close)
+        with patch.object(stock_register_window, "QMessageBox", FakeMessageBox):
+            self.assertTrue(stock_register_window.confirm_stock_reset(parent, "005930", "삼성전자"))
+
+        dialog = FakeMessageBox.last
+        self.assertEqual(FakeMessageBox.Warning, dialog.icon)
+        self.assertEqual("⚠ 종목초기화 확인", dialog.title)
+        self.assertIn("해당 종목의 모든 기록을 삭제하고", dialog.text)
+        self.assertIn("삭제된 데이터는 복구할 수 없습니다.", dialog.text)
+        self.assertIn("005930 삼성전자", dialog.text)
+        self.assertEqual(["확인", "취소"], [label for label, _role, _button in dialog.buttons])
+        self.assertIs(dialog.default_button, dialog.cancel_button)
+        self.assertIs(dialog.escape_button, dialog.cancel_button)
 
     def test_stock_register_unassign_runs_without_confirm_dialog_and_toasts_counts(self) -> None:
         import gui_stock_register_window as stock_register_window
