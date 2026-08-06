@@ -8,11 +8,113 @@ UI에 직접 의존하지 않는다.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+from gui_auto_trade_runtime import now_text, write_state_json
+from gui_auto_trade_status_ops import append_stock_log
 from gui_order_utils import pending_order_side_quantities
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
+
+LOGGER = logging.getLogger(__name__)
+PENDING_INTEGRITY_USER_REASON = "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."
+
+
+def mark_pending_order_integrity_review_required(
+    routine_name: str,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    issue_codes: list[str],
+    *,
+    source: str,
+) -> bool:
+    state = read_json_dict(stock_dir / "state.json")
+    if not isinstance(state, dict):
+        state = {}
+    before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+    unique_issues = list(dict.fromkeys(str(issue).strip() for issue in issue_codes if str(issue).strip()))
+    reason = "PENDING_ORDER_DATA_INTEGRITY"
+    if unique_issues:
+        reason += ": " + " / ".join(unique_issues)
+
+    if before_status in {"REVIEW_REQUIRED", "REVIEW"}:
+        existing_reason = str(state.get("review_reason", "") or "").strip()
+        if existing_reason == reason:
+            return True
+        LOGGER.warning(
+            "pending integrity review-required write skipped: already in review with different reason "
+            "code=%s name=%s routine=%s stock_dir=%s existing_reason=%s new_reason=%s",
+            code,
+            name,
+            routine_name,
+            stock_dir,
+            existing_reason,
+            reason,
+        )
+        return True
+
+    timestamp = now_text()
+
+    state.update(
+        {
+            "status": "REVIEW_REQUIRED",
+            "review_required": True,
+            "review_status": "PENDING",
+            "review_location": source,
+            "review_reason": reason,
+            "review_detail": f"{code} {name} / {reason}",
+            "review_checked_at": timestamp,
+            "updated_at": timestamp,
+            "trade_enabled": False,
+            "buy_enabled": False,
+            "sell_enabled": False,
+        }
+    )
+    if before_status not in {"REVIEW_REQUIRED", "REVIEW"}:
+        state["review_entered_at"] = timestamp
+
+    ok = write_state_json(stock_dir, state)
+    log_message = (
+        f"미체결 데이터 무결성 오류: {before_status} -> REVIEW_REQUIRED / "
+        f"routine={routine_name} / issues={', '.join(unique_issues) or '-'}"
+    )
+    append_stock_log(stock_dir, "ERROR" if ok else "CRITICAL", log_message)
+    if not ok:
+        LOGGER.error(
+            "pending integrity review-required write failed: code=%s name=%s routine=%s stock_dir=%s issues=%s",
+            code,
+            name,
+            routine_name,
+            stock_dir,
+            unique_issues,
+        )
+        return False
+
+    saved_state = read_json_dict(stock_dir / "state.json")
+    saved_ok = (
+        isinstance(saved_state, dict)
+        and str(saved_state.get("status", "") or "").strip().upper() == "REVIEW_REQUIRED"
+        and saved_state.get("review_required") is True
+        and str(saved_state.get("review_reason", "") or "").strip() == reason
+    )
+    if not saved_ok:
+        append_stock_log(
+            stock_dir,
+            "CRITICAL",
+            f"미체결 데이터 무결성 검토관리 저장 검증 실패: routine={routine_name} / issues={', '.join(unique_issues) or '-'}",
+        )
+        LOGGER.error(
+            "pending integrity review-required read-back failed: code=%s name=%s routine=%s stock_dir=%s reason=%s",
+            code,
+            name,
+            routine_name,
+            stock_dir,
+            reason,
+        )
+        return False
+    return True
 
 
 def auto_trade_unregister_category(
