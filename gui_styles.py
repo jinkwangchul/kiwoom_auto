@@ -16,6 +16,21 @@ from PyQt5.QtWidgets import QLabel, QHeaderView, QTableWidget
 
 PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY = "plain_header_use_table_body_background"
 PLAIN_HEADER_GRID_COLOR_PROPERTY = "plain_header_grid_color"
+TABLE_LIGHT_SELECTION_STYLE = """
+QTableWidget {
+    selection-background-color: #dbeafe;
+    selection-color: #111827;
+}
+QTableWidget::item:selected,
+QTableWidget::item:selected:active,
+QTableWidget::item:selected:!active {
+    background: #dbeafe;
+    color: #111827;
+}
+QTableWidget::item:focus {
+    outline: 0;
+}
+"""
 
 
 class PlainHorizontalHeader(QHeaderView):
