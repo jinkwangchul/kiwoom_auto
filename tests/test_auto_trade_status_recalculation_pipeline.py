@@ -15,7 +15,7 @@ import gui_auto_trade_runtime as auto_trade_runtime
 import gui_auto_trade_policy as auto_trade_policy
 import gui_auto_trade_status_ops as status_ops
 import gui_auto_trade_timer as auto_trade_timer
-from gui_auto_trade_utils import auto_trade_unregister_category
+from gui_auto_trade_utils import auto_trade_unregister_category, mark_pending_order_integrity_review_required
 from runtime_io import read_json_dict
 
 
@@ -154,6 +154,280 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertTrue(mode_changed)
         self.assertEqual("SCHEDULED", config["operation_mode"])
         self.assertEqual("immediate", unregister["category"])
+        self.assertEqual(["Strategy: 보유·미체결 없음"], unregister["reasons"])
+
+    def test_unregister_policy_blocks_active_and_emergency_statuses(self) -> None:
+        scenarios = {
+            "RUNNING": "Strategy: 운영 중 종목입니다.",
+            "STARTED": "Strategy: 운영 중 종목입니다.",
+            "AUTO": "Strategy: 운영 중 종목입니다.",
+            "TRADING": "Strategy: 운영 중 종목입니다.",
+            "SELL_ONLY": "Strategy: 운영 중 종목입니다.",
+            "EMERGENCY_STOP": "Strategy: 긴급정지 종목입니다.",
+        }
+        for raw_status, expected_reason in scenarios.items():
+            with self.subTest(raw_status=raw_status), tempfile.TemporaryDirectory() as temp:
+                _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+                state_path = stock_dir / "state.json"
+                state = read_json_dict(state_path)
+                state["status"] = raw_status
+                state["holding_qty"] = 0
+                state["buy_pending_qty"] = 0
+                state["sell_pending_qty"] = 0
+                state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+                unregister = auto_trade_unregister_category(
+                    "Strategy",
+                    stock_dir,
+                    "111111",
+                    "Stock",
+                )
+
+            self.assertEqual("blocked", unregister["category"])
+            self.assertEqual([expected_reason], unregister["reasons"])
+
+    def test_unregister_policy_blocks_review_required_as_review_management(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["status"] = "REVIEW_REQUIRED"
+            state["holding_qty"] = 0
+            state["buy_pending_qty"] = 0
+            state["sell_pending_qty"] = 0
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+            unregister = auto_trade_unregister_category(
+                "Strategy",
+                stock_dir,
+                "111111",
+                "Stock",
+            )
+
+        self.assertEqual("blocked", unregister["category"])
+        self.assertEqual(["Strategy: 검토관리 종목입니다."], unregister["reasons"])
+
+    def test_unregister_policy_moves_pending_integrity_error_to_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state.update(
+                {
+                    "status": "STOPPED",
+                    "holding_qty": 0,
+                    "pending_order": True,
+                    "pending_qty": 5,
+                    "buy_pending_qty": 0,
+                    "sell_pending_qty": 0,
+                }
+            )
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (stock_dir / "orders.json").write_text("[]", encoding="utf-8")
+
+            unregister = auto_trade_unregister_category(
+                "Strategy",
+                stock_dir,
+                "111111",
+                "Stock",
+            )
+            saved_state = read_json_dict(state_path)
+
+        self.assertEqual("blocked", unregister["category"])
+        self.assertEqual(
+            ["Strategy: 처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."],
+            unregister["reasons"],
+        )
+        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertTrue(saved_state["review_required"])
+        self.assertIn("LEGACY_PENDING_SUMMARY_ONLY", saved_state["review_reason"])
+
+    def test_unregister_policy_moves_unknown_pending_side_to_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state.update({"status": "STOPPED", "holding_qty": 0})
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (stock_dir / "orders.json").write_text(
+                json.dumps(
+                    {
+                        "orders": [
+                            {
+                                "status": "OPEN",
+                                "side": "",
+                                "order_qty": 5,
+                                "filled_qty": 0,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            unregister = auto_trade_unregister_category(
+                "Strategy",
+                stock_dir,
+                "111111",
+                "Stock",
+            )
+            saved_state = read_json_dict(state_path)
+
+        self.assertEqual("blocked", unregister["category"])
+        self.assertEqual(
+            ["Strategy: 처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."],
+            unregister["reasons"],
+        )
+        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertIn("PENDING_ORDER_SIDE_UNKNOWN", saved_state["review_reason"])
+
+    def test_unregister_policy_keeps_normal_buy_pending_as_policy_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["status"] = "STOPPED"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (stock_dir / "orders.json").write_text(
+                json.dumps(
+                    {
+                        "orders": [
+                            {
+                                "status": "OPEN",
+                                "side": "BUY",
+                                "order_qty": 5,
+                                "filled_qty": 2,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            unregister = auto_trade_unregister_category("Strategy", stock_dir, "111111", "Stock")
+            saved_state = read_json_dict(stock_dir / "state.json")
+
+        self.assertEqual("blocked", unregister["category"])
+        self.assertEqual(["Strategy: 매수미결 3"], unregister["reasons"])
+        self.assertNotEqual("REVIEW_REQUIRED", saved_state["status"])
+
+    def test_unregister_policy_keeps_normal_sell_pending_as_policy_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["status"] = "STOPPED"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (stock_dir / "orders.json").write_text(
+                json.dumps(
+                    {
+                        "orders": [
+                            {
+                                "status": "OPEN",
+                                "side": "SELL",
+                                "order_qty": 4,
+                                "filled_qty": 1,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            unregister = auto_trade_unregister_category("Strategy", stock_dir, "111111", "Stock")
+            saved_state = read_json_dict(stock_dir / "state.json")
+
+        self.assertEqual("blocked", unregister["category"])
+        self.assertEqual(["Strategy: 매도미결 3"], unregister["reasons"])
+        self.assertNotEqual("REVIEW_REQUIRED", saved_state["status"])
+
+    def test_unregister_policy_has_no_integrity_error_without_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state["status"] = "STOPPED"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+            unregister = auto_trade_unregister_category("Strategy", stock_dir, "111111", "Stock")
+            saved_state = read_json_dict(stock_dir / "state.json")
+
+        self.assertEqual("immediate", unregister["category"])
+        self.assertEqual(["Strategy: 보유·미체결 없음"], unregister["reasons"])
+        self.assertNotEqual("REVIEW_REQUIRED", saved_state["status"])
+
+    def test_unregister_policy_blocks_holding_or_pending_without_mutating_files(self) -> None:
+        scenarios = [
+            ("holding", {"holding_qty": 5}, [], "Strategy: 보유 5"),
+            (
+                "buy_pending",
+                {},
+                [{"status": "OPEN", "side": "BUY", "order_qty": 5, "filled_qty": 2}],
+                "Strategy: 매수미결 3",
+            ),
+            (
+                "sell_pending",
+                {},
+                [{"status": "OPEN", "side": "SELL", "order_qty": 4, "filled_qty": 1}],
+                "Strategy: 매도미결 3",
+            ),
+        ]
+        for label, state_updates, orders, expected_reason in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+                state_path = stock_dir / "state.json"
+                orders_path = stock_dir / "orders.json"
+                state = read_json_dict(state_path)
+                state.update({"status": "STOPPED", **state_updates})
+                state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+                orders_path.write_text(
+                    json.dumps({"orders": orders}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                before_state = state_path.read_text(encoding="utf-8")
+                before_orders = orders_path.read_text(encoding="utf-8")
+
+                unregister = auto_trade_unregister_category("Strategy", stock_dir, "111111", "Stock")
+
+                self.assertEqual("blocked", unregister["category"])
+                self.assertEqual([expected_reason], unregister["reasons"])
+                self.assertEqual(before_state, state_path.read_text(encoding="utf-8"))
+                self.assertEqual(before_orders, orders_path.read_text(encoding="utf-8"))
+                self.assertFalse((stock_dir / "orders_archive.json").exists())
+
+    def test_pending_integrity_review_required_is_idempotent_for_same_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
+            state_path = stock_dir / "state.json"
+            state = read_json_dict(state_path)
+            state.update(
+                {
+                    "status": "REVIEW_REQUIRED",
+                    "review_required": True,
+                    "review_reason": "PENDING_ORDER_DATA_INTEGRITY: LEGACY_PENDING_SUMMARY_ONLY",
+                }
+            )
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch("gui_auto_trade_utils.write_state_json") as writer,
+                patch("gui_auto_trade_utils.append_stock_log") as stock_log,
+            ):
+                ok = mark_pending_order_integrity_review_required(
+                    "Strategy",
+                    stock_dir,
+                    "111111",
+                    "Stock",
+                    ["LEGACY_PENDING_SUMMARY_ONLY"],
+                    source="test",
+                )
+
+        self.assertTrue(ok)
+        writer.assert_not_called()
+        stock_log.assert_not_called()
 
     def test_first_timer_tick_before_recovery_keeps_running_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

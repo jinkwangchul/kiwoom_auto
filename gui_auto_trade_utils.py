@@ -13,11 +13,15 @@ from pathlib import Path
 
 from gui_auto_trade_runtime import now_text, write_state_json
 from gui_auto_trade_status_ops import append_stock_log
-from gui_order_utils import pending_order_side_quantities
+from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
+    is_review_required_state,
+)
+from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
 from runtime_io import read_json_dict
-from state_policy import auto_trade_status_display
 
 LOGGER = logging.getLogger(__name__)
+UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
 PENDING_INTEGRITY_USER_REASON = "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."
 
 
@@ -127,14 +131,11 @@ def auto_trade_unregister_category(
     자동매매설정 창의 루틴 등록해제 정책에 따라 선택 종목을 분류한다.
 
     반환 category:
-    - immediate: 정지/감시중 + 보유 0 + 현재 미체결 0
-    - force: 정지/감시중 + 보유 또는 현재 미체결 있음
-    - blocked: 매수/매도, 매도만, 일시중지, 검토필요, 확인불가 등
+    - immediate: 보유 0 + 현재 미체결 0
+    - blocked: 보유·미체결, 운영 중, 보호 상태, 무결성 오류 등
     """
     state = read_json_dict(stock_dir / "state.json")
     raw_status = str(state.get("status", "STOPPED")).strip().upper()
-    display_status = auto_trade_status_display(raw_status)
-
     try:
         holding_qty = int(state.get("holding_qty", 0) or 0)
     except Exception:
@@ -148,22 +149,62 @@ def auto_trade_unregister_category(
         "runtime_dirs": [(routine_name, stock_dir)],
     }
 
-    allowed_statuses = {"STOPPED", "STOP", "MONITORING", "WATCHING", ""}
-    blocked_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+    known_statuses = {
+        "STOPPED",
+        "STOP",
+        "MONITORING",
+        "WATCHING",
+        "",
+        "RUNNING",
+        "STARTED",
+        "AUTO",
+        "TRADING",
+        "SELL_ONLY",
+        "EMERGENCY_STOP",
+        "EMERGENCY_STOPPED",
+    }
 
-    if raw_status in blocked_statuses:
+    if is_review_required_state(state):
         item["category"] = "blocked"
-        item["reasons"] = [f"{routine_name}: {display_status} 상태"]
+        item["reasons"] = [f"{routine_name}: 검토관리 종목입니다."]
         return item
 
-    if raw_status not in allowed_statuses:
+    if is_emergency_stopped_state(state):
         item["category"] = "blocked"
-        item["reasons"] = [f"{routine_name}: {display_status or '상태확인필요'} 상태"]
+        item["reasons"] = [f"{routine_name}: 긴급정지 종목입니다."]
+        return item
+
+    operation_active_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+    if raw_status in operation_active_statuses:
+        item["category"] = "blocked"
+        item["reasons"] = [f"{routine_name}: 운영 중 종목입니다."]
+        return item
+
+    if raw_status not in known_statuses:
+        item["category"] = "blocked"
+        LOGGER.error(
+            "unexpected unregister policy status: %s code=%s name=%s routine=%s stock_dir=%s",
+            raw_status,
+            code,
+            name,
+            routine_name,
+            stock_dir,
+        )
+        item["reasons"] = [f"{routine_name}: {UNEXPECTED_STATUS_REASON}"]
         return item
 
     if buy_pending_qty == "?" or sell_pending_qty == "?":
         item["category"] = "blocked"
-        item["reasons"] = [f"{routine_name}: 미체결 확인 필요"]
+        issue_codes = pending_order_integrity_issue_codes(stock_dir, state)
+        mark_pending_order_integrity_review_required(
+            routine_name,
+            stock_dir,
+            code,
+            name,
+            issue_codes,
+            source="등록해제 미체결 데이터 무결성 오류",
+        )
+        item["reasons"] = [f"{routine_name}: {PENDING_INTEGRITY_USER_REASON}"]
         return item
 
     pending_parts: list[str] = []
@@ -177,13 +218,11 @@ def auto_trade_unregister_category(
         if holding_qty > 0:
             details.append(f"보유 {holding_qty}")
         details.extend(pending_parts)
-        reason = f"{routine_name}: {display_status}"
-        if details:
-            reason += f" / {', '.join(details)}"
-        item["category"] = "force"
+        reason = f"{routine_name}: {', '.join(details)}"
+        item["category"] = "blocked"
         item["reasons"] = [reason]
         return item
 
     item["category"] = "immediate"
-    item["reasons"] = [f"{routine_name}: 정지/감시중, 보유·미체결 없음"]
+    item["reasons"] = [f"{routine_name}: 보유·미체결 없음"]
     return item

@@ -6244,12 +6244,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual(stock_register_window.STOCK_RESET_NOT_INITIALIZABLE, result["status"])
             self.assertEqual("종목 저장 위치 확인 실패", result["reason"])
 
-    def test_stock_register_reset_blocks_review_before_legacy_force_and_archive_paths(self) -> None:
+    def test_stock_register_reset_blocks_review_without_archive_paths(self) -> None:
         import gui_stock_register_window as stock_register_window
 
-        self.assertFalse(hasattr(stock_register_window, "ForceUnregisterConfirmDialog"))
-        self.assertFalse(hasattr(stock_register_window, "reset_runtime_state_for_force_unregister"))
-        self.assertFalse(hasattr(stock_register_window, "reset_runtime_orders_for_force_unregister"))
         self.assertFalse(hasattr(stock_register_window, "ARCHIVED_STOCKS_DIR"))
 
         with (

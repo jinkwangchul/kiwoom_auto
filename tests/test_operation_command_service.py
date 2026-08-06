@@ -1437,7 +1437,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
-    def test_unregister_partial_reset_failure_refreshes_completed_changes_and_continues(self) -> None:
+    def test_unregister_processes_only_immediate_and_blocks_unsafe_items(self) -> None:
         import gui_auto_trade_unregister as unregister
 
         immediate = {
@@ -1446,22 +1446,22 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             "name": "즉시종목",
             "runtime_dirs": [],
         }
-        failed_force = {
-            "category": "force",
+        blocked_holding = {
+            "category": "blocked",
             "code": "222222",
-            "name": "실패종목",
-            "runtime_dirs": [("실패루틴", Path("failed"))],
+            "name": "보유종목",
+            "runtime_dirs": [("보유루틴", Path("holding"))],
         }
-        completed_force = {
-            "category": "force",
+        blocked_pending = {
+            "category": "blocked",
             "code": "333333",
-            "name": "완료종목",
-            "runtime_dirs": [("완료루틴", Path("completed"))],
+            "name": "미체결종목",
+            "runtime_dirs": [("미체결루틴", Path("pending"))],
         }
         items_by_code = {
             "111111": immediate,
-            "222222": failed_force,
-            "333333": completed_force,
+            "222222": blocked_holding,
+            "333333": blocked_pending,
         }
         window = Mock()
         parent = Mock()
@@ -1469,8 +1469,8 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         window.current_selected_routine_name.return_value = "테스트루틴"
         window.selected_stock_infos.return_value = [
             (Path("immediate"), "111111", "즉시종목"),
-            (Path("failed"), "222222", "실패종목"),
-            (Path("completed"), "333333", "완료종목"),
+            (Path("holding"), "222222", "보유종목"),
+            (Path("pending"), "333333", "미체결종목"),
         ]
 
         with (
@@ -1479,28 +1479,19 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 "auto_trade_unregister_category",
                 side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
             ),
-            patch.object(
-                unregister,
-                "reset_runtime_state_for_force_unregister",
-                side_effect=lambda stock_dir: stock_dir != Path("failed"),
-            ),
             patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
-            patch.object(unregister, "append_stock_log"),
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,
         ):
             unregister.unregister_selected_auto_trade_stocks(window)
 
-        self.assertEqual(
-            [("111111", "즉시종목", []), ("333333", "완료종목", [])],
-            [call.args for call in update_routines.call_args_list],
-        )
+        update_routines.assert_called_once_with("111111", "즉시종목", [])
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
         warning.assert_not_called()
         toast.assert_called_once_with(
             window,
-            "종목해제 2종목 | 해제불가 1종목",
+            "종목해제 1종목 | 해제불가 2종목",
         )
 
     def test_unregister_result_toast_text_contract(self) -> None:
@@ -1572,7 +1563,6 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 },
             ) as category,
             patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
-            patch.object(unregister, "append_stock_log"),
             patch.object(unregister, "append_changelog"),
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,
@@ -1637,7 +1627,6 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
             ),
             patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
-            patch.object(unregister, "append_stock_log"),
             patch.object(unregister, "append_changelog"),
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,

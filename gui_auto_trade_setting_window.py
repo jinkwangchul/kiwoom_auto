@@ -128,11 +128,8 @@ from gui_schedule_window import (
 )
 from gui_config_utils import (
     default_config,
-    default_state,
-    default_orders,
     ensure_stock_runtime_files,
 )
-from gui_force_unregister_dialog import ForceUnregisterConfirmDialog
 from gui_search_stock_register_dialog import SearchStockRegisterDialog
 from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_review_utils import (
@@ -165,7 +162,6 @@ from gui_auto_trade_runtime import (
     now_text,
     parse_stock_folder_name,
     get_stock_dirs_in_routine,
-    write_state_json,
 )
 
 
@@ -1180,8 +1176,6 @@ from gui_auto_trade_order_log import (
     open_auto_trade_log_view_window,
 )
 from gui_auto_trade_unregister import (
-    reset_runtime_orders_for_force_unregister,
-    reset_runtime_state_for_force_unregister,
     unregister_selected_auto_trade_stocks,
 )
 from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
@@ -11217,93 +11211,3 @@ def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
             continue
         result.append(stock_dir)
     return result
-
-
-def reset_runtime_orders_for_force_unregister(stock_dir: Path) -> bool:
-    """
-    강제 등록해제 시 자동매매설정 표에 남는 매결/도결/미체결 흔적을 제거한다.
-
-    정책:
-    - 현재 화면과 판단 기준이 되는 orders.json 은 빈 주문 목록으로 초기화한다.
-    - 기존 주문 기록은 즉시 삭제하지 않고 orders_archive.json 에 보존한다.
-    - config.json, logs 폴더, 루틴 종목 폴더는 건드리지 않는다.
-    """
-    orders_path = stock_dir / "orders.json"
-    archive_path = stock_dir / "orders_archive.json"
-
-    current_orders = read_orders_data(orders_path)
-
-    try:
-        if current_orders:
-            archive_data = read_json_dict(archive_path)
-            archives = archive_data.get("archives", [])
-            if not isinstance(archives, list):
-                archives = []
-
-            archives.append(
-                {
-                    "archived_at": now_text(),
-                    "reason": "강제 등록해제 상태초기화로 orders.json 현재 표시/판단 흔적 초기화",
-                    "orders": current_orders,
-                }
-            )
-
-            archive_path.write_text(
-                json.dumps({"archives": archives}, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-
-        orders_path.write_text(json.dumps(default_orders(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return True
-    except Exception:
-        return False
-
-
-def reset_runtime_state_for_force_unregister(stock_dir: Path) -> bool:
-    """
-    강제 등록해제 시 runtime 폴더와 설정/로그는 유지하되,
-    현재 운영상태(state.json)와 화면 판단용 주문 흔적(orders.json)을 초기화한다.
-    """
-    state_path = stock_dir / "state.json"
-    state = read_json_dict(state_path)
-    if not state:
-        state = default_state()
-
-    reset_values = {
-        "status": "STOPPED",
-        "trade_set_status": "WAIT_BUY",
-        "current_set_no": 1,
-        "current_round": 0,
-        "avg_price": 0,
-        "holding_qty": 0,
-        "holding_amount": 0,
-        "buy_count": 0,
-        "last_buy_price": 0,
-        "last_buy_time": "",
-        "last_sell_time": "",
-        "pending_order": False,
-        "pending_qty": 0,
-        "remaining_qty": 0,
-        "unfilled_qty": 0,
-        "buy_pending_qty": 0,
-        "sell_pending_qty": 0,
-        "paused_at": "",
-        "resumed_at": "",
-        "review_required": False,
-        "review_reason": "",
-        "missed_buy_signal_count": 0,
-        "missed_sell_signal_count": 0,
-        "pause_signal_check_status": "UNCHECKED",
-        "ignore_signals_before": "",
-        "updated_at": now_text(),
-    }
-    state.update(reset_values)
-
-    try:
-        if not reset_runtime_orders_for_force_unregister(stock_dir):
-            return False
-        if not write_state_json(stock_dir, state):
-            return False
-        return True
-    except Exception:
-        return False
