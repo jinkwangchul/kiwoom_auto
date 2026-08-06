@@ -149,6 +149,22 @@ def _orchestrator_kwargs(**overrides) -> dict:
 
 
 class SignalDecisionPolicyServiceTest(unittest.TestCase):
+    def test_private_time_defaults_preserve_merge_contract(self):
+        defaults = signal_decision_policy_service._deep_merge_defaults(None)
+        self.assertEqual("09:00:00", defaults["regular_market"]["start_time"])
+        self.assertEqual("15:20:00", defaults["regular_market"]["realtime_end_time"])
+
+        merged = signal_decision_policy_service._deep_merge_defaults(
+            {
+                "regular_market": {"start_time": "10:00:00"},
+                "extra_markets": [{"enabled": True}],
+            }
+        )
+        self.assertEqual("10:00:00", merged["regular_market"]["start_time"])
+        self.assertEqual("15:20:00", merged["regular_market"]["realtime_end_time"])
+        self.assertTrue(merged["extra_markets"][0]["enabled"])
+        self.assertEqual("NEXT_MARKET", merged["extra_markets"][0]["name"])
+
     def test_buy_decision_passes_policy_without_mutating_input(self):
         decision_preview = _decision("BUY")
         before = deepcopy(decision_preview)

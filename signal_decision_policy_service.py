@@ -8,11 +8,90 @@ execution or order adapters.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
-from time_policy import deep_merge_defaults, seconds_from_hhmmss
+from state_policy import (
+    REGULAR_SESSION_END_TIME,
+    REGULAR_SESSION_START_TIME,
+    seconds_from_hhmmss,
+)
+
+
+_DEFAULT_OPERATING_TIME_CONFIG: dict[str, Any] = {
+    "regular_market": {
+        "start_time": REGULAR_SESSION_START_TIME,
+        "realtime_end_time": REGULAR_SESSION_END_TIME,
+        "closing_auction_start_time": "15:20:00",
+        "closing_auction_end_time": "15:30:00",
+    },
+    "global_scheduled_trade": {
+        "buy_start_time": "09:00:00",
+        "buy_end_time": "13:30:00",
+    },
+    "extra_markets": [
+        {
+            "name": "NEXT_MARKET",
+            "display_name": "넥스트장",
+            "enabled": False,
+            "start_time": "08:00:00",
+            "end_time": "20:00:00",
+        },
+        {
+            "name": "EXTRA_MARKET_1",
+            "display_name": "추가시장1",
+            "enabled": False,
+            "start_time": "00:00:00",
+            "end_time": "00:00:00",
+        },
+        {
+            "name": "EXTRA_MARKET_2",
+            "display_name": "추가시장2",
+            "enabled": False,
+            "start_time": "00:00:00",
+            "end_time": "00:00:00",
+        },
+    ],
+    "market_close_liquidation": {
+        "enabled": False,
+        "minutes_before_regular_end": 10,
+        "order_type": "MARKET",
+    },
+}
+
+
+def _deep_merge_defaults(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the legacy time-policy defaults without importing its module."""
+    result = json.loads(json.dumps(_DEFAULT_OPERATING_TIME_CONFIG, ensure_ascii=False))
+    if not isinstance(config, dict):
+        return result
+
+    for key, value in config.items():
+        if key == "extra_markets" and isinstance(value, list):
+            default_markets = result.get("extra_markets", [])
+            merged_markets = []
+            for index in range(max(len(default_markets), len(value))):
+                base = (
+                    dict(default_markets[index])
+                    if index < len(default_markets)
+                    and isinstance(default_markets[index], dict)
+                    else {}
+                )
+                incoming = (
+                    value[index]
+                    if index < len(value) and isinstance(value[index], dict)
+                    else {}
+                )
+                base.update(incoming)
+                merged_markets.append(base)
+            result[key] = merged_markets
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key].update(value)
+        else:
+            result[key] = value
+    return result
 
 
 STAGE = "SIGNAL_POLICY_PREVIEW"
@@ -95,11 +174,17 @@ def _now_from_inputs(
 
 
 def _is_regular_time(now_dt: datetime) -> bool:
-    config = deep_merge_defaults(None)
+    config = _deep_merge_defaults(None)
     regular = config["regular_market"]
     now_s = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
-    start_s = seconds_from_hhmmss(regular["start_time"], "09:00:00")
-    end_s = seconds_from_hhmmss(regular["realtime_end_time"], "15:20:00")
+    start_s = seconds_from_hhmmss(
+        regular["start_time"],
+        REGULAR_SESSION_START_TIME,
+    )
+    end_s = seconds_from_hhmmss(
+        regular["realtime_end_time"],
+        REGULAR_SESSION_END_TIME,
+    )
     return start_s <= now_s <= end_s
 
 

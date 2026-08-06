@@ -637,7 +637,7 @@ def in_manual_trading_session(
 def status_for_schedule_window(
     config: dict[str, object] | None = None,
     now_dt: datetime | None = None,
-    after_end_status: str = "SELL_ONLY",
+    after_end_status: str = "AUTO_CLOSE",
 ) -> str:
     """전역/개별 시간 + 정규장 상한(15:20)을 반영한 현재 상태."""
     current = now_dt or datetime.now()

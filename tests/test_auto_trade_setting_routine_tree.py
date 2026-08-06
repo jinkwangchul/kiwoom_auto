@@ -214,6 +214,107 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                             expected,
                             state_policy.scheduled_status_for_now(config, now_dt),
                         )
+                self.assertEqual(
+                    "AUTO_CLOSE",
+                    state_policy.status_for_schedule_window(
+                        config,
+                        datetime(2026, 7, 24, 13, 31),
+                    ),
+                )
+
+    def test_buy_end_context_writer_uses_auto_close_status(self) -> None:
+        import gui_auto_trade_status_ops as status_ops
+
+        class FakeBox:
+            Question = 4
+            AcceptRole = 0
+            RejectRole = 1
+
+            def __init__(self, _parent):
+                self._clicked = None
+
+            def setIcon(self, _icon):
+                pass
+
+            def setWindowTitle(self, _title):
+                pass
+
+            def setText(self, _text):
+                pass
+
+            def addButton(self, _text, role):
+                button = object()
+                if role == self.AcceptRole:
+                    self._clicked = button
+                return button
+
+            def setDefaultButton(self, _button):
+                pass
+
+            def exec_(self):
+                pass
+
+            def clickedButton(self):
+                return self._clicked
+
+        class FakeTable:
+            def viewport(self):
+                return self
+
+            def update(self):
+                pass
+
+            def repaint(self):
+                pass
+
+        class FakeWindow:
+            def __init__(self, stock_dir: Path) -> None:
+                self.stock_dir = stock_dir
+                self.stock_table = FakeTable()
+                self.calls = []
+
+            def selected_stock_infos(self):
+                return [(self.stock_dir, "005930", "삼성전자")]
+
+            def current_selected_routine_name(self):
+                return "루틴A"
+
+            def update_stock_status(self, stock_dir, code, name, status, metadata, log_suffix):
+                self.calls.append((stock_dir, code, name, status, metadata, log_suffix))
+                return True
+
+            def refresh_all(self):
+                pass
+
+            def statusBarMessage(self, _message):
+                pass
+
+        with TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                json.dumps({"status": "RUNNING"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = FakeWindow(stock_dir)
+
+            with (
+                patch.object(status_ops, "QMessageBox", FakeBox),
+                patch.object(
+                    status_ops,
+                    "read_operation_policy",
+                    return_value={"auto_close": {"method": "현재가", "profit_percent": "1.0"}},
+                ),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                status_ops.auto_trade_set_selected_stocks_buy_end(window)
+
+        self.assertEqual(len(window.calls), 1)
+        _stock_dir, _code, _name, status, metadata, _log_suffix = window.calls[0]
+        self.assertEqual("AUTO_CLOSE", status)
+        self.assertEqual("USER_CONTEXT_MENU", metadata["auto_close_source"])
+        self.assertEqual("현재가", metadata["auto_close_method"])
+        self.assertEqual("1.0", metadata["auto_close_policy"]["profit_percent"])
 
     def _definition(self) -> RoutineDefinitionRecord:
         return RoutineDefinitionRecord(

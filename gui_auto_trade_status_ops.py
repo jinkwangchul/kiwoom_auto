@@ -787,7 +787,7 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
 
 
 def auto_trade_set_selected_stocks_buy_end(window) -> None:
-    """선택 종목을 SELL_ONLY 상태로 전환한다. 화면 표시는 '감시/매도'로 한다."""
+    """선택 종목을 canonical AUTO_CLOSE 상태로 전환한다."""
     selected = window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
 
@@ -836,12 +836,24 @@ def auto_trade_set_selected_stocks_buy_end(window) -> None:
         return
 
     completed: list[str] = []
+    operation_policy = read_operation_policy()
+    auto_close_policy = operation_policy.get("auto_close", {})
+    if not isinstance(auto_close_policy, dict):
+        auto_close_policy = {}
     for stock_dir, code, name in targets:
+        requested_at = now_text()
+        policy_snapshot = dict(auto_close_policy)
+        method = str(policy_snapshot.get("method") or "").strip() or "루틴매도신호"
+        policy_snapshot["method"] = method
         metadata = {
-            "buy_end_requested_at": now_text(),
+            "buy_end_requested_at": requested_at,
             "buy_end_reason": "USER_CONTEXT_MENU",
+            "auto_close_requested_at": requested_at,
+            "auto_close_source": "USER_CONTEXT_MENU",
+            "auto_close_method": method,
+            "auto_close_policy": policy_snapshot,
         }
-        if window.update_stock_status(stock_dir, code, name, "SELL_ONLY", metadata, "상태 칼럼 우클릭 매수종료"):
+        if window.update_stock_status(stock_dir, code, name, "AUTO_CLOSE", metadata, "상태 칼럼 우클릭 매수종료"):
             completed.append(f"{code} {name}")
 
     if completed:
