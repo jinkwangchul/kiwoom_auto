@@ -981,6 +981,10 @@ class StockRegisterWindow(QDialog):
         self.btn_search_register.setToolTip("검색 결과에서 선택한 종목을 등록합니다.")
         self.btn_manual_register = QPushButton("종목등록")
         self.btn_manual_register.setToolTip("종목명 또는 종목코드를 직접 입력하여 등록합니다.")
+        self.btn_stock_history = QPushButton("종목이력")
+        self.btn_stock_history.setObjectName("stockRegisterStockHistoryButton")
+        self.btn_stock_history.setEnabled(False)
+        self.btn_stock_history.setToolTip("선택한 종목의 주문 이력을 확인합니다.")
         self.btn_delete_stock = QPushButton("종목삭제")
         self.btn_delete_stock.setEnabled(False)
         self.btn_close = QPushButton("닫기")
@@ -1003,6 +1007,7 @@ class StockRegisterWindow(QDialog):
         buttons = [
             self.btn_search_register,
             self.btn_manual_register,
+            self.btn_stock_history,
             self.btn_delete_stock,
             self.btn_close,
         ]
@@ -1429,6 +1434,7 @@ class StockRegisterWindow(QDialog):
     def _connect_events(self) -> None:
         self.btn_close.clicked.connect(self.close)
         self.btn_manual_register.clicked.connect(self.open_manual_register_dialog)
+        self.btn_stock_history.clicked.connect(self.open_selected_stock_history)
         self.btn_delete_stock.clicked.connect(self.delete_selected_stock)
         self.stock_search_input.textChanged.connect(self.refresh_stock_table)
         self.stock_table.itemSelectionChanged.connect(self.on_stock_selection_changed)
@@ -1608,6 +1614,70 @@ class StockRegisterWindow(QDialog):
     def on_stock_selection_changed(self) -> None:
         selected_rows = self.stock_table.selectionModel().selectedRows()
         self.btn_delete_stock.setEnabled(len(selected_rows) >= 1)
+        self.btn_stock_history.setEnabled(self.can_open_selected_stock_history())
+
+    def selected_stock_history_target(self) -> tuple[Path, str, str, str] | None:
+        """종목이력 창을 열 수 있는 단일 선택 대상 정보를 반환한다."""
+        selected_stocks = self.selected_registered_stocks()
+        if len(selected_stocks) != 1:
+            return None
+
+        code, name = selected_stocks[0]
+        runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+        if len(runtime_dirs) != 1:
+            return None
+
+        routine_name, stock_dir = runtime_dirs[0]
+        return stock_dir, routine_name, code, name
+
+    def can_open_selected_stock_history(self) -> bool:
+        return self.selected_stock_history_target() is not None
+
+    def open_selected_stock_history(self) -> None:
+        selected_stocks = self.selected_registered_stocks()
+        if not selected_stocks:
+            QMessageBox.information(
+                self,
+                "종목이력",
+                "조회할 종목을 하나 선택하세요.",
+            )
+            return
+
+        if len(selected_stocks) != 1:
+            QMessageBox.information(
+                self,
+                "종목이력",
+                "종목이력은 한 종목씩 확인할 수 있습니다.",
+            )
+            return
+
+        code, name = selected_stocks[0]
+        runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+        if not runtime_dirs:
+            QMessageBox.information(
+                self,
+                "종목이력",
+                "해당 종목의 이력 저장 위치를 찾을 수 없습니다.",
+            )
+            return
+
+        if len(runtime_dirs) != 1:
+            QMessageBox.information(
+                self,
+                "종목이력",
+                "해당 종목의 이력 저장 위치가 여러 개입니다.",
+            )
+            return
+
+        routine_name, stock_dir = runtime_dirs[0]
+        dialog = OrderStatusWindow(
+            stock_dir=stock_dir,
+            routine_name=routine_name,
+            stock_code=code,
+            stock_name=name,
+            parent=self,
+        )
+        dialog.exec_()
 
     def on_stock_table_item_clicked(self, item: QTableWidgetItem) -> None:
         """
@@ -2223,6 +2293,7 @@ class StockRegisterWindow(QDialog):
         self.stock_table.blockSignals(False)
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
+        self.btn_stock_history.setEnabled(False)
         self._position_stock_performance_sort_badges()
     def open_search_register_dialog(self) -> None:
         """

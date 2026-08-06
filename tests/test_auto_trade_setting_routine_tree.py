@@ -4471,6 +4471,129 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIs(window.stock_search_input.parent(), window)
         self.assertIs(window.stock_table.parent(), window)
         self.assertEqual("종목등록", window.btn_manual_register.text())
+        self.assertEqual("종목이력", window.btn_stock_history.text())
+        self.assertEqual("stockRegisterStockHistoryButton", window.btn_stock_history.objectName())
+        self.assertFalse(window.btn_stock_history.isEnabled())
+
+    def test_stock_register_window_adds_stock_history_button_between_register_and_delete(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        button_layout = window._stock_register_button_layout
+        self.assertEqual(
+            [
+                window.btn_search_register,
+                window.btn_manual_register,
+                window.btn_stock_history,
+                window.btn_delete_stock,
+                window.btn_close,
+            ],
+            [
+                button_layout.itemAt(index).widget()
+                for index in range(button_layout.count())
+            ],
+        )
+
+    def test_stock_register_stock_history_button_enabled_only_for_single_resolved_runtime(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        cases = [
+            ([], [], False),
+            ([("005930", "삼성전자"), ("000660", "SK하이닉스")], [], False),
+            ([("005930", "삼성전자")], [], False),
+            ([("005930", "삼성전자")], [("루틴A", Path("stocks") / "005930_삼성전자"), ("루틴B", Path("stocks") / "005930_삼성전자")], False),
+            ([("005930", "삼성전자")], [("루틴A", Path("stocks") / "005930_삼성전자")], True),
+        ]
+
+        for selected, runtime_dirs, expected in cases:
+            with self.subTest(selected=selected, runtime_dirs=runtime_dirs):
+                with (
+                    patch.object(window, "selected_registered_stocks", return_value=selected),
+                    patch.object(stock_register_window, "stock_runtime_dirs_for_stock", return_value=runtime_dirs),
+                ):
+                    window.on_stock_selection_changed()
+                    self.assertEqual(expected, window.btn_stock_history.isEnabled())
+
+    def test_stock_register_open_selected_stock_history_passes_explicit_target_to_order_window(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        stock_dir = Path("stocks") / "005930_삼성전자"
+        dialog = MagicMock()
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        with (
+            patch.object(window, "selected_registered_stocks", return_value=[("005930", "삼성전자")]),
+            patch.object(stock_register_window, "stock_runtime_dirs_for_stock", return_value=[("지표추종매매B", stock_dir)]),
+            patch.object(stock_register_window, "OrderStatusWindow", return_value=dialog) as order_window,
+        ):
+            window.open_selected_stock_history()
+
+        order_window.assert_called_once_with(
+            stock_dir=stock_dir,
+            routine_name="지표추종매매B",
+            stock_code="005930",
+            stock_name="삼성전자",
+            parent=window,
+        )
+        dialog.exec_.assert_called_once_with()
+
+    def test_stock_history_window_uses_stock_history_title(self) -> None:
+        import gui_order_status_window as order_status_window
+
+        with TemporaryDirectory() as temp_dir:
+            dialog = order_status_window.OrderStatusWindow(
+                stock_dir=Path(temp_dir),
+                routine_name="지표추종매매B",
+                stock_code="005930",
+                stock_name="삼성전자",
+            )
+        self.addCleanup(dialog.close)
+
+        self.assertEqual("종목이력 - 005930 삼성전자", dialog.windowTitle())
+        self.assertTrue(hasattr(dialog, "btn_refresh"))
+        self.assertTrue(hasattr(dialog, "btn_export"))
+        self.assertTrue(hasattr(dialog, "timeline_text"))
+
+    def test_stock_register_open_selected_stock_history_blocks_unavailable_targets(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        cases = [
+            ([], [], "조회할 종목을 하나 선택하세요."),
+            ([("005930", "삼성전자"), ("000660", "SK하이닉스")], [], "종목이력은 한 종목씩 확인할 수 있습니다."),
+            ([("005930", "삼성전자")], [], "해당 종목의 이력 저장 위치를 찾을 수 없습니다."),
+            (
+                [("005930", "삼성전자")],
+                [("루틴A", Path("stocks") / "005930_삼성전자"), ("루틴B", Path("stocks") / "005930_삼성전자")],
+                "해당 종목의 이력 저장 위치가 여러 개입니다.",
+            ),
+        ]
+
+        with patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        for selected, runtime_dirs, message in cases:
+            with self.subTest(message=message):
+                with (
+                    patch.object(window, "selected_registered_stocks", return_value=selected),
+                    patch.object(stock_register_window, "stock_runtime_dirs_for_stock", return_value=runtime_dirs),
+                    patch.object(stock_register_window, "OrderStatusWindow") as order_window,
+                    patch.object(stock_register_window.QMessageBox, "information") as information,
+                ):
+                    window.open_selected_stock_history()
+
+                order_window.assert_not_called()
+                information.assert_called_once_with(window, "종목이력", message)
 
     def test_stock_register_table_displays_assigned_instance_name_before_definition_name(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -6769,7 +6892,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.btn_start,
             window.btn_set_schedule,
             window.btn_stock_register,
-            window.btn_order_view,
             window.btn_log_view,
             window.btn_review_view,
             window.btn_refresh,

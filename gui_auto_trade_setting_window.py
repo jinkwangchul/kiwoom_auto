@@ -116,7 +116,6 @@ from gui_order_utils import (
     order_sort_key,
     summarize_orders,
 )
-from gui_order_status_window import OrderStatusWindow
 from gui_log_view_window import LogViewWindow
 from gui_schedule_utils import (
     schedule_config_updates,
@@ -1179,7 +1178,6 @@ from gui_auto_trade_integrity import (
 )
 from gui_auto_trade_order_log import (
     open_auto_trade_log_view_window,
-    open_auto_trade_order_status_window,
 )
 from gui_auto_trade_unregister import (
     reset_runtime_orders_for_force_unregister,
@@ -2220,7 +2218,7 @@ class AutoTradeSettingWindow(QDialog):
     - 자동매매 루틴 목록 표시
     - 선택 루틴의 종목별 저장 폴더 표시
     - state.json 기준 상태 요약 표시
-    - 실제 자동매매 시작/정지/삭제/환경설정/주문상태/로그 기능은 다음 단계에서 구현
+    - 실제 자동매매 시작/정지/삭제/환경설정/로그 기능은 다음 단계에서 구현
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2302,7 +2300,6 @@ class AutoTradeSettingWindow(QDialog):
             button.setVisible(False)
         self.btn_set_schedule = QPushButton("환경설정")
         self.btn_stock_register = QPushButton("종목관리")
-        self.btn_order_view = QPushButton("주문상태 보기")
         self.btn_log_view = QPushButton("로그 보기")
         self.btn_review_view = QPushButton("검토관리")
         self.btn_refresh = QPushButton("안정성검사")
@@ -2322,7 +2319,6 @@ class AutoTradeSettingWindow(QDialog):
             (self.btn_fetch_minute_candles, "autoTradeSettingFetchMinuteCandlesButton"),
             (self.btn_set_schedule, "autoTradeSettingScheduleButton"),
             (self.btn_stock_register, "autoTradeSettingStockRegisterButton"),
-            (self.btn_order_view, "autoTradeSettingOrderViewButton"),
             (self.btn_log_view, "autoTradeSettingLogViewButton"),
             (self.btn_review_view, "autoTradeSettingReviewViewButton"),
             (self.btn_refresh, "autoTradeSettingRefreshButton"),
@@ -2466,7 +2462,6 @@ class AutoTradeSettingWindow(QDialog):
             self.btn_start,
             self.btn_set_schedule,
             self.btn_stock_register,
-            self.btn_order_view,
             self.btn_log_view,
             self.btn_review_view,
             self.btn_refresh,
@@ -3062,7 +3057,6 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
         self.btn_stock_register.clicked.connect(self.open_stock_register_window)
-        self.btn_order_view.clicked.connect(self.open_order_status_window)
         self.btn_log_view.clicked.connect(self.open_log_view_window)
         self.btn_review_view.clicked.connect(self.open_review_required_window)
         self._fixed_signals_connected = True
@@ -3397,7 +3391,6 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_early_close.setEnabled(self.has_early_close_scope_targets())
         self.btn_set_schedule.setEnabled(True)
         self.btn_stock_register.setEnabled(True)
-        self.btn_order_view.setEnabled(single_stock)
         self.btn_log_view.setEnabled(single_stock)
         self.btn_review_view.setEnabled(True)
         self.update_startup_recovery_controls()
@@ -11172,9 +11165,6 @@ class AutoTradeSettingWindow(QDialog):
             popup = AutoTradeNotificationPopup(self)
             self._notification_popup = popup
         popup.show_message(message, timeout_ms)
-
-    def open_order_status_window(self) -> None:
-        open_auto_trade_order_status_window(self)
 
     def open_log_view_window(self) -> None:
         open_auto_trade_log_view_window(self)

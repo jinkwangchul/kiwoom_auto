@@ -384,7 +384,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "btn_early_close",
                 "btn_set_schedule",
                 "btn_delete",
-                "btn_order_view",
                 "btn_log_view",
                 "btn_review_view",
                 "btn_execution_enable",

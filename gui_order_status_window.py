@@ -2,7 +2,7 @@
 """
 gui_order_status_window.py
 
-주문상태 보기 창 UI.
+종목이력 창 UI.
 선택한 종목 runtime 폴더의 orders.json 을 읽어 주문/체결/타임라인을 표시한다.
 """
 
@@ -50,7 +50,7 @@ def create_current_trade_title_widget(
     title_text: str,
 ) -> QWidget:
     """
-    주문상태 보기 최상단 현재 자동매매현황 제목 위젯.
+    종목이력 최상단 현재 자동매매현황 제목 위젯.
     상태 점 + 제목을 한 줄로 표시한다.
     """
     container = QWidget()
@@ -87,7 +87,7 @@ def stock_runtime_status_from_state(stock_dir: Path) -> str:
 
 class OrderStatusWindow(QDialog):
     """
-    주문상태 보기 창.
+    종목이력 창.
 
     선택한 루틴/종목 폴더의 orders.json 을 읽어
     주문/체결/미체결 현황과 간단한 매매 타임라인을 표시한다.
@@ -109,7 +109,7 @@ class OrderStatusWindow(QDialog):
         self.stock_name = stock_name
         self.orders_path = stock_dir / "orders.json"
 
-        self.setWindowTitle(f"주문상태 보기 - {stock_code} {stock_name}")
+        self.setWindowTitle(f"종목이력 - {stock_code} {stock_name}")
         self.resize(1040, 620)
 
         self.status_title_container = QWidget()
