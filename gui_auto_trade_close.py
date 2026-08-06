@@ -33,6 +33,7 @@ from gui_order_utils import order_value
 from gui_order_utils import pending_order_side_quantities
 from gui_order_utils import read_orders_data
 from runtime_io import read_json_dict
+from gui_toast import show_toast
 from state_policy import auto_trade_status_display
 from gui_auto_trade_integrity import auto_trade_setting_data_inconsistency_reasons
 from gui_auto_trade_policy import (
@@ -1258,6 +1259,20 @@ def auto_trade_cancel_selected_early_close(window) -> None:
     notify(success_message)
 
 
+def _kiwoom_server_login_block_message(window) -> str:
+    try:
+        parent = window.parent()
+    except Exception:
+        parent = None
+    api = getattr(parent, "kiwoom_api", None)
+    checker = getattr(api, "is_connected", None)
+    try:
+        connected = callable(checker) and checker() is True
+    except Exception:
+        connected = False
+    return "" if connected else "키움 서버에 로그인되어 있지 않습니다."
+
+
 def auto_trade_apply_selected_early_close(
     window,
     method: str,
@@ -1271,6 +1286,11 @@ def auto_trade_apply_selected_early_close(
     루틴 방식 조기마감은 첫 매도신호 전까지 매수/매도 신호를 허용하고,
     첫 매도주문 접수 이후 추가 주문 차단은 메인 주문판정 계층에서 처리한다.
     """
+    login_block_message = _kiwoom_server_login_block_message(window)
+    if login_block_message:
+        show_toast(window, login_block_message, duration_ms=2500)
+        return
+
     selected = window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
 
@@ -1348,27 +1368,7 @@ def auto_trade_apply_selected_early_close(
     # 보유가 없는 경우는 사용자의 재확인 대상이 아니다.
     # 조기마감은 보유수량을 0으로 만드는 1차 리셋 절차이므로,
     # 보유가 없으면 조기마감 절차를 생략하고 감시/대기 + 현황 주황으로 정리한다.
-    if not close_targets and not review_items:
-        preview_no_target = "\n".join(f"- {item}" for item in no_target_items[:8])
-        if len(no_target_items) > 8:
-            preview_no_target += f"\n- 외 {len(no_target_items) - 8}개"
-        if skipped_preview_items:
-            skipped_preview = "\n".join(f"- {item}" for item in skipped_preview_items[:5])
-            if len(skipped_preview_items) > 5:
-                skipped_preview += f"\n- 외 {len(skipped_preview_items) - 5}개"
-            preview_no_target += f"\n\n제외:\n{skipped_preview}"
-        if not preview_no_target.strip():
-            preview_no_target = "대상 없음"
-
-        show_ok_message(
-            QMessageBox.Information,
-            "조기마감 생략",
-            "선택 종목에 보유 대상이 없습니다.\n\n"
-            "조기마감 절차는 수행하지 않고\n"
-            "감시/대기 상태로 전환합니다.\n\n"
-            f"대상:\n{preview_no_target}",
-        )
-    else:
+    if close_targets or review_items:
         preview_parts: list[str] = []
         if close_targets:
             target_preview = "\n".join(f"- {code} {name}" for _, code, name in close_targets[:8])
@@ -1402,6 +1402,7 @@ def auto_trade_apply_selected_early_close(
 
     completed: list[str] = []
     skipped: list[str] = []
+    early_close_applied_count = 0
     command_service = OperationCommandService(PROJECT_ROOT)
 
     for stock_dir, code, name in selected:
@@ -1547,6 +1548,7 @@ def auto_trade_apply_selected_early_close(
             continue
 
         completed.append(f"{code} {name}")
+        early_close_applied_count += 1
         if command_result.stock_results and command_result.stock_results[0].status == STOCK_APPLIED:
             log_reason = (
                 f"조기마감/{method_text}/{execution.get('stage')}"
@@ -1575,3 +1577,12 @@ def auto_trade_apply_selected_early_close(
     if skipped:
         message += f" / 제외 {len(skipped)}개"
     window.statusBarMessage(message)
+    if early_close_applied_count > 0:
+        toast_message = f"{early_close_applied_count}종목을 조기마감 적용하였습니다."
+    elif not close_targets:
+        toast_message = "조기마감 적용 대상이 없습니다."
+    elif skipped:
+        toast_message = skipped[0]
+    else:
+        toast_message = "조기마감 적용 대상이 없습니다."
+    show_toast(window, toast_message, duration_ms=2500)
