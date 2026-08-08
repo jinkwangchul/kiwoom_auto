@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
 )
 
 from state_policy import normalized_hhmmss_or_empty
+from gui_toast import show_toast
 from gui_auto_trade_setting_window import (
     append_changelog,
     now_text,
@@ -45,6 +46,13 @@ OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 
 def write_operation_policy(policy: dict[str, object]) -> None:
     policy = dict(policy)
+    scheduled = policy.get("scheduled_operation")
+    if isinstance(scheduled, dict):
+        policy["scheduled_operation"] = {
+            key: value
+            for key, value in scheduled.items()
+            if key != "after_buy_end_status"
+        }
     policy["updated_at"] = now_text()
     OPERATION_POLICY_PATH.write_text(
         json.dumps(policy, ensure_ascii=False, indent=2) + "\n",
@@ -133,9 +141,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.regular_end = self._make_time_edit("15:20:00")
         self.scheduled_start = self._make_time_edit("09:00:00")
         self.scheduled_end_buy = self._make_time_edit("13:30:00")
-        self.scheduled_after_status = QComboBox()
-        self.scheduled_after_status.addItems(["감시/매도", "감시/대기"])
-        self.scheduled_after_status.setMinimumWidth(110)
 
         self.extra_name: list[QLineEdit] = []
         self.extra_start: list[TimeComboWidget] = []
@@ -442,9 +447,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
         scheduled_layout.addSpacing(22)
         scheduled_layout.addWidget(QLabel("매수종료"))
         scheduled_layout.addWidget(self.scheduled_end_buy)
-        scheduled_layout.addSpacing(22)
-        scheduled_layout.addWidget(QLabel("매수종료 후"))
-        scheduled_layout.addWidget(self.scheduled_after_status)
         scheduled_layout.addStretch(1)
         scheduled_box.setLayout(scheduled_layout)
         layout.addWidget(scheduled_box)
@@ -498,12 +500,21 @@ class OperationEnvironmentSettingsDialog(QDialog):
             manual_layout.addWidget(checkbox, 0, index + 2, Qt.AlignLeft | Qt.AlignVCenter)
 
         self.manual_liquidation.setText("청산정책 적용")
-        self.manual_liquidation.setMinimumWidth(130)
+        self.manual_liquidation.setMinimumWidth(
+            max(130, self.manual_liquidation.sizeHint().width())
+        )
 
-        slash_label = QLabel("/")
-        slash_label.setFixedWidth(18)
-        manual_layout.addWidget(slash_label, 0, 5, Qt.AlignRight | Qt.AlignVCenter)
-        manual_layout.addWidget(self.manual_liquidation, 0, 6, Qt.AlignLeft | Qt.AlignVCenter)
+        separator_label = QLabel("|")
+        separator_label.setFixedWidth(18)
+        manual_layout.addWidget(separator_label, 0, 5, Qt.AlignRight | Qt.AlignVCenter)
+        manual_layout.addWidget(
+            self.manual_liquidation,
+            0,
+            6,
+            1,
+            2,
+            Qt.AlignLeft | Qt.AlignVCenter,
+        )
         layout.addWidget(manual_box)
 
         # 4. 자동마감 설정
@@ -628,7 +639,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
         scheduled = self.policy.get("scheduled_operation", {}) if isinstance(self.policy.get("scheduled_operation"), dict) else {}
         self._set_time_edit(self.scheduled_start, scheduled.get("default_start_time", "09:00:00"), "09:00:00")
         self._set_time_edit(self.scheduled_end_buy, scheduled.get("default_end_buy_time", "13:30:00"), "13:30:00")
-        self.scheduled_after_status.setCurrentText(str(scheduled.get("after_buy_end_status", "감시/매도")))
 
         manual = self.policy.get("manual_operation", {}) if isinstance(self.policy.get("manual_operation"), dict) else {}
         self.manual_use_regular.setChecked(bool(manual.get("use_regular_market", True)))
@@ -704,7 +714,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
             "scheduled_operation": {
                 "default_start_time": self._time_edit_text(self.scheduled_start),
                 "default_end_buy_time": self._time_edit_text(self.scheduled_end_buy),
-                "after_buy_end_status": self.scheduled_after_status.currentText(),
             },
             "manual_operation": {
                 "use_regular_market": self.manual_use_regular.isChecked(),
@@ -745,5 +754,11 @@ class OperationEnvironmentSettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"환경설정 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
-        QMessageBox.information(self, "저장 완료", "환경설정을 저장했습니다.")
+        toast_parent = self.parentWidget() or self
+        show_toast(
+            parent=toast_parent,
+            message="환경설정을 저장했습니다.",
+            duration_ms=2000,
+            position="center",
+        )
         super().accept()

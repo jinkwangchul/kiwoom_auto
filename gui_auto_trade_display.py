@@ -24,7 +24,6 @@ from gui_order_utils import (
     DIRECTIONAL_NEGATIVE_COLOR,
     DIRECTIONAL_NEUTRAL_COLOR,
     DIRECTIONAL_POSITIVE_COLOR,
-    directional_value_color,
     format_signed_money,
     format_signed_percent,
 )
@@ -47,9 +46,9 @@ class SortableTableWidgetItem(QTableWidgetItem):
 
 
 ROUTINE_PROFIT_SIGNAL_COLORS = {
-    "LOSS": DIRECTIONAL_NEGATIVE_COLOR,
-    "COST_NOT_RECOVERED": DIRECTIONAL_POSITIVE_COLOR,
-    "NET_PROFIT": DIRECTIONAL_POSITIVE_COLOR,
+    "LOSS": DIRECTIONAL_POSITIVE_COLOR,
+    "COST_NOT_RECOVERED": DIRECTIONAL_NEGATIVE_COLOR,
+    "NET_PROFIT": DIRECTIONAL_NEGATIVE_COLOR,
     "NEUTRAL": DIRECTIONAL_NEUTRAL_COLOR,
 }
 
@@ -773,7 +772,7 @@ def routine_profit_signal(
         else:
             signal = "NET_PROFIT" if net_value > 0 else "COST_NOT_RECOVERED"
 
-    return signal, display_text, directional_value_color(gross_value)
+    return signal, display_text, profit_loss_value_color(gross_value)
 
 
 def create_routine_profit_signal_widget(
@@ -846,8 +845,25 @@ def auto_trade_setting_status_color(display_status: str) -> str:
         "매수/매도": "#16a34a",
         "자동마감": "#7c3aed",
         "조기마감": "#ea580c",
+        "긴급정지": "#E60000",
+        "검토종목": "#FF8C00",
     }
     return color_map.get(normalized, auto_trade_status_color(normalized))
+
+
+def auto_trade_setting_status_sort_rank(display_status: object) -> int:
+    """Return the semantic ordering used by auto-trade status columns."""
+    normalized = str(display_status or "").strip()
+    if normalized == "감시/매도":
+        normalized = "자동마감"
+    return {
+        "감시/대기": 0,
+        "매수/매도": 1,
+        "자동마감": 2,
+        "조기마감": 3,
+        "긴급정지": 4,
+        "검토종목": 5,
+    }.get(normalized, 99)
 
 
 def create_auto_trade_setting_status_item(display_status: str) -> QTableWidgetItem:
@@ -860,6 +876,82 @@ def create_auto_trade_setting_status_item(display_status: str) -> QTableWidgetIt
     return item
 
 
+def create_auto_trade_setting_activity_status_item(
+    display_status: str,
+    active: bool,
+) -> QTableWidgetItem:
+    """Create the auto-trade setting status cell with its activity style applied."""
+    item = create_auto_trade_setting_status_item(display_status)
+    apply_auto_trade_setting_activity_style(item, active)
+    return item
+
+
+def create_auto_trade_operation_item(
+    config: dict[str, object],
+    state: dict[str, object] | None,
+    *,
+    liquidation_result_policy: str = "NONE",
+    liquidation_completed_today: bool = False,
+) -> QTableWidgetItem:
+    """Create the official operation-mode cell used by auto-trade views."""
+    from gui_auto_trade_policy import auto_trade_operation_display
+
+    (
+        operation_display_text,
+        operation_color,
+        operation_display_tooltip,
+        _ats_labels,
+    ) = auto_trade_operation_display(config, state)
+    item = SortableTableWidgetItem(operation_display_text)
+
+    if liquidation_result_policy == "RED_STOP":
+        item.setToolTip(
+            "청산 결과 불안정\n\n"
+            "시장가 청산 잔여 또는 미수 발생 - 운영정지 후 무결성 확인 필요"
+        )
+    elif liquidation_result_policy == "CURRENT_CARRYOVER":
+        item.setToolTip("현재가 청산 잔여\n\n이월 취급 / 시간외·ATS 재진입 금지")
+    elif liquidation_completed_today:
+        item.setToolTip("금일 청산 완료\n\n시간외/ATS 재진입 금지")
+    elif operation_display_text == "수동+ATS":
+        item.setToolTip(operation_display_tooltip)
+    elif operation_display_text == "수동":
+        item.setToolTip("")
+    else:
+        item.setToolTip(operation_display_tooltip + "\n\n주의: 정규장외 거래 적용중")
+    item.setForeground(QColor(operation_color))
+    item.setTextAlignment(Qt.AlignCenter)
+    return item
+
+
+def create_auto_trade_stock_name_item(
+    name: str,
+    *,
+    review_required: bool = False,
+    review_status: bool = False,
+    trade_started: bool = False,
+) -> QTableWidgetItem:
+    """Create the stock-name cell shared by auto-trade setting and monitoring."""
+    item = SortableTableWidgetItem(str(name))
+    if review_required or review_status:
+        item.setToolTip("검토관리에서 먼저 처리해야 합니다.")
+    elif trade_started:
+        item.setToolTip("현재 운영 중입니다.")
+    else:
+        item.setToolTip("더블클릭하면 이 종목의 운영을 시작합니다.")
+    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    return item
+
+
+def apply_auto_trade_plain_metric_item_style(
+    item: QTableWidgetItem,
+    value: object,
+) -> None:
+    """Apply the plain stock metric cell contract used by the setting table."""
+    item.setToolTip(str(value))
+    item.setTextAlignment(Qt.AlignCenter)
+
+
 
 
 def apply_auto_trade_setting_activity_style(item: QTableWidgetItem, active: bool) -> None:
@@ -869,6 +961,28 @@ def apply_auto_trade_setting_activity_style(item: QTableWidgetItem, active: bool
         return
     item.setBackground(QColor("#F4F5F7"))
     item.setForeground(QColor("#AFB2B9"))
+
+
+def apply_auto_trade_setting_protection_row_style(
+    item: QTableWidgetItem,
+    *,
+    review_required: bool = False,
+    operation_excluded: bool = False,
+) -> None:
+    """검토관리/운영제외 행 단위 표시 계약을 공통 적용한다."""
+    original_flags = item.flags()
+    if review_required:
+        item.setBackground(QColor("#FFFFFF"))
+        item.setForeground(QColor("#FF8C00"))
+        tooltip = item.toolTip().strip()
+        item.setToolTip(f"{tooltip}\n검토관리".strip())
+        item.setFlags(original_flags)
+        return
+    if operation_excluded:
+        apply_auto_trade_setting_activity_style(item, False)
+        tooltip = item.toolTip().strip()
+        item.setToolTip(f"{tooltip}\n운영 제외".strip())
+        item.setFlags(original_flags)
 
 
 def apply_auto_trade_setting_liquidation_style(

@@ -13,7 +13,35 @@ from PyQt5.QtCore import Qt
 
 
 def selected_stock_rows(window) -> list[int]:
-    return [index.row() for index in window.stock_table.selectionModel().selectedRows()]
+    selection_model = window.stock_table.selectionModel()
+    if selection_model is None:
+        return []
+
+    rows: list[int] = []
+    seen: set[int] = set()
+
+    def add_row(row: int) -> None:
+        if row < 0 or row in seen:
+            return
+        seen.add(row)
+        rows.append(row)
+
+    for index in selection_model.selectedRows():
+        add_row(index.row())
+
+    if rows:
+        return rows
+
+    for index in selection_model.selectedIndexes():
+        add_row(index.row())
+
+    if rows:
+        return rows
+
+    for item in window.stock_table.selectedItems():
+        add_row(item.row())
+
+    return rows
 
 
 def has_selected_stock(window) -> bool:

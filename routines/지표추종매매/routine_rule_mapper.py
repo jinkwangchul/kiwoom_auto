@@ -749,6 +749,9 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
         return None
 
     value = {
+        "buy_phase": "BASE",
+        "buy_round": 1,
+        "budget_reference": "STARTING_BUDGET",
         "hoga_mode": _hoga_mode_token(base.get("hoga_combo")),
         "order_price_basis": _price_basis_token(base.get("order_combo")),
         "hoga_up": _safe_int(base.get("up_line")),
@@ -772,13 +775,23 @@ def _build_buy_execution_base_candidate(base: dict[str, Any], warnings: list[str
     }
 
 
-def _build_buy_execution_repeat_candidate(repeat: dict[str, Any], warnings: list[str]) -> dict[str, Any] | None:
+def _build_buy_execution_repeat_candidate(
+    repeat: dict[str, Any],
+    warnings: list[str],
+    *,
+    legacy_base: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not _truthy_ui(repeat.get("apply_all_check")):
         return None
 
+    detail_mode_value = repeat.get("detail_mode_combo")
+    if detail_mode_value in (None, ""):
+        detail_mode_value = _as_dict(legacy_base).get("detail_mode_combo")
     value = {
+        "buy_phase": "REPEAT",
+        "starts_from_round": 2,
         "apply_all": True,
-        "detail_mode": _detail_mode_token(repeat.get("detail_mode_combo")),
+        "detail_mode": _detail_mode_token(detail_mode_value),
         "round_operator": _round_operator_token(repeat.get("round_operator_combo")),
         "round_budget_value": _safe_float(repeat.get("round_budget_line")),
         "budget_ratio": _safe_float(repeat.get("budget_ratio_line")),
@@ -1548,7 +1561,11 @@ def build_engine_rules_preview_from_ui_state(
         _set_path_value(preview_rules, BUY_EXECUTION_BASE_PATH, buy_execution_base_candidate["value"])
         preview_candidates.setdefault("execution", {})["base"] = buy_execution_base_candidate
 
-    buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(execution_repeat, validation_warnings)
+    buy_execution_repeat_candidate = _build_buy_execution_repeat_candidate(
+        execution_repeat,
+        validation_warnings,
+        legacy_base=execution_base,
+    )
     if buy_execution_repeat_candidate:
         _set_path_value(preview_rules, BUY_EXECUTION_REPEAT_PATH, buy_execution_repeat_candidate["value"])
         preview_candidates.setdefault("execution", {})["repeat"] = buy_execution_repeat_candidate

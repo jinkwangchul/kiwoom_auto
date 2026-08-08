@@ -454,6 +454,12 @@ def enqueue_routine_signal(
             "source": source,
             "execution_enabled": False,
         }
+        for field in ("routine_type", "routine_instance_id", "cycle_identity"):
+            value = result.get(field)
+            if value not in (None, ""):
+                record[field] = value
+        if isinstance(result.get("execution_intent"), dict):
+            record["execution_intent"] = deepcopy(result["execution_intent"])
 
         dedupe_key = _make_dedupe_key(record)
         for old in signals:
@@ -471,6 +477,17 @@ def enqueue_routine_signal(
         )
         existing_ids = {str(item.get("id", "")) for item in signals}
         record["id"] = base_id if base_id not in existing_ids else f"{base_id}_{uuid4().hex[:8]}"
+        execution_intent = record.get("execution_intent")
+        if isinstance(execution_intent, dict) and not str(
+            execution_intent.get("source_signal_id") or ""
+        ).strip():
+            execution_intent["source_signal_id"] = record["id"]
+        if isinstance(execution_intent, dict) and not str(
+            execution_intent.get("cycle_identity") or ""
+        ).strip():
+            execution_intent["cycle_identity"] = f"CYCLE_{record['id']}"
+        if isinstance(execution_intent, dict):
+            record["cycle_identity"] = execution_intent.get("cycle_identity")
         signals.append(record)
         return True, {
             "status": "queued",

@@ -15,11 +15,12 @@ gui_review_required_window.py
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import datetime
 from pathlib import Path
+from tempfile import gettempdir
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -36,33 +37,123 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_common_utils import safe_int_value
-from gui_order_utils import (
-    format_number_value,
-    pending_order_side_quantities,
-)
+from gui_order_utils import pending_order_side_quantities
 from gui_review_utils import safe_float_value
-from gui_styles import apply_plain_table_header
+from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
 from gui_table_utils import next_sort_order
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
 from gui_auto_trade_runtime import write_state_json
-from state_policy import auto_trade_status_display
-from operator_reconciliation_service import (
-    collect_operator_reconciliation_items,
-    retry_operator_chejan_reconciliation,
+from gui_auto_trade_integrity import (
+    is_review_required_state as _common_is_review_required_state,
+    read_review_state_with_issue,
 )
-
-
+from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
 ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
+REVIEW_UNKNOWN_TEXT = "-"
+REVIEW_TIME_UNRECORDED = "\ubbf8\uae30\ub85d"
+REVIEW_DISPLAY_STATUS_UNRESOLVED = "\ubbf8\ud574\uacb0"
+REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED = "\uae34\uae09\uc815\uc9c0"
+REVIEW_REASON_OPERATION_DATA_MISSING = "\uc6b4\uc601 \ub370\uc774\ud130 \uc5c6\uc74c"
+REVIEW_REASON_OPERATION_DATA_READ_ERROR = "\uc6b4\uc601 \ub370\uc774\ud130 \uc77d\uae30 \uc624\ub958"
+REVIEW_DETECTION_EVENT_UNRECORDED = "\ubbf8\uae30\ub85d"
+REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT = "\uc885\ubaa9\uad00\ub9ac"
+REVIEW_SOURCE_EMERGENCY_RELEASE = "\uae34\uae09\uc815\uc9c0\ud574\uc81c"
+REVIEW_REPRODUCTION_MANIFEST_PREFIX = "review_required_library_cases_"
+REVIEW_DETECTION_EVENT_DISPLAY_BY_SOURCE = {
+    "\uc6b4\uc601\uc2dc\uc791": "\uc6b4\uc601 \uc2dc\uc791",
+    "\uc6b4\uc601\uc911": "\uc6b4\uc601 \uc911",
+    "\uc548\uc815\uc131\uac80\uc0ac": "\uc548\uc815\uc131 \uac80\uc0ac",
+    "\uae34\uae09\uc815\uc9c0\ud574\uc81c": "\uae34\uae09\uc815\uc9c0 \ud574\uc81c",
+    "\uac15\uc81c\uc885\ub8cc": "\uc6b4\uc601 \uc885\ub8cc",
+    "\uc885\ubaa9\ub4f1\ub85d \ucc3d \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\uc885\ubaa9 \ub4f1\ub85d",
+    "\ub4f1\ub85d\ud574\uc81c \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\uc885\ubaa9 \ud574\uc81c",
+    "\ub8e8\ud2f4 \uc774\ub3d9 \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\ub8e8\ud2f4 \ub4f1\ub85d",
+    "\ub8e8\ud2f4 \ud574\uc81c \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\ub8e8\ud2f4 \ud574\uc81c",
+    "PRODUCTION_RECOVERY": "\ud504\ub85c\uadf8\ub7a8 \uc2dc\uc791",
+}
+
 
 def review_entered_at_display(state: dict[str, object]) -> str:
     """Read the persisted review transition time without inferring one."""
     entered_at = str(state.get("review_entered_at", "") or "").strip()
-    return entered_at or "미기록"
+    return entered_at or REVIEW_TIME_UNRECORDED
+
+
+def review_detection_event_display(source: object) -> str:
+    """Return the operator-facing production event for the stored review source."""
+    raw = str(source or "").strip()
+    if not raw or raw == REVIEW_UNKNOWN_TEXT:
+        return REVIEW_DETECTION_EVENT_UNRECORDED
+    return REVIEW_DETECTION_EVENT_DISPLAY_BY_SOURCE.get(raw, raw)
+
+
+def _review_manifest_entered_at_display(raw: object) -> str:
+    timestamp = str(raw or "").strip()
+    if len(timestamp) == 15 and timestamp[8] == "_":
+        date_part = timestamp[:8]
+        time_part = timestamp[9:]
+        if date_part.isdigit() and time_part.isdigit():
+            return (
+                f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} "
+                f"{time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+            )
+    return timestamp or REVIEW_TIME_UNRECORDED
+
+
+def _state_issue_review_record_from_manifest(
+    code: str,
+    name: str,
+) -> dict[str, str]:
+    """Read persisted visible-GUI reproduction metadata without mutating stock data."""
+
+    temp_root = Path(gettempdir())
+    candidates = sorted(
+        temp_root.glob(f"{REVIEW_REPRODUCTION_MANIFEST_PREFIX}*.json"),
+        reverse=True,
+    )
+    project_root_text = str(PROJECT_ROOT)
+    for manifest_path in candidates:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(manifest.get("root", "") or "").strip() != project_root_text:
+            continue
+        cases = manifest.get("cases", [])
+        if not isinstance(cases, list):
+            continue
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            if str(case.get("code", "") or "").strip() != code:
+                continue
+            case_name = str(case.get("name", "") or "").strip()
+            if case_name and case_name != name:
+                stock_dir_text = str(case.get("stock_dir", "") or "")
+                if f"{code}_" not in stock_dir_text:
+                    continue
+            location = (
+                case.get("review_location")
+                or REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT
+            )
+            entered_at = (
+                case.get("review_entered_at")
+                or case.get("created_at")
+                or manifest.get("created_at")
+            )
+            return {
+                "review_location": review_detection_event_display(location),
+                "review_entered_at": _review_manifest_entered_at_display(entered_at),
+            }
+    return {
+        "review_location": REVIEW_DETECTION_EVENT_UNRECORDED,
+        "review_entered_at": REVIEW_TIME_UNRECORDED,
+    }
 
 
 def get_routine_dirs() -> list[Path]:
@@ -115,20 +206,7 @@ def is_review_required_state(state: dict[str, object] | None) -> bool:
     자동매매설정 창에서는 이 조건에 걸린 종목을 절대 표시하지 않는다.
     검토관리 창에서는 이 조건에 걸린 종목만 표시한다.
     """
-    if not isinstance(state, dict):
-        return False
-
-    raw_status = str(state.get("status", "")).strip().upper()
-    if raw_status in {"REVIEW_REQUIRED", "REVIEW"}:
-        return True
-
-    if bool(state.get("review_required", False)):
-        return True
-
-    try:
-        return auto_trade_status_display(raw_status) == "검토종목"
-    except Exception:
-        return False
+    return _common_is_review_required_state(state)
 
 
 def is_review_required_stock_dir(stock_dir: Path) -> bool:
@@ -138,6 +216,60 @@ def is_review_required_stock_dir(stock_dir: Path) -> bool:
     except Exception:
         return False
     return is_review_required_state(state)
+
+
+def _read_central_review_state(state_path: Path) -> tuple[dict[str, object], str]:
+    return read_review_state_with_issue(state_path)
+
+
+def _review_display_status_for_collected_row(
+    state: dict[str, object] | None,
+    *,
+    state_issue_reason: str = "",
+    review_location_source: object = "",
+    holding_qty: int = 0,
+    avg_price: float = 0.0,
+    buy_pending_qty: object = 0,
+    sell_pending_qty: object = 0,
+) -> str:
+    """Return the review-management status display for a collected row."""
+    if state_issue_reason:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if not isinstance(state, dict) or not state:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+
+    review_status = str(state.get("review_status", "") or "").strip().upper()
+    if review_status == "RESOLVED":
+        return "\ud574\uacb0"
+
+    emergency_reason = str(state.get("emergency_reason", "") or "").strip()
+    emergency_stopped_at = str(state.get("emergency_stopped_at", "") or "").strip()
+    source = str(review_location_source or state.get("review_location", "") or "").strip()
+    if (
+        (emergency_reason or emergency_stopped_at)
+        and source != REVIEW_SOURCE_EMERGENCY_RELEASE
+    ):
+        return REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED
+
+    if review_status in {"PENDING", "REVIEW_REQUIRED", "NEEDS_REVIEW"}:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+
+    if buy_pending_qty == "?" or sell_pending_qty == "?":
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if holding_qty > 0:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if safe_int_value(buy_pending_qty, 0) > 0:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if safe_int_value(sell_pending_qty, 0) > 0:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if avg_price > 0 and holding_qty <= 0:
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    if auto_trade_setting_server_mismatch_detected(state):
+        return REVIEW_DISPLAY_STATUS_UNRESOLVED
+
+    if is_review_required_state(state):
+        return "\ud574\uacb0"
+    return REVIEW_DISPLAY_STATUS_UNRESOLVED
 
 
 def append_changelog(change_type: str, filename: str, message: str) -> None:
@@ -223,7 +355,7 @@ def get_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
         return []
 
 def auto_trade_setting_data_inconsistency_reasons(state: dict[str, object] | None) -> list[str]:
-    """운영 중/재시작/안정성검사 공통 내부 데이터 불일치 판정.
+    """운영 중/재시작/자동 로컬 무결성검사 공통 내부 데이터 불일치 판정.
 
     주의:
     - holding_qty/current_qty/qty 계열은 수량으로 본다.
@@ -334,7 +466,7 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     """키움 서버 정보와 프로그램 내부 정보 불일치/서버 불안 표시 여부.
 
     실제 키움 연동 단계에서 아래 플래그 중 하나가 저장되면 현황을 빨강으로 표시한다.
-    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/안정성검사 대상이라는 뜻이다.
+    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/무결성 확인 대상이라는 뜻이다.
     """
     if not isinstance(state, dict):
         return False
@@ -394,25 +526,41 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
         code = str(record.code or "").strip()
         name = str(record.name or "").strip()
         stock_dir = repo.resolve_stock_dir(code, name)
-        state = read_json_dict(stock_dir / "state.json")
-        if not is_review_required_state(state):
-            continue
-
+        state, state_issue_reason = _read_central_review_state(stock_dir / "state.json")
         routine_name = str(record.routine or state.get("review_routine", "") or "-").strip() or "-"
-        holding_qty = safe_int_value(state.get("holding_qty"), 0)
-        avg_price = safe_float_value(state.get("avg_price"), 0.0)
-        buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
 
-        if buy_pending_qty == "?" or sell_pending_qty == "?":
-            return_availability = "미해결"
-        elif holding_qty > 0 or safe_int_value(buy_pending_qty, 0) > 0 or safe_int_value(sell_pending_qty, 0) > 0:
-            return_availability = "미해결"
-        elif avg_price > 0 and holding_qty <= 0:
-            return_availability = "미해결"
-        elif auto_trade_setting_server_mismatch_detected(state):
-            return_availability = "미해결"
+        if state_issue_reason:
+            if not str(record.routine or "").strip():
+                continue
+            state_issue_record = _state_issue_review_record_from_manifest(code, name)
+            holding_qty = 0
+            avg_price = 0.0
+            buy_pending_qty = 0
+            sell_pending_qty = 0
+            review_location = state_issue_record["review_location"]
+            review_entered_at = state_issue_record["review_entered_at"]
+            display_status = _review_display_status_for_collected_row(
+                None,
+                state_issue_reason=state_issue_reason,
+            )
+        elif not is_review_required_state(state):
+            continue
         else:
-            return_availability = "해결"
+            holding_qty = safe_int_value(state.get("holding_qty"), 0)
+            avg_price = safe_float_value(state.get("avg_price"), 0.0)
+            buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
+            review_location_source = state.get("review_location", "") or REVIEW_UNKNOWN_TEXT
+            review_location = review_detection_event_display(review_location_source)
+            review_entered_at = review_entered_at_display(state)
+
+            display_status = _review_display_status_for_collected_row(
+                state,
+                review_location_source=review_location_source,
+                holding_qty=holding_qty,
+                avg_price=avg_price,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+            )
 
         key = (routine_name, code, name)
         if key in seen_keys:
@@ -424,15 +572,16 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             "stock_dir": stock_dir,
             "code": code,
             "name": name,
-            "review_location": str(state.get("review_location", "") or "-").strip() or "-",
-            "review_reason": str(state.get("review_reason", "") or state.get("review_detail", "") or "-").strip() or "-",
-            "review_entered_at": review_entered_at_display(state),
+            "review_location": review_location,
+            "review_reason": state_issue_reason or str(state.get("review_reason", "") or state.get("review_detail", "") or REVIEW_UNKNOWN_TEXT).strip() or REVIEW_UNKNOWN_TEXT,
+            "review_entered_at": review_entered_at,
             "last_checked_at": str(state.get("review_checked_at", "") or state.get("updated_at", "") or "-").strip() or "-",
             "holding_qty": holding_qty,
             "avg_price": avg_price,
             "buy_pending_qty": buy_pending_qty,
             "sell_pending_qty": sell_pending_qty,
-            "return_availability": return_availability,
+            "display_status": display_status,
+            "return_availability": display_status,
         })
 
     rows.sort(key=lambda row: (str(row.get("review_entered_at", "")), str(row.get("routine_name", "")), str(row.get("code", ""))))
@@ -441,19 +590,19 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
 class GlobalReviewRequiredWindow(QDialog):
     """프로그램 전체 단위 검토종목 통합 관리창."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("검토종목 관리")
         self.resize(1100, 620)
 
         self.summary_label = QLabel("검토종목: 0개")
         self.table = QTableWidget()
-        self.runtime_summary_label = QLabel("운영 Reconciliation: 0개")
-        self.runtime_table = QTableWidget()
         self.btn_return = QPushButton("복귀")
         self.btn_unassign = QPushButton("미지정")
         self.btn_delete = QPushButton("삭제")
-        self.btn_runtime_retry = QPushButton("안전 재처리")
         self.btn_refresh = QPushButton("새로고침")
         self.btn_close = QPushButton("닫기")
         self._review_sort_column = -1
@@ -475,15 +624,16 @@ class GlobalReviewRequiredWindow(QDialog):
             "검토 전환 시각",
             "사유",
             "검출",
-            "보유",
-            "미수",
-            "미도",
         ]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
+        detection_header_item = self.table.horizontalHeaderItem(6)
+        if detection_header_item is not None:
+            detection_header_item.setTextAlignment(Qt.AlignCenter)
         apply_plain_table_header(self.table)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
         header.setStretchLastSection(False)
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
@@ -494,68 +644,25 @@ class GlobalReviewRequiredWindow(QDialog):
         self.table.setColumnWidth(4, 180)   # 검토 전환 시각
         self.table.setColumnWidth(5, 350)   # 사유
         self.table.setColumnWidth(6, 130)   # 검출
-        self.table.setColumnWidth(7, 100)   # 보유
-        self.table.setColumnWidth(8, 75)    # 미수
-        self.table.setColumnWidth(9, 75)    # 미도
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setStyleSheet(TABLE_LIGHT_SELECTION_STYLE)
         layout.addWidget(self.table)
-
-        layout.addWidget(self.runtime_summary_label)
-        runtime_headers = [
-            "상태",
-            "유형",
-            "계좌",
-            "코드",
-            "주문ID",
-            "Broker No",
-            "Event",
-            "Queue",
-            "Fill",
-            "Position",
-            "사유",
-            "확인시각",
-        ]
-        self.runtime_table.setColumnCount(len(runtime_headers))
-        self.runtime_table.setHorizontalHeaderLabels(runtime_headers)
-        apply_plain_table_header(self.runtime_table)
-        runtime_header = self.runtime_table.horizontalHeader()
-        runtime_header.setSectionResizeMode(QHeaderView.Interactive)
-        runtime_header.setStretchLastSection(False)
-        runtime_header.setSectionsClickable(True)
-        self.runtime_table.setColumnWidth(0, 120)
-        self.runtime_table.setColumnWidth(1, 180)
-        self.runtime_table.setColumnWidth(2, 100)
-        self.runtime_table.setColumnWidth(3, 80)
-        self.runtime_table.setColumnWidth(4, 130)
-        self.runtime_table.setColumnWidth(5, 120)
-        self.runtime_table.setColumnWidth(6, 180)
-        self.runtime_table.setColumnWidth(7, 110)
-        self.runtime_table.setColumnWidth(8, 70)
-        self.runtime_table.setColumnWidth(9, 80)
-        self.runtime_table.setColumnWidth(10, 300)
-        self.runtime_table.setColumnWidth(11, 160)
-        self.runtime_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.runtime_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.runtime_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.runtime_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        layout.addWidget(self.runtime_table)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         self.btn_return.setMinimumWidth(90)
         self.btn_unassign.setMinimumWidth(90)
         self.btn_delete.setMinimumWidth(90)
-        self.btn_runtime_retry.setMinimumWidth(110)
         self.btn_refresh.setMinimumWidth(100)
         self.btn_close.setMinimumWidth(100)
         buttons.addWidget(self.btn_return)
         buttons.addWidget(self.btn_unassign)
         buttons.addWidget(self.btn_delete)
-        buttons.addWidget(self.btn_runtime_retry)
         buttons.addWidget(self.btn_refresh)
         buttons.addWidget(self.btn_close)
         layout.addLayout(buttons)
@@ -565,7 +672,6 @@ class GlobalReviewRequiredWindow(QDialog):
         self.btn_return.clicked.connect(self.return_selected_items_to_auto_list)
         self.btn_unassign.clicked.connect(self.unassign_selected_review_items)
         self.btn_delete.clicked.connect(self.delete_selected_review_items)
-        self.btn_runtime_retry.clicked.connect(self.retry_selected_runtime_reconciliation_items)
         self.btn_refresh.clicked.connect(self.load_review_items)
         self.btn_close.clicked.connect(self.close)
         self.table.horizontalHeader().sectionClicked.connect(self.sort_review_table_by_column)
@@ -614,6 +720,7 @@ class GlobalReviewRequiredWindow(QDialog):
         item.setTextAlignment(align)
         if tooltip:
             item.setToolTip(tooltip)
+        item.setForeground(QBrush(QColor("#000000")))
         self.table.setItem(row, col, item)
 
     def _review_row_tooltip(self, row: dict[str, object]) -> str:
@@ -622,11 +729,9 @@ class GlobalReviewRequiredWindow(QDialog):
         name = str(row.get("name", "-") or "-").strip() or "-"
         routine = str(row.get("routine_name", "-") or "-").strip() or "-"
         location = str(row.get("review_location", "-") or "-").strip() or "-"
-        holding_qty = str(row.get("holding_qty", "-") or "-").strip() or "-"
-        avg_price = format_number_value(row.get("avg_price", 0))
-        buy_pending_qty = str(row.get("buy_pending_qty", "-") or "-").strip() or "-"
-        sell_pending_qty = str(row.get("sell_pending_qty", "-") or "-").strip() or "-"
-        return_availability = str(row.get("return_availability", "-") or "-").strip() or "-"
+        display_status = str(
+            row.get("display_status", row.get("return_availability", "-")) or "-"
+        ).strip() or "-"
         reason = str(row.get("review_reason", "-") or "-").strip() or "-"
         entered_at = str(row.get("review_entered_at", "-") or "-").strip() or "-"
         return (
@@ -634,111 +739,14 @@ class GlobalReviewRequiredWindow(QDialog):
             f"종목명: {name}\n"
             f"현재위치: {routine}\n"
             f"검토위치: {location}\n"
-            f"보유: {holding_qty}\n"
-            f"평단: {avg_price}\n"
-            f"미수: {buy_pending_qty}\n"
-            f"미도: {sell_pending_qty}\n"
-            f"상태: {return_availability}\n"
+            f"상태: {display_status}\n"
             f"사유: {reason}\n"
             f"검토 전환 시각: {entered_at}"
         )
 
 
     def _central_review_rows(self) -> list[dict[str, object]]:
-        """
-        검토관리창 표시 전용 중앙 stocks 수집기.
-
-        버튼 카운트와 창 내부 목록이 달라지는 문제를 막기 위해
-        load_review_items()에서 외부/구형 수집 함수를 거치지 않고
-        중앙 stocks/state.json을 직접 스캔한다.
-        """
-        rows: list[dict[str, object]] = []
-
-        try:
-            repo = stock_repository_factory()
-            stocks_dir = repo.stocks_dir
-        except Exception:
-            stocks_dir = PROJECT_ROOT / "stocks"
-
-        if not stocks_dir.exists():
-            return rows
-
-        seen: set[tuple[str, str]] = set()
-
-        for stock_dir in sorted(stocks_dir.iterdir(), key=lambda p: p.name):
-            if not stock_dir.is_dir():
-                continue
-
-            folder_name = stock_dir.name
-            parts = folder_name.split("_", 1)
-            if len(parts) == 2:
-                code, name = parts[0].strip(), parts[1].strip()
-            else:
-                code, name = folder_name.strip(), folder_name.strip()
-
-            if not code or not code[:6].isdigit():
-                continue
-
-            state = read_json_dict(stock_dir / "state.json")
-            if not isinstance(state, dict):
-                continue
-
-            if not is_review_required_state(state):
-                continue
-
-            config = read_json_dict(stock_dir / "config.json")
-            if not isinstance(config, dict):
-                config = {}
-
-            routine_name = (
-                str(config.get("routine", "") or "").strip()
-                or str(config.get("routine_name", "") or "").strip()
-                or str(config.get("active_routine", "") or "").strip()
-                or str(state.get("review_routine", "") or "").strip()
-                or "-"
-            )
-
-            holding_qty = safe_int_value(state.get("holding_qty"), 0)
-            avg_price = safe_float_value(state.get("avg_price"), 0.0)
-            buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
-
-            if buy_pending_qty == "?" or sell_pending_qty == "?":
-                return_availability = "미해결"
-            elif holding_qty > 0 or safe_int_value(buy_pending_qty, 0) > 0 or safe_int_value(sell_pending_qty, 0) > 0:
-                return_availability = "미해결"
-            elif avg_price > 0 and holding_qty <= 0:
-                return_availability = "미해결"
-            else:
-                try:
-                    return_availability = "미해결" if auto_trade_setting_server_mismatch_detected(state) else "해결"
-                except Exception:
-                    return_availability = "해결"
-
-            key = (code, name)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            rows.append(
-                {
-                    "routine_name": routine_name,
-                    "stock_dir": stock_dir,
-                    "code": code,
-                    "name": name,
-                    "review_location": str(state.get("review_location", "") or "-").strip() or "-",
-                    "review_reason": str(state.get("review_reason", "") or state.get("review_detail", "") or "-").strip() or "-",
-                    "review_entered_at": review_entered_at_display(state),
-                    "last_checked_at": str(state.get("review_checked_at", "") or state.get("updated_at", "") or "-").strip() or "-",
-                    "holding_qty": holding_qty,
-                    "avg_price": avg_price,
-                    "buy_pending_qty": buy_pending_qty,
-                    "sell_pending_qty": sell_pending_qty,
-                    "return_availability": return_availability,
-                }
-            )
-
-        rows.sort(key=lambda row: (str(row.get("review_entered_at", "")), str(row.get("routine_name", "")), str(row.get("code", ""))))
-        return rows
+        return collect_global_review_required_rows()
 
     def load_review_items(self) -> None:
         rows = self._central_review_rows()
@@ -748,13 +756,15 @@ class GlobalReviewRequiredWindow(QDialog):
             self._set_item(row_index, 0, row.get("code", "-"), tooltip=tooltip)
             self._set_item(row_index, 1, row.get("name", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
             self._set_item(row_index, 2, row.get("routine_name", "-"), tooltip=tooltip)
-            self._set_item(row_index, 3, row.get("return_availability", "-"), tooltip=tooltip)
+            self._set_item(
+                row_index,
+                3,
+                row.get("display_status", row.get("return_availability", "-")),
+                tooltip=tooltip,
+            )
             self._set_item(row_index, 4, row.get("review_entered_at", "미기록"), tooltip=tooltip)
             self._set_item(row_index, 5, row.get("review_reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 6, row.get("review_location", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 7, row.get("holding_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 8, row.get("buy_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
-            self._set_item(row_index, 9, row.get("sell_pending_qty", "-"), Qt.AlignRight | Qt.AlignVCenter, tooltip)
+            self._set_item(row_index, 6, row.get("review_location", "-"), tooltip=tooltip)
 
             first_item = self.table.item(row_index, 0)
             if first_item is not None:
@@ -764,139 +774,6 @@ class GlobalReviewRequiredWindow(QDialog):
 
         self._apply_saved_review_sort()
         self.summary_label.setText(f"검토종목: {len(rows)}개")
-        self.load_runtime_reconciliation_items()
-
-    def _runtime_row_tooltip(self, row: dict[str, object]) -> str:
-        return (
-            f"유형: {row.get('occurrence_type', '-')}\n"
-            f"상태: {row.get('status', '-')}\n"
-            f"계좌: {row.get('account_no', '-')}\n"
-            f"종목: {row.get('code', '-')}\n"
-            f"주문ID: {row.get('order_id', '-')}\n"
-            f"Broker No: {row.get('broker_order_no', '-')}\n"
-            f"Event: {row.get('event_identity', '-')}\n"
-            f"Queue: {row.get('queue_status', '-')}\n"
-            f"Fill 반영: {row.get('fill_applied', '-')}\n"
-            f"Position 반영: {row.get('position_applied', '-')}\n"
-            f"Broker 비교: {row.get('broker_reconciliation_status', '-')}\n"
-            f"사유: {row.get('reason', '-')}\n"
-            f"권장 조치: {row.get('recommended_action', '-')}"
-        )
-
-    def load_runtime_reconciliation_items(self) -> None:
-        result = collect_operator_reconciliation_items()
-        rows = list(result.get("items") or [])
-        self.runtime_table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            tooltip = self._runtime_row_tooltip(row)
-            self._set_runtime_item(row_index, 0, row.get("status", "-"), tooltip=tooltip)
-            self._set_runtime_item(row_index, 1, row.get("occurrence_type", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_runtime_item(row_index, 2, row.get("account_no", "-"), tooltip=tooltip)
-            self._set_runtime_item(row_index, 3, row.get("code", "-"), tooltip=tooltip)
-            self._set_runtime_item(row_index, 4, row.get("order_id", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_runtime_item(row_index, 5, row.get("broker_order_no", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_runtime_item(row_index, 6, row.get("event_identity", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_runtime_item(row_index, 7, row.get("queue_status", "-"), tooltip=tooltip)
-            self._set_runtime_item(row_index, 8, "Y" if row.get("fill_applied") else "N", tooltip=tooltip)
-            self._set_runtime_item(row_index, 9, "Y" if row.get("position_applied") else "N", tooltip=tooltip)
-            self._set_runtime_item(row_index, 10, row.get("reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
-            self._set_runtime_item(row_index, 11, row.get("last_checked_at", "-"), tooltip=tooltip)
-            first_item = self.runtime_table.item(row_index, 0)
-            if first_item is not None:
-                first_item.setData(Qt.UserRole, dict(row))
-        summary = result.get("summary") if isinstance(result, dict) else {}
-        if not isinstance(summary, dict):
-            summary = {}
-        self.runtime_summary_label.setText(
-            "운영 Reconciliation: "
-            f"{summary.get('total', len(rows))}개 / "
-            f"재처리 가능 {summary.get('retryable', 0)}개 / "
-            f"수동 확인 {summary.get('manual_review_required', 0)}개"
-        )
-
-    def _set_runtime_item(
-        self,
-        row: int,
-        col: int,
-        text: object,
-        align=Qt.AlignCenter,
-        tooltip: str = "",
-    ) -> None:
-        item = QTableWidgetItem(str(text if text not in (None, "") else "-"))
-        item.setTextAlignment(align)
-        if tooltip:
-            item.setToolTip(tooltip)
-        self.runtime_table.setItem(row, col, item)
-
-    def selected_runtime_reconciliation_rows(self) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for index in self.runtime_table.selectionModel().selectedRows():
-            item = self.runtime_table.item(index.row(), 0)
-            if item is None:
-                continue
-            row = item.data(Qt.UserRole)
-            if not isinstance(row, dict):
-                continue
-            item_id = str(row.get("item_id") or "")
-            if item_id in seen:
-                continue
-            seen.add(item_id)
-            result.append(row)
-        return result
-
-    def retry_selected_runtime_reconciliation_items(self) -> None:
-        rows = self.selected_runtime_reconciliation_rows()
-        if not rows:
-            QMessageBox.information(self, "운영 Reconciliation", "재처리할 항목을 선택하세요.")
-            return
-        retryable = [row for row in rows if row.get("source_type") == "CHEJAN_RECONCILIATION" and row.get("retryable") is True]
-        if not retryable:
-            QMessageBox.information(self, "운영 Reconciliation", "선택 항목은 자동 재처리 대상이 아닙니다.")
-            return
-        preview = "\n".join(
-            f"- {row.get('code', '-')} {row.get('order_id', '-')} {row.get('event_identity', '-')}"
-            for row in retryable[:8]
-        )
-        if len(retryable) > 8:
-            preview += f"\n- 외 {len(retryable) - 8}개"
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("운영 Reconciliation 재처리")
-        box.setText(
-            "저장된 Chejan evidence 기준으로 누락된 Fill/Position 후속 단계만 재처리합니다.\n"
-            "SendOrder, Broker API, 주문 재시도는 수행하지 않습니다.\n\n"
-            f"{preview}"
-        )
-        proceed_button = box.addButton("재처리", QMessageBox.AcceptRole)
-        box.addButton("취소", QMessageBox.RejectRole)
-        box.setDefaultButton(proceed_button)
-        box.exec_()
-        if box.clickedButton() != proceed_button:
-            return
-        resolved = 0
-        blocked: list[str] = []
-        for row in retryable:
-            result = retry_operator_chejan_reconciliation(
-                order_queued_id=str(row.get("order_queued_id") or ""),
-                event_identity=str(row.get("event_identity") or ""),
-            )
-            if result.get("retried") is True:
-                resolved += 1
-            else:
-                reasons = result.get("blocked_reasons")
-                if not isinstance(reasons, list):
-                    reasons = list(result.get("reconciliation_result", {}).get("blocked_reasons", [])) if isinstance(result.get("reconciliation_result"), dict) else []
-                blocked.append(f"{row.get('code', '-')} {row.get('order_id', '-')}: {', '.join(str(reason) for reason in reasons) or result.get('stage', 'blocked')}")
-        self.load_review_items()
-        message = f"해결 {resolved}건"
-        if blocked:
-            message += "\n\n차단:\n" + "\n".join(f"- {line}" for line in blocked[:10])
-            if len(blocked) > 10:
-                message += f"\n- 외 {len(blocked) - 10}건"
-        QMessageBox.information(self, "운영 Reconciliation", message)
 
     def selected_stock_dirs(self) -> list[tuple[Path, str, str]]:
         """검토관리창에서 선택된 종목의 runtime 폴더를 반환한다."""
@@ -934,7 +811,7 @@ class GlobalReviewRequiredWindow(QDialog):
 
         buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
         if buy_pending_qty == "?" or sell_pending_qty == "?":
-            return "미체결 수량 확인 필요"
+            return PENDING_INTEGRITY_USER_REASON
         if safe_int_value(buy_pending_qty, 0) > 0:
             return "미수/매수 미체결 존재"
         if safe_int_value(sell_pending_qty, 0) > 0:
@@ -976,8 +853,19 @@ class GlobalReviewRequiredWindow(QDialog):
         changed = 0
         blocked: list[str] = []
         failed = 0
+        row_status_by_dir = {
+            str(Path(row.get("stock_dir", ""))): str(
+                row.get("display_status", row.get("return_availability", "")) or ""
+            ).strip()
+            for row in collect_global_review_required_rows()
+        }
 
         for stock_dir, code, name in targets:
+            display_status = row_status_by_dir.get(str(Path(stock_dir)), "")
+            if display_status != "\ud574\uacb0":
+                blocked.append(f"{code} {name}: 해결 상태만 복귀 가능")
+                continue
+
             state_path = stock_dir / "state.json"
             state = read_json_dict(state_path)
             if not isinstance(state, dict):
@@ -996,7 +884,7 @@ class GlobalReviewRequiredWindow(QDialog):
             state["buy_enabled"] = False
             state["startup_reset_reason"] = ""
 
-            if write_state_json(stock_dir, state):
+            if write_state_json(stock_dir, state, allow_review_state_transition=True):
                 append_stock_log(stock_dir, "GUI", f"검토관리 복귀: {before_status} -> MONITORING")
                 changed += 1
             else:
@@ -1061,7 +949,7 @@ class GlobalReviewRequiredWindow(QDialog):
 
             try:
                 update_base_stock_routines(code, name, [])
-                if not write_state_json(stock_dir, state):
+                if not write_state_json(stock_dir, state, allow_review_state_transition=True):
                     failed += 1
                     continue
                 append_stock_log(stock_dir, "GUI", f"검토관리 미지정 전환: {before_status} -> STOPPED")

@@ -169,6 +169,21 @@ def _apply_operation_policy_to_created_orders(append_result: dict[str, Any]) -> 
             )
             continue
 
+        try:
+            from decision_trace_stage_observer import observe_policy_result
+
+            observe_policy_result(
+                order,
+                result,
+                gate_input={
+                    "order_status": str(order.get("status") or ""),
+                    "order_side": str(order.get("side") or ""),
+                    "execution_enabled": bool(order.get("execution_enabled", False)),
+                },
+            )
+        except Exception:
+            pass
+
         after_status = str(result.get("after_status") or result.get("policy_status") or "").upper()
         item = {
             "ok": bool(result.get("ok")),
@@ -269,6 +284,12 @@ def _build_order_queue_candidates_for_signals(
     if apply_approval and callable(evaluate_order_approval):
         for order in created_orders:
             result = evaluate_order_approval(order)
+            try:
+                from decision_trace_stage_observer import observe_approval_result
+
+                observe_approval_result(order, result)
+            except Exception:
+                pass
             approval_status = str(result.get("approval_status", "") or "").upper()
             approval_checked += 1
             order["approval_status"] = result.get("approval_status", "")

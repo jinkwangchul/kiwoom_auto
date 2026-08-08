@@ -82,6 +82,45 @@ def _source_signal_id(signal: dict[str, Any]) -> str | None:
     return None
 
 
+def _first_text(source: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = str(source.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _execution_intent(signal: dict[str, Any], policy_result: dict[str, Any]) -> dict[str, Any]:
+    """Translate a routine policy result without reinterpreting its strategy."""
+    price_basis = policy_result.get("order_price_basis")
+    return {
+        "side": "BUY",
+        "buy_phase": policy_result.get("buy_phase"),
+        "buy_round": policy_result.get("buy_round"),
+        "budget": policy_result.get("round_budget"),
+        "quantity": policy_result.get("quantity"),
+        "price_basis": price_basis,
+        "price": policy_result.get("order_price"),
+        "hoga": "MARKET" if price_basis == "MARKET" else "LIMIT",
+        "hoga_mode": policy_result.get("hoga_mode"),
+        "hoga_up": policy_result.get("hoga_up"),
+        "hoga_down": policy_result.get("hoga_down"),
+        "reason": _first_text(signal, ("reason", "signal_reason")) or "INDICATOR_FOLLOW_BUY_SIGNAL",
+        "source_signal_id": _source_signal_id(signal),
+        "routine_type": _first_text(signal, ("routine_type", "routine_name")) or "INDICATOR_FOLLOW",
+        "routine_instance_id": _first_text(
+            signal,
+            ("routine_instance_id", "assigned_routine_instance_id", "instance_id"),
+        ),
+        "cycle_identity": _first_text(signal, ("cycle_identity", "cycle_id")),
+        "confirmed_previous_round": signal.get("confirmed_previous_round"),
+        "budget_reference": policy_result.get("budget_reference"),
+        "is_last_round": policy_result.get("is_last_round"),
+        "unresolved": False,
+        "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
+    }
+
+
 def _candidate_id_payload(signal: dict[str, Any], policy_result: dict[str, Any]) -> dict[str, Any]:
     return {
         "candidate_version": CANDIDATE_VERSION,
@@ -92,6 +131,7 @@ def _candidate_id_payload(signal: dict[str, Any], policy_result: dict[str, Any])
         "order_price_basis": policy_result.get("order_price_basis"),
         "order_price": None if policy_result.get("order_price_basis") == "MARKET" else policy_result.get("order_price"),
         "round_budget": policy_result.get("round_budget"),
+        "quantity": policy_result.get("quantity"),
         "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
     }
 
@@ -112,7 +152,10 @@ def _draft(signal: dict[str, Any], policy_result: dict[str, Any]) -> dict[str, A
         "order_type": order_type,
         "price": price,
         "budget": policy_result.get("round_budget"),
-        "quantity_policy": "BUDGET_BASED",
+        "quantity": policy_result.get("quantity"),
+        "quantity_policy": "ROUTINE_EXECUTION_INTENT",
+        "buy_phase": policy_result.get("buy_phase"),
+        "buy_round": policy_result.get("buy_round"),
         "next_buy_round": policy_result.get("next_buy_round"),
         "is_last_round": policy_result.get("is_last_round"),
         "hoga_mode": policy_result.get("hoga_mode"),
@@ -121,6 +164,7 @@ def _draft(signal: dict[str, Any], policy_result: dict[str, Any]) -> dict[str, A
         "source_signal_id": _source_signal_id(signal),
         "policy_version": POLICY_VERSION,
         "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
+        "execution_intent": _execution_intent(signal, policy_result),
     }
 
 
@@ -142,6 +186,9 @@ def _result(
     diagnostics: list[dict[str, Any]],
 ) -> dict[str, Any]:
     policy_result = _as_dict(execution_policy_result)
+    execution_intent = None
+    if isinstance(order_candidate_draft, dict):
+        execution_intent = order_candidate_draft.get("execution_intent")
     return {
         "service_type": SERVICE_TYPE,
         "status": status,
@@ -152,6 +199,7 @@ def _result(
         "send_order_called": False,
         "gui_updated": False,
         "order_candidate_draft": deepcopy(order_candidate_draft),
+        "execution_intent": deepcopy(execution_intent),
         "execution_policy_result": deepcopy(policy_result),
         "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
         "evidence": deepcopy(evidence or {}),

@@ -16,11 +16,20 @@ from datetime import datetime
 from PyQt5.QtWidgets import QMessageBox, QWidget
 
 from gui_toast import show_toast
+from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
-from gui_auto_trade_integrity import is_review_required_stock_dir
+from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
+    is_review_required_stock_dir,
+)
 from gui_auto_trade_policy import auto_trade_setting_trade_started
 from gui_review_utils import review_required_for_start
+from operation_policy_gate import (
+    is_emergency_stop,
+    read_operation_state,
+    write_global_operation_running_state,
+)
 from state_policy import (
     operation_mode_display,
     real_trade_enabled,
@@ -223,7 +232,7 @@ def _start_failure_user_message(
             "검토관리에서 처리한 뒤 다시 시도하십시오."
         )
     if all_already_running:
-        return "선택한 인스턴스는 이미 운영 중입니다."
+        return "선택한 루틴은 이미 운영 중입니다."
     if reasons and reasons <= {"PREVIOUS_CLOSE_UNAVAILABLE"}:
         return (
             "전일 종가를 확인할 수 없어 초회 매수 금액을 검증할 수 없습니다.\n"
@@ -273,12 +282,8 @@ def _start_failure_user_message(
 def _all_start_targets_emergency_stopped(
     targets: list[tuple[Path, str, str]],
 ) -> bool:
-    emergency_statuses = {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
     return bool(targets) and all(
-        str(read_json_dict(Path(stock_dir) / "state.json").get("status") or "")
-        .strip()
-        .upper()
-        in emergency_statuses
+        is_emergency_stopped_state(read_json_dict(Path(stock_dir) / "state.json"))
         for stock_dir, _code, _name in targets
     )
 
@@ -316,7 +321,7 @@ def _single_start_failure_user_message(
     subject = _subject_text(label)
 
     if reason in {"REVIEW_REQUIRED", "RECOVERY_STOCK_REVIEW_REQUIRED"}:
-        if status.startswith("EMERGENCY") or "긴급" in review_reason:
+        if is_emergency_stopped_state(state) or "긴급" in review_reason:
             return f"{subject} 긴급정지 상태입니다."
         return (
             f"{subject} 검토관리 대상입니다.\n"
@@ -373,7 +378,7 @@ def _single_start_failure_user_message(
             f"{label}의 운영 상태를 확인하는 중 오류가 발생했습니다.\n"
             "로그를 확인한 뒤 다시 시도하십시오."
         )
-    if status.startswith("EMERGENCY"):
+    if is_emergency_stopped_state(state):
         return f"{subject} 긴급정지 상태입니다."
     return (
         f"{subject} 현재 운영을 시작할 수 없는 상태입니다.\n"
@@ -722,6 +727,42 @@ def auto_trade_start_selected_auto_trades(
     if request_scope == START_REQUEST_SINGLE and len(selected) != 1:
         request_scope = START_REQUEST_MULTIPLE
 
+    if is_emergency_stop(read_operation_state()):
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+        result = {
+            "ok": False,
+            "reason": "GLOBAL_EMERGENCY_STOP",
+            "user_message": (
+                "전역 긴급정지 상태입니다. 정지해제 후 운영시작을 다시 시도하십시오."
+            ),
+            "requested": requested,
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "review_required": (),
+            "failed": (),
+            "skipped": (),
+            "operation": "START",
+            "requested_count": len(requested),
+            "started_count": 0,
+            "excluded_review_count": 0,
+            "excluded_validation_count": 0,
+            "failed_count": 0,
+            "global_failure_reason": "GLOBAL_EMERGENCY_STOP",
+            "internal_reason": ("GLOBAL_EMERGENCY_STOP",),
+            "blocked": True,
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            global_failure=True,
+        )
+        _show_start_failure_once(window, result)
+        return result
+
     if not selected:
         result = {
             "ok": False,
@@ -953,6 +994,7 @@ def auto_trade_start_selected_auto_trades(
 
     eligible = tuple(f"{code} {name}" for _stock_dir, code, name in start_targets)
     completed: list[str] = []
+    completed_codes: list[str] = []
     review_required: list[str] = []
     failed: list[str] = []
     validation_blocked: list[str] = []
@@ -1077,6 +1119,19 @@ def auto_trade_start_selected_auto_trades(
             continue
         if result in ("changed", "unchanged"):
             completed.append(f"{code} {name}({mode_display}/{trade_permission_text}/{auto_trade_status_display(applied_status)})")
+            completed_codes.append(str(code))
+            if result == "changed":
+                append_production_event(
+                    "OPERATION_STARTED",
+                    result="SUCCESS",
+                    source=str(source or "auto_trade_start_selected_auto_trades"),
+                    template_args={"target": f"{code} {name}".strip()},
+                    target_type="STOCK",
+                    target_id=str(code),
+                    target_name=str(name),
+                    stock_code=str(code),
+                    stock_name=str(name),
+                )
         else:
             failed.append(f"{code} {name}")
             failure_reasons.append(
@@ -1155,6 +1210,21 @@ def auto_trade_start_selected_auto_trades(
         "global_failure_reason": "",
         "internal_reason": tuple(dict.fromkeys(failure_reasons)),
     }
+    if completed:
+        try:
+            operation_state_write = write_global_operation_running_state(
+                participant_stock_codes=completed_codes,
+            )
+        except Exception as exc:
+            LOGGER.exception("Global operation RUNNING state write failed")
+            operation_state_write = {
+                "ok": False,
+                "error": str(exc),
+            }
+        result["operation_state_write"] = operation_state_write
+        result["operation_state_write_failed"] = (
+            operation_state_write.get("ok") is not True
+        )
     _apply_start_request_context(
         result,
         request_scope=request_scope,
@@ -1163,6 +1233,10 @@ def auto_trade_start_selected_auto_trades(
         stock_failure_reason=(failure_reasons[0] if failure_reasons else ""),
     )
     if completed:
+        if result.get("operation_state_write_failed"):
+            result_lines.append(
+                "전역 운영 상태 기록 실패: 종목 시작 상태는 유지됩니다."
+            )
         if request_scope != START_REQUEST_SINGLE:
             result["user_message"] = _start_result_summary(
                 started_count=len(completed),
@@ -1173,8 +1247,16 @@ def auto_trade_start_selected_auto_trades(
         result["user_action"] = ""
         if request_scope == START_REQUEST_SINGLE:
             window.statusBarMessage(str(result["user_message"]))
+            if result.get("operation_state_write_failed"):
+                window.statusBarMessage(
+                    "전역 운영 상태 기록에 실패했습니다. 로그를 확인하십시오."
+                )
         elif excluded_review_count or excluded_validation_count or non_validation_failed_count or skipped:
             window.statusBarMessage(str(result["user_message"]))
+            if result.get("operation_state_write_failed"):
+                window.statusBarMessage(
+                    "전역 운영 상태 기록에 실패했습니다. 로그를 확인하십시오."
+                )
         else:
             window.show_auto_trade_result_dialog(
                 "운영시작 처리 완료",
@@ -1342,6 +1424,18 @@ def auto_trade_stop_selected_auto_trades(
             }
             if window.update_stock_status(stock_dir, code, name, "REVIEW_REQUIRED", metadata, reason_text):
                 review_moved.append(f"{code} {name}")
+                append_production_event(
+                    "OPERATION_STOPPED",
+                    result="COMPLETED",
+                    source=str(source or "auto_trade_stop_selected_auto_trades"),
+                    template_args={"target": f"{code} {name}".strip()},
+                    target_type="STOCK",
+                    target_id=str(code),
+                    target_name=str(name),
+                    stock_code=str(code),
+                    stock_name=str(name),
+                    reason_code="REVIEW_REQUIRED",
+                )
             continue
 
         metadata = {
@@ -1366,6 +1460,17 @@ def auto_trade_stop_selected_auto_trades(
         }
         if window.update_stock_status(stock_dir, code, name, "STOPPED", metadata, "강제종료"):
             completed.append(f"{code} {name}")
+            append_production_event(
+                "OPERATION_STOPPED",
+                result="COMPLETED",
+                source=str(source or "auto_trade_stop_selected_auto_trades"),
+                template_args={"target": f"{code} {name}".strip()},
+                target_type="STOCK",
+                target_id=str(code),
+                target_name=str(name),
+                stock_code=str(code),
+                stock_name=str(name),
+            )
 
     if completed or review_moved:
         changelog_parts: list[str] = []

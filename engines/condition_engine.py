@@ -161,14 +161,89 @@ def _apply_percent_offset(base_value: float | None, operator: str, offset_percen
     return base_value
 
 
+def _notify_observer(observer: Any, method_name: str, payload: dict[str, Any]) -> None:
+    if observer is None:
+        return
+    callback = getattr(observer, method_name, None)
+    if not callable(callback):
+        return
+    try:
+        callback(payload)
+    except Exception:
+        # Diagnostic observation must never alter a Production decision.
+        return
+
+
+def _operand(source: str, key: str, index: int | None, value: Any, reason: str = "") -> dict[str, Any]:
+    result = {
+        "source": source,
+        "key": key,
+        "index": index,
+        "value": value,
+    }
+    if value is None:
+        result["reason"] = reason or "value unavailable"
+    return result
+
+
+def _series_period(condition: dict[str, Any], key: str, *, compare: bool = False) -> int | None:
+    field = "compare_period" if compare else "period"
+    value = condition.get(field)
+    try:
+        if value not in (None, ""):
+            return int(value)
+    except (TypeError, ValueError):
+        pass
+    suffix = "".join(character for character in str(key) if character.isdigit())
+    return int(suffix) if suffix else None
+
+
+def _indicator_snapshot(
+    key: str,
+    index: int,
+    series: list[float | None] | None,
+    period: int | None = None,
+) -> dict[str, Any]:
+    current = _value_at(series, index)
+    result = {
+        "indicator": key,
+        "index": index,
+        "current": current,
+        "previous": _value_at(series, index - 1),
+        "previous2": _value_at(series, index - 2),
+    }
+    if period is not None:
+        result["period"] = period
+    if current is None:
+        result["reason"] = "indicator value unavailable"
+    return result
+
+
 def evaluate_condition(
     condition: dict[str, Any],
     series_map: SeriesMap,
     index: int = -1,
+    observer: Any = None,
+    condition_path: str = "",
 ) -> ConditionResult:
     """조건 1개를 평가한다."""
     enabled = condition.get("enabled", True)
     if not enabled:
+        _notify_observer(
+            observer,
+            "observe_condition",
+            {
+                "path": condition_path,
+                "condition_type": str(condition.get("type") or condition.get("target") or "DISABLED"),
+                "operator": str(condition.get("operator") or "DISABLED"),
+                "negated": bool(condition.get("not", False)),
+                "left_operand": _operand("indicator", _series_key(condition), index, None, "condition disabled"),
+                "right_operand": _operand("none", "none", None, None, "condition disabled"),
+                "raw_result": True,
+                "final_result": True,
+                "indicator_snapshots": [],
+            },
+        )
         return ConditionResult(True, "비활성 조건 통과 처리")
 
     target_key = _series_key(condition)
@@ -182,6 +257,8 @@ def evaluate_condition(
 
     passed = False
     detail = f"{target_key} {operator}"
+    right_operand = _operand("none", "none", None, None, "operator has no right operand")
+    snapshots = [_indicator_snapshot(target_key, index, series, _series_period(condition, target_key))]
 
     if operator == "TURN_UP":
         passed = (
@@ -208,6 +285,15 @@ def evaluate_condition(
         compare_series = series_map.get(compare_target)
         compare_current = _value_at(compare_series, index)
         compare_prev = _value_at(compare_series, index - 1)
+        right_operand = _operand("indicator", compare_target, index, compare_current)
+        snapshots.append(
+            _indicator_snapshot(
+                compare_target,
+                index,
+                compare_series,
+                _series_period(condition, compare_target, compare=True),
+            )
+        )
         if prev is not None and current is not None and compare_prev is not None and compare_current is not None:
             if operator == "CROSS_UP":
                 passed = prev <= compare_prev and current > compare_current
@@ -233,16 +319,59 @@ def evaluate_condition(
                 if offset_percent is None
                 else f"{target_key} {operator} {compare_key} offset {offset_percent}%"
             )
+            right_operand = _operand("indicator", compare_key, index, right_value)
+            snapshots.append(
+                _indicator_snapshot(
+                    compare_key,
+                    index,
+                    series_map.get(compare_key),
+                    _series_period(condition, compare_key, compare=True),
+                )
+            )
         else:
             detail = f"{target_key} {operator} {right_value}"
+            right_operand = _operand("literal", "value", None, right_value)
         if current is not None and right_value is not None:
             passed = _compare(current, operator, right_value)
     else:
-        return ConditionResult(False, f"지원하지 않는 조건: {target_key} {operator}")
+        detail = f"지원하지 않는 조건: {target_key} {operator}"
+        _notify_observer(
+            observer,
+            "observe_condition",
+            {
+                "path": condition_path,
+                "condition_type": str(condition.get("type") or target_key),
+                "operator": operator or "UNSUPPORTED",
+                "negated": use_not,
+                "left_operand": _operand("indicator", target_key, index, current),
+                "right_operand": right_operand,
+                "raw_result": False,
+                "final_result": False,
+                "indicator_snapshots": snapshots,
+            },
+        )
+        return ConditionResult(False, detail)
 
+    raw_passed = passed
     if use_not:
         passed = not passed
         detail = "NOT " + detail
+
+    _notify_observer(
+        observer,
+        "observe_condition",
+        {
+            "path": condition_path,
+            "condition_type": str(condition.get("type") or target_key),
+            "operator": operator,
+            "negated": use_not,
+            "left_operand": _operand("indicator", target_key, index, current),
+            "right_operand": right_operand,
+            "raw_result": raw_passed,
+            "final_result": passed,
+            "indicator_snapshots": snapshots,
+        },
+    )
 
     return ConditionResult(passed, detail)
 
@@ -251,47 +380,85 @@ def evaluate_group(
     group: dict[str, Any],
     series_map: SeriesMap,
     index: int = -1,
+    observer: Any = None,
+    group_path: str = "",
 ) -> GroupResult:
     """조건그룹 1개를 AND 기준으로 평가한다."""
     group_name = str(group.get("name", "조건")).strip() or "조건"
     if not group.get("enabled", True):
+        _notify_observer(observer, "observe_group", {
+            "path": group_path,
+            "group_name": group_name,
+            "enabled": False,
+            "logic": _logic(group.get("conditions_logic", group.get("logic", "AND")), "AND"),
+            "condition_paths": [],
+            "result": False,
+        })
         return GroupResult(False, group_name, ["그룹 비활성"])
 
     conditions = group.get("conditions", [])
     if not isinstance(conditions, list) or not conditions:
+        _notify_observer(observer, "observe_group", {
+            "path": group_path,
+            "group_name": group_name,
+            "enabled": True,
+            "logic": _logic(group.get("conditions_logic", group.get("logic", "AND")), "AND"),
+            "condition_paths": [],
+            "result": False,
+        })
         return GroupResult(False, group_name, ["조건 없음"])
 
     details: list[str] = []
     logic = _logic(group.get("conditions_logic", group.get("logic", "AND")), "AND")
     all_passed = True
     any_passed = False
-    for condition in conditions:
+    condition_paths: list[str] = []
+    for condition_index, condition in enumerate(conditions):
         if not isinstance(condition, dict):
             all_passed = False
             details.append("잘못된 조건 형식")
             continue
-        result = evaluate_condition(condition, series_map, index)
+        condition_path = f"{group_path}.conditions[{condition_index}]"
+        condition_paths.append(condition_path)
+        result = evaluate_condition(condition, series_map, index, observer, condition_path)
         details.append(("PASS " if result.passed else "FAIL ") + result.detail)
         if not result.passed:
             all_passed = False
         else:
             any_passed = True
 
-    return GroupResult(any_passed if logic == "OR" else all_passed, group_name, details)
+    passed = any_passed if logic == "OR" else all_passed
+    _notify_observer(observer, "observe_group", {
+        "path": group_path,
+        "group_name": group_name,
+        "enabled": True,
+        "logic": logic,
+        "condition_paths": condition_paths,
+        "result": passed,
+    })
+    return GroupResult(passed, group_name, details)
 
 
 def evaluate_groups_or(
     groups: list[dict[str, Any]],
     series_map: SeriesMap,
     index: int = -1,
+    observer: Any = None,
+    path_prefix: str = "groups",
 ) -> tuple[bool, list[GroupResult]]:
     """조건그룹 목록을 OR 기준으로 평가한다."""
     results: list[GroupResult] = []
     any_passed = False
-    for group in groups:
+    for group_index, group in enumerate(groups):
         if not isinstance(group, dict):
             continue
-        result = evaluate_group(group, series_map, index)
+        result = evaluate_group(
+            group,
+            series_map,
+            index,
+            observer,
+            f"{path_prefix}[{group_index}]",
+        )
         results.append(result)
         if result.passed:
             any_passed = True

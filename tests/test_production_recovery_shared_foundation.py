@@ -448,7 +448,7 @@ class _FakeTimer:
 
 
 class RecoveryTimerLifecycleTest(unittest.TestCase):
-    def test_gui_creates_timers_without_automatic_start(self) -> None:
+    def test_settings_window_owns_only_gui_refresh_timers(self) -> None:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
         init_source = inspect.getsource(AutoTradeSettingWindow.__init__)
@@ -458,8 +458,9 @@ class RecoveryTimerLifecycleTest(unittest.TestCase):
         )
         self.assertNotIn("_time_policy_timer.start()", init_source)
         self.assertNotIn("_runtime_file_timer.start()", init_source)
-        self.assertNotIn(".start()", show_source)
-        self.assertIn("start_recovery_bound_timers", start_source)
+        self.assertIn("timer.start()", show_source)
+        self.assertNotIn("start_recovery_bound_timers", start_source)
+        self.assertIn("SETTINGS_GUI_TIMERS_STARTED", start_source)
 
     def test_timer_waits_for_recovery_and_starts_once(self) -> None:
         registry = ProductionRecoveryStateRegistry()
@@ -598,9 +599,9 @@ class ProductionRecoveryCallPathSourceTest(unittest.TestCase):
         function_at = source.index("def auto_trade_apply_selected_early_close(")
         recovery_at = source.index('"EARLY_CLOSE_REQUEST"', function_at)
         transition_at = source.index("evaluate_production_transition(", recovery_at)
-        command_at = source.index("command_service.apply_early_close(", transition_at)
+        intent_at = source.index("apply_close_intent(", transition_at)
         self.assertLess(recovery_at, transition_at)
-        self.assertLess(transition_at, command_at)
+        self.assertLess(transition_at, intent_at)
         execution_at = source.index("def _start_close_liquidation_execution(")
         execution_gate_at = source.index('f"{reason}_EXECUTION"', execution_at)
         cancel_at = source.index(
@@ -613,7 +614,7 @@ class ProductionRecoveryCallPathSourceTest(unittest.TestCase):
         source = (
             Path(__file__).resolve().parents[1] / "gui_auto_trade_timer.py"
         ).read_text(encoding="utf-8")
-        function_at = source.index("def auto_trade_on_time_policy_timer_tick(")
+        function_at = source.index("def auto_trade_run_operation_cycle(")
         recovery_at = source.index("startup_recovery_session_ready", function_at)
         recalculate_at = source.index(
             "recalculate_all_status_by_operation_policy(",

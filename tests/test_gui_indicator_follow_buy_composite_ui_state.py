@@ -350,6 +350,16 @@ class GuiIndicatorFollowBuyCompositeUiStateTest(unittest.TestCase):
         self.assertEqual("45", signal_filter["buy_rsi_value_line"])
         self.assertEqual(self.dialog._collect_buy_composite_ui_state(), signal_filter["buy_composite"])
 
+    def test_detail_mode_is_collected_in_repeat_namespace(self) -> None:
+        self.dialog.buy_base_detail_mode_combo = _FakeComboBox()
+        self.dialog.buy_base_detail_mode_combo.addItems(["회차기준", "예산기준", "능동매수"])
+        self.dialog.buy_base_detail_mode_combo.setCurrentText("능동매수")
+
+        state = self.dialog.collect_indicator_follow_ui_state()
+
+        self.assertNotIn("detail_mode_combo", state["buy_ui"]["base"])
+        self.assertEqual("능동매수", state["buy_ui"]["repeat"]["detail_mode_combo"])
+
     def test_rules_json_is_not_modified_by_collect_or_restore(self) -> None:
         before = _sha256(RULES_PATH)
 

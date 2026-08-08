@@ -207,6 +207,12 @@ class _FakeButton:
     def setEnabled(self, value: bool) -> None:
         self.enabled = value
 
+    def setText(self, value: str) -> None:
+        self.text = value
+
+    def setStyleSheet(self, value: str) -> None:
+        self.style_sheet = value
+
 
 class _FakeApi:
     def __init__(self, *, connected: bool = True, accounts: list[str] | None = None, send_order_result: object = 0) -> None:
@@ -368,6 +374,39 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertFalse(allowed)
         window.require_startup_recovery_session.assert_called_once_with("Manual SendOrder")
 
+    def test_trusted_runtime_update_rebinds_approved_session_to_new_snapshot(self) -> None:
+        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window._startup_recovery_approved = True
+        window._startup_recovery_approved_snapshot = "SNAPSHOT_A"
+        window._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
+        results = [
+            {
+                "status": "REVIEW_REQUIRED",
+                "operator_approval_allowed": True,
+                "snapshot_hash": "SNAPSHOT_B",
+            },
+            {
+                "status": "REVIEW_REQUIRED",
+                "operator_approval_allowed": True,
+                "snapshot_hash": "SNAPSHOT_B",
+            },
+        ]
+        window.refresh_startup_recovery_status = mock.Mock(
+            side_effect=lambda: window._startup_recovery_result.update(
+                results.pop(0)
+            ) or window._startup_recovery_result
+        )
+
+        rebound = (
+            main_gui.MainWindow.rebind_startup_recovery_after_trusted_runtime_update(
+                window
+            )
+        )
+
+        self.assertTrue(rebound)
+        self.assertTrue(window._startup_recovery_approved)
+        self.assertEqual("SNAPSHOT_B", window._startup_recovery_approved_snapshot)
+
     def test_start_button_recomputes_selected_stock_after_recovery_approval(self) -> None:
         class Parent:
             def __init__(self, ready: bool) -> None:
@@ -376,14 +415,13 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
                 return self.ready
 
-        def start_enabled(*, has_stock: bool, ready: bool) -> bool:
+        def start_enabled(*, has_registered: bool, ready: bool) -> bool:
             window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
             for name in (
                 "btn_start",
-                "btn_stop",
                 "btn_early_close",
                 "btn_set_schedule",
-                "btn_delete",
+                "btn_stock_register",
                 "btn_log_view",
                 "btn_review_view",
                 "btn_execution_enable",
@@ -395,18 +433,32 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 "btn_manual_queue_commit",
             ):
                 setattr(window, name, _FakeButton(name))
-            window.has_selected_stock = mock.Mock(return_value=has_stock)
-            window.has_single_selected_stock = mock.Mock(return_value=has_stock)
+            window.has_selected_stock = mock.Mock(return_value=False)
+            window.has_single_selected_stock = mock.Mock(return_value=False)
             window.parent = lambda: Parent(ready)
             window._last_execution_preview_result = {}
 
-            gui.AutoTradeSettingWindow.update_action_buttons(window)
+            registered = (
+                [Path("stocks/005930_삼성전자")]
+                if has_registered
+                else []
+            )
+            with mock.patch.object(
+                gui,
+                "all_registered_stock_dirs",
+                return_value=registered,
+            ), mock.patch.object(
+                gui,
+                "read_operation_state",
+                return_value={},
+            ):
+                gui.AutoTradeSettingWindow.update_action_buttons(window)
 
             return bool(window.btn_start.enabled)
 
-        self.assertFalse(start_enabled(has_stock=True, ready=False))
-        self.assertTrue(start_enabled(has_stock=True, ready=True))
-        self.assertFalse(start_enabled(has_stock=False, ready=True))
+        self.assertTrue(start_enabled(has_registered=True, ready=False))
+        self.assertTrue(start_enabled(has_registered=True, ready=True))
+        self.assertFalse(start_enabled(has_registered=False, ready=True))
 
     def test_review_startup_recovery_refreshes_auto_trade_action_buttons(self) -> None:
         class StatusBar:
@@ -1495,17 +1547,43 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = self._window_for_queue_commit()
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
 
-        result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
-            window,
-            order_executions_path=gui.ORDER_EXECUTIONS_PATH,
-            order_locks_path=gui.ORDER_LOCKS_PATH,
-        )
+        runtime_paths = {
+            gui.ORDER_EXECUTIONS_PATH.resolve(strict=False),
+            gui.ORDER_LOCKS_PATH.resolve(strict=False),
+        }
+        before = {
+            path: path.read_bytes() if path.exists() else None
+            for path in runtime_paths
+        }
+        original_exists = Path.exists
+
+        def missing_runtime_file(path: Path) -> bool:
+            if path.resolve(strict=False) in runtime_paths:
+                return False
+            return original_exists(path)
+
+        with mock.patch.object(
+            Path,
+            "exists",
+            autospec=True,
+            side_effect=missing_runtime_file,
+        ):
+            result = gui.AutoTradeSettingWindow.ensure_execution_runtime_files_ready(
+                window,
+                order_executions_path=gui.ORDER_EXECUTIONS_PATH,
+                order_locks_path=gui.ORDER_LOCKS_PATH,
+            )
 
         self.assertFalse(result["runtime_files_ready"])
         self.assertIn("PROJECT_RUNTIME_PATH_NOT_ALLOWED", result["blocked_reasons"])
         window.confirm_execution_runtime_file_init.assert_not_called()
-        self.assertFalse(gui.ORDER_EXECUTIONS_PATH.exists())
-        self.assertFalse(gui.ORDER_LOCKS_PATH.exists())
+        self.assertEqual(
+            before,
+            {
+                path: path.read_bytes() if path.exists() else None
+                for path in runtime_paths
+            },
+        )
 
     def test_partial_runtime_files_create_only_missing_file_without_overwrite(self) -> None:
         window = self._window_for_queue_commit()

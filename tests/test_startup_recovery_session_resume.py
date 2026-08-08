@@ -414,7 +414,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 )
                 self.refresh_all = Mock()
                 self.restore_stock_table_view_state = Mock()
-                self.update_controls_calls = 0
+                self.stop_operation_timers = Mock()
 
             def isVisible(self) -> bool:
                 return True
@@ -431,9 +431,6 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
                 return False
 
-            def update_startup_recovery_controls(self) -> None:
-                self.update_controls_calls += 1
-
         timer_window = TimerWindow()
 
         with (
@@ -446,7 +443,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
         timer_window.refresh_all.assert_not_called()
         reset_ats.assert_not_called()
         probe.assert_not_called()
-        self.assertEqual(1, timer_window.update_controls_calls)
+        timer_window.stop_operation_timers.assert_called_once_with()
 
     def test_real_auto_trade_state_allows_pending_signal_consumer(self) -> None:
         class Parent:
@@ -668,8 +665,8 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             ),
             patch.object(
                 gui_main_table_loader,
-                "create_auto_trade_setting_status_item",
-                side_effect=lambda status: {"status": status},
+                "create_auto_trade_setting_activity_status_item",
+                side_effect=lambda status, _active: {"status": status},
             ),
         )
 
@@ -754,6 +751,9 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             def setForeground(self, *_args) -> None:
                 return None
 
+            def setToolTip(self, *_args) -> None:
+                return None
+
         routine_name = "indicator follow"
         stock_dirs = {
             "001111": Path("stocks") / "001111_STOPPED",
@@ -817,8 +817,8 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             ),
             patch.object(
                 gui_main_table_loader,
-                "create_auto_trade_setting_status_item",
-                side_effect=lambda status: {"status": status},
+                "create_auto_trade_setting_activity_status_item",
+                side_effect=lambda status, _active: {"status": status},
             ),
         ):
             window = Window()

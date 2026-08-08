@@ -23,6 +23,9 @@ class _AcceptedSellDialog:
     def values(self) -> dict[str, bool]:
         return {"extra1": True, "extra2": False, "extra3": False}
 
+    def selected_visible_keys(self) -> tuple[str, ...]:
+        return ("extra1",)
+
 
 class GuiAutoTradeAtsOpsTest(unittest.TestCase):
     def test_apply_selection_writes_runtime_only_and_ignores_legacy_config(self) -> None:
@@ -76,16 +79,27 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
                 "extra2": False,
                 "extra3": False,
             }
-            with patch.object(
-                ats_ops,
-                "ManualAtsSettingsDialog",
-                _AcceptedSellDialog,
-            ):
-                ats_ops.auto_trade_open_selected_manual_ats_settings_dialog(window)
+        with patch.object(
+            ats_ops,
+            "ManualAtsSettingsDialog",
+            _AcceptedSellDialog,
+        ), patch.object(
+            ats_ops,
+            "manual_ats_visible_session_keys",
+            return_value=("extra1",),
+        ), patch.object(
+            ats_ops,
+            "read_json_dict",
+            return_value={"operation_mode": "CONTINUOUS"},
+        ):
+            ats_ops.auto_trade_open_selected_manual_ats_settings_dialog(window)
 
         window.execute_selected_manual_ats_liquidation.assert_called_once_with(
             "시장가",
             {"extra1": True, "extra2": False, "extra3": False},
+            selected,
+            ("extra1",),
+            ("extra1",),
         )
         window.save_selected_manual_ats_state.assert_not_called()
 

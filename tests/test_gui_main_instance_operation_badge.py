@@ -33,6 +33,45 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_review_required_button_count_uses_review_window_collector(self) -> None:
+        rows = [
+            {"code": "000660", "review_reason": "긴급정지 해제 시 보유잔량 존재"},
+            {"code": "323410", "review_reason": "운영 데이터 불일치"},
+            {"code": "035420", "review_reason": "운영 데이터 없음"},
+            {"code": "051910", "review_reason": "운영 데이터 읽기 오류"},
+        ]
+        window = SimpleNamespace(btn_review_required=QLabel())
+        window.review_required_stock_count = (
+            lambda: gui_windows.MainWindow.review_required_stock_count(window)
+        )
+
+        with patch.object(
+            gui_windows,
+            "collect_global_review_required_rows",
+            return_value=rows,
+        ) as collector:
+            count = gui_windows.MainWindow.review_required_stock_count(window)
+            gui_windows.MainWindow.update_review_required_button_text(window)
+
+        collector.assert_called()
+        self.assertEqual(4, count)
+        self.assertEqual("검토관리종목(4)", window.btn_review_required.text())
+
+    def test_review_required_button_omits_count_when_collector_empty(self) -> None:
+        window = SimpleNamespace(btn_review_required=QLabel())
+        window.review_required_stock_count = (
+            lambda: gui_windows.MainWindow.review_required_stock_count(window)
+        )
+
+        with patch.object(
+            gui_windows,
+            "collect_global_review_required_rows",
+            return_value=[],
+        ):
+            gui_windows.MainWindow.update_review_required_button_text(window)
+
+        self.assertEqual("검토관리종목", window.btn_review_required.text())
+
     def test_badge_click_selects_and_double_click_requests_toggle(self) -> None:
         on_click = MagicMock()
         on_double_click = MagicMock()
@@ -166,6 +205,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         window.registered_operation_targets = lambda: (
             gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
         )
+        window.registered_operation_start_targets = lambda: (
+            gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
+        )
         window.running_registered_operation_targets = lambda: (
             gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
         )
@@ -198,7 +240,60 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
         window.update_global_operation_button_state.assert_called_once_with()
 
-    def test_auto_trade_setting_bottom_button_stops_only_running_targets(self) -> None:
+    def test_auto_trade_setting_bottom_start_filters_operation_excluded_targets(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            included_dir = root / "005930_Samsung"
+            excluded_dir = root / "000660_SKHynix"
+            included_dir.mkdir()
+            excluded_dir.mkdir()
+            (included_dir / "config.json").write_text(
+                json.dumps({"operation_excluded": False}),
+                encoding="utf-8",
+            )
+            (excluded_dir / "config.json").write_text(
+                json.dumps({"operation_excluded": True}),
+                encoding="utf-8",
+            )
+            window = SimpleNamespace(
+                selected_stock_infos=Mock(),
+                update_global_operation_button_state=Mock(),
+                statusBarMessage=Mock(),
+            )
+            window.registered_operation_targets = lambda: (
+                gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
+            )
+            window.registered_operation_start_targets = lambda: (
+                gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
+            )
+            window.running_registered_operation_targets = lambda: (
+                gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
+            )
+
+            with (
+                patch(
+                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    return_value=[included_dir, excluded_dir],
+                ),
+                patch(
+                    "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
+                ) as start_backend,
+            ):
+                gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
+
+            start_backend.assert_called_once()
+            self.assertEqual(
+                ["005930"],
+                [
+                    target[1]
+                    for target in start_backend.call_args.kwargs["selected_targets"]
+                ],
+            )
+            window.selected_stock_infos.assert_not_called()
+            window.statusBarMessage.assert_not_called()
+            window.update_global_operation_button_state.assert_called_once_with()
+
+    def test_auto_trade_setting_bottom_button_does_not_stop_running_targets(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             running_dir = root / "005930_삼성전자"
@@ -219,6 +314,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window.registered_operation_targets = lambda: (
                 gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
             )
+            window.registered_operation_start_targets = lambda: (
+                gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
+            )
             window.running_registered_operation_targets = lambda: (
                 gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
             )
@@ -238,15 +336,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
 
             start_backend.assert_not_called()
-            call = stop_backend.call_args
-            self.assertEqual(
-                ["005930"],
-                [target[1] for target in call.kwargs["selected_targets"]],
-            )
-            self.assertEqual(
-                "auto_trade_global_stop_button",
-                call.kwargs["source"],
-            )
+            stop_backend.assert_not_called()
             window.update_global_operation_button_state.assert_called_once_with()
 
     def test_stop_backend_accepts_explicit_targets_without_current_routine(self) -> None:
@@ -324,25 +414,37 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
             )
 
-            with patch(
-                "gui_auto_trade_setting_window.all_registered_stock_dirs",
-                return_value=[running_dir, stopped_dir],
+            with (
+                patch(
+                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    return_value=[running_dir, stopped_dir],
+                ),
+                patch(
+                    "gui_auto_trade_setting_window.read_operation_state",
+                    return_value={"emergency_stop": False, "operation_status": ""},
+                ),
             ):
                 gui_windows.AutoTradeSettingWindow.update_global_operation_button_state(
                     window
                 )
 
-            window.btn_start.setText.assert_called_once_with("■ 운영중지")
-            window.btn_start.setEnabled.assert_called_once_with(True)
+            window.btn_start.setText.assert_called_once_with("운영중")
+            window.btn_start.setEnabled.assert_called_once_with(False)
 
             (running_dir / "state.json").write_text(
                 json.dumps({"status": "STOPPED", "trade_enabled": False}),
                 encoding="utf-8",
             )
             window.btn_start.reset_mock()
-            with patch(
-                "gui_auto_trade_setting_window.all_registered_stock_dirs",
-                return_value=[running_dir, stopped_dir],
+            with (
+                patch(
+                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    return_value=[running_dir, stopped_dir],
+                ),
+                patch(
+                    "gui_auto_trade_setting_window.read_operation_state",
+                    return_value={"emergency_stop": False, "operation_status": ""},
+                ),
             ):
                 gui_windows.AutoTradeSettingWindow.update_global_operation_button_state(
                     window
@@ -351,7 +453,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window.btn_start.setText.assert_called_once_with("▶ 운영시작")
             window.btn_start.setEnabled.assert_called_once_with(True)
 
-    def test_stock_name_double_click_forwards_exact_stock(self) -> None:
+    def test_stock_name_double_click_toggles_operation_exclusion(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "000660_SK하이닉스"
             stock_dir.mkdir()
@@ -365,6 +467,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 ),
                 statusBarMessage=Mock(),
             )
+            target = (stock_dir, "000660", "Test")
+            window.stock_info_from_row.return_value = target
+            window.toggle_stock_operation_exclusion = Mock(return_value=True)
             item = SimpleNamespace(column=lambda: 1, row=lambda: 2)
 
             with patch(
@@ -375,15 +480,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     item,
                 )
 
-        call = adapter.call_args
-        self.assertEqual(
-            (stock_dir, "000660", "SK하이닉스"),
-            call.args[1],
-        )
-        self.assertEqual(
-            "auto_trade_stock_name_double_click",
-            call.kwargs["source"],
-        )
+        window.toggle_stock_operation_exclusion.assert_called_once_with(target)
+        adapter.assert_not_called()
 
     def test_running_status_indicator_does_not_call_start_backend(self) -> None:
         with TemporaryDirectory() as temp:
@@ -419,7 +517,10 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
     def test_non_name_cells_do_not_start_stock(self) -> None:
         for column in (0, 2, 3, 4):
             with self.subTest(column=column):
-                window = SimpleNamespace(stock_info_from_row=Mock())
+                window = SimpleNamespace(
+                    stock_info_from_row=Mock(),
+                    toggle_stock_operation_exclusion=Mock(),
+                )
                 item = SimpleNamespace(column=lambda: column, row=lambda: 2)
 
                 with patch(
@@ -432,6 +533,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
                 adapter.assert_not_called()
                 window.stock_info_from_row.assert_not_called()
+                window.toggle_stock_operation_exclusion.assert_not_called()
 
     def test_status_indicator_ignores_reentry_while_start_is_inflight(self) -> None:
         with TemporaryDirectory() as temp:
@@ -541,6 +643,30 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
 
         self.assertEqual(["005930"], [info[1] for info in infos])
+        table.close()
+
+    def test_selected_stock_infos_falls_back_to_selected_indexes(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "005930_Samsung"
+            stock_dir.mkdir()
+            table = QTableWidget(1, 2)
+            table.setSelectionBehavior(QAbstractItemView.SelectItems)
+            table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            code_item = QTableWidgetItem("005930")
+            code_item.setData(Qt.UserRole, str(stock_dir))
+            table.setItem(0, 0, code_item)
+            table.setItem(0, 1, QTableWidgetItem("Samsung"))
+            table.selectionModel().select(
+                table.model().index(0, 1),
+                QItemSelectionModel.Select,
+            )
+
+            infos = gui_auto_trade_selection.selected_stock_infos(
+                SimpleNamespace(stock_table=table)
+            )
+
+        self.assertEqual([(stock_dir, "005930", "Samsung")], infos)
         table.close()
 
     def test_context_row_preserves_or_replaces_extended_row_selection(self) -> None:

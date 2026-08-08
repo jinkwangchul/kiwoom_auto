@@ -20,6 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from gui_auto_trade_integrity import (
+    is_review_required_state,
+    read_review_state_with_issue,
+)
 from gui_routine_registry import routine_display_name as registry_routine_display_name
 
 
@@ -212,6 +216,19 @@ def write_json_file(path: Path, data: dict[str, object]) -> bool:
         return False
 
 
-def write_state_json(stock_dir: Path, state: dict[str, object]) -> bool:
+def write_state_json(
+    stock_dir: Path,
+    state: dict[str, object],
+    *,
+    allow_review_state_transition: bool = False,
+) -> bool:
     """종목 state.json 저장 공통 함수."""
+    if not allow_review_state_transition:
+        current_state, state_issue_reason = read_review_state_with_issue(stock_dir / "state.json")
+        next_status = str(state.get("status", "") or "").strip().upper()
+        if (
+            (state_issue_reason or is_review_required_state(current_state))
+            and next_status not in {"REVIEW_REQUIRED", "REVIEW"}
+        ):
+            return False
     return write_json_file(stock_dir / "state.json", state)

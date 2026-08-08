@@ -27,17 +27,35 @@ from pathlib import Path
 from typing import Any
 
 from gui_auto_trade_runtime import all_registered_stock_dirs
-from routine_instance_registry import load_routine_definitions
+from routine_instance_registry import load_routine_definitions, routine_instance_by_id
+from order_candidate_engine import read_latest_price
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_PATH = RUNTIME_DIR / "routine_signal_probe.log"
+ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
+FILLS_PATH = RUNTIME_DIR / "fills.json"
+POSITIONS_PATH = RUNTIME_DIR / "positions.json"
+_DEFAULT_OBSERVER_SENTINEL = object()
+_DEFAULT_DECISION_TRACE_OBSERVER: Any = None
 
 
 try:
     from routine_signal_queue import enqueue_routine_signal
 except Exception:  # pragma: no cover
     enqueue_routine_signal = None
+
+
+def _default_decision_trace_observer() -> Any:
+    global _DEFAULT_DECISION_TRACE_OBSERVER
+    if _DEFAULT_DECISION_TRACE_OBSERVER is None:
+        try:
+            from decision_trace_production_observer import ProductionDecisionTraceObserver
+
+            _DEFAULT_DECISION_TRACE_OBSERVER = ProductionDecisionTraceObserver(project_root=PROJECT_ROOT)
+        except Exception:
+            return None
+    return _DEFAULT_DECISION_TRACE_OBSERVER
 
 
 def now_text() -> str:
@@ -56,6 +74,15 @@ def _read_json(path: Path) -> Any:
 def _read_json_dict(path: Path) -> dict[str, Any]:
     data = _read_json(path)
     return data if isinstance(data, dict) else {}
+
+
+def _read_runtime_ledger(path: Path, list_key: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return {"version": 1, list_key: []}
+    data = _read_json(path)
+    if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
+        return None
+    return data
 
 
 def _append_log(line: str) -> None:
@@ -85,6 +112,16 @@ def _load_candles_from_stock_dir(stock_dir: Path) -> list[dict[str, Any]]:
                 if isinstance(value, list):
                     return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _load_instance_rules(routine_instance_id: str) -> dict[str, Any] | None:
+    if not routine_instance_id:
+        return None
+    instance = routine_instance_by_id(routine_instance_id, project_root=PROJECT_ROOT)
+    if instance is None or instance.rules_path is None:
+        return None
+    data = _read_json(instance.rules_path)
+    return data if isinstance(data, dict) else None
 
 
 def _load_routine_module(routine_dir: Path):
@@ -142,13 +179,20 @@ def _maybe_enqueue_signal(
     code: str,
     name: str,
     tick_key: str,
+    routine_type: str = "",
+    routine_instance_id: str = "",
 ) -> dict[str, Any] | None:
     if not callable(enqueue_routine_signal):
         return None
 
     try:
+        queue_payload = dict(result)
+        if routine_type:
+            queue_payload.setdefault("routine_type", routine_type)
+        if routine_instance_id:
+            queue_payload.setdefault("routine_instance_id", routine_instance_id)
         return enqueue_routine_signal(
-            result,
+            queue_payload,
             routine=routine_name,
             code=code,
             name=name,
@@ -167,12 +211,21 @@ def probe_routine_for_stock(
     routine_name: str,
     stock_dir: Path,
     tick_key: str,
+    *,
+    decision_trace_observer: Any = _DEFAULT_OBSERVER_SENTINEL,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
     state = _read_json_dict(stock_dir / "state.json")
     stock_config = _read_json_dict(stock_dir / "config.json")
+    routine_instance_id = str(stock_config.get("assigned_routine_instance_id") or "").strip()
+    routine_type = str(getattr(routine_module, "ROUTINE_TYPE", "") or "").strip()
 
     queue_result = None
+    trace_observer = (
+        _default_decision_trace_observer()
+        if decision_trace_observer is _DEFAULT_OBSERVER_SENTINEL
+        else decision_trace_observer
+    )
 
     if not _is_trade_watch_target(state):
         result = {
@@ -204,7 +257,53 @@ def probe_routine_for_stock(
                 "candles": candles,
                 "probe_only": True,
                 "tick_key": tick_key,
+                "routine_instance_id": routine_instance_id,
+                "routine_type": routine_type,
             }
+            instance_rules = _load_instance_rules(routine_instance_id)
+            if isinstance(instance_rules, dict):
+                context["rules"] = instance_rules
+                context["rules_source"] = "ROUTINE_INSTANCE_RULES"
+            trace_collector = None
+            begin_trace = getattr(trace_observer, "begin", None)
+            if callable(begin_trace):
+                try:
+                    trace_collector = begin_trace(
+                        stock_code=code,
+                        routine_instance_id=routine_instance_id,
+                        routine_name=routine_name,
+                        initial_rules=instance_rules,
+                    )
+                    if trace_collector is not None:
+                        context["decision_trace_observer"] = trace_collector
+                except Exception:
+                    trace_collector = None
+            current_price = read_latest_price(code, name)
+            if isinstance(current_price, (int, float)) and current_price > 0:
+                context["current_price"] = current_price
+            cycle_projector = getattr(routine_module, "project_cycle_context", None)
+            if callable(cycle_projector):
+                try:
+                    context["cycle"] = cycle_projector(
+                        code=code,
+                        routine_instance_id=routine_instance_id,
+                        order_queue=_read_runtime_ledger(ORDER_QUEUE_PATH, "orders"),
+                        fills=_read_runtime_ledger(FILLS_PATH, "fills"),
+                        positions=_read_runtime_ledger(POSITIONS_PATH, "positions"),
+                    )
+                except Exception as exc:
+                    context["cycle"] = {
+                        "status": "unresolved",
+                        "active": False,
+                        "confirmed_buy_round": None,
+                        "cumulative_filled_buy_amount": None,
+                        "holding_qty": 0,
+                        "avg_price": 0.0,
+                        "last_buy_order_identity": None,
+                        "partial_sell": False,
+                        "cycle_ended": False,
+                        "unresolved_reason": f"CYCLE_PROJECTION_ERROR:{type(exc).__name__}",
+                    }
             try:
                 raw_result = evaluate(context)
                 result = raw_result if isinstance(raw_result, dict) else {
@@ -222,10 +321,47 @@ def probe_routine_for_stock(
                     code=code,
                     name=name,
                     tick_key=tick_key,
+                    routine_type=routine_type,
+                    routine_instance_id=routine_instance_id,
                 )
                 if isinstance(queue_result, dict):
                     result["queue_status"] = queue_result.get("status")
                     result["queue_id"] = queue_result.get("id", "")
+
+                try:
+                    from event_journal_trade_observer import observe_signal_created
+
+                    observe_signal_created(
+                        result,
+                        queue_result,
+                        routine_name=routine_name,
+                        stock_code=code,
+                        stock_name=name,
+                        routine_instance_id=routine_instance_id,
+                    )
+                except Exception:
+                    pass
+
+                # Bind only a newly queued signal. A duplicate result points at an
+                # older signal and must never be attached to this decision trace.
+                signal_id = ""
+                if isinstance(queue_result, dict) and queue_result.get("status") == "queued":
+                    signal_id = str(queue_result.get("id") or "").strip()
+                append_trace = getattr(trace_observer, "append_decision", None)
+                if trace_collector is not None and callable(append_trace):
+                    try:
+                        append_trace(
+                            trace_collector,
+                            result=result,
+                            candles=candles,
+                            context=context,
+                            routine_name=routine_name,
+                            code=code,
+                            name=name,
+                            signal_id=signal_id,
+                        )
+                    except Exception:
+                        pass
 
             except Exception as exc:
                 result = {
@@ -235,6 +371,20 @@ def probe_routine_for_stock(
                     "code": code,
                     "name": name,
                 }
+                append_trace = getattr(trace_observer, "append_decision", None)
+                if trace_collector is not None and callable(append_trace):
+                    try:
+                        append_trace(
+                            trace_collector,
+                            result=result,
+                            candles=candles,
+                            context=context,
+                            routine_name=routine_name,
+                            code=code,
+                            name=name,
+                        )
+                    except Exception:
+                        pass
 
     queue_text = ""
     if isinstance(queue_result, dict):

@@ -8,7 +8,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 import gui_auto_trade_run_control as run_control
+import gui_auto_trade_status_ops as status_ops
 import gui_auto_trade_context_menu as context_menu
+import operation_policy_gate
+from gui_auto_trade_setting_window import AutoTradeSettingWindow
 from gui_auto_trade_run_control import (
     START_REQUEST_MULTIPLE,
     START_REQUEST_SINGLE,
@@ -76,13 +79,256 @@ class _StartWindow:
         return "changed", "STOPPED", "MONITORING"
 
 
+class _ReviewWindow:
+    def __init__(self) -> None:
+        self.status_updates: list[str] = []
+
+    def mark_review_required(self, stock_dir, code, name, item, source="") -> bool:
+        return AutoTradeSettingWindow.mark_review_required(
+            self,
+            stock_dir,
+            code,
+            name,
+            item,
+            source=source,
+        )
+
+    def update_stock_status(
+        self,
+        stock_dir,
+        code,
+        name,
+        new_status,
+        extra_state=None,
+        log_suffix="",
+    ):
+        self.status_updates.append(str(new_status))
+        return status_ops.auto_trade_update_stock_status(
+            self,
+            stock_dir,
+            code,
+            name,
+            new_status,
+            extra_state,
+            log_suffix,
+        )
+
+
 class AutoTradeStartContractTest(unittest.TestCase):
     def setUp(self) -> None:
+        self._runtime_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._runtime_temp.cleanup)
+        operation_state_path = Path(self._runtime_temp.name) / "operation_state.json"
+        operation_state_path.write_text("{}", encoding="utf-8")
+        self._operation_state_patcher = patch.object(
+            operation_policy_gate,
+            "OPERATION_STATE_PATH",
+            operation_state_path,
+        )
+        self._operation_state_patcher.start()
+        self.addCleanup(self._operation_state_patcher.stop)
+        self._event_journal_patcher = patch(
+            "gui_auto_trade_run_control.append_production_event"
+        )
+        self._event_journal_patcher.start()
+        self.addCleanup(self._event_journal_patcher.stop)
         self._changelog_patcher = patch(
             "gui_auto_trade_run_control.append_changelog"
         )
         self._changelog_patcher.start()
         self.addCleanup(self._changelog_patcher.stop)
+
+    def test_running_data_mismatch_enters_review_with_stock_emergency_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "holding_qty": 0,
+                        "avg_price": 1000,
+                        "trade_enabled": True,
+                        "buy_enabled": True,
+                        "sell_enabled": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            item = {
+                "review_reasons": ["보유 0인데 평단 존재"],
+                "current_price": 0,
+                "pnl_rate_text": "-",
+            }
+            window = _ReviewWindow()
+
+            with patch.object(status_ops, "append_stock_log"):
+                ok = AutoTradeSettingWindow.mark_review_required(
+                    window,
+                    stock_dir,
+                    "005930",
+                    "삼성전자",
+                    item,
+                    source="운영시작",
+                )
+
+            saved_state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(ok)
+        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertTrue(saved_state["review_required"])
+        self.assertEqual("PENDING", saved_state["review_status"])
+        self.assertEqual("운영 데이터 불일치", saved_state["review_reason"])
+        self.assertEqual("보유 0인데 평단 존재", saved_state["review_detail"])
+        self.assertEqual("운영시작", saved_state["review_location"])
+        self.assertEqual("운영 데이터 불일치", saved_state["emergency_reason"])
+        self.assertEqual(["EMERGENCY_STOPPED", "REVIEW_REQUIRED"], window.status_updates)
+        self.assertIn("emergency_stopped_at", saved_state)
+        self.assertFalse(saved_state["trade_enabled"])
+        self.assertFalse(saved_state["buy_enabled"])
+        self.assertFalse(saved_state["sell_enabled"])
+
+    def test_running_policy_recalculation_data_mismatch_uses_running_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "operation_mode": "CONTINUOUS",
+                        "real_trade_enabled": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "holding_qty": 0,
+                        "avg_price": 1000,
+                        "trade_enabled": True,
+                        "buy_enabled": True,
+                        "sell_enabled": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            window = _ReviewWindow()
+
+            with patch.object(status_ops, "append_stock_log"):
+                result = status_ops.auto_trade_recalculate_stock_status_by_operation_policy(
+                    window,
+                    stock_dir,
+                    "005930",
+                    "삼성전자",
+                    "시간 경과 자동 재판정",
+                    silent_unchanged=True,
+                )
+
+            saved_state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(("protected", "RUNNING", "REVIEW_REQUIRED"), result)
+        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertEqual("운영 데이터 불일치", saved_state["review_reason"])
+        self.assertEqual("보유 0인데 평단 존재", saved_state["review_detail"])
+        self.assertEqual("운영중", saved_state["review_location"])
+        self.assertEqual("운영 데이터 불일치", saved_state["emergency_reason"])
+        self.assertEqual(["EMERGENCY_STOPPED", "REVIEW_REQUIRED"], window.status_updates)
+        self.assertFalse(saved_state["trade_enabled"])
+        self.assertFalse(saved_state["buy_enabled"])
+        self.assertFalse(saved_state["sell_enabled"])
+
+    def test_start_requested_recalculation_does_not_relabel_as_running_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "operation_mode": "CONTINUOUS",
+                        "real_trade_enabled": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "holding_qty": 0,
+                        "avg_price": 1000,
+                        "trade_enabled": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            window = _ReviewWindow()
+
+            with patch.object(status_ops, "append_stock_log"):
+                result = status_ops.auto_trade_recalculate_stock_status_by_operation_policy(
+                    window,
+                    stock_dir,
+                    "005930",
+                    "삼성전자",
+                    "운영시작",
+                    {"trade_enabled": True},
+                    silent_unchanged=True,
+                )
+
+            saved_state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertIn(result[0], {"changed", "unchanged"})
+        self.assertNotEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertNotIn("review_location", saved_state)
+        self.assertNotIn("REVIEW_REQUIRED", window.status_updates)
+        self.assertNotIn("EMERGENCY_STOPPED", window.status_updates)
+
+    def test_stopped_data_mismatch_review_does_not_add_emergency_stop_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "STOPPED",
+                        "holding_qty": 0,
+                        "avg_price": 1000,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            item = {
+                "review_reasons": ["보유 0인데 평단 존재"],
+                "current_price": 0,
+                "pnl_rate_text": "-",
+            }
+            window = _ReviewWindow()
+
+            with patch.object(status_ops, "append_stock_log"):
+                ok = AutoTradeSettingWindow.mark_review_required(
+                    window,
+                    stock_dir,
+                    "005930",
+                    "삼성전자",
+                    item,
+                    source="운영시작",
+                )
+
+            saved_state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(ok)
+        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
+        self.assertEqual("보유 0인데 평단 존재", saved_state["review_reason"])
+        self.assertEqual(["REVIEW_REQUIRED"], window.status_updates)
+        self.assertNotIn("emergency_stopped_at", saved_state)
+        self.assertNotIn("emergency_reason", saved_state)
 
     def test_recovery_block_message_contract_is_shared(self) -> None:
         self.assertEqual(

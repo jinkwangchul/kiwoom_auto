@@ -134,7 +134,7 @@ def commit_execution_queue_manually(
     if runtime_queue_target and not committed:
         blocked_reasons.append("QUEUE_COMMIT_FAILED_AFTER_RUNTIME_COMMIT")
 
-    return {
+    result = {
         "status": "COMMITTED" if committed else "BLOCKED",
         "manual_commit": committed,
         "commit_stage": "committed" if committed else _as_dict(commit_result).get("write_stage", "commit"),
@@ -142,3 +142,19 @@ def commit_execution_queue_manually(
         "commit_result": commit_result,
         "blocked_reasons": blocked_reasons,
     }
+    if committed and _as_dict(commit_result).get("post_write_verified") is True:
+        try:
+            from event_journal_trade_observer import observe_order_queued
+
+            preview = _as_dict(queue_write_preview_result)
+            record = _as_dict(preview.get("order_queued_record_preview"))
+            observer_order = _as_dict(_as_dict(context).get("event_journal_order")) or record
+            observe_order_queued(
+                observer_order,
+                record,
+                queue_commit_result=result,
+                read_back_result={"verified": True, "record": record},
+            )
+        except Exception:
+            pass
+    return result

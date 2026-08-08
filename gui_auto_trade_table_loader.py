@@ -44,7 +44,10 @@ from state_policy import (
 from gui_auto_trade_display import (
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
+    apply_auto_trade_setting_protection_row_style,
     auto_trade_setting_display_status,
+    auto_trade_setting_status_color,
+    auto_trade_setting_status_sort_rank,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
     display_status_text_for_gui,
@@ -87,6 +90,7 @@ from gui_auto_trade_policy import (
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
+    is_operation_excluded,
     is_review_required_state,
 )
 from gui_ats_utils import (
@@ -97,7 +101,6 @@ from gui_ats_utils import (
 )
 
 
-
 OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
 
 
@@ -105,16 +108,11 @@ def apply_auto_trade_operation_excluded_row_style(
     item: SortableTableWidgetItem,
     excluded: bool,
 ) -> None:
-    if not excluded:
-        return
-    original_flags = item.flags()
-    apply_auto_trade_setting_activity_style(item, False)
-    item.setFlags(original_flags)
-    tooltip = item.toolTip().strip()
-    if tooltip:
-        item.setToolTip(f"{tooltip}\n?? ??")
-    else:
-        item.setToolTip("?? ??")
+    apply_auto_trade_setting_protection_row_style(
+        item,
+        operation_excluded=excluded,
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -227,30 +225,12 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             code, name = parse_stock_folder_name(stock_dir.name)
             state = read_json_dict(stock_dir / "state.json")
 
+            # 검토종목은 자동매매설정 창에서 완전 제외한다.
             config = read_json_dict(stock_dir / "config.json")
             if not config:
                 config = default_config()
-            operation_excluded = bool(config.get(OPERATION_EXCLUDED_CONFIG_KEY, False))
+            operation_excluded = is_operation_excluded(config)
             review_required = is_review_required_state(state)
-
-            stock_status_filter = str(getattr(window, "_stock_status_filter", "running") or "running").strip().lower()
-            if stock_status_filter == "stopped":
-                stock_status_filter = "running"
-            if stock_status_filter == "all":
-                pass
-            elif stock_status_filter == "running":
-                if review_required or operation_excluded:
-                    continue
-            elif stock_status_filter == "excluded":
-                if review_required or not operation_excluded:
-                    continue
-            elif stock_status_filter == "error":
-                if not review_required:
-                    continue
-            else:
-                if review_required or operation_excluded:
-                    continue
-                config = default_config()
 
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
             holding_qty = safe_int_value(state.get("holding_qty"), 0)
@@ -311,7 +291,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             # 정책 기준:
             # - 조기/자동마감은 1차 리셋 활동이다.
             # - 첫 매도신호 전까지 매수 흐름은 정상 루틴 마무리 과정으로 본다.
-            # - 검토관리는 청산 이후에도 잔여 문제가 남거나, 명시적 안정성검사/재시작/
+            # - 검토관리는 청산 이후에도 잔여 문제가 남거나, 재시작/
             #   긴급정지 해제 같은 검사 컨텍스트에서 판단한다.
 
             # 조기마감/자동마감은 v2.2 기준 추가매수 금지 상태가 아니다.
@@ -405,6 +385,18 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 current_session_trade_started=current_session_trade_started,
                 persisted_trade_started=trade_started,
             )
+
+            stock_status_filter = str(getattr(window, "_stock_status_filter", "all") or "all").strip().lower()
+            if stock_status_filter == "stopped":
+                stock_status_filter = "running"
+            if stock_status_filter == "running" and (review_required or operation_excluded):
+                continue
+            if stock_status_filter == "excluded" and (
+                review_required or not operation_excluded
+            ):
+                continue
+            if stock_status_filter in {"error", "review"} and not review_required:
+                continue
 
             window.stock_table.insertRow(row)
 
@@ -525,26 +517,13 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 profit_text,
                 pending_text,
             ]
-            status_rank = {
-                "감시/대기": 0,
-                "매수/매도": 1,
-                "자동마감": 2,
-                "조기마감": 3,
-            }.get(display_status, 99)
-            if auto_trade_setting_server_mismatch_detected(state):
-                situation_rank = 3
-            elif auto_trade_setting_no_next_step_notice(state):
-                situation_rank = 2
-            elif current_session_trade_started:
-                situation_rank = 1
-            else:
-                situation_rank = 0
+            status_rank = auto_trade_setting_status_sort_rank(display_status)
 
             sort_values = [
                 code,
                 name,
                 operation_display_text,
-                situation_rank,
+                None,
                 status_rank,
                 method_text,
                 liquidation_text,
@@ -579,11 +558,12 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     item.setToolTip(value)
 
                 item.setData(Qt.UserRole, str(stock_dir))
-                item.setData(SORT_ROLE, sort_values[col])
+                sort_value = item.data(SORT_ROLE) if col == 3 else sort_values[col]
+                item.setData(SORT_ROLE, sort_value)
 
                 if col == 2:
                     if liquidation_result_policy == "RED_STOP":
-                        item.setToolTip("청산 결과 불안정\n\n시장가 청산 잔여 또는 미수 발생 - 운영정지 후 안정성검사 필요")
+                        item.setToolTip("청산 결과 불안정\n\n시장가 청산 잔여 또는 미수 발생 - 운영정지 후 무결성 확인 필요")
                     elif liquidation_result_policy == "CURRENT_CARRYOVER":
                         item.setToolTip("현재가 청산 잔여\n\n이월 취급 / 시간외·ATS 재진입 금지")
                     elif liquidation_completed_today:
@@ -609,12 +589,16 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     )
                 if col == 4:
                     apply_auto_trade_setting_activity_style(item, status_cell_active)
+                    if display_status in ("긴급정지", "검토종목"):
+                        item.setForeground(QColor(auto_trade_setting_status_color(display_status)))
                 if col == 9:
                     item.setForeground(QColor(directional_value_color(profit_amount)))
-                apply_auto_trade_operation_excluded_row_style(
-                    item,
-                    operation_excluded,
-                )
+                if col != 3:
+                    apply_auto_trade_setting_protection_row_style(
+                        item,
+                        review_required=review_required,
+                        operation_excluded=operation_excluded,
+                    )
 
                 if col in (0, 2, 3, 5, 6, 7, 8, 9, 10):
                     item.setTextAlignment(Qt.AlignCenter)

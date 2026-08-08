@@ -1,0 +1,357 @@
+# -*- coding: utf-8 -*-
+"""Stable contract and operator templates for the Event Journal."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from string import Formatter
+from typing import Any
+from uuid import uuid4
+
+
+SCHEMA_VERSION = "event_journal_v1"
+
+CATEGORIES = frozenset({"SYSTEM", "OPERATION", "SETTING", "SIGNAL", "ORDER", "FILL"})
+LEGACY_CATEGORIES = frozenset({"WARNING", "ERROR"})
+SEVERITIES = frozenset({"INFO", "NOTICE", "WARNING", "ERROR"})
+RESULTS = frozenset(
+    {
+        "SUCCESS",
+        "COMPLETED",
+        "REQUESTED",
+        "ACCEPTED",
+        "BLOCKED",
+        "REJECTED",
+        "FAILED",
+        "UNCERTAIN",
+        "CANCELLED",
+    }
+)
+
+EVENT_TYPE_CATEGORIES = {
+    "APP_STARTED": "SYSTEM",
+    "APP_STOPPED": "SYSTEM",
+    "OPERATION_HOST_STARTED": "SYSTEM",
+    "OPERATION_HOST_STOPPED": "SYSTEM",
+    "LOGIN_SUCCEEDED": "SYSTEM",
+    "CONNECTION_LOST": "SYSTEM",
+    "ACCOUNT_CHANGED": "SYSTEM",
+    "RECOVERY_COMPLETED": "SYSTEM",
+    "RECOVERY_WARNING": "SYSTEM",
+    "RECOVERY_FAILED": "SYSTEM",
+    "OPERATION_STARTED": "OPERATION",
+    "OPERATION_STOPPED": "OPERATION",
+    "EMERGENCY_STOPPED": "OPERATION",
+    "EMERGENCY_RELEASED": "OPERATION",
+    "OPERATION_EXCLUDED": "SETTING",
+    "OPERATION_EXCLUSION_RELEASED": "SETTING",
+    "SETTING_CHANGED": "SETTING",
+    "TRADING_TIME_CHANGED": "SETTING",
+    "ATS_CHANGED": "SETTING",
+    "ROUTINE_CHANGED": "SETTING",
+    "BUY_SIGNAL_DETECTED": "SIGNAL",
+    "SELL_SIGNAL_DETECTED": "SIGNAL",
+    "APPROVAL_BLOCKED": "ORDER",
+    "POLICY_BLOCKED": "ORDER",
+    "EXECUTION_BLOCKED": "ORDER",
+    "ORDER_QUEUED": "ORDER",
+    "SEND_ORDER_REQUEST_ACCEPTED": "ORDER",
+    "SEND_ORDER_REQUEST_REJECTED": "ORDER",
+    "SEND_ORDER_RESULT_UNCERTAIN": "ORDER",
+    "BROKER_ORDER_ACCEPTED": "ORDER",
+    "BROKER_ORDER_REJECTED": "ORDER",
+    "ORDER_CANCELLED": "ORDER",
+    "PARTIAL_FILL": "FILL",
+    "FULL_FILL": "FILL",
+    "AUTO_CLOSE_STARTED": "OPERATION",
+    "EARLY_CLOSE_STARTED": "OPERATION",
+    "LIQUIDATION_REQUESTED": "OPERATION",
+    "LIQUIDATION_COMPLETED": "OPERATION",
+    "INTEGRITY_WARNING": "SYSTEM",
+    "RUNTIME_WARNING": "SYSTEM",
+    "PROCESSING_ERROR": "SYSTEM",
+}
+EVENT_TYPES = frozenset(EVENT_TYPE_CATEGORIES)
+LEGACY_EVENT_TYPE_CATEGORIES = {
+    "RECOVERY_WARNING": "WARNING",
+    "RECOVERY_FAILED": "ERROR",
+    "INTEGRITY_WARNING": "WARNING",
+    "RUNTIME_WARNING": "WARNING",
+    "PROCESSING_ERROR": "ERROR",
+}
+
+EVENT_TYPE_LABELS = {
+    "APP_STARTED": "프로그램 시작",
+    "APP_STOPPED": "프로그램 종료",
+    "OPERATION_HOST_STARTED": "운영 Host 시작",
+    "OPERATION_HOST_STOPPED": "운영 Host 정지",
+    "LOGIN_SUCCEEDED": "로그인 성공",
+    "CONNECTION_LOST": "연결 해제",
+    "ACCOUNT_CHANGED": "계좌 변경",
+    "RECOVERY_COMPLETED": "Recovery 완료",
+    "RECOVERY_WARNING": "Recovery 경고",
+    "RECOVERY_FAILED": "Recovery 실패",
+    "OPERATION_STARTED": "운영 시작",
+    "OPERATION_STOPPED": "운영 중지",
+    "EMERGENCY_STOPPED": "긴급정지",
+    "EMERGENCY_RELEASED": "긴급정지 해제",
+    "OPERATION_EXCLUDED": "운영제외",
+    "OPERATION_EXCLUSION_RELEASED": "제외해제",
+    "SETTING_CHANGED": "설정 변경",
+    "TRADING_TIME_CHANGED": "운영시간 변경",
+    "ATS_CHANGED": "ATS 변경",
+    "ROUTINE_CHANGED": "루틴 변경",
+    "BUY_SIGNAL_DETECTED": "매수 신호 발생",
+    "SELL_SIGNAL_DETECTED": "매도 신호 발생",
+    "APPROVAL_BLOCKED": "승인 차단",
+    "POLICY_BLOCKED": "운영정책 차단",
+    "EXECUTION_BLOCKED": "주문 실행 차단",
+    "ORDER_QUEUED": "주문 준비 완료",
+    "SEND_ORDER_REQUEST_ACCEPTED": "주문 요청",
+    "SEND_ORDER_REQUEST_REJECTED": "주문 요청 실패",
+    "SEND_ORDER_RESULT_UNCERTAIN": "주문 결과 불확실",
+    "BROKER_ORDER_ACCEPTED": "Broker 주문 접수",
+    "BROKER_ORDER_REJECTED": "Broker 주문 거부",
+    "ORDER_CANCELLED": "주문 취소",
+    "PARTIAL_FILL": "부분체결",
+    "FULL_FILL": "전량체결",
+    "AUTO_CLOSE_STARTED": "자동마감 시작",
+    "EARLY_CLOSE_STARTED": "조기마감 시작",
+    "LIQUIDATION_REQUESTED": "청산 요청",
+    "LIQUIDATION_COMPLETED": "청산 완료",
+    "INTEGRITY_WARNING": "무결성 경고",
+    "RUNTIME_WARNING": "Runtime 경고",
+    "PROCESSING_ERROR": "처리 오류",
+}
+
+SUMMARY_TEMPLATES = {
+    "APP_STARTED": "자동매매 프로그램이 시작되었습니다.",
+    "APP_STOPPED": "자동매매 프로그램이 정상 종료되었습니다.",
+    "OPERATION_HOST_STARTED": "자동매매 Operation Host가 시작되었습니다.",
+    "OPERATION_HOST_STOPPED": "자동매매 Operation Host가 정지되었습니다.",
+    "LOGIN_SUCCEEDED": "Broker 로그인이 완료되었습니다.",
+    "CONNECTION_LOST": "Broker 연결이 해제되었습니다.",
+    "ACCOUNT_CHANGED": "운영 계좌가 {account_display}(으)로 변경되었습니다.",
+    "RECOVERY_COMPLETED": "이전 운영 상태 복구가 완료되었습니다.",
+    "RECOVERY_WARNING": "이전 운영 상태 복구 중 확인이 필요한 항목이 발견되었습니다.",
+    "RECOVERY_FAILED": "이전 운영 상태 복구에 실패했습니다.",
+    "OPERATION_STARTED": "{target} 자동매매 운영을 시작했습니다.",
+    "OPERATION_STOPPED": "{target} 자동매매 운영을 중지했습니다.",
+    "EMERGENCY_STOPPED": "자동매매 운영이 긴급정지되었습니다.",
+    "EMERGENCY_RELEASED": "자동매매 긴급정지가 해제되었습니다.",
+    "OPERATION_EXCLUDED": "{stock_name}이 운영 대상에서 제외되었습니다.",
+    "OPERATION_EXCLUSION_RELEASED": "{stock_name}의 운영제외가 해제되었습니다.",
+    "SETTING_CHANGED": "{target} 설정이 변경되었습니다.",
+    "TRADING_TIME_CHANGED": "운영시간 설정이 변경되었습니다.",
+    "ATS_CHANGED": "ATS 설정이 변경되었습니다.",
+    "ROUTINE_CHANGED": "{stock_name}의 적용 루틴이 변경되었습니다.",
+    "BUY_SIGNAL_DETECTED": "{stock_name}에서 매수 신호가 발생했습니다.",
+    "SELL_SIGNAL_DETECTED": "{stock_name}에서 매도 신호가 발생했습니다.",
+    "APPROVAL_BLOCKED": "{stock_name} 주문 후보가 승인 단계에서 차단되었습니다.",
+    "POLICY_BLOCKED": "{stock_name} 주문이 운영정책에 의해 차단되었습니다.",
+    "EXECUTION_BLOCKED": "{stock_name} 주문이 실행 준비 단계에서 차단되었습니다.",
+    "ORDER_QUEUED": "{stock_name} 주문 실행 준비가 완료되었습니다.",
+    "SEND_ORDER_REQUEST_ACCEPTED": "{stock_name} 주문을 Broker에 요청했습니다.",
+    "SEND_ORDER_REQUEST_REJECTED": "{stock_name} 주문 요청을 전달하지 못했습니다.",
+    "SEND_ORDER_RESULT_UNCERTAIN": "{stock_name} 주문 요청 결과를 확정하지 못했습니다.",
+    "BROKER_ORDER_ACCEPTED": "{stock_name} 주문이 Broker에 접수되었습니다.",
+    "BROKER_ORDER_REJECTED": "{stock_name} 주문이 Broker에서 거부되었습니다.",
+    "ORDER_CANCELLED": "{stock_name} 주문이 취소되었습니다.",
+    "PARTIAL_FILL": "{stock_name} 주문이 누적 {filled_qty}주 체결되었습니다.",
+    "FULL_FILL": "{stock_name} 주문 체결이 완료되었습니다.",
+    "AUTO_CLOSE_STARTED": "{target} 자동마감을 시작했습니다.",
+    "EARLY_CLOSE_STARTED": "{target} 조기마감을 시작했습니다.",
+    "LIQUIDATION_REQUESTED": "{stock_name} 청산을 요청했습니다.",
+    "LIQUIDATION_COMPLETED": "{stock_name} 청산이 완료되었습니다.",
+    "INTEGRITY_WARNING": "{target}에서 무결성 이상이 발견되었습니다.",
+    "RUNTIME_WARNING": "{target} Runtime 상태에 확인이 필요한 항목이 있습니다.",
+    "PROCESSING_ERROR": "{target} 처리 중 오류가 발생했습니다.",
+}
+
+REQUIRED_FIELDS = frozenset(
+    {"schema_version", "event_id", "occurred_at", "category", "severity", "event_type", "summary"}
+)
+OPTIONAL_FIELDS = frozenset(
+    {
+        "app_session_id",
+        "result",
+        "source",
+        "target_type",
+        "target_id",
+        "target_name",
+        "stock_code",
+        "stock_name",
+        "routine",
+        "signal_id",
+        "order_id",
+        "execution_id",
+        "broker_order_no",
+        "command_id",
+        "reason_code",
+        "reason_args",
+        "details",
+        "changes",
+    }
+)
+ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
+
+
+def new_event_id() -> str:
+    return str(uuid4())
+
+
+def new_app_session_id() -> str:
+    return str(uuid4())
+
+
+def parse_aware_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _template_arguments(template: str) -> frozenset[str]:
+    names = {
+        field_name
+        for _, field_name, _, _ in Formatter().parse(template)
+        if field_name
+    }
+    return frozenset(names)
+
+
+def required_template_arguments(event_type: str) -> frozenset[str]:
+    template = SUMMARY_TEMPLATES.get(str(event_type or ""), "")
+    return _template_arguments(template)
+
+
+def render_summary(event_type: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    template = SUMMARY_TEMPLATES.get(str(event_type or ""))
+    if template is None:
+        return {"rendered": False, "summary": "", "error": "unsupported event_type"}
+    values = arguments if isinstance(arguments, dict) else {}
+    if str(event_type or "") == "PARTIAL_FILL" and values.get("order_qty") not in (None, ""):
+        template = "{stock_name} 주문이 누적 {filled_qty}/{order_qty}주 체결되었습니다."
+    missing = sorted(name for name in _template_arguments(template) if values.get(name) in (None, ""))
+    if missing:
+        return {
+            "rendered": False,
+            "summary": "",
+            "error": f"missing template arguments: {', '.join(missing)}",
+        }
+    try:
+        summary = template.format_map(values)
+    except Exception as exc:
+        return {"rendered": False, "summary": "", "error": f"template render failed: {exc}"}
+    return {"rendered": True, "summary": summary, "error": ""}
+
+
+def _contains_unmasked_account(value: Any) -> bool:
+    text = str(value or "").strip()
+    digits = "".join(character for character in text if character.isdigit())
+    return len(digits) >= 8 and "*" not in text
+
+
+def account_safety_issues(value: Any, *, key: str = "") -> list[str]:
+    issues: list[str] = []
+    normalized_key = str(key or "").strip().lower()
+    account_key = "account" in normalized_key or "계좌" in normalized_key
+    if account_key and not isinstance(value, (dict, list, tuple)) and _contains_unmasked_account(value):
+        issues.append(f"unmasked account value is not allowed: {key or '<value>'}")
+    if isinstance(value, dict):
+        field_name = str(
+            value.get("field_key")
+            or value.get("field")
+            or value.get("setting_key")
+            or ""
+        ).strip().lower()
+        if "account" in field_name or "계좌" in field_name:
+            for value_key in ("before", "after", "value"):
+                if _contains_unmasked_account(value.get(value_key)):
+                    issues.append(
+                        f"unmasked account value is not allowed: {field_name}.{value_key}"
+                    )
+        for child_key, child_value in value.items():
+            issues.extend(account_safety_issues(child_value, key=str(child_key)))
+    elif isinstance(value, (list, tuple)):
+        for child_value in value:
+            issues.extend(account_safety_issues(child_value, key=key))
+    return issues
+
+
+def validate_event_record(record: Any, *, allow_legacy_categories: bool = False) -> list[str]:
+    if not isinstance(record, dict):
+        return ["event record must be an object"]
+    issues: list[str] = []
+    unknown = sorted(set(record) - ALLOWED_FIELDS)
+    if unknown:
+        issues.append(f"unsupported fields: {', '.join(unknown)}")
+    missing = sorted(field for field in REQUIRED_FIELDS if record.get(field) in (None, ""))
+    if missing:
+        issues.append(f"missing required fields: {', '.join(missing)}")
+    if record.get("schema_version") != SCHEMA_VERSION:
+        issues.append("schema_version is invalid")
+    category = str(record.get("category") or "")
+    allowed_categories = CATEGORIES | LEGACY_CATEGORIES if allow_legacy_categories else CATEGORIES
+    if category not in allowed_categories:
+        issues.append("category is invalid")
+    severity = str(record.get("severity") or "")
+    if severity not in SEVERITIES:
+        issues.append("severity is invalid")
+    event_type = str(record.get("event_type") or "")
+    if event_type not in EVENT_TYPES:
+        issues.append("event_type is invalid")
+    elif category in allowed_categories:
+        accepted_categories = {EVENT_TYPE_CATEGORIES[event_type]}
+        if allow_legacy_categories and event_type in LEGACY_EVENT_TYPE_CATEGORIES:
+            accepted_categories.add(LEGACY_EVENT_TYPE_CATEGORIES[event_type])
+        if category not in accepted_categories:
+            issues.append("category does not match event_type")
+    result = record.get("result")
+    if result not in (None, "") and str(result) not in RESULTS:
+        issues.append("result is invalid")
+    if parse_aware_timestamp(record.get("occurred_at")) is None:
+        issues.append("occurred_at must be timezone-aware ISO 8601")
+    if record.get("changes") is not None:
+        changes = record.get("changes")
+        if not isinstance(changes, list) or any(not isinstance(item, dict) for item in changes):
+            issues.append("changes must be an array of objects")
+    if record.get("reason_args") is not None and not isinstance(record.get("reason_args"), dict):
+        issues.append("reason_args must be an object")
+    if str(record.get("target_type") or "").upper() == "ACCOUNT":
+        for field in ("target_id", "target_name"):
+            if _contains_unmasked_account(record.get(field)):
+                issues.append(f"{field} must not contain a raw account number")
+    issues.extend(account_safety_issues(record))
+    return issues
+
+
+def normalize_legacy_event_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a display/read copy using the current functional category."""
+
+    event_type = str(record.get("event_type") or "")
+    legacy_category = LEGACY_EVENT_TYPE_CATEGORIES.get(event_type)
+    if legacy_category is None or str(record.get("category") or "") != legacy_category:
+        return dict(record)
+    normalized = dict(record)
+    normalized["category"] = EVENT_TYPE_CATEGORIES[event_type]
+    return normalized
+
+
+def event_target_display(record: dict[str, Any]) -> str:
+    target_name = str(record.get("target_name") or "").strip()
+    stock_name = str(record.get("stock_name") or "").strip()
+    stock_code = str(record.get("stock_code") or "").strip()
+    if stock_name and stock_code:
+        return f"{stock_name} ({stock_code})"
+    if target_name:
+        return target_name
+    if stock_name:
+        return stock_name
+    return "전체"

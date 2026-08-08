@@ -54,6 +54,21 @@ def _build_execution_id(order_id: str, lock_id: str, request_hash: str) -> str:
     return f"EXEC_PREVIEW_{order_id}_{lock_id}_{request_hash[:12]}"
 
 
+def _routine_provenance(order: dict[str, Any]) -> dict[str, Any]:
+    intent = _as_dict(order.get("execution_intent"))
+    provenance = _as_dict(order.get("order_provenance"))
+    result: dict[str, Any] = {}
+    for field in ("routine_type", "routine_instance_id", "cycle_identity"):
+        value = intent.get(field)
+        if value in (None, ""):
+            value = order.get(field)
+        if value in (None, ""):
+            value = provenance.get(field)
+        if value not in (None, ""):
+            result[field] = value
+    return result
+
+
 def build_execution_request_preview(
     order: Any,
     guard: Any,
@@ -130,6 +145,12 @@ def build_execution_request_preview(
             "guard_snapshot": deepcopy(guard_dict),
             "request_preview": request_preview,
         }
+        execution_intent = order_dict.get("execution_intent")
+        if isinstance(execution_intent, dict):
+            execution_request["execution_intent"] = deepcopy(execution_intent)
+        routine_provenance = _routine_provenance(order_dict)
+        if routine_provenance:
+            execution_request["routine_provenance"] = routine_provenance
 
     return {
         "ok": not unresolved,

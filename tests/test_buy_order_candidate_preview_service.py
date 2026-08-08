@@ -31,8 +31,10 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
             "signal_type": "BUY",
             "signal_id": "SIG_BUY_1",
             "symbol": "005930",
+            "routine_type": "INDICATOR_FOLLOW",
+            "routine_instance_id": "routine-1",
             "order_price": 70000,
-            "current_price": 70100,
+            "current_price": 70000,
             "market_price": 70200,
         }
         signal.update(overrides)
@@ -54,8 +56,8 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
                         "apply_all": True,
                         "detail_mode": "ROUND",
                         "round_operator": "ADD",
-                        "round_budget_value": 100000,
-                        "budget_ratio": 0,
+                        "round_budget_value": 0.5,
+                        "budget_ratio": 0.5,
                     },
                 }
             }
@@ -65,12 +67,23 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
         return rules
 
     def _runtime(self, **overrides):
-        runtime = {"current_buy_round": 0, "used_budget": 0}
+        runtime = {
+            "confirmed_current_buy_round": 0,
+            "confirmed_cumulative_buy_budget": 0,
+        }
         runtime.update(overrides)
         return runtime
 
     def _budget(self, **overrides):
-        budget = {"total_budget": 500000, "remaining_budget": 500000, "max_buy_rounds": 3}
+        budget = {
+            "starting_budget_type": "QUANTITY",
+            "starting_quantity": 1,
+            "base_buy_budget": 70000,
+            "previous_buy_budget": 70000,
+            "total_budget": 500000,
+            "remaining_budget": 500000,
+            "max_buy_rounds": 3,
+        }
         budget.update(overrides)
         return budget
 
@@ -98,8 +111,11 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
         self.assertEqual("BUY", draft["side"])
         self.assertEqual("LIMIT", draft["order_type"])
         self.assertEqual(70000.0, draft["price"])
-        self.assertEqual(100000.0, draft["budget"])
-        self.assertEqual("BUDGET_BASED", draft["quantity_policy"])
+        self.assertEqual(70000.0, draft["budget"])
+        self.assertEqual(1, draft["quantity"])
+        self.assertEqual("ROUTINE_EXECUTION_INTENT", draft["quantity_policy"])
+        self.assertEqual("BASE", draft["buy_phase"])
+        self.assertEqual(1, draft["buy_round"])
         self.assertEqual(1, draft["next_buy_round"])
         self.assertFalse(draft["is_last_round"])
         self.assertEqual("SINGLE", draft["hoga_mode"])
@@ -108,6 +124,9 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
         self.assertEqual("SIG_BUY_1", draft["source_signal_id"])
         self.assertEqual(POLICY_VERSION, draft["policy_version"])
         self.assertEqual(draft["execution_snapshot"], result["execution_snapshot"])
+        self.assertEqual(draft["execution_intent"], result["execution_intent"])
+        self.assertEqual("routine-1", result["execution_intent"]["routine_instance_id"])
+        self.assertIsNone(result["execution_intent"]["cycle_identity"])
 
     def test_evaluator_blocked_preserves_evidence_without_candidate(self):
         def blocked_evaluator(**_kwargs):
@@ -150,11 +169,14 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
         self.assertEqual("MULTI", multi["order_candidate_draft"]["hoga_mode"])
 
     def test_budget_price_round_are_preserved(self):
-        result = self._build(runtime_state_snapshot=self._runtime(current_buy_round=1))
+        result = self._build(runtime_state_snapshot=self._runtime(
+            confirmed_current_buy_round=1,
+            confirmed_cumulative_buy_budget=70000,
+        ))
         draft = result["order_candidate_draft"]
 
         self.assertEqual(2, draft["next_buy_round"])
-        self.assertEqual(100000.0, draft["budget"])
+        self.assertEqual(70000.0, draft["budget"])
         self.assertEqual(70000.0, draft["price"])
 
     def test_candidate_id_is_deterministic(self):
@@ -203,13 +225,17 @@ class BuyOrderCandidatePreviewServiceTest(unittest.TestCase):
             captured.update(kwargs)
             return {
                 "status": "READY",
+                "buy_phase": "BASE",
+                "buy_round": 1,
                 "next_buy_round": 1,
                 "order_price_basis": "ORDER_PRICE",
                 "order_price": 70000.0,
                 "hoga_mode": "SINGLE",
                 "hoga_up": 1,
                 "hoga_down": 0,
-                "round_budget": 100000.0,
+                "round_budget": 70000.0,
+                "quantity": 1,
+                "budget_reference": "STARTING_QUANTITY",
                 "is_last_round": False,
                 "evidence": {"ok": True},
                 "execution_snapshot": {"policy_hash": "ready"},

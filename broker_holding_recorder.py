@@ -21,6 +21,11 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from operation_close_completion_check_service import (
+    SOURCE_BROKER_HOLDING_COMMIT,
+    check_global_close_completion_for_runtime_path,
+)
+
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_HOLDING_RECORDED = "BROKER_HOLDING_RECORDED"
@@ -937,7 +942,7 @@ def record_broker_holding_snapshot(
                     failed.update({"before_sha256": before_sha256, "after_sha256": after_sha256, "backup_path": backup_path})
                     return _with_lock_metadata(failed, lock_acquired=True, lock_wait_ms=lock.wait_ms)
 
-                return _with_lock_metadata(
+                result = _with_lock_metadata(
                     {
                         "holding_recorded": True,
                         "holding_stage": "broker_holding_recorded",
@@ -965,6 +970,11 @@ def record_broker_holding_snapshot(
                     lock_acquired=True,
                     lock_wait_ms=lock.wait_ms,
                 )
+                result["completion_check_result"] = check_global_close_completion_for_runtime_path(
+                    source=SOURCE_BROKER_HOLDING_COMMIT,
+                    runtime_path=target_path,
+                )
+                return result
     except TimeoutError:
         return _with_lock_metadata(_blocked("broker_holding_lock", "broker holdings lock timeout"), lock_acquired=False)
 

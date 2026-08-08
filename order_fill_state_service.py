@@ -18,6 +18,11 @@ import shutil
 from typing import Any
 from uuid import uuid4
 
+from operation_close_completion_check_service import (
+    SOURCE_ORDER_FILL_STATE_COMMIT,
+    check_global_close_completion_for_runtime_path,
+)
+
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_COMMIT_REQUIRED = "ORDER_FILL_STATE_COMMIT_REQUIRED"
@@ -501,7 +506,7 @@ def commit_order_fill_state(
         return _commit_blocked("write_queue", f"failed to write order_queue json: {exc}")
 
     after_sha256 = _sha256_file(target_path)
-    return {
+    result = {
         "order_fill_state_committed": True,
         "fill_state_stage": "order_fill_state_committed",
         "next_stage": NEXT_STAGE_LIFECYCLE_REVIEW_REQUIRED,
@@ -518,3 +523,8 @@ def commit_order_fill_state(
         "blocked_reasons": [],
         "warnings": [],
     }
+    result["completion_check_result"] = check_global_close_completion_for_runtime_path(
+        source=SOURCE_ORDER_FILL_STATE_COMMIT,
+        runtime_path=target_path,
+    )
+    return result

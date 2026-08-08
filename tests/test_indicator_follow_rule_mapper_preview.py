@@ -3561,6 +3561,9 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         self.assertEqual(execution["base"]["operation"], "set_execution_policy")
         self.assertEqual(execution["base"]["path"], "buy.execution.base")
         self.assertEqual(execution["base"]["value"], {
+            "buy_phase": "BASE",
+            "buy_round": 1,
+            "budget_reference": "STARTING_BUDGET",
             "hoga_mode": "SINGLE",
             "order_price_basis": "ORDER_PRICE",
             "hoga_up": 2,
@@ -3578,6 +3581,8 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
             "ratio_count": 2,
         })
         self.assertEqual(execution["repeat"]["value"], {
+            "buy_phase": "REPEAT",
+            "starts_from_round": 2,
             "apply_all": True,
             "detail_mode": "ROUND",
             "round_operator": "ADD",
@@ -3592,6 +3597,51 @@ class IndicatorFollowRuleMapperPreviewTest(unittest.TestCase):
         session = self.mapper.build_rule_approval_session(result)
         self.assertEqual(session["candidate_types"]["buy.execution.base"], "set_execution_policy")
         self.assertEqual(session["candidate_types"]["buy.execution.repeat"], "set_execution_policy")
+
+    def test_buy_execution_detail_modes_map_from_repeat_namespace(self):
+        expected = {
+            "회차기준": "ROUND",
+            "예산기준": "BUDGET",
+            "능동매수": "ACTIVE_BUY",
+        }
+        for ui_value, rule_value in expected.items():
+            with self.subTest(ui_value=ui_value):
+                state = deepcopy(self.ui_state)
+                state["buy_ui"]["base"] = {
+                    "hoga_combo": "단일호가",
+                    "order_combo": "주문가",
+                }
+                state["buy_ui"]["repeat"] = {
+                    "apply_all_check": True,
+                    "detail_mode_combo": ui_value,
+                }
+
+                result = self.mapper.build_engine_rules_preview_from_ui_state(
+                    state,
+                    deepcopy(self.current_rules),
+                )
+
+                repeat = result["preview_rules"]["buy"]["execution"]["repeat"]
+                self.assertEqual(rule_value, repeat["detail_mode"])
+
+    def test_buy_execution_legacy_base_detail_mode_is_read_for_compatibility(self):
+        state = deepcopy(self.ui_state)
+        state["buy_ui"]["base"] = {
+            "hoga_combo": "단일호가",
+            "order_combo": "주문가",
+            "detail_mode_combo": "예산기준",
+        }
+        state["buy_ui"]["repeat"] = {"apply_all_check": True}
+
+        result = self.mapper.build_engine_rules_preview_from_ui_state(
+            state,
+            deepcopy(self.current_rules),
+        )
+
+        self.assertEqual(
+            "BUDGET",
+            result["preview_rules"]["buy"]["execution"]["repeat"]["detail_mode"],
+        )
 
     def test_buy_execution_empty_disabled_and_legacy_fields_do_not_create_candidates(self):
         state = deepcopy(self.ui_state)

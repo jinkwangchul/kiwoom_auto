@@ -6,8 +6,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from PyQt5 import sip
 from PyQt5.QtCore import QItemSelectionModel
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QDialog
 
 from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close,
@@ -21,12 +22,27 @@ from gui_auto_trade_run_control import (
     show_auto_trade_operation_failure_dialog,
     startup_recovery_operation_block_message,
 )
+from gui_auto_trade_status_ops import (
+    auto_trade_set_operation_mode_for_targets,
+    handle_auto_trade_operation_mode_double_click,
+)
+from gui_auto_trade_ats_ops import (
+    auto_trade_execute_selected_manual_ats_liquidation,
+    auto_trade_open_selected_manual_ats_settings_dialog,
+    auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_state,
+)
 from gui_auto_trade_context_menu import (
     StockContextMenuCallbacks,
     show_monitor_stock_context_menu,
 )
 from gui_config_utils import default_config
-from gui_auto_trade_integrity import is_review_required_stock_dir
+from gui_schedule_utils import schedule_config_updates
+from gui_schedule_window import ScheduleOperationDialog
+from gui_auto_trade_integrity import (
+    is_operation_excluded,
+    is_review_required_stock_dir,
+)
 from gui_main_table_loader import (
     ROUTINE_INSTANCE_ID_ROLE,
     ROUTINE_ROW_KIND_ROLE,
@@ -36,7 +52,11 @@ from gui_main_table_loader import (
     ROUTINE_STOCK_PATH_ROLE,
 )
 from runtime_io import read_json_dict
-from state_policy import normalize_operation_mode
+from state_policy import (
+    effective_schedule_times,
+    normalize_operation_mode,
+    read_global_schedule,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -141,7 +161,7 @@ def clear_main_monitoring_stock_selection(window) -> None:
         )
 
 
-class MainMonitoringStockOperationAdapter(QWidget):
+class MainMonitoringStockOperationAdapter:
     """Supply monitoring selection/refresh while reusing existing operations."""
 
     def __init__(
@@ -152,7 +172,6 @@ class MainMonitoringStockOperationAdapter(QWidget):
         request_scope: str | None = None,
         recovery_action_label: str = "",
     ) -> None:
-        super().__init__(window)
         self._window = window
         self._targets = tuple(targets)
         self._request_scope = request_scope or (
@@ -164,7 +183,12 @@ class MainMonitoringStockOperationAdapter(QWidget):
         self._last_operation_block_reason = ""
         self._last_operation_user_message = ""
         self._last_operation_failure_dialog_shown = False
-        self.hide()
+
+    def parent(self):
+        return self._window
+
+    def close(self) -> None:
+        return
 
     def selected_stock_infos(self) -> list[tuple[Path, str, str]]:
         return [
@@ -194,7 +218,10 @@ class MainMonitoringStockOperationAdapter(QWidget):
         }
         if len(instance_ids) == 1:
             return next(iter(instance_ids))
-        return "관제창 복수 인스턴스"
+        return "관제창 복수 루틴"
+
+    def target_snapshot(self) -> list[tuple[Path, str, str]]:
+        return self.selected_stock_infos()
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
         return (
@@ -231,13 +258,80 @@ class MainMonitoringStockOperationAdapter(QWidget):
         selected_paths, scroll_value = self.capture_stock_table_view_state()
         self._window.refresh_all()
         self.restore_stock_table_view_state(selected_paths, scroll_value)
+        window = getattr(self._window, "auto_trade_setting_window", None)
+        if window is not None and not sip.isdeleted(window):
+            refresh = getattr(window, "refresh_all", None)
+            if callable(refresh):
+                refresh()
 
     def update_action_buttons(self) -> None:
         return
 
+    def load_selected_routine_stocks(self) -> None:
+        self.refresh_all()
+
+    def selected_stocks_are_operation_excluded(self) -> bool:
+        selected = self.selected_stock_infos()
+        return bool(selected) and all(
+            is_operation_excluded(read_json_dict(stock_dir / "config.json"))
+            for stock_dir, _code, _name in selected
+        )
+
+    def set_stock_operation_exclusion(
+        self,
+        target: tuple[Path, str, str],
+        excluded: bool,
+        *,
+        notify: bool = True,
+        refresh: bool = True,
+    ) -> bool:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.set_stock_operation_exclusion(
+            self,
+            target,
+            excluded,
+            notify=notify,
+            refresh=refresh,
+        )
+
+    def toggle_stock_operation_exclusion(
+        self,
+        target: tuple[Path, str, str],
+    ) -> bool:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.toggle_stock_operation_exclusion(
+            self,
+            target,
+        )
+
+    def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.registered_operation_targets(self)
+
+    def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.running_registered_operation_targets(self)
+
+    def set_selected_stock_operation_exclusions(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        AutoTradeSettingWindow.set_selected_stock_operation_exclusions(self)
+
+    def clear_selected_stock_operation_exclusions(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        AutoTradeSettingWindow.clear_selected_stock_operation_exclusions(self)
+
     def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
         self._last_operation_user_message = str(message or "").strip()
         self._window.statusBar().showMessage(message, timeout_ms)
+
+    def statusBar_message(self, message: str, timeout_ms: int = 7000) -> None:
+        self.statusBarMessage(message, timeout_ms)
 
     def operation_message_parent(self):
         return self._window
@@ -247,6 +341,9 @@ class MainMonitoringStockOperationAdapter(QWidget):
 
     def update_stock_status(self, *args, **kwargs):
         return self._execution_host().update_stock_status(*args, **kwargs)
+
+    def update_stock_operation_mode(self, *args, **kwargs):
+        return self._execution_host().update_stock_operation_mode(*args, **kwargs)
 
     def queue_pending_order_cancellations_for_stock_automatically(
         self,
@@ -382,7 +479,14 @@ class MainMonitoringStockOperationAdapter(QWidget):
         heading: str,
         lines: list[str],
     ) -> None:
-        self._execution_host().show_auto_trade_result_dialog(title, heading, lines)
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        AutoTradeSettingWindow.show_auto_trade_result_dialog(
+            self._window,
+            title,
+            heading,
+            lines,
+        )
 
     def open_review_required_window(self) -> None:
         self._window.open_review_required_window()
@@ -392,6 +496,110 @@ class MainMonitoringStockOperationAdapter(QWidget):
             self,
             request_scope=self._request_scope,
         )
+
+    def set_selected_individual_schedule_time(self) -> None:
+        selected = self.target_snapshot()
+        if not selected:
+            return
+        first_config = (
+            read_json_dict(selected[0][0] / "config.json") or default_config()
+        )
+        start_time, end_buy_time, _ = effective_schedule_times(first_config)
+        dialog = ScheduleOperationDialog(
+            self._window,
+            start_time,
+            end_buy_time,
+            len(selected),
+        )
+        dialog.setWindowTitle("종목 시간 예외 설정")
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        auto_trade_set_operation_mode_for_targets(
+            self,
+            selected,
+            "SCHEDULED",
+            schedule_config_updates(
+                dialog.start_time(),
+                dialog.end_buy_time(),
+            ),
+        )
+
+    def reset_selected_schedule_to_global(self) -> None:
+        selected = self.target_snapshot()
+        if not selected:
+            return
+        global_schedule = read_global_schedule()
+        auto_trade_set_operation_mode_for_targets(
+            self,
+            selected,
+            "SCHEDULED",
+            schedule_config_updates(
+                global_schedule["start_time"],
+                global_schedule["end_buy_time"],
+            ),
+        )
+
+    def set_selected_continuous_operation_mode(self) -> dict[str, object]:
+        selected = self.target_snapshot()
+        if not selected:
+            return {
+                "requested": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "results": [],
+            }
+        return auto_trade_set_operation_mode_for_targets(
+            self,
+            selected,
+            "CONTINUOUS",
+        )
+
+    def handle_operation_mode_double_click(self) -> dict[str, object]:
+        selected = self.target_snapshot()
+        if not selected:
+            return {
+                "requested": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "results": [],
+            }
+        return handle_auto_trade_operation_mode_double_click(self, selected[0])
+
+    def selected_manual_ats_state(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, bool]:
+        return auto_trade_selected_manual_ats_state(
+            self,
+            selected if selected is not None else self.target_snapshot(),
+        )
+
+    def save_selected_manual_ats_state(
+        self,
+        ats_state: dict[str, bool],
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> int:
+        return auto_trade_save_selected_manual_ats_state(
+            self,
+            ats_state,
+            selected if selected is not None else self.target_snapshot(),
+        )
+
+    def execute_selected_manual_ats_liquidation(
+        self,
+        method: str,
+        ats_state: dict[str, bool],
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> None:
+        auto_trade_execute_selected_manual_ats_liquidation(
+            self,
+            method,
+            ats_state,
+            selected if selected is not None else self.target_snapshot(),
+        )
+
+    def open_selected_manual_ats_settings_dialog(self) -> None:
+        auto_trade_open_selected_manual_ats_settings_dialog(self)
 
     def stop_selected_auto_trades(self) -> dict[str, object]:
         return auto_trade_stop_selected_auto_trades(self)
@@ -445,7 +653,8 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
     if item is None:
         return False
     row = item.row()
-    if _stock_target_for_row(window, row) is None:
+    context_target = _stock_target_for_row(window, row)
+    if context_target is None:
         return False
 
     ensure_main_monitoring_context_stock_selected(window, row)
@@ -458,6 +667,12 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
     callbacks = StockContextMenuCallbacks(
         select_all=lambda: select_all_visible_main_monitoring_stocks(window),
         clear_selection=lambda: clear_main_monitoring_stock_selection(window),
+        start=adapter.start_selected_auto_trades,
+        stock_register=lambda target_instance_id=context_target.routine_instance_id: (
+            window.open_routine_instance_stock_register_from_main_table(
+                target_instance_id
+            )
+        ),
         early_close=lambda method: adapter.apply_selected_early_close(
             method,
             source="우클릭",
@@ -465,11 +680,18 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         early_close_profit_loss=adapter.apply_selected_early_close_profit_loss,
         early_close_cancel=adapter.cancel_selected_early_close,
         individual_liquidation=adapter.apply_selected_individual_liquidation_method,
+        time_change=adapter.set_selected_individual_schedule_time,
+        time_reset=adapter.reset_selected_schedule_to_global,
+        ats_settings=adapter.open_selected_manual_ats_settings_dialog,
+        set_operation_exclusion=adapter.set_selected_stock_operation_exclusions,
+        clear_operation_exclusion=adapter.clear_selected_stock_operation_exclusions,
     )
     show_monitor_stock_context_menu(
         window,
         window.routine_table.viewport().mapToGlobal(position),
         has_selection=True,
         callbacks=callbacks,
+        selected_modes=adapter.selected_operation_mode_set(),
+        operation_excluded=adapter.selected_stocks_are_operation_excluded(),
     )
     return True

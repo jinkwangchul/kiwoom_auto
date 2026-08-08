@@ -53,7 +53,6 @@ PROTECTED_FILE_NAMES = {
     "gui_auto_trade_table_loader.py",
     "gui_auto_trade_unregister.py",
     "gui_stock_register_window.py",
-    "gui_routine_assign_window.py",
     "gui_macd_routine_settings_dialog.py",
     "macd_signal_engine.py",
     "routine.py",

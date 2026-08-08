@@ -126,6 +126,17 @@ def _logic(value: Any, default: str = "OR") -> str:
     return logic if logic in {"AND", "OR"} else default
 
 
+def _notify_decision_observer(observer: Any, method_name: str, *args: Any) -> None:
+    callback = getattr(observer, method_name, None)
+    if not callable(callback):
+        return
+    try:
+        callback(*args)
+    except Exception:
+        # Observation is deliberately fail-open at the Production boundary.
+        return
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None or value == "":
@@ -360,6 +371,7 @@ def _evaluate_buy_moving_average_filter(
     buy_cfg: dict[str, Any],
     series_map: dict[str, list[float | None]],
     evaluation_index: int,
+    observer: Any = None,
 ) -> tuple[bool, str | None]:
     filter_cfg = _buy_moving_average_filter_config(config, buy_cfg)
     if not filter_cfg:
@@ -430,7 +442,13 @@ def _evaluate_buy_moving_average_filter(
         "compare_target": "MA",
         "period": period,
     }
-    result = evaluate_condition(runtime_condition, series_map, evaluation_index)
+    result = evaluate_condition(
+        runtime_condition,
+        series_map,
+        evaluation_index,
+        observer,
+        "buy.filters.moving_average.conditions[0]",
+    )
     return result.passed, _moving_average_detail(
         enabled=True,
         period=period,
@@ -490,6 +508,7 @@ def _evaluate_buy_price_compare_filter(
     buy_cfg: dict[str, Any],
     series_map: dict[str, list[float | None]],
     evaluation_index: int,
+    observer: Any = None,
 ) -> tuple[bool, str | None]:
     filter_cfg = _buy_price_compare_filter_config(config, buy_cfg)
     if not filter_cfg:
@@ -523,7 +542,7 @@ def _evaluate_buy_price_compare_filter(
 
     logic = _logic(filter_cfg.get("conditions_logic", filter_cfg.get("logic", "AND")), "AND")
     condition_results = []
-    for condition in conditions:
+    for condition_index, condition in enumerate(conditions):
         if not isinstance(condition, dict):
             continue
         target = condition.get("target")
@@ -551,7 +570,13 @@ def _evaluate_buy_price_compare_filter(
                 reason="insufficient_data",
                 evaluation_index=evaluation_index,
             )
-        result = evaluate_condition(condition, series_map, evaluation_index)
+        result = evaluate_condition(
+            condition,
+            series_map,
+            evaluation_index,
+            observer,
+            f"buy.filters.price_compare.conditions[{condition_index}]",
+        )
         condition_results.append((condition, result))
 
     if not condition_results:
@@ -882,6 +907,7 @@ def _evaluate_buy_ocr_filter(
     buy_cfg: dict[str, Any],
     series_map: dict[str, list[float | None]],
     evaluation_index: int,
+    observer: Any = None,
 ) -> tuple[bool, str | None]:
     filter_cfg = _buy_ocr_filter_config(config, buy_cfg)
     if not filter_cfg:
@@ -910,7 +936,7 @@ def _evaluate_buy_ocr_filter(
 
     condition_results = []
     condition_details: list[str] = []
-    for condition in conditions:
+    for condition_index, condition in enumerate(conditions):
         if not isinstance(condition, dict):
             return False, _ocr_detail(
                 enabled=True,
@@ -935,7 +961,13 @@ def _evaluate_buy_ocr_filter(
                 evaluation_index=evaluation_index,
                 condition_details=condition_details,
             )
-        result = evaluate_condition(runtime_condition, series_map, evaluation_index)
+        result = evaluate_condition(
+            runtime_condition,
+            series_map,
+            evaluation_index,
+            observer,
+            f"buy.filters.ocr.conditions[{condition_index}]",
+        )
         condition_results.append(result)
         condition_details.append(("PASS " if result.passed else "FAIL ") + result.detail)
 
@@ -1350,6 +1382,7 @@ def evaluate_indicator_follow_routine(
     - 비신호를 별도 주문신호로 승격하지 않는다.
     """
     cfg = config if isinstance(config, dict) else DEFAULT_INDICATOR_FOLLOW_CONFIG
+    observer = context.get("decision_trace_observer") if isinstance(context, dict) else None
     if isinstance(context, dict) and isinstance(context.get("candles"), list):
         candles = context["candles"]
 
@@ -1380,7 +1413,13 @@ def evaluate_indicator_follow_routine(
     for signal_name, signal_cfg in condition_sell_signals.items():
         signal_groups = signal_cfg.get("groups", []) if isinstance(signal_cfg.get("groups"), list) else []
         if bool(signal_cfg.get("enabled", True)):
-            passed, results = evaluate_groups_or(signal_groups, series_map, sell_index)
+            passed, results = evaluate_groups_or(
+                signal_groups,
+                series_map,
+                sell_index,
+                observer,
+                f"sell.signals.{signal_name}.groups",
+            )
         else:
             passed, results = False, []
         condition_sell_passed[signal_name] = passed
@@ -1407,6 +1446,31 @@ def evaluate_indicator_follow_routine(
     else:
         sell_passed = any(condition_sell_passed.get(name, False) for name in active_sell_names) or profit_passed
 
+    active_sell_group_paths = [
+        f"sell.signals.{signal_name}.groups[{group_index}]"
+        for signal_name in active_sell_names
+        if signal_name != "profit_rate_sell"
+        for group_index, group in enumerate(
+            condition_sell_signals.get(signal_name, {}).get("groups", [])
+            if isinstance(condition_sell_signals.get(signal_name, {}).get("groups"), list)
+            else []
+        )
+        if isinstance(group, dict) and bool(group.get("enabled", True))
+    ]
+    matched_sell_group_paths = [
+        f"sell.signals.{signal_name}.groups[{group_index}]"
+        for signal_name in active_sell_names
+        if signal_name != "profit_rate_sell"
+        for group_index, result in enumerate(condition_sell_results.get(signal_name, []))
+        if result.passed
+    ]
+    _notify_decision_observer(observer, "observe_aggregation", "SELL", {
+        "logic": sell_logic,
+        "active_group_paths": active_sell_group_paths,
+        "matched_group_paths": matched_sell_group_paths,
+        "result": sell_passed,
+    })
+
     if sell_passed:
         matched = [
             result.group_name
@@ -1426,7 +1490,27 @@ def evaluate_indicator_follow_routine(
 
     buy_index = _delay_index(candles, buy_delay)
     buy_groups = buy_cfg.get("groups", []) if isinstance(buy_cfg.get("groups"), list) else []
-    buy_passed, buy_results = evaluate_groups_or(buy_groups, series_map, buy_index)
+    buy_passed, buy_results = evaluate_groups_or(
+        buy_groups,
+        series_map,
+        buy_index,
+        observer,
+        "buy.groups",
+    )
+    _notify_decision_observer(observer, "observe_aggregation", "BUY", {
+        "logic": "OR",
+        "active_group_paths": [
+            f"buy.groups[{group_index}]"
+            for group_index, group in enumerate(buy_groups)
+            if isinstance(group, dict) and bool(group.get("enabled", True))
+        ],
+        "matched_group_paths": [
+            f"buy.groups[{group_index}]"
+            for group_index, result in enumerate(buy_results)
+            if result.passed
+        ],
+        "result": buy_passed,
+    })
     if buy_passed:
         matched = [result.group_name for result in buy_results if result.passed]
         details = [detail for result in buy_results for detail in result.details]
@@ -1445,7 +1529,9 @@ def evaluate_indicator_follow_routine(
                 "enabled": bool(filter_cfgs["rsi"].get("enabled", True)) if filter_cfgs["rsi"] else False,
             }
 
-            ma_passed, ma_detail = _evaluate_buy_moving_average_filter(cfg, buy_cfg, series_map, buy_index)
+            ma_passed, ma_detail = _evaluate_buy_moving_average_filter(
+                cfg, buy_cfg, series_map, buy_index, observer
+            )
             if ma_detail:
                 details.append(ma_detail)
             filter_results["moving_average"] = {
@@ -1455,7 +1541,9 @@ def evaluate_indicator_follow_routine(
                 "enabled": bool(filter_cfgs["moving_average"].get("enabled", True)) if filter_cfgs["moving_average"] else False,
             }
 
-            price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(cfg, buy_cfg, series_map, buy_index)
+            price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(
+                cfg, buy_cfg, series_map, buy_index, observer
+            )
             if price_compare_detail:
                 details.append(price_compare_detail)
             filter_results["price_compare"] = {
@@ -1475,7 +1563,9 @@ def evaluate_indicator_follow_routine(
                 "enabled": bool(filter_cfgs["bollinger"].get("enabled", True)) if filter_cfgs["bollinger"] else False,
             }
 
-            ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(cfg, buy_cfg, series_map, buy_index)
+            ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(
+                cfg, buy_cfg, series_map, buy_index, observer
+            )
             if ocr_detail:
                 details.append(ocr_detail)
             filter_results["ocr"] = {
@@ -1497,12 +1587,16 @@ def evaluate_indicator_follow_routine(
             details.append(rsi_detail)
         if not rsi_passed:
             return RoutineSignal(None, "BUY RSI filter blocked", matched, details, buy_index, buy_delay)
-        ma_passed, ma_detail = _evaluate_buy_moving_average_filter(cfg, buy_cfg, series_map, buy_index)
+        ma_passed, ma_detail = _evaluate_buy_moving_average_filter(
+            cfg, buy_cfg, series_map, buy_index, observer
+        )
         if ma_detail:
             details.append(ma_detail)
         if not ma_passed:
             return RoutineSignal(None, "BUY moving average filter blocked", matched, details, buy_index, buy_delay)
-        price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(cfg, buy_cfg, series_map, buy_index)
+        price_compare_passed, price_compare_detail = _evaluate_buy_price_compare_filter(
+            cfg, buy_cfg, series_map, buy_index, observer
+        )
         if price_compare_detail:
             details.append(price_compare_detail)
         if not price_compare_passed:
@@ -1512,7 +1606,9 @@ def evaluate_indicator_follow_routine(
             details.append(bollinger_detail)
         if not bollinger_passed:
             return RoutineSignal(None, "BUY bollinger filter blocked", matched, details, buy_index, buy_delay)
-        ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(cfg, buy_cfg, series_map, buy_index)
+        ocr_passed, ocr_detail = _evaluate_buy_ocr_filter(
+            cfg, buy_cfg, series_map, buy_index, observer
+        )
         if ocr_detail:
             details.append(ocr_detail)
         if not ocr_passed:

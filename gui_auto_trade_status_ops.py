@@ -13,11 +13,13 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtWidgets import QMessageBox
+from gui_operation_ui_context import operation_dialog_parent
 
 from gui_config_utils import default_config, default_state
 from gui_review_utils import review_reason_summary
 from gui_schedule_utils import (
     schedule_change_log_text,
+    schedule_config_updates,
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import get_stock_dirs_in_routine, write_state_json
@@ -27,7 +29,7 @@ from auto_close_runtime_policy_snapshot import (
     AUTO_CLOSE_RUNTIME_STATUSES,
     auto_close_runtime_snapshot_metadata,
 )
-from close_liquidation_transition_service import DOMAIN_CLOSE
+from close_intent_service import CLOSE_INTENT_AUTO_CLOSE, apply_close_intent
 from state_policy import (
     auto_trade_status_display,
     normalize_operation_mode,
@@ -36,6 +38,7 @@ from state_policy import (
     operation_mode_change_decision,
     operation_mode_display,
     operation_mode_recalculation_target_status,
+    read_global_schedule,
     read_operation_policy,
     scheduled_status_for_now,
     start_status_by_operation_mode,
@@ -46,8 +49,11 @@ from gui_auto_trade_policy import (
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_trade_started,
 )
-from transition_evidence_reader import TIME_POLICY_SCOPE, TransitionEvidenceScope
-from transition_production_guard import evaluate_production_transition
+from gui_auto_trade_integrity import (
+    auto_trade_setting_data_inconsistency_reasons,
+    is_emergency_stopped_state,
+    is_review_required_state,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -254,15 +260,15 @@ def auto_trade_operation_policy_protected_status(window, status: object) -> bool
     auto_trade_setting_should_preserve_raw_status()에서 판단한다.
     """
     current = str(status or "STOPPED").strip().upper() or "STOPPED"
-    return current in {
-        "EMERGENCY_STOPPED",
-        "EMERGENCY_STOP",
-        "EMERGENCY",
-        "REVIEW_REQUIRED",
-        "REVIEW",
-        "FORCE_CLOSE",
-        "FORCE_LIQUIDATION",
-    }
+    state = {"status": current}
+    return (
+        is_emergency_stopped_state(state)
+        or is_review_required_state(state)
+        or current in {
+            "FORCE_CLOSE",
+            "FORCE_LIQUIDATION",
+        }
+    )
 
 
 def _operation_policy_status_read_back_matches(
@@ -314,15 +320,40 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         append_stock_log(stock_dir, "ERROR", f"운영정책 재판정 실패: Runtime 파일 손상 / {reason}")
         return "failed", "", ""
     before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
+    start_requested = bool(extra_state and extra_state.get("trade_enabled") is True)
 
-    if bool(state.get("review_required", False)):
+    if is_review_required_state(state):
         if not silent_unchanged:
             append_stock_log(
                 stock_dir,
                 "GUI",
                 f"운영정책 재판정 보호: 검토관리 우선 / {reason}",
-            )
+        )
         return "protected", before_status, before_status
+
+    operation_active_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+    data_reasons = auto_trade_setting_data_inconsistency_reasons(state)
+    if (
+        not start_requested
+        and before_status in operation_active_statuses
+        and data_reasons
+    ):
+        marker = getattr(window, "mark_review_required", None)
+        if not callable(marker):
+            append_stock_log(
+                stock_dir,
+                "ERROR",
+                f"운영 중 데이터 불일치 검토관리 전환 실패: mark_review_required 없음 / {reason}",
+            )
+            return "failed", before_status, before_status
+        review_item = {
+            "review_reasons": data_reasons,
+            "current_price": state.get("current_price", 0),
+            "pnl_rate_text": str(state.get("pnl_rate_text", "-") or "-"),
+        }
+        if marker(stock_dir, code, name, review_item, source="운영중"):
+            return "protected", before_status, "REVIEW_REQUIRED"
+        return "failed", before_status, before_status
 
     if bool(state.get("signal_probe_only", False)):
         probe_metadata = {
@@ -375,7 +406,6 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
 
     # 재시작/수동중지 상태에서는 시간 타이머가 상태를 자동으로 다시 켜면 안 된다.
     # 매매시작 버튼이 trade_enabled=True 메타를 전달한 경우에만 시간정책 재판정 진입을 허용한다.
-    start_requested = bool(extra_state and extra_state.get("trade_enabled") is True)
     if not start_requested and not auto_trade_setting_trade_started(state):
         if not silent_unchanged:
             append_stock_log(
@@ -470,48 +500,84 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
                 recalculated_at,
             )
             return "protected", before_status, before_status
-        snapshot_state = {**state, **snapshot_metadata}
-        snapshot_method = str(
-            snapshot_state.get("auto_close_method") or ""
-        ).strip()
-        snapshot_requested_at = str(
-            snapshot_state.get("auto_close_requested_at") or ""
-        ).strip()
-        snapshot_source = str(
-            snapshot_state.get("auto_close_source") or ""
-        ).strip()
-        routine_instance_id = str(
-            config.get("assigned_routine_instance_id") or ""
-        ).strip()
-        transition = evaluate_production_transition(
-            policy_domain=DOMAIN_CLOSE,
-            current_policy=snapshot_method,
-            requested_policy=snapshot_method,
+        transition_result = apply_close_intent(
+            intent=CLOSE_INTENT_AUTO_CLOSE,
+            stock_dir=stock_dir,
+            stock_code=code,
+            stock_name=name,
+            runtime_state=state,
+            runtime_config=config,
+            current_status=before_status,
+            requested_status=new_status,
+            metadata=snapshot_metadata,
+            log_suffix="",
+            status_writer=lambda *_args, **_kwargs: True,
+            read_back_checker=lambda *_args, **_kwargs: True,
             queue_path=ORDER_QUEUE_PATH,
             fills_path=FILLS_PATH,
-            runtime_state=snapshot_state,
-            runtime_routine_instance_id=routine_instance_id,
-            scope=TransitionEvidenceScope(
-                scope_type=TIME_POLICY_SCOPE,
-                stock_code=code,
-                trade_date=snapshot_requested_at[:10],
-                routine_instance_id=routine_instance_id,
-                auto_close_requested_at=snapshot_requested_at,
-                source=snapshot_source,
-            ),
+            dry_run=True,
         )
-        if not transition.allowed:
+        transition = transition_result.get("transition")
+        if transition_result.get("blocked"):
             append_stock_log(
                 stock_dir,
                 "BLOCKED",
                 "자동마감 정책 전환 차단: "
-                f"{transition.reason_code} / "
-                f"evidence={transition.evidence_status}",
+                f"{getattr(transition, 'reason_code', transition_result.get('reason'))} / "
+                f"evidence={getattr(transition, 'evidence_status', '')}",
             )
             return "protected", before_status, before_status
     metadata.update(snapshot_metadata)
     if extra_state:
         metadata.update(extra_state)
+
+    def _write_recalculated_status(log_suffix: str) -> str:
+        if new_status in AUTO_CLOSE_RUNTIME_STATUSES:
+            result = apply_close_intent(
+                intent=CLOSE_INTENT_AUTO_CLOSE,
+                stock_dir=stock_dir,
+                stock_code=code,
+                stock_name=name,
+                runtime_state=state,
+                runtime_config=config,
+                current_status=before_status,
+                requested_status=new_status,
+                metadata=metadata,
+                log_suffix=log_suffix,
+                status_writer=window.update_stock_status,
+                read_back_checker=_operation_policy_status_read_back_matches,
+                queue_path=ORDER_QUEUE_PATH,
+                fills_path=FILLS_PATH,
+            )
+            if result.get("ok"):
+                return "ok"
+            if result.get("blocked"):
+                transition = result.get("transition")
+                append_stock_log(
+                    stock_dir,
+                    "BLOCKED",
+                    "AUTO_CLOSE transition blocked: "
+                    f"{result.get('reason')} / "
+                    f"evidence={getattr(transition, 'evidence_status', '')}",
+                )
+                return "protected"
+            return "failed"
+
+        if window.update_stock_status(
+            stock_dir,
+            code,
+            name,
+            new_status,
+            metadata,
+            log_suffix,
+        ):
+            if _operation_policy_status_read_back_matches(
+                stock_dir,
+                new_status,
+                metadata,
+            ):
+                return "ok"
+        return "failed"
 
     if new_status == before_status:
         # 상태가 같아도 매매시작/강제종료 계열의 메타값은 반드시 저장한다.
@@ -522,13 +588,11 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
                 f"운영정책 재판정 상태유지/메타갱신: "
                 f"{operation_mode_display(mode)} / {auto_trade_status_display(before_status)} / {reason}"
             )
-            if window.update_stock_status(stock_dir, code, name, new_status, metadata, log_suffix):
-                if _operation_policy_status_read_back_matches(
-                    stock_dir,
-                    new_status,
-                    metadata,
-                ):
-                    return "unchanged", before_status, new_status
+            write_result = _write_recalculated_status(log_suffix)
+            if write_result == "ok":
+                return "unchanged", before_status, new_status
+            if write_result == "protected":
+                return "protected", before_status, before_status
             return "failed", before_status, new_status
 
         if not silent_unchanged:
@@ -543,13 +607,11 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         f"운영정책 재판정: {operation_mode_display(mode)} / "
         f"{auto_trade_status_display(before_status)} -> {auto_trade_status_display(new_status)} / {reason}"
     )
-    if window.update_stock_status(stock_dir, code, name, new_status, metadata, log_suffix):
-        if _operation_policy_status_read_back_matches(
-            stock_dir,
-            new_status,
-            metadata,
-        ):
-            return "changed", before_status, new_status
+    write_result = _write_recalculated_status(log_suffix)
+    if write_result == "ok":
+        return "changed", before_status, new_status
+    if write_result == "protected":
+        return "protected", before_status, before_status
     return "failed", before_status, new_status
 
 
@@ -689,57 +751,110 @@ def auto_trade_set_selected_schedule_operation_mode(window) -> None:
     window.set_selected_individual_schedule_time()
 
 
-
 def handle_auto_trade_operation_mode_double_click(
     window,
     target: tuple[Path, str, str],
-) -> None:
-    """Toggle the selected stock's operation mode from the operation-mode cell."""
-    stock_dir, _code, _name = target
+) -> dict[str, object]:
+    """Apply the production operation-cell double-click contract to one target."""
+
+    stock_dir, code, name = target
     config = read_json_dict(Path(stock_dir) / "config.json")
     if not isinstance(config, dict) or not config:
         QMessageBox.warning(
-            window,
+            operation_dialog_parent(window),
             "운영방식 변경",
-            "선택한 종목의 운영방식 설정을 읽을 수 없습니다.",
+            f"{code} {name}의 운영방식 설정을 읽을 수 없습니다.",
         )
-        return
+        return {
+            "requested": 1,
+            "succeeded": 0,
+            "failed": 1,
+            "results": [
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "stock_dir": str(stock_dir),
+                    "success": False,
+                    "reason": "운영방식 설정을 읽을 수 없습니다.",
+                }
+            ],
+        }
+
     current_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    next_mode = "SCHEDULED" if current_mode == "CONTINUOUS" else "CONTINUOUS"
-    auto_trade_set_selected_operation_mode(window, next_mode)
-
-
-def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_updates: dict[str, object] | None = None) -> None:
-    selected = window.selected_stock_infos()
-
-    if len(selected) != 1:
-        QMessageBox.warning(
+    if current_mode == "CONTINUOUS":
+        global_schedule = read_global_schedule()
+        return auto_trade_set_operation_mode_for_targets(
             window,
-            "선택 오류",
-            "운영방식 변경은 한 종목만 선택해야 합니다.",
+            [target],
+            "SCHEDULED",
+            schedule_config_updates(
+                global_schedule["start_time"],
+                global_schedule["end_buy_time"],
+            ),
         )
-        return
+    return auto_trade_set_operation_mode_for_targets(
+        window,
+        [target],
+        "CONTINUOUS",
+    )
+
+
+
+def auto_trade_set_operation_mode_for_targets(
+    window,
+    selected: list[tuple[Path, str, str]],
+    operation_mode: str,
+    config_updates: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Apply one operation-mode request to a fixed target snapshot."""
+    targets = list(selected)
+    dialog_parent = operation_dialog_parent(window)
+    result: dict[str, object] = {
+        "requested": len(targets),
+        "succeeded": 0,
+        "failed": 0,
+        "results": [],
+    }
+    if not targets:
+        QMessageBox.warning(
+            dialog_parent,
+            "선택 오류",
+            "운영방식 변경은 종목을 1개 이상 선택해야 합니다.",
+        )
+        return result
 
     mode = normalize_operation_mode(operation_mode)
     display_mode = operation_mode_display(mode)
-    stock_dir, code, name = selected[0]
     routine_name = window.current_selected_routine_name()
     routine_context = routine_name or (
         "전체"
         if bool(getattr(window, "_all_stocks_scope_active", False))
         else "선택 종목"
     )
-    changed = window.update_stock_operation_mode(
-        stock_dir,
-        code,
-        name,
-        mode,
-        config_updates,
-    )
-    status_result = ""
-    before_status = ""
-    new_status = ""
-    if changed:
+
+    target_results = result["results"]
+    assert isinstance(target_results, list)
+    for stock_dir, code, name in targets:
+        changed = window.update_stock_operation_mode(
+            stock_dir,
+            code,
+            name,
+            mode,
+            config_updates,
+        )
+        if not changed:
+            target_results.append(
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "stock_dir": str(stock_dir),
+                    "success": False,
+                    "reason": "운영방식 또는 시간 설정을 변경할 수 없습니다.",
+                }
+            )
+            result["failed"] = int(result["failed"]) + 1
+            continue
+
         status_result, before_status, new_status = (
             window.recalculate_stock_status_by_operation_policy(
                 stock_dir,
@@ -769,6 +884,17 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
             "config.json/state.json",
             f"종목별 운영방식 변경: {routine_context} -> {display_mode}: {' | '.join(changelog_parts)}",
         )
+        target_results.append(
+            {
+                "stock_code": code,
+                "stock_name": name,
+                "stock_dir": str(stock_dir),
+                "success": True,
+                "reason": "",
+                "status_result": status_result,
+            }
+        )
+        result["succeeded"] = int(result["succeeded"]) + 1
 
     window.refresh_all()
     parent = window.parent()
@@ -776,13 +902,47 @@ def auto_trade_set_selected_operation_mode(window, operation_mode: str, config_u
     if callable(refresh_parent):
         refresh_parent()
 
-    if not changed:
+    failed = int(result["failed"])
+    succeeded = int(result["succeeded"])
+    if failed:
+        failed_lines = [
+            f"{item['stock_code']} {item['stock_name']}: {item['reason']}"
+            for item in target_results
+            if not bool(item.get("success"))
+        ]
+        if len(targets) == 1:
+            message = "선택한 종목을 변경할 수 없습니다."
+        elif succeeded:
+            message = (
+                f"일부 종목의 운영방식/시간 설정을 변경하지 못했습니다.\n\n"
+                f"성공 {succeeded}개 / 실패 {failed}개\n"
+                + "\n".join(failed_lines[:10])
+            )
+        else:
+            message = (
+                "선택한 종목의 운영방식/시간 설정을 변경할 수 없습니다.\n\n"
+                + "\n".join(failed_lines[:10])
+            )
         QMessageBox.warning(
-            window,
+            dialog_parent,
             "운영방식 변경",
-            "선택한 종목을 변경할 수 없습니다.",
+            message,
         )
-        return
+    return result
+
+
+def auto_trade_set_selected_operation_mode(
+    window,
+    operation_mode: str,
+    config_updates: dict[str, object] | None = None,
+) -> dict[str, object]:
+    selected = list(window.selected_stock_infos())
+    return auto_trade_set_operation_mode_for_targets(
+        window,
+        selected,
+        operation_mode,
+        config_updates,
+    )
 
 
 

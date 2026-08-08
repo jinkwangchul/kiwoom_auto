@@ -114,11 +114,13 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     "auto_trade_setting_liquidation_phase_active",
                     return_value=False,
                 ),
+                patch.object(close, "_kiwoom_server_login_block_message", return_value=""),
                 patch.object(
                     close,
                     "evaluate_production_transition",
                     return_value=rejected,
                 ),
+                patch.object(close, "show_toast"),
                 patch.object(close, "append_changelog"),
             ):
                 close.auto_trade_apply_selected_early_close(
@@ -167,7 +169,9 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     "auto_trade_setting_liquidation_phase_active",
                     return_value=False,
                 ),
+                patch.object(close, "_kiwoom_server_login_block_message", return_value=""),
                 patch.object(close, "evaluate_production_transition") as transition,
+                patch.object(close, "show_toast"),
                 patch.object(close, "append_changelog"),
             ):
                 close.auto_trade_apply_selected_early_close(window, "현재가")
@@ -279,8 +283,12 @@ class TransitionProductionCallerTest(unittest.TestCase):
                 ),
                 patch.object(
                     status_ops,
-                    "evaluate_production_transition",
-                    return_value=rejected,
+                    "apply_close_intent",
+                    return_value={
+                        "blocked": True,
+                        "reason": rejected.reason_code,
+                        "transition": rejected,
+                    },
                 ),
                 patch.object(status_ops, "append_stock_log"),
             ):
@@ -335,7 +343,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     "now_text",
                     return_value="2026-07-27 13:30:00",
                 ),
-                patch.object(status_ops, "evaluate_production_transition") as transition,
+                patch.object(status_ops, "apply_close_intent") as close_intent,
                 patch.object(status_ops.LOGGER, "warning") as warning,
             ):
                 result = status_ops.auto_trade_recalculate_stock_status_by_operation_policy(
@@ -349,7 +357,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
 
             self.assertEqual(("protected", "RUNNING", "RUNNING"), result)
             self.assertEqual("AUTO_CLOSE_TIME_POLICY", parent.caller_name)
-            transition.assert_not_called()
+            close_intent.assert_not_called()
             window.update_stock_status.assert_not_called()
             self.assertEqual(before, state_path.read_bytes())
             warning.assert_not_called()

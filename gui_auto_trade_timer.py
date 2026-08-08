@@ -138,32 +138,33 @@ def auto_trade_on_runtime_file_timer_tick(window) -> None:
     window.update_action_buttons()
 
 
-
-def auto_trade_on_time_policy_timer_tick(window) -> None:
-    """분이 바뀐 경우에만 운영방식/시간정책을 자동 재판정한다.
-
-    원칙:
-    - 초 단위 반복 작업 금지
-    - 상태 변화가 없으면 화면 갱신 금지
-    - 변경 종목이 있을 때만 현재 창을 갱신
-    - 긴급정지/검토종목/조기마감은 재판정 함수에서 보호
-    """
+def auto_trade_on_time_policy_gui_timer_tick(window) -> None:
+    """Refresh the settings UI for time-dependent display state only."""
     if not window.isVisible():
         return
 
-    recovery_check = getattr(type(window), "startup_recovery_session_ready", None)
-    if callable(recovery_check) and recovery_check(window, refresh=True) is not True:
-        stop_timers = getattr(type(window), "stop_periodic_timers_for_recovery", None)
-        if callable(stop_timers):
-            stop_timers(window)
-        update_controls = getattr(type(window), "update_startup_recovery_controls", None)
-        if callable(update_controls):
-            update_controls(window)
+    minute_key = auto_trade_current_time_policy_minute_key(window)
+    if minute_key == getattr(window, "_last_time_policy_gui_minute_key", ""):
         return
+    window._last_time_policy_gui_minute_key = minute_key
 
-    minute_key = window.current_time_policy_minute_key()
-    if minute_key == window._last_time_policy_minute_key:
-        return
+    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
+    window.refresh_all()
+    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
+
+
+def auto_trade_run_operation_cycle(window) -> dict[str, object]:
+    """Run the durable operation cycle independently from GUI visibility."""
+    recovery_check = getattr(window, "startup_recovery_session_ready", None)
+    if callable(recovery_check) and recovery_check(refresh=True) is not True:
+        stop_timers = getattr(window, "stop_operation_timers", None)
+        if callable(stop_timers):
+            stop_timers()
+        return {"processed": False, "reason_code": "RECOVERY_NOT_READY"}
+
+    minute_key = auto_trade_current_time_policy_minute_key(window)
+    if minute_key == getattr(window, "_last_time_policy_minute_key", ""):
+        return {"processed": False, "reason_code": "MINUTE_ALREADY_PROCESSED"}
 
     window._last_time_policy_minute_key = minute_key
     result = window.recalculate_all_status_by_operation_policy(
@@ -173,23 +174,6 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
     )
     changed_count = int(result.get("changed", 0) or 0)
     failed_count = int(result.get("failed", 0) or 0)
-
-    # 상태값이 바뀌지 않아도 분이 바뀌면 청산 활성/비활성 표시가 달라질 수 있다.
-    # 따라서 시간 틱에서는 항상 현재 표를 다시 그린다.
-    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.refresh_all()
-    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    parent = window.parent()
-    refresh_all = getattr(parent, "refresh_all", None)
-    if callable(refresh_all):
-        try:
-            refresh_all()
-        except Exception:
-            LOGGER.exception("Main monitoring refresh failed")
-            window.statusBarMessage(
-                "관제창 상태를 갱신하지 못했습니다. "
-                "로그를 확인한 뒤 화면을 새로고침하십시오."
-            )
 
     rebind_recovery = getattr(
         window,
@@ -204,10 +188,7 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
         market_closed=manual_ats_market_day_closed(),
     )
 
-    close_result = auto_trade_continue_pending_close_liquidations(
-        window,
-        limit=5,
-    )
+    close_result = auto_trade_continue_pending_close_liquidations(window, limit=5)
     close_processed = int(close_result.get("processed", 0) or 0)
     close_blocked = int(close_result.get("blocked", 0) or 0)
     if close_processed > 0 or close_blocked > 0:
@@ -216,9 +197,7 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
             f"진행 {close_processed} / 차단 {close_blocked}"
         )
 
-    # STEP 3: 루틴 evaluate() 연결 확인용 안전 프로브.
-    # - 로그만 기록한다.
-    # - 주문/예산/청산/state 변경 없음.
+    signal_result: dict[str, object] = {}
     if callable(probe_all_enabled_routine_stocks_once):
         try:
             probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
@@ -236,48 +215,52 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
                     or auto_trade_real_execution_active(window)
                 )
             ):
-                try:
-                    consumer_result = consume_pending_routine_signals_dry_run(
-                        limit=5,
-                        mark_previewed=True,
-                        write_order_queue=True,
-                        apply_approval=True,
-                    )
-                    summary = consumer_result.get("summary", {}) if isinstance(consumer_result, dict) else {}
-                    checked = int(summary.get("signals_checked", 0) or 0)
-                    blocked = int(summary.get("blocked", 0) or 0)
-                    allowed = int(summary.get("allowed", 0) or 0)
-                    errors = int(summary.get("errors", 0) or 0)
-                    orders_created = int(summary.get("orders_created", 0) or 0)
-                    approval_checked = int(summary.get("approval_checked", 0) or 0)
-                    approved = int(summary.get("approved", 0) or 0)
-                    if checked > 0 or errors > 0:
-                        window.statusBarMessage(
-                            f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
-                            f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
-                        )
-                    if auto_trade_real_execution_active(window):
-                        auto_executor = getattr(type(window), "auto_process_executable_orders_for_real_trade", None)
-                        if callable(auto_executor):
-                            auto_result = auto_executor(window, limit=5)
-                            processed = int(auto_result.get("processed", 0) or 0)
-                            auto_blocked = int(auto_result.get("blocked", 0) or 0)
-                            if processed > 0 or auto_blocked > 0:
-                                window.statusBarMessage(
-                                    f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
-                                )
-                except Exception:
-                    LOGGER.exception("Routine signal consumer failed")
+                consumer_result = consume_pending_routine_signals_dry_run(
+                    limit=5,
+                    mark_previewed=True,
+                    write_order_queue=True,
+                    apply_approval=True,
+                )
+                summary = (
+                    consumer_result.get("summary", {})
+                    if isinstance(consumer_result, dict)
+                    else {}
+                )
+                checked = int(summary.get("signals_checked", 0) or 0)
+                blocked = int(summary.get("blocked", 0) or 0)
+                allowed = int(summary.get("allowed", 0) or 0)
+                errors = int(summary.get("errors", 0) or 0)
+                orders_created = int(summary.get("orders_created", 0) or 0)
+                approval_checked = int(summary.get("approval_checked", 0) or 0)
+                approved = int(summary.get("approved", 0) or 0)
+                if checked > 0 or errors > 0:
                     window.statusBarMessage(
-                        "주문 후보를 검증하는 중 오류가 발생했습니다. "
-                        "로그를 확인하십시오."
+                        f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
+                        f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
                     )
+                signal_result = dict(summary)
+                if auto_trade_real_execution_active(window):
+                    auto_executor = getattr(
+                        window,
+                        "auto_process_executable_orders_for_real_trade",
+                        None,
+                    )
+                    if callable(auto_executor):
+                        auto_result = auto_executor(limit=5)
+                        processed = int(auto_result.get("processed", 0) or 0)
+                        auto_blocked = int(auto_result.get("blocked", 0) or 0)
+                        signal_result["orders_processed"] = processed
+                        signal_result["orders_blocked"] = auto_blocked
+                        if processed > 0 or auto_blocked > 0:
+                            window.statusBarMessage(
+                                f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
+                            )
         except Exception:
-            LOGGER.exception("Routine signal probe failed")
+            LOGGER.exception("Routine signal operation cycle failed")
             window.statusBarMessage(
-                "루틴 신호를 점검하는 중 오류가 발생했습니다. "
-                "로그를 확인하십시오."
+                "주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오."
             )
+            signal_result = {"errors": 1}
 
     if callable(rebind_recovery):
         rebind_recovery()
@@ -287,4 +270,28 @@ def auto_trade_on_time_policy_timer_tick(window) -> None:
             f"시간정책 자동반영: 변경 {changed_count}개"
             + (f" / 실패 {failed_count}개" if failed_count else "")
         )
+
+    return {
+        "processed": True,
+        "reason_code": "OPERATION_CYCLE_COMPLETED",
+        "minute_key": minute_key,
+        "changed": changed_count,
+        "failed": failed_count,
+        "close_processed": close_processed,
+        "close_blocked": close_blocked,
+        "signal_result": signal_result,
+    }
+
+
+
+def auto_trade_on_time_policy_timer_tick(window) -> None:
+    """Backward-compatible entry point for the durable operation cycle.
+
+    원칙:
+    - 초 단위 반복 작업 금지
+    - 상태 변화가 없으면 화면 갱신 금지
+    - 변경 종목이 있을 때만 현재 창을 갱신
+    - 긴급정지/검토종목/조기마감은 재판정 함수에서 보호
+    """
+    return auto_trade_run_operation_cycle(window)
 

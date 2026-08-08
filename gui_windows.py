@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5 import sip
-from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt
+from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt, QTimer
 from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -52,9 +52,11 @@ from PyQt5.QtWidgets import (
 
 LOGGER = logging.getLogger(__name__)
 
-from gui_order_utils import directional_value_color
 from gui_stock_register_window import StockRegisterWindow
-from gui_review_required_window import GlobalReviewRequiredWindow
+from gui_review_required_window import (
+    GlobalReviewRequiredWindow,
+    collect_global_review_required_rows,
+)
 from gui_main_emergency_ops import (
     has_emergency_stopped_stock as emergency_has_emergency_stopped_stock,
     update_emergency_button_state as emergency_update_emergency_button_state,
@@ -90,7 +92,9 @@ from gui_main_table_loader import (
     ROUTINE_PROFIT_LED_GAP,
     ROUTINE_PROFIT_LED_SIZE,
     MAIN_STOCK_METRIC_LAYOUT_PREVIEW,
+    ROUTINE_STOCK_CODE_ROLE,
     ROUTINE_STOCK_INITIAL_BUY_ROLE,
+    ROUTINE_STOCK_DISPLAY_ROLE,
     ROUTINE_STOCK_METRICS_ROLE,
     ROUTINE_STOCK_PATH_ROLE,
     ROUTINE_STOCK_PROFIT_LED_ROLE,
@@ -110,12 +114,21 @@ from gui_main_table_loader import (
     main_load_routine_table,
     main_load_running_stock_table,
     main_monitoring_table_font,
-    routine_instance_buy_limit_configured,
 )
 from gui_main_budget_panel import update_main_budget_panel
+from account_funds_foundation import (
+    DISCONNECTED as ACCOUNT_FUNDS_DISCONNECTED,
+    FAILED as ACCOUNT_FUNDS_FAILED,
+    LOADING as ACCOUNT_FUNDS_LOADING,
+    READY as ACCOUNT_FUNDS_READY,
+    AccountFundsProjection,
+    format_money as format_account_funds_money,
+)
+from kiwoom_account_funds_adapter import KiwoomAccountFundsAdapter
 from gui_main_stock_context_menu import (
     MainMonitoringStockOperationAdapter,
     MainMonitoringStockTarget,
+    _stock_target_for_row,
     show_main_monitoring_stock_context_menu,
 )
 from gui_auto_trade_display import (
@@ -124,16 +137,27 @@ from gui_auto_trade_display import (
     draw_stock_position_metric_display,
 )
 from gui_auto_trade_run_control import show_auto_trade_operation_failure_dialog
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
+from gui_event_record_window import open_event_record_prototype
+from event_journal_production import append_owner_event_once
 from runtime_io import read_json_dict
+from gui_review_utils import current_price_from_state
+from gui_operation_environment import (
+    effective_amount_starting_budget,
+    starting_budget_defaults,
+    suggested_buy_limit,
+)
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
     AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
+    InstanceStockSearchRegisterDialog,
     auto_trade_setting_badge_stylesheet,
     get_routine_dirs,
     get_stock_dirs_in_routine,
+    handle_stock_name_operation_exclusion_double_click,
     handle_kiwoom_raw_chejan_event,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
@@ -185,6 +209,7 @@ from operation_command_service import (
     RESULT_PARTIAL_SUCCESS,
     SCOPE_ROUTINE_INSTANCE,
 )
+from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -337,6 +362,53 @@ INITIAL_BUY_BADGE_HEIGHT = AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT
 INITIAL_BUY_BADGE_GAP = 4
 INITIAL_BUY_AMOUNT_COLOR = "#B98200"
 INITIAL_BUY_QUANTITY_COLOR = "#6F52B5"
+ROUTINE_STOCK_OPERATION_TOKEN_INDEX = 2
+ROUTINE_STOCK_NAME_TOKEN_INDEX = 0
+
+
+def _routine_stock_token_rect(table, index, token_index: int) -> QRect:
+    if table is None or not index.isValid() or token_index < 0:
+        return QRect()
+    values = index.data(ROUTINE_STOCK_VALUES_ROLE)
+    if not isinstance(values, (list, tuple)) or token_index >= len(values):
+        return QRect()
+    row_rect = table.visualRect(index)
+    if row_rect.isNull():
+        return QRect()
+    x = row_rect.left() + ROUTINE_STOCK_TEXT_OFFSET
+    separator_width = routine_instance_separator_width(table.font())
+    for column, width in enumerate(routine_stock_column_widths(table.font())[: len(values)]):
+        if column > 0 and column != 1:
+            x += separator_width
+        token_rect = QRect(x, row_rect.top(), width, row_rect.height())
+        if column == token_index:
+            return token_rect
+        x += width
+    return QRect()
+
+
+def _routine_stock_name_rect(table, index) -> QRect:
+    token_rect = _routine_stock_token_rect(
+        table,
+        index,
+        ROUTINE_STOCK_NAME_TOKEN_INDEX,
+    )
+    if token_rect.isNull():
+        return QRect()
+    code = str(index.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+    text_left = (
+        token_rect.left()
+        + ROUTINE_PROFIT_LED_BOX_SIZE
+        + ROUTINE_PROFIT_LED_GAP
+    )
+    if code:
+        text_left += QFontMetrics(table.font()).horizontalAdvance(f"{code} ")
+    return QRect(
+        text_left,
+        token_rect.top(),
+        max(0, token_rect.right() - text_left + 1),
+        token_rect.height(),
+    )
 
 
 def _initial_buy_component_rects(cell_rect: QRect) -> dict[str, QRect]:
@@ -387,10 +459,15 @@ def _draw_initial_buy_display(
     painter.restore()
 
     if not hide_value:
+        value_text = str(initial_buy.get("value_text", "") or "")
         painter.drawText(
             components["value"],
-            Qt.AlignRight | Qt.AlignVCenter,
-            str(initial_buy.get("value_text", "") or ""),
+            (
+                Qt.AlignCenter
+                if value_text == "대기"
+                else Qt.AlignRight | Qt.AlignVCenter
+            ),
+            value_text,
         )
 
 
@@ -553,7 +630,7 @@ def _main_stock_metric_component_layouts(
 
 
 def _main_stock_value_alignment(value: str):
-    if str(value).strip() in {"-", "\ubbf8\uc124\uc815"}:
+    if str(value).strip() in {"-", "\ubbf8\uc124\uc815", "대기"}:
         return Qt.AlignCenter | Qt.AlignVCenter
     return Qt.AlignRight | Qt.AlignVCenter
 
@@ -582,6 +659,7 @@ def _draw_routine_stock_metric_text_sequence(
     row_rect: QRect,
     start_x: int,
     texts: list[str],
+    foregrounds: list[QColor | None] | None = None,
     hidden_value_indexes: set[int] | None = None,
 ) -> tuple[list[tuple[str, int, int, int, int]], int]:
     metric_rects, separator_rects, end_x = _routine_stock_metric_layout_rects(
@@ -595,9 +673,10 @@ def _draw_routine_stock_metric_text_sequence(
     hidden_value_indexes = hidden_value_indexes or set()
     for index, (text, metric_rect, rects) in enumerate(zip(texts, metric_rects, component_rects)):
         original_pen = painter.pen()
-        if index == 2:
-            _label, left_value, _right_value = _split_main_stock_metric_text(text)
-            painter.setPen(QColor(directional_value_color(left_value)))
+        if foregrounds is not None and index < len(foregrounds):
+            foreground = foregrounds[index]
+            if isinstance(foreground, QColor) and foreground.isValid():
+                painter.setPen(foreground)
         _draw_main_stock_metric_components(
             painter,
             text,
@@ -790,11 +869,42 @@ class _RoutineTreeInteractionController(QObject):
                 cell_rect = self.table.visualRect(index)
                 row_kind = str(index.data(ROUTINE_ROW_KIND_ROLE) or "")
                 if row_kind == ROUTINE_ROW_STOCK:
+                    limit_rect = self._stock_metric_rect(index, 11)
+                    if (
+                        event.type() == QEvent.MouseButtonRelease
+                        and event.button() == Qt.LeftButton
+                        and limit_rect.contains(event.pos())
+                    ):
+                        if not self.window.consume_routine_stock_buy_limit_release(index.row()):
+                            self.window.schedule_routine_stock_buy_limit_single_click(index.row())
+                        event.accept()
+                        return True
                     if (
                         event.type() == QEvent.MouseButtonDblClick
                         and event.button() == Qt.LeftButton
-                        and self.window._main_routine_initial_buy_badge_enabled()
                     ):
+                        operation_rect = _routine_stock_token_rect(
+                            self.table,
+                            index,
+                            ROUTINE_STOCK_OPERATION_TOKEN_INDEX,
+                        )
+                        if operation_rect.contains(event.pos()):
+                            if self.window.handle_routine_stock_operation_double_click(index.row()):
+                                event.accept()
+                                return True
+                            return super().eventFilter(watched, event)
+                        if _routine_stock_name_rect(
+                            self.table,
+                            index,
+                        ).contains(event.pos()):
+                            if self.window.handle_routine_stock_name_double_click(
+                                index.row()
+                            ):
+                                event.accept()
+                                return True
+                            return super().eventFilter(watched, event)
+                        if not self.window._main_routine_initial_buy_badge_enabled():
+                            return super().eventFilter(watched, event)
                         initial_buy_rect = self._stock_legacy_metric_rect(index, 1)
                         initial_buy_parts = _initial_buy_component_rects(initial_buy_rect)
                         if initial_buy_parts["badge"].contains(event.pos()):
@@ -805,7 +915,10 @@ class _RoutineTreeInteractionController(QObject):
                             self.window.start_routine_stock_initial_buy_edit(index.row())
                             event.accept()
                             return True
-                        if self._stock_metric_rect(index, 11).contains(event.pos()):
+                        if limit_rect.contains(event.pos()):
+                            self.window.cancel_routine_stock_buy_limit_single_click(
+                                suppress_release_row=index.row(),
+                            )
                             self.window.handle_routine_stock_buy_limit_double_click(index.row())
                             event.accept()
                             return True
@@ -838,11 +951,6 @@ class _RoutineTreeInteractionController(QObject):
                         self.window.open_routine_settings_from_main_table(
                             self.table.item(index.row(), 0)
                         )
-                    elif (
-                        row_kind == ROUTINE_ROW_CHILD
-                        and self._child_name_rect(index).contains(event.pos())
-                    ):
-                        self.window.start_routine_instance_name_edit(index.row())
                     event.accept()
                     return True
             elif event.type() == QEvent.MouseButtonDblClick:
@@ -929,6 +1037,73 @@ class _RoutineBuyLimitValueEditFilter(QObject):
 class _RoutineTreeItemDelegate(QStyledItemDelegate):
     """Paint the first-column hierarchy without text-based indentation."""
 
+    @staticmethod
+    def _stock_token(tokens: object, column: int) -> dict[str, object]:
+        if isinstance(tokens, (list, tuple)) and column < len(tokens):
+            token = tokens[column]
+            if isinstance(token, dict):
+                return token
+        return {}
+
+    @staticmethod
+    def _stock_token_font(base_font: QFont, token: dict[str, object]) -> QFont:
+        font = QFont(base_font)
+        if "bold" in token:
+            font.setBold(bool(token.get("bold")))
+        if "italic" in token:
+            font.setItalic(bool(token.get("italic")))
+        point_size = token.get("point_size")
+        try:
+            point_size_int = int(point_size)
+        except (TypeError, ValueError):
+            point_size_int = 0
+        if point_size_int > 0:
+            font.setPointSize(point_size_int)
+        return font
+
+    @staticmethod
+    def _stock_token_alignment(
+        token: dict[str, object],
+        fallback: Qt.Alignment,
+    ) -> Qt.Alignment:
+        try:
+            alignment = int(token.get("alignment", 0) or 0)
+        except (TypeError, ValueError):
+            alignment = 0
+        return Qt.Alignment(alignment) if alignment else fallback
+
+    @staticmethod
+    def _stock_token_foreground(
+        token: dict[str, object],
+        option,
+        *,
+        visually_enabled: bool,
+    ) -> QColor:
+        if option.state & QStyle.State_Selected:
+            return option.palette.highlightedText().color()
+        color_text = str(token.get("foreground", "") or "").strip()
+        color = QColor(color_text)
+        if color.isValid():
+            return color
+        if not visually_enabled:
+            return QColor("#9ca3af")
+        return option.palette.text().color()
+
+    @staticmethod
+    def _fill_stock_token_background(
+        painter,
+        rect: QRect,
+        token: dict[str, object],
+        option,
+    ) -> None:
+        if option.state & QStyle.State_Selected:
+            return
+        color_text = str(token.get("background", "") or "").strip()
+        color = QColor(color_text)
+        if not color.isValid():
+            return
+        painter.fillRect(rect.adjusted(1, 2, -1, -2), color)
+
     def display_text(self, index, widget) -> str:
         display_text = str(index.data(Qt.DisplayRole) or "")
         if str(index.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
@@ -965,19 +1140,33 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
             values = index.data(ROUTINE_STOCK_VALUES_ROLE)
             if not isinstance(values, (list, tuple)):
                 values = [self.display_text(index, option.widget)]
+            display_tokens = index.data(ROUTINE_STOCK_DISPLAY_ROLE)
+            if not isinstance(display_tokens, (list, tuple)):
+                display_tokens = ()
             metrics_data = index.data(ROUTINE_STOCK_METRICS_ROLE)
             if not isinstance(metrics_data, (list, tuple)):
                 metrics_data = ()
-            x = option.rect.left() + ROUTINE_STOCK_TEXT_OFFSET
             separator_width = routine_instance_separator_width(painter.font())
             stock_column_widths = routine_stock_column_widths(painter.font())
             stock_position_value_widths = routine_stock_position_value_widths(painter.font())
             visible_stock_column_widths = stock_column_widths[: len(values)]
             for column, width in enumerate(visible_stock_column_widths):
-                text = str(values[column] if column < len(values) else "")
+                token = self._stock_token(display_tokens, column)
+                text = str(
+                    token.get("text")
+                    if token.get("text") not in (None, "")
+                    else values[column] if column < len(values) else ""
+                )
+                cell_rect = _routine_stock_token_rect(
+                    option.widget,
+                    index,
+                    column,
+                )
+                if cell_rect.isNull():
+                    continue
                 if column > 0 and column != 1:
                     separator_rect = QRect(
-                        x,
+                        cell_rect.left() - separator_width,
                         option.rect.top(),
                         separator_width,
                         option.rect.height(),
@@ -987,12 +1176,12 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         Qt.AlignCenter,
                         "|",
                     )
-                    x += separator_width
-                cell_rect = QRect(
-                    x,
-                    option.rect.top(),
-                    width,
-                    option.rect.height(),
+                self._fill_stock_token_background(painter, cell_rect, token, option)
+                token_font = self._stock_token_font(option.font, token)
+                token_pen = self._stock_token_foreground(
+                    token,
+                    option,
+                    visually_enabled=visually_enabled,
                 )
                 if column == 0:
                     stock_led_left = cell_rect.left()
@@ -1014,12 +1203,13 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         Qt.ElideRight,
                         max(0, text_rect.width()),
                     )
+                    painter.setFont(token_font)
+                    painter.setPen(token_pen)
                     painter.drawText(
                         text_rect,
                         Qt.AlignLeft | Qt.AlignVCenter,
                         elided,
                     )
-                    x += width
                     continue
                 if column == 1:
                     initial_buy = index.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
@@ -1041,7 +1231,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                             == str(index.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
                         ),
                     )
-                    x += width
                     continue
                 if column == 3:
                     led_size = min(
@@ -1058,21 +1247,37 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     painter.save()
                     painter.setRenderHint(QPainter.Antialiasing, True)
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(
-                        QColor("#111827" if visually_enabled else "#9CA3AF")
-                    )
+                    painter.setBrush(token_pen)
                     painter.drawEllipse(led_rect)
                     painter.restore()
-                    x += width
                     continue
                 alignment = (
                         Qt.AlignLeft | Qt.AlignVCenter
                         if column == 0
                         else Qt.AlignCenter
                 )
+                alignment = self._stock_token_alignment(token, alignment)
                 if column >= 7:
+                    painter.setFont(token_font)
+                    painter.setPen(token_pen)
                     if column == 7:
                         metric_texts = _routine_stock_metric_texts(list(values), tuple(metrics_data))
+                        metric_foregrounds: list[QColor | None] = []
+                        for metric_index in range(len(metric_texts)):
+                            token_index = 7 + metric_index
+                            metric_token = (
+                                display_tokens[token_index]
+                                if token_index < len(display_tokens)
+                                and isinstance(display_tokens[token_index], dict)
+                                else {}
+                            )
+                            metric_foregrounds.append(
+                                self._stock_token_foreground(
+                                    metric_token,
+                                    option,
+                                    visually_enabled=visually_enabled,
+                                )
+                            )
                         hidden_value_indexes: set[int] = set()
                         if (
                             str(getattr(option.widget, "_editing_stock_buy_limit_path", "") or "")
@@ -1084,6 +1289,7 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                             row_rect=option.rect,
                             start_x=cell_rect.left() + ROUTINE_STOCK_METRIC_SEPARATOR_GAP,
                             texts=metric_texts,
+                            foregrounds=metric_foregrounds,
                             hidden_value_indexes=hidden_value_indexes,
                         )
                         painter.restore()
@@ -1107,7 +1313,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
                         show_label=True,
                     ):
-                        x += width
                         continue
                     if column == 11 and draw_limit_metric(
                         painter,
@@ -1122,7 +1327,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                             == str(index.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
                         ),
                     ):
-                        x += width
                         continue
                     if draw_stock_position_metric(
                         painter,
@@ -1132,19 +1336,19 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
                         label_hint=stock_metric_label_hint,
                     ):
-                        x += width
                         continue
                 elided = painter.fontMetrics().elidedText(
                     text,
                     Qt.ElideRight,
                     max(0, cell_rect.width() - 4),
                 )
+                painter.setFont(token_font)
+                painter.setPen(token_pen)
                 painter.drawText(
                     cell_rect.adjusted(2, 0, -2, 0),
                     alignment,
                     elided,
                 )
-                x += width
             painter.restore()
             return
         content_offset = (
@@ -1309,6 +1513,12 @@ class MainWindow(QMainWindow):
         self.buy_time_status_label = QLabel("매수 가능 상태: 확인 전")
         self.account_total_deposit_label = QLabel("-")
         self.account_order_available_label = QLabel("-")
+        self._account_funds_projection = AccountFundsProjection()
+        self.account_funds_adapter = (
+            KiwoomAccountFundsAdapter(self.kiwoom_api)
+            if self.kiwoom_api is not None
+            else None
+        )
 
         # 관제창 예산 현황 표시 전용 QLabel
         # 실제 예산 저장/주문수량 계산/매수 제한 로직은 아직 연결하지 않는다.
@@ -1344,10 +1554,14 @@ class MainWindow(QMainWindow):
         self._main_routine_metric_sort_active = False
         self._main_routine_initial_buy_sort_mode = ""
         self._main_routine_initial_buy_sort_next_mode = "AMOUNT"
+        self._main_routine_column_sort_key = ""
+        self._main_routine_excluded_only = False
         self._main_routine_valid_button = None
+        self._main_routine_excluded_button = None
         self._main_routine_level_buttons: dict[str, QPushButton] = {}
         self._main_routine_metric_buttons: dict[str, QPushButton] = {}
         self._main_routine_initial_buy_sort_button = None
+        self._main_routine_column_sort_buttons: dict[str, QPushButton] = {}
         self._routine_buy_limit_edit_filter = _RoutineBuyLimitValueEditFilter(self)
         self._routine_instance_buy_limit_editor = None
         self._routine_instance_buy_limit_editor_instance_id = ""
@@ -1356,6 +1570,13 @@ class MainWindow(QMainWindow):
         self._routine_stock_buy_limit_editor = None
         self._routine_stock_buy_limit_editor_config_path = ""
         self._routine_stock_buy_limit_edit_finishing = False
+        self._routine_stock_buy_limit_pending_path = ""
+        self._routine_stock_buy_limit_suppressed_release_row = -1
+        self._routine_stock_buy_limit_click_timer = QTimer(self)
+        self._routine_stock_buy_limit_click_timer.setSingleShot(True)
+        self._routine_stock_buy_limit_click_timer.timeout.connect(
+            self._execute_routine_stock_buy_limit_single_click
+        )
         self.routine_table._editing_stock_buy_limit_path = ""
         self._routine_stock_initial_buy_editor = None
         self._routine_stock_initial_buy_editor_config_path = ""
@@ -1372,16 +1593,29 @@ class MainWindow(QMainWindow):
 
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
         self.btn_initialize = QPushButton("초기화")
-        self.btn_log_view = QPushButton("로그 보기")
+        self.btn_log_view = QPushButton("이벤트기록")
         self.btn_review_required = QPushButton("검토관리종목")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = QPushButton("긴급정지")
 
         self._setup_ui()
         self._connect_events()
+        operation_host = self.main_monitoring_auto_trade_operation_host()
+        operation_host.operation_cycle_completed.connect(
+            self._on_main_operation_cycle_completed
+        )
         normalize_base_stock_single_routine_file()
         self.refresh_startup_recovery_status()
         self.refresh_all()
+        append_owner_event_once(
+            self,
+            "app_started",
+            "APP_STARTED",
+            result="SUCCESS",
+            source="MainWindow.__init__",
+            target_type="APPLICATION",
+            target_id="kiwoom_auto",
+        )
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -1515,6 +1749,11 @@ class MainWindow(QMainWindow):
         routine_layout = QVBoxLayout()
         routine_layout.setContentsMargins(8, 6, 8, 8)
         self._setup_routine_table()
+        routine_header_layout = QHBoxLayout()
+        routine_header_layout.setContentsMargins(0, 0, 0, 0)
+        routine_header_layout.addStretch(1)
+        routine_header_layout.addWidget(self._create_main_routine_excluded_badge())
+        routine_layout.addLayout(routine_header_layout)
         routine_content_layout = QHBoxLayout()
         routine_content_layout.setContentsMargins(0, 0, 0, 0)
         routine_content_layout.setSpacing(6)
@@ -1529,6 +1768,26 @@ class MainWindow(QMainWindow):
         layout.addWidget(routine_box, 1)
 
         return layout
+
+    def _create_main_routine_excluded_badge(self) -> QPushButton:
+        button = self._create_main_routine_filter_badge(
+            "제외종목",
+            "mainRoutineExcludedStockBadge",
+        )
+        button.setCheckable(True)
+        font = button.font()
+        point_size = font.pointSizeF()
+        if point_size > 0:
+            font.setPointSizeF(point_size * 1.1)
+        elif font.pixelSize() > 0:
+            font.setPixelSize(max(1, round(font.pixelSize() * 1.1)))
+        button.setFont(font)
+        button.setFixedHeight(round(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT * 1.1))
+        text_width = button.fontMetrics().horizontalAdvance(button.text())
+        button.setFixedWidth(max(button.sizeHint().width(), text_width + 28))
+        button.clicked.connect(self._set_main_routine_excluded_only)
+        self._main_routine_excluded_button = button
+        return button
 
     def _create_routine_filter_badge_area(self) -> QWidget:
         badge_area = QWidget()
@@ -1618,6 +1877,35 @@ class MainWindow(QMainWindow):
         self._main_routine_initial_buy_sort_button = initial_buy_sort_button
         layout.addWidget(initial_buy_sort_button, 0, Qt.AlignHCenter)
 
+        layout.addSpacing(8)
+        layout.addWidget(
+            self._create_main_routine_filter_separator(
+                "mainRoutineColumnSortSeparator"
+            ),
+            0,
+            Qt.AlignHCenter,
+        )
+        layout.addSpacing(8)
+
+        self._main_routine_column_sort_buttons = {}
+        for sort_key, title in (
+            ("operation", "운영"),
+            ("situation", "현황"),
+            ("status", "상태"),
+            ("method", "방식"),
+            ("liquidation", "청산"),
+        ):
+            button = self._create_main_routine_filter_badge(
+                title,
+                f"mainRoutine{sort_key.title()}ColumnSortBadge",
+            )
+            button.clicked.connect(
+                lambda _checked=False, target_key=sort_key:
+                self._set_main_routine_column_sort(target_key)
+            )
+            self._main_routine_column_sort_buttons[sort_key] = button
+            layout.addWidget(button, 0, Qt.AlignHCenter)
+
         layout.addStretch(1)
         self._update_main_routine_filter_badges()
         return badge_area
@@ -1683,6 +1971,29 @@ class MainWindow(QMainWindow):
             "}"
         )
         valid_only = bool(self._main_routine_valid_only)
+        excluded_only = bool(getattr(self, "_main_routine_excluded_only", False))
+        excluded_button = getattr(self, "_main_routine_excluded_button", None)
+        if excluded_button is not None:
+            excluded_button.setChecked(excluded_only)
+            excluded_text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if excluded_only
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            excluded_button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    excluded_text_color,
+                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                    if excluded_only
+                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+                + (
+                    "QPushButton {"
+                    f" min-height: {excluded_button.height() - 2}px;"
+                    f" max-height: {excluded_button.height() - 2}px;"
+                    "}"
+                )
+            )
         if self._main_routine_valid_button is not None:
             self._main_routine_valid_button.setChecked(valid_only)
             valid_text_color = (
@@ -1768,6 +2079,31 @@ class MainWindow(QMainWindow):
                 + disabled_style
             )
 
+        column_sort_enabled = self._main_routine_display_level == "stock"
+        for sort_key, button in self._main_routine_column_sort_buttons.items():
+            button.setEnabled(column_sort_enabled)
+            button.setCursor(
+                Qt.PointingHandCursor if column_sort_enabled else Qt.ArrowCursor
+            )
+            active = (
+                column_sort_enabled
+                and sort_key == self._main_routine_column_sort_key
+            )
+            text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            button.setStyleSheet(
+                self._main_routine_filter_badge_style(
+                    text_color,
+                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                    if active
+                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+                + disabled_style
+            )
+
     def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str], ...]:
         selected_keys: list[tuple[str, str, str, str]] = []
         for index in self.routine_table.selectionModel().selectedRows():
@@ -1813,6 +2149,11 @@ class MainWindow(QMainWindow):
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
 
+    def _set_main_routine_excluded_only(self, enabled: bool) -> None:
+        self._main_routine_excluded_only = bool(enabled)
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
+
     def _set_main_routine_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
         if clean_level not in {"group", "routine", "stock"}:
@@ -1838,6 +2179,8 @@ class MainWindow(QMainWindow):
         ):
             self._main_routine_metric_sort_key = ""
             self._main_routine_metric_sort_active = False
+        if clean_level != "stock":
+            self._main_routine_column_sort_key = ""
         self._main_routine_display_level = clean_level
         self._main_routine_display_level_applied = True
         self._update_main_routine_filter_badges()
@@ -1854,6 +2197,7 @@ class MainWindow(QMainWindow):
         if clean_metric not in available_metrics:
             return
         self._main_routine_initial_buy_sort_mode = ""
+        self._main_routine_column_sort_key = ""
         self._main_routine_metric_sort_key = clean_metric
         self._main_routine_metric_sort_active = True
         self._update_main_routine_filter_badges()
@@ -1869,6 +2213,26 @@ class MainWindow(QMainWindow):
         )
         self._main_routine_metric_sort_key = ""
         self._main_routine_metric_sort_active = False
+        self._main_routine_column_sort_key = ""
+        self._update_main_routine_filter_badges()
+        self._reload_main_routine_table_preserving_view()
+
+    def _set_main_routine_column_sort(self, sort_key: str) -> None:
+        clean_key = str(sort_key or "").strip()
+        if self._main_routine_display_level != "stock":
+            return
+        if clean_key not in {
+            "operation",
+            "situation",
+            "status",
+            "method",
+            "liquidation",
+        }:
+            return
+        self._main_routine_metric_sort_key = ""
+        self._main_routine_metric_sort_active = False
+        self._main_routine_initial_buy_sort_mode = ""
+        self._main_routine_column_sort_key = clean_key
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
 
@@ -2075,7 +2439,7 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.clicked.connect(self.on_emergency_stop_clicked)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
         self.btn_initialize.clicked.connect(self.not_implemented)
-        self.btn_log_view.clicked.connect(self.not_implemented)
+        self.btn_log_view.clicked.connect(self.open_event_record_window)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
         self.routine_table.customContextMenuRequested.connect(self.open_routine_context_menu)
@@ -2099,10 +2463,16 @@ class MainWindow(QMainWindow):
             return False
 
     def _stop_production_recovery_timers(self) -> None:
-        window = getattr(self, "auto_trade_setting_window", None)
-        stopper = getattr(window, "stop_periodic_timers_for_recovery", None)
+        host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
+        stopper = getattr(host, "stop_operation_timers", None)
         if callable(stopper):
             stopper()
+
+    def _on_main_operation_cycle_completed(self, _result: dict[str, object]) -> None:
+        """Refresh monitoring from canonical readers after an operation cycle."""
+        if getattr(self, "_main_window_closing", False):
+            return
+        self.refresh_all()
 
     def _production_recovery_status_result(self) -> dict[str, object]:
         context = production_recovery_registry.snapshot()
@@ -2233,6 +2603,17 @@ class MainWindow(QMainWindow):
             broker_evidence=broker_evidence,
         )
         self._production_recovery_status_result()
+        append_owner_event_once(
+            self,
+            f"recovery:{identity.recovery_session_id}",
+            "RECOVERY_FAILED",
+            severity="ERROR",
+            result="FAILED",
+            source="MainWindow._fail_production_recovery",
+            target_type="RECOVERY_SESSION",
+            target_id=identity.recovery_session_id,
+            reason_code=str(reason_code or "RECOVERY_FAILED"),
+        )
 
     def _finish_production_recovery(self, identity) -> None:
         holdings = self._production_recovery_parts.get("HOLDINGS")
@@ -2306,8 +2687,8 @@ class MainWindow(QMainWindow):
 
         context = production_recovery_registry.snapshot()
         if recovery_account_allows_isolated_stock_operation(context):
-            window = getattr(self, "auto_trade_setting_window", None)
-            starter = getattr(window, "start_periodic_timers_after_recovery", None)
+            host = self.main_monitoring_auto_trade_operation_host()
+            starter = getattr(host, "start_after_recovery", None)
             if callable(starter):
                 timer_result = starter(identity)
                 self._production_recovery_timer_start_result = timer_result
@@ -2332,11 +2713,33 @@ class MainWindow(QMainWindow):
         else:
             self._stop_production_recovery_timers()
         self._production_recovery_status_result()
+        context = production_recovery_registry.snapshot()
+        if context is not None and context.identity == identity:
+            warning = context.account_status == ACCOUNT_REVIEW_REQUIRED
+            append_owner_event_once(
+                self,
+                f"recovery:{identity.recovery_session_id}",
+                "RECOVERY_WARNING" if warning else "RECOVERY_COMPLETED",
+                severity="WARNING" if warning else "INFO",
+                result="COMPLETED",
+                source="MainWindow._finish_production_recovery",
+                target_type="RECOVERY_SESSION",
+                target_id=identity.recovery_session_id,
+                reason_code=str(context.account_status or ""),
+            )
+            self._request_account_funds_after_recovery(identity)
         window = getattr(self, "auto_trade_setting_window", None)
         updater = getattr(window, "update_startup_recovery_controls", None)
         if callable(updater):
             updater()
         self.update_review_required_button_text()
+
+    def _request_account_funds_after_recovery(self, identity) -> dict[str, object]:
+        """Refresh the UI projection only for the account Recovery just completed."""
+        recovered_account = str(getattr(identity, "account_no", "") or "").strip()
+        if not recovered_account or recovered_account != self.selected_account_no():
+            return {"ok": False, "status": "STALE_RECOVERY_ACCOUNT"}
+        return self.request_account_funds()
 
     def _on_production_recovery_snapshot(
         self,
@@ -2684,7 +3087,7 @@ class MainWindow(QMainWindow):
             if refresh:
                 self._production_recovery_status_result()
             context = production_recovery_registry.snapshot()
-            identity = self._production_recovery_identity
+            identity = getattr(self, "_production_recovery_identity", None)
             api = getattr(self, "kiwoom_api", None)
             login_session_id = str(
                 getattr(api, "login_session_id", lambda: "")() or ""
@@ -2823,6 +3226,8 @@ class MainWindow(QMainWindow):
             if api.is_connected():
                 message = "로그인 상태: 연결됨"
                 self.login_status_label.setText(message)
+                self.refresh_kiwoom_accounts()
+                self.sync_account_funds_selection(connected=True)
                 self.statusBar().showMessage(message)
                 return
 
@@ -2867,6 +3272,7 @@ class MainWindow(QMainWindow):
 
         self.login_status_label.setText(label_text)
         self.refresh_kiwoom_accounts()
+        self.sync_account_funds_selection(connected=connected)
         if connected:
             self.start_production_recovery()
         else:
@@ -2878,6 +3284,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message)
 
     def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
+        self.sync_account_funds_selection()
         if self._production_recovery_required():
             self.start_production_recovery()
             return
@@ -2935,6 +3342,101 @@ class MainWindow(QMainWindow):
         account = str(combo.currentText() or "").strip()
         return account if account in self.kiwoom_account_numbers() else ""
 
+    def sync_account_funds_selection(self, *, connected: bool | None = None):
+        """Project the selected login account into the memory-only funds view."""
+        if connected is None:
+            api = getattr(self, "kiwoom_api", None)
+            checker = getattr(api, "is_connected", None)
+            try:
+                connected = callable(checker) and checker() is True
+            except Exception:
+                connected = False
+        account_id = self.selected_account_no() if connected else ""
+        snapshot = self._account_funds_projection.select_account(
+            account_id,
+            connected=bool(connected),
+        )
+        adapter = getattr(self, "account_funds_adapter", None)
+        selector = getattr(adapter, "set_active_account", None)
+        if callable(selector):
+            selector(account_id)
+        self.render_account_funds_snapshot(snapshot)
+        return snapshot
+
+    def request_account_funds(self) -> dict[str, object]:
+        """Run an injected adapter; the Production Kiwoom adapter is intentionally absent."""
+        adapter = getattr(self, "account_funds_adapter", None)
+        requester = getattr(adapter, "request_account_funds", None)
+        if not callable(requester):
+            return {"ok": False, "status": "ADAPTER_UNAVAILABLE"}
+
+        request = self._account_funds_projection.begin_request()
+        if request is None:
+            self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+            return {"ok": False, "status": "ACCOUNT_UNAVAILABLE"}
+        self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+
+        def on_result(payload) -> None:
+            if self._account_funds_projection.apply_result(request, payload):
+                self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+
+        try:
+            adapter_result = requester(
+                request.account_id,
+                request_id=request.request_id,
+                callback=on_result,
+            )
+        except Exception as exc:
+            if self._account_funds_projection.fail_request(request, exc):
+                self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+            return {"ok": False, "status": ACCOUNT_FUNDS_FAILED}
+        if isinstance(adapter_result, dict) and adapter_result.get("ok") is False:
+            self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+            return {"ok": False, "status": ACCOUNT_FUNDS_FAILED}
+        return {
+            "ok": True,
+            "status": ACCOUNT_FUNDS_LOADING,
+            "account_id": request.account_id,
+            "request_id": request.request_id,
+        }
+
+    def render_account_funds_snapshot(self, snapshot=None) -> None:
+        """Bind one memory snapshot to the existing account/funds labels."""
+        snapshot = snapshot or self._account_funds_projection.snapshot
+        account_text = snapshot.account_display or "-"
+        self.account_label.setText(f"계좌번호: {account_text}")
+
+        if snapshot.status == ACCOUNT_FUNDS_DISCONNECTED:
+            account_type = "-"
+            deposit = "미연결"
+            orderable = "미연결"
+            buy_status = "미연결"
+        elif snapshot.status == ACCOUNT_FUNDS_LOADING:
+            account_type = "-"
+            deposit = "조회 중"
+            orderable = "조회 중"
+            buy_status = "조회 중"
+        elif snapshot.status == ACCOUNT_FUNDS_FAILED:
+            account_type = "확인 필요"
+            deposit = "조회 실패"
+            orderable = "조회 실패"
+            buy_status = "확인 필요"
+        elif snapshot.status == ACCOUNT_FUNDS_READY:
+            account_type = snapshot.account_type or "확인 필요"
+            deposit = format_account_funds_money(snapshot.deposit)
+            orderable = format_account_funds_money(snapshot.orderable_cash)
+            buy_status = "확인 필요"
+        else:
+            account_type = "-"
+            deposit = "-"
+            orderable = "-"
+            buy_status = "확인 전"
+
+        self.account_type_label.setText(f"계좌 구분: {account_type}")
+        self.account_total_deposit_label.setText(deposit)
+        self.account_order_available_label.setText(orderable)
+        self.buy_time_status_label.setText(f"매수 가능 상태: {buy_status}")
+
     def refresh_all(self) -> None:
         self.load_routine_table()
         self.load_running_stock_table()
@@ -2957,21 +3459,8 @@ class MainWindow(QMainWindow):
         update_main_budget_panel(self)
 
     def review_required_stock_count(self) -> int:
-        """관제창에서 제외된 검토관리 대상 종목 수를 계산한다."""
-        count = 0
-        seen: set[str] = set()
-        for stock_dir in self.all_runtime_stock_dirs():
-            key = str(stock_dir.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                state = read_json_dict(stock_dir / "state.json")
-            except Exception:
-                state = {}
-            if is_review_required_state(state):
-                count += 1
-        return count
+        """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
+        return len(collect_global_review_required_rows())
 
     def update_review_required_button_text(self) -> None:
         if not hasattr(self, "btn_review_required"):
@@ -3314,6 +3803,71 @@ class MainWindow(QMainWindow):
             return None
         return PROJECT_ROOT / stock_path / "config.json"
 
+    @staticmethod
+    def _stock_current_price_for_config(config_path: Path) -> float | None:
+        state = read_json_dict(config_path.parent / "state.json")
+        return current_price_from_state(state if isinstance(state, dict) else {})
+
+    @staticmethod
+    def _stock_default_initial_buy_value(config_path: Path, mode: str) -> int:
+        defaults = starting_budget_defaults()
+        if mode == "QUANTITY":
+            return int(defaults["quantity"])
+        amount = effective_amount_starting_budget(
+            MainWindow._stock_current_price_for_config(config_path),
+            defaults["amount_multiplier"],
+        )
+        return int(amount or 0)
+
+    @staticmethod
+    def _stock_suggested_buy_limit(config_path: Path, *, minimum: bool = False) -> int | None:
+        defaults = starting_budget_defaults()
+        multiplier_key = (
+            "limit_minimum_multiplier" if minimum else "limit_recommended_multiplier"
+        )
+        return suggested_buy_limit(
+            MainWindow._stock_current_price_for_config(config_path),
+            defaults[multiplier_key],
+        )
+
+    def handle_routine_stock_operation_double_click(self, row: int) -> bool:
+        target = _stock_target_for_row(self, row)
+        if target is None:
+            return False
+        config = read_json_dict(target.stock_dir / "config.json")
+        if not isinstance(config, dict) or not config:
+            QMessageBox.warning(
+                self,
+                "운영방식 변경",
+                f"{target.code} {target.name}의 운영방식 설정을 읽을 수 없습니다.",
+            )
+            return True
+
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            [target],
+            request_scope="single",
+        )
+        self._main_monitoring_stock_operation_adapter = adapter
+        adapter.handle_operation_mode_double_click()
+        return True
+
+    def handle_routine_stock_name_double_click(self, row: int) -> bool:
+        target = _stock_target_for_row(self, row)
+        if target is None:
+            return False
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            [target],
+            request_scope="single",
+        )
+        self._main_monitoring_stock_operation_adapter = adapter
+        handle_stock_name_operation_exclusion_double_click(
+            adapter,
+            (target.stock_dir, target.code, target.name),
+        )
+        return True
+
     def _routine_stock_initial_buy_value_rect(self, row: int) -> QRect:
         index = self.routine_table.model().index(row, 0)
         if not index.isValid():
@@ -3345,7 +3899,7 @@ class MainWindow(QMainWindow):
             config = {}
         current_mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
         next_mode = "QUANTITY" if current_mode == "AMOUNT" else "AMOUNT"
-        next_value = 1 if next_mode == "QUANTITY" else 0
+        next_value = self._stock_default_initial_buy_value(config_path, next_mode)
         self._write_stock_initial_buy_config(
             config_path,
             mode=next_mode,
@@ -3371,11 +3925,16 @@ class MainWindow(QMainWindow):
         mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
         if mode != "AMOUNT":
             mode = "QUANTITY"
-        value = config.get("buy_amount", 0) if mode == "AMOUNT" else config.get("buy_qty", 1)
+        value = config.get("buy_amount", 0) if mode == "AMOUNT" else config.get("buy_qty", 0)
         try:
-            value_text = str(max(0 if mode == "AMOUNT" else 1, int(value or 0)))
+            configured_value = int(value or 0)
         except (TypeError, ValueError):
-            value_text = "0" if mode == "AMOUNT" else "1"
+            configured_value = 0
+        value_text = str(
+            configured_value
+            if configured_value > 0
+            else self._stock_default_initial_buy_value(config_path, mode)
+        )
 
         self.finish_routine_stock_initial_buy_edit(save=True)
         self.finish_routine_stock_buy_limit_edit(save=True)
@@ -3457,7 +4016,60 @@ class MainWindow(QMainWindow):
             max(20, metric_rect.height() - 4),
         )
 
-    def handle_routine_stock_buy_limit_double_click(self, row: int) -> None:
+    def schedule_routine_stock_buy_limit_single_click(self, row: int) -> None:
+        config_path = self._stock_config_path_for_routine_row(row)
+        if config_path is None:
+            return
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict) or not bool(
+            config.get("buy_limit_enabled", False)
+        ):
+            return
+        if self._stock_current_price_for_config(config_path) is None:
+            return
+        item = self.routine_table.item(row, 0)
+        stock_path = (
+            str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
+            if item is not None
+            else ""
+        )
+        if not stock_path:
+            return
+        self._routine_stock_buy_limit_pending_path = stock_path
+        self._routine_stock_buy_limit_click_timer.start(
+            QApplication.doubleClickInterval() + 25
+        )
+
+    def cancel_routine_stock_buy_limit_single_click(
+        self,
+        *,
+        suppress_release_row: int = -1,
+    ) -> None:
+        self._routine_stock_buy_limit_click_timer.stop()
+        self._routine_stock_buy_limit_pending_path = ""
+        self._routine_stock_buy_limit_suppressed_release_row = suppress_release_row
+
+    def consume_routine_stock_buy_limit_release(self, row: int) -> bool:
+        if self._routine_stock_buy_limit_suppressed_release_row != row:
+            return False
+        self._routine_stock_buy_limit_suppressed_release_row = -1
+        return True
+
+    def _execute_routine_stock_buy_limit_single_click(self) -> None:
+        stock_path = self._routine_stock_buy_limit_pending_path
+        self._routine_stock_buy_limit_pending_path = ""
+        if not stock_path:
+            return
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            if item is None:
+                continue
+            candidate = str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
+            if candidate == stock_path:
+                self.start_routine_stock_buy_limit_edit(row)
+                return
+
+    def start_routine_stock_buy_limit_edit(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
         stock_path = (
             str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
@@ -3470,20 +4082,11 @@ class MainWindow(QMainWindow):
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
-        enabled = bool(config.get("buy_limit_enabled", False))
-        amount = config.get("buy_limit_amount")
+        if self._stock_current_price_for_config(config_path) is None:
+            return
 
         self.finish_routine_instance_buy_limit_edit(save=True)
         self.finish_routine_stock_buy_limit_edit(save=True)
-
-        if routine_instance_buy_limit_configured(enabled=enabled, amount=amount):
-            self._write_stock_buy_limit_config(
-                config_path,
-                enabled=False,
-                amount=None,
-            )
-            self.load_routine_table()
-            return
 
         editor_rect = self._routine_stock_buy_limit_value_rect(row)
         if editor_rect.isNull():
@@ -3505,16 +4108,49 @@ class MainWindow(QMainWindow):
             """
         )
         editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        editor.setText("")
+        configured_amount = self._parse_buy_limit_amount(
+            str(config.get("buy_limit_amount") or "")
+        )
+        suggested_amount = self._stock_suggested_buy_limit(config_path)
+        editor.setText(str(configured_amount or suggested_amount or ""))
         editor.setGeometry(editor_rect)
         editor.installEventFilter(self._routine_buy_limit_edit_filter)
         self.routine_table._editing_stock_buy_limit_path = stock_path
-        self.routine_table.viewport().update(self.routine_table.visualRect(self.routine_table.model().index(row, 0)))
+        self.routine_table.viewport().update(
+            self.routine_table.visualRect(self.routine_table.model().index(row, 0))
+        )
+        editor.selectAll()
         editor.show()
         editor.setFocus(Qt.MouseFocusReason)
 
         self._routine_stock_buy_limit_editor = editor
         self._routine_stock_buy_limit_editor_config_path = str(config_path)
+
+    def handle_routine_stock_buy_limit_double_click(self, row: int) -> None:
+        config_path = self._stock_config_path_for_routine_row(row)
+        if config_path is None:
+            return
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        enabled = bool(config.get("buy_limit_enabled", False))
+
+        self.finish_routine_instance_buy_limit_edit(save=True)
+        self.finish_routine_stock_buy_limit_edit(save=False)
+
+        if enabled:
+            self._write_stock_buy_limit_config(
+                config_path,
+                enabled=False,
+                amount=None,
+            )
+        else:
+            self._write_stock_buy_limit_config(
+                config_path,
+                enabled=True,
+                amount=self._stock_suggested_buy_limit(config_path),
+            )
+        self.load_routine_table()
 
     def finish_routine_stock_buy_limit_edit(self, *, save: bool) -> None:
         editor = self._routine_stock_buy_limit_editor
@@ -3535,10 +4171,22 @@ class MainWindow(QMainWindow):
         if not save:
             return
         config_path = Path(config_path_text)
+        if amount is None:
+            return
+        minimum_amount = self._stock_suggested_buy_limit(config_path, minimum=True)
+        if minimum_amount is None:
+            return
+        if amount < minimum_amount:
+            QMessageBox.warning(
+                self,
+                "종목 한도 변경",
+                f"종목 한도는 현재 최소 금액 {minimum_amount:,}원 이상이어야 합니다.",
+            )
+            return
         try:
             self._write_stock_buy_limit_config(
                 config_path,
-                enabled=amount is not None,
+                enabled=True,
                 amount=amount,
             )
         except Exception as exc:
@@ -3672,7 +4320,7 @@ class MainWindow(QMainWindow):
                 "ok": False,
                 "reason": "INSTANCE_NOT_FOUND",
                 "user_message": (
-                    "선택한 인스턴스 정보를 읽을 수 없습니다.\n"
+                    "선택한 루틴 정보를 읽을 수 없습니다.\n"
                     "화면을 새로고침한 뒤 다시 시도하십시오."
                 ),
             }
@@ -3720,7 +4368,7 @@ class MainWindow(QMainWindow):
                 "ok": False,
                 "reason": "NO_REGISTERED_STOCKS",
                 "user_message": (
-                    "선택한 인스턴스에 등록된 종목이 없습니다.\n"
+                    "선택한 루틴에 등록된 종목이 없습니다.\n"
                     "자동매매 설정에서 종목을 등록하십시오."
                 ),
             }
@@ -3751,7 +4399,7 @@ class MainWindow(QMainWindow):
                 operation_result = adapter.start_selected_auto_trades()
         except Exception:
             LOGGER.exception(
-                "인스턴스 %s %s 처리 오류",
+                "루틴 %s %s 처리 오류",
                 instance_id,
                 requested_action,
             )
@@ -3962,12 +4610,24 @@ class MainWindow(QMainWindow):
         menu = QMenu(self.routine_table)
         menu.setToolTipsVisible(True)
         settings_action = menu.addAction("설정변경")
+        rename_action = menu.addAction("이름변경")
+        stock_register_action = menu.addAction("종목등록")
         menu.addSeparator()
         early_close_action = menu.addAction("조기마감")
         immediate_action = menu.addAction("즉시청산")
         settings_action.triggered.connect(
             lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
                 item
+            )
+        )
+        rename_action.triggered.connect(
+            lambda _checked=False, row=item.row(): self.start_routine_instance_name_edit(
+                row
+            )
+        )
+        stock_register_action.triggered.connect(
+            lambda _checked=False, target_id=instance_id: self.open_routine_instance_stock_register_from_main_table(
+                target_id
             )
         )
         self._set_routine_operation_actions_enabled(
@@ -3991,6 +4651,35 @@ class MainWindow(QMainWindow):
             )
         )
         menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+
+    def open_routine_instance_stock_register_from_main_table(self, instance_id: str) -> None:
+        clean_instance_id = str(instance_id or "").strip()
+        if not clean_instance_id:
+            return
+        instance = routine_instance_by_id(clean_instance_id)
+        if instance is None:
+            QMessageBox.warning(self, "종목등록", "선택한 루틴을 확인할 수 없습니다.")
+            return
+        definition = routine_definition_by_id(str(instance.definition_id or "").strip())
+        if definition is None:
+            QMessageBox.warning(self, "종목등록", "선택한 루틴 유형을 확인할 수 없습니다.")
+            return
+        instance_dir = Path(instance.rules_path).parent if instance.rules_path else Path()
+        metadata = {
+            "row_kind": "instance",
+            "definition_id": str(definition.definition_id),
+            "instance_id": str(instance.instance_id),
+            "definition_name": str(definition.display_name),
+            "instance_name": str(instance.display_name),
+            "package_dir": str(definition.package_dir),
+            "instance_dir": str(instance_dir) if instance_dir else "",
+            "display_name": str(instance.display_name),
+        }
+        self.instance_stock_search_register_window = InstanceStockSearchRegisterDialog(
+            self,
+            instance_metadata=metadata,
+        )
+        self.instance_stock_search_register_window.show()
 
     def request_routine_definition_operation(
         self,
@@ -4016,7 +4705,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 f"카테고리 {command_label} 불가",
-                "체크된 하위 루틴 인스턴스가 없습니다.",
+                "체크된 하위 루틴이 없습니다.",
             )
             return
 
@@ -4053,14 +4742,30 @@ class MainWindow(QMainWindow):
                 failed_count += 1
                 recovery_blocked_count += 1
                 continue
-            result = service.apply(
-                OperationCommandRequest(
+            if command == MODE_EARLY_CLOSE:
+                intent_result = apply_close_intent(
+                    intent=CLOSE_INTENT_EARLY_CLOSE,
                     target_scope=SCOPE_ROUTINE_INSTANCE,
                     target_id=instance_id,
-                    command=command,
                     source="main_routine_parent_context_menu",
+                    requested_policy="",
+                    project_root=PROJECT_ROOT,
+                    operation_command_service_factory=OperationCommandService,
                 )
-            )
+                result = intent_result.get("command_result")
+            else:
+                result = service.apply(
+                    OperationCommandRequest(
+                        target_scope=SCOPE_ROUTINE_INSTANCE,
+                        target_id=instance_id,
+                        command=command,
+                        source="main_routine_parent_context_menu",
+                    )
+                )
+            if result is None:
+                failed_count += 1
+                command_failed_count += 1
+                continue
             if result.status == RESULT_FAILED or not result.stock_results:
                 failed_count += 1
                 command_failed_count += 1
@@ -4126,14 +4831,34 @@ class MainWindow(QMainWindow):
             )
             return
 
-        result = OperationCommandService(PROJECT_ROOT).apply(
-            OperationCommandRequest(
+        if command == MODE_EARLY_CLOSE:
+            intent_result = apply_close_intent(
+                intent=CLOSE_INTENT_EARLY_CLOSE,
                 target_scope=SCOPE_ROUTINE_INSTANCE,
                 target_id=instance_id,
-                command=command,
                 source="main_routine_context_menu",
+                requested_policy="",
+                project_root=PROJECT_ROOT,
+                operation_command_service_factory=OperationCommandService,
             )
-        )
+            result = intent_result.get("command_result")
+        else:
+            result = OperationCommandService(PROJECT_ROOT).apply(
+                OperationCommandRequest(
+                    target_scope=SCOPE_ROUTINE_INSTANCE,
+                    target_id=instance_id,
+                    command=command,
+                    source="main_routine_context_menu",
+                )
+            )
+        if result is None:
+            self.update_review_required_button_text()
+            QMessageBox.warning(
+                self,
+                f"猷⑦떞 {command_label} ?ㅽ뙣",
+                "紐낅졊???곸슜??????먮뒗 寃곌낵瑜??뺤씤?섏? 紐삵뻽?듬땲??",
+            )
+            return
         if result.status == RESULT_FAILED or not result.stock_results:
             self.update_review_required_button_text()
             QMessageBox.warning(
@@ -4180,12 +4905,29 @@ class MainWindow(QMainWindow):
         if window is not None and sip.isdeleted(window):
             self.auto_trade_setting_window = None
             window = None
+        if window is not None and window.isVisible():
+            if window.isMinimized():
+                window.showNormal()
+            else:
+                window.show()
+            window.raise_()
+            window.activateWindow()
+            return
+        if window is not None and not window.isVisible():
+            self.auto_trade_setting_window = None
+            window.deleteLater()
+            window = None
         if window is None:
             window = AutoTradeSettingWindow(self)
+            window.setAttribute(Qt.WA_DeleteOnClose, True)
             self.auto_trade_setting_window = window
-            identity = self._production_recovery_identity
-            if identity is not None and self.startup_recovery_session_ready(refresh=False):
-                window.start_periodic_timers_after_recovery(identity)
+            window.destroyed.connect(
+                lambda _obj=None, target=window: (
+                    setattr(self, "auto_trade_setting_window", None)
+                    if getattr(self, "auto_trade_setting_window", None) is target
+                    else None
+                )
+            )
         if window.isMinimized():
             window.showNormal()
         else:
@@ -4193,20 +4935,14 @@ class MainWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
 
-    def main_monitoring_auto_trade_operation_host(self) -> AutoTradeSettingWindow:
-        """Return the existing production execution host without showing it."""
+    def main_monitoring_auto_trade_operation_host(self) -> AutoTradeOperationHost:
+        """Return the widget-free production operation host for monitoring."""
 
-        window = getattr(self, "auto_trade_setting_window", None)
-        if window is not None and sip.isdeleted(window):
-            self.auto_trade_setting_window = None
-            window = None
-        if window is None:
-            window = AutoTradeSettingWindow(self)
-            self.auto_trade_setting_window = window
-            identity = getattr(self, "_production_recovery_identity", None)
-            if identity is not None and self.startup_recovery_session_ready(refresh=False):
-                window.start_periodic_timers_after_recovery(identity)
-        return window
+        host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
+        if host is None:
+            host = AutoTradeOperationHost(self)
+            self._main_monitoring_auto_trade_operation_host = host
+        return host
 
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(
@@ -4220,9 +4956,31 @@ class MainWindow(QMainWindow):
         if window is not None:
             setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
 
+    def closeEvent(self, event) -> None:
+        """Stop the single operation host only when the main program closes."""
+        self._main_window_closing = True
+        host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
+        shutdown = getattr(host, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+        super().closeEvent(event)
+        if event.isAccepted():
+            append_owner_event_once(
+                self,
+                "app_stopped",
+                "APP_STOPPED",
+                result="COMPLETED",
+                source="MainWindow.closeEvent",
+                target_type="APPLICATION",
+                target_id="kiwoom_auto",
+            )
+
     def open_review_required_window(self) -> None:
         self.review_required_window = GlobalReviewRequiredWindow(self)
         self.review_required_window.show()
+
+    def open_event_record_window(self) -> None:
+        open_event_record_prototype(self)
 
     def not_implemented(self) -> None:
         QMessageBox.information(

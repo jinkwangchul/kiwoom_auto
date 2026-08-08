@@ -132,6 +132,271 @@ class OperationPolicyGateSingleOrderTests(unittest.TestCase):
         self.assertEqual("BLOCKED_POLICY", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
 
+    def test_global_emergency_stop_writer_blocks_operation_policy_gate(self) -> None:
+        self._write_state()
+        self._write_queue(status="APPROVED")
+        self._write_json(self.operation_state_path, {"existing_key": "preserve"})
+
+        writer_result = operation_policy_gate.write_global_emergency_stop_state(
+            emergency_stop=True,
+            timestamp="2026-07-29 10:00:00",
+        )
+        result = operation_policy_gate.apply_operation_policy_gate_for_order(
+            "ORDER_1",
+            queue_path=self.order_queue_path,
+        )
+        order = self._single_order()
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(writer_result["ok"])
+        self.assertTrue(operation_state["emergency_stop"])
+        self.assertEqual("2026-07-29 10:00:00", operation_state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", operation_state["emergency_reason"])
+        self.assertEqual("CONTROL_WINDOW", operation_state["emergency_source"])
+        self.assertEqual("preserve", operation_state["existing_key"])
+        self.assertEqual("BLOCKED_POLICY", result["after_status"])
+        self.assertEqual("BLOCKED_POLICY", order.get("status"))
+        self.assertEqual("긴급정지 활성", order.get("policy_reason"))
+
+    def test_global_emergency_release_writer_restores_operation_policy_contract(self) -> None:
+        self._write_state()
+        self._write_queue(status="APPROVED")
+        self._write_json(
+            self.operation_state_path,
+            {
+                "existing_key": "preserve",
+                "emergency_stop": True,
+                "emergency_stopped_at": "2026-07-29 10:00:00",
+            },
+        )
+
+        writer_result = operation_policy_gate.write_global_emergency_stop_state(
+            emergency_stop=False,
+            timestamp="2026-07-29 10:05:00",
+        )
+        result = operation_policy_gate.apply_operation_policy_gate_for_order(
+            "ORDER_1",
+            queue_path=self.order_queue_path,
+        )
+        order = self._single_order()
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(writer_result["ok"])
+        self.assertFalse(operation_state["emergency_stop"])
+        self.assertEqual("2026-07-29 10:00:00", operation_state["emergency_stopped_at"])
+        self.assertEqual("2026-07-29 10:05:00", operation_state["emergency_released_at"])
+        self.assertEqual("", operation_state["emergency_reason"])
+        self.assertEqual("", operation_state["emergency_source"])
+        self.assertEqual("preserve", operation_state["existing_key"])
+        self.assertEqual("EXECUTABLE", result["after_status"])
+        self.assertEqual("EXECUTABLE", order.get("status"))
+
+    def test_global_operation_running_writer_records_today_start_and_preserves_existing_keys(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "existing_key": "preserve",
+                "emergency_stop": False,
+                "emergency_released_at": "2026-07-29 09:00:00",
+            },
+        )
+
+        writer_result = operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["005930"],
+            timestamp="2026-07-29 09:05:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(writer_result["ok"])
+        self.assertEqual("2026-07-29", operation_state["operation_date"])
+        self.assertEqual("RUNNING", operation_state["operation_status"])
+        self.assertEqual("2026-07-29 09:05:00", operation_state["operation_started_at"])
+        self.assertEqual("2026-07-29 09:05:00", operation_state["operation_updated_at"])
+        self.assertEqual(["005930"], operation_state["operation_participant_stock_codes"])
+        self.assertFalse(operation_state["emergency_stop"])
+        self.assertEqual("2026-07-29 09:00:00", operation_state["emergency_released_at"])
+        self.assertEqual("preserve", operation_state["existing_key"])
+
+    def test_global_operation_running_writer_preserves_first_start_for_same_day_running(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-29",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2026-07-29 09:05:00",
+                "operation_updated_at": "2026-07-29 09:05:00",
+                "operation_participant_stock_codes": ["005930"],
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["000660", "005930"],
+            timestamp="2026-07-29 10:15:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("2026-07-29 09:05:00", operation_state["operation_started_at"])
+        self.assertEqual("2026-07-29 10:15:00", operation_state["operation_updated_at"])
+        self.assertEqual(["000660", "005930"], operation_state["operation_participant_stock_codes"])
+
+    def test_global_operation_running_writer_resets_start_when_date_changes(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-28",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2026-07-28 09:05:00",
+                "operation_updated_at": "2026-07-28 09:05:00",
+                "operation_participant_stock_codes": ["000660"],
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["005930"],
+            timestamp="2026-07-29 09:10:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("2026-07-29", operation_state["operation_date"])
+        self.assertEqual("RUNNING", operation_state["operation_status"])
+        self.assertEqual("2026-07-29 09:10:00", operation_state["operation_started_at"])
+        self.assertEqual("2026-07-29 09:10:00", operation_state["operation_updated_at"])
+        self.assertEqual(["005930"], operation_state["operation_participant_stock_codes"])
+
+    def test_global_operation_running_writer_clears_previous_normal_end_fields_on_new_day(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-28",
+                "operation_status": "NORMAL_ENDED",
+                "operation_started_at": "2026-07-28 09:05:00",
+                "operation_updated_at": "2026-07-28 15:31:00",
+                "operation_closing_started_at": "2026-07-28 15:20:00",
+                "operation_close_reason": "AUTO_CLOSE",
+                "operation_ended_at": "2026-07-28 15:31:00",
+                "operation_end_reason": "ALL_PARTICIPANTS_COMPLETE",
+                "operation_participant_stock_codes": ["000660"],
+                "emergency_stop": True,
+                "emergency_stopped_at": "2026-07-28 14:00:00",
+                "emergency_reason": "USER_EMERGENCY_STOP",
+                "emergency_source": "CONTROL_WINDOW",
+                "unknown_key": "preserve",
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["005930"],
+            timestamp="2026-07-29 09:10:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("2026-07-29", operation_state["operation_date"])
+        self.assertEqual("RUNNING", operation_state["operation_status"])
+        self.assertEqual("2026-07-29 09:10:00", operation_state["operation_started_at"])
+        self.assertEqual("2026-07-29 09:10:00", operation_state["operation_updated_at"])
+        self.assertEqual(["005930"], operation_state["operation_participant_stock_codes"])
+        self.assertNotIn("operation_closing_started_at", operation_state)
+        self.assertNotIn("operation_close_reason", operation_state)
+        self.assertNotIn("operation_ended_at", operation_state)
+        self.assertNotIn("operation_end_reason", operation_state)
+        self.assertTrue(operation_state["emergency_stop"])
+        self.assertEqual("2026-07-28 14:00:00", operation_state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", operation_state["emergency_reason"])
+        self.assertEqual("CONTROL_WINDOW", operation_state["emergency_source"])
+        self.assertEqual("preserve", operation_state["unknown_key"])
+
+    def test_global_operation_running_writer_clears_previous_closing_fields_on_new_day(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-28",
+                "operation_status": "CLOSING",
+                "operation_started_at": "2026-07-28 09:05:00",
+                "operation_closing_started_at": "2026-07-28 15:20:00",
+                "operation_close_reason": "EARLY_CLOSE",
+                "operation_ended_at": "2026-07-28 15:31:00",
+                "operation_end_reason": "ALL_PARTICIPANTS_COMPLETE",
+                "operation_participant_stock_codes": ["000660"],
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["005930"],
+            timestamp="2026-07-29 09:10:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("RUNNING", operation_state["operation_status"])
+        self.assertEqual(["005930"], operation_state["operation_participant_stock_codes"])
+        for key in operation_policy_gate.PREVIOUS_CLOSE_SESSION_FIELDS:
+            self.assertNotIn(key, operation_state)
+
+    def test_global_operation_running_writer_preserves_today_running_close_fields(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-29",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2026-07-29 09:05:00",
+                "operation_updated_at": "2026-07-29 09:05:00",
+                "operation_closing_started_at": "bad-same-day-residue",
+                "operation_close_reason": "bad-same-day-residue",
+                "operation_ended_at": "bad-same-day-residue",
+                "operation_end_reason": "bad-same-day-residue",
+                "operation_participant_stock_codes": ["005930"],
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["000660"],
+            timestamp="2026-07-29 10:15:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("2026-07-29 09:05:00", operation_state["operation_started_at"])
+        self.assertEqual(["000660", "005930"], operation_state["operation_participant_stock_codes"])
+        for key in operation_policy_gate.PREVIOUS_CLOSE_SESSION_FIELDS:
+            self.assertEqual("bad-same-day-residue", operation_state[key])
+
+    def test_global_operation_running_writer_ignores_invalid_existing_participants(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-29",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2026-07-29 09:05:00",
+                "operation_updated_at": "2026-07-29 09:05:00",
+                "operation_participant_stock_codes": ["005930", "005930", "", "invalid"],
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["A000660", "bad", "", "005930"],
+            timestamp="2026-07-29 10:15:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(["000660", "005930"], operation_state["operation_participant_stock_codes"])
+
+    def test_global_operation_running_writer_treats_non_list_existing_participants_as_empty(self) -> None:
+        self._write_json(
+            self.operation_state_path,
+            {
+                "operation_date": "2026-07-29",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2026-07-29 09:05:00",
+                "operation_participant_stock_codes": "005930",
+            },
+        )
+
+        operation_policy_gate.write_global_operation_running_state(
+            participant_stock_codes=["000660"],
+            timestamp="2026-07-29 10:15:00",
+        )
+        operation_state = json.loads(self.operation_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(["000660"], operation_state["operation_participant_stock_codes"])
+
     def test_non_approved_order_is_skipped(self) -> None:
         self._write_state()
         self._write_queue(status="PENDING")

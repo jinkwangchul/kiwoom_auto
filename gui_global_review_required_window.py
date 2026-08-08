@@ -30,10 +30,12 @@ from PyQt5.QtWidgets import (
 from gui_table_utils import next_sort_order
 from gui_styles import apply_plain_table_header
 from gui_common_utils import safe_int_value
+from gui_auto_trade_display import apply_auto_trade_setting_protection_row_style
 from gui_review_utils import safe_float_value
 from gui_order_utils import pending_order_side_quantities, format_number_value
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
+from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
 from gui_auto_trade_setting_window import (
     append_changelog,
     append_stock_log,
@@ -247,6 +249,7 @@ class GlobalReviewRequiredWindow(QDialog):
         item.setTextAlignment(align)
         if tooltip:
             item.setToolTip(tooltip)
+        apply_auto_trade_setting_protection_row_style(item, review_required=True)
         self.table.setItem(row, col, item)
 
     def _review_row_tooltip(self, row: dict[str, object]) -> str:
@@ -434,7 +437,7 @@ class GlobalReviewRequiredWindow(QDialog):
 
         buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
         if buy_pending_qty == "?" or sell_pending_qty == "?":
-            return "미체결 수량 확인 필요"
+            return PENDING_INTEGRITY_USER_REASON
         if safe_int_value(buy_pending_qty, 0) > 0:
             return "미수/매수 미체결 존재"
         if safe_int_value(sell_pending_qty, 0) > 0:

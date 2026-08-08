@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from execution_queue_writer import mutate_order_queue
+from runtime_atomic_writer import write_json_atomic
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -79,6 +80,32 @@ def _first_truthy(data: dict[str, Any], keys: list[str]) -> bool:
     return False
 
 
+def _normalize_stock_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text.startswith("A"):
+        text = text[1:]
+    return text if len(text) == 6 and text.isdigit() else ""
+
+
+def _normalized_stock_codes(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    for value in values:
+        code = _normalize_stock_code(value)
+        if code and code not in result:
+            result.append(code)
+    return sorted(result)
+
+
+PREVIOUS_CLOSE_SESSION_FIELDS = (
+    "operation_closing_started_at",
+    "operation_close_reason",
+    "operation_ended_at",
+    "operation_end_reason",
+)
+
+
 def read_order_queue() -> dict[str, Any]:
     data = _read_json(ORDER_QUEUE_PATH, {"version": 1, "updated_at": "", "orders": []})
     if not isinstance(data, dict):
@@ -91,6 +118,239 @@ def read_order_queue() -> dict[str, Any]:
 def read_operation_state() -> dict[str, Any]:
     data = _read_json(OPERATION_STATE_PATH, {})
     return data if isinstance(data, dict) else {}
+
+
+def write_global_emergency_stop_state(
+    *,
+    emergency_stop: bool,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Atomically merge the global emergency-stop latch into operation_state."""
+    data = read_operation_state()
+    when = timestamp or now_text()
+
+    data["emergency_stop"] = emergency_stop
+    if emergency_stop:
+        data["emergency_stopped_at"] = when
+        data["emergency_reason"] = "USER_EMERGENCY_STOP"
+        data["emergency_source"] = "CONTROL_WINDOW"
+    else:
+        data["emergency_released_at"] = when
+        data["emergency_reason"] = ""
+        data["emergency_source"] = ""
+
+    result = write_json_atomic(OPERATION_STATE_PATH, data)
+    ok = result.get("status") == "OK" and result.get("written") is True
+    return {
+        "ok": ok,
+        "emergency_stop": emergency_stop,
+        "operation_state_path": str(OPERATION_STATE_PATH),
+        **result,
+    }
+
+
+def write_global_operation_running_state(
+    *,
+    participant_stock_codes: Any = None,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Atomically merge today's global operation RUNNING state."""
+    data = read_operation_state()
+    when = timestamp or now_text()
+    operation_date = when[:10]
+
+    already_running_today = (
+        str(data.get("operation_date") or "").strip() == operation_date
+        and str(data.get("operation_status") or "").strip().upper() == "RUNNING"
+        and bool(str(data.get("operation_started_at") or "").strip())
+    )
+    existing_participants = (
+        _normalized_stock_codes(data.get("operation_participant_stock_codes"))
+        if already_running_today
+        else []
+    )
+    new_participants = _normalized_stock_codes(participant_stock_codes)
+    participants = sorted({*existing_participants, *new_participants})
+
+    data["operation_date"] = operation_date
+    data["operation_status"] = "RUNNING"
+    if not already_running_today:
+        data["operation_started_at"] = when
+        for key in PREVIOUS_CLOSE_SESSION_FIELDS:
+            data.pop(key, None)
+    data["operation_updated_at"] = when
+    data["operation_participant_stock_codes"] = participants
+
+    result = write_json_atomic(OPERATION_STATE_PATH, data)
+    ok = result.get("status") == "OK" and result.get("written") is True
+    return {
+        "ok": ok,
+        "operation_date": operation_date,
+        "operation_status": "RUNNING",
+        "operation_participant_stock_codes": participants,
+        "operation_state_path": str(OPERATION_STATE_PATH),
+        **result,
+    }
+
+
+def write_global_operation_closing_state(
+    *,
+    close_reason: str,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Atomically merge today's global operation CLOSING state."""
+
+    data = read_operation_state()
+    when = timestamp or now_text()
+    operation_date = when[:10]
+    current_date = str(data.get("operation_date") or "").strip()
+    current_status = str(data.get("operation_status") or "").strip().upper()
+
+    if current_date != operation_date:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "operation_date is not today",
+            "operation_date": current_date,
+            "requested_operation_date": operation_date,
+            "operation_status": current_status,
+            "operation_state_path": str(OPERATION_STATE_PATH),
+            "written": False,
+        }
+    if current_status not in {"RUNNING", "CLOSING"}:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": f"operation_status is not RUNNING or CLOSING: {current_status}",
+            "operation_date": current_date,
+            "operation_status": current_status,
+            "operation_state_path": str(OPERATION_STATE_PATH),
+            "written": False,
+        }
+
+    already_closing_today = current_status == "CLOSING"
+    closing_started_at = str(data.get("operation_closing_started_at") or "").strip()
+    existing_reason = str(data.get("operation_close_reason") or "").strip()
+    clean_reason = str(close_reason or "").strip().upper()
+
+    data["operation_status"] = "CLOSING"
+    if not already_closing_today or not closing_started_at:
+        data["operation_closing_started_at"] = when
+        closing_started_at = when
+    else:
+        data["operation_closing_started_at"] = closing_started_at
+    data["operation_updated_at"] = when
+    if not already_closing_today or not existing_reason:
+        data["operation_close_reason"] = clean_reason
+        existing_reason = clean_reason
+    else:
+        data["operation_close_reason"] = existing_reason
+
+    result = write_json_atomic(OPERATION_STATE_PATH, data)
+    ok = result.get("status") == "OK" and result.get("written") is True
+    return {
+        "ok": ok,
+        "operation_date": operation_date,
+        "operation_status": "CLOSING",
+        "operation_closing_started_at": closing_started_at,
+        "operation_close_reason": existing_reason,
+        "operation_state_path": str(OPERATION_STATE_PATH),
+        **result,
+    }
+
+
+def write_global_operation_normal_ended_state(
+    *,
+    timestamp: str | None = None,
+    operation_end_reason: str = "ALL_PARTICIPANTS_COMPLETE",
+    operation_state_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Atomically merge today's global operation NORMAL_ENDED state."""
+
+    target_path = Path(operation_state_path) if operation_state_path is not None else OPERATION_STATE_PATH
+    data = _read_json(target_path, {})
+    if not isinstance(data, dict):
+        data = {}
+
+    when = timestamp or now_text()
+    operation_date = when[:10]
+    current_date = str(data.get("operation_date") or "").strip()
+    current_status = str(data.get("operation_status") or "").strip().upper()
+    participants = _normalized_stock_codes(data.get("operation_participant_stock_codes"))
+
+    if current_date != operation_date:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "operation_date is not today",
+            "operation_date": current_date,
+            "requested_operation_date": operation_date,
+            "operation_status": current_status,
+            "operation_state_path": str(target_path),
+            "written": False,
+        }
+    if current_status not in {"CLOSING", "NORMAL_ENDED"}:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": f"operation_status is not CLOSING or NORMAL_ENDED: {current_status}",
+            "operation_date": current_date,
+            "operation_status": current_status,
+            "operation_state_path": str(target_path),
+            "written": False,
+        }
+    if not participants:
+        return {
+            "ok": False,
+            "blocked": True,
+            "reason": "operation_participant_stock_codes is empty",
+            "operation_date": current_date,
+            "operation_status": current_status,
+            "operation_state_path": str(target_path),
+            "written": False,
+        }
+
+    already_normal_ended = current_status == "NORMAL_ENDED"
+    ended_at = str(data.get("operation_ended_at") or "").strip()
+    existing_reason = str(data.get("operation_end_reason") or "").strip()
+    clean_reason = str(operation_end_reason or "").strip().upper() or "ALL_PARTICIPANTS_COMPLETE"
+
+    data["operation_status"] = "NORMAL_ENDED"
+    if not already_normal_ended or not ended_at:
+        data["operation_ended_at"] = when
+        ended_at = when
+    else:
+        data["operation_ended_at"] = ended_at
+    if not already_normal_ended or not existing_reason:
+        data["operation_end_reason"] = clean_reason
+        existing_reason = clean_reason
+    else:
+        data["operation_end_reason"] = existing_reason
+    data["operation_updated_at"] = when
+
+    result = write_json_atomic(target_path, data)
+    written = result.get("status") == "OK" and result.get("written") is True
+    read_back = _read_json(target_path, {}) if written else {}
+    read_back_ok = (
+        isinstance(read_back, dict)
+        and str(read_back.get("operation_date") or "").strip() == operation_date
+        and str(read_back.get("operation_status") or "").strip().upper() == "NORMAL_ENDED"
+        and str(read_back.get("operation_ended_at") or "").strip() == ended_at
+        and str(read_back.get("operation_end_reason") or "").strip() == existing_reason
+        and _normalized_stock_codes(read_back.get("operation_participant_stock_codes")) == participants
+    )
+    ok = bool(written and read_back_ok)
+    return {
+        "ok": ok,
+        "operation_date": operation_date,
+        "operation_status": "NORMAL_ENDED",
+        "operation_ended_at": ended_at,
+        "operation_end_reason": existing_reason,
+        "operation_participant_stock_codes": participants,
+        "operation_state_path": str(target_path),
+        "read_back_ok": read_back_ok,
+        **result,
+    }
 
 
 def find_stock_dir(code: str, name: str = "") -> Path | None:

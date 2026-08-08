@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from gui_auto_trade_integrity import auto_trade_setting_data_inconsistency_reasons
+
 try:
     from gui_routine_registry import (
         get_routine_records,
@@ -172,6 +174,7 @@ def extract_routines_from_config(config: dict[str, Any]) -> list[str]:
 LOCAL_STATUS_PASS = "PASS"
 LOCAL_STATUS_REVIEW_REQUIRED = "REVIEW_REQUIRED"
 LOCAL_STATUS_CHECK_ERROR = "CHECK_ERROR"
+LOCAL_STATUS_INTEGRITY_ISSUE = "INTEGRITY_ISSUE"
 SERVER_STATUS_NOT_CHECKED = "SERVER_NOT_CHECKED"
 
 LOCAL_INTEGRITY_SCOPE = "local_stock_integrity"
@@ -192,6 +195,10 @@ CHECK_ERROR_ISSUES = {
     "NO_STOCK_TARGETS",
     "STOCK_TARGET_ACCESS_ERROR",
     "JSON_READ_ERROR",
+}
+
+READ_ONLY_INTEGRITY_ISSUES = {
+    "STATE_SEMANTIC_INTEGRITY",
 }
 
 
@@ -218,13 +225,19 @@ def _standard_issue(
 ) -> dict[str, object]:
     requires_review = issue_code in REVIEW_REQUIRED_ISSUES
     if execution_status is None:
-        execution_status = (
-            LOCAL_STATUS_CHECK_ERROR
-            if issue_code in CHECK_ERROR_ISSUES
-            else LOCAL_STATUS_REVIEW_REQUIRED
-        )
+        if issue_code in CHECK_ERROR_ISSUES:
+            execution_status = LOCAL_STATUS_CHECK_ERROR
+        elif issue_code in READ_ONLY_INTEGRITY_ISSUES:
+            execution_status = LOCAL_STATUS_INTEGRITY_ISSUE
+        else:
+            execution_status = LOCAL_STATUS_REVIEW_REQUIRED
     if severity is None:
-        severity = "ERROR" if execution_status == LOCAL_STATUS_CHECK_ERROR else "REVIEW"
+        if execution_status == LOCAL_STATUS_CHECK_ERROR:
+            severity = "ERROR"
+        elif execution_status == LOCAL_STATUS_INTEGRITY_ISSUE:
+            severity = "WARNING"
+        else:
+            severity = "REVIEW"
     path_text = (
         _safe_relative_path(source_path, project_root)
         if isinstance(source_path, Path)
@@ -266,10 +279,16 @@ def _standard_result(
         1 for issue in issues
         if issue.get("execution_status") == LOCAL_STATUS_CHECK_ERROR
     )
+    integrity_issue_count = sum(
+        1 for issue in issues
+        if issue.get("execution_status") == LOCAL_STATUS_INTEGRITY_ISSUE
+    )
     if check_error_count:
         local_status = LOCAL_STATUS_CHECK_ERROR
     elif review_required_count:
         local_status = LOCAL_STATUS_REVIEW_REQUIRED
+    elif integrity_issue_count:
+        local_status = LOCAL_STATUS_INTEGRITY_ISSUE
     else:
         local_status = LOCAL_STATUS_PASS
     return {
@@ -278,6 +297,7 @@ def _standard_result(
         "checked_stock_count": checked_stock_count,
         "review_required_count": review_required_count,
         "check_error_count": check_error_count,
+        "integrity_issue_count": integrity_issue_count,
         "server_not_checked_count": 0,
         "issues": issues,
         "started_at": started_at,
@@ -294,10 +314,16 @@ def _result_with_recalculated_counts(
         1 for issue in issues
         if issue.get("execution_status") == LOCAL_STATUS_CHECK_ERROR
     )
+    integrity_issue_count = sum(
+        1 for issue in issues
+        if issue.get("execution_status") == LOCAL_STATUS_INTEGRITY_ISSUE
+    )
     if check_error_count:
         local_status = LOCAL_STATUS_CHECK_ERROR
     elif review_required_count:
         local_status = LOCAL_STATUS_REVIEW_REQUIRED
+    elif integrity_issue_count:
+        local_status = LOCAL_STATUS_INTEGRITY_ISSUE
     else:
         local_status = LOCAL_STATUS_PASS
 
@@ -305,6 +331,7 @@ def _result_with_recalculated_counts(
     updated["local_status"] = local_status
     updated["review_required_count"] = review_required_count
     updated["check_error_count"] = check_error_count
+    updated["integrity_issue_count"] = integrity_issue_count
     updated["issues"] = issues
     updated["completed_at"] = now_text()
     return updated
@@ -624,6 +651,22 @@ def run_local_stock_integrity_check(project_root: Path) -> dict[str, object]:
 
             if target_name == "config":
                 config_data = data
+
+            if target_name == "state":
+                for reason in auto_trade_setting_data_inconsistency_reasons(data):
+                    issues.append(
+                        _standard_issue(
+                            issue_code="STATE_SEMANTIC_INTEGRITY",
+                            message=reason,
+                            recommended_action="종목 상태의 수량·금액·평단 값을 확인하세요.",
+                            source_path=json_path,
+                            project_root=root,
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            stock_dir=stock_dir,
+                            checked_at=checked_at,
+                        )
+                    )
 
             if target_name == "orders":
                 orders = data.get("orders")

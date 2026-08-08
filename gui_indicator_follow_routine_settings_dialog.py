@@ -2255,8 +2255,7 @@ class IndicatorFollowRoutineSettingsDialog(
         buy_base_section_names = [
             name for name in buy_base_names
             if (
-                name == "buy_base_detail_mode_combo"
-                or name.startswith("buy_base_hoga_")
+                name.startswith("buy_base_hoga_")
                 or name.startswith("buy_base_order_")
                 or name.startswith("buy_base_up_")
                 or name.startswith("buy_base_down_")

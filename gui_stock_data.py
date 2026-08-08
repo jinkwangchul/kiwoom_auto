@@ -14,8 +14,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from gui_common_utils import sanitize_path_part
-
 try:
     from stock_repository import repository as stock_repository_factory
 except Exception:

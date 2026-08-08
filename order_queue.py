@@ -29,12 +29,27 @@ SIGNAL_QUEUE_PATH = RUNTIME_DIR / "routine_signals.json"
 ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
 
 VALID_SIGNALS = {"BUY", "SELL"}
+TERMINAL_ORDER_STATUSES = {
+    "FILLED",
+    "CANCELLED",
+    "CANCELED",
+    "PARTIAL_CANCELLED",
+    "BROKER_REJECTED",
+    "SEND_CALL_REJECTED",
+    "REJECTED",
+    "BLOCKED",
+    "INVALID",
+}
 
 
 try:
-    from order_candidate_engine import build_order_candidate
+    from order_candidate_engine import (
+        build_order_candidate,
+        build_order_candidate_from_execution_intent,
+    )
 except Exception:  # pragma: no cover
     build_order_candidate = None
+    build_order_candidate_from_execution_intent = None
 
 try:
     from execution_queue_writer import mutate_order_queue
@@ -94,6 +109,29 @@ def _order_dedupe_key(order: dict[str, Any]) -> str:
 
 def _source_signal_id(order: dict[str, Any]) -> str:
     return str(order.get("source_signal_id", "") or "").strip()
+
+
+def _execution_round_key(order: dict[str, Any]) -> tuple[str, str, str, int] | None:
+    intent = order.get("execution_intent")
+    if not isinstance(intent, dict) or _norm(intent.get("side")) != "BUY":
+        return None
+    routine_type = _norm(intent.get("routine_type"))
+    routine_instance_id = str(intent.get("routine_instance_id") or "").strip()
+    buy_round = intent.get("buy_round")
+    cycle_identity = str(intent.get("cycle_identity") or "").strip()
+    if (
+        routine_type != "INDICATOR_FOLLOW"
+        or not routine_instance_id
+        or not isinstance(buy_round, int)
+        or isinstance(buy_round, bool)
+        or buy_round <= 0
+    ):
+        return None
+    if buy_round == 1:
+        cycle_identity = "PENDING_BASE"
+    elif not cycle_identity:
+        return None
+    return routine_type, routine_instance_id, cycle_identity, buy_round
 
 
 def _queue_result(
@@ -162,6 +200,15 @@ def _candidate_duplicate_reason(order: dict[str, Any], orders: list[Any]) -> str
         for existing in orders:
             if isinstance(existing, dict) and _order_dedupe_key(existing) == key:
                 return "duplicate legacy candidate key"
+    execution_key = _execution_round_key(order)
+    if execution_key is not None:
+        for existing in orders:
+            if not isinstance(existing, dict):
+                continue
+            if _norm(existing.get("status")) in TERMINAL_ORDER_STATUSES:
+                continue
+            if _execution_round_key(existing) == execution_key:
+                return "duplicate live routine buy round"
     return None
 
 
@@ -377,6 +424,9 @@ def build_order_provenance_from_signal(signal: dict[str, Any]) -> dict[str, Any]
         "signal_created_at": signal.get("created_at"),
         "signal_updated_at": signal.get("updated_at"),
         "routine": signal.get("routine"),
+        "routine_type": signal.get("routine_type"),
+        "routine_instance_id": signal.get("routine_instance_id"),
+        "cycle_identity": signal.get("cycle_identity"),
         "engine": signal.get("engine") if "engine" in signal else None,
         "code": signal.get("code"),
         "name": signal.get("name"),
@@ -416,7 +466,17 @@ def signal_to_order_candidate(signal: dict[str, Any], index: int) -> dict[str, A
         return None
 
     computed: dict[str, Any] = {}
-    if callable(build_order_candidate):
+    execution_intent = signal.get("execution_intent")
+    if isinstance(execution_intent, dict) and callable(build_order_candidate_from_execution_intent):
+        try:
+            computed = build_order_candidate_from_execution_intent(execution_intent)
+        except Exception as exc:
+            computed = {
+                "candidate_status": "CANDIDATE_ERROR",
+                "candidate_reason": f"루틴 실행의도 주문후보 검증 예외: {exc}",
+                "execution_enabled": False,
+            }
+    elif callable(build_order_candidate):
         try:
             computed = build_order_candidate(signal)
         except Exception as exc:
@@ -453,6 +513,8 @@ def signal_to_order_candidate(signal: dict[str, Any], index: int) -> dict[str, A
         "tick_key": signal.get("tick_key", ""),
         "order_provenance": build_order_provenance_from_signal(signal),
     }
+    if isinstance(execution_intent, dict):
+        order["execution_intent"] = deepcopy(execution_intent)
 
     order.update(computed)
     _normalize_quantity_fields(order)

@@ -21,6 +21,10 @@ from chejan_event_recorder import (
     mark_chejan_reconciliation_state,
 )
 from execution_fill_recorder import find_existing_execution_fill_record, record_execution_fill
+from operation_close_completion_check_service import (
+    SOURCE_STARTUP_RECOVERY,
+    check_global_close_completion_after_durable_update,
+)
 from position_update_service import update_position_from_fill
 
 
@@ -204,6 +208,42 @@ def _startup_stock_state_summary(stock_state_paths: list[str | Path]) -> dict[st
         "blocked_items": blocked_items,
         "invalid_items": invalid_items,
     }
+
+
+def _startup_completion_check_result(
+    *,
+    queue_path: str | Path,
+    positions_path: str | Path,
+    broker_holdings_path: str | Path,
+    stock_state_paths: list[Path],
+) -> dict[str, Any] | None:
+    operation_state_path = Path(queue_path).parent / "operation_state.json"
+    if not operation_state_path.exists():
+        return None
+    try:
+        data = json.loads(operation_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    today = datetime.now().strftime("%Y-%m-%d")
+    if str(data.get("operation_date") or "").strip() != today:
+        return None
+    if str(data.get("operation_status") or "").strip().upper() != "CLOSING":
+        return None
+    stocks_dir = (
+        stock_state_paths[0].parent.parent
+        if stock_state_paths
+        else PROJECT_ROOT / "stocks"
+    )
+    return check_global_close_completion_after_durable_update(
+        source=SOURCE_STARTUP_RECOVERY,
+        operation_state_path=operation_state_path,
+        stocks_dir=stocks_dir,
+        order_queue_path=queue_path,
+        positions_path=positions_path,
+        broker_holdings_path=broker_holdings_path,
+    )
 
 
 def _identity_key(source: Any, identity: Any) -> str:
@@ -717,7 +757,7 @@ def assess_startup_recovery(
     else:
         status = STARTUP_RESUME_READY
 
-    return {
+    result = {
         "assessment_type": "STARTUP_RECOVERY_SESSION_RESUME",
         "status": status,
         "operator_approval_allowed": status in {
@@ -754,6 +794,15 @@ def assess_startup_recovery(
         "send_order_called": False,
         "broker_api_called": False,
     }
+    completion_check = _startup_completion_check_result(
+        queue_path=queue_path,
+        positions_path=positions_path,
+        broker_holdings_path=broker_holdings_path,
+        stock_state_paths=stock_paths,
+    )
+    if completion_check is not None:
+        result["completion_check_result"] = completion_check
+    return result
 
 
 def retry_operator_chejan_reconciliation(

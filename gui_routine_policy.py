@@ -8,12 +8,26 @@ gui_routine_policy.py
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 from gui_common_utils import safe_int_value
+from gui_auto_trade_utils import (
+    PENDING_INTEGRITY_USER_REASON,
+    mark_pending_order_integrity_review_required,
+)
 from gui_stock_data import base_stock_routines_for_stock, stock_runtime_dir_for_routine
-from gui_order_utils import pending_order_side_quantities
+from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
 from gui_routine_guard import routine_action_guard_info
+from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
+    is_review_protected_stock_dir,
+    is_review_required_state,
+)
 from runtime_io import read_json_dict
-from state_policy import auto_trade_status_display
+
+LOGGER = logging.getLogger(__name__)
+UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
 
 
 def routine_action_reasons_for_stock(code: str, name: str, allow_unassigned: bool = True) -> tuple[bool, dict[str, object]]:
@@ -22,13 +36,29 @@ def routine_action_reasons_for_stock(code: str, name: str, allow_unassigned: boo
 
     허용:
     - 미등록 종목(allow_unassigned=True)
-    - 정지/감시중 + 보유 0 + 현재 미체결 0
+    - 보유 0 + 현재 미체결 0
     """
     info = routine_action_guard_info(code, name)
     reasons: list[str] = []
     routine_name = str(info.get("routine_name", "")).strip()
     raw_status = str(info.get("raw_status", "")).strip().upper()
-    display_status = str(info.get("display_status", "")).strip()
+    state = info.get("state")
+    if not isinstance(state, dict):
+        state = {"status": raw_status}
+
+    stock_dir = info.get("stock_dir")
+    if (
+        (stock_dir is not None and is_review_protected_stock_dir(Path(stock_dir)))
+        or is_review_required_state(state)
+    ):
+        reasons.append("검토관리")
+        info["reasons"] = reasons
+        return False, info
+
+    if is_emergency_stopped_state(state):
+        reasons.append("긴급정지")
+        info["reasons"] = reasons
+        return False, info
 
     if not routine_name:
         if allow_unassigned:
@@ -43,13 +73,32 @@ def routine_action_reasons_for_stock(code: str, name: str, allow_unassigned: boo
         info["reasons"] = []
         return True, info
 
-    allowed_statuses = {"STOPPED", "STOP", "MONITORING", "WATCHING", ""}
-    blocked_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY", "PAUSED", "REVIEW_REQUIRED", "EMERGENCY_STOP"}
+    known_statuses = {
+        "STOPPED",
+        "STOP",
+        "MONITORING",
+        "WATCHING",
+        "",
+        "RUNNING",
+        "STARTED",
+        "AUTO",
+        "TRADING",
+        "SELL_ONLY",
+        "EMERGENCY_STOP",
+        "EMERGENCY_STOPPED",
+    }
 
-    if raw_status in blocked_statuses:
-        reasons.append(f"{display_status} 상태")
-    elif raw_status not in allowed_statuses:
-        reasons.append(f"{display_status or '상태확인필요'} 상태")
+    if is_review_required_state(state):
+        reasons.append("검토관리")
+    elif raw_status not in known_statuses:
+        LOGGER.error(
+            "unexpected registration policy status: %s code=%s name=%s routine=%s",
+            raw_status,
+            code,
+            name,
+            routine_name,
+        )
+        reasons.append(UNEXPECTED_STATUS_REASON)
 
     holding_qty = safe_int_value(info.get("holding_qty"), 0)
     if holding_qty > 0:
@@ -58,7 +107,21 @@ def routine_action_reasons_for_stock(code: str, name: str, allow_unassigned: boo
     buy_pending_qty = info.get("buy_pending_qty", 0)
     sell_pending_qty = info.get("sell_pending_qty", 0)
     if buy_pending_qty == "?" or sell_pending_qty == "?":
-        reasons.append("미체결 확인 필요")
+        stock_dir = info.get("stock_dir")
+        if stock_dir is not None:
+            state = info.get("state")
+            if not isinstance(state, dict):
+                state = {}
+            issue_codes = pending_order_integrity_issue_codes(Path(stock_dir), state)
+            mark_pending_order_integrity_review_required(
+                routine_name,
+                Path(stock_dir),
+                code,
+                name,
+                issue_codes,
+                source="루틴 이동 미체결 데이터 무결성 오류",
+            )
+        reasons.append(PENDING_INTEGRITY_USER_REASON)
     else:
         if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:
             reasons.append(f"매수미결 {buy_pending_qty}")
@@ -96,7 +159,7 @@ def can_unassign_active_routine_from_stock(code: str, name: str) -> tuple[bool, 
     종목등록설정 우클릭 '루틴 해제' 가능 여부를 반환한다.
 
     루틴 해제는 종목 자체는 유지하고 기초종목.txt의 루틴명만 제거한다.
-    운영 중이거나 보유/미체결이 있는 종목은 기존 안전 정책에 따라 차단한다.
+    검토관리이거나 보유/미체결이 있는 종목은 기존 안전 정책에 따라 차단한다.
     """
     exists, routines = base_stock_routines_for_stock(code, name)
     if not exists:
@@ -112,15 +175,36 @@ def can_unassign_active_routine_from_stock(code: str, name: str) -> tuple[bool, 
 
     state = read_json_dict(stock_dir / "state.json")
     raw_status = str(state.get("status", "STOPPED")).strip().upper()
-    display_status = auto_trade_status_display(raw_status)
-    allowed_statuses = {"STOPPED", "STOP", "MONITORING", "WATCHING", ""}
-    blocked_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY", "PAUSED", "REVIEW_REQUIRED", "EMERGENCY_STOP"}
+    known_statuses = {
+        "STOPPED",
+        "STOP",
+        "MONITORING",
+        "WATCHING",
+        "",
+        "RUNNING",
+        "STARTED",
+        "AUTO",
+        "TRADING",
+        "SELL_ONLY",
+        "EMERGENCY_STOP",
+        "EMERGENCY_STOPPED",
+    }
 
     reasons: list[str] = []
-    if raw_status in blocked_statuses:
-        reasons.append(f"{display_status} 상태")
-    elif raw_status not in allowed_statuses:
-        reasons.append(f"{display_status or '상태확인필요'} 상태")
+    if is_review_protected_stock_dir(stock_dir):
+        reasons.append("검토관리")
+    elif raw_status not in known_statuses:
+        LOGGER.error(
+            "unexpected routine unassign policy status: %s code=%s name=%s routine=%s",
+            raw_status,
+            code,
+            name,
+            routine_name,
+        )
+        reasons.append(UNEXPECTED_STATUS_REASON)
+
+    if is_emergency_stopped_state(state) and "긴급정지" not in reasons:
+        reasons.append("긴급정지")
 
     holding_qty = safe_int_value(state.get("holding_qty"), 0)
     if holding_qty > 0:
@@ -128,7 +212,16 @@ def can_unassign_active_routine_from_stock(code: str, name: str) -> tuple[bool, 
 
     buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
     if buy_pending_qty == "?" or sell_pending_qty == "?":
-        reasons.append("미체결 확인 필요")
+        issue_codes = pending_order_integrity_issue_codes(stock_dir, state)
+        mark_pending_order_integrity_review_required(
+            routine_name,
+            stock_dir,
+            code,
+            name,
+            issue_codes,
+            source="루틴 해제 미체결 데이터 무결성 오류",
+        )
+        reasons.append(PENDING_INTEGRITY_USER_REASON)
     else:
         if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:
             reasons.append(f"매수미결 {buy_pending_qty}")

@@ -60,6 +60,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QHeaderView,
 )
+from event_journal_production import append_production_event
 
 LOGGER = logging.getLogger(__name__)
 OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
@@ -116,7 +117,6 @@ from gui_order_utils import (
     order_sort_key,
     summarize_orders,
 )
-from gui_log_view_window import LogViewWindow
 from gui_schedule_utils import (
     schedule_config_updates,
     schedule_change_log_text,
@@ -1172,9 +1172,7 @@ from gui_auto_trade_integrity import (
     restart_initial_review_reason_for_stock,
     auto_trade_setting_server_mismatch_detected,
 )
-from gui_auto_trade_order_log import (
-    open_auto_trade_log_view_window,
-)
+from gui_stock_performance_window import open_stock_performance_prototype
 from gui_auto_trade_unregister import (
     unregister_selected_auto_trade_stocks,
 )
@@ -1209,11 +1207,7 @@ from gui_auto_trade_timer import (
     auto_trade_current_runtime_file_signature,
     auto_trade_current_time_policy_minute_key,
     auto_trade_on_runtime_file_timer_tick,
-    auto_trade_on_time_policy_timer_tick,
-)
-from production_recovery_timer_lifecycle import (
-    start_recovery_bound_timers,
-    stop_recovery_bound_timers,
+    auto_trade_on_time_policy_gui_timer_tick,
 )
 from gui_auto_trade_status_ops import (
     auto_trade_operation_policy_protected_status,
@@ -1236,7 +1230,6 @@ from gui_auto_trade_run_control import (
 from operation_policy_gate import read_operation_state
 from gui_auto_trade_review_ops import (
     auto_trade_open_review_required_window,
-    auto_trade_run_current_routine_stability_check,
 )
 from gui_auto_trade_table_loader import (
     _selected_instance_stock_dirs,
@@ -2204,6 +2197,25 @@ class StockPolicyOverrideDialog(QDialog):
         self.accept()
 
 
+def handle_stock_name_operation_exclusion_double_click(
+    host,
+    target: tuple[Path, str, str],
+) -> bool:
+    running_targets_getter = getattr(
+        host,
+        "running_registered_operation_targets",
+        None,
+    )
+    if callable(running_targets_getter) and running_targets_getter():
+        status_message = getattr(host, "statusBarMessage", None)
+        if callable(status_message):
+            status_message(
+                "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
+            )
+        return False
+    return bool(host.toggle_stock_operation_exclusion(target))
+
+
 class AutoTradeSettingWindow(QDialog):
     """
     자동매매설정 창.
@@ -2294,9 +2306,8 @@ class AutoTradeSettingWindow(QDialog):
             button.setVisible(False)
         self.btn_set_schedule = QPushButton("환경설정")
         self.btn_stock_register = QPushButton("종목관리")
-        self.btn_log_view = QPushButton("로그 보기")
+        self.btn_log_view = QPushButton("종목실적")
         self.btn_review_view = QPushButton("검토관리")
-        self.btn_refresh = QPushButton("안정성검사")
         self.btn_close = QPushButton("닫기")
         for button, object_name in (
             (self.btn_start, "autoTradeSettingStartButton"),
@@ -2313,9 +2324,8 @@ class AutoTradeSettingWindow(QDialog):
             (self.btn_fetch_minute_candles, "autoTradeSettingFetchMinuteCandlesButton"),
             (self.btn_set_schedule, "autoTradeSettingScheduleButton"),
             (self.btn_stock_register, "autoTradeSettingStockRegisterButton"),
-            (self.btn_log_view, "autoTradeSettingLogViewButton"),
+            (self.btn_log_view, "autoTradeSettingStockPerformanceButton"),
             (self.btn_review_view, "autoTradeSettingReviewViewButton"),
-            (self.btn_refresh, "autoTradeSettingRefreshButton"),
             (self.btn_close, "autoTradeSettingCloseButton"),
         ):
             button.setObjectName(object_name)
@@ -2332,7 +2342,7 @@ class AutoTradeSettingWindow(QDialog):
         self._default_operation_instance_by_definition: dict[str, str] = {}
         self._routine_operation_status_by_instance: dict[str, str] = {}
         # Run one policy reconciliation as soon as startup recovery permits it.
-        self._last_time_policy_minute_key = ""
+        self._last_time_policy_gui_minute_key = ""
         self._time_policy_timer = QTimer(self)
         self._time_policy_timer.setInterval(10_000)
         self._time_policy_timer.timeout.connect(self.on_time_policy_timer_tick)
@@ -2458,7 +2468,6 @@ class AutoTradeSettingWindow(QDialog):
             self.btn_stock_register,
             self.btn_log_view,
             self.btn_review_view,
-            self.btn_refresh,
             self.btn_close,
         ]
 
@@ -3035,7 +3044,6 @@ class AutoTradeSettingWindow(QDialog):
             self.on_stock_table_name_item_double_clicked
         )
         self.stock_table.customContextMenuRequested.connect(self.on_stock_table_context_menu)
-        self.btn_refresh.clicked.connect(self.run_current_routine_stability_check)
         self.btn_close.clicked.connect(self.close)
         self.btn_start.clicked.connect(self.start_selected_auto_trades)
         self.btn_fetch_minute_candles.clicked.connect(self.fetch_minute_candles_for_selected_stock)
@@ -3051,7 +3059,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_early_close.clicked.connect(self.apply_selected_early_close_default)
         self.btn_set_schedule.clicked.connect(self.open_operation_environment_settings)
         self.btn_stock_register.clicked.connect(self.open_stock_register_window)
-        self.btn_log_view.clicked.connect(self.open_log_view_window)
+        self.btn_log_view.clicked.connect(self.open_stock_performance_window)
         self.btn_review_view.clicked.connect(self.open_review_required_window)
         self._fixed_signals_connected = True
 
@@ -3180,12 +3188,12 @@ class AutoTradeSettingWindow(QDialog):
             )
 
     def on_time_policy_timer_tick(self) -> None:
-        previous_minute_key = self._last_time_policy_minute_key
+        previous_minute_key = self._last_time_policy_gui_minute_key
         try:
-            auto_trade_on_time_policy_timer_tick(self)
+            auto_trade_on_time_policy_gui_timer_tick(self)
         except Exception:
-            LOGGER.exception("Time policy timer refresh failed")
-            self._last_time_policy_minute_key = previous_minute_key
+            LOGGER.exception("Time policy GUI timer refresh failed")
+            self._last_time_policy_gui_minute_key = previous_minute_key
             self.statusBarMessage(
                 "시간정책 상태를 갱신하지 못했습니다. "
                 "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
@@ -3305,19 +3313,39 @@ class AutoTradeSettingWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        for timer in (self._time_policy_timer, self._runtime_file_timer):
+            if not timer.isActive():
+                timer.start()
 
     def start_periodic_timers_after_recovery(self, identity) -> dict[str, object]:
-        """Start existing timers only through the approved Recovery lifecycle."""
-        return start_recovery_bound_timers(
-            identity=identity,
-            timers=(self._time_policy_timer, self._runtime_file_timer),
-        )
+        """Compatibility hook: these timers refresh the settings UI only."""
+        del identity
+        started_count = 0
+        if self.isVisible():
+            for timer in (self._time_policy_timer, self._runtime_file_timer):
+                if timer.isActive():
+                    continue
+                timer.start()
+                started_count += 1
+        return {
+            "started": True,
+            "reason_code": "SETTINGS_GUI_TIMERS_STARTED",
+            "started_count": started_count,
+        }
 
     def stop_periodic_timers_for_recovery(self) -> dict[str, object]:
-        """Stop existing timers when login/account/day Recovery context changes."""
-        return stop_recovery_bound_timers(
-            (self._time_policy_timer, self._runtime_file_timer)
-        )
+        """Stop settings-only GUI refresh timers."""
+        stopped_count = 0
+        for timer in (self._time_policy_timer, self._runtime_file_timer):
+            if not timer.isActive():
+                continue
+            timer.stop()
+            stopped_count += 1
+        return {
+            "stopped": True,
+            "reason_code": "SETTINGS_GUI_TIMERS_STOPPED",
+            "stopped_count": stopped_count,
+        }
 
     def closeEvent(self, event) -> None:
         """창을 닫을 때 주기 갱신 타이머를 정리한다."""
@@ -3497,19 +3525,7 @@ class AutoTradeSettingWindow(QDialog):
         target = self.stock_info_from_row(item.row())
         if target is None:
             return
-        running_targets_getter = getattr(
-            self,
-            "running_registered_operation_targets",
-            None,
-        )
-        if callable(running_targets_getter) and running_targets_getter():
-            status_message = getattr(self, "statusBarMessage", None)
-            if callable(status_message):
-                status_message(
-                    "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
-                )
-            return
-        self.toggle_stock_operation_exclusion(target)
+        handle_stock_name_operation_exclusion_double_click(self, target)
 
     def set_stock_operation_exclusion(
         self,
@@ -3519,12 +3535,19 @@ class AutoTradeSettingWindow(QDialog):
         notify: bool = True,
         refresh: bool = True,
     ) -> bool:
+        message_parent_getter = getattr(self, "operation_message_parent", None)
+        message_parent = (
+            message_parent_getter()
+            if callable(message_parent_getter)
+            else self
+        )
         stock_dir, code, name = target
         config_path = stock_dir / "config.json"
         config = read_json_dict(config_path)
         if not config:
             config = default_config()
 
+        exclusion_changed = is_operation_excluded(config) != bool(excluded)
         config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
         config["updated_at"] = now_text()
 
@@ -3535,7 +3558,7 @@ class AutoTradeSettingWindow(QDialog):
             )
         except Exception as exc:
             QMessageBox.critical(
-                self,
+                message_parent,
                 "저장 오류",
                 f"{code} {name} 운영 제외 설정 저장 중 오류가 발생했습니다.\n\n{exc}",
             )
@@ -3547,11 +3570,23 @@ class AutoTradeSettingWindow(QDialog):
             if excluded
             else "운영종목으로 전환됐습니다."
         )
+        if exclusion_changed:
+            append_production_event(
+                "OPERATION_EXCLUDED" if excluded else "OPERATION_EXCLUSION_RELEASED",
+                result="COMPLETED",
+                source="AutoTradeSettingWindow.set_stock_operation_exclusion",
+                template_args={"stock_name": str(name or code)},
+                target_type="STOCK",
+                target_id=str(code),
+                target_name=str(name),
+                stock_code=str(code),
+                stock_name=str(name),
+            )
         append_stock_log(stock_dir, "GUI", f"{label}: {code} {name}")
         append_changelog("UPDATE", "config.json", f"{label}: {code} {name}")
         if notify:
             self.statusBarMessage(f"{code} {name} {label}")
-            show_toast(self, toast_message)
+            show_toast(message_parent, toast_message)
         if refresh:
             self.refresh_all()
         return True
@@ -3569,6 +3604,12 @@ class AutoTradeSettingWindow(QDialog):
         )
 
     def set_selected_stock_operation_exclusions(self) -> None:
+        message_parent_getter = getattr(self, "operation_message_parent", None)
+        message_parent = (
+            message_parent_getter()
+            if callable(message_parent_getter)
+            else self
+        )
         selected = self.selected_stock_infos()
         if not selected:
             return
@@ -3606,18 +3647,24 @@ class AutoTradeSettingWindow(QDialog):
         if succeeded:
             self.refresh_all()
             if len(succeeded) == 1 and failed == 0:
-                show_toast(self, f"{succeeded[0]}을 제외 지정했습니다.")
+                show_toast(message_parent, f"{succeeded[0]}을 운영제외했습니다.")
             elif failed:
                 show_toast(
-                    self,
-                    f"{len(succeeded)}개 종목을 제외 지정했습니다. 실패 {failed}개",
+                    message_parent,
+                    f"{len(succeeded)}개 종목을 운영제외했습니다. 실패 {failed}개",
                 )
             else:
-                show_toast(self, f"{len(succeeded)}개 종목을 제외 지정했습니다.")
+                show_toast(message_parent, f"{len(succeeded)}개 종목을 운영제외했습니다.")
         elif failed:
-            show_toast(self, "제외지정에 실패했습니다.")
+            show_toast(message_parent, "운영제외에 실패했습니다.")
 
     def clear_selected_stock_operation_exclusions(self) -> None:
+        message_parent_getter = getattr(self, "operation_message_parent", None)
+        message_parent = (
+            message_parent_getter()
+            if callable(message_parent_getter)
+            else self
+        )
         selected = self.selected_stock_infos()
         if not selected:
             return
@@ -3655,16 +3702,16 @@ class AutoTradeSettingWindow(QDialog):
         if succeeded:
             self.refresh_all()
             if len(succeeded) == 1 and failed == 0:
-                show_toast(self, f"{succeeded[0]}의 제외 상태를 해제했습니다.")
+                show_toast(message_parent, f"{succeeded[0]}의 운영제외를 해제했습니다.")
             elif failed:
                 show_toast(
-                    self,
-                    f"{len(succeeded)}개 종목의 제외 상태를 해제했습니다. 실패 {failed}개",
+                    message_parent,
+                    f"{len(succeeded)}개 종목의 운영제외를 해제했습니다. 실패 {failed}개",
                 )
             else:
-                show_toast(self, f"{len(succeeded)}개 종목의 제외 상태를 해제했습니다.")
+                show_toast(message_parent, f"{len(succeeded)}개 종목의 운영제외를 해제했습니다.")
         elif failed:
-            show_toast(self, "제외해제에 실패했습니다.")
+            show_toast(message_parent, "운영제외 해제에 실패했습니다.")
 
     def operation_stock_dir_from_row(self, row: int) -> Path | None:
         code_item = self.stock_table.item(row, 0)
@@ -3749,8 +3796,14 @@ class AutoTradeSettingWindow(QDialog):
         self,
         ats_state: dict[str, bool],
         selected: list[tuple[Path, str, str]] | None = None,
+        editable_keys: tuple[str, ...] | None = None,
     ) -> int:
-        return auto_trade_save_selected_manual_ats_state(self, ats_state, selected)
+        return auto_trade_save_selected_manual_ats_state(
+            self,
+            ats_state,
+            selected,
+            editable_keys,
+        )
 
     def open_selected_manual_ats_settings_dialog(self) -> None:
         auto_trade_open_selected_manual_ats_settings_dialog(self)
@@ -3763,12 +3816,16 @@ class AutoTradeSettingWindow(QDialog):
         method: str,
         ats_state: dict[str, bool],
         selected: list[tuple[Path, str, str]] | None = None,
+        editable_keys: tuple[str, ...] | None = None,
+        selected_sessions: tuple[str, ...] | None = None,
     ) -> None:
         auto_trade_execute_selected_manual_ats_liquidation(
             self,
             method,
             ats_state,
             selected,
+            editable_keys,
+            selected_sessions,
         )
 
     def selected_operation_mode_set(
@@ -8559,6 +8616,7 @@ class AutoTradeSettingWindow(QDialog):
             context={
                 "manual_queue_write_confirmed": True,
                 "manual_runtime_queue_write_confirmed": True,
+                "event_journal_order": order_dict,
             },
             queue_commit_readiness_policy_result=queue_commit_readiness,
             manual_queue_commit_after_runtime_confirmed=True,
@@ -10246,17 +10304,30 @@ class AutoTradeSettingWindow(QDialog):
             return {"processed": False, "stage": "read_executable_order", "order_id": order_id, "blocked_reasons": read_result.get("blocked_reasons", [])}
         order = read_result.get("order")
         order_dict = order if isinstance(order, dict) else {}
+        def observed_execution(result: dict[str, object], step: str, passed: bool) -> dict[str, object]:
+            try:
+                from decision_trace_stage_observer import observe_execution_result
+
+                observe_execution_result(
+                    order_dict,
+                    result,
+                    execution_step=step,
+                    passed=passed,
+                )
+            except Exception:
+                pass
+            return result
         if order_dict.get("status") != "EXECUTABLE":
-            return {"processed": False, "stage": "executable_status", "order_id": order_id, "blocked_reasons": ["target record status is not EXECUTABLE"]}
+            return observed_execution({"processed": False, "stage": "executable_status", "order_id": order_id, "blocked_reasons": ["target record status is not EXECUTABLE"]}, "EXECUTION_ENABLE", False)
 
         auto_reasons = self.auto_trade_execution_block_reasons(order_dict)
         if auto_reasons:
-            return {"processed": False, "stage": "auto_trade_runtime_state", "order_id": order_id, "blocked_reasons": auto_reasons}
+            return observed_execution({"processed": False, "stage": "auto_trade_runtime_state", "order_id": order_id, "blocked_reasons": auto_reasons}, "EXECUTION_ENABLE", False)
 
         enable_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
         enable_preview = preview_execution_enable(order_dict, {"operator_confirmed_for_execution_enable": True})
         if enable_preview.get("enable_preview") is not True:
-            return {"processed": False, "stage": "execution_enable_preview", "order_id": order_id, "blocked_reasons": list(enable_preview.get("blocked_reasons") or [])}
+            return observed_execution({"processed": False, "stage": "execution_enable_preview", "order_id": order_id, "blocked_reasons": list(enable_preview.get("blocked_reasons") or [])}, "EXECUTION_ENABLE", False)
         enable_result = commit_execution_enable(
             enable_preview,
             queue_path,
@@ -10264,7 +10335,8 @@ class AutoTradeSettingWindow(QDialog):
             context={"manual_execution_enable_commit_confirmed": True},
         )
         if enable_result.get("enabled") is not True:
-            return {"processed": False, "stage": "execution_enable_commit", "order_id": order_id, "blocked_reasons": list(enable_result.get("blocked_reasons") or []), "execution_enable_result": enable_result}
+            return observed_execution({"processed": False, "stage": "execution_enable_commit", "order_id": order_id, "blocked_reasons": list(enable_result.get("blocked_reasons") or []), "execution_enable_result": enable_result}, "EXECUTION_ENABLE", False)
+        observed_execution({"order_id": order_id, "source_signal_id": order_dict.get("source_signal_id", "")}, "EXECUTION_ENABLE", True)
 
         enabled_read = self.read_order_from_queue_by_id(order_id, queue_path)
         enabled_order = enabled_read.get("order") if isinstance(enabled_read, dict) else {}
@@ -10272,7 +10344,7 @@ class AutoTradeSettingWindow(QDialog):
         guard = self.build_real_preflight_guard_from_gui(enabled_order_dict, operator_confirmed=True)
         guard_reasons = self.real_preflight_guard_block_reasons(guard, include_operator=False)
         if guard_reasons:
-            return {"processed": False, "stage": "real_preflight_guard", "order_id": order_id, "blocked_reasons": guard_reasons, "execution_enable_result": enable_result}
+            return observed_execution({"processed": False, "stage": "real_preflight_guard", "order_id": order_id, "blocked_reasons": guard_reasons, "execution_enable_result": enable_result}, "REAL_READY", False)
 
         preflight_snapshot = AutoTradeSettingWindow.queue_file_snapshot(queue_path)
         preflight_preview = preview_real_order_preflight(
@@ -10281,7 +10353,7 @@ class AutoTradeSettingWindow(QDialog):
             {"manual_real_preflight_confirmed": True},
         )
         if preflight_preview.get("real_preflight_preview") is not True:
-            return {"processed": False, "stage": "real_preflight_preview", "order_id": order_id, "blocked_reasons": list(preflight_preview.get("blocked_reasons") or []), "execution_enable_result": enable_result}
+            return observed_execution({"processed": False, "stage": "real_preflight_preview", "order_id": order_id, "blocked_reasons": list(preflight_preview.get("blocked_reasons") or []), "execution_enable_result": enable_result}, "REAL_READY", False)
         preflight_result = commit_real_order_preflight(
             preflight_preview,
             queue_path,
@@ -10289,28 +10361,29 @@ class AutoTradeSettingWindow(QDialog):
             context={"manual_real_preflight_commit_confirmed": True},
         )
         if preflight_result.get("real_preflight_committed") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "real_preflight_commit",
                 "order_id": order_id,
                 "blocked_reasons": list(preflight_result.get("blocked_reasons") or []),
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
-            }
+            }, "REAL_READY", False)
+        observed_execution({"order_id": order_id, "source_signal_id": order_dict.get("source_signal_id", "")}, "REAL_READY", True)
 
         real_ready_read = self.read_order_from_queue_by_id(order_id, queue_path)
         real_ready_order = real_ready_read.get("order") if isinstance(real_ready_read, dict) else {}
         real_ready_order_dict = real_ready_order if isinstance(real_ready_order, dict) else {}
         execution_preview = preview_execution_for_real_ready_order(order_id, guard, queue_path)
         if execution_preview.get("ok") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "execution_preview",
                 "order_id": order_id,
                 "blocked_reasons": list(execution_preview.get("blocked_reasons") or execution_preview.get("issues") or []),
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
-            }
+            }, "FINAL_GUARD", False)
 
         runtime_commit = self.commit_execution_runtime_for_preview(
             real_ready_order_dict,
@@ -10321,7 +10394,7 @@ class AutoTradeSettingWindow(QDialog):
             require_runtime_file_init_dialog=False,
         )
         if runtime_commit.get("runtime_commit_ready") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "runtime_commit",
                 "order_id": order_id,
@@ -10330,7 +10403,7 @@ class AutoTradeSettingWindow(QDialog):
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
                 "runtime_commit_result": runtime_commit,
-            }
+            }, "FINAL_GUARD", False)
 
         preview_result = execution_preview.get("preview_result")
         preview_result_dict = preview_result if isinstance(preview_result, dict) else {}
@@ -10338,7 +10411,7 @@ class AutoTradeSettingWindow(QDialog):
         if not isinstance(queue_write_preview, dict):
             queue_write_preview = preview_result_dict.get("queue_write_preview_result")
         if not isinstance(queue_write_preview, dict) or queue_write_preview.get("write_preview") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "queue_write_preview",
                 "order_id": order_id,
@@ -10347,7 +10420,7 @@ class AutoTradeSettingWindow(QDialog):
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
                 "runtime_commit_result": runtime_commit,
-            }
+            }, "FINAL_GUARD", False)
 
         runtime_commit_result = runtime_commit.get("runtime_commit_result")
         runtime_commit_result_dict = runtime_commit_result if isinstance(runtime_commit_result, dict) else {}
@@ -10362,7 +10435,7 @@ class AutoTradeSettingWindow(QDialog):
             },
         )
         if queue_commit_readiness.get("status") != "READY_TO_COMMIT_QUEUE":
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "queue_commit_readiness",
                 "order_id": order_id,
@@ -10372,7 +10445,7 @@ class AutoTradeSettingWindow(QDialog):
                 "execution_preview_result": execution_preview,
                 "runtime_commit_result": runtime_commit,
                 "queue_commit_readiness_policy_result": queue_commit_readiness,
-            }
+            }, "FINAL_GUARD", False)
 
         queue_commit = commit_execution_queue_manually(
             queue_write_preview,
@@ -10385,7 +10458,7 @@ class AutoTradeSettingWindow(QDialog):
             manual_queue_commit_after_runtime_confirmed=True,
         )
         if queue_commit.get("manual_commit") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "queue_commit",
                 "order_id": order_id,
@@ -10396,14 +10469,14 @@ class AutoTradeSettingWindow(QDialog):
                 "runtime_commit_result": runtime_commit,
                 "queue_commit_readiness_policy_result": queue_commit_readiness,
                 "queue_commit_result": queue_commit,
-            }
+            }, "FINAL_GUARD", False)
         read_back = self.verify_manual_queue_commit_read_back(
             queue_path=queue_path,
             queue_write_preview_result=queue_write_preview,
             runtime_commit_result=runtime_commit_result_dict,
         )
         if read_back.get("verified") is not True:
-            return {
+            return observed_execution({
                 "processed": False,
                 "stage": "queue_commit_read_back",
                 "order_id": order_id,
@@ -10415,11 +10488,20 @@ class AutoTradeSettingWindow(QDialog):
                 "queue_commit_readiness_policy_result": queue_commit_readiness,
                 "queue_commit_result": queue_commit,
                 "queue_commit_read_back": read_back,
-            }
+            }, "FINAL_GUARD", False)
 
         record = queue_write_preview.get("order_queued_record_preview")
         record_dict = record if isinstance(record, dict) else {}
         order_queued_id = str(record_dict.get("id") or "").strip()
+        observed_execution(
+            {
+                "order_id": order_id,
+                "source_signal_id": order_dict.get("source_signal_id", ""),
+                "execution_id": record_dict.get("execution_id", ""),
+            },
+            "FINAL_GUARD",
+            True,
+        )
         send_order_result = self.send_order_for_order_queued_automatically(
             order_queued_id,
             queue_path=queue_path,
@@ -10753,9 +10835,6 @@ class AutoTradeSettingWindow(QDialog):
 
     def set_selected_stocks_buy_end(self) -> None:
         auto_trade_set_selected_stocks_buy_end(self)
-
-    def run_current_routine_stability_check(self) -> None:
-        auto_trade_run_current_routine_stability_check(self)
 
     def split_start_targets(
         self,
@@ -11160,8 +11239,8 @@ class AutoTradeSettingWindow(QDialog):
             self._notification_popup = popup
         popup.show_message(message, timeout_ms)
 
-    def open_log_view_window(self) -> None:
-        open_auto_trade_log_view_window(self)
+    def open_stock_performance_window(self) -> None:
+        open_stock_performance_prototype(self)
 
 def base_stock_routine_assignments() -> dict[tuple[str, str], set[str]]:
     """

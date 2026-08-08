@@ -6159,14 +6159,69 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             stock_dir = self._stock_reset_runtime_dir(Path(tmpdir))
             with patch.object(
                 stock_register_window,
-                "stock_runtime_dirs_for_stock",
-                return_value=[("루틴A", stock_dir)],
+                "stock_reset_stock_dirs_for_stock",
+                return_value=[stock_dir],
             ):
                 result = stock_register_window.stock_reset_eligibility("111111", "대상")
 
         self.assertEqual(stock_register_window.STOCK_RESET_INITIALIZABLE, result["status"])
         self.assertEqual("", result["reason"])
         self.assertEqual(stock_dir, result["stock_dir"])
+
+    def test_stock_reset_eligibility_uses_central_stock_dir_without_routine_assignment(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeRepository:
+            def __init__(self, stock_dir: Path) -> None:
+                self.stock_dir = stock_dir
+
+            def list_stock_dirs(self) -> list[Path]:
+                return [self.stock_dir]
+
+            def parse_stock_folder(self, _path: Path) -> tuple[str, str]:
+                return "111111", "대상"
+
+        with TemporaryDirectory() as tmpdir:
+            stock_dir = self._stock_reset_runtime_dir(Path(tmpdir) / "stocks")
+            with (
+                patch.object(stock_register_window, "stock_repository_factory", return_value=FakeRepository(stock_dir)),
+                patch.object(
+                    stock_register_window,
+                    "stock_runtime_dirs_for_stock",
+                    side_effect=AssertionError("reset eligibility must not use routine assignment dirs"),
+                ),
+            ):
+                result = stock_register_window.stock_reset_eligibility("111111", "대상")
+
+        self.assertEqual(stock_register_window.STOCK_RESET_INITIALIZABLE, result["status"])
+        self.assertEqual(stock_dir, result["stock_dir"])
+
+    def test_stock_reset_eligibility_blocks_duplicate_central_stock_dirs(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        class FakeRepository:
+            def __init__(self, stock_dirs: list[Path]) -> None:
+                self.stock_dirs = stock_dirs
+
+            def list_stock_dirs(self) -> list[Path]:
+                return self.stock_dirs
+
+            def parse_stock_folder(self, _path: Path) -> tuple[str, str]:
+                return "111111", "대상"
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first_dir = self._stock_reset_runtime_dir(root / "stocks_a")
+            second_dir = self._stock_reset_runtime_dir(root / "stocks_b")
+            with patch.object(
+                stock_register_window,
+                "stock_repository_factory",
+                return_value=FakeRepository([first_dir, second_dir]),
+            ):
+                result = stock_register_window.stock_reset_eligibility("111111", "대상")
+
+        self.assertEqual(stock_register_window.STOCK_RESET_NOT_INITIALIZABLE, result["status"])
+        self.assertEqual("종목 저장 위치 중복", result["reason"])
 
     def test_stock_reset_eligibility_blocks_unsafe_states(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -6176,7 +6231,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ("buy_pending", "STOPPED", {}, [{"status": "OPEN", "side": "BUY", "pending_qty": 3}], "매수미결 있음"),
             ("sell_pending", "STOPPED", {}, [{"status": "OPEN", "side": "SELL", "pending_qty": 2}], "매도미결 있음"),
             ("running", "RUNNING", {}, [], "운영 중"),
-            ("sell_only", "SELL_ONLY", {}, [], "운영 중"),
+            ("auto_close", "AUTO_CLOSE", {}, [], "마감 진행 중"),
+            ("auto_closing", "AUTO_CLOSING", {}, [], "마감 진행 중"),
+            ("sell_only", "SELL_ONLY", {}, [], "마감 진행 중"),
+            ("watch_sell", "WATCH_SELL", {}, [], "마감 진행 중"),
             ("review", "STOPPED", {"review_required": True}, [], "검토관리 상태"),
             ("emergency", "EMERGENCY_STOPPED", {}, [], "긴급정지 상태"),
             ("in_progress", "STOPPED", {"transition_status": "IN_PROGRESS"}, [], "진행 중인 명령 또는 전환 상태"),
@@ -6193,8 +6251,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     )
                     with patch.object(
                         stock_register_window,
-                        "stock_runtime_dirs_for_stock",
-                        return_value=[("루틴A", stock_dir)],
+                        "stock_reset_stock_dirs_for_stock",
+                        return_value=[stock_dir],
                     ):
                         result = stock_register_window.stock_reset_eligibility("111111", "대상")
 
@@ -6218,17 +6276,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             cases = [
                 ("missing_dir", [], "종목 저장 위치 없음"),
-                ("multiple_dirs", [("루틴A", clean_dir), ("루틴B", clean_dir)], "종목 저장 위치 중복"),
-                ("corrupt_state", [("루틴A", corrupt_state_dir)], "state 무결성 오류: JSON 읽기 실패"),
-                ("corrupt_orders", [("루틴A", corrupt_orders_dir)], "orders 무결성 오류: JSON 읽기 실패"),
-                ("missing_orders", [("루틴A", missing_orders_dir)], "orders 무결성 오류: 파일 없음"),
+                ("multiple_dirs", [clean_dir, clean_dir], "종목 저장 위치 중복"),
+                ("corrupt_state", [corrupt_state_dir], "state 무결성 오류: JSON 읽기 실패"),
+                ("corrupt_orders", [corrupt_orders_dir], "orders 무결성 오류: JSON 읽기 실패"),
+                ("missing_orders", [missing_orders_dir], "orders 무결성 오류: 파일 없음"),
             ]
 
             for label, runtime_dirs, reason in cases:
                 with self.subTest(label=label):
                     with patch.object(
                         stock_register_window,
-                        "stock_runtime_dirs_for_stock",
+                        "stock_reset_stock_dirs_for_stock",
                         return_value=runtime_dirs,
                     ):
                         result = stock_register_window.stock_reset_eligibility("111111", "대상")
@@ -6237,7 +6295,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
             with patch.object(
                 stock_register_window,
-                "stock_runtime_dirs_for_stock",
+                "stock_reset_stock_dirs_for_stock",
                 side_effect=RuntimeError("boom"),
             ):
                 result = stock_register_window.stock_reset_eligibility("111111", "대상")
@@ -7338,7 +7396,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.btn_stock_register,
             window.btn_log_view,
             window.btn_review_view,
-            window.btn_refresh,
             window.btn_close,
         ]
         self.assertEqual(len(bottom_buttons), bottom_button_layout.count())
@@ -7350,6 +7407,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ],
         )
         self.assertTrue(all(button.minimumHeight() == 34 for button in bottom_buttons))
+        self.assertFalse(hasattr(window, "btn_refresh"))
+        self.assertFalse(hasattr(window, "run_current_routine_stability_check"))
         self.assertEqual("자동매매운영실적", window.routine_box.title())
         self.assertEqual("등록종목상태", window.stock_box.title())
         self.assertEqual(window.routine_box.font(), window.stock_box.font())

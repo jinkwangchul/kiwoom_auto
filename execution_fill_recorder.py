@@ -21,6 +21,8 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from event_journal_trade_observer import observe_execution_fill
+
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_POSITION_UPDATE_REQUIRED = "POSITION_UPDATE_REQUIRED"
@@ -640,7 +642,9 @@ def record_execution_fill(
                     "blocked_reasons": [],
                     "warnings": [],
                 }
-                return _with_lock_metadata(result_payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+                final_result = _with_lock_metadata(result_payload, lock_acquired=True, lock_wait_ms=lock.wait_ms)
+                observe_execution_fill(final_result)
+                return final_result
     except TimeoutError:
         return _with_lock_metadata(_blocked("fill_lock", "fills lock timeout"), lock_acquired=False)
 

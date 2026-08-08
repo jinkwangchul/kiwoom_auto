@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import weakref
+
 from PyQt5.QtCore import QEvent, QTimer, Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
@@ -109,6 +111,11 @@ class ToastMessage(QFrame):
         parent = self.parentWidget()
         if parent is not None:
             parent.removeEventFilter(self)
+            try:
+                if getattr(parent, "_common_toast_message", None) is self:
+                    parent._common_toast_message = None
+            except RuntimeError:
+                pass
         super().closeEvent(event)
 
     def message(self) -> str:
@@ -134,9 +141,26 @@ def show_toast(
     toast = ToastMessage(parent, message, duration_ms, position=position)
     parent._common_toast_message = toast
 
-    def clear_reference() -> None:
-        if getattr(parent, "_common_toast_message", None) is toast:
-            parent._common_toast_message = None
+    parent_ref = weakref.ref(parent)
+    toast_ref = weakref.ref(toast)
+
+    def clear_reference(
+        _destroyed: object = None,
+        bound_parent_ref: weakref.ReferenceType[QWidget] = parent_ref,
+        bound_toast_ref: weakref.ReferenceType[ToastMessage] = toast_ref,
+    ) -> None:
+        current_parent = bound_parent_ref()
+        current_toast = bound_toast_ref()
+        if current_parent is None or current_toast is None:
+            return
+        try:
+            if (
+                getattr(current_parent, "_common_toast_message", None)
+                is current_toast
+            ):
+                current_parent._common_toast_message = None
+        except RuntimeError:
+            return
 
     toast.destroyed.connect(clear_reference)
     toast.show_at_parent_position()

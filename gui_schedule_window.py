@@ -17,11 +17,7 @@ from PyQt5.QtCore import Qt
 
 
 class ScheduleOperationDialog(QDialog):
-    """종목별 개별 시간 예외 설정창.
-
-    전역 기본값은 운영환경설정에서 관리하고,
-    이 창의 값은 선택 종목의 개별 예외시간으로 저장한다.
-    """
+    """Per-stock schedule override dialog."""
 
     def __init__(self, *args, **kwargs) -> None:
         parent = kwargs.get("parent", None)
@@ -54,10 +50,7 @@ class ScheduleOperationDialog(QDialog):
         end_h, end_m = self._split_hhmm(end_buy_time, "13:30:00")
 
         main_layout = QVBoxLayout()
-
-        notice = QLabel(
-            f"선택된 {self._selected_count}종목 개별시간적용"
-        )
+        notice = QLabel(f"선택한 {self._selected_count}종목 개별시간 적용")
         notice.setMinimumHeight(28)
         main_layout.addWidget(notice)
 
@@ -84,9 +77,7 @@ class ScheduleOperationDialog(QDialog):
         form_layout.setColumnStretch(5, 1)
         main_layout.addLayout(form_layout)
 
-        guide = QLabel(
-            "※ 기본값은 환경설정에서 변경"
-        )
+        guide = QLabel("기본값은 환경설정에서 변경합니다.")
         guide.setStyleSheet("color: #555555;")
         main_layout.addWidget(guide)
 
@@ -149,8 +140,9 @@ class ScheduleOperationDialog(QDialog):
             return
         super().accept()
 
+
 class ScheduleTradeManagementDialog(QDialog):
-    """기존 스케줄매매관리창 호환용 임시 클래스."""
+    """Compatibility dialog for the old schedule trade management entry."""
 
     def __init__(self, *args, **kwargs) -> None:
         parent = kwargs.get("parent", None)

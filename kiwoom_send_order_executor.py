@@ -18,6 +18,7 @@ from execution_queue_writer import (
     record_broker_send_rejected,
     record_broker_send_uncertain,
 )
+from event_journal_trade_observer import observe_send_order_result
 
 
 STATUS_SENT = "SEND_ORDER_SENT"
@@ -311,7 +312,9 @@ def execute_claimed_send_order(
                 **_merge_writer_result("in_progress", in_progress),
                 **_merge_writer_result("record", recorded),
             )
-        return _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=None, callable_exception=callable_error)
+        finished = _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=None, callable_exception=callable_error)
+        observe_send_order_result({**_as_dict(identity), "code": send_order_args[4]}, finished)
+        return finished
 
     code = _return_code(raw_result)
     if code == 0:
@@ -358,7 +361,9 @@ def execute_claimed_send_order(
             **_merge_writer_result("in_progress", in_progress),
             **_merge_writer_result("record", recorded),
         )
-    return _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=raw_result, return_code=code)
+    finished = _finish_claimed_call_result(recorded, attempt, in_progress, raw_result=raw_result, return_code=code)
+    observe_send_order_result({**_as_dict(identity), "code": send_order_args[4]}, finished)
+    return finished
 
 
 def _first_reason(result: dict[str, Any], fallback: str) -> str:

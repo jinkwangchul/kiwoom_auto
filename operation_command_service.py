@@ -15,6 +15,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from runtime_atomic_writer import STATUS_OK, write_json_atomic
+from event_journal_trade_observer import observe_liquidation_requested
 
 
 SCOPE_STOCK = "STOCK"
@@ -316,11 +317,13 @@ class OperationCommandService:
                 )
             )
 
-        return OperationCommandResult(
+        result = OperationCommandResult(
             self._aggregate_status(results),
             command_id,
             tuple(results),
         )
+        observe_liquidation_requested(request, result)
+        return result
 
     def _validate_request(self, request: OperationCommandRequest) -> str:
         if str(request.target_scope or "").strip().upper() not in {

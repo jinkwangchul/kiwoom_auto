@@ -29,6 +29,7 @@ from state_policy import (
 from gui_operation_environment import read_operation_policy
 from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
 from gui_auto_trade_runtime import now_text
+from gui_ats_utils import manual_ats_enabled_labels
 from operation_command_service import (
     IMMEDIATE_LIQUIDATION_REQUEST_KEY,
     IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
@@ -871,7 +872,7 @@ def auto_trade_setting_has_unresolved_quantity(
 
     주의: 이 함수는 수량 존재 여부만 반환한다.
     반환값 True만으로 검토관리 이동을 결정하면 안 된다.
-    검토관리 이동은 재시작/안정성검사/무결성검사/긴급정지해제/강제종료/청산완료후잔여 같은
+    검토관리 이동은 재시작/무결성검사/긴급정지해제/강제종료/청산완료후잔여 같은
     명시적 검사 컨텍스트에서만 수행한다.
     """
     if holding_qty > 0:
@@ -893,7 +894,7 @@ def auto_trade_setting_has_buy_pending_problem(buy_pending_qty: object) -> bool:
     - 조기/자동마감 시작 또는 진행 중이라는 이유만으로 이 값이 True라고
       즉시 검토관리로 이동하면 안 된다.
     - 루틴 방식 조기/자동마감에서는 첫 매도신호 전까지 매수 흐름을 정상으로 본다.
-    - 검토관리 이동은 청산 후에도 잔여 문제가 남거나, 명시적 안정성검사/재시작/
+    - 검토관리 이동은 청산 후에도 잔여 문제가 남거나, 재시작/
       긴급정지 해제 같은 검사 컨텍스트에서만 판단한다.
     """
     if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:
@@ -954,6 +955,39 @@ def auto_trade_setting_liquidation_completed_today(state: dict[str, object] | No
             return True
 
     return False
+
+
+def auto_trade_operation_display(
+    config: dict[str, object],
+    state: dict[str, object] | None = None,
+) -> tuple[str, str, str, list[str]]:
+    """Return the shared operation-column display metadata for both GUI views."""
+
+    operation_text, operation_color, operation_tooltip = operation_text_and_color(
+        config
+    )
+    display_text = compact_operation_time_range(operation_text)
+    display_tooltip = str(operation_tooltip or "").strip()
+    if display_text == "수동":
+        display_tooltip = ""
+
+    ats_labels = (
+        []
+        if auto_trade_setting_liquidation_completed_today(state)
+        else manual_ats_enabled_labels(config, state)
+    )
+    if ats_labels:
+        display_text = "수동+ATS"
+        operation_color = "#D97706"
+        label_text = "/".join(
+            str(label) for label in ats_labels if str(label).strip()
+        )
+        display_tooltip = (
+            f"현재 운영세션 ATS 적용 | {label_text}\n\n"
+            "※주의:정규장외 시장 거래중"
+        )
+
+    return display_text, operation_color, display_tooltip, ats_labels
 
 
 def auto_trade_setting_effective_liquidation_method(

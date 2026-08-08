@@ -24,6 +24,7 @@ from gui_order_utils import (
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
 
+PENDING_INTEGRITY_USER_REASON = "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."
 REVIEW_REASON_OPERATION_DATA_MISSING = "운영 데이터 없음"
 REVIEW_REASON_OPERATION_DATA_READ_ERROR = "운영 데이터 읽기 오류"
 _TRUE_TEXT_VALUES = {"TRUE", "1", "YES", "Y", "ON", "검토", "검토필요"}
@@ -138,7 +139,7 @@ def is_review_protected_stock_dir(stock_dir: Path) -> bool:
 
 
 def auto_trade_setting_data_inconsistency_reasons(state: dict[str, object] | None) -> list[str]:
-    """운영 중/재시작/안정성검사 공통 내부 데이터 불일치 판정.
+    """운영 중/재시작/자동 로컬 무결성검사 공통 내부 데이터 불일치 판정.
 
     주의:
     - holding_qty/current_qty/qty 계열은 수량으로 본다.
@@ -329,7 +330,7 @@ def restart_initial_review_reason_for_stock(
     if isinstance(sell_pending_qty, int) and sell_pending_qty > 0:
         return True, "재시작 시 미체결 매도 존재", details
     if buy_pending_qty == "?" or sell_pending_qty == "?":
-        return True, "재시작 시 미체결 수량 확인 필요", details
+        return True, PENDING_INTEGRITY_USER_REASON, details
 
     return False, "재시작 초기검사 정상", details
 
@@ -338,7 +339,7 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     """키움 서버 정보와 프로그램 내부 정보 불일치/서버 불안 표시 여부.
 
     실제 키움 연동 단계에서 아래 플래그 중 하나가 저장되면 현황을 빨강으로 표시한다.
-    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/안정성검사 대상이라는 뜻이다.
+    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/무결성 확인 대상이라는 뜻이다.
     """
     if not isinstance(state, dict):
         return False
@@ -374,4 +375,3 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
             return True
 
     return False
-

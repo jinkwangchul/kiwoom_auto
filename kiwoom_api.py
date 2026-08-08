@@ -24,11 +24,32 @@ else:
     _QAX_IMPORT_ERROR = None
 
 from kiwoom_candle_adapter import save_minute_candles_for_stock
+from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
 RecoverySnapshotCallback = Callable[[dict[str, Any]], None]
+AccountFundsCallback = Callable[[dict[str, Any]], None]
+
+TRADE_COST_DIAGNOSTIC_FIDS = (
+    "9201",
+    "9203",
+    "904",
+    "9001",
+    "302",
+    "907",
+    "900",
+    "901",
+    "910",
+    "911",
+    "902",
+    "903",
+    "913",
+    "908",
+    "938",
+    "939",
+)
 
 
 class KiwoomApi(QObject):
@@ -67,7 +88,9 @@ class KiwoomApi(QObject):
     )
     HOLDINGS_SCREEN_NO = "9101"
     OPEN_ORDERS_SCREEN_NO = "9102"
+    ACCOUNT_FUNDS_SCREEN_NO = "9103"
     RECOVERY_TR_TIMEOUT_MS = 15_000
+    ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -188,6 +211,22 @@ class KiwoomApi(QObject):
             accounts.append(account)
             seen.add(account)
         return accounts
+
+    def account_server_type(self) -> str:
+        """Return the official login-server classification for UI projection."""
+        if not self.is_available() or not self.is_connected():
+            return ""
+        try:
+            raw_value = self._control.dynamicCall(
+                "GetLoginInfo(QString)",
+                "GetServerGubun",
+            )
+        except Exception:
+            return ""
+        value = str(raw_value or "").strip()
+        if value == "1":
+            return "SIMULATION"
+        return "REAL" if value else ""
 
     def login_session_id(self) -> str:
         """Return the current process-local Kiwoom login session identity."""
@@ -357,6 +396,112 @@ class KiwoomApi(QObject):
                 ("체결구분", "1"),
                 ("거래소구분", "0"),
             ),
+        )
+
+    def request_account_funds_snapshot(
+        self,
+        account_id: str,
+        *,
+        request_id: int,
+        screen_no: str = ACCOUNT_FUNDS_SCREEN_NO,
+        callback: AccountFundsCallback | None = None,
+        timeout_ms: int = ACCOUNT_FUNDS_TR_TIMEOUT_MS,
+    ) -> dict[str, Any]:
+        """Request OPW00001 summary values without persisting broker data."""
+        clean_account = str(account_id or "").strip()
+        if not self.is_available():
+            return self._finish_callback(
+                callback,
+                {"ok": False, "account_id": clean_account, "request_id": request_id,
+                 "error": self._unavailable_reason or "kiwoom api unavailable"},
+            )
+        if not self.is_connected():
+            return self._finish_callback(
+                callback,
+                {"ok": False, "account_id": clean_account, "request_id": request_id,
+                 "error": "kiwoom api is not connected"},
+            )
+        if not clean_account or clean_account not in self.account_numbers():
+            return self._finish_callback(
+                callback,
+                {"ok": False, "account_id": clean_account, "request_id": request_id,
+                 "error": "account is not in the login session"},
+            )
+
+        rqname = "OPW00001_ACCOUNT_FUNDS_{}_{}".format(
+            int(request_id),
+            datetime.now().strftime("%H%M%S%f"),
+        )
+        pending = {
+            "type": "account_funds",
+            "trcode": "opw00001",
+            "screen_no": str(screen_no),
+            "account_id": clean_account,
+            "request_id": int(request_id),
+            "callback": callback,
+            "started_at": datetime.now().isoformat(timespec="microseconds"),
+        }
+        self._pending_tr[rqname] = pending
+        try:
+            for field, value in (
+                ("계좌번호", clean_account),
+                ("비밀번호", ""),
+                ("비밀번호입력매체구분", "00"),
+                ("조회구분", "2"),
+            ):
+                self._control.dynamicCall(
+                    "SetInputValue(QString, QString)",
+                    field,
+                    value,
+                )
+            result = self._control.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                rqname,
+                "opw00001",
+                0,
+                str(screen_no),
+            )
+        except Exception:
+            result = -1
+        if int(result or 0) != 0:
+            self._pending_tr.pop(rqname, None)
+            return self._finish_callback(
+                callback,
+                {"ok": False, "account_id": clean_account, "request_id": request_id,
+                 "rqname": rqname, "result": result, "error": "CommRqData failed"},
+            )
+
+        try:
+            clean_timeout = max(int(timeout_ms), 1)
+        except (TypeError, ValueError):
+            clean_timeout = self.ACCOUNT_FUNDS_TR_TIMEOUT_MS
+        QTimer.singleShot(
+            clean_timeout,
+            lambda request_name=rqname: self._expire_account_funds_request(request_name),
+        )
+        return {
+            "ok": True,
+            "status": "REQUESTED",
+            "account_id": clean_account,
+            "request_id": int(request_id),
+            "rqname": rqname,
+            "result": result,
+        }
+
+    def _expire_account_funds_request(self, rqname: str) -> None:
+        pending = self._pending_tr.pop(str(rqname), None)
+        if not pending or pending.get("type") != "account_funds":
+            return
+        callback = pending.get("callback")
+        self._finish_callback(
+            callback if callable(callback) else None,
+            {
+                "ok": False,
+                "account_id": pending.get("account_id", ""),
+                "request_id": pending.get("request_id"),
+                "rqname": str(rqname),
+                "error": "account funds request timed out",
+            },
         )
 
     def _start_recovery_snapshot_request(
@@ -537,29 +682,39 @@ class KiwoomApi(QObject):
             if fid:
                 fids.append(fid)
 
+        observed_fids = list(dict.fromkeys([*fids, *TRADE_COST_DIAGNOSTIC_FIDS]))
+        fid_raw_values: dict[str, str] = {}
         fid_values: dict[str, str] = {}
-        for fid in fids:
+        for fid in observed_fids:
             try:
                 value = self._control.dynamicCall("GetChejanData(int)", int(fid))
             except Exception:
                 value = ""
-            fid_values[fid] = str(value or "").strip()
+            raw_text = "" if value is None else str(value)
+            fid_raw_values[fid] = raw_text
+            fid_values[fid] = raw_text.strip()
 
         try:
             count = int(item_cnt)
         except (TypeError, ValueError):
             count = len(fids)
 
-        self.raw_chejan_received.emit(
-            {
-                "source": "kiwoom_chejan",
-                "gubun": str(gubun or "").strip(),
-                "item_count": count,
-                "fid_list": fids,
-                "fid_values": fid_values,
-                "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
+        raw_event = {
+            "source": "kiwoom_chejan",
+            "gubun": str(gubun or "").strip(),
+            "item_count": count,
+            "fid_list": fids,
+            "observed_fid_list": observed_fids,
+            "fid_raw_values": fid_raw_values,
+            "fid_values": fid_values,
+            "received_at": datetime.now().isoformat(sep=" ", timespec="milliseconds"),
+        }
+        if raw_event["gubun"] == "0":
+            try:
+                record_trade_cost_chejan_diagnostic(raw_event)
+            except Exception:
+                pass
+        self.raw_chejan_received.emit(raw_event)
 
     def _on_receive_tr_data(self, *args: Any) -> None:
         if len(args) < 5:
@@ -576,6 +731,9 @@ class KiwoomApi(QObject):
                 str(prev_next).strip(),
                 pending,
             )
+            return
+        if pending.get("type") == "account_funds":
+            self._on_receive_account_funds(request_name, str(trcode), pending)
             return
         pending = self._pending_tr.pop(request_name, None)
         if not pending or pending.get("type") != "minute_candles":
@@ -614,6 +772,51 @@ class KiwoomApi(QObject):
                 "error": str(exc),
             }
 
+        self._finish_callback(callback if callable(callback) else None, result)
+
+    def _on_receive_account_funds(
+        self,
+        rqname: str,
+        trcode: str,
+        pending: dict[str, Any],
+    ) -> None:
+        current = self._pending_tr.pop(rqname, None)
+        if current is not pending:
+            return
+        callback = pending.get("callback")
+        try:
+            raw_deposit = self._control.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "예수금",
+            )
+            raw_orderable = self._control.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "주문가능금액",
+            )
+            result = {
+                "ok": True,
+                "account_id": pending.get("account_id", ""),
+                "request_id": pending.get("request_id"),
+                "rqname": rqname,
+                "raw_deposit": str(raw_deposit or ""),
+                "raw_orderable_cash": str(raw_orderable or ""),
+                "account_type": self.account_server_type(),
+                "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "account_id": pending.get("account_id", ""),
+                "request_id": pending.get("request_id"),
+                "rqname": rqname,
+                "error": f"account funds response parsing failed: {exc}",
+            }
         self._finish_callback(callback if callable(callback) else None, result)
 
     def _on_receive_recovery_snapshot_page(

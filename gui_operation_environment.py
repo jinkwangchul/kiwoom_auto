@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTime
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -45,6 +47,13 @@ from gui_toast import show_toast
 
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
+
+STARTING_BUDGET_DEFAULTS = {
+    "quantity": 1,
+    "amount_multiplier": 1.5,
+    "limit_recommended_multiplier": 100.0,
+    "limit_minimum_multiplier": 25.0,
+}
 
 
 def now_text() -> str:
@@ -78,8 +87,8 @@ def default_operation_policy() -> dict[str, object]:
             "end_time": "15:20:00",
         },
         "extra_sessions": [
-            {"enabled": False, "name": "추가시간1", "start_time": "08:00:00", "end_time": "08:50:00"},
-            {"enabled": False, "name": "추가시간2", "start_time": "15:40:00", "end_time": "19:50:00"},
+            {"enabled": False, "name": "장전프리", "start_time": "08:00:00", "end_time": "08:50:00"},
+            {"enabled": False, "name": "장마감NTX", "start_time": "15:40:00", "end_time": "19:50:00"},
             {"enabled": False, "name": "추가시간3", "start_time": "", "end_time": ""},
         ],
         "scheduled_operation": {
@@ -101,14 +110,15 @@ def default_operation_policy() -> dict[str, object]:
             "loss_percent": "",
         },
         "early_close": {
-            "method": "시장가",
+            "method": "루틴매도신호",
             "profit_percent": "",
             "loss_percent": "",
         },
         "liquidation": {
             "minutes_before_regular_close": "5",
-            "method": "이월",
+            "method": "시장가",
         },
+        "starting_budget_defaults": dict(STARTING_BUDGET_DEFAULTS),
         "updated_at": "",
     }
 
@@ -137,7 +147,11 @@ def read_operation_policy() -> dict[str, object]:
     return merged
 
 
-def write_operation_policy(policy: dict[str, object]) -> None:
+def write_operation_policy(
+    policy: dict[str, object],
+    *,
+    path: Path | None = None,
+) -> None:
     policy = dict(policy)
     scheduled = policy.get("scheduled_operation")
     if isinstance(scheduled, dict):
@@ -147,19 +161,105 @@ def write_operation_policy(policy: dict[str, object]) -> None:
             if key != "after_buy_end_status"
         }
     policy["updated_at"] = now_text()
-    OPERATION_POLICY_PATH.write_text(
+    target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
+    target_path.write_text(
         json.dumps(policy, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
+def _positive_decimal(value: object, fallback: float) -> float:
+    try:
+        parsed = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return fallback
+    if not parsed.is_finite() or parsed <= 0:
+        return fallback
+    return float(parsed)
+
+
+def _plain_number_text(value: object) -> str:
+    try:
+        text = format(Decimal(str(value)), "f")
+    except InvalidOperation:
+        return str(value)
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def starting_budget_defaults(policy: dict[str, object] | None = None) -> dict[str, float | int]:
+    source = policy if isinstance(policy, dict) else read_operation_policy()
+    raw = source.get("starting_budget_defaults", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    quantity_value = _positive_decimal(raw.get("quantity"), 1.0)
+    return {
+        "quantity": max(1, int(quantity_value)),
+        "amount_multiplier": _positive_decimal(raw.get("amount_multiplier"), 1.5),
+        "limit_recommended_multiplier": _positive_decimal(
+            raw.get("limit_recommended_multiplier"), 100.0
+        ),
+        "limit_minimum_multiplier": _positive_decimal(
+            raw.get("limit_minimum_multiplier"), 25.0
+        ),
+    }
+
+
+def effective_amount_starting_budget(
+    current_price: object,
+    amount_multiplier: object,
+) -> int | None:
+    try:
+        price = Decimal(str(current_price).replace(",", "").strip())
+        multiplier = Decimal(str(amount_multiplier).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not price.is_finite() or not multiplier.is_finite() or price <= 0 or multiplier <= 0:
+        return None
+    quantity = int((price * multiplier / price).to_integral_value(rounding=ROUND_FLOOR))
+    if quantity < 1:
+        return None
+    return int((price * quantity).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def round_up_to_leading_place(amount: object) -> int | None:
+    try:
+        value = Decimal(str(amount).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    integer_value = int(value.to_integral_value(rounding=ROUND_CEILING))
+    place = 10 ** (len(str(integer_value)) - 1)
+    return ((integer_value + place - 1) // place) * place
+
+
+def suggested_buy_limit(current_price: object, multiplier: object) -> int | None:
+    try:
+        amount = Decimal(str(current_price).replace(",", "").strip()) * Decimal(
+            str(multiplier).replace(",", "").strip()
+        )
+    except (InvalidOperation, ValueError):
+        return None
+    return round_up_to_leading_place(amount)
+
+
 class TimeComboWidget(QWidget):
     """시/분 콤보박스로 시간을 선택하는 작은 위젯."""
 
-    def __init__(self, default_time: str = "09:00:00", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        default_time: str = "09:00:00",
+        parent: QWidget | None = None,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
         super().__init__(parent)
+        self.allow_empty = allow_empty
         self.hour_combo = QComboBox()
         self.minute_combo = QComboBox()
+        if allow_empty:
+            self.hour_combo.addItem("")
+            self.minute_combo.addItem("")
         self.hour_combo.addItems([f"{hour:02d}" for hour in range(24)])
         self.minute_combo.addItems([f"{minute:02d}" for minute in range(0, 60, 5)])
         self.hour_combo.setFixedWidth(68)
@@ -175,6 +275,10 @@ class TimeComboWidget(QWidget):
         self.set_time(default_time, default_time)
 
     def set_time(self, value: object, default_time: str = "09:00:00") -> None:
+        if self.allow_empty and str(value or "").strip() == "":
+            self.hour_combo.setCurrentText("")
+            self.minute_combo.setCurrentText("")
+            return
         normalized = normalized_hhmmss_or_empty(value) or normalized_hhmmss_or_empty(default_time) or "09:00:00"
         try:
             hour, minute, _second = [int(part) for part in normalized.split(":")]
@@ -185,7 +289,47 @@ class TimeComboWidget(QWidget):
         self.minute_combo.setCurrentText(f"{rounded_minute:02d}")
 
     def time_text(self) -> str:
+        if self.allow_empty and (
+            not self.hour_combo.currentText().strip()
+            or not self.minute_combo.currentText().strip()
+        ):
+            return ""
         return f"{int(self.hour_combo.currentText()):02d}:{int(self.minute_combo.currentText()):02d}:00"
+
+
+class ProgramFactoryResetConfirmDialog(QDialog):
+    CONFIRMATION_TEXT = "전체초기화"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("프로그램 초기화 확인")
+        self.setModal(True)
+
+        warning = QLabel(
+            "프로그램의 모든 종목, 운영 데이터 및 사용자 설정이 삭제되고\n"
+            "초기 상태로 돌아갑니다.\n"
+            "삭제된 데이터는 프로그램에서 복구할 수 없습니다.\n\n"
+            "계속하려면 아래에 '전체초기화'를 입력하십시오."
+        )
+        self.confirmation_input = QLineEdit()
+        self.confirmation_input.setObjectName("programFactoryResetConfirmationInput")
+
+        buttons = QDialogButtonBox()
+        self.reset_button = buttons.addButton("초기화", QDialogButtonBox.AcceptRole)
+        self.cancel_button = buttons.addButton("취소", QDialogButtonBox.RejectRole)
+        self.reset_button.setObjectName("programFactoryResetConfirmButton")
+        self.reset_button.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.confirmation_input.textChanged.connect(
+            lambda text: self.reset_button.setEnabled(text == self.CONFIRMATION_TEXT)
+        )
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(warning)
+        layout.addWidget(self.confirmation_input)
+        layout.addWidget(buttons)
+        self.confirmation_input.setFocus()
 
 
 class OperationEnvironmentSettingsDialog(QDialog):
@@ -236,6 +380,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.scheduled_end_buy = self._make_time_edit("13:30:00")
 
         self.extra_name: list[QLineEdit] = []
+        self.extra_enabled: list[QCheckBox] = []
         self.extra_start: list[TimeComboWidget] = []
         self.extra_end: list[TimeComboWidget] = []
 
@@ -275,7 +420,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.early_close_market = QCheckBox("시장가")
         self.early_close_current = QCheckBox("현재가")
         self.early_close_profit_loss = QCheckBox("익절/손절")
-        self.early_close_market.setChecked(True)
+        self.early_close_signal.setChecked(True)
         self.early_close_options = [
             self.early_close_signal,
             self.early_close_market,
@@ -301,6 +446,10 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.liquidation_minutes = QComboBox()
         self.liquidation_minutes.addItems([str(value) for value in range(5, 101, 5)])
         self.liquidation_minutes.setFixedWidth(70)
+        self.starting_quantity = self._make_short_line("1")
+        self.starting_amount_multiplier = self._make_short_line("1.5")
+        self.limit_recommended_multiplier = self._make_short_line("100")
+        self.limit_minimum_multiplier = self._make_short_line("25")
         self._setup_ui()
         self._connect_close_option_checks()
         self.manual_liquidation.clicked.connect(lambda _checked=False: self._update_manual_liquidation_mode())
@@ -312,8 +461,13 @@ class OperationEnvironmentSettingsDialog(QDialog):
         return line
 
 
-    def _make_time_edit(self, default_time: str) -> TimeComboWidget:
-        return TimeComboWidget(default_time)
+    def _make_time_edit(
+        self,
+        default_time: str,
+        *,
+        allow_empty: bool = False,
+    ) -> TimeComboWidget:
+        return TimeComboWidget(default_time, allow_empty=allow_empty)
 
     def _set_time_edit(self, edit: TimeComboWidget, value: object, default_time: str) -> None:
         edit.set_time(value, default_time)
@@ -329,7 +483,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         for name, checkbox in self.liquidation_checks.items():
             if checkbox.isChecked():
                 return name
-        return "이월"
+        return "시장가"
 
 
 
@@ -447,7 +601,13 @@ class OperationEnvironmentSettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"추가시간 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
-        QMessageBox.information(self, "저장 완료", "추가시간 설정을 저장했습니다.")
+        toast_parent = self.parentWidget() or self
+        show_toast(
+            parent=toast_parent,
+            message="환경설정을 저장했습니다.",
+            duration_ms=2000,
+            position="center",
+        )
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout()
@@ -488,21 +648,26 @@ class OperationEnvironmentSettingsDialog(QDialog):
         operation_time_layout.addWidget(ats_label, 4, 0, Qt.AlignCenter)
 
         for index in range(3):
+            enabled = QCheckBox()
+            enabled.setToolTip("ATS설정 팝업에 이 항목을 표시합니다.")
             name = QLineEdit()
             name.setFixedWidth(120)
-            start_time = self._make_time_edit("09:00:00")
-            end_time = self._make_time_edit("15:20:00")
+            start_time = self._make_time_edit("09:00:00", allow_empty=True)
+            end_time = self._make_time_edit("15:20:00", allow_empty=True)
+            self.extra_enabled.append(enabled)
             self.extra_name.append(name)
             self.extra_start.append(start_time)
             self.extra_end.append(end_time)
 
             row = index + 3
-            operation_time_layout.addWidget(name, row, 1, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
-
-            save_button = QPushButton("저장")
-            save_button.setFixedWidth(44)
-            save_button.clicked.connect(self.save_extra_sessions_only)
-            operation_time_layout.addWidget(save_button, row, 2, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
+            name_wrap = QWidget()
+            name_layout = QHBoxLayout()
+            name_layout.setContentsMargins(0, 0, 0, 0)
+            name_layout.setSpacing(6)
+            name_layout.addWidget(enabled)
+            name_layout.addWidget(name)
+            name_wrap.setLayout(name_layout)
+            operation_time_layout.addWidget(name_wrap, row, 1, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
 
             if index == 1:
                 operation_time_layout.addWidget(QLabel("시작"), row, 3, Qt.AlignRight | Qt.AlignVCenter)
@@ -681,7 +846,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         liquidation_start_layout = QHBoxLayout()
         liquidation_start_layout.setContentsMargins(0, 0, 0, 0)
         liquidation_start_layout.setSpacing(8)
-        liquidation_start_layout.addWidget(QLabel("정규장 종료"))
+        liquidation_start_layout.addWidget(QLabel("■ 정규장 종료"))
         self.liquidation_minutes.setFixedWidth(64)
         liquidation_start_layout.addWidget(self.liquidation_minutes)
         liquidation_start_layout.addWidget(QLabel("분전"))
@@ -701,15 +866,165 @@ class OperationEnvironmentSettingsDialog(QDialog):
 
         layout.addWidget(liquidation_box)
 
+        # 7. 시작 예산 설정
+        budget_box, budget_layout = make_row_box("7. 시작 예산 설정")
+        budget_content_wrap = QWidget()
+        budget_content_layout = QHBoxLayout()
+        budget_content_layout.setContentsMargins(0, 0, 0, 0)
+        budget_content_layout.setSpacing(32)
+
+        quantity_wrap = QWidget()
+        quantity_layout = QHBoxLayout()
+        quantity_layout.setContentsMargins(0, 0, 0, 0)
+        quantity_layout.setSpacing(6)
+        quantity_layout.addWidget(QLabel("■ 주수 :"))
+        self.starting_quantity.setFixedWidth(54)
+        quantity_layout.addWidget(self.starting_quantity)
+        quantity_wrap.setLayout(quantity_layout)
+        budget_content_layout.addWidget(quantity_wrap)
+
+        amount_wrap = QWidget()
+        amount_layout = QHBoxLayout()
+        amount_layout.setContentsMargins(0, 0, 0, 0)
+        amount_layout.setSpacing(6)
+        amount_layout.addWidget(QLabel("■ 금액 : 현재가 ×"))
+        self.starting_amount_multiplier.setFixedWidth(54)
+        amount_layout.addWidget(self.starting_amount_multiplier)
+        amount_wrap.setLayout(amount_layout)
+        budget_content_layout.addWidget(amount_wrap)
+
+        limit_wrap = QWidget()
+        limit_layout = QHBoxLayout()
+        limit_layout.setContentsMargins(0, 0, 0, 0)
+        limit_layout.setSpacing(6)
+        limit_layout.addWidget(QLabel("■ 한도금액 : 현재가 × 권장"))
+        self.limit_recommended_multiplier.setFixedWidth(54)
+        limit_layout.addWidget(self.limit_recommended_multiplier)
+        limit_layout.addWidget(QLabel("| 최소"))
+        self.limit_minimum_multiplier.setFixedWidth(54)
+        limit_layout.addWidget(self.limit_minimum_multiplier)
+        limit_wrap.setLayout(limit_layout)
+        budget_content_layout.addWidget(limit_wrap)
+        budget_content_layout.addStretch(1)
+        budget_content_wrap.setLayout(budget_content_layout)
+        budget_layout.addWidget(
+            budget_content_wrap,
+            0,
+            1,
+            1,
+            7,
+            Qt.AlignLeft | Qt.AlignVCenter,
+        )
+        layout.addWidget(budget_box)
+
+        self.program_factory_reset_button = QPushButton("프로그램 초기화")
+        self.program_factory_reset_button.setObjectName("operationEnvironmentProgramResetButton")
+        self.program_factory_reset_button.clicked.connect(self._request_program_factory_reset)
+        self.settings_reset_button = QPushButton("설정 초기화")
+        self.settings_reset_button.setObjectName("operationEnvironmentSettingsResetButton")
+        self.settings_reset_button.clicked.connect(self._load_official_settings_defaults)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText("저장")
         buttons.button(QDialogButtonBox.Cancel).setText("취소")
         buttons.button(QDialogButtonBox.Save).setMinimumWidth(110)
         buttons.button(QDialogButtonBox.Cancel).setMinimumWidth(110)
+        bottom_button_style = (
+            "QPushButton {"
+            " border: 1px solid #A6A6A6;"
+            " border-radius: 2px;"
+            " background-color: #F5F5F5;"
+            " color: #202020;"
+            " padding: 0 10px;"
+            "}"
+            "QPushButton:hover { background-color: #EAF2FA; border-color: #7A9FC2; }"
+            "QPushButton:pressed { background-color: #DCE8F3; border-color: #5F87AD; }"
+            "QPushButton:focus { border-color: #0078D4; }"
+            "QPushButton:disabled { background-color: #F0F0F0; color: #9A9A9A; border-color: #C8C8C8; }"
+        )
+        for button in (
+            self.program_factory_reset_button,
+            self.settings_reset_button,
+            buttons.button(QDialogButtonBox.Save),
+            buttons.button(QDialogButtonBox.Cancel),
+        ):
+            button.setFixedHeight(32)
+            button.setStyleSheet(bottom_button_style)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.settings_button_box = buttons
+
+        bottom_buttons = QHBoxLayout()
+        bottom_buttons.addWidget(self.program_factory_reset_button)
+        bottom_buttons.addWidget(self.settings_reset_button)
+        bottom_buttons.addStretch(1)
+        bottom_buttons.addWidget(buttons)
+        layout.addLayout(bottom_buttons)
         self.setLayout(layout)
+
+    def _load_official_settings_defaults(self) -> None:
+        self.policy = default_operation_policy()
+        self.load_policy_to_widgets()
+
+    def _main_window_kiwoom_api(self) -> object | None:
+        current: QWidget | None = self
+        while current is not None:
+            api = getattr(current, "kiwoom_api", None)
+            if api is not None:
+                return api
+            current = current.parentWidget()
+        return None
+
+    def _request_program_factory_reset(self) -> None:
+        confirmation = ProgramFactoryResetConfirmDialog(self)
+        if confirmation.exec_() != QDialog.Accepted:
+            return
+
+        api = self._main_window_kiwoom_api()
+        is_connected = getattr(api, "is_connected", None)
+        if not callable(is_connected):
+            QMessageBox.warning(
+                self,
+                "프로그램 초기화 불가",
+                "키움 서버 연결 상태를 확인할 수 없습니다.",
+            )
+            return
+        try:
+            broker_connected = bool(is_connected())
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "프로그램 초기화 불가",
+                "키움 서버 연결 상태를 확인할 수 없습니다.",
+            )
+            return
+
+        from program_factory_reset import execute_program_factory_reset
+
+        result = execute_program_factory_reset(
+            PROJECT_ROOT,
+            broker_connected=broker_connected,
+        )
+        if not result.get("success"):
+            issues = [str(item) for item in result.get("issues", []) if str(item).strip()]
+            detail = "\n".join(f"- {item}" for item in issues[:8])
+            QMessageBox.critical(
+                self,
+                "프로그램 초기화 실패",
+                "프로그램 초기화를 완료하지 못했습니다.\n\n"
+                + (detail or "초기화 대상을 확인해 주세요."),
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "프로그램 초기화 완료",
+            "프로그램 초기화가 완료되었습니다.\n"
+            "프로그램을 종료합니다. 다시 실행해 주세요.",
+        )
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
 
     def load_policy_to_widgets(self) -> None:
         regular = self.policy.get("regular_market", {}) if isinstance(self.policy.get("regular_market"), dict) else {}
@@ -721,6 +1036,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
             extra_sessions = []
         for index in range(3):
             item = extra_sessions[index] if index < len(extra_sessions) and isinstance(extra_sessions[index], dict) else {}
+            self.extra_enabled[index].setChecked(bool(item.get("enabled", True)))
             self.extra_name[index].setText(str(item.get("name", f"추가시간{index + 1}")))
             self._set_time_edit(self.extra_start[index], item.get("start_time", "09:00:00"), "09:00:00")
             self._set_time_edit(self.extra_end[index], item.get("end_time", "15:20:00"), "15:20:00")
@@ -741,7 +1057,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.auto_loss.setText(str(auto.get("loss_percent", "")))
 
         early = self.policy.get("early_close", {}) if isinstance(self.policy.get("early_close"), dict) else {}
-        self.early_close_method.setCurrentText(str(early.get("method", "시장가")))
+        self.early_close_method.setCurrentText(str(early.get("method", "루틴매도신호")))
         self.early_profit.setText(str(early.get("profit_percent", "")))
         self.early_loss.setText(str(early.get("loss_percent", "")))
 
@@ -750,10 +1066,20 @@ class OperationEnvironmentSettingsDialog(QDialog):
         if liq_minutes not in [str(value) for value in range(5, 101, 5)]:
             liq_minutes = "5"
         self.liquidation_minutes.setCurrentText(liq_minutes)
-        method = str(liquidation.get("method", "이월"))
+        method = str(liquidation.get("method", "시장가"))
         if method not in self.liquidation_checks:
-            method = "이월"
+            method = "시장가"
         self._select_liquidation_method(self.liquidation_checks[method])
+
+        budget_defaults = starting_budget_defaults(self.policy)
+        self.starting_quantity.setText(str(budget_defaults["quantity"]))
+        self.starting_amount_multiplier.setText(_plain_number_text(budget_defaults["amount_multiplier"]))
+        self.limit_recommended_multiplier.setText(
+            _plain_number_text(budget_defaults["limit_recommended_multiplier"])
+        )
+        self.limit_minimum_multiplier.setText(
+            _plain_number_text(budget_defaults["limit_minimum_multiplier"])
+        )
 
         self._sync_combo_to_close_checkboxes()
         self.update_manual_extra_labels()
@@ -781,8 +1107,59 @@ class OperationEnvironmentSettingsDialog(QDialog):
             return False
         return True
 
+    def _validated_starting_budget_defaults(self) -> dict[str, float | int] | None:
+        fields = (
+            ("주수", self.starting_quantity, True),
+            ("금액 배수", self.starting_amount_multiplier, False),
+            ("한도금액 권장 배수", self.limit_recommended_multiplier, False),
+            ("한도금액 최소 배수", self.limit_minimum_multiplier, False),
+        )
+        parsed: dict[str, float | int] = {}
+        keys = tuple(STARTING_BUDGET_DEFAULTS)
+        for key, (label, editor, integer_only) in zip(keys, fields):
+            text = editor.text().replace(",", "").strip()
+            try:
+                value = Decimal(text)
+            except InvalidOperation:
+                value = Decimal(0)
+            valid = value.is_finite() and value > 0
+            if integer_only:
+                valid = valid and value == value.to_integral_value()
+            if not valid:
+                QMessageBox.warning(self, "입력 확인", f"{label}은(는) 0보다 큰 {'정수' if integer_only else '숫자'}로 입력하세요.")
+                editor.setFocus()
+                return None
+            parsed[key] = int(value) if integer_only else float(value)
+        if parsed["limit_minimum_multiplier"] > parsed["limit_recommended_multiplier"]:
+            QMessageBox.warning(
+                self,
+                "입력 확인",
+                "한도금액 최소 배수는 권장 배수보다 클 수 없습니다.",
+            )
+            self.limit_minimum_multiplier.setFocus()
+            return None
+        return parsed
 
-    def build_policy_from_widgets(self) -> dict[str, object]:
+    def _starting_budget_values_or_existing(self) -> dict[str, float | int]:
+        try:
+            return {
+                "quantity": int(Decimal(self.starting_quantity.text().strip())),
+                "amount_multiplier": float(Decimal(self.starting_amount_multiplier.text().strip())),
+                "limit_recommended_multiplier": float(
+                    Decimal(self.limit_recommended_multiplier.text().strip())
+                ),
+                "limit_minimum_multiplier": float(
+                    Decimal(self.limit_minimum_multiplier.text().strip())
+                ),
+            }
+        except (InvalidOperation, ValueError):
+            return starting_budget_defaults(self.policy)
+
+
+    def build_policy_from_widgets(
+        self,
+        budget_defaults: dict[str, float | int] | None = None,
+    ) -> dict[str, object]:
         # 저장 직전에도 체크박스 선택값을 저장용 콤보값에 맞춘다.
         # accept() 외 경로에서 호출되어도 저장값이 흔들리지 않게 하기 위함이다.
         self._sync_close_checkboxes_to_combo()
@@ -794,6 +1171,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
             },
             "extra_sessions": [
                 {
+                    "enabled": self.extra_enabled[index].isChecked(),
                     "name": self.extra_name[index].text().strip() or f"추가시간{index + 1}",
                     "start_time": self._time_edit_text(self.extra_start[index]),
                     "end_time": self._time_edit_text(self.extra_end[index]),
@@ -827,6 +1205,11 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 "minutes_before_regular_close": self.liquidation_minutes.currentText(),
                 "method": self._current_liquidation_method(),
             },
+            "starting_budget_defaults": (
+                dict(budget_defaults)
+                if budget_defaults is not None
+                else self._starting_budget_values_or_existing()
+            ),
         }
 
 
@@ -836,7 +1219,10 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self._sync_close_checkboxes_to_combo()
         if not self._validate_profit_loss_inputs():
             return
-        policy = self.build_policy_from_widgets()
+        budget_defaults = self._validated_starting_budget_defaults()
+        if budget_defaults is None:
+            return
+        policy = self.build_policy_from_widgets(budget_defaults)
         try:
             write_operation_policy(policy)
             append_changelog("UPDATE", "operation_policy.json", "환경설정 저장")

@@ -91,6 +91,74 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
         self.assertEqual("PASS", result["local_status"])
         self.assertEqual(2, result["checked_stock_count"])
 
+    def test_valid_state_quantity_amount_and_average_price_pass(self) -> None:
+        self._stock(
+            state={
+                "status": "STOPPED",
+                "holding_qty": 2,
+                "holding_amount": 20_000,
+                "avg_price": 10_000,
+            }
+        )
+
+        result = self._result()
+
+        self.assertEqual("PASS", result["local_status"])
+        self.assertNotIn("STATE_SEMANTIC_INTEGRITY", self._issue_codes(result))
+
+    def test_non_numeric_state_value_is_read_only_integrity_issue(self) -> None:
+        self._stock(state={"status": "STOPPED", "holding_qty": "not-a-number"})
+
+        result = self._result()
+
+        self.assertEqual("INTEGRITY_ISSUE", result["local_status"])
+        self.assertIn("STATE_SEMANTIC_INTEGRITY", self._issue_codes(result))
+        self.assertFalse(result["issues"][0]["requires_review"])
+
+    def test_negative_state_value_is_read_only_integrity_issue(self) -> None:
+        self._stock(state={"status": "STOPPED", "holding_qty": -1})
+
+        result = self._result()
+
+        self.assertEqual("INTEGRITY_ISSUE", result["local_status"])
+        self.assertTrue(any("음수" in str(issue["message"]) for issue in result["issues"]))
+
+    def test_zero_holding_with_average_price_is_read_only_integrity_issue(self) -> None:
+        self._stock(state={"status": "STOPPED", "holding_qty": 0, "avg_price": 10_000})
+
+        result = self._result()
+
+        self.assertEqual("INTEGRITY_ISSUE", result["local_status"])
+        self.assertTrue(any("보유 0인데 평단 존재" == issue["message"] for issue in result["issues"]))
+
+    def test_zero_holding_with_amount_is_read_only_integrity_issue(self) -> None:
+        self._stock(state={"status": "STOPPED", "holding_qty": 0, "holding_amount": 10_000})
+
+        result = self._result()
+
+        self.assertEqual("INTEGRITY_ISSUE", result["local_status"])
+        self.assertTrue(any("보유 0인데 보유금액 존재" == issue["message"] for issue in result["issues"]))
+
+    def test_semantic_integrity_issue_does_not_write_or_enter_review(self) -> None:
+        stock_dir = self._stock(
+            state={"status": "STOPPED", "holding_qty": 0, "avg_price": 10_000}
+        )
+        state_path = stock_dir / "state.json"
+        before = state_path.read_bytes()
+        writer = mock.Mock(return_value=True)
+
+        result = integrity_checker.apply_integrity_review_required_issues(
+            self._result(),
+            project_root=self.root,
+            review_writer=writer,
+        )
+
+        self.assertEqual("INTEGRITY_ISSUE", result["local_status"])
+        self.assertEqual(before, state_path.read_bytes())
+        self.assertEqual("STOPPED", json.loads(state_path.read_text(encoding="utf-8"))["status"])
+        writer.assert_not_called()
+        self.assertFalse((self.root / "PROJECT_CHANGELOG.txt").exists())
+
     def test_zero_targets_is_check_error_not_pass(self) -> None:
         result = self._result()
 
@@ -281,6 +349,7 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
             "checked_stock_count",
             "review_required_count",
             "check_error_count",
+            "integrity_issue_count",
             "server_not_checked_count",
             "issues",
             "started_at",
@@ -610,6 +679,8 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("✓", window.integrity_status_icon_label.text())
+        self.assertIn("#15803d", window.integrity_status_icon_label.styleSheet())
         self.assertEqual("로컬 무결성 통과 | 서버 정합성 미확인", window.integrity_status_label.text())
 
     def test_pass_shows_toast(self) -> None:
@@ -631,6 +702,8 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("⚠", window.integrity_status_icon_label.text())
+        self.assertIn("#d97706", window.integrity_status_icon_label.styleSheet())
         self.assertEqual("검토관리 005930 삼성전자", window.integrity_status_label.text())
 
     def test_review_required_multiple_stocks_text_counts_stocks(self) -> None:
@@ -646,6 +719,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("⚠", window.integrity_status_icon_label.text())
         self.assertEqual("검토관리 005930 삼성전자 외 1종목", window.integrity_status_label.text())
 
     def test_same_stock_multiple_issues_count_as_one_stock(self) -> None:
@@ -659,6 +733,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("⚠", window.integrity_status_icon_label.text())
         self.assertEqual("검토관리 005930 삼성전자", window.integrity_status_label.text())
 
     def test_writer_callback_is_passed_to_review_application(self) -> None:
@@ -695,6 +770,29 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         apply.assert_not_called()
         self.parent.review_writer.assert_not_called()
 
+    def test_read_only_integrity_issue_does_not_call_writer(self) -> None:
+        window = self._window()
+        result = self._result(
+            "INTEGRITY_ISSUE",
+            issues=[
+                {
+                    "execution_status": "INTEGRITY_ISSUE",
+                    "issue_code": "STATE_SEMANTIC_INTEGRITY",
+                    "requires_review": False,
+                }
+            ],
+        )
+        with (
+            mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=result),
+            mock.patch("gui_stock_register_window.apply_integrity_review_required_issues") as apply,
+        ):
+            window.run_initial_integrity_check()
+
+        apply.assert_not_called()
+        self.parent.review_writer.assert_not_called()
+        self.assertEqual("로컬 의미 무결성 문제 발견", window.integrity_status_label.text())
+        self.assertEqual("⚠", window.integrity_status_icon_label.text())
+
     def test_writer_fail_sets_top_status_text(self) -> None:
         window = self._window()
         result = self._result("REVIEW_REQUIRED", issues=[self._review_issue()])
@@ -708,6 +806,8 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("✕", window.integrity_status_icon_label.text())
+        self.assertIn("#dc2626", window.integrity_status_icon_label.styleSheet())
         self.assertEqual("무결성 문제 발견 | 검토관리 반영 실패", window.integrity_status_label.text())
 
     def test_writer_fail_shows_toast(self) -> None:
@@ -733,6 +833,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
+        self.assertEqual("ⓘ", window.integrity_status_icon_label.text())
         self.assertEqual("검사 대상 종목 없음", window.integrity_status_label.text())
 
     def test_check_exception_keeps_window_usable(self) -> None:
@@ -747,6 +848,8 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
             window.run_initial_integrity_check()
 
         self.assertTrue(window.isEnabled())
+        self.assertEqual("✕", window.integrity_status_icon_label.text())
+        self.assertIn("#dc2626", window.integrity_status_icon_label.styleSheet())
         self.assertEqual("무결성 검사 실패", window.integrity_status_label.text())
 
     def test_refresh_after_review_check(self) -> None:

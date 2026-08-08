@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
+from gui_auto_trade_integrity import is_emergency_stopped_state
 from gui_operation_environment import OPERATION_POLICY_PATH
 from runtime_io import read_json_dict
 
@@ -44,9 +45,6 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
     "30",
 )
 
-_EMERGENCY_STATUSES = {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
-
-
 @dataclass(frozen=True)
 class StockContextMenuCallbacks:
     select_all: Callable[[], None]
@@ -55,6 +53,14 @@ class StockContextMenuCallbacks:
     early_close_profit_loss: Callable[[], None]
     early_close_cancel: Callable[[], None]
     individual_liquidation: Callable[[str, str], None]
+    start: Callable[[], None] | None = None
+    unregister: Callable[[], None] | None = None
+    stock_register: Callable[[], None] | None = None
+    time_change: Callable[[], None] | None = None
+    time_reset: Callable[[], None] | None = None
+    ats_settings: Callable[[], None] | None = None
+    set_operation_exclusion: Callable[[], None] | None = None
+    clear_operation_exclusion: Callable[[], None] | None = None
 
 
 class _MenuStatusIconEngine(QIconEngine):
@@ -138,13 +144,11 @@ def _selected_emergency_state(selected: list[tuple[object, str, str]]) -> tuple[
     has_non_emergency = False
     for stock_dir, _code, _name in selected:
         state = read_json_dict(stock_dir / "state.json")
-        status = str(state.get("status", "") or "").strip().upper()
-        if status in _EMERGENCY_STATUSES:
+        if is_emergency_stopped_state(state):
             has_emergency = True
         else:
             has_non_emergency = True
     return has_emergency, has_non_emergency
-
 
 
 def _stock_register_context_instance_metadata(window) -> dict[str, object] | None:
@@ -173,10 +177,8 @@ def _stock_register_context_instance_metadata(window) -> dict[str, object] | Non
     return target
 
 
-
 def _stock_register_context_action_visible(window) -> bool:
     return _stock_register_context_instance_metadata(window) is not None
-
 
 
 def _add_early_close_menu(
@@ -328,15 +330,40 @@ def show_monitor_stock_context_menu(
     *,
     has_selection: bool,
     callbacks: StockContextMenuCallbacks,
+    selected_modes: set[str] | None = None,
+    operation_excluded: bool = False,
 ) -> None:
     """Show the monitoring stock-row profile with the shared menu form."""
 
     menu = _new_stock_context_menu(parent)
     operation_policy = _context_menu_operation_policy()
 
-    action_select_all = menu.addAction("전체 선택")
-    action_clear_selection = menu.addAction("전체 해제")
+    action_stock_register = None
+    if callbacks.stock_register is not None:
+        action_stock_register = menu.addAction("종목등록")
+        action_stock_register.setEnabled(has_selection)
 
+    action_start = None
+    if callbacks.start is not None:
+        action_start = menu.addAction("운영시작")
+        action_start.setEnabled(has_selection)
+        menu.addSeparator()
+    action_select_all = menu.addAction("전체선택")
+    action_clear_selection = menu.addAction("전체해제")
+
+    action_set_exclusion = None
+    action_clear_exclusion = None
+    if operation_excluded and callbacks.clear_operation_exclusion is not None:
+        action_clear_exclusion = menu.addAction("제외해제")
+        action_clear_exclusion.setEnabled(has_selection)
+    elif callbacks.set_operation_exclusion is not None:
+        action_set_exclusion = menu.addAction("운영제외")
+        action_set_exclusion.setEnabled(has_selection)
+
+    action_unregister = None
+    if callbacks.unregister is not None:
+        action_unregister = menu.addAction("등록해제")
+        action_unregister.setEnabled(has_selection)
     menu.addSeparator()
     early_close = _add_early_close_menu(
         menu,
@@ -350,13 +377,35 @@ def show_monitor_stock_context_menu(
         operation_policy=operation_policy,
     )
 
+    action_time_change = None
+    action_time_reset = None
+    action_ats_settings = None
+    selected_modes = set(selected_modes or ())
+    if selected_modes == {"SCHEDULED"}:
+        menu.addSeparator()
+        action_time_change = menu.addAction("시간변경")
+        action_time_reset = menu.addAction("변경리셋")
+    elif selected_modes == {"CONTINUOUS"}:
+        menu.addSeparator()
+        action_ats_settings = menu.addAction("ATS설정")
+
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
-    if chosen == action_select_all:
+    if action_start is not None and chosen == action_start:
+        callbacks.start()
+    elif action_stock_register is not None and chosen == action_stock_register:
+        callbacks.stock_register()
+    elif chosen == action_select_all:
         callbacks.select_all()
     elif chosen == action_clear_selection:
         callbacks.clear_selection()
+    elif action_set_exclusion is not None and chosen == action_set_exclusion:
+        callbacks.set_operation_exclusion()
+    elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
+        callbacks.clear_operation_exclusion()
+    elif action_unregister is not None and chosen == action_unregister:
+        callbacks.unregister()
     elif _dispatch_early_close_action(
         chosen,
         early_close,
@@ -371,6 +420,15 @@ def show_monitor_stock_context_menu(
         callbacks.individual_liquidation("현재가", individual["minutes"])
     elif chosen == individual["carry"]:
         callbacks.individual_liquidation("이월", individual["minutes"])
+    elif action_time_change is not None and chosen == action_time_change:
+        if callbacks.time_change is not None:
+            callbacks.time_change()
+    elif action_time_reset is not None and chosen == action_time_reset:
+        if callbacks.time_reset is not None:
+            callbacks.time_reset()
+    elif action_ats_settings is not None and chosen == action_ats_settings:
+        if callbacks.ats_settings is not None:
+            callbacks.ats_settings()
     else:
         for minute, action in individual["time_actions"]:
             if chosen == action:
@@ -420,7 +478,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         action_clear_exclusion.setEnabled(has_selection)
     else:
         if running_view:
-            action_set_exclusion = menu.addAction("제외지정")
+            action_set_exclusion = menu.addAction("운영제외")
             action_set_exclusion.setEnabled(has_selection)
         action_unregister = menu.addAction("등록해제")
         action_unregister.setEnabled(has_selection)

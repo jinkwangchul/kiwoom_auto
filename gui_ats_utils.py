@@ -51,6 +51,30 @@ def manual_ats_session_labels() -> dict[str, str]:
         return fallback
 
 
+def manual_ats_visible_session_keys() -> tuple[str, ...]:
+    """ATS settings popup entries enabled by operation policy.
+
+    Existing policies without ``enabled`` predate visibility controls and remain
+    visible for compatibility. Newly created default policies keep their
+    explicit disabled values.
+    """
+    keys = ("extra1", "extra2", "extra3")
+    try:
+        policy = read_operation_policy()
+        sessions = policy.get("extra_sessions", []) if isinstance(policy, dict) else []
+        if not isinstance(sessions, list):
+            return keys
+        return tuple(
+            key
+            for index, key in enumerate(keys)
+            if index >= len(sessions)
+            or not isinstance(sessions[index], dict)
+            or bool(sessions[index].get("enabled", True))
+        )
+    except Exception:
+        return keys
+
+
 
 def manual_ats_selected_keys_and_source(
     config: dict[str, object] | None,
@@ -232,6 +256,7 @@ class ManualAtsSettingsDialog(QDialog):
         initial_state: dict[str, bool] | None = None,
         labels: dict[str, str] | None = None,
         parent: QWidget | None = None,
+        visible_keys: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("ATS설정")
@@ -240,6 +265,10 @@ class ManualAtsSettingsDialog(QDialog):
 
         state = initial_state if isinstance(initial_state, dict) else {}
         label_map = labels if isinstance(labels, dict) else manual_ats_session_labels()
+        allowed_keys = set(visible_keys if visible_keys is not None else manual_ats_visible_session_keys())
+        self.visible_session_keys = tuple(
+            key for key in ("extra1", "extra2", "extra3") if key in allowed_keys
+        )
 
         layout = QVBoxLayout()
         guide = QLabel("사용할 ATS 구간을 선택하세요.")
@@ -253,9 +282,13 @@ class ManualAtsSettingsDialog(QDialog):
         self.check_extra2.setChecked(bool(state.get("extra2", False)))
         self.check_extra3.setChecked(bool(state.get("extra3", False)))
 
-        layout.addWidget(self.check_extra1)
-        layout.addWidget(self.check_extra2)
-        layout.addWidget(self.check_extra3)
+        self._session_checks = {
+            "extra1": self.check_extra1,
+            "extra2": self.check_extra2,
+            "extra3": self.check_extra3,
+        }
+        for key in self.visible_session_keys:
+            layout.addWidget(self._session_checks[key])
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -292,8 +325,12 @@ class ManualAtsSettingsDialog(QDialog):
         }
 
     def has_any_ats(self) -> bool:
-        values = self.values()
-        return any(bool(values.get(key, False)) for key in ["extra1", "extra2", "extra3"])
+        return bool(self.selected_visible_keys())
+
+    def selected_visible_keys(self) -> tuple[str, ...]:
+        return tuple(
+            key for key in self.visible_session_keys if self._session_checks[key].isChecked()
+        )
 
     def update_sell_button_state(self) -> None:
         enabled = self.has_any_ats()

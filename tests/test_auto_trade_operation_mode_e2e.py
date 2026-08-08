@@ -164,7 +164,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         warning.assert_called_once_with(
             window,
             "선택 오류",
-            "운영방식 변경은 한 종목만 선택해야 합니다.",
+            "운영방식 변경은 종목을 1개 이상 선택해야 합니다.",
         )
 
     def test_active_ats_blocks_mode_change_and_preserves_runtime_selection(self) -> None:
@@ -209,7 +209,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_not_called()
 
-    def test_multi_selection_is_blocked_before_backend_and_preserves_ats(self) -> None:
+    def test_multi_selection_calls_existing_backend_for_each_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             first = self._stock(root, mode="CONTINUOUS", with_ats=True)
@@ -238,9 +238,14 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 (first, "111111", "테스트종목"),
                 (second, "222222", "두번째종목"),
             ]
-            window.update_stock_operation_mode = Mock()
+            window.update_stock_operation_mode = Mock(
+                side_effect=[True, False],
+            )
             with patch.object(status_ops.QMessageBox, "warning") as warning:
-                status_ops.auto_trade_set_selected_operation_mode(window, "SCHEDULED")
+                result = status_ops.auto_trade_set_selected_operation_mode(
+                    window,
+                    "SCHEDULED",
+                )
             configs = [
                 json.loads((path / "config.json").read_text(encoding="utf-8"))
                 for path in (first, second)
@@ -250,16 +255,14 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 for path in (first, second)
             ]
 
-        window.update_stock_operation_mode.assert_not_called()
+        self.assertEqual(2, window.update_stock_operation_mode.call_count)
+        self.assertEqual(1, result["succeeded"])
+        self.assertEqual(1, result["failed"])
         self.assertTrue(all(config["operation_mode"] == "CONTINUOUS" for config in configs))
         self.assertTrue(all("manual_ats_selection" in state for state in states))
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
-        warning.assert_called_once_with(
-            window,
-            "선택 오류",
-            "운영방식 변경은 한 종목만 선택해야 합니다.",
-        )
+        warning.assert_called_once()
 
     def test_context_menu_has_no_operation_mode_change_entry(self) -> None:
         source = (
@@ -286,6 +289,69 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.set_selected_operation_mode.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_not_called()
+
+    def test_operation_column_double_click_defers_backend_until_event_returns(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+        import gui_auto_trade_setting_window as setting_window
+
+        target = (Path("stocks/111111_TEST"), "111111", "테스트")
+        callbacks = []
+        window = SimpleNamespace(
+            stock_table=SimpleNamespace(selectRow=Mock()),
+            operation_stock_dir_from_row=Mock(return_value=target[0]),
+            stock_info_from_row=Mock(return_value=target),
+            _stock_operation_mode_double_click_pending=False,
+        )
+        item = Mock()
+        item.column.return_value = 2
+        item.row.return_value = 3
+
+        with (
+            patch.object(setting_window.QTimer, "singleShot", side_effect=lambda _ms, callback: callbacks.append(callback)),
+            patch.object(setting_window, "handle_auto_trade_operation_mode_double_click") as backend,
+        ):
+            AutoTradeSettingWindow.on_stock_table_item_double_clicked(window, item)
+
+            self.assertEqual(1, len(callbacks))
+            backend.assert_not_called()
+            self.assertTrue(window._stock_operation_mode_double_click_pending)
+            window.stock_table.selectRow.assert_called_once_with(3)
+
+            callbacks[0]()
+
+        backend.assert_called_once_with(window, target)
+        self.assertFalse(window._stock_operation_mode_double_click_pending)
+
+    def test_operation_column_fast_double_click_queues_backend_once(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+        import gui_auto_trade_setting_window as setting_window
+
+        target = (Path("stocks/111111_TEST"), "111111", "테스트")
+        callbacks = []
+        window = SimpleNamespace(
+            stock_table=SimpleNamespace(selectRow=Mock()),
+            operation_stock_dir_from_row=Mock(return_value=target[0]),
+            stock_info_from_row=Mock(return_value=target),
+            _stock_operation_mode_double_click_pending=False,
+        )
+        item = Mock()
+        item.column.return_value = 2
+        item.row.return_value = 3
+
+        with (
+            patch.object(setting_window.QTimer, "singleShot", side_effect=lambda _ms, callback: callbacks.append(callback)),
+            patch.object(setting_window, "handle_auto_trade_operation_mode_double_click") as backend,
+        ):
+            AutoTradeSettingWindow.on_stock_table_item_double_clicked(window, item)
+            AutoTradeSettingWindow.on_stock_table_item_double_clicked(window, item)
+
+            self.assertEqual(1, len(callbacks))
+            backend.assert_not_called()
+
+            callbacks[0]()
+
+        backend.assert_called_once_with(window, target)
+        self.assertFalse(window._stock_operation_mode_double_click_pending)
 
     def test_write_failure_does_not_report_success_and_reloads_runtime_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

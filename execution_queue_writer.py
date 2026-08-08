@@ -718,6 +718,28 @@ def preview_execution_queue_write(
     if duplicate_reason:
         return _blocked("duplicate", duplicate_reason)
 
+    record = {
+        "id": _order_queued_id(order_id, request_hash),
+        "status": "ORDER_QUEUED",
+        "source": "execution_queue_pending",
+        "source_signal_id": source_signal_id,
+        "order_id": order_id,
+        "candidate_id": candidate_id,
+        "queue_pending_id": queue_pending_id,
+        "request_hash": request_hash,
+        "lock_id": execution_lock_id,
+        "execution_id": execution_id,
+        "execution_request": deepcopy(execution_request),
+        "queue_contract_version": _clean_text(pending.get("queue_contract_version")) or "preview-1",
+        "send_order_called": False,
+        "execution_enabled": False,
+        "blocked_reasons": [],
+    }
+    for field in ("execution_intent", "routine_provenance"):
+        value = execution_request.get(field)
+        if isinstance(value, dict):
+            record[field] = deepcopy(value)
+
     return {
         "write_preview": True,
         "write_stage": "order_queued_record_preview_created",
@@ -725,23 +747,7 @@ def preview_execution_queue_write(
         "preview_only": True,
         "no_write": True,
         "blocked_reasons": [],
-        "order_queued_record_preview": {
-            "id": _order_queued_id(order_id, request_hash),
-            "status": "ORDER_QUEUED",
-            "source": "execution_queue_pending",
-            "source_signal_id": source_signal_id,
-            "order_id": order_id,
-            "candidate_id": candidate_id,
-            "queue_pending_id": queue_pending_id,
-            "request_hash": request_hash,
-            "lock_id": execution_lock_id,
-            "execution_id": execution_id,
-            "execution_request": deepcopy(execution_request),
-            "queue_contract_version": _clean_text(pending.get("queue_contract_version")) or "preview-1",
-            "send_order_called": False,
-            "execution_enabled": False,
-            "blocked_reasons": [],
-        },
+        "order_queued_record_preview": record,
     }
 
 

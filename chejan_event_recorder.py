@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from execution_queue_writer import mutate_order_queue, preserve_queue_mutation_result
+from event_journal_trade_observer import observe_broker_chejan_result
 
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
@@ -1244,7 +1245,9 @@ def record_chejan_event(
         "warnings": [],
     }
     result.update({key: value for key, value in mutation_result.items() if key not in result})
-    return preserve_queue_mutation_result(result, mutation_result)
+    final_result = preserve_queue_mutation_result(result, mutation_result)
+    observe_broker_chejan_result(final_result, event)
+    return final_result
 
 
 def inspect_broker_chejan_lifecycle(

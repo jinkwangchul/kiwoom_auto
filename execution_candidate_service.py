@@ -109,12 +109,13 @@ def build_execution_candidate(
 
     if not execution_request_preview:
         return _blocked("preview_result", "execution_request_preview is required")
+    execution_request = _as_dict(execution_request_preview.get("execution_request"))
 
     order_id = _extract_order_id(preview, execution_request_preview)
     source_signal_id = _extract_source_signal_id(execution_request_preview)
     request_hash = _extract_request_hash(preview, request_hash_preview, execution_request_preview)
 
-    return {
+    result = {
         "candidate": True,
         "candidate_stage": "candidate_created",
         "candidate_id": _candidate_id(order_id, request_hash),
@@ -126,3 +127,10 @@ def build_execution_candidate(
         "lock_preview": deepcopy(lock_preview),
         "execution_request_preview": deepcopy(execution_request_preview),
     }
+    execution_intent = execution_request.get("execution_intent")
+    if isinstance(execution_intent, dict):
+        result["execution_intent"] = deepcopy(execution_intent)
+    routine_provenance = execution_request.get("routine_provenance")
+    if isinstance(routine_provenance, dict):
+        result["routine_provenance"] = deepcopy(routine_provenance)
+    return result

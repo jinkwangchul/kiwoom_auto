@@ -29,11 +29,14 @@ from PyQt5.QtWidgets import (
 
 from gui_stock_data import (
     append_base_stock,
+    base_stock_routines_for_stock,
     is_valid_stock_code,
     load_stock_library,
     normalize_stock_code,
     read_base_stocks,
 )
+from runtime_io import read_json_dict
+from stock_repository import repository as stock_repository_factory
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -75,9 +78,11 @@ class SearchStockRegisterDialog(QDialog):
         self.search_input.setPlaceholderText("검색어 입력")
 
         self.result_table = QTableWidget()
+        self._result_sort_column = -1
+        self._result_sort_order = Qt.AscendingOrder
 
         self.btn_search = QPushButton("검색")
-        self.btn_register = QPushButton("선택 등록")
+        self.btn_register = QPushButton("선택등록")
         self.btn_close = QPushButton("닫기")
 
         self._setup_ui()
@@ -106,10 +111,9 @@ class SearchStockRegisterDialog(QDialog):
 
     def _setup_result_table(self) -> None:
         headers = [
-            "코드",
+            "종목코드",
             "종목명",
-            "시장",
-            "등록상태",
+            "분류",
         ]
 
         self.result_table.setColumnCount(len(headers))
@@ -118,12 +122,11 @@ class SearchStockRegisterDialog(QDialog):
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.setColumnWidth(0, 110)
         self.result_table.setColumnWidth(1, 220)
-        self.result_table.setColumnWidth(2, 120)
-        self.result_table.setColumnWidth(3, 130)
+        self.result_table.setColumnWidth(2, 150)
         self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.result_table.setSortingEnabled(True)
+        self.result_table.setSortingEnabled(False)
         self.result_table.horizontalHeader().setSortIndicatorShown(True)
         self.result_table.setContextMenuPolicy(Qt.CustomContextMenu)
 
@@ -133,6 +136,35 @@ class SearchStockRegisterDialog(QDialog):
         self.btn_register.clicked.connect(self.register_selected_stocks)
         self.btn_close.clicked.connect(self.close)
         self.result_table.customContextMenuRequested.connect(self.show_result_context_menu)
+        self.result_table.horizontalHeader().sectionClicked.connect(
+            self.on_result_header_clicked
+        )
+
+    def on_result_header_clicked(self, column: int) -> None:
+        if column == self._result_sort_column:
+            self._result_sort_order = (
+                Qt.DescendingOrder
+                if self._result_sort_order == Qt.AscendingOrder
+                else Qt.AscendingOrder
+            )
+        else:
+            self._result_sort_column = column
+            self._result_sort_order = Qt.AscendingOrder
+        self._apply_result_sort()
+
+    def _apply_result_sort(self) -> None:
+        if self._result_sort_column < 0:
+            self.result_table.setSortingEnabled(False)
+            return
+        self.result_table.setSortingEnabled(True)
+        self.result_table.horizontalHeader().setSortIndicator(
+            self._result_sort_column,
+            self._result_sort_order,
+        )
+        self.result_table.sortItems(
+            self._result_sort_column,
+            self._result_sort_order,
+        )
 
     def show_result_context_menu(self, position) -> None:
         """
@@ -143,7 +175,7 @@ class SearchStockRegisterDialog(QDialog):
         action_select_all = menu.addAction("전체 선택")
         action_clear_selection = menu.addAction("전체 해제")
         menu.addSeparator()
-        action_register_selected = menu.addAction("선택 등록")
+        action_register_selected = menu.addAction("선택등록")
 
         has_rows = self.result_table.rowCount() > 0
         has_selection = bool(self.result_table.selectionModel().selectedRows())
@@ -222,11 +254,11 @@ class SearchStockRegisterDialog(QDialog):
             code = stock.get("code", "").strip()
             name = stock.get("name", "").strip()
             registered = code in existing_codes or name in existing_names
+            status_text = self._registration_status_text(code, name) if registered else "등록대기"
             values = [
                 code,
                 name,
-                stock.get("market", ""),
-                "등록됨" if registered else "미등록",
+                status_text,
             ]
 
             for col, value in enumerate(values):
@@ -235,7 +267,7 @@ class SearchStockRegisterDialog(QDialog):
                 item.setData(Qt.UserRole, value)
                 self.result_table.setItem(row, col, item)
 
-        self.result_table.setSortingEnabled(True)
+        self._apply_result_sort()
         self.result_table.clearSelection()
 
     def register_selected_stocks(self) -> None:
@@ -335,9 +367,9 @@ class SearchStockRegisterDialog(QDialog):
 
         result_message = (
             "종목 등록 처리가 완료되었습니다.\n\n"
-            f"신규등록 : {completed_count}개\n"
-            f"등록제외 : {duplicate_count}개\n"
-            f"등록불가 : {error_count}개"
+            f"등록 {completed_count}건 | "
+            f"중복 {duplicate_count}건 | "
+            f"차단 {error_count}건"
         )
 
         if error_count > 0:
@@ -354,3 +386,13 @@ class SearchStockRegisterDialog(QDialog):
             result_message,
         )
 
+    def _registration_status_text(self, code: str, name: str) -> str:
+        stock_dir = stock_repository_factory().resolve_stock_dir(code, name)
+        if isinstance(stock_dir, Path) and stock_dir.exists():
+            state = read_json_dict(stock_dir / "state.json")
+            if str(state.get("status", "") or "").strip().upper() == "REVIEW_REQUIRED" or state.get("review_required") is True:
+                return "검토관리"
+
+        _exists, routines = base_stock_routines_for_stock(code, name)
+        routine_name = str(routines[0]).strip() if routines else ""
+        return routine_name or "등록대기"

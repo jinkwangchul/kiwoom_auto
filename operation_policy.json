@@ -5,25 +5,27 @@
   },
   "extra_sessions": [
     {
+      "enabled": false,
       "name": "장전프리",
       "start_time": "08:00:00",
       "end_time": "08:50:00"
     },
     {
-      "name": "마감후NTX",
-      "start_time": "15:30:00",
+      "enabled": false,
+      "name": "장마감NTX",
+      "start_time": "15:40:00",
       "end_time": "19:50:00"
     },
     {
-      "name": "미지정",
-      "start_time": "00:00:00",
-      "end_time": "00:00:00"
+      "enabled": false,
+      "name": "추가시간3",
+      "start_time": "",
+      "end_time": ""
     }
   ],
   "scheduled_operation": {
-    "default_start_time": "09:30:00",
-    "default_end_buy_time": "13:30:00",
-    "after_buy_end_status": "감시/매도"
+    "default_start_time": "09:00:00",
+    "default_end_buy_time": "13:30:00"
   },
   "manual_operation": {
     "use_regular_market": true,
@@ -36,8 +38,8 @@
   },
   "auto_close": {
     "method": "루틴매도신호",
-    "profit_percent": "2.07",
-    "loss_percent": "0.45"
+    "profit_percent": "",
+    "loss_percent": ""
   },
   "early_close": {
     "method": "루틴매도신호",
@@ -45,8 +47,14 @@
     "loss_percent": ""
   },
   "liquidation": {
-    "minutes_before_regular_close": "10",
+    "minutes_before_regular_close": "5",
     "method": "시장가"
   },
-  "updated_at": "2026-06-16 08:18:22"
+  "starting_budget_defaults": {
+    "quantity": 1,
+    "amount_multiplier": 1.5,
+    "limit_recommended_multiplier": 100.0,
+    "limit_minimum_multiplier": 25.0
+  },
+  "updated_at": "2026-08-07 13:42:44"
 }

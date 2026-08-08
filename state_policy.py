@@ -353,13 +353,19 @@ def read_global_schedule() -> dict[str, str]:
     return {"start_time": start_time, "end_buy_time": end_buy_time}
 
 
-def write_global_schedule(start_time: str, end_buy_time: str) -> None:
+def write_global_schedule(
+    start_time: str,
+    end_buy_time: str,
+    *,
+    path: Path | None = None,
+) -> None:
     data = {
         "start_time": normalized_hhmmss_or_empty(start_time) or "09:00:00",
         "end_buy_time": normalized_hhmmss_or_empty(end_buy_time) or "13:30:00",
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    GLOBAL_SCHEDULE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    target_path = Path(path) if path is not None else GLOBAL_SCHEDULE_PATH
+    target_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def schedule_override_enabled(config: dict[str, object], global_schedule: dict[str, str] | None = None) -> bool:

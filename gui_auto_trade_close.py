@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui_operation_ui_context import operation_dialog_parent
 
 from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
@@ -33,9 +34,15 @@ from gui_order_utils import order_value
 from gui_order_utils import pending_order_side_quantities
 from gui_order_utils import read_orders_data
 from runtime_io import read_json_dict
+from gui_auto_trade_runtime import parse_stock_folder_name
+from gui_auto_trade_table_loader import _selected_instance_stock_dirs
 from gui_toast import show_toast
 from state_policy import auto_trade_status_display
-from gui_auto_trade_integrity import auto_trade_setting_data_inconsistency_reasons
+from gui_auto_trade_integrity import (
+    auto_trade_setting_data_inconsistency_reasons,
+    is_emergency_stopped_state,
+    is_review_required_state,
+)
 from gui_auto_trade_policy import (
     operation_policy_section,
     auto_trade_setting_early_close_requested,
@@ -59,9 +66,13 @@ from close_liquidation_execution_pipeline import (
     commit_close_liquidation_candidate_preview,
     normalize_direct_liquidation_method,
 )
+from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from operation_close_completion_check_service import (
+    SOURCE_EARLY_CLOSE_DURABLE_UPDATE,
+    check_global_close_completion_after_durable_update,
+)
 from operation_command_service import (
     COMMAND_INDIVIDUAL_LIQUIDATION,
-    EarlyCloseCompatibility,
     IndividualLiquidationOverride,
     MODE_EARLY_CLOSE,
     MODE_NORMAL,
@@ -674,6 +685,13 @@ def auto_trade_continue_pending_close_liquidations(
                     "stage": "runtime_state_write",
                     "blocked_reasons": ["early close Runtime state write failed"],
                 }
+            else:
+                result = {
+                    **result,
+                    "completion_check_result": check_global_close_completion_after_durable_update(
+                        source=SOURCE_EARLY_CLOSE_DURABLE_UPDATE,
+                    ),
+                }
         results.append(
             {
                 "stock_dir": str(stock_path),
@@ -811,6 +829,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     method: str,
     minutes_before_regular_close: str = "5",
 ) -> None:
+    dialog_parent = operation_dialog_parent(window)
     normalized_method = short_close_method_text(method)
     if normalized_method not in {"시장가", "현재가", "이월"}:
         return
@@ -944,7 +963,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     if not completed:
         if failed:
             QMessageBox.critical(
-                window,
+                dialog_parent,
                 "개별청산 요청 오류",
                 "개별청산 요청을 Runtime에 반영하지 못했습니다.\n\n"
                 + "\n".join(failed),
@@ -961,7 +980,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     )
     if failed:
         QMessageBox.warning(
-            window,
+            dialog_parent,
             "개별청산 일부 실패",
             "\n".join(failed),
         )
@@ -969,15 +988,49 @@ def auto_trade_apply_selected_individual_liquidation_method(
 
 
 def auto_trade_apply_selected_early_close_default(window) -> None:
-    """외부 조기마감 버튼: 환경설정의 조기마감 디폴트값을 선택 종목에 즉시 적용한다."""
+    """외부 조기마감 버튼: 좌측 선택 scope의 현재 등록 종목에 디폴트값을 적용한다."""
     method = str(operation_policy_section("early_close").get("method", "루틴")).strip() or "루틴"
-    window.apply_selected_early_close(method, source="디폴트값")
+    selected = _early_close_scope_stock_infos(window)
+    auto_trade_apply_selected_early_close(
+        window,
+        method,
+        source="디폴트값",
+        selected=selected,
+    )
+
+
+def _early_close_scope_stock_infos(window) -> list[tuple[Path, str, str]]:
+    result: list[tuple[Path, str, str]] = []
+    for stock_dir in _selected_instance_stock_dirs(window):
+        code, name = parse_stock_folder_name(stock_dir.name)
+        if not code:
+            config = read_json_dict(stock_dir / "config.json")
+            code = str(config.get("code") or config.get("stock_code") or "").strip()
+            name = str(config.get("name") or config.get("stock_name") or "").strip()
+        if not code:
+            continue
+        result.append((stock_dir, code, name))
+    return result
+
+
+def _kiwoom_server_login_block_message(window) -> str:
+    try:
+        parent = window.parent()
+    except Exception:
+        parent = None
+    api = getattr(parent, "kiwoom_api", None)
+    checker = getattr(api, "is_connected", None)
+    try:
+        connected = callable(checker) and checker() is True
+    except Exception:
+        connected = False
+    return "" if connected else "키움 서버에 로그인되어 있지 않습니다."
 
 
 
 def auto_trade_apply_selected_early_close_profit_loss(window) -> None:
     """우클릭 조기마감 > 손/익절: 익절/손절 비율을 분리 입력 후 전환한다."""
-    dialog = ProfitLossEarlyCloseDialog(window)
+    dialog = ProfitLossEarlyCloseDialog(operation_dialog_parent(window))
     if dialog.exec_() != QDialog.Accepted:
         return
 
@@ -1259,25 +1312,12 @@ def auto_trade_cancel_selected_early_close(window) -> None:
     notify(success_message)
 
 
-def _kiwoom_server_login_block_message(window) -> str:
-    try:
-        parent = window.parent()
-    except Exception:
-        parent = None
-    api = getattr(parent, "kiwoom_api", None)
-    checker = getattr(api, "is_connected", None)
-    try:
-        connected = callable(checker) and checker() is True
-    except Exception:
-        connected = False
-    return "" if connected else "키움 서버에 로그인되어 있지 않습니다."
-
-
 def auto_trade_apply_selected_early_close(
     window,
     method: str,
     source: str = "우클릭",
     extra_policy: dict[str, object] | None = None,
+    selected: list[tuple[Path, str, str]] | None = None,
 ) -> None:
     """선택 종목에 조기마감 명령을 적용한다.
 
@@ -1291,11 +1331,12 @@ def auto_trade_apply_selected_early_close(
         show_toast(window, login_block_message, duration_ms=2500)
         return
 
-    selected = window.selected_stock_infos()
+    selected = selected if selected is not None else window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
+    dialog_parent = operation_dialog_parent(window)
 
     def show_ok_message(icon, title: str, message: str) -> None:
-        box = QMessageBox(window)
+        box = QMessageBox(dialog_parent)
         box.setIcon(icon)
         box.setWindowTitle(title)
         box.setText(message)
@@ -1318,6 +1359,7 @@ def auto_trade_apply_selected_early_close(
     review_items: list[str] = []
     no_target_items: list[str] = []
     skipped_preview_items: list[str] = []
+    early_close_applied_count = 0
 
     for stock_dir, code, name in selected:
         state = read_json_dict(stock_dir / "state.json")
@@ -1326,14 +1368,11 @@ def auto_trade_apply_selected_early_close(
             config = default_config()
 
         status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        if status in {
-            "EMERGENCY_STOPPED",
-            "EMERGENCY_STOP",
-            "EMERGENCY",
-            "REVIEW_REQUIRED",
-            "REVIEW",
-        }:
+        if is_emergency_stopped_state(state):
             skipped_preview_items.append(f"{code} {name}({auto_trade_status_display(status)})")
+            continue
+        if is_review_required_state(state):
+            skipped_preview_items.append(f"{code} {name}(검토종목)")
             continue
 
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
@@ -1383,7 +1422,7 @@ def auto_trade_apply_selected_early_close(
 
         preview = "\n\n".join(preview_parts) if preview_parts else "대상 없음"
 
-        box = QMessageBox(window)
+        box = QMessageBox(dialog_parent)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("조기마감 확인")
         box.setText(
@@ -1402,20 +1441,14 @@ def auto_trade_apply_selected_early_close(
 
     completed: list[str] = []
     skipped: list[str] = []
-    early_close_applied_count = 0
-    command_service = OperationCommandService(PROJECT_ROOT)
-
     for stock_dir, code, name in selected:
         state = read_json_dict(stock_dir / "state.json")
         status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        if status in {
-            "EMERGENCY_STOPPED",
-            "EMERGENCY_STOP",
-            "EMERGENCY",
-            "REVIEW_REQUIRED",
-            "REVIEW",
-        }:
+        if is_emergency_stopped_state(state):
             skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
+            continue
+        if is_review_required_state(state):
+            skipped.append(f"{code} {name}(검토종목)")
             continue
 
         config = read_json_dict(stock_dir / "config.json")
@@ -1482,19 +1515,33 @@ def auto_trade_apply_selected_early_close(
                 f"{code} {name}(정책 전환 차단:{transition.reason_code})"
             )
             continue
-        command_result = command_service.apply_early_close(
-            OperationCommandRequest(
-                target_scope=SCOPE_STOCK,
-                target_id=str(stock_dir.resolve()),
-                command=MODE_EARLY_CLOSE,
-                source=source,
-            ),
-            EarlyCloseCompatibility(
-                method=method_text,
-                policy=dict(extra_policy or {}),
-                has_close_progress_quantity=has_close_progress_qty,
-            ),
+        intent_result = apply_close_intent(
+            intent=CLOSE_INTENT_EARLY_CLOSE,
+            target_scope=SCOPE_STOCK,
+            target_id=str(stock_dir.resolve()),
+            source=source,
+            requested_policy=method_text,
+            has_close_progress_quantity=has_close_progress_qty,
+            extra_policy=dict(extra_policy or {}),
+            stock_code=code,
+            runtime_state=state,
+            runtime_routine_instance_id=routine_instance_id,
+            current_policy=current_policy,
+            current_started_at=current_started_at,
+            current_command_id=current_command_id,
+            requested_at=transition_requested_at,
+            project_root=PROJECT_ROOT,
+            queue_path=ORDER_QUEUE_PATH,
+            fills_path=FILLS_PATH,
+            operation_command_service_factory=OperationCommandService,
+            transition_guard=evaluate_production_transition,
         )
+        command_result = intent_result.get("command_result")
+        if command_result is None:
+            skipped.append(
+                f"{code} {name}({intent_result.get('reason') or '紐낅졊 ?곸슜 ?ㅽ뙣'})"
+            )
+            continue
         if command_result.status == RESULT_FAILED or command_result.failed:
             reason = command_result.error
             if command_result.failed:
@@ -1540,6 +1587,12 @@ def auto_trade_apply_selected_early_close(
         if not persisted:
             skipped.append(f"{code} {name}(조기마감 상태 저장 실패)")
             continue
+        execution = {
+            **execution,
+            "completion_check_result": check_global_close_completion_after_durable_update(
+                source=SOURCE_EARLY_CLOSE_DURABLE_UPDATE,
+            ),
+        }
         if execution.get("ok") is not True:
             skipped.append(
                 f"{code} {name}("

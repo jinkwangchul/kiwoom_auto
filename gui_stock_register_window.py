@@ -63,6 +63,7 @@ from PyQt5.QtWidgets import (QFrame,
 
 from integrity_checker import (
     LOCAL_STATUS_CHECK_ERROR,
+    LOCAL_STATUS_INTEGRITY_ISSUE,
     LOCAL_STATUS_PASS,
     LOCAL_STATUS_REVIEW_REQUIRED,
     apply_integrity_review_required_issues,
@@ -286,7 +287,21 @@ LOGGER = logging.getLogger(__name__)
 UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
 STOCK_RESET_INITIALIZABLE = "INITIALIZABLE"
 STOCK_RESET_NOT_INITIALIZABLE = "NOT_INITIALIZABLE"
-STOCK_RESET_RUNNING_STATUSES = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
+STOCK_RESET_ACTIVE_TRADING_STATUSES = {"RUNNING", "STARTED", "AUTO", "TRADING"}
+STOCK_RESET_CLOSING_STATUSES = {"AUTO_CLOSE", "AUTO_CLOSING", "AUTO_CLOSED"}
+STOCK_RESET_LEGACY_CLOSING_STATUSES = {
+    # Legacy compatibility only. New canonical closing states use AUTO_CLOSE
+    # variants, but old SELL_ONLY-family values must still block reset safely.
+    "SELL_ONLY",
+    "WATCH_SELL",
+    "BUY_SUSPENDED",
+    "BUY_STOPPED",
+}
+STOCK_RESET_RUNNING_STATUSES = (
+    STOCK_RESET_ACTIVE_TRADING_STATUSES
+    | STOCK_RESET_CLOSING_STATUSES
+    | STOCK_RESET_LEGACY_CLOSING_STATUSES
+)
 STOCK_RESET_KNOWN_STATUSES = {
     "STOPPED",
     "STOP",
@@ -417,6 +432,24 @@ def stock_runtime_dirs_for_stock(code: str, name: str) -> list[tuple[str, Path]]
     return assigned_runtime_dirs_for_stock(code, name)
 
 
+def stock_reset_stock_dirs_for_stock(code: str, name: str) -> list[Path]:
+    """
+    종목초기화 전용 중앙 stocks/ 폴더를 반환한다.
+
+    루틴 배정 여부는 초기화 가능 여부가 아니므로 assigned runtime helper를
+    사용하지 않는다.
+    """
+    repo = stock_repository_factory()
+    matches: list[Path] = []
+    clean_code = str(code or "").strip()
+    clean_name = str(name or "").strip()
+    for stock_dir in repo.list_stock_dirs():
+        parsed_code, parsed_name = repo.parse_stock_folder(stock_dir)
+        if parsed_code == clean_code and parsed_name == clean_name:
+            matches.append(Path(stock_dir))
+    return matches
+
+
 def _read_json_dict_for_stock_reset(path: Path) -> tuple[dict[str, object], str]:
     if not path.exists():
         return {}, "파일 없음"
@@ -488,24 +521,23 @@ def stock_reset_eligibility(code: str, name: str) -> dict[str, object]:
     정책과 섞지 않는다. 판정 중 Runtime이나 주문 파일을 수정하지 않는다.
     """
     try:
-        runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+        stock_dirs = stock_reset_stock_dirs_for_stock(code, name)
     except Exception as exc:
         LOGGER.error(
-            "stock reset eligibility failed to resolve runtime dirs: code=%s name=%s error=%s",
+            "stock reset eligibility failed to resolve central stock dirs: code=%s name=%s error=%s",
             code,
             name,
             exc,
         )
         return _stock_reset_not_initializable("종목 저장 위치 확인 실패", None)
 
-    if not runtime_dirs:
+    if not stock_dirs:
         return _stock_reset_not_initializable("종목 저장 위치 없음", None)
 
-    if len(runtime_dirs) != 1:
+    if len(stock_dirs) != 1:
         return _stock_reset_not_initializable("종목 저장 위치 중복", None)
 
-    _routine_name, stock_dir = runtime_dirs[0]
-    stock_dir = Path(stock_dir)
+    stock_dir = Path(stock_dirs[0])
     if not stock_dir.exists() or not stock_dir.is_dir():
         return _stock_reset_not_initializable("종목 저장 위치 없음", stock_dir)
 
@@ -530,8 +562,10 @@ def stock_reset_eligibility(code: str, name: str) -> dict[str, object]:
     if is_emergency_stopped_state(state):
         return _stock_reset_not_initializable("긴급정지 상태", stock_dir)
 
-    if raw_status in STOCK_RESET_RUNNING_STATUSES:
+    if raw_status in STOCK_RESET_ACTIVE_TRADING_STATUSES:
         return _stock_reset_not_initializable("운영 중", stock_dir)
+    if raw_status in STOCK_RESET_CLOSING_STATUSES or raw_status in STOCK_RESET_LEGACY_CLOSING_STATUSES:
+        return _stock_reset_not_initializable("마감 진행 중", stock_dir)
 
     if _state_has_in_progress_lifecycle(state):
         return _stock_reset_not_initializable("진행 중인 명령 또는 전환 상태", stock_dir)
@@ -1701,6 +1735,8 @@ class StockRegisterWindow(QDialog):
             return "", ""
         if text.startswith("검토관리"):
             return "⚠", "#d97706"
+        if text.startswith("로컬 의미 무결성 문제"):
+            return "⚠", "#d97706"
         if text == "검사 대상 종목 없음":
             return "ⓘ", "#475569"
         if "실패" in text or "오류" in text:
@@ -1824,6 +1860,11 @@ class StockRegisterWindow(QDialog):
             if local_status == LOCAL_STATUS_CHECK_ERROR:
                 self._set_integrity_status_text("무결성 검사 실패")
                 self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
+                return
+
+            if local_status == LOCAL_STATUS_INTEGRITY_ISSUE:
+                self._set_integrity_status_text("로컬 의미 무결성 문제 발견")
+                self._show_integrity_toast("로컬 의미 무결성 검사 완료 | 종목 상태값을 확인하세요.")
                 return
 
             if local_status == LOCAL_STATUS_PASS:

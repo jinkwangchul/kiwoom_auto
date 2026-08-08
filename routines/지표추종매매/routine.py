@@ -20,6 +20,22 @@ from typing import Any
 import json
 from pathlib import Path
 
+try:
+    from routine_cycle_projection import project_indicator_follow_cycle  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .routine_cycle_projection import project_indicator_follow_cycle  # type: ignore
+    except Exception:  # pragma: no cover
+        project_indicator_follow_cycle = None
+
+try:
+    from routine_buy_execution import build_indicator_follow_buy_intent  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .routine_buy_execution import build_indicator_follow_buy_intent  # type: ignore
+    except Exception:  # pragma: no cover
+        build_indicator_follow_buy_intent = None
+
 
 try:
     from routine_macd_engine import (  # type: ignore
@@ -77,6 +93,37 @@ except Exception as first_exc:  # pragma: no cover
 ROUTINE_NAME = "지표추종매매"
 ROUTINE_API_VERSION = "0.2"
 EXECUTION_ENABLED = False
+ROUTINE_TYPE = "INDICATOR_FOLLOW"
+
+
+def project_cycle_context(
+    *,
+    code: str,
+    routine_instance_id: str,
+    order_queue: Any,
+    fills: Any,
+    positions: Any,
+) -> dict[str, Any]:
+    if not callable(project_indicator_follow_cycle):
+        return {
+            "status": "unresolved",
+            "active": False,
+            "confirmed_buy_round": None,
+            "cumulative_filled_buy_amount": None,
+            "holding_qty": 0,
+            "avg_price": 0.0,
+            "last_buy_order_identity": None,
+            "partial_sell": False,
+            "cycle_ended": False,
+            "unresolved_reason": "CYCLE_PROJECTION_IMPORT_FAILED",
+        }
+    return project_indicator_follow_cycle(
+        code=code,
+        routine_instance_id=routine_instance_id,
+        order_queue=order_queue,
+        fills=fills,
+        positions=positions,
+    )
 
 
 def get_routine_info() -> dict[str, Any]:
@@ -170,9 +217,53 @@ def evaluate(context: dict[str, Any] | None = None) -> dict[str, Any]:
 
     candles = _extract_candles(context)
     config = _extract_config(context)
+    observer = context.get("decision_trace_observer")
+    set_effective_rules = getattr(observer, "set_effective_rules", None)
+    if callable(set_effective_rules):
+        try:
+            set_effective_rules(config)
+        except Exception:
+            pass
 
     signal = evaluate_indicator_follow_routine(candles, config, context)
     result = signal_to_dict(signal)
+    cycle = context.get("cycle")
+    if isinstance(cycle, dict):
+        result["cycle"] = dict(cycle)
+        if str(result.get("signal") or "").strip().upper() == "BUY":
+            if str(cycle.get("status") or "").strip().lower() == "unresolved":
+                result["signal"] = None
+                result["reason"] = "매매사이클 체결 상태를 확인할 수 없어 BUY를 차단합니다."
+                result["buy_execution_blocked"] = True
+                result["buy_execution_blocked_reason"] = cycle.get("unresolved_reason")
+            else:
+                confirmed_round = cycle.get("confirmed_buy_round")
+                cumulative_amount = cycle.get("cumulative_filled_buy_amount")
+                result["buy_execution_runtime_state"] = {
+                    "confirmed_current_buy_round": confirmed_round,
+                    "confirmed_cumulative_buy_budget": cumulative_amount,
+                }
+                result["next_buy_round"] = (
+                    confirmed_round + 1 if isinstance(confirmed_round, int) else None
+                )
+                result["buy_phase"] = "BASE" if confirmed_round == 0 else "REPEAT"
+                if not callable(build_indicator_follow_buy_intent):
+                    result["signal"] = None
+                    result["buy_execution_blocked"] = True
+                    result["buy_execution_blocked_reason"] = "BUY_EXECUTION_BRIDGE_IMPORT_FAILED"
+                else:
+                    execution = build_indicator_follow_buy_intent(
+                        buy_signal_result=result,
+                        context=context,
+                    )
+                    if execution.get("status") == "READY":
+                        result["execution_intent"] = execution.get("execution_intent")
+                        result["buy_execution_policy_status"] = "READY"
+                    else:
+                        result["signal"] = None
+                        result["buy_execution_blocked"] = True
+                        result["buy_execution_blocked_reason"] = execution.get("reason")
+                        result["buy_execution_policy_status"] = "BLOCKED"
     result["routine"] = ROUTINE_NAME
     result["execution_enabled"] = EXECUTION_ENABLED
     result["engine"] = _ENGINE_SOURCE

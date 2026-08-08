@@ -97,7 +97,7 @@ def build_execution_queue_pending(
     if not _clean_text(execution_request.get("lock_id")):
         return _blocked("candidate", "execution_request.lock_id is required")
 
-    return {
+    result = {
         "queue_pending": True,
         "queue_pending_stage": "queue_pending_created",
         "queue_pending_id": _queue_pending_id(candidate_id),
@@ -114,3 +114,8 @@ def build_execution_queue_pending(
         "lock_preview": deepcopy(lock_preview),
         "execution_request_preview": deepcopy(execution_request_preview),
     }
+    for field in ("execution_intent", "routine_provenance"):
+        value = execution_request.get(field)
+        if isinstance(value, dict):
+            result[field] = deepcopy(value)
+    return result
