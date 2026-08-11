@@ -200,6 +200,96 @@ def evaluate_operation_close_completion(
     }
 
 
+def resolve_liquidation_holding_quantity(
+    stock_code: str,
+    *,
+    positions_path: str | Path = POSITIONS_PATH,
+    broker_holdings_path: str | Path = BROKER_HOLDINGS_PATH,
+) -> dict[str, Any]:
+    """Resolve a liquidation quantity from the latest durable position sources."""
+
+    checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    code = _normalize_stock_code(stock_code)
+    result: dict[str, Any] = {
+        "ok": False,
+        "stock_code": code,
+        "holding_checked_at": checked_at,
+        "position_qty": None,
+        "broker_holding_qty": None,
+        "resolved_liquidation_qty": None,
+        "reconciliation_result": "SOURCE_INVALID",
+        "blocked_reasons": [],
+    }
+    reasons = result["blocked_reasons"]
+    if not code:
+        reasons.append("stock code is invalid")
+        return result
+
+    positions_data, positions_error = _read_json_object(Path(positions_path))
+    broker_data, broker_error = _read_json_object(Path(broker_holdings_path))
+    if positions_error:
+        reasons.append(f"positions: {positions_error}")
+    if broker_error:
+        reasons.append(f"broker_holdings: {broker_error}")
+    if reasons:
+        return result
+
+    position_qtys, position_reason = _quantities_from_collection(
+        positions_data,
+        code,
+        ("positions", "records", "holdings"),
+    )
+    broker_qtys, broker_reason = _quantities_from_collection(
+        broker_data,
+        code,
+        ("broker_holdings", "holdings", "positions", "records"),
+    )
+    if position_reason:
+        reasons.append(f"positions: {position_reason}")
+    if broker_reason:
+        reasons.append(f"broker_holdings: {broker_reason}")
+    if reasons:
+        return result
+
+    position_qty = position_qtys[0] if position_qtys else None
+    broker_qty = broker_qtys[0] if broker_qtys else None
+    result["position_qty"] = position_qty
+    result["broker_holding_qty"] = broker_qty
+
+    if broker_qty is None:
+        result["reconciliation_result"] = "BROKER_SOURCE_MISSING"
+        reasons.append("broker holding quantity is unavailable")
+        return result
+    if position_qty is None:
+        if broker_qty > 0:
+            result["reconciliation_result"] = "BROKER_ONLY"
+            reasons.append("positive broker holding has no matching internal position")
+            return result
+        result.update(
+            {
+                "ok": True,
+                "resolved_liquidation_qty": 0,
+                "reconciliation_result": "CONSISTENT",
+            }
+        )
+        return result
+    if position_qty != broker_qty:
+        result["reconciliation_result"] = "QUANTITY_MISMATCH"
+        reasons.append(
+            f"holding quantity conflict: positions={position_qty}, broker_holdings={broker_qty}"
+        )
+        return result
+
+    result.update(
+        {
+            "ok": True,
+            "resolved_liquidation_qty": position_qty,
+            "reconciliation_result": "CONSISTENT",
+        }
+    )
+    return result
+
+
 def _evaluate_stock(
     stock_code: str,
     *,
@@ -619,6 +709,40 @@ def _quantity_from_collection(
         if qty is not None:
             return qty
     return None
+
+
+def _quantities_from_collection(
+    data: dict[str, Any],
+    stock_code: str,
+    keys: tuple[str, ...],
+) -> tuple[list[int], str]:
+    candidates: list[Any] = []
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+    if isinstance(data.get(stock_code), dict):
+        candidates.append(data[stock_code])
+
+    quantities: list[int] = []
+    for item in candidates:
+        if not isinstance(item, dict) or _record_code(item) != stock_code:
+            continue
+        raw_qty = next(
+            (
+                item[key]
+                for key in ("quantity", "holding_quantity", "holding_qty", "qty")
+                if key in item
+            ),
+            None,
+        )
+        qty = _int_or_none(raw_qty)
+        if qty is None or qty < 0:
+            return [], "matching record has an invalid quantity"
+        quantities.append(qty)
+    if len(quantities) > 1:
+        return [], "multiple matching quantity records found"
+    return quantities, ""
 
 
 def _record_code(item: dict[str, Any]) -> str:

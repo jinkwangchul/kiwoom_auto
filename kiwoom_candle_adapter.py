@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from candle_manager import save_candles
+from candle_manager import DEFAULT_CANDLES_MAX_COUNT, load_candles, save_candles
+from candle_timeframe_aggregation import candle_market_datetime
 from stock_repository import StockRepository
 
 
@@ -91,9 +92,28 @@ def save_minute_candles_for_stock(
     code: str,
     name: str,
     rows: list[dict[str, Any]],
-    max_count: int = 300,
+    max_count: int = DEFAULT_CANDLES_MAX_COUNT,
 ) -> list[dict[str, Any]]:
-    """Normalize opt10080 rows and save them to stocks/{code}_{name}/candles.json."""
+    """Merge one current trade day's opt10080 rows into candles.json."""
     stock_dir = StockRepository().resolve_stock_dir(code, name)
-    candles = normalize_opt10080_rows(rows)
-    return save_candles(stock_dir, candles, max_count=max_count)
+    incoming = normalize_opt10080_rows(rows)
+    if not incoming:
+        return load_candles(stock_dir)
+
+    incoming_times = [
+        bar_time
+        for candle in incoming
+        if (bar_time := candle_market_datetime(candle)) is not None
+    ]
+    if not incoming_times:
+        return load_candles(stock_dir)
+    target_date = max(incoming_times).date()
+
+    merged_by_minute: dict[Any, dict[str, Any]] = {}
+    for candle in load_candles(stock_dir) + incoming:
+        bar_time = candle_market_datetime(candle)
+        if bar_time is None or bar_time.date() != target_date:
+            continue
+        merged_by_minute[bar_time] = candle
+    merged = [merged_by_minute[key] for key in sorted(merged_by_minute)]
+    return save_candles(stock_dir, merged, max_count=max_count)

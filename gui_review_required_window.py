@@ -41,6 +41,8 @@ from gui_order_utils import pending_order_side_quantities
 from gui_review_utils import safe_float_value
 from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
 from gui_table_utils import next_sort_order
+from gui_toast import show_toast
+from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
 from gui_auto_trade_runtime import write_state_json
@@ -50,8 +52,6 @@ from gui_auto_trade_integrity import (
 )
 from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
 PROJECT_ROOT = Path(__file__).resolve().parent
-BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
-ARCHIVED_STOCKS_DIR = PROJECT_ROOT / "archived_stocks"
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 
 REVIEW_UNKNOWN_TEXT = "-"
@@ -308,6 +308,126 @@ def append_stock_log(stock_dir: Path, event_type: str, message: str) -> Path | N
         return log_path
     except Exception:
         return None
+
+
+def append_review_normalization_event(
+    *,
+    event_type: str,
+    source: str,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    destination: str,
+    state_before: dict[str, object],
+    result: dict[str, object],
+) -> dict[str, object]:
+    """Record one finalized review action without participating in its mutation."""
+    status = str(result.get("status", "") or "")
+    journal_result = {
+        "NORMALIZED": "COMPLETED",
+        "BLOCKED": "BLOCKED",
+    }.get(status, "FAILED")
+    severity = {
+        "COMPLETED": "INFO",
+        "BLOCKED": "WARNING",
+        "FAILED": "ERROR",
+    }[journal_result]
+    state_after = read_json_dict(Path(stock_dir) / "state.json")
+    details: dict[str, object] = {"destination": destination}
+    before_status = str(state_before.get("status", "") or "").strip()
+    after_status = str(state_after.get("status", "") or "").strip()
+    previous_routine = str(
+        state_before.get("active_routine")
+        or state_before.get("routine_name")
+        or state_before.get("review_routine")
+        or ""
+    ).strip()
+    review_reason = str(state_before.get("review_reason", "") or "").strip()
+    result_reason = str(result.get("reason", "") or "").strip()
+    restored_routine = str(result.get("routine_name", "") or "").strip()
+    if before_status:
+        details["before_status"] = before_status
+    if after_status:
+        details["after_status"] = after_status
+    if previous_routine:
+        details["previous_routine"] = previous_routine
+    if review_reason:
+        details["review_reason"] = review_reason
+    if result_reason:
+        details["reason"] = result_reason
+    if destination == "RESTORE" and restored_routine:
+        details["restored_routine"] = restored_routine
+    if destination == "UNASSIGNED" and journal_result == "COMPLETED":
+        details["routine_link_released"] = True
+
+    return append_production_event(
+        event_type,
+        severity=severity,
+        result=journal_result,
+        source=source,
+        template_args={"stock_name": name},
+        target_type="STOCK",
+        target_id=code,
+        target_name=name,
+        stock_code=code,
+        stock_name=name,
+        details=details,
+    )
+
+
+def append_review_force_reset_event(
+    *,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    state_before: dict[str, object],
+    result: str,
+    reason: str = "",
+    delete_target_verified: bool,
+) -> dict[str, object]:
+    """Record the one finalized local-project disposal outcome for a stock."""
+    severity = {
+        "COMPLETED": "INFO",
+        "BLOCKED": "WARNING",
+        "FAILED": "ERROR",
+    }[result]
+    details: dict[str, object] = {
+        "delete_target_verified": delete_target_verified,
+        "post_delete_verified": result == "COMPLETED",
+        "local_holding_qty": safe_int_value(state_before.get("holding_qty"), 0),
+    }
+    for key, value in (
+        ("before_status", state_before.get("status")),
+        ("review_status", state_before.get("review_status")),
+        ("review_reason", state_before.get("review_reason")),
+        (
+            "previous_routine",
+            state_before.get("active_routine")
+            or state_before.get("routine_name")
+            or state_before.get("review_routine"),
+        ),
+    ):
+        clean_value = str(value or "").strip()
+        if clean_value:
+            details[key] = clean_value
+    if reason:
+        details["reason"] = reason
+    if result == "COMPLETED":
+        details["final_state"] = "UNREGISTERED"
+
+    return append_production_event(
+        "REVIEW_FORCE_RESET",
+        severity=severity,
+        result=result,
+        source="GlobalReviewRequiredWindow.delete_selected_review_items",
+        template_args={"stock_name": name},
+        target_type="STOCK",
+        target_id=code,
+        target_name=name,
+        stock_code=code,
+        stock_name=name,
+        details=details,
+    )
 
 
 def update_base_stock_routines(code: str, name: str, routines: list[str]) -> bool:
@@ -602,7 +722,7 @@ class GlobalReviewRequiredWindow(QDialog):
         self.table = QTableWidget()
         self.btn_return = QPushButton("복귀")
         self.btn_unassign = QPushButton("미지정")
-        self.btn_delete = QPushButton("삭제")
+        self.btn_delete = QPushButton("강제초기화")
         self.btn_refresh = QPushButton("새로고침")
         self.btn_close = QPushButton("닫기")
         self._review_sort_column = -1
@@ -847,215 +967,233 @@ class GlobalReviewRequiredWindow(QDialog):
         """검토관리 종목을 원래 루틴에 남긴 채 감시/대기 상태로 복귀한다."""
         targets = self.selected_stock_dirs()
         if not targets:
-            QMessageBox.information(self, "복귀", "복귀할 검토종목을 선택하세요.")
+            show_toast(self, "복귀할 검토종목을 선택하세요.")
             return
 
         changed = 0
         blocked: list[str] = []
         failed = 0
-        row_status_by_dir = {
-            str(Path(row.get("stock_dir", ""))): str(
-                row.get("display_status", row.get("return_availability", "")) or ""
-            ).strip()
-            for row in collect_global_review_required_rows()
-        }
+        from gui_main_emergency_ops import normalize_review_emergency_target
 
         for stock_dir, code, name in targets:
-            display_status = row_status_by_dir.get(str(Path(stock_dir)), "")
-            if display_status != "\ud574\uacb0":
-                blocked.append(f"{code} {name}: 해결 상태만 복귀 가능")
-                continue
-
-            state_path = stock_dir / "state.json"
-            state = read_json_dict(state_path)
-            if not isinstance(state, dict):
-                failed += 1
-                continue
-
-            block_reason = self._review_exit_block_reason(stock_dir, state)
-            if block_reason:
-                blocked.append(f"{code} {name}: {block_reason}")
-                continue
-
-            before_status = str(state.get("status", "") or "REVIEW_REQUIRED")
-            self._clear_review_state(state)
-            state["status"] = "MONITORING"
-            state["trade_enabled"] = False
-            state["buy_enabled"] = False
-            state["startup_reset_reason"] = ""
-
-            if write_state_json(stock_dir, state, allow_review_state_transition=True):
-                append_stock_log(stock_dir, "GUI", f"검토관리 복귀: {before_status} -> MONITORING")
+            state_before = read_json_dict(stock_dir / "state.json")
+            result = normalize_review_emergency_target(
+                self,
+                stock_dir,
+                code,
+                name,
+                destination="RESTORE",
+            )
+            append_review_normalization_event(
+                event_type="REVIEW_RETURNED",
+                source="GlobalReviewRequiredWindow.return_selected_items_to_auto_list",
+                stock_dir=stock_dir,
+                code=code,
+                name=name,
+                destination="RESTORE",
+                state_before=state_before,
+                result=result,
+            )
+            status = str(result.get("status", "") or "")
+            if status == "NORMALIZED":
+                append_stock_log(stock_dir, "GUI", "검토관리 복귀: 정상화 완료")
                 changed += 1
+            elif status == "BLOCKED":
+                blocked.append(
+                    f"{code} {name}: {result.get('reason') or '무결성 문제'}"
+                )
             else:
                 failed += 1
 
         self._refresh_after_review_action()
-        message = f"복귀 완료: {changed}개"
-        if blocked:
-            preview = "\n".join(f"- {item}" for item in blocked[:8])
-            if len(blocked) > 8:
-                preview += f"\n- 외 {len(blocked) - 8}개"
-            message += f"\n\n복귀 불가:\n{preview}"
-        if failed:
-            message += f"\n\n실패: {failed}개"
-        QMessageBox.information(self, "복귀 완료", message)
+        unavailable = len(blocked) + failed
+        result_parts: list[str] = []
+        if changed:
+            result_parts.append(f"복귀 완료 {changed}개")
+        if unavailable:
+            result_parts.append(f"복귀 불가 {unavailable}개")
+        show_toast(self, " | ".join(result_parts))
 
     def unassign_selected_review_items(self) -> None:
         """무결성 문제가 해소된 검토관리 종목을 미지정으로 전환한다."""
         targets = self.selected_stock_dirs()
         if not targets:
-            QMessageBox.information(self, "미지정", "미지정으로 전환할 검토종목을 선택하세요.")
-            return
-
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("미지정 확인")
-        box.setText(
-            "선택한 검토종목을 미지정으로 전환하시겠습니까?\n\n"
-            "미지정은 무결성 문제가 해소된 종목만 가능합니다.\n"
-            "종목은 유지하고 루틴 연결만 해제합니다."
-        )
-        proceed_button = box.addButton("진행", QMessageBox.AcceptRole)
-        box.addButton("취소", QMessageBox.RejectRole)
-        box.setDefaultButton(proceed_button)
-        box.exec_()
-        if box.clickedButton() != proceed_button:
+            show_toast(self, "미지정으로 전환할 검토종목을 선택하세요.")
             return
 
         changed = 0
         blocked: list[str] = []
         failed = 0
+        from gui_main_emergency_ops import normalize_review_emergency_target
 
         for stock_dir, code, name in targets:
-            state_path = stock_dir / "state.json"
-            state = read_json_dict(state_path)
-            if not isinstance(state, dict):
-                failed += 1
-                continue
-
-            block_reason = self._review_exit_block_reason(stock_dir, state)
-            if block_reason:
-                blocked.append(f"{code} {name}: {block_reason}")
-                continue
-
-            before_status = str(state.get("status", "") or "REVIEW_REQUIRED")
-            self._clear_review_state(state)
-            state["status"] = "STOPPED"
-            state["trade_enabled"] = False
-            state["buy_enabled"] = False
-            state["active_routine"] = ""
-            state["routine_name"] = ""
-
-            try:
-                update_base_stock_routines(code, name, [])
-                if not write_state_json(stock_dir, state, allow_review_state_transition=True):
-                    failed += 1
-                    continue
-                append_stock_log(stock_dir, "GUI", f"검토관리 미지정 전환: {before_status} -> STOPPED")
+            state_before = read_json_dict(stock_dir / "state.json")
+            result = normalize_review_emergency_target(
+                self,
+                stock_dir,
+                code,
+                name,
+                destination="UNASSIGNED",
+            )
+            append_review_normalization_event(
+                event_type="REVIEW_UNASSIGNED",
+                source="GlobalReviewRequiredWindow.unassign_selected_review_items",
+                stock_dir=stock_dir,
+                code=code,
+                name=name,
+                destination="UNASSIGNED",
+                state_before=state_before,
+                result=result,
+            )
+            status = str(result.get("status", "") or "")
+            if status == "NORMALIZED":
+                append_stock_log(stock_dir, "GUI", "검토관리 미지정 전환: 정상화 완료")
                 changed += 1
-            except Exception:
+            elif status == "BLOCKED":
+                blocked.append(
+                    f"{code} {name}: {result.get('reason') or '무결성 문제'}"
+                )
+            else:
                 failed += 1
 
         if changed:
             append_changelog("UPDATE", "기초종목.txt/state.json", f"검토관리 미지정 전환: {changed}개")
         self._refresh_after_review_action()
 
-        message = f"미지정 전환 완료: {changed}개"
-        if blocked:
-            preview = "\n".join(f"- {item}" for item in blocked[:8])
-            if len(blocked) > 8:
-                preview += f"\n- 외 {len(blocked) - 8}개"
-            message += f"\n\n미지정 불가:\n{preview}"
-        if failed:
-            message += f"\n\n실패: {failed}개"
-        QMessageBox.information(self, "미지정 완료", message)
+        unavailable = len(blocked) + failed
+        result_parts: list[str] = []
+        if changed:
+            result_parts.append(f"미지정 완료 {changed}개")
+        if unavailable:
+            result_parts.append(f"미지정 불가 {unavailable}개")
+        show_toast(self, " | ".join(result_parts))
 
     def delete_selected_review_items(self) -> None:
-        """검토관리 종목을 시스템에서 삭제한다."""
+        """정상화할 수 없는 검토종목의 로컬 프로젝트 데이터를 폐기한다."""
         targets = self.selected_stock_dirs()
         if not targets:
-            QMessageBox.information(self, "삭제", "삭제할 검토종목을 선택하세요.")
+            QMessageBox.information(
+                self,
+                "강제초기화",
+                "강제초기화할 검토종목을 선택하세요.",
+            )
             return
 
-        preview = "\n".join(f"- {code} {name}" for _, code, name in targets[:8])
-        if len(targets) > 8:
-            preview += f"\n- 외 {len(targets) - 8}개"
-
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("검토종목 삭제 확인")
-        box.setText(
-            f"삭제 대상: {len(targets)}건\n\n"
-            f"{preview}\n\n"
-            "삭제 후 복구할 수 없습니다."
+        from gui_stock_register_window import (
+            STOCK_RESET_INITIALIZABLE,
+            confirm_force_stock_reset,
+            delete_stock_project_data,
+            force_stock_reset_preflight,
         )
-        proceed_button = box.addButton("삭제", QMessageBox.AcceptRole)
-        box.addButton("취소", QMessageBox.RejectRole)
-        box.setDefaultButton(proceed_button)
-        box.exec_()
-        if box.clickedButton() != proceed_button:
+
+        prepared_targets: list[tuple[Path, str, str, dict[str, object]]] = []
+        blocked: list[str] = []
+        seen_identities: set[tuple[str, str]] = set()
+        for selected_dir, code, name in targets:
+            state_before = read_json_dict(selected_dir / "state.json")
+            identity = (code, name)
+            if identity in seen_identities:
+                reason = "대상 identity 중복"
+                blocked.append(f"{code} {name}: {reason}")
+                append_review_force_reset_event(
+                    stock_dir=selected_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="BLOCKED",
+                    reason=reason,
+                    delete_target_verified=False,
+                )
+                continue
+            seen_identities.add(identity)
+            preflight = force_stock_reset_preflight(code, name, selected_dir)
+            if preflight.get("status") != STOCK_RESET_INITIALIZABLE:
+                reason = str(preflight.get("reason") or "대상 확인 실패")
+                blocked.append(f"{code} {name}: {reason}")
+                append_review_force_reset_event(
+                    stock_dir=selected_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="BLOCKED",
+                    reason=reason,
+                    delete_target_verified=False,
+                )
+                continue
+            stock_dir = preflight.get("stock_dir")
+            if not isinstance(stock_dir, Path):
+                reason = "대상 경로 확인 실패"
+                blocked.append(f"{code} {name}: {reason}")
+                append_review_force_reset_event(
+                    stock_dir=selected_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="BLOCKED",
+                    reason=reason,
+                    delete_target_verified=False,
+                )
+                continue
+            prepared_targets.append((stock_dir, code, name, state_before))
+
+        if blocked:
+            QMessageBox.information(
+                self,
+                "강제초기화 불가",
+                "강제초기화 대상을 확인할 수 없습니다.\n\n" + "\n".join(blocked[:8]),
+            )
+            return
+
+        if not confirm_force_stock_reset(
+            self,
+            [(code, name) for _, code, name, _ in prepared_targets],
+        ):
             return
 
         deleted = 0
         failed = 0
-        target_keys = {(code, name) for _, code, name in targets}
-
-        try:
-            if BASE_STOCK_PATH.exists():
-                new_lines: list[str] = []
-                for raw_line in BASE_STOCK_PATH.read_text(encoding="utf-8").splitlines():
-                    parts = [part.strip() for part in raw_line.strip().split(",")]
-                    if len(parts) >= 2 and (parts[0], parts[1]) in target_keys:
-                        continue
-                    if raw_line.strip():
-                        new_lines.append(raw_line.strip())
-                BASE_STOCK_PATH.write_text(
-                    "\n".join(new_lines) + ("\n" if new_lines else ""),
-                    encoding="utf-8",
+        for stock_dir, code, name, state_before in prepared_targets:
+            verified = force_stock_reset_preflight(code, name, stock_dir)
+            verified_dir = verified.get("stock_dir")
+            if verified.get("status") != STOCK_RESET_INITIALIZABLE or not isinstance(verified_dir, Path):
+                reason = str(verified.get("reason") or "대상 재확인 실패")
+                append_review_force_reset_event(
+                    stock_dir=stock_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="BLOCKED",
+                    reason=reason,
+                    delete_target_verified=False,
                 )
-        except Exception:
-            failed += len(targets)
-
-        archive_root = ARCHIVED_STOCKS_DIR
-        archive_root.mkdir(exist_ok=True)
-        timestamp = now_text().replace("-", "").replace(":", "").replace(" ", "_")
-
-        try:
-            repo = stock_repository_factory()
-        except Exception:
-            repo = None
-
-        for stock_dir, code, name in targets:
-            try:
-                target_dir = stock_dir
-                if repo is not None:
-                    target_dir = repo.resolve_stock_dir(code, name)
-                if not target_dir.exists() or not target_dir.is_dir():
-                    failed += 1
-                    continue
-
-                try:
-                    if repo is not None:
-                        repo.update_stock_routine(code, name, [])
-                except Exception:
-                    pass
-
-                archive_dir = archive_root / f"{target_dir.name}_{timestamp}"
-                suffix = 1
-                while archive_dir.exists():
-                    suffix += 1
-                    archive_dir = archive_root / f"{target_dir.name}_{timestamp}_{suffix}"
-                target_dir.rename(archive_dir)
+                failed += 1
+                continue
+            result = delete_stock_project_data(code, name, verified_dir)
+            if result.get("status") == "DELETED":
+                append_review_force_reset_event(
+                    stock_dir=stock_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="COMPLETED",
+                    delete_target_verified=True,
+                )
                 deleted += 1
-            except Exception:
+            else:
+                append_review_force_reset_event(
+                    stock_dir=stock_dir,
+                    code=code,
+                    name=name,
+                    state_before=state_before,
+                    result="FAILED",
+                    reason=str(result.get("reason") or "강제초기화 처리 실패"),
+                    delete_target_verified=True,
+                )
                 failed += 1
 
-        if deleted:
-            append_changelog("DELETE", "stocks/archive", f"검토관리 종목 archive 이동: {deleted}개")
         self._refresh_after_review_action()
 
-        message = f"삭제 완료: {deleted}개"
+        message = f"강제초기화 완료: {deleted}개"
         if failed:
             message += f" / 실패 {failed}개"
-        QMessageBox.information(self, "삭제 완료", message)
+        show_toast(self, message)

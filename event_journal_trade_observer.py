@@ -489,6 +489,49 @@ def observe_liquidation_requested(request: Any, command_result: Any) -> list[dic
 
 
 @_fail_open_observer
+def observe_manual_ats_liquidation_outcome(
+    *,
+    command_id: str,
+    stock_code: str,
+    stock_name: str,
+    result: str,
+    details: dict[str, Any],
+    reason_code: str = "",
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    """Record one durable final ATS liquidation outcome per command id."""
+
+    clean_command_id = _text(command_id)
+    clean_code = _text(stock_code)
+    clean_name = _text(stock_name) or clean_code
+    if not clean_command_id or not clean_code:
+        return {
+            "appended": False,
+            "skipped": True,
+            "reason": "ATS_LIQUIDATION_IDENTITY_MISSING",
+        }
+    normalized_result = _text(result).upper()
+    severity = "ERROR" if normalized_result == "FAILED" else "WARNING" if normalized_result == "BLOCKED" else "NOTICE"
+    return append_production_event(
+        "MANUAL_ATS_LIQUIDATION",
+        event_id=f"manual-ats-liquidation:{clean_command_id}",
+        severity=severity,
+        result=normalized_result,
+        source="gui_auto_trade_ats_ops",
+        occurred_at=occurred_at,
+        template_args={"stock_name": clean_name},
+        target_type="STOCK",
+        target_id=clean_code,
+        target_name=clean_name,
+        stock_code=clean_code,
+        stock_name=clean_name,
+        command_id=clean_command_id,
+        reason_code=_text(reason_code) or None,
+        details=dict(details),
+    )
+
+
+@_fail_open_observer
 def observe_liquidation_completed(completion_result: Any) -> list[dict[str, Any]]:
     """Record completion only after the canonical NORMAL_ENDED write succeeds."""
 
@@ -522,6 +565,37 @@ def observe_liquidation_completed(completion_result: Any) -> list[dict[str, Any]
                 details={"close_mode": _text(stock.get("close_mode")), "completion_status": _text(stock.get("status"))},
             )
         )
+    return outputs
+
+
+@_fail_open_observer
+def observe_pnl_cycle_boundaries(boundary_results: Any) -> list[dict[str, Any]]:
+    """Record newly durable stock PnL-cycle boundaries."""
+    outputs = []
+    for result in boundary_results if isinstance(boundary_results, list) else []:
+        value = _dict(result)
+        boundary = _dict(value.get("boundary"))
+        if value.get("written") is not True or not _text(boundary.get("boundary_id")):
+            continue
+        code = _text(boundary.get("stock_code"))
+        boundary_id = _text(boundary.get("boundary_id"))
+        outputs.append(_append_once(
+            ("PNL_CYCLE_BOUNDARY_CREATED", boundary_id),
+            "PNL_CYCLE_BOUNDARY_CREATED",
+            severity="NOTICE",
+            result="COMPLETED",
+            source="confirmable_pnl_cycle_service.record_completion_boundaries",
+            target_type="STOCK",
+            target_id=code,
+            target_name=code,
+            stock_code=code,
+            details={
+                "boundary_id": boundary_id,
+                "reason": _text(boundary.get("boundary_reason")),
+                "completion_evidence_id": _text(boundary.get("completion_evidence_id")),
+                "boundary_at": _text(boundary.get("boundary_at")),
+            },
+        ))
     return outputs
 
 

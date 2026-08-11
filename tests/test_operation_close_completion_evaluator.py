@@ -17,6 +17,7 @@ from operation_close_completion_evaluator import (
     STATUS_REVIEW_REQUIRED,
     STATUS_UNKNOWN,
     evaluate_operation_close_completion,
+    resolve_liquidation_holding_quantity,
 )
 
 
@@ -202,6 +203,80 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
         self._write_json(self.broker_holdings_path, {"broker_holdings": [{"code": "111111", "quantity": 2}]})
 
         self.assertEqual({"111111": STATUS_EVIDENCE_CONFLICT}, self._statuses(self._evaluate()))
+
+    def test_liquidation_quantity_uses_matching_positions_and_broker_holdings(self) -> None:
+        self._write_json(
+            self.positions_path,
+            {"positions": [{"code": "111111", "quantity": 70}]},
+        )
+        self._write_json(
+            self.broker_holdings_path,
+            {"holdings": [{"code": "111111", "holding_quantity": 70}]},
+        )
+
+        result = resolve_liquidation_holding_quantity(
+            "111111",
+            positions_path=self.positions_path,
+            broker_holdings_path=self.broker_holdings_path,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(70, result["position_qty"])
+        self.assertEqual(70, result["broker_holding_qty"])
+        self.assertEqual(70, result["resolved_liquidation_qty"])
+        self.assertEqual("CONSISTENT", result["reconciliation_result"])
+
+    def test_liquidation_quantity_blocks_positions_broker_mismatch(self) -> None:
+        self._write_json(
+            self.positions_path,
+            {"positions": [{"code": "111111", "quantity": 70}]},
+        )
+        self._write_json(
+            self.broker_holdings_path,
+            {"holdings": [{"code": "111111", "holding_quantity": 110}]},
+        )
+
+        result = resolve_liquidation_holding_quantity(
+            "111111",
+            positions_path=self.positions_path,
+            broker_holdings_path=self.broker_holdings_path,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("QUANTITY_MISMATCH", result["reconciliation_result"])
+        self.assertIsNone(result["resolved_liquidation_qty"])
+
+    def test_liquidation_quantity_accepts_broker_zero_without_position_record(self) -> None:
+        self._write_json(self.positions_path, {"positions": []})
+        self._write_json(
+            self.broker_holdings_path,
+            {"holdings": [{"code": "111111", "holding_quantity": 0}]},
+        )
+
+        result = resolve_liquidation_holding_quantity(
+            "111111",
+            positions_path=self.positions_path,
+            broker_holdings_path=self.broker_holdings_path,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(0, result["resolved_liquidation_qty"])
+
+    def test_liquidation_quantity_blocks_positive_broker_only_holding(self) -> None:
+        self._write_json(self.positions_path, {"positions": []})
+        self._write_json(
+            self.broker_holdings_path,
+            {"holdings": [{"code": "111111", "holding_quantity": 5}]},
+        )
+
+        result = resolve_liquidation_holding_quantity(
+            "111111",
+            positions_path=self.positions_path,
+            broker_holdings_path=self.broker_holdings_path,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("BROKER_ONLY", result["reconciliation_result"])
 
     def test_corrupt_state_is_unknown(self) -> None:
         self._operation_state(["111111"])

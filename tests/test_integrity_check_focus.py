@@ -653,14 +653,14 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
         check.assert_called_once()
 
-    def test_start_status_text_is_set_before_check(self) -> None:
+    def test_local_check_does_not_show_progress_in_server_integrity_banner(self) -> None:
         window = self._window()
         seen: list[str] = []
         original = window._set_integrity_status_text
 
-        def record(message: str) -> None:
+        def record(message: str, *, dot_color: str) -> None:
             seen.append(message)
-            original(message)
+            original(message, dot_color=dot_color)
 
         with mock.patch.object(window, "_set_integrity_status_text", side_effect=record):
             with mock.patch(
@@ -669,7 +669,11 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
             ):
                 window.run_initial_integrity_check()
 
-        self.assertEqual("무결성 검사 중...", seen[0])
+        self.assertNotIn("무결성 검사 중...", seen)
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_pass_sets_top_status_text(self) -> None:
         window = self._window()
@@ -679,9 +683,9 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("✓", window.integrity_status_icon_label.text())
-        self.assertIn("#15803d", window.integrity_status_icon_label.styleSheet())
-        self.assertEqual("로컬 무결성 통과 | 서버 정합성 미확인", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertIn("#9ca3af", window.integrity_status_icon_label.styleSheet())
+        self.assertEqual("서버/로컬 상태 : 서버 정합성 미확인", window.integrity_status_label.text())
 
     def test_pass_shows_toast(self) -> None:
         window = self._window()
@@ -695,6 +699,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
     def test_review_required_one_stock_text(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         result = self._result("REVIEW_REQUIRED", issues=[self._review_issue()])
         with (
             mock.patch("gui_stock_register_window.run_local_stock_integrity_check", return_value=result),
@@ -702,12 +707,15 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("⚠", window.integrity_status_icon_label.text())
-        self.assertIn("#d97706", window.integrity_status_icon_label.styleSheet())
-        self.assertEqual("검토관리 005930 삼성전자", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_review_required_multiple_stocks_text_counts_stocks(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         issues = [
             self._review_issue("005930", "삼성전자"),
             self._review_issue("000660", "SK하이닉스"),
@@ -719,11 +727,15 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("⚠", window.integrity_status_icon_label.text())
-        self.assertEqual("검토관리 005930 삼성전자 외 1종목", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_same_stock_multiple_issues_count_as_one_stock(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         second = dict(self._review_issue())
         second["issue_code"] = "REQUIRED_PATH_MISSING"
         result = self._result("REVIEW_REQUIRED", issues=[self._review_issue(), second])
@@ -733,8 +745,11 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("⚠", window.integrity_status_icon_label.text())
-        self.assertEqual("검토관리 005930 삼성전자", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_writer_callback_is_passed_to_review_application(self) -> None:
         window = self._window()
@@ -772,6 +787,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
     def test_read_only_integrity_issue_does_not_call_writer(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         result = self._result(
             "INTEGRITY_ISSUE",
             issues=[
@@ -790,11 +806,45 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
         apply.assert_not_called()
         self.parent.review_writer.assert_not_called()
-        self.assertEqual("로컬 의미 무결성 문제 발견", window.integrity_status_label.text())
-        self.assertEqual("⚠", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
+        self.assertEqual("INTEGRITY_ISSUE", window._last_integrity_check_result["local_status"])
+
+    def test_server_local_status_uses_approved_status_dot(self) -> None:
+        from gui_auto_trade_display import create_auto_trade_status_item
+
+        window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
+
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
+        row_status_item = create_auto_trade_status_item("등록대기")
+        self.assertEqual(
+            row_status_item.text().split()[0],
+            window.integrity_status_icon_label.text(),
+        )
+        self.assertEqual(
+            window.stock_table.font(),
+            window.integrity_status_icon_label.font(),
+        )
+        dot_metrics = window.integrity_status_icon_label.fontMetrics()
+        self.assertEqual(
+            dot_metrics.horizontalAdvance(row_status_item.text().split()[0]),
+            window.integrity_status_icon_label.width(),
+        )
+        self.assertEqual(
+            dot_metrics.horizontalAdvance(" "),
+            window._integrity_status_container.layout().spacing(),
+        )
+        self.assertIn("color: #9ca3af", window.integrity_status_icon_label.styleSheet())
 
     def test_writer_fail_sets_top_status_text(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         result = self._result("REVIEW_REQUIRED", issues=[self._review_issue()])
         failed = self._result(
             "CHECK_ERROR",
@@ -806,9 +856,11 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("✕", window.integrity_status_icon_label.text())
-        self.assertIn("#dc2626", window.integrity_status_icon_label.styleSheet())
-        self.assertEqual("무결성 문제 발견 | 검토관리 반영 실패", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_writer_fail_shows_toast(self) -> None:
         window = self._window()
@@ -827,17 +879,22 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
     def test_zero_targets_sets_text(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         with mock.patch(
             "gui_stock_register_window.run_local_stock_integrity_check",
             return_value=self._result("CHECK_ERROR", checked=0, issues=[self._check_error_issue()]),
         ):
             window.run_initial_integrity_check()
 
-        self.assertEqual("ⓘ", window.integrity_status_icon_label.text())
-        self.assertEqual("검사 대상 종목 없음", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_check_exception_keeps_window_usable(self) -> None:
         window = self._window()
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         with (
             mock.patch(
                 "gui_stock_register_window.run_local_stock_integrity_check",
@@ -848,9 +905,11 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
             window.run_initial_integrity_check()
 
         self.assertTrue(window.isEnabled())
-        self.assertEqual("✕", window.integrity_status_icon_label.text())
-        self.assertIn("#dc2626", window.integrity_status_icon_label.styleSheet())
-        self.assertEqual("무결성 검사 실패", window.integrity_status_label.text())
+        self.assertEqual("●", window.integrity_status_icon_label.text())
+        self.assertEqual(
+            "서버/로컬 상태 : 서버 정합성 미확인",
+            window.integrity_status_label.text(),
+        )
 
     def test_refresh_after_review_check(self) -> None:
         window = self._window()

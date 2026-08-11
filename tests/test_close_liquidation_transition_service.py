@@ -26,10 +26,18 @@ from close_liquidation_transition_service import (
     REASON_UNKNOWN_REQUESTED_POLICY,
     TransitionEvidence,
     decide_close_liquidation_transition,
+    normalize_direct_close_policy_alias,
 )
 
 
 class CloseLiquidationTransitionServiceTest(unittest.TestCase):
+    def test_direct_close_aliases_use_korean_canonical_values(self) -> None:
+        self.assertEqual("시장가", normalize_direct_close_policy_alias("시장가즉시"))
+        self.assertEqual("현재가", normalize_direct_close_policy_alias("현재가즉시"))
+        self.assertEqual("시장가", normalize_direct_close_policy_alias("시장가"))
+        self.assertEqual("현재가", normalize_direct_close_policy_alias("현재가"))
+        self.assertEqual("루틴", normalize_direct_close_policy_alias("루틴"))
+
     def decide(
         self,
         current: object,

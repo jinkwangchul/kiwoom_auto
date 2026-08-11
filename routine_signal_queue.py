@@ -458,6 +458,16 @@ def enqueue_routine_signal(
             value = result.get(field)
             if value not in (None, ""):
                 record[field] = value
+        for field in (
+            "signal_bar_time",
+            "signal_bar_close",
+            "signal_timeframe_minutes",
+            "signal_trade_date",
+            "signal_input_hash",
+        ):
+            value = result.get(field)
+            if value not in (None, ""):
+                record[field] = value
         if isinstance(result.get("execution_intent"), dict):
             record["execution_intent"] = deepcopy(result["execution_intent"])
 

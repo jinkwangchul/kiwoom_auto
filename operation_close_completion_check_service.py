@@ -17,7 +17,8 @@ from operation_close_completion_evaluator import (
     evaluate_operation_close_completion,
 )
 from operation_policy_gate import write_global_operation_normal_ended_state
-from event_journal_trade_observer import observe_liquidation_completed
+from event_journal_trade_observer import observe_liquidation_completed, observe_pnl_cycle_boundaries
+from confirmable_pnl_cycle_service import record_completion_boundaries
 
 
 SOURCE_ORDER_FILL_STATE_COMMIT = "ORDER_FILL_STATE_COMMIT"
@@ -104,6 +105,11 @@ def check_global_close_completion_after_durable_update(
         ).strip().upper(),
     }
     observe_liquidation_completed(final_result)
+    final_result["pnl_cycle_boundary_results"] = record_completion_boundaries(
+        final_result,
+        ledger_path=Path(operation_state_path).resolve().parent / "pnl_cycle_boundaries.json",
+    )
+    observe_pnl_cycle_boundaries(final_result["pnl_cycle_boundary_results"])
     return final_result
 
 

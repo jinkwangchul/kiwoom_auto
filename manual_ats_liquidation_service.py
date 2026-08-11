@@ -21,9 +21,11 @@ from operation_command_service import (
     ManualAtsLiquidationOverride,
     OperationCommandRequest,
     OperationCommandService,
+    MANUAL_ATS_LIQUIDATION_REQUEST_KEY,
     RESULT_SUCCESS,
     SCOPE_STOCK,
     STOCK_APPLIED,
+    STOCK_IGNORED_DUPLICATE,
 )
 from order_approval_engine import evaluate_order_approval
 from order_candidate_engine import get_real_holding_qty, read_latest_price
@@ -85,6 +87,7 @@ def build_manual_ats_liquidation_preview(
     now_dt: datetime | None = None,
     command_id: str = "",
     latest_price_reader: Callable[[str, str], Any] = read_latest_price,
+    holding_qty_override: int | None = None,
 ) -> dict[str, Any]:
     path = Path(stock_dir).resolve()
     clean_code = str(code or "").strip()
@@ -143,7 +146,11 @@ def build_manual_ats_liquidation_preview(
     if not active_sessions:
         reasons.append("current time is outside the selected ATS sessions")
 
-    holding_qty = get_real_holding_qty(state)
+    holding_qty = (
+        holding_qty_override
+        if holding_qty_override is not None
+        else get_real_holding_qty(state)
+    )
     if holding_qty is None or holding_qty <= 0:
         reasons.append("actual holding quantity is missing or zero")
 
@@ -184,7 +191,11 @@ def build_manual_ats_liquidation_preview(
         "price": order_price,
         "candidate_status": "CANDIDATE_READY",
         "candidate_reason": "수동운영 ATS 청산 요청",
-        "holding_source": "state",
+        "holding_source": (
+            "positions_broker_reconciliation"
+            if holding_qty_override is not None
+            else "state"
+        ),
         "price_basis": "market" if method == METHOD_MARKET else "latest_price",
         "execution_enabled": False,
         "reason": "MANUAL_ATS_LIQUIDATION",
@@ -231,39 +242,18 @@ def commit_manual_ats_liquidation_preview(
             else ["ATS liquidation preview is required"],
         }
 
+    request_result = ensure_manual_ats_liquidation_request(
+        preview,
+        project_root=project_root,
+        command_service_factory=command_service_factory,
+    )
+    if request_result.get("ok") is not True:
+        return request_result
+
     command_id = str(preview.get("command_id") or "").strip()
     stock_dir = str(preview.get("stock_dir") or "").strip()
-    command_service = command_service_factory(project_root)
-    command_result = command_service.apply_manual_ats_liquidation(
-        OperationCommandRequest(
-            target_scope=SCOPE_STOCK,
-            target_id=stock_dir,
-            command=COMMAND_MANUAL_ATS_LIQUIDATION,
-            source="ATS_SETTINGS",
-            occurred_at=str(preview.get("requested_at") or ""),
-            command_id=command_id,
-        ),
-        ManualAtsLiquidationOverride(
-            sell_method=str(preview.get("sell_method") or ""),
-            selected_ats_sessions=tuple(preview.get("selected_ats_sessions") or ()),
-            trade_date=str(preview.get("trade_date") or ""),
-            program_session_id=str(preview.get("program_session_id") or ""),
-        ),
-    )
-    if (
-        command_result.status != RESULT_SUCCESS
-        or not command_result.stock_results
-        or command_result.stock_results[0].status != STOCK_APPLIED
-    ):
-        reason = command_result.error
-        if command_result.stock_results:
-            reason = command_result.stock_results[0].error or reason
-        return {
-            "ok": False,
-            "stage": "runtime_request",
-            "command_result": command_result,
-            "blocked_reasons": [reason or "manual ATS liquidation Runtime request failed"],
-        }
+    command_service = request_result["command_service"]
+    command_result = request_result["command_result"]
 
     candidate = deepcopy(preview["order_candidate"])
     order_id = str(candidate.get("id") or "")
@@ -373,4 +363,96 @@ def commit_manual_ats_liquidation_preview(
         "policy_result": policy_result,
         "status_result": status_result,
         "blocked_reasons": [],
+    }
+
+
+def ensure_manual_ats_liquidation_request(
+    preview: dict[str, Any],
+    *,
+    project_root: str | Path,
+    command_service_factory: Callable[..., OperationCommandService] = OperationCommandService,
+) -> dict[str, Any]:
+    """Persist one durable request or reuse its pre-order resume state."""
+    if not isinstance(preview, dict) or preview.get("ok") is not True:
+        return {
+            "ok": False,
+            "stage": "preview",
+            "blocked_reasons": ["ATS liquidation preview is not ready"],
+        }
+    command_id = str(preview.get("command_id") or "").strip()
+    stock_dir = str(preview.get("stock_dir") or "").strip()
+    current_state = read_json_dict(Path(stock_dir) / "state.json")
+    current_request = current_state.get(MANUAL_ATS_LIQUIDATION_REQUEST_KEY)
+    current_request = current_request if isinstance(current_request, dict) else {}
+    current_status = str(current_request.get("status") or "").strip().upper()
+    if current_status == "WAITING_CANCEL_CONFIRMATION":
+        return {
+            "ok": False,
+            "stage": "runtime_request",
+            "blocked_reasons": [
+                "manual ATS liquidation is already waiting for cancel confirmation"
+            ],
+        }
+    command_service = command_service_factory(project_root)
+    command_result = command_service.apply_manual_ats_liquidation(
+        OperationCommandRequest(
+            target_scope=SCOPE_STOCK,
+            target_id=stock_dir,
+            command=COMMAND_MANUAL_ATS_LIQUIDATION,
+            source="MANUAL_ATS_LIQUIDATION",
+            occurred_at=str(preview.get("requested_at") or ""),
+            command_id=command_id,
+        ),
+        ManualAtsLiquidationOverride(
+            sell_method=str(preview.get("sell_method") or ""),
+            selected_ats_sessions=tuple(preview.get("selected_ats_sessions") or ()),
+            trade_date=str(preview.get("trade_date") or ""),
+            program_session_id=str(preview.get("program_session_id") or ""),
+        ),
+    )
+    applied = (
+        command_result.status == RESULT_SUCCESS
+        and bool(command_result.stock_results)
+        and command_result.stock_results[0].status == STOCK_APPLIED
+    )
+    if applied:
+        return {
+            "ok": True,
+            "stage": "runtime_request",
+            "command_service": command_service,
+            "command_result": command_result,
+            "request_status": "REQUESTED",
+            "blocked_reasons": [],
+        }
+
+    duplicate = (
+        bool(command_result.stock_results)
+        and command_result.stock_results[0].status == STOCK_IGNORED_DUPLICATE
+    )
+    if duplicate:
+        state = read_json_dict(Path(stock_dir) / "state.json")
+        request = state.get(MANUAL_ATS_LIQUIDATION_REQUEST_KEY)
+        request = request if isinstance(request, dict) else {}
+        request_status = str(request.get("status") or "").strip().upper()
+        if (
+            str(request.get("command_id") or "").strip() == command_id
+            and request_status in {"REQUESTED", "READY_TO_RESUME"}
+        ):
+            return {
+                "ok": True,
+                "stage": "runtime_request_reused",
+                "command_service": command_service,
+                "command_result": command_result,
+                "request_status": request_status,
+                "blocked_reasons": [],
+            }
+
+    reason = command_result.error
+    if command_result.stock_results:
+        reason = command_result.stock_results[0].error or reason
+    return {
+        "ok": False,
+        "stage": "runtime_request",
+        "command_result": command_result,
+        "blocked_reasons": [reason or "manual ATS liquidation Runtime request failed"],
     }

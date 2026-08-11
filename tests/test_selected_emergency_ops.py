@@ -31,8 +31,6 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                     "status": status,
                     "holding_qty": 0,
                     "trade_enabled": status == "RUNNING",
-                    "buy_enabled": status == "RUNNING",
-                    "sell_enabled": status == "RUNNING",
                 },
                 ensure_ascii=False,
             )
@@ -47,6 +45,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             refresh_all=Mock(),
             statusBarMessage=Mock(),
             production_recovery_stock_is_review_required=lambda _code: False,
+            startup_recovery_session_ready=lambda refresh=False: True,
         )
 
     def test_stop_changes_only_selected_target_and_verifies_saved_state(self) -> None:
@@ -68,8 +67,8 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             self.assertEqual((), result["failed"])
             self.assertEqual("EMERGENCY_STOPPED", saved["status"])
             self.assertFalse(saved["trade_enabled"])
-            self.assertFalse(saved["buy_enabled"])
-            self.assertFalse(saved["sell_enabled"])
+            self.assertNotIn("buy_enabled", saved)
+            self.assertNotIn("sell_enabled", saved)
             self.assertEqual(before_untouched, read_json_dict(untouched[0] / "state.json"))
             window.refresh_all.assert_called_once_with()
             toast.assert_called_once()
@@ -132,6 +131,8 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             self.assertEqual("STOPPED", saved["status"])
             self.assertFalse(saved["review_required"])
             self.assertFalse(saved["trade_enabled"])
+            self.assertNotIn("buy_enabled", saved)
+            self.assertNotIn("sell_enabled", saved)
             self.assertEqual(before_untouched, read_json_dict(untouched[0] / "state.json"))
             toast.assert_called_once()
 
@@ -149,7 +150,8 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
 
             saved = read_json_dict(target[0] / "state.json")
             self.assertEqual(("000001 테스트",), result["review"])
-            self.assertEqual("REVIEW_REQUIRED", saved["status"])
+            self.assertEqual("EMERGENCY_STOPPED", saved["status"])
+            self.assertTrue(saved["review_required"])
             self.assertEqual("PENDING", saved["review_status"])
             self.assertFalse(saved["trade_enabled"])
 
@@ -161,7 +163,14 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             patch.object(
                 emergency_ops,
                 "read_json_dict",
-                side_effect=[dict(initial), {}, dict(initial), dict(initial)],
+                side_effect=[
+                    dict(initial),
+                    dict(initial),
+                    dict(initial),
+                    dict(initial),
+                    dict(initial),
+                    dict(initial),
+                ],
             ),
             patch.object(emergency_ops, "write_state_json", return_value=True),
             patch.object(emergency_ops, "emergency_review_reason_for_stock", return_value=(False, "정상")),
@@ -175,6 +184,137 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
         self.assertEqual(("000001 테스트",), result["failed"])
         self.assertEqual((), result["normal"])
         toast.assert_not_called()
+
+    def test_common_restore_releases_review_and_preserves_routine_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir, code, name = self._target(root, "000001", status="EMERGENCY_STOPPED")
+            config = {
+                "routine_instance_name": "지표추종매매-A",
+                "assigned_routine_instance_id": "instance-a",
+            }
+            (stock_dir / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False), encoding="utf-8"
+            )
+            state = read_json_dict(stock_dir / "state.json")
+            state.update(
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "review_reason": "기존 사유",
+                }
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+
+            with patch.object(emergency_ops, "append_stock_log"):
+                result = emergency_ops.normalize_review_emergency_target(
+                    self._window(), stock_dir, code, name, destination="RESTORE"
+                )
+
+            saved = read_json_dict(stock_dir / "state.json")
+            self.assertEqual("NORMALIZED", result["status"])
+            self.assertEqual("STOPPED", saved["status"])
+            self.assertFalse(saved["review_required"])
+            self.assertEqual("지표추종매매-A", saved["review_routine"])
+            self.assertEqual(config, read_json_dict(stock_dir / "config.json"))
+
+    def test_common_unassigned_releases_review_and_clears_routine_without_deleting_stock(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir, code, name = self._target(root, "000001", status="REVIEW_REQUIRED")
+            state = read_json_dict(stock_dir / "state.json")
+            state.update(
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "active_routine": "지표추종매매-A",
+                    "routine_name": "지표추종매매-A",
+                }
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+
+            with (
+                patch.object(emergency_ops, "append_stock_log"),
+                patch.object(emergency_ops, "update_base_stock_routines", return_value=True) as unassign,
+            ):
+                result = emergency_ops.normalize_review_emergency_target(
+                    self._window(), stock_dir, code, name, destination="UNASSIGNED"
+                )
+
+            saved = read_json_dict(stock_dir / "state.json")
+            self.assertEqual("NORMALIZED", result["status"])
+            self.assertEqual("STOPPED", saved["status"])
+            self.assertFalse(saved["review_required"])
+            self.assertEqual("", saved["active_routine"])
+            self.assertEqual("", saved["routine_name"])
+            self.assertTrue(stock_dir.exists())
+            unassign.assert_called_once_with(code, name, [])
+
+    def test_common_restore_blocks_without_release_or_routine_change(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir, code, name = self._target(root, "000001", status="EMERGENCY_STOPPED")
+            state = read_json_dict(stock_dir / "state.json")
+            state.update(
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "active_routine": "지표추종매매-A",
+                }
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+            before = read_json_dict(stock_dir / "state.json")
+
+            with (
+                patch.object(
+                    emergency_ops,
+                    "emergency_review_reason_for_stock",
+                    return_value=(True, "보유잔량 존재"),
+                ),
+                patch.object(emergency_ops, "update_base_stock_routines") as unassign,
+            ):
+                result = emergency_ops.normalize_review_emergency_target(
+                    self._window(), stock_dir, code, name, destination="RESTORE"
+                )
+
+            self.assertEqual("BLOCKED", result["status"])
+            self.assertEqual(before, read_json_dict(stock_dir / "state.json"))
+            unassign.assert_not_called()
+
+    def test_common_unassigned_blocks_without_release_or_routine_change(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir, code, name = self._target(root, "000001", status="REVIEW_REQUIRED")
+            state = read_json_dict(stock_dir / "state.json")
+            state.update(
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "active_routine": "지표추종매매-A",
+                }
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+            before = read_json_dict(stock_dir / "state.json")
+
+            with (
+                patch.object(
+                    emergency_ops,
+                    "emergency_review_reason_for_stock",
+                    return_value=(True, "보유잔량 존재"),
+                ),
+                patch.object(emergency_ops, "update_base_stock_routines") as unassign,
+            ):
+                result = emergency_ops.normalize_review_emergency_target(
+                    self._window(), stock_dir, code, name, destination="UNASSIGNED"
+                )
+
+            self.assertEqual("BLOCKED", result["status"])
+            self.assertEqual(before, read_json_dict(stock_dir / "state.json"))
+            unassign.assert_not_called()
 
     def test_setting_window_callers_pass_current_selection_snapshot(self) -> None:
         target = (Path("stocks/000001_TEST"), "000001", "테스트")

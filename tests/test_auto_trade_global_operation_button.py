@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -212,6 +213,13 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        self.start_clock_patcher = patch.object(
+            run_control,
+            "current_datetime",
+            return_value=datetime(2026, 8, 10, 10, 0, 0),
+        )
+        self.start_clock_patcher.start()
+        self.addCleanup(self.start_clock_patcher.stop)
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -929,15 +937,21 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 for target in start_backend.call_args.kwargs["selected_targets"]
             ],
         )
-        self.assertNotIn(
-            "operation_excluded",
-            read_json_dict(self.targets[1][0] / "config.json"),
+        self.assertTrue(
+            read_json_dict(self.targets[1][0] / "config.json").get(
+                "operation_excluded"
+            )
+        )
+        self.assertTrue(
+            read_json_dict(self.targets[3][0] / "config.json").get(
+                "operation_excluded"
+            )
         )
         self.assertEqual("운영중", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
         self.assertIn("정상 운영시작 되었습니다.", self.window.status_messages)
 
-    def test_context_start_before_running_does_not_exclude_unselected_targets(self) -> None:
+    def test_context_start_before_running_excludes_unselected_registered_targets(self) -> None:
         selected_targets = [self.targets[0], self.targets[2]]
         self.window._selected_stock_infos = selected_targets
 
@@ -949,9 +963,105 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             self.window.start_selected_rows_auto_trades()
 
         start_backend.assert_called_once()
+        self.assertTrue(
+            read_json_dict(self.targets[1][0] / "config.json").get(
+                "operation_excluded"
+            )
+        )
+
+    def test_context_start_before_running_clears_selected_operation_exclusion(self) -> None:
+        selected_target = self.targets[0]
+        self._write_operation_excluded(selected_target[0], True)
+        self.window._selected_stock_infos = [selected_target]
+
+        with patch.object(
+            setting_window,
+            "auto_trade_start_selected_auto_trades",
+            return_value={"ok": True},
+        ) as start_backend:
+            self.window.start_selected_rows_auto_trades()
+
+        start_backend.assert_called_once()
+        self.assertFalse(
+            read_json_dict(selected_target[0] / "config.json").get(
+                "operation_excluded"
+            )
+        )
+
+    def test_context_start_before_running_all_failed_keeps_unselected_unchanged(self) -> None:
+        selected_target = self.targets[0]
+        untouched_target = self.targets[1]
+        before_untouched = read_json_dict(untouched_target[0] / "config.json")
+        self.window._selected_stock_infos = [selected_target]
+
+        with patch.object(
+            setting_window,
+            "auto_trade_start_selected_auto_trades",
+            return_value={"ok": False, "reason": "START_FAILED"},
+        ) as start_backend:
+            self.window.start_selected_rows_auto_trades()
+
+        start_backend.assert_called_once()
+        self.assertEqual(
+            before_untouched,
+            read_json_dict(untouched_target[0] / "config.json"),
+        )
+
+    def test_context_start_before_running_partial_success_confirms_operation_set(self) -> None:
+        selected_targets = [self.targets[0], self.targets[2]]
+        untouched_target = self.targets[1]
+        self.window._selected_stock_infos = selected_targets
+
+        with patch.object(
+            setting_window,
+            "auto_trade_start_selected_auto_trades",
+            return_value={
+                "ok": True,
+                "completed": (f"{selected_targets[0][1]} {selected_targets[0][2]}",),
+                "failed": (f"{selected_targets[1][1]} {selected_targets[1][2]}",),
+            },
+        ):
+            self.window.start_selected_rows_auto_trades()
+
+        self.assertTrue(
+            read_json_dict(untouched_target[0] / "config.json").get(
+                "operation_excluded"
+            )
+        )
+
+    def test_context_start_before_running_does_not_exclude_review_or_unassigned(self) -> None:
+        selected_target = self.targets[0]
+        review_target = self.targets[1]
+        unassigned_target = self.targets[2]
+        self._write_state(
+            review_target[0],
+            status="REVIEW_REQUIRED",
+            trade_enabled=False,
+            review_required=True,
+        )
+        unassigned_config_path = unassigned_target[0] / "config.json"
+        unassigned_config = read_json_dict(unassigned_config_path)
+        unassigned_config.pop("assigned_routine_instance_id", None)
+        unassigned_config_path.write_text(
+            json.dumps(unassigned_config, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.window._selected_stock_infos = [selected_target]
+
+        with patch.object(
+            setting_window,
+            "auto_trade_start_selected_auto_trades",
+            return_value={"ok": True},
+        ):
+            self.window.start_selected_rows_auto_trades()
+
         self.assertNotIn(
             "operation_excluded",
-            read_json_dict(self.targets[1][0] / "config.json"),
+            read_json_dict(review_target[0] / "config.json"),
+        )
+        self.assertNotIn(
+            "operation_excluded",
+            read_json_dict(unassigned_target[0] / "config.json"),
         )
 
     def test_context_start_while_running_includes_selected_excluded_target(self) -> None:
@@ -1140,8 +1250,8 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertEqual("2026-07-29 10:00:00", changed_state["emergency_stopped_at"])
         self.assertEqual("USER_EMERGENCY_STOP", changed_state["emergency_reason"])
         self.assertFalse(changed_state["trade_enabled"])
-        self.assertFalse(changed_state["buy_enabled"])
-        self.assertFalse(changed_state["sell_enabled"])
+        self.assertNotIn("buy_enabled", changed_state)
+        self.assertNotIn("sell_enabled", changed_state)
         self.assertEqual(before_untouched, read_json_dict(untouched[0] / "state.json"))
 
     def test_context_emergency_stop_multi_selected_stocks_only(self) -> None:
@@ -1163,8 +1273,8 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             state = read_json_dict(target[0] / "state.json")
             self.assertEqual("EMERGENCY_STOPPED", state["status"])
             self.assertFalse(state["trade_enabled"])
-            self.assertFalse(state["buy_enabled"])
-            self.assertFalse(state["sell_enabled"])
+            self.assertNotIn("buy_enabled", state)
+            self.assertNotIn("sell_enabled", state)
         self.assertEqual(before_untouched, read_json_dict(untouched[0] / "state.json"))
 
     def test_context_emergency_stop_skips_existing_emergency_without_timestamp_overwrite(self) -> None:
@@ -1199,8 +1309,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             target[0],
             status="EMERGENCY_STOPPED",
             trade_enabled=False,
-            buy_enabled=False,
-            sell_enabled=False,
         )
         self.window._selected_stock_infos = [target]
 
@@ -1217,11 +1325,15 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual(("000001 테스트1",), result["normal"])
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
-        self.assertEqual("RESOLVED", state["review_status"])
+        self.assertEqual("STOPPED", state["status"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertEqual("PASSED", state["emergency_release_check"])
+        self.assertEqual("", state["emergency_stopped_at"])
+        self.assertEqual("", state["emergency_reason"])
+        self.assertFalse(state["review_required"])
+        self.assertEqual("", state["review_status"])
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
         start_backend.assert_not_called()
         stop_backend.assert_not_called()
 
@@ -1231,13 +1343,18 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             target[0],
             status="EMERGENCY_STOPPED",
             trade_enabled=False,
-            buy_enabled=False,
-            sell_enabled=False,
+            holding_qty=1,
+            emergency_stopped_at="2026-07-29 09:00:00",
+            emergency_reason="USER_EMERGENCY_STOP",
         )
+        (target[0] / "orders.json").write_text(
+            json.dumps({"orders": []}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        expected_reason = emergency_ops.emergency_review_reason_for_stock(target[0])[1]
         self.window._selected_stock_infos = [target]
 
         with (
-            patch("gui_main_emergency_ops.emergency_review_reason_for_stock", return_value=(True, "보유수량 존재")),
             patch("gui_main_emergency_ops.append_changelog"),
             patch("gui_main_emergency_ops.append_stock_log"),
             patch("gui_main_emergency_ops.show_toast"),
@@ -1249,10 +1366,16 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual(("000001 테스트1",), result["review"])
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
+        self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertTrue(state["review_required"])
+        self.assertEqual("PENDING", state["review_status"])
+        self.assertEqual(expected_reason, state["review_reason"])
+        self.assertEqual("2026-07-29 09:00:00", state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", state["emergency_reason"])
+        self.assertNotIn("emergency_release_check", state)
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
         start_backend.assert_not_called()
         stop_backend.assert_not_called()
 
@@ -1279,8 +1402,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertEqual(("000001 테스트1",), result["normal"])
         self.assertEqual(("000002 테스트2",), result["skipped"])
         released_state = read_json_dict(release_target[0] / "state.json")
-        self.assertEqual("REVIEW_REQUIRED", released_state["status"])
-        self.assertEqual("RESOLVED", released_state["review_status"])
+        self.assertEqual("STOPPED", released_state["status"])
+        self.assertFalse(released_state["trade_enabled"])
+        self.assertFalse(released_state["review_required"])
+        self.assertEqual("", released_state["review_status"])
         self.assertEqual(before_normal, read_json_dict(normal_selected[0] / "state.json"))
         self.assertEqual(before_unselected, read_json_dict(unselected_emergency[0] / "state.json"))
 
@@ -1290,21 +1415,21 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             target[0],
             status="EMERGENCY_STOPPED",
             trade_enabled=False,
-            buy_enabled=False,
-            sell_enabled=False,
         )
         window = type(
             "WindowWithoutRoutineName",
             (),
-            {
-                "production_recovery_stock_is_review_required": lambda _self, _code: False,
-            },
+             {
+                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
+                 "startup_recovery_session_ready": lambda _self, refresh=False: True,
+             },
         )()
 
         with (
             patch("gui_main_emergency_ops.emergency_review_reason_for_stock", return_value=(False, "정상")),
             patch("gui_main_emergency_ops.append_stock_log"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:06:00"),
+            patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
         ):
             result = emergency_ops.release_emergency_stop_target(
                 window,
@@ -1315,11 +1440,16 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual("normal", result)
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
-        self.assertEqual("RESOLVED", state["review_status"])
+        self.assertEqual("STOPPED", state["status"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertEqual("PASSED", state["emergency_release_check"])
+        self.assertEqual("", state["emergency_stopped_at"])
+        self.assertEqual("", state["emergency_reason"])
+        self.assertFalse(state["review_required"])
+        self.assertEqual("", state["review_status"])
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
+        start_backend.assert_not_called()
 
     def test_release_emergency_stop_target_uses_empty_routine_when_metadata_missing(self) -> None:
         target = self.targets[0]
@@ -1336,13 +1466,29 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             json.dumps(config, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        self._write_state(target[0], status="EMERGENCY_STOPPED", trade_enabled=False)
-        window = type("WindowWithoutRoutineMetadata", (), {})()
+        self._write_state(
+            target[0],
+            status="EMERGENCY_STOPPED",
+            trade_enabled=False,
+            holding_qty=1,
+            emergency_stopped_at="2026-07-29 09:00:00",
+            emergency_reason="USER_EMERGENCY_STOP",
+        )
+        (target[0] / "orders.json").write_text(
+            json.dumps({"orders": []}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        expected_reason = emergency_ops.emergency_review_reason_for_stock(target[0])[1]
+        window = type(
+            "WindowWithoutRoutineMetadata",
+            (),
+            {"startup_recovery_session_ready": lambda _self, refresh=False: True},
+        )()
 
         with (
-            patch("gui_main_emergency_ops.emergency_review_reason_for_stock", return_value=(True, "보유수량 존재")),
             patch("gui_main_emergency_ops.append_stock_log"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:07:00"),
+            patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
         ):
             result = emergency_ops.release_emergency_stop_target(
                 window,
@@ -1353,11 +1499,18 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual("review", result)
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
+        self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertEqual("", state["review_routine"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertTrue(state["review_required"])
+        self.assertEqual("PENDING", state["review_status"])
+        self.assertEqual(expected_reason, state["review_reason"])
+        self.assertEqual("2026-07-29 09:00:00", state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", state["emergency_reason"])
+        self.assertNotIn("emergency_release_check", state)
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
+        start_backend.assert_not_called()
 
     def test_release_emergency_stop_target_blocks_pending_integrity_error(self) -> None:
         target = self.targets[0]
@@ -1365,9 +1518,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             target[0],
             status="EMERGENCY_STOPPED",
             trade_enabled=False,
-            buy_enabled=False,
-            sell_enabled=False,
             holding_qty=0,
+            emergency_stopped_at="2026-07-29 09:00:00",
+            emergency_reason="USER_EMERGENCY_STOP",
         )
         (target[0] / "orders.json").write_text(
             json.dumps(
@@ -1388,14 +1541,16 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         window = type(
             "WindowWithoutRoutineName",
             (),
-            {
-                "production_recovery_stock_is_review_required": lambda _self, _code: False,
-            },
+             {
+                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
+                 "startup_recovery_session_ready": lambda _self, refresh=False: True,
+             },
         )()
 
         with (
             patch("gui_main_emergency_ops.append_stock_log"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:08:00"),
+            patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
         ):
             result = emergency_ops.release_emergency_stop_target(
                 window,
@@ -1406,12 +1561,18 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual("review", result)
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
+        self.assertEqual("EMERGENCY_STOPPED", state["status"])
+        self.assertTrue(state["review_required"])
+        self.assertEqual("PENDING", state["review_status"])
         self.assertIn("PENDING_ORDER_DATA_INTEGRITY", state["review_reason"])
         self.assertIn("PENDING_ORDER_QTY_MISSING", state["review_reason"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertEqual("2026-07-29 09:00:00", state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", state["emergency_reason"])
+        self.assertNotIn("emergency_release_check", state)
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
+        start_backend.assert_not_called()
 
     def test_release_emergency_stop_target_blocks_operation_data_mismatch(self) -> None:
         target = self.targets[0]
@@ -1419,10 +1580,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             target[0],
             status="EMERGENCY_STOPPED",
             trade_enabled=False,
-            buy_enabled=False,
-            sell_enabled=False,
             holding_qty=0,
             avg_price=1000,
+            emergency_stopped_at="2026-07-29 09:00:00",
+            emergency_reason="USER_EMERGENCY_STOP",
         )
         (target[0] / "orders.json").write_text(
             json.dumps({"orders": []}, ensure_ascii=False) + "\n",
@@ -1431,14 +1592,16 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         window = type(
             "WindowWithoutRoutineName",
             (),
-            {
-                "production_recovery_stock_is_review_required": lambda _self, _code: False,
-            },
+             {
+                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
+                 "startup_recovery_session_ready": lambda _self, refresh=False: True,
+             },
         )()
 
         with (
             patch("gui_main_emergency_ops.append_stock_log"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:09:00"),
+            patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
         ):
             result = emergency_ops.release_emergency_stop_target(
                 window,
@@ -1449,13 +1612,18 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         state = read_json_dict(target[0] / "state.json")
         self.assertEqual("review", result)
-        self.assertEqual("REVIEW_REQUIRED", state["status"])
+        self.assertEqual("EMERGENCY_STOPPED", state["status"])
+        self.assertTrue(state["review_required"])
         self.assertEqual("PENDING", state["review_status"])
         self.assertEqual("보유 0인데 평단 존재", state["review_reason"])
         self.assertNotEqual("RESOLVED", state["review_status"])
         self.assertFalse(state["trade_enabled"])
-        self.assertFalse(state["buy_enabled"])
-        self.assertFalse(state["sell_enabled"])
+        self.assertEqual("2026-07-29 09:00:00", state["emergency_stopped_at"])
+        self.assertEqual("USER_EMERGENCY_STOP", state["emergency_reason"])
+        self.assertNotIn("emergency_release_check", state)
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
+        start_backend.assert_not_called()
 
     def test_stock_name_double_click_toggles_operation_exclusion(self) -> None:
         target = self.targets[0]

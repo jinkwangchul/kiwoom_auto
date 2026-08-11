@@ -60,6 +60,7 @@ from close_liquidation_transition_service import (
     DOMAIN_CLOSE,
     DOMAIN_LIQUIDATION,
     POLICY_ROUTINE_CLOSE,
+    normalize_direct_close_policy_alias,
 )
 from close_liquidation_execution_pipeline import (
     build_close_liquidation_candidate_preview,
@@ -205,10 +206,14 @@ def _current_close_transition_policy(
     state: dict[str, object],
     requested_at: str,
 ) -> tuple[str, str]:
-    early_method = str(state.get("early_close_method") or "").strip()
+    early_method = normalize_direct_close_policy_alias(
+        state.get("early_close_method")
+    )
     early_policy = state.get("early_close_policy")
     if not early_method and isinstance(early_policy, dict):
-        early_method = str(early_policy.get("method") or "").strip()
+        early_method = normalize_direct_close_policy_alias(
+            early_policy.get("method")
+        )
     early_started_at = str(state.get("early_close_requested_at") or "").strip()
     if early_method or early_started_at:
         return early_method or POLICY_ROUTINE_CLOSE, early_started_at or requested_at
@@ -243,7 +248,9 @@ def _command_transition_scope(
 
 
 def _close_liquidation_cancel_required(method: object) -> bool:
-    return short_close_method_text(method) in {"시장가", "현재가", "손/익절"}
+    return bool(normalize_direct_liquidation_method(method)) or (
+        short_close_method_text(method) == "손/익절"
+    )
 
 
 def _close_execution_result(
@@ -392,13 +399,6 @@ def _persist_early_close_execution_result(
             {
                 "review_required": True,
                 "review_reason": "EARLY_CLOSE_EXECUTION_FAILED",
-            }
-        )
-    elif runtime_status == "EARLY_CLOSED":
-        metadata.update(
-            {
-                "buy_enabled": False,
-                "sell_enabled": False,
             }
         )
     return bool(
@@ -577,9 +577,16 @@ def _start_close_liquidation_execution(
 def auto_trade_continue_pending_close_liquidations(
     window,
     *,
-    limit: int = 5,
+    limit: int | None = 5,
+    target_routine_instance_ids: set[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     """Resume Command requests after cancel confirmation without new identity."""
+
+    target_instances = {
+        str(instance_id or "").strip()
+        for instance_id in (target_routine_instance_ids or ())
+        if str(instance_id or "").strip()
+    }
 
     try:
         from gui_auto_trade_runtime import all_registered_stock_dirs
@@ -597,7 +604,7 @@ def auto_trade_continue_pending_close_liquidations(
     processed = 0
     blocked_count = 0
     for stock_dir in stock_dirs:
-        if len(results) >= max(0, int(limit)):
+        if limit is not None and len(results) >= max(0, int(limit)):
             break
         stock_path = Path(stock_dir)
         state = read_json_dict(stock_path / "state.json")
@@ -609,6 +616,8 @@ def auto_trade_continue_pending_close_liquidations(
         routine_instance_id = str(
             config.get("assigned_routine_instance_id") or ""
         ).strip()
+        if target_instances and routine_instance_id not in target_instances:
+            continue
 
         request = state.get("individual_liquidation_request")
         request = request if isinstance(request, dict) else {}
@@ -623,7 +632,9 @@ def auto_trade_continue_pending_close_liquidations(
                 "REVIEW_REQUIRED",
             }:
                 continue
-            method = str(state.get("early_close_method") or "").strip()
+            method = normalize_direct_close_policy_alias(
+                state.get("early_close_method")
+            )
             command_id = str(state.get("operation_command_id") or "").strip()
             requested_at = str(
                 state.get("early_close_requested_at") or ""
@@ -828,20 +839,23 @@ def auto_trade_apply_selected_individual_liquidation_method(
     window,
     method: str,
     minutes_before_regular_close: str = "5",
-) -> None:
+    *,
+    show_error_dialog: bool = True,
+) -> dict[str, object]:
     dialog_parent = operation_dialog_parent(window)
     normalized_method = short_close_method_text(method)
     if normalized_method not in {"시장가", "현재가", "이월"}:
-        return
+        return {"ok": False, "message": "지원하지 않는 개별청산 방식입니다."}
 
     selected = window.selected_stock_infos()
     if not selected:
-        return
+        return {"ok": False, "message": "개별청산할 종목을 선택하세요."}
 
     minutes = str(minutes_before_regular_close).strip() or "5"
     command_service = OperationCommandService(PROJECT_ROOT)
     completed: list[str] = []
     failed: list[str] = []
+    failure_messages: list[str] = []
     for stock_dir, code, name in selected:
         requested_at = now_text()
         state = read_json_dict(stock_dir / "state.json")
@@ -865,6 +879,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
             failed.append(
                 f"{code} {name}({_recovery_block_user_message(window, recovery)})"
             )
+            failure_messages.append(_recovery_block_user_message(window, recovery))
             continue
         current_policy, _is_override = effective_liquidation_policy_for_config(
             config,
@@ -901,9 +916,9 @@ def auto_trade_apply_selected_individual_liquidation_method(
             ),
         )
         if not transition.allowed:
-            failed.append(
-                f"{code} {name}(정책 전환 차단:{transition.reason_code})"
-            )
+            reason = f"정책 전환 차단:{transition.reason_code}"
+            failed.append(f"{code} {name}({reason})")
+            failure_messages.append(reason)
             continue
         result = command_service.apply_individual_liquidation(
             OperationCommandRequest(
@@ -941,10 +956,9 @@ def auto_trade_apply_selected_individual_liquidation_method(
                 reason="INDIVIDUAL_LIQUIDATION",
             )
             if execution.get("ok") is not True:
-                failed.append(
-                    f"{code} {name}("
-                    f"{execution.get('stage') or '실행 연결 실패'})"
-                )
+                reason = str(execution.get("stage") or "실행 연결 실패")
+                failed.append(f"{code} {name}({reason})")
+                failure_messages.append(reason)
                 continue
             completed.append(f"{code} {name}")
             append_stock_log(
@@ -958,17 +972,24 @@ def auto_trade_apply_selected_individual_liquidation_method(
             reason = result.error
             if result.stock_results:
                 reason = result.stock_results[0].error or reason
-            failed.append(f"{code} {name}({reason or '요청 실패'})")
+            reason = str(reason or "요청 실패")
+            failed.append(f"{code} {name}({reason})")
+            failure_messages.append(reason)
 
     if not completed:
-        if failed:
+        if failed and show_error_dialog:
             QMessageBox.critical(
                 dialog_parent,
                 "개별청산 요청 오류",
                 "개별청산 요청을 Runtime에 반영하지 못했습니다.\n\n"
                 + "\n".join(failed),
             )
-        return
+        return {
+            "ok": False,
+            "completed_count": 0,
+            "failed_count": len(failed),
+            "message": failure_messages[0] if failure_messages else "개별청산 요청에 실패했습니다.",
+        }
 
     selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
     window.refresh_all()
@@ -978,12 +999,18 @@ def auto_trade_apply_selected_individual_liquidation_method(
     window.statusBarMessage(
         f"개별청산 요청 완료: {minutes}분/{normalized_method} / 대상 {len(completed)}개"
     )
-    if failed:
+    if failed and show_error_dialog:
         QMessageBox.warning(
             dialog_parent,
             "개별청산 일부 실패",
             "\n".join(failed),
         )
+    return {
+        "ok": True,
+        "completed_count": len(completed),
+        "failed_count": len(failed),
+        "message": failure_messages[0] if failure_messages else "",
+    }
 
 
 
@@ -1318,7 +1345,10 @@ def auto_trade_apply_selected_early_close(
     source: str = "우클릭",
     extra_policy: dict[str, object] | None = None,
     selected: list[tuple[Path, str, str]] | None = None,
-) -> None:
+    *,
+    show_error_dialog: bool = True,
+    show_result_toast: bool = True,
+) -> dict[str, object]:
     """선택 종목에 조기마감 명령을 적용한다.
 
     조기마감은 보유수량을 0으로 만드는 1차 리셋 절차다.
@@ -1326,16 +1356,19 @@ def auto_trade_apply_selected_early_close(
     루틴 방식 조기마감은 첫 매도신호 전까지 매수/매도 신호를 허용하고,
     첫 매도주문 접수 이후 추가 주문 차단은 메인 주문판정 계층에서 처리한다.
     """
+    dialog_parent = operation_dialog_parent(window)
     login_block_message = _kiwoom_server_login_block_message(window)
     if login_block_message:
-        show_toast(window, login_block_message, duration_ms=2500)
-        return
+        if show_result_toast:
+            show_toast(dialog_parent, login_block_message, duration_ms=2500)
+        return {"ok": False, "message": login_block_message}
 
     selected = selected if selected is not None else window.selected_stock_infos()
     routine_name = window.current_selected_routine_name()
-    dialog_parent = operation_dialog_parent(window)
 
     def show_ok_message(icon, title: str, message: str) -> None:
+        if not show_error_dialog:
+            return
         box = QMessageBox(dialog_parent)
         box.setIcon(icon)
         box.setWindowTitle(title)
@@ -1350,9 +1383,9 @@ def auto_trade_apply_selected_early_close(
             "선택 오류",
             "조기마감할 종목을 1개 이상 선택하세요.",
         )
-        return
+        return {"ok": False, "message": "조기마감할 종목을 선택하세요."}
 
-    method_text = str(method or "").strip() or "루틴"
+    method_text = normalize_direct_close_policy_alias(method) or "루틴"
 
     blocked_liquidation: list[str] = []
     close_targets: list[tuple[Path, str, str]] = []
@@ -1402,7 +1435,7 @@ def auto_trade_apply_selected_early_close(
             f"대상:\n{preview_blocked}",
         )
         window.statusBarMessage("조기마감 불가: 청산 진행 중")
-        return
+        return {"ok": False, "message": "조기마감 불가: 청산 진행 중"}
 
     # 보유가 없는 경우는 사용자의 재확인 대상이 아니다.
     # 조기마감은 보유수량을 0으로 만드는 1차 리셋 절차이므로,
@@ -1437,7 +1470,7 @@ def auto_trade_apply_selected_early_close(
         box.exec_()
         if box.clickedButton() != proceed_button:
             window.statusBarMessage("조기마감 취소")
-            return
+            return {"ok": False, "cancelled": True, "message": "조기마감 취소"}
 
     completed: list[str] = []
     skipped: list[str] = []
@@ -1638,4 +1671,16 @@ def auto_trade_apply_selected_early_close(
         toast_message = skipped[0]
     else:
         toast_message = "조기마감 적용 대상이 없습니다."
-    show_toast(window, toast_message, duration_ms=2500)
+    if show_result_toast:
+        show_toast(dialog_parent, toast_message, duration_ms=2500)
+    failure_message = ""
+    if skipped:
+        failure_message = str(skipped[0])
+        if "(" in failure_message and failure_message.endswith(")"):
+            failure_message = failure_message.split("(", 1)[1][:-1].strip()
+    return {
+        "ok": bool(completed) and not skipped,
+        "completed_count": len(completed),
+        "failed_count": len(skipped),
+        "message": failure_message or ("" if completed else toast_message),
+    }

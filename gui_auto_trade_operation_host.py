@@ -138,9 +138,21 @@ class AutoTradeOperationHost(QObject):
         finally:
             self._operation_cycle_running = False
         if isinstance(result, dict):
-            self.operation_cycle_completed.emit(result)
+            signal_result = result.get("signal_result", {})
+            deferred = (
+                isinstance(signal_result, dict)
+                and signal_result.get("deferred_for_candle_refresh") is True
+            )
+            if not deferred:
+                self.operation_cycle_completed.emit(result)
             return result
         return {"processed": False, "reason_code": "INVALID_OPERATION_CYCLE_RESULT"}
+
+    def complete_deferred_operation_cycle(self, result: dict[str, object]) -> None:
+        """Emit the cycle boundary after asynchronous candle/signal work ends."""
+        if self._shutting_down or not isinstance(result, dict):
+            return
+        self.operation_cycle_completed.emit(dict(result))
 
     def __getattr__(self, name: str):
         owner_value = getattr(self._owner, name, None)

@@ -11,11 +11,12 @@ from manual_ats_runtime import (
     MANUAL_ATS_SELECTION_KEY,
     clear_manual_ats_runtime_selection,
     manual_ats_runtime_selected_keys,
-    reset_manual_ats_runtime_selections,
-    reset_expired_manual_ats_runtime_selections,
     write_manual_ats_runtime_selection,
 )
-from gui_ats_utils import manual_ats_market_day_closed
+from gui_ats_utils import (
+    manual_ats_active_now,
+    manual_ats_enabled_labels,
+)
 from state_policy import manual_extra_session_enabled_now
 
 
@@ -33,7 +34,7 @@ class ManualAtsRuntimeTest(unittest.TestCase):
             )
         )
 
-    def test_selection_requires_same_trade_date_and_program_session(self) -> None:
+    def test_selection_persists_across_trade_dates_and_program_sessions(self) -> None:
         state = {
             MANUAL_ATS_SELECTION_KEY: {
                 "selected_sessions": ["extra1", "extra3"],
@@ -50,24 +51,81 @@ class ManualAtsRuntimeTest(unittest.TestCase):
                 program_session_id="session-a",
             ),
         )
+        for check_now, session_id in (
+            (now, "session-b"),
+            (datetime(2026, 7, 26, 8, 30, tzinfo=timezone.utc), "session-a"),
+            (datetime(2026, 7, 26, 8, 30, tzinfo=timezone.utc), "session-b"),
+        ):
+            with self.subTest(now=check_now, program_session_id=session_id):
+                self.assertEqual(
+                    ("extra1", "extra3"),
+                    manual_ats_runtime_selected_keys(
+                        state,
+                        now_dt=check_now,
+                        program_session_id=session_id,
+                    ),
+                )
+
+    def test_empty_or_invalid_selection_has_no_active_sessions(self) -> None:
         self.assertEqual(
             (),
             manual_ats_runtime_selected_keys(
-                state,
-                now_dt=now,
-                program_session_id="session-b",
+                {MANUAL_ATS_SELECTION_KEY: {"selected_sessions": []}}
             ),
         )
         self.assertEqual(
-            (),
+            ("extra2",),
             manual_ats_runtime_selected_keys(
-                state,
-                now_dt=datetime(2026, 7, 26, 8, 30, tzinfo=timezone.utc),
-                program_session_id="session-a",
+                {
+                    MANUAL_ATS_SELECTION_KEY: {
+                        "selected_sessions": ["invalid", "extra2", "extra4"]
+                    }
+                }
             ),
         )
 
-    def test_runtime_write_and_reset_do_not_change_config_or_operation_mode(self) -> None:
+    def test_display_and_active_time_use_persisted_selection(self) -> None:
+        config = {"operation_mode": "CONTINUOUS"}
+        state = {
+            MANUAL_ATS_SELECTION_KEY: {
+                "selected_sessions": ["extra1"],
+                "trade_date": "2025-01-02",
+                "program_session_id": "old-session",
+            }
+        }
+        policy = {
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "name": "장전프리",
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                }
+            ]
+        }
+        with patch("gui_ats_utils.read_operation_policy", return_value=policy):
+            self.assertEqual(["장전프리"], manual_ats_enabled_labels(config, state))
+            self.assertTrue(
+                manual_ats_active_now(
+                    config,
+                    state,
+                    datetime(2026, 7, 26, 8, 30, tzinfo=timezone.utc),
+                )
+            )
+            self.assertFalse(
+                manual_ats_active_now(
+                    config,
+                    state,
+                    datetime(2026, 7, 26, 9, 0, tzinfo=timezone.utc),
+                )
+            )
+
+        self.assertEqual(
+            [],
+            manual_ats_enabled_labels({"operation_mode": "SCHEDULED"}, state),
+        )
+
+    def test_runtime_write_and_explicit_clear_do_not_change_config_or_operation_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock = Path(temp) / "stocks" / "005930_삼성전자"
             stock.mkdir(parents=True)
@@ -101,11 +159,10 @@ class ManualAtsRuntimeTest(unittest.TestCase):
                 json.loads((stock / "config.json").read_text(encoding="utf-8")),
             )
 
-            result = reset_manual_ats_runtime_selections(Path(temp) / "stocks")
-            self.assertEqual({"cleared": 1, "failed": 0}, result)
-            reset_state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
-            self.assertNotIn(MANUAL_ATS_SELECTION_KEY, reset_state)
-            self.assertEqual("RUNNING", reset_state["status"])
+            self.assertTrue(clear_manual_ats_runtime_selection(stock))
+            cleared_state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
+            self.assertNotIn(MANUAL_ATS_SELECTION_KEY, cleared_state)
+            self.assertEqual("RUNNING", cleared_state["status"])
             self.assertEqual(
                 config,
                 json.loads((stock / "config.json").read_text(encoding="utf-8")),
@@ -117,66 +174,6 @@ class ManualAtsRuntimeTest(unittest.TestCase):
             (stock / "state.json").write_text('{"status":"MONITORING"}', encoding="utf-8")
             self.assertTrue(clear_manual_ats_runtime_selection(stock))
             self.assertTrue(clear_manual_ats_runtime_selection(stock))
-
-    def test_market_close_clears_selection_without_changing_status(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            stock = Path(temp) / "stocks" / "005930_삼성전자"
-            stock.mkdir(parents=True)
-            (stock / "state.json").write_text(
-                json.dumps(
-                    {
-                        "status": "RUNNING",
-                        MANUAL_ATS_SELECTION_KEY: {
-                            "selected_sessions": ["extra1"],
-                            "trade_date": "2026-07-25",
-                            "program_session_id": "session-a",
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            result = reset_expired_manual_ats_runtime_selections(
-                Path(temp) / "stocks",
-                now_dt=datetime(2026, 7, 25, 20, 0, tzinfo=timezone.utc),
-                market_closed=True,
-            )
-            state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual({"cleared": 1, "failed": 0}, result)
-        self.assertEqual("RUNNING", state["status"])
-        self.assertNotIn(MANUAL_ATS_SELECTION_KEY, state)
-
-    def test_market_close_uses_latest_environment_session_end(self) -> None:
-        policy = {
-            "regular_market": {
-                "start_time": "09:00:00",
-                "end_time": "15:20:00",
-            },
-            "extra_sessions": [
-                {
-                    "name": "장전프리",
-                    "start_time": "08:00:00",
-                    "end_time": "08:50:00",
-                },
-                {
-                    "name": "마감후NXT",
-                    "start_time": "15:30:00",
-                    "end_time": "19:50:00",
-                },
-            ],
-        }
-        with patch("gui_ats_utils.read_operation_policy", return_value=policy):
-            self.assertFalse(
-                manual_ats_market_day_closed(
-                    datetime(2026, 7, 25, 19, 49, 59, tzinfo=timezone.utc)
-                )
-            )
-            self.assertTrue(
-                manual_ats_market_day_closed(
-                    datetime(2026, 7, 25, 19, 50, 0, tzinfo=timezone.utc)
-                )
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 from event_journal_production import append_production_event
+from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS, project_current_stock_pnl
 
 LOGGER = logging.getLogger(__name__)
 OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
@@ -93,6 +94,7 @@ from gui_styles import (
 from gui_toast import show_toast
 from gui_common_utils import safe_int_value, sanitize_path_part
 from gui_stock_data import append_base_stock, active_routine_for_stock, stock_runtime_dir_for_routine
+from gui_stock_instance_chart_window import open_stock_instance_chart
 from gui_order_utils import (
     directional_value_color,
     format_signed_percent,
@@ -1107,12 +1109,10 @@ from state_policy import (
     write_global_schedule,
 )
 from gui_ats_utils import (
-    ManualAtsSettingsDialog,
     auto_trade_setting_regular_market_active_now,
     manual_ats_active_now,
     manual_ats_enabled_labels,
     manual_ats_session_labels,
-    manual_ats_source,
 )
 from gui_auto_trade_display import (
     apply_auto_trade_setting_activity_style,
@@ -1161,6 +1161,8 @@ from gui_auto_trade_policy import (
     auto_trade_setting_mark_liquidation_result_for_display,
     auto_trade_setting_liquidation_active,
     auto_trade_setting_liquidation_phase_active,
+    auto_trade_setting_close_routine_mode_active,
+    auto_trade_setting_close_routine_order_allowed,
 )
 from gui_auto_trade_integrity import (
     unique_review_reasons,
@@ -1198,8 +1200,8 @@ from gui_auto_trade_close import (
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
-    auto_trade_open_selected_manual_ats_settings_dialog,
     auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
     auto_trade_set_selected_manual_ats_flag,
 )
@@ -1216,7 +1218,6 @@ from gui_auto_trade_status_ops import (
     auto_trade_resume_status_after_pause,
     auto_trade_set_selected_operation_mode,
     auto_trade_set_selected_schedule_operation_mode,
-    auto_trade_set_selected_stocks_buy_end,
     auto_trade_update_stock_operation_mode,
     auto_trade_update_stock_status,
     handle_auto_trade_operation_mode_double_click,
@@ -1228,9 +1229,14 @@ from gui_auto_trade_run_control import (
     startup_recovery_operation_block_message,
 )
 from operation_policy_gate import read_operation_state
+from order_manager import (
+    decide_routine_order_for_stock_dir,
+    mark_routine_order_accepted_for_stock_dir,
+)
 from gui_auto_trade_review_ops import (
     auto_trade_open_review_required_window,
 )
+from gui_review_required_window import collect_global_review_required_rows
 from gui_auto_trade_table_loader import (
     _selected_instance_stock_dirs,
     auto_trade_load_selected_routine_stocks,
@@ -1301,6 +1307,7 @@ from chejan_event_review_service import review_chejan_event
 from final_send_gate_service import evaluate_final_send_gate
 from order_queued_review_service import review_order_queued_record
 from position_update_service import update_position_from_fill
+from realized_pnl_ledger import record_realized_pnl
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -1695,6 +1702,7 @@ ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
+REALIZED_PNL_LEDGER_PATH = PROJECT_ROOT / "runtime" / "realized_pnl.json"
 
 
 def startup_recovery_action_allowed(window, action: str) -> bool:
@@ -1803,6 +1811,14 @@ def handle_kiwoom_raw_chejan_event(
         "record_result": recorded,
         "blocked_reasons": list(recorded.get("blocked_reasons") or []),
     }
+    if response["recorded"] is True:
+        response["close_routine_final_sell_marker"] = (
+            _mark_close_routine_final_sell_from_broker_acceptance(
+                candidates[0],
+                normalized,
+                recorded,
+            )
+        )
     downstream_source = recorded
     if response["recorded"] is not True and _chejan_record_duplicate(recorded):
         if _has_pending_chejan_reconciliation_for_event(candidates[0], normalized):
@@ -1818,9 +1834,10 @@ def handle_kiwoom_raw_chejan_event(
             response["duplicate_noop"] = True
             return response
 
-    fill_result, position_result, reconciliation_result = _record_fill_and_position_from_chejan(
+    fill_result, position_result, realized_pnl_result, reconciliation_result = _record_fill_and_position_from_chejan(
         downstream_source,
         normalized,
+        candidates[0],
         live_context or {},
     )
     if fill_result is not None:
@@ -1833,6 +1850,11 @@ def handle_kiwoom_raw_chejan_event(
         if position_result.get("position_updated") is not True:
             response["manual_reconciliation_required"] = True
             response["position_blocked_reasons"] = list(position_result.get("blocked_reasons") or [])
+    if realized_pnl_result is not None:
+        response["realized_pnl_result"] = realized_pnl_result
+        if realized_pnl_result.get("realized_pnl_recorded") is not True:
+            response["manual_reconciliation_required"] = True
+            response["realized_pnl_blocked_reasons"] = list(realized_pnl_result.get("blocked_reasons") or [])
     if reconciliation_result is not None:
         response["reconciliation_result"] = reconciliation_result
         response["reconciliation_persisted"] = reconciliation_result.get("reconciliation_persisted") is True
@@ -1844,6 +1866,94 @@ def handle_kiwoom_raw_chejan_event(
                 or ["chejan reconciliation state was not persisted"]
             )
     return response
+
+
+def _order_routine_instance_id(order: dict[str, object]) -> str:
+    for container in (
+        order,
+        order.get("execution_intent"),
+        order.get("order_provenance"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        value = str(
+            container.get("routine_instance_id")
+            or container.get("assigned_routine_instance_id")
+            or ""
+        ).strip()
+        if value:
+            return value
+    return ""
+
+
+def _mark_close_routine_final_sell_from_broker_acceptance(
+    order: dict[str, object],
+    normalized_event: dict[str, object],
+    record_result: dict[str, object],
+) -> dict[str, object]:
+    """Persist the routine-close final SELL marker only at broker acceptance."""
+    event_type = str(
+        record_result.get("event_type") or normalized_event.get("event_type") or ""
+    ).strip().upper()
+    if event_type not in {"ORDER_ACCEPTED", "ORDER_OPEN"}:
+        return {"attempted": False, "marked": False, "reason": "not broker acceptance"}
+    if str(order.get("source") or "").strip() != "routine_signals":
+        return {"attempted": False, "marked": False, "reason": "not routine signal order"}
+    if str(order.get("side") or "").strip().upper() != "SELL":
+        return {"attempted": False, "marked": False, "reason": "not SELL order"}
+
+    code = str(order.get("code") or normalized_event.get("code") or "").strip()
+    routine_instance_id = _order_routine_instance_id(order)
+    matches: list[Path] = []
+    for stock_dir_value in all_registered_stock_dirs():
+        stock_dir = Path(stock_dir_value)
+        stock_code, _ = parse_stock_folder_name(stock_dir.name)
+        if stock_code != code:
+            continue
+        config = read_json_dict(stock_dir / "config.json")
+        assigned_instance_id = str(
+            config.get("assigned_routine_instance_id") or ""
+        ).strip()
+        if routine_instance_id and assigned_instance_id != routine_instance_id:
+            continue
+        matches.append(stock_dir)
+
+    if len(matches) != 1:
+        return {
+            "attempted": True,
+            "marked": False,
+            "reason": f"runtime stock match count is {len(matches)}",
+        }
+
+    stock_dir = matches[0]
+    state = read_json_dict(stock_dir / "state.json")
+    display_status = str(state.get("status") or "")
+    decision = decide_routine_order_for_stock_dir(
+        stock_dir,
+        "SELL",
+        display_status=display_status,
+    )
+    if decision.get("allowed") is not True or decision.get(
+        "mark_close_final_sell_after_order"
+    ) is not True:
+        return {
+            "attempted": True,
+            "marked": False,
+            "reason": str(decision.get("reason") or "routine close marker not required"),
+            "stock_dir": str(stock_dir),
+        }
+
+    marked = mark_routine_order_accepted_for_stock_dir(
+        stock_dir,
+        decision,
+        source="kiwoom_chejan",
+    )
+    return {
+        "attempted": True,
+        "marked": marked is True,
+        "reason": "broker accepted routine SELL" if marked else "state write failed",
+        "stock_dir": str(stock_dir),
+    }
 
 
 def _clean_runtime_text(value: object) -> str:
@@ -1888,12 +1998,30 @@ def _position_result_ok(result: dict[str, object] | None) -> bool:
 def _record_fill_and_position_from_chejan(
     chejan_result: dict[str, object],
     normalized_event: dict[str, object],
+    order_record: dict[str, object],
     live_context: dict[str, object],
-) -> tuple[dict[str, object] | None, dict[str, object] | None, dict[str, object] | None]:
+) -> tuple[
+    dict[str, object] | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+]:
     if chejan_result.get("recorded") is not True or chejan_result.get("next_stage") != "FILL_RECORD_REQUIRED":
-        return None, None, None
+        return None, None, None, None
 
     completed_steps = ["QUEUE_LIFECYCLE"]
+    live_context = dict(live_context)
+    provenance = order_record.get("routine_provenance")
+    if isinstance(provenance, dict):
+        live_context.setdefault(
+            "routine_instance_id",
+            str(provenance.get("routine_instance_id") or "").strip(),
+        )
+    else:
+        live_context.setdefault(
+            "routine_instance_id",
+            str(order_record.get("routine_instance_id") or "").strip(),
+        )
     fill_result = record_execution_fill(
         chejan_result,
         normalized_event,
@@ -1913,7 +2041,7 @@ def _record_fill_and_position_from_chejan(
             reasons=list(fill_result.get("blocked_reasons") or []) if isinstance(fill_result, dict) else ["fill record failed"],
             context=live_context,
         )
-        return fill_result, None, reconciliation
+        return fill_result, None, None, reconciliation
 
     completed_steps.append("FILL_RECORD")
     position_result = update_position_from_fill(
@@ -1948,9 +2076,32 @@ def _record_fill_and_position_from_chejan(
             reasons=list(position_result.get("blocked_reasons") or []) if isinstance(position_result, dict) else ["position update failed"],
             context=live_context,
         )
-        return fill_result, position_result, reconciliation
+        return fill_result, position_result, None, reconciliation
 
     completed_steps.append("POSITION_UPDATE")
+    realized_pnl_result = None
+    if _clean_runtime_text(fill_record.get("side")).upper() == "SELL":
+        realized_context = dict(live_context)
+        realized_context["fills_path"] = str(FILLS_PATH)
+        realized_pnl_result = record_realized_pnl(
+            fill_record,
+            position_result,
+            order_record,
+            REALIZED_PNL_LEDGER_PATH,
+            context=realized_context,
+        )
+        if realized_pnl_result.get("realized_pnl_recorded") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                ORDER_QUEUE_PATH,
+                chejan_result,
+                required=True,
+                failed_stage="REALIZED_PNL_LEDGER",
+                completed_steps=completed_steps,
+                reasons=list(realized_pnl_result.get("blocked_reasons") or ["realized P/L ledger write failed"]),
+                context=live_context,
+            )
+            return fill_result, position_result, realized_pnl_result, reconciliation
+        completed_steps.append("REALIZED_PNL_LEDGER")
     reconciliation = mark_chejan_reconciliation_state(
         ORDER_QUEUE_PATH,
         chejan_result,
@@ -1958,7 +2109,7 @@ def _record_fill_and_position_from_chejan(
         completed_steps=completed_steps,
         context=live_context,
     )
-    return fill_result, position_result, reconciliation
+    return fill_result, position_result, realized_pnl_result, reconciliation
 
 
 def get_routine_dirs() -> list[Path]:
@@ -2307,7 +2458,7 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_set_schedule = QPushButton("환경설정")
         self.btn_stock_register = QPushButton("종목관리")
         self.btn_log_view = QPushButton("종목실적")
-        self.btn_review_view = QPushButton("검토관리")
+        self.btn_review_view = QPushButton("검토관리(0)")
         self.btn_close = QPushButton("닫기")
         for button, object_name in (
             (self.btn_start, "autoTradeSettingStartButton"),
@@ -2353,6 +2504,9 @@ class AutoTradeSettingWindow(QDialog):
         self._runtime_file_timer = QTimer(self)
         self._runtime_file_timer.setInterval(2_000)
         self._runtime_file_timer.timeout.connect(self.on_runtime_file_timer_tick)
+        self._pnl_refresh_timer = QTimer(self)
+        self._pnl_refresh_timer.setInterval(PNL_REFRESH_INTERVAL_MS)
+        self._pnl_refresh_timer.timeout.connect(self.refresh_stock_pnl_cells)
         self._last_execution_preview_result: dict[str, object] | None = None
         self._last_execution_preview_queue_snapshot: dict[str, object] | None = None
         self._last_execution_enable_preview_result: dict[str, object] | None = None
@@ -3043,6 +3197,9 @@ class AutoTradeSettingWindow(QDialog):
         self.stock_table.itemDoubleClicked.connect(
             self.on_stock_table_name_item_double_clicked
         )
+        self.stock_table.itemDoubleClicked.connect(
+            self.on_stock_table_code_item_double_clicked
+        )
         self.stock_table.customContextMenuRequested.connect(self.on_stock_table_context_menu)
         self.btn_close.clicked.connect(self.close)
         self.btn_start.clicked.connect(self.start_selected_auto_trades)
@@ -3167,7 +3324,17 @@ class AutoTradeSettingWindow(QDialog):
         self.load_selected_routine_stocks()
         self.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
         self._runtime_file_snapshot = self.current_runtime_file_signature()
+        self.update_review_required_button_text()
         self.update_action_buttons()
+
+    def review_required_stock_count(self) -> int:
+        """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
+        return len(collect_global_review_required_rows())
+
+    def update_review_required_button_text(self) -> None:
+        if not hasattr(self, "btn_review_view"):
+            return
+        self.btn_review_view.setText(f"검토관리({self.review_required_stock_count()})")
 
     def current_time_policy_minute_key(self) -> str:
         return auto_trade_current_time_policy_minute_key(self)
@@ -3313,7 +3480,7 @@ class AutoTradeSettingWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        for timer in (self._time_policy_timer, self._runtime_file_timer):
+        for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
             if not timer.isActive():
                 timer.start()
 
@@ -3322,7 +3489,7 @@ class AutoTradeSettingWindow(QDialog):
         del identity
         started_count = 0
         if self.isVisible():
-            for timer in (self._time_policy_timer, self._runtime_file_timer):
+            for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
                 if timer.isActive():
                     continue
                 timer.start()
@@ -3336,7 +3503,7 @@ class AutoTradeSettingWindow(QDialog):
     def stop_periodic_timers_for_recovery(self) -> dict[str, object]:
         """Stop settings-only GUI refresh timers."""
         stopped_count = 0
-        for timer in (self._time_policy_timer, self._runtime_file_timer):
+        for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
             if not timer.isActive():
                 continue
             timer.stop()
@@ -3351,6 +3518,25 @@ class AutoTradeSettingWindow(QDialog):
         """창을 닫을 때 주기 갱신 타이머를 정리한다."""
         self.stop_periodic_timers_for_recovery()
         super().closeEvent(event)
+
+    def refresh_stock_pnl_cells(self) -> None:
+        """Update only PnL cells; never rebuild the settings table."""
+        for row in range(self.stock_table.rowCount()):
+            code_item = self.stock_table.item(row, 0)
+            pnl_item = self.stock_table.item(row, 9)
+            if code_item is None or pnl_item is None:
+                continue
+            result = project_current_stock_pnl(code_item.text(), project_root=PROJECT_ROOT)
+            if result.get("available") is True:
+                amount = float(result.get("cumulative_profit") or 0)
+                rate = result.get("cumulative_rate")
+                text = f"손익 {format_signed_money(amount)} / {format_signed_percent(rate, digits=2) if rate is not None else '-'}"
+            elif result.get("reason") == "EVALUATION_PRICE_UNAVAILABLE":
+                continue
+            else:
+                text = "손익 확인 필요 / -"
+            if pnl_item.text() != text:
+                pnl_item.setText(text)
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
         """하단 종목표의 선택 종목 경로와 세로 스크롤 위치를 저장한다."""
@@ -3515,6 +3701,25 @@ class AutoTradeSettingWindow(QDialog):
         if stock_dir is None or code_item is None or name_item is None:
             return None
         return stock_dir, code_item.text().strip(), name_item.text().strip()
+
+    def on_stock_table_code_item_double_clicked(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        """Open the common instance chart only from the stock-code column."""
+        if item.column() != 0:
+            return
+        row = item.row()
+        if row < 0 or row >= self.stock_table.rowCount():
+            return
+        stock_code = item.text().strip()
+        if not stock_code:
+            return
+        open_stock_instance_chart(
+            stock_code,
+            trade_date=None,
+            parent=self,
+        )
 
     def on_stock_table_name_item_double_clicked(
         self,
@@ -3792,6 +3997,15 @@ class AutoTradeSettingWindow(QDialog):
     ) -> dict[str, bool]:
         return auto_trade_selected_manual_ats_state(self, selected)
 
+    def selected_manual_ats_liquidation_available(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> bool:
+        return auto_trade_selected_manual_ats_liquidation_available(
+            self,
+            selected,
+        )
+
     def save_selected_manual_ats_state(
         self,
         ats_state: dict[str, bool],
@@ -3804,9 +4018,6 @@ class AutoTradeSettingWindow(QDialog):
             selected,
             editable_keys,
         )
-
-    def open_selected_manual_ats_settings_dialog(self) -> None:
-        auto_trade_open_selected_manual_ats_settings_dialog(self)
 
     def set_selected_manual_ats_flag(self, flag_key: str, enabled: bool, label: str) -> None:
         auto_trade_set_selected_manual_ats_flag(self, flag_key, enabled, label)
@@ -9158,6 +9369,7 @@ class AutoTradeSettingWindow(QDialog):
             "started_at": clean_started_at,
             "cancel_requested": 0,
             "cancel_pending": 0,
+            "cancel_order_identities": [],
             "blocked_reasons": [],
             "results": [],
         }
@@ -9260,6 +9472,13 @@ class AutoTradeSettingWindow(QDialog):
                     "cancelable order requires broker_order_no and positive remaining_quantity"
                 )
                 continue
+            result["cancel_order_identities"].append(
+                {
+                    "order_queued_id": str(source_order.get("id") or "").strip(),
+                    "order_id": str(source_order.get("order_id") or "").strip(),
+                    "broker_order_no": broker_order_no,
+                }
+            )
             if self._pending_cancel_duplicate_reason(orders, broker_order_no):
                 result["cancel_pending"] = int(result["cancel_pending"]) + 1
                 continue
@@ -9998,18 +10217,39 @@ class AutoTradeSettingWindow(QDialog):
             or order.get("order_action")
             or "NEW"
         ).strip().upper()
-        close_sell_status = (
-            (side == "SELL" or order_action == "CANCEL")
-            and status in {
-                "EARLY_CLOSE",
-                "EARLY_CLOSING",
-                "AUTO_CLOSE",
-                "AUTO_CLOSING",
-            }
+        close_status = status in {
+            "EARLY_CLOSE",
+            "EARLY_CLOSING",
+            "AUTO_CLOSE",
+            "AUTO_CLOSING",
+        }
+        routine_close_order = (
+            close_status
+            and order_action != "CANCEL"
+            and side in {"BUY", "SELL"}
+            and auto_trade_setting_close_routine_mode_active(
+                state_dict,
+                display_status=status,
+            )
+        )
+        routine_order_allowed, routine_order_reason = (
+            auto_trade_setting_close_routine_order_allowed(
+                state_dict,
+                side,
+                display_status=status,
+            )
+            if routine_close_order
+            else (True, "")
+        )
+        close_status_exception = (
+            close_status
+            and (side == "SELL" or order_action == "CANCEL" or routine_close_order)
         )
         reasons: list[str] = []
-        if status != "RUNNING" and not close_sell_status:
+        if status != "RUNNING" and not close_status_exception:
             reasons.append("auto trade status is not RUNNING")
+        if routine_close_order and not routine_order_allowed:
+            reasons.append(routine_order_reason)
         if state_dict.get("trade_enabled") is not True:
             reasons.append("trade_enabled is not true")
         if state_dict.get("real_trade_enabled") is not True:
@@ -10640,8 +10880,6 @@ class AutoTradeSettingWindow(QDialog):
                 "emergency_stopped_at": stopped_at,
                 "emergency_reason": "운영 데이터 불일치",
                 "trade_enabled": False,
-                "buy_enabled": False,
-                "sell_enabled": False,
                 "operation_notice": "",
                 "operation_notice_reason": "",
                 "operation_notice_at": "",
@@ -10832,9 +11070,6 @@ class AutoTradeSettingWindow(QDialog):
         config_updates: dict[str, object] | None = None,
     ) -> None:
         auto_trade_set_selected_operation_mode(self, operation_mode, config_updates)
-
-    def set_selected_stocks_buy_end(self) -> None:
-        auto_trade_set_selected_stocks_buy_end(self)
 
     def split_start_targets(
         self,
@@ -11059,32 +11294,22 @@ class AutoTradeSettingWindow(QDialog):
             selected_targets=selected_targets,
             source="auto_trade_global_start_button",
         )
-        self.update_global_operation_button_state()
+        parent_refreshed = False
+        parent_getter = getattr(self, "parent", None)
+        parent = parent_getter() if callable(parent_getter) else None
+        parent_refresh = getattr(parent, "refresh_all", None)
+        if callable(parent_refresh):
+            parent_refresh()
+            parent_refreshed = True
+        if not parent_refreshed:
+            self.update_global_operation_button_state()
 
-    def start_selected_rows_auto_trades(self) -> None:
+    def start_selected_rows_auto_trades(self) -> dict[str, object] | None:
         selected_targets = self.selected_stock_infos()
         if not selected_targets:
-            return
+            return None
 
-        running_targets_getter = getattr(
-            self,
-            "running_registered_operation_targets",
-            None,
-        )
-        if not callable(running_targets_getter):
-            result = auto_trade_start_selected_auto_trades(
-                self,
-                request_scope="multiple",
-                selected_targets=selected_targets,
-                source="auto_trade_context_menu",
-            )
-            if result.get("ok") is True:
-                status_message = getattr(self, "statusBarMessage", None)
-                if callable(status_message):
-                    status_message("정상 운영시작 되었습니다.")
-            return
-
-        running_targets = running_targets_getter()
+        running_targets = self.running_registered_operation_targets()
         global_running = _today_global_operation_status(
             read_operation_state()
         ) in {"RUNNING", "CLOSING"}
@@ -11094,18 +11319,46 @@ class AutoTradeSettingWindow(QDialog):
         }
 
         if not running_targets and not global_running:
+            start_targets: list[tuple[Path, str, str]] = []
+            selected_keys: set[str] = set()
+            for target in selected_targets:
+                stock_dir, code, _name = target
+                key = str(code or "").strip() or str(Path(stock_dir).resolve())
+                selected_keys.add(key)
+                if auto_trade_stock_operation_excluded(stock_dir):
+                    if not set_auto_trade_stock_operation_excluded(stock_dir, False):
+                        continue
+                    if auto_trade_stock_operation_excluded(stock_dir):
+                        continue
+                start_targets.append(target)
+
+            if not start_targets:
+                self.refresh_all()
+                return None
+
             result = auto_trade_start_selected_auto_trades(
                 self,
                 request_scope="multiple",
-                selected_targets=selected_targets,
+                selected_targets=start_targets,
                 source="auto_trade_context_menu",
             )
             if result.get("ok") is True:
+                for stock_dir, code, _name in self.registered_operation_targets():
+                    key = str(code or "").strip() or str(Path(stock_dir).resolve())
+                    if key in selected_keys or is_review_required_stock_dir(stock_dir):
+                        continue
+                    config = read_json_dict(stock_dir / "config.json")
+                    if not str(
+                        config.get("assigned_routine_instance_id", "") or ""
+                    ).strip():
+                        continue
+                    set_auto_trade_stock_operation_excluded(stock_dir, True)
+                self.refresh_all()
                 status_message = getattr(self, "statusBarMessage", None)
                 if callable(status_message):
                     status_message("정상 운영시작 되었습니다.")
             self.update_global_operation_button_state()
-            return
+            return result
 
         selected_running: list[tuple[Path, str, str]] = []
         selected_inactive: list[tuple[Path, str, str]] = []
@@ -11121,24 +11374,33 @@ class AutoTradeSettingWindow(QDialog):
             status_message = getattr(self, "statusBarMessage", None)
             if callable(status_message):
                 status_message("운영중인 종목입니다.")
-            return
+            return {
+                "ok": False,
+                "reason": "ALREADY_RUNNING",
+            }
 
         if selected_running and selected_inactive:
             status_message = getattr(self, "statusBarMessage", None)
             if callable(status_message):
                 status_message("운영중인 종목이 포함되어 있습니다.")
-            return
+            return {
+                "ok": False,
+                "reason": "MIXED_RUNNING_SELECTION",
+            }
 
         start_targets: list[tuple[Path, str, str]] = []
         for target in selected_inactive:
             stock_dir, _code, _name = target
             if auto_trade_stock_operation_excluded(stock_dir):
-                set_auto_trade_stock_operation_excluded(stock_dir, False)
+                if not set_auto_trade_stock_operation_excluded(stock_dir, False):
+                    continue
+                if auto_trade_stock_operation_excluded(stock_dir):
+                    continue
             start_targets.append(target)
 
         if not start_targets:
             self.refresh_all()
-            return
+            return None
 
         result = auto_trade_start_selected_auto_trades(
             self,
@@ -11151,6 +11413,7 @@ class AutoTradeSettingWindow(QDialog):
             if callable(status_message):
                 status_message("정상 운영시작 되었습니다.")
         self.update_global_operation_button_state()
+        return result
 
     def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
         selected_targets = self.selected_stock_infos()

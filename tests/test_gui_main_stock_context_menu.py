@@ -16,6 +16,7 @@ from PyQt5.QtGui import QMouseEvent, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QMenu,
     QStyle,
     QStyleOptionViewItem,
     QTableWidget,
@@ -24,7 +25,10 @@ from PyQt5.QtWidgets import (
 )
 
 import gui_auto_trade_context_menu as common_menu
+import gui_auto_trade_close as close_ops
 import gui_auto_trade_status_ops as status_ops
+import gui_auto_trade_unregister as unregister_ops
+import gui_main_emergency_ops as emergency_ops
 import gui_main_stock_context_menu as monitoring_menu
 import gui_windows
 from gui_main_table_loader import (
@@ -694,10 +698,17 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             "시장가즉시",
             source="우클릭",
             extra_policy=None,
+            show_error_dialog=True,
+            show_result_toast=True,
         )
         profit_loss.assert_called_once_with(adapter)
         cancel.assert_called_once_with(adapter)
-        individual.assert_called_once_with(adapter, "현재가", "15")
+        individual.assert_called_once_with(
+            adapter,
+            "현재가",
+            "15",
+            show_error_dialog=True,
+        )
         adapter.close()
 
     def test_select_all_uses_only_visible_stock_rows(self) -> None:
@@ -763,6 +774,174 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.assertFalse(opened)
         show_menu.assert_not_called()
 
+    def test_ats_session_clicks_stay_open_and_refresh_filled_dots(self) -> None:
+        runtime_state = {
+            "extra1": False,
+            "extra2": False,
+            "extra3": False,
+        }
+        toggle_calls = []
+
+        def toggle(key: str, enabled: bool, label: str) -> None:
+            toggle_calls.append((key, enabled, label))
+            runtime_state[key] = enabled
+
+        root = QMenu()
+        with (
+            patch.object(
+                common_menu,
+                "manual_ats_visible_session_keys",
+                return_value=("extra1", "extra2"),
+            ),
+            patch.object(
+                common_menu,
+                "manual_ats_session_labels",
+                return_value={"extra1": "장전프리", "extra2": "장마감NXT"},
+            ),
+        ):
+            ats = common_menu._add_ats_settings_menu(
+                root,
+                has_selection=True,
+                state_getter=lambda: dict(runtime_state),
+                toggle=toggle,
+                liquidation_available_getter=lambda: any(runtime_state.values()),
+            )
+        menu = ats["menu"]
+        menu.show()
+        self.app.processEvents()
+        toggle_filter = menu._ats_toggle_filter
+
+        def has_visible_icon(action) -> bool:
+            image = action.icon().pixmap(16, 16).toImage()
+            return any(
+                image.pixelColor(x, y).alpha() > 0
+                for x in range(image.width())
+                for y in range(image.height())
+            )
+
+        def click(action) -> bool:
+            position = menu.actionGeometry(action).center()
+            event = QMouseEvent(
+                QEvent.MouseButtonRelease,
+                QPointF(position),
+                Qt.LeftButton,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            )
+            return toggle_filter.eventFilter(menu, event)
+
+        first = ats["session_actions"][0][2]
+        second = ats["session_actions"][1][2]
+        self.assertFalse(has_visible_icon(first))
+        self.assertFalse(has_visible_icon(second))
+        self.assertFalse(ats["market"].isEnabled())
+        self.assertFalse(ats["current"].isEnabled())
+
+        self.assertTrue(click(first))
+        self.assertTrue(menu.isVisible())
+        self.assertTrue(has_visible_icon(first))
+        self.assertFalse(has_visible_icon(second))
+        self.assertTrue(ats["market"].isEnabled())
+        self.assertTrue(ats["current"].isEnabled())
+
+        self.assertTrue(click(second))
+        self.assertTrue(menu.isVisible())
+        self.assertTrue(has_visible_icon(first))
+        self.assertTrue(has_visible_icon(second))
+
+        self.assertTrue(click(first))
+        self.assertTrue(menu.isVisible())
+        self.assertFalse(has_visible_icon(first))
+        self.assertTrue(has_visible_icon(second))
+        self.assertTrue(ats["market"].isEnabled())
+        self.assertTrue(click(second))
+        self.assertFalse(has_visible_icon(second))
+        self.assertFalse(ats["market"].isEnabled())
+        self.assertFalse(ats["current"].isEnabled())
+        self.assertEqual(
+            [
+                ("extra1", True, "장전프리"),
+                ("extra2", True, "장마감NXT"),
+                ("extra1", False, "장전프리"),
+                ("extra2", False, "장마감NXT"),
+            ],
+            toggle_calls,
+        )
+        self.assertFalse(click(ats["market"]))
+        menu.close()
+        root.close()
+
+    def test_monitor_continuous_ats_submenu_uses_shared_adapter_backends(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        self._write_stock_config(row, mode="CONTINUOUS")
+        self._select_rows(row)
+        self.app.processEvents()
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(row, 0)
+        ).center()
+
+        for chosen_text in ("ATS 주간", "시장가"):
+            with self.subTest(chosen_text=chosen_text):
+                _FakeMenu.root = None
+                _FakeMenu.chosen_menu_title = "ATS설정"
+                _FakeMenu.chosen_text = chosen_text
+                with (
+                    patch.object(common_menu, "QMenu", _FakeMenu),
+                    patch.object(
+                        common_menu,
+                        "manual_ats_visible_session_keys",
+                        return_value=("extra1", "extra2"),
+                    ),
+                    patch.object(
+                        common_menu,
+                        "manual_ats_session_labels",
+                        return_value={"extra1": "ATS 장전", "extra2": "ATS 주간"},
+                    ),
+                    patch.object(
+                        monitoring_menu.MainMonitoringStockOperationAdapter,
+                        "selected_manual_ats_state",
+                        return_value={"extra1": True, "extra2": False, "extra3": False},
+                    ),
+                    patch.object(
+                        monitoring_menu,
+                        "auto_trade_set_selected_manual_ats_flag",
+                    ) as save_backend,
+                    patch.object(
+                        monitoring_menu,
+                        "auto_trade_execute_selected_manual_ats_liquidation",
+                    ) as liquidation_backend,
+                ):
+                    opened = monitoring_menu.show_main_monitoring_stock_context_menu(
+                        self.window,
+                        position,
+                    )
+
+                self.assertTrue(opened)
+                adapter = self.window._main_monitoring_stock_operation_adapter
+                if chosen_text == "ATS 주간":
+                    save_backend.assert_called_once_with(
+                        adapter,
+                        "extra2",
+                        True,
+                        "ATS 주간",
+                    )
+                    liquidation_backend.assert_not_called()
+                else:
+                    liquidation_backend.assert_called_once_with(
+                        adapter,
+                        "시장가",
+                        {"extra1": True, "extra2": False, "extra3": False},
+                        adapter.target_snapshot(),
+                        ("extra1", "extra2"),
+                        ("extra1",),
+                    )
+                    save_backend.assert_not_called()
+
     def test_stock_context_menu_adds_stock_register_entry_for_row_instance(self) -> None:
         row = self._add_row(
             kind=ROUTINE_ROW_STOCK,
@@ -781,10 +960,17 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             opened = monitoring_menu.show_main_monitoring_stock_context_menu(
                 self.window,
                 position,
-            )
+        )
 
         self.assertTrue(opened)
-        self.assertEqual("종목등록", _FakeMenu.root.actions[0].text)
+        self.assertEqual(
+            ["종목등록", "등록해제"],
+            [
+                action.text
+                for action in _FakeMenu.root.actions
+                if not action.separator
+            ][-2:],
+        )
         self.window.open_routine_instance_stock_register_from_main_table.assert_called_once_with(
             "instance-a"
         )
@@ -846,7 +1032,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             patch.object(common_menu, "QMenu", _FakeMenu),
             patch.object(setting_window, "append_stock_log"),
             patch.object(setting_window, "append_changelog"),
-            patch.object(setting_window, "show_toast"),
+            patch.object(setting_window, "show_toast") as toast,
         ):
             _FakeMenu.chosen_text = "운영제외"
             self.assertTrue(
@@ -889,9 +1075,152 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             )
             self.assertEqual("SCHEDULED", config["operation_mode"])
 
+        self.assertTrue(toast.call_args_list)
+        self.assertTrue(
+            all(call.args[0] is self.window for call in toast.call_args_list)
+        )
         self.assertTrue(stock_dir.exists())
         self.assertTrue((stock_dir / "state.json").exists())
         self.assertEqual(2, self.window.refresh_all.call_count)
+
+    def test_monitor_emergency_stop_uses_window_as_toast_parent(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        target = monitoring_menu.MainMonitoringStockTarget(
+            stock_dir=stock_dir,
+            code="005930",
+            name="삼성전자",
+            routine_instance_id="instance-a",
+        )
+        adapter = monitoring_menu.MainMonitoringStockOperationAdapter(
+            self.window,
+            [target],
+        )
+        adapter.refresh_all = Mock()
+        adapter.statusBarMessage = Mock()
+
+        with (
+            patch.object(emergency_ops, "update_runtime_stock_status", return_value=True) as update,
+            patch.object(emergency_ops, "append_changelog"),
+            patch.object(emergency_ops, "show_toast") as toast,
+        ):
+            result = adapter.emergency_stop_selected_auto_trade_stocks()
+
+        self.assertEqual(1, result["changed_count"])
+        self.assertIs(update.call_args.args[0], adapter)
+        self.assertIs(toast.call_args.kwargs["parent"], self.window)
+        self.assertIsInstance(toast.call_args.kwargs["parent"], QWidget)
+
+    def test_monitor_unregister_uses_window_as_toast_parent(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        target = monitoring_menu.MainMonitoringStockTarget(
+            stock_dir=stock_dir,
+            code="005930",
+            name="삼성전자",
+            routine_instance_id="instance-a",
+        )
+        adapter = monitoring_menu.MainMonitoringStockOperationAdapter(
+            self.window,
+            [target],
+        )
+        adapter.refresh_all = Mock()
+        adapter.statusBar_message = Mock()
+        self.window.refresh_all = Mock()
+
+        with (
+            patch.object(
+                unregister_ops,
+                "auto_trade_unregister_category",
+                return_value={
+                    "category": "immediate",
+                    "code": "005930",
+                    "name": "삼성전자",
+                },
+            ),
+            patch.object(unregister_ops, "update_base_stock_routines", return_value=True),
+            patch.object(unregister_ops, "append_changelog"),
+            patch.object(unregister_ops, "show_toast") as toast,
+        ):
+            adapter.unregister_selected_auto_trade_stocks()
+
+        self.assertIs(toast.call_args.args[0], self.window)
+        self.assertIsInstance(toast.call_args.args[0], QWidget)
+
+    def test_monitor_emergency_release_uses_window_as_toast_parent(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        (stock_dir / "state.json").write_text(
+            json.dumps({"status": "EMERGENCY_STOPPED"}),
+            encoding="utf-8",
+        )
+        target = monitoring_menu.MainMonitoringStockTarget(
+            stock_dir=stock_dir,
+            code="005930",
+            name="삼성전자",
+            routine_instance_id="instance-a",
+        )
+        adapter = monitoring_menu.MainMonitoringStockOperationAdapter(
+            self.window,
+            [target],
+        )
+        adapter.refresh_all = Mock()
+        adapter.statusBarMessage = Mock()
+
+        with (
+            patch.object(
+                emergency_ops,
+                "release_emergency_stop_target",
+                return_value="normal",
+            ),
+            patch.object(emergency_ops, "append_changelog"),
+            patch.object(emergency_ops, "show_toast") as toast,
+        ):
+            result = adapter.release_selected_emergency_stopped_auto_trade_stocks()
+
+        self.assertEqual(1, result["normal_count"])
+        self.assertIs(toast.call_args.kwargs["parent"], self.window)
+        self.assertIsInstance(toast.call_args.kwargs["parent"], QWidget)
+
+    def test_monitor_early_close_uses_window_as_toast_parent(self) -> None:
+        target = monitoring_menu.MainMonitoringStockTarget(
+            stock_dir=self.root,
+            code="005930",
+            name="삼성전자",
+            routine_instance_id="instance-a",
+        )
+        adapter = monitoring_menu.MainMonitoringStockOperationAdapter(
+            self.window,
+            [target],
+        )
+
+        with (
+            patch.object(
+                close_ops,
+                "_kiwoom_server_login_block_message",
+                return_value="로그인 필요",
+            ),
+            patch.object(close_ops, "show_toast") as toast,
+        ):
+            adapter.apply_selected_early_close("시장가")
+
+        self.assertIs(toast.call_args.args[0], self.window)
+        self.assertIsInstance(toast.call_args.args[0], QWidget)
 
     def test_main_context_stock_row_keeps_stock_register_action(self) -> None:
         row = self._add_row(
@@ -913,7 +1242,14 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                 position,
             )
 
-        self.assertEqual("종목등록", _FakeMenu.root.actions[0].text)
+        self.assertEqual(
+            ["종목등록", "등록해제"],
+            [
+                action.text
+                for action in _FakeMenu.root.actions
+                if not action.separator
+            ][-2:],
+        )
         self.window.open_routine_instance_stock_register_from_main_table.assert_called_once_with(
             "instance-a"
         )
@@ -995,7 +1331,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
 
         root = _FakeMenu.root
         self.assertEqual(
-            ["전체선택", "전체해제"],
+            ["전체선택", "선택해제"],
             [action.text for action in root.actions if not action.separator],
         )
         self.assertEqual(
@@ -1053,6 +1389,84 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                     else "set_operation_exclusion"
                 )
                 getattr(callbacks, other_name).assert_not_called()
+
+    def test_monitor_excluded_selection_disables_only_early_close_menu(self) -> None:
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(),
+            start=Mock(),
+            emergency_stop=Mock(),
+            clear_operation_exclusion=Mock(),
+        )
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_monitor_stock_context_menu(
+                self.window.routine_table,
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                operation_excluded=True,
+            )
+
+        menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
+        self.assertFalse(menus["조기마감"].enabled)
+        self.assertTrue(menus["개별청산"].enabled)
+        actions = {
+            action.text: action
+            for action in _FakeMenu.root.actions
+            if not action.separator
+        }
+        self.assertTrue(actions["운영시작"].enabled)
+        self.assertTrue(actions["긴급정지"].enabled)
+        self.assertTrue(actions["제외해제"].enabled)
+
+    def test_settings_excluded_selection_uses_config_and_disables_early_close(self) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir()
+        (stock_dir / "config.json").write_text(
+            json.dumps({"operation_excluded": True}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (stock_dir / "state.json").write_text("{}", encoding="utf-8")
+        window = Mock()
+        window._stock_status_filter = "excluded"
+        window.stock_table.itemAt.return_value = None
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window.selected_stock_infos.return_value = [
+            (stock_dir, "005930", "삼성전자")
+        ]
+        window.selected_operation_mode_set.return_value = set()
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_auto_trade_stock_context_menu(window, QPoint())
+
+        menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
+        self.assertFalse(menus["조기마감"].enabled)
+        self.assertTrue(menus["개별청산"].enabled)
+
+    def test_normal_selection_keeps_early_close_enabled(self) -> None:
+        callbacks = common_menu.StockContextMenuCallbacks(
+            select_all=Mock(),
+            clear_selection=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(),
+        )
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_monitor_stock_context_menu(
+                self.window.routine_table,
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                operation_excluded=False,
+            )
+
+        menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
+        self.assertTrue(menus["조기마감"].enabled)
 
     def test_carry_disables_shared_individual_time_menu(self) -> None:
         callbacks = common_menu.StockContextMenuCallbacks(

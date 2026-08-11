@@ -467,8 +467,6 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
-                patch.object(auto_trade_timer, "reset_expired_manual_ats_runtime_selections"),
-                patch.object(auto_trade_timer, "manual_ats_market_day_closed", return_value=True),
                 patch.object(auto_trade_timer, "probe_all_enabled_routine_stocks_once", None),
             ):
                 auto_trade_timer.auto_trade_on_time_policy_timer_tick(window)
@@ -512,8 +510,6 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         )
 
         with (
-            patch.object(auto_trade_timer, "reset_expired_manual_ats_runtime_selections"),
-            patch.object(auto_trade_timer, "manual_ats_market_day_closed", return_value=False),
             patch.object(auto_trade_timer, "probe_all_enabled_routine_stocks_once", probe),
             patch.object(auto_trade_timer, "consume_pending_routine_signals_dry_run", None),
         ):

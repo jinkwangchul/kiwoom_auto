@@ -67,6 +67,16 @@ _POLICY_ALIASES: Final = {
 }
 
 
+def normalize_direct_close_policy_alias(value: object) -> str:
+    """Return the Korean canonical value for direct close aliases only."""
+    text = _clean_text(value)
+    if text in {"시장가", "시장가즉시"}:
+        return POLICY_MARKET
+    if text in {"현재가", "현재가즉시"}:
+        return POLICY_CURRENT_PRICE
+    return text
+
+
 @dataclass(frozen=True)
 class TransitionEvidence:
     routine_close_action_started: bool = False
@@ -111,7 +121,8 @@ def _normalize_domain(value: object) -> str:
 
 
 def _normalize_policy(value: object) -> str:
-    return _POLICY_ALIASES.get(_clean_text(value), _clean_text(value))
+    normalized = normalize_direct_close_policy_alias(value)
+    return _POLICY_ALIASES.get(normalized, normalized)
 
 
 def _decision(

@@ -24,7 +24,11 @@ from gui_schedule_utils import (
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import get_stock_dirs_in_routine, write_state_json
 from gui_order_utils import pending_order_side_quantities
-from manual_ats_runtime import manual_ats_runtime_selected_keys
+from gui_ats_utils import manual_ats_active_now
+from manual_ats_runtime import (
+    clear_manual_ats_runtime_selection,
+    manual_ats_runtime_selected_keys,
+)
 from auto_close_runtime_policy_snapshot import (
     AUTO_CLOSE_RUNTIME_STATUSES,
     auto_close_runtime_snapshot_metadata,
@@ -359,8 +363,6 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         probe_metadata = {
             "trade_enabled": True,
             "real_trade_enabled": False,
-            "buy_enabled": False,
-            "sell_enabled": False,
             "signal_probe_only": True,
             "operation_policy_recalculated_at": now_text(),
             "operation_policy_reason": reason,
@@ -368,7 +370,7 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         }
         needs_restore = before_status != "MONITORING" or any(
             state.get(key) != value for key, value in probe_metadata.items()
-            if key in {"trade_enabled", "real_trade_enabled", "buy_enabled", "sell_enabled", "signal_probe_only"}
+            if key in {"trade_enabled", "real_trade_enabled", "signal_probe_only"}
         )
         if needs_restore:
             if window.update_stock_status(
@@ -421,6 +423,14 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
 
     mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     new_status = status_after_operation_mode_change(mode, config)
+    if start_requested and extra_state:
+        guarded_start_status = str(
+            extra_state.get("start_policy_status") or ""
+        ).strip().upper()
+        if guarded_start_status in {"RUNNING", "MONITORING"}:
+            # 공통 운영시작 Backend가 같은 시각으로 완료한 Guard 판정을
+            # 상태/권한 단일 write에서도 그대로 사용한다.
+            new_status = guarded_start_status
 
     recalculated_at = now_text()
     metadata = {
@@ -662,6 +672,7 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
     decision_config = target_config if mode == "SCHEDULED" else config
     decision_now = current_datetime()
     runtime_state = read_json_dict(stock_dir / "state.json")
+    manual_ats_selected = bool(manual_ats_runtime_selected_keys(runtime_state))
     buy_pending_qty, sell_pending_qty = pending_order_side_quantities(
         stock_dir,
         runtime_state,
@@ -684,8 +695,9 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         decision_config,
         mode,
         decision_now,
-        ats_runtime_active=bool(
-            manual_ats_runtime_selected_keys(runtime_state, now_dt=decision_now)
+        ats_runtime_active=(
+            manual_ats_active_now(config, runtime_state, decision_now)
+            and auto_trade_setting_trade_started(runtime_state)
         ),
         runtime_status=runtime_status,
         pending_order_active=pending_order_active,
@@ -738,6 +750,16 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
             f"운영방식 저장 read-back 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
         )
         return False
+
+    if before_mode != mode and manual_ats_selected:
+        if not clear_manual_ats_runtime_selection(stock_dir):
+            append_stock_log(
+                stock_dir,
+                "ERROR",
+                "운영방식 변경 후 ATS 설정 해제 실패: "
+                f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
+            )
+            return False
 
     append_stock_log(stock_dir, "GUI", f"운영방식 변경: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}")
     return True
@@ -943,90 +965,3 @@ def auto_trade_set_selected_operation_mode(
         operation_mode,
         config_updates,
     )
-
-
-
-def auto_trade_set_selected_stocks_buy_end(window) -> None:
-    """선택 종목을 canonical AUTO_CLOSE 상태로 전환한다."""
-    selected = window.selected_stock_infos()
-    routine_name = window.current_selected_routine_name()
-
-    if not selected or not routine_name:
-        QMessageBox.warning(window, "선택 오류", "매수종료할 종목을 1개 이상 선택하세요.")
-        return
-
-    targets: list[tuple[Path, str, str]] = []
-    skipped: list[str] = []
-    allowed_statuses = {"RUNNING", "MONITORING"}
-
-    for stock_dir, code, name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        if status in allowed_statuses:
-            targets.append((stock_dir, code, name))
-        else:
-            skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
-
-    if not targets:
-        message = "매수종료 전환 대상 없음"
-        if skipped:
-            message += f": 제외 {len(skipped)}개"
-        window.statusBarMessage(message)
-        return
-
-    preview = "\n".join(f"- {code} {name}" for _, code, name in targets[:8])
-    if len(targets) > 8:
-        preview += f"\n- 외 {len(targets) - 8}개"
-
-    box = QMessageBox(window)
-    box.setIcon(QMessageBox.Question)
-    box.setWindowTitle("매수종료 확인")
-    box.setText(
-        "선택 종목을 매수종료 상태로 전환합니다.\n\n"
-        "신규매수는 중단되고 보유분 매도 조건만 계속 관리됩니다.\n\n"
-        f"대상:\n{preview}\n\n"
-        "계속하시겠습니까?"
-    )
-    proceed_button = box.addButton("진행", QMessageBox.AcceptRole)
-    box.addButton("취소", QMessageBox.RejectRole)
-    box.setDefaultButton(proceed_button)
-    box.exec_()
-    if box.clickedButton() != proceed_button:
-        window.statusBarMessage("매수종료 전환 취소")
-        return
-
-    completed: list[str] = []
-    operation_policy = read_operation_policy()
-    auto_close_policy = operation_policy.get("auto_close", {})
-    if not isinstance(auto_close_policy, dict):
-        auto_close_policy = {}
-    for stock_dir, code, name in targets:
-        requested_at = now_text()
-        policy_snapshot = dict(auto_close_policy)
-        method = str(policy_snapshot.get("method") or "").strip() or "루틴매도신호"
-        policy_snapshot["method"] = method
-        metadata = {
-            "buy_end_requested_at": requested_at,
-            "buy_end_reason": "USER_CONTEXT_MENU",
-            "auto_close_requested_at": requested_at,
-            "auto_close_source": "USER_CONTEXT_MENU",
-            "auto_close_method": method,
-            "auto_close_policy": policy_snapshot,
-        }
-        if window.update_stock_status(stock_dir, code, name, "AUTO_CLOSE", metadata, "상태 칼럼 우클릭 매수종료"):
-            completed.append(f"{code} {name}")
-
-    if completed:
-        changelog_message = f"선택종목 매수종료 전환: {routine_name} -> {' / '.join(completed)}"
-        if skipped:
-            changelog_message += f" / 제외: {' / '.join(skipped)}"
-        append_changelog("UPDATE", "state.json", changelog_message)
-
-    window.refresh_all()
-    window.stock_table.viewport().update()
-    window.stock_table.repaint()
-
-    message = f"매수종료 전환 완료: {len(completed)}개"
-    if skipped:
-        message += f" / 제외 {len(skipped)}개"
-    window.statusBarMessage(message)

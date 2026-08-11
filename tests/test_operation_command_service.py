@@ -45,6 +45,7 @@ from operation_command_service import (
 )
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
+    auto_trade_setting_display_status,
     auto_trade_setting_display_status_for_current_session,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_liquidation_text,
@@ -113,7 +114,7 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual(str(COMMAND_ID), state["operation_command_id"])
         self.assertEqual("monitoring_window", state["operation_command_source"])
         self.assertEqual("EARLY_CLOSE", state["status"])
-        self.assertTrue(state["liquidation_policy_forced"])
+        self.assertFalse(state["liquidation_policy_forced"])
 
     def test_early_close_preserves_operation_start_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -125,6 +126,8 @@ class OperationCommandServiceTest(unittest.TestCase):
                     "status": "RUNNING",
                     "trade_enabled": True,
                     "trade_started_at": "2026-07-19 09:00:00",
+                    "buy_enabled": False,
+                    "sell_enabled": True,
                 },
             )
             result = self._service(root).apply_early_close(
@@ -146,6 +149,8 @@ class OperationCommandServiceTest(unittest.TestCase):
             "2026-07-19 09:00:00",
             state["trade_started_at"],
         )
+        self.assertFalse(state["buy_enabled"])
+        self.assertTrue(state["sell_enabled"])
 
     def test_duplicate_command_id_does_not_increment_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -540,6 +545,163 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertTrue(auto_trade_setting_early_close_requested(state))
         self.assertTrue(auto_trade_setting_close_routine_mode_active(state))
         self.assertEqual("legacy_early_close", state["early_close_source"])
+        self.assertNotIn("buy_enabled", state)
+        self.assertNotIn("sell_enabled", state)
+
+    def test_early_close_method_controls_direct_liquidation_permission(self) -> None:
+        from routine_order_permission import canonical_routine_order_permission
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            routine_stock = self._stock(root, "111111_Routine")
+            market_stock = self._stock(root, "222222_Market")
+            service = self._service(root)
+            routine_result = service.apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "111111",
+                    MODE_EARLY_CLOSE,
+                    "monitoring_instance",
+                    command_id="routine-command",
+                ),
+                EarlyCloseCompatibility(method="루틴"),
+            )
+            market_result = service.apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "222222",
+                    MODE_EARLY_CLOSE,
+                    "monitoring_instance",
+                    command_id="market-command",
+                ),
+                EarlyCloseCompatibility(method="시장가"),
+            )
+            routine_state = self._state(routine_stock)
+            market_state = self._state(market_stock)
+
+        operation_state = {
+            "operation_date": "2026-07-19",
+            "operation_status": "RUNNING",
+        }
+        config = {
+            "operation_mode": "SCHEDULED",
+            "start_time": "09:00:00",
+            "end_buy_time": "13:30:00",
+        }
+        now_dt = datetime(2026, 7, 19, 10, 0, 0)
+
+        self.assertEqual(RESULT_SUCCESS, routine_result.status)
+        self.assertEqual("조기마감", auto_trade_setting_display_status(routine_state["status"]))
+        self.assertEqual("루틴", auto_trade_setting_method_text("조기마감", {}, routine_state))
+        self.assertFalse(routine_state["liquidation_policy_forced"])
+        self.assertEqual("", routine_state["liquidation_policy_reason"])
+        self.assertTrue(
+            canonical_routine_order_permission(
+                state=routine_state,
+                signal_type="BUY",
+                config=config,
+                operation_state=operation_state,
+                now_dt=now_dt,
+            )["allowed"]
+        )
+        self.assertTrue(
+            canonical_routine_order_permission(
+                state=routine_state,
+                signal_type="SELL",
+                config=config,
+                operation_state=operation_state,
+                now_dt=now_dt,
+            )["allowed"]
+        )
+
+        compatibility_state = dict(
+            routine_state,
+            liquidation_policy_forced=True,
+            liquidation_policy_reason="EARLY_CLOSE",
+        )
+        self.assertTrue(
+            canonical_routine_order_permission(
+                state=compatibility_state,
+                signal_type="BUY",
+                config=config,
+                operation_state=operation_state,
+                now_dt=now_dt,
+            )["allowed"]
+        )
+
+        routine_state["close_routine_final_sell_ordered"] = True
+        self.assertFalse(
+            canonical_routine_order_permission(
+                state=routine_state,
+                signal_type="BUY",
+                config=config,
+                operation_state=operation_state,
+                now_dt=now_dt,
+            )["allowed"]
+        )
+        self.assertFalse(
+            canonical_routine_order_permission(
+                state=routine_state,
+                signal_type="SELL",
+                config=config,
+                operation_state=operation_state,
+                now_dt=now_dt,
+            )["allowed"]
+        )
+
+        self.assertEqual(RESULT_SUCCESS, market_result.status)
+        self.assertEqual("조기마감", auto_trade_setting_display_status(market_state["status"]))
+        self.assertEqual("시장가", auto_trade_setting_method_text("조기마감", {}, market_state))
+        self.assertNotIn(IMMEDIATE_LIQUIDATION_REQUEST_KEY, market_state)
+        self.assertTrue(market_state["liquidation_policy_forced"])
+        self.assertEqual("EARLY_CLOSE", market_state["liquidation_policy_reason"])
+        for signal_type in ("BUY", "SELL"):
+            self.assertFalse(
+                canonical_routine_order_permission(
+                    state=market_state,
+                    signal_type=signal_type,
+                    config=config,
+                    operation_state=operation_state,
+                    now_dt=now_dt,
+                )["allowed"]
+            )
+
+    def test_early_close_aliases_are_written_as_canonical_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            market_stock = self._stock(root, "111111_Market")
+            current_stock = self._stock(root, "222222_Current")
+            service = self._service(root)
+
+            market_result = service.apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "111111",
+                    MODE_EARLY_CLOSE,
+                    "context_menu",
+                    command_id="market-command",
+                ),
+                EarlyCloseCompatibility(method="시장가즉시"),
+            )
+            current_result = service.apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "222222",
+                    MODE_EARLY_CLOSE,
+                    "context_menu",
+                    command_id="current-command",
+                ),
+                EarlyCloseCompatibility(method="현재가즉시"),
+            )
+            market_state = self._state(market_stock)
+            current_state = self._state(current_stock)
+
+        self.assertEqual(RESULT_SUCCESS, market_result.status)
+        self.assertEqual("시장가", market_state["early_close_method"])
+        self.assertEqual("시장가", market_state["early_close_policy"]["method"])
+        self.assertEqual(RESULT_SUCCESS, current_result.status)
+        self.assertEqual("현재가", current_state["early_close_method"])
+        self.assertEqual("현재가", current_state["early_close_policy"]["method"])
 
     def test_individual_liquidation_records_one_shot_override_without_changing_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -677,6 +839,64 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertEqual(STOCK_APPLIED, status_result.status)
         self.assertEqual("SEND_CALL_ACCEPTED", request["status"])
         self.assertEqual("ATS_ORDER_1", request["order_id"])
+
+    def test_manual_ats_liquidation_waiting_status_persists_cancel_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "005930_Samsung")
+            service = self._service(root)
+            service.apply_manual_ats_liquidation(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    COMMAND_MANUAL_ATS_LIQUIDATION,
+                    "MANUAL_ATS_LIQUIDATION",
+                    command_id="ats-command-waiting",
+                ),
+                ManualAtsLiquidationOverride("MARKET", ("extra1",)),
+            )
+            identities = [
+                {
+                    "order_queued_id": "source-queued-1",
+                    "order_id": "source-order-1",
+                    "broker_order_no": "broker-1",
+                }
+            ]
+            waiting_result = service.record_manual_ats_liquidation_status(
+                str(stock),
+                "ats-command-waiting",
+                "WAITING_CANCEL_CONFIRMATION",
+                cancel_order_identities=identities,
+                holding_readback={
+                    "holding_checked_at": "2026-08-09T16:00:00+09:00",
+                    "position_qty": 7,
+                    "broker_holding_qty": 7,
+                    "resolved_liquidation_qty": 7,
+                    "reconciliation_result": "CONSISTENT",
+                },
+                cancel_readback={
+                    "initial_holding_qty": 7,
+                    "pending_order_count": 1,
+                    "cancel_requested_count": 1,
+                    "cancel_pending_count": 0,
+                },
+            )
+            ready_result = service.record_manual_ats_liquidation_status(
+                str(stock),
+                "ats-command-waiting",
+                "READY_TO_RESUME",
+            )
+            request = self._state(stock)[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
+
+        self.assertEqual(STOCK_APPLIED, waiting_result.status)
+        self.assertEqual(STOCK_APPLIED, ready_result.status)
+        self.assertEqual("READY_TO_RESUME", request["status"])
+        self.assertEqual(identities, request["cancel_order_identities"])
+        self.assertEqual("MANUAL_ATS_LIQUIDATION", request["source"])
+        self.assertEqual(7, request["resolved_liquidation_qty"])
+        self.assertEqual("CONSISTENT", request["reconciliation_result"])
+        self.assertEqual(1, request["pending_order_count"])
+        self.assertEqual(1, request["cancel_requested_count"])
 
     def test_runtime_individual_liquidation_override_precedes_environment_policy(
         self,
@@ -1247,6 +1467,99 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             duration_ms=2500,
         )
         window.statusBarMessage.assert_not_called()
+
+    def test_disconnected_server_silent_mode_returns_login_message(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            selected = [self._write_stock(Path(temp), "005930_Samsung")]
+            window = self._window(selected)
+            window.parent.return_value.kiwoom_api.is_connected.return_value = False
+
+            with (
+                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.show_toast") as show_toast,
+            ):
+                result = auto_trade_apply_selected_early_close(
+                    window,
+                    "루틴",
+                    show_error_dialog=False,
+                    show_result_toast=False,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "키움 서버에 로그인되어 있지 않습니다.",
+            result["message"],
+        )
+        service_type.assert_not_called()
+        show_toast.assert_not_called()
+
+    def test_shared_early_close_backend_canonicalizes_direct_aliases(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        for alias, canonical in (
+            ("시장가즉시", "시장가"),
+            ("현재가즉시", "현재가"),
+        ):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as temp:
+                selected = [self._write_stock(Path(temp), "005930_Samsung")]
+                window = self._window(selected)
+                self._MessageBox.proceed = True
+                command_result = OperationCommandResult(
+                    RESULT_SUCCESS,
+                    f"{canonical}-command",
+                    (
+                        StockOperationCommandResult(
+                            "005930",
+                            str(selected[0][0]),
+                            STOCK_APPLIED,
+                            1,
+                        ),
+                    ),
+                )
+                with (
+                    patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                    patch(
+                        "gui_auto_trade_close.pending_order_side_quantities",
+                        return_value=(0, 0),
+                    ),
+                    patch(
+                        "gui_auto_trade_close.auto_trade_setting_liquidation_phase_active",
+                        return_value=False,
+                    ),
+                    patch("gui_auto_trade_close._production_recovery_gate", return_value=None),
+                    patch(
+                        "gui_auto_trade_close.evaluate_production_transition",
+                        return_value=Mock(allowed=True),
+                    ),
+                    patch(
+                        "gui_auto_trade_close.apply_close_intent",
+                        return_value={"command_result": command_result},
+                    ) as close_intent,
+                    patch(
+                        "gui_auto_trade_close._start_close_liquidation_execution",
+                        return_value={"ok": True, "stage": "send_order"},
+                    ) as execute,
+                    patch(
+                        "gui_auto_trade_close._persist_early_close_execution_result",
+                        return_value=True,
+                    ),
+                    patch(
+                        "gui_auto_trade_close.check_global_close_completion_after_durable_update",
+                        return_value={"ok": True},
+                    ),
+                    patch("gui_auto_trade_close.append_changelog"),
+                    patch("gui_auto_trade_close.append_stock_log"),
+                    patch("gui_auto_trade_close.show_toast"),
+                ):
+                    auto_trade_apply_selected_early_close(window, alias)
+
+                self.assertEqual(
+                    canonical,
+                    close_intent.call_args.kwargs["requested_policy"],
+                )
+                self.assertEqual(canonical, execute.call_args.kwargs["method"])
 
     def test_partial_failure_is_reported_and_direct_writer_is_not_called(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
@@ -2794,6 +3107,46 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         window.statusBarMessage.assert_not_called()
         critical.assert_called_once()
 
+    def test_individual_liquidation_silent_failure_returns_message_without_modal(
+        self,
+    ) -> None:
+        import gui_auto_trade_close as close
+
+        window = Mock()
+        window.selected_stock_infos.return_value = [
+            (Path("stocks/005930_Samsung"), "005930", "Samsung")
+        ]
+        service = Mock()
+        service.apply_individual_liquidation.return_value = OperationCommandResult(
+            RESULT_FAILED,
+            "failed-command",
+            error="키움 서버에 로그인되어 있지 않습니다.",
+        )
+        with (
+            patch.object(close, "OperationCommandService", return_value=service),
+            patch.object(
+                close,
+                "evaluate_production_transition",
+                return_value=Mock(allowed=True),
+            ),
+            patch.object(close.QMessageBox, "critical") as critical,
+            patch.object(close.QMessageBox, "warning") as warning,
+        ):
+            result = close.auto_trade_apply_selected_individual_liquidation_method(
+                window,
+                "시장가",
+                "15",
+                show_error_dialog=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            "키움 서버에 로그인되어 있지 않습니다.",
+            result["message"],
+        )
+        critical.assert_not_called()
+        warning.assert_not_called()
+
     def test_individual_liquidation_menu_has_no_current_marker_on_read_failure(
         self,
     ) -> None:
@@ -2875,7 +3228,6 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         self.assertNotIn("시간변경", root_actions)
         self.assertNotIn("변경리셋", root_actions)
         self.assertNotIn("혼합 선택: 공통 메뉴만 사용", root_actions)
-        window.open_selected_manual_ats_settings_dialog.assert_not_called()
 
     def test_all_manual_selection_shows_only_ats_mode_action(self) -> None:
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
@@ -2897,9 +3249,143 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             for action in self._FakeMenu.root.actions
             if not action.separator
         ]
-        self.assertIn("ATS설정", root_actions)
+        self.assertIn(
+            "ATS설정",
+            [submenu.title for submenu in self._FakeMenu.root.submenus],
+        )
         self.assertNotIn("시간변경", root_actions)
         self.assertNotIn("변경리셋", root_actions)
+
+    def test_ats_submenu_uses_visible_sessions_and_current_state(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {"CONTINUOUS"}
+        window.selected_manual_ats_state.return_value = {
+            "extra1": True,
+            "extra2": False,
+            "extra3": False,
+        }
+        window.selected_manual_ats_liquidation_available.return_value = True
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.manual_ats_visible_session_keys",
+                return_value=("extra1", "extra3"),
+            ),
+            patch(
+                "gui_auto_trade_context_menu.manual_ats_session_labels",
+                return_value={
+                    "extra1": "ATS 장전",
+                    "extra2": "ATS 주간",
+                    "extra3": "ATS 야간",
+                },
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        ats_menu = self._FakeMenu.root.submenus[2]
+        self.assertEqual("ATS설정", ats_menu.title)
+        self.assertTrue(ats_menu.enabled)
+        self.assertEqual(
+            ["ATS 장전", "ATS 야간", "시장가", "현재가"],
+            [action.text for action in ats_menu.actions if not action.separator],
+        )
+        self.assertEqual(1, sum(action.separator for action in ats_menu.actions))
+        self.assertTrue(ats_menu.actions[0].property("atsSessionCurrent"))
+        self.assertFalse(ats_menu.actions[1].property("atsSessionCurrent"))
+        self.assertTrue(ats_menu.actions[3].enabled)
+        self.assertTrue(ats_menu.actions[4].enabled)
+
+    def test_ats_liquidation_actions_are_disabled_outside_selected_session(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {"CONTINUOUS"}
+        window.selected_manual_ats_state.return_value = {
+            "extra1": True,
+            "extra2": False,
+            "extra3": False,
+        }
+        window.selected_manual_ats_liquidation_available.return_value = False
+        self._FakeMenu.chosen_text = None
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.manual_ats_visible_session_keys",
+                return_value=("extra1",),
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        ats_menu = self._FakeMenu.root.submenus[2]
+        actions = [action for action in ats_menu.actions if not action.separator]
+        self.assertFalse(actions[-2].enabled)
+        self.assertFalse(actions[-1].enabled)
+
+    def test_ats_submenu_is_disabled_without_visible_sessions(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        window = self._window()
+        window.selected_operation_mode_set.return_value = {"CONTINUOUS"}
+        self._FakeMenu.chosen_menu_title = "ATS설정"
+        self._FakeMenu.chosen_text = "시장가"
+        with (
+            patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+            patch(
+                "gui_auto_trade_context_menu.manual_ats_visible_session_keys",
+                return_value=(),
+            ),
+        ):
+            show_auto_trade_stock_context_menu(window, object())
+
+        ats_menu = self._FakeMenu.root.submenus[2]
+        self.assertFalse(ats_menu.enabled)
+        window.execute_selected_manual_ats_liquidation.assert_not_called()
+
+    def test_ats_submenu_dispatches_existing_setting_and_liquidation_backends(self) -> None:
+        from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+
+        selected = [(Path("stocks/005930_Samsung"), "005930", "Samsung")]
+        state = {"extra1": True, "extra2": False, "extra3": False}
+        for chosen_text in ("ATS 주간", "현재가"):
+            with self.subTest(chosen_text=chosen_text):
+                window = self._window()
+                window.selected_stock_infos.return_value = selected
+                window.selected_operation_mode_set.return_value = {"CONTINUOUS"}
+                window.selected_manual_ats_state.return_value = dict(state)
+                self._FakeMenu.chosen_menu_title = "ATS설정"
+                self._FakeMenu.chosen_text = chosen_text
+                with (
+                    patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
+                    patch(
+                        "gui_auto_trade_context_menu.manual_ats_visible_session_keys",
+                        return_value=("extra1", "extra2"),
+                    ),
+                    patch(
+                        "gui_auto_trade_context_menu.manual_ats_session_labels",
+                        return_value={"extra1": "ATS 장전", "extra2": "ATS 주간"},
+                    ),
+                ):
+                    show_auto_trade_stock_context_menu(window, object())
+
+                if chosen_text == "ATS 주간":
+                    window.set_selected_manual_ats_flag.assert_called_once_with(
+                        "extra2",
+                        True,
+                        "ATS 주간",
+                    )
+                    window.execute_selected_manual_ats_liquidation.assert_not_called()
+                else:
+                    window.execute_selected_manual_ats_liquidation.assert_called_once_with(
+                        "현재가",
+                        state,
+                        selected,
+                        ("extra1", "extra2"),
+                        ("extra1",),
+                    )
+                    window.set_selected_manual_ats_flag.assert_not_called()
 
     def test_all_scheduled_selection_shows_only_schedule_mode_actions(self) -> None:
         from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu

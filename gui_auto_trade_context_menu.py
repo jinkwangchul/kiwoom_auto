@@ -11,11 +11,18 @@ from dataclasses import dataclass
 import json
 from typing import Callable
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, QObject, Qt
 from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
 from PyQt5.QtWidgets import QMenu
 
-from gui_auto_trade_integrity import is_emergency_stopped_state
+from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
+    is_operation_excluded,
+)
+from gui_ats_utils import (
+    manual_ats_session_labels,
+    manual_ats_visible_session_keys,
+)
 from gui_operation_environment import OPERATION_POLICY_PATH
 from runtime_io import read_json_dict
 
@@ -54,11 +61,19 @@ class StockContextMenuCallbacks:
     early_close_cancel: Callable[[], None]
     individual_liquidation: Callable[[str, str], None]
     start: Callable[[], None] | None = None
+    emergency_stop: Callable[[], None] | None = None
+    emergency_release: Callable[[], None] | None = None
     unregister: Callable[[], None] | None = None
     stock_register: Callable[[], None] | None = None
     time_change: Callable[[], None] | None = None
     time_reset: Callable[[], None] | None = None
-    ats_settings: Callable[[], None] | None = None
+    ats_state: Callable[[], dict[str, bool]] | None = None
+    ats_toggle: Callable[[str, bool, str], None] | None = None
+    ats_liquidation_available: Callable[[], bool] | None = None
+    ats_liquidation: Callable[
+        [str, dict[str, bool], tuple[str, ...], tuple[str, ...]],
+        None,
+    ] | None = None
     set_operation_exclusion: Callable[[], None] | None = None
     clear_operation_exclusion: Callable[[], None] | None = None
 
@@ -93,6 +108,31 @@ class _MenuStatusIconEngine(QIconEngine):
 
 def _menu_status_icon(selected: bool) -> QIcon:
     return QIcon(_MenuStatusIconEngine(selected))
+
+
+class _PersistentAtsToggleFilter(QObject):
+    """Handle ATS session clicks without closing the surrounding QMenu."""
+
+    def __init__(self, menu: QMenu) -> None:
+        super().__init__(menu)
+        self._handlers: dict[int, Callable[[], None]] = {}
+
+    def register(self, action, handler: Callable[[], None]) -> None:
+        self._handlers[id(action)] = handler
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() != QEvent.MouseButtonRelease:
+            return super().eventFilter(watched, event)
+        action_at = getattr(watched, "actionAt", None)
+        action = action_at(event.pos()) if callable(action_at) else None
+        handler = self._handlers.get(id(action))
+        if handler is None:
+            return super().eventFilter(watched, event)
+        handler()
+        set_active_action = getattr(watched, "setActiveAction", None)
+        if callable(set_active_action):
+            set_active_action(action)
+        return True
 
 
 def _context_menu_operation_policy() -> dict[str, object]:
@@ -185,6 +225,7 @@ def _add_early_close_menu(
     menu: QMenu,
     *,
     has_selection: bool,
+    operation_excluded: bool = False,
     operation_policy: dict[str, object],
 ):
     early_close_menu = menu.addMenu("조기마감")
@@ -195,7 +236,7 @@ def _add_early_close_menu(
     action_early_carry = early_close_menu.addAction("이월")
     early_close_menu.addSeparator()
     action_early_cancel = early_close_menu.addAction("취소")
-    early_close_menu.setEnabled(has_selection)
+    early_close_menu.setEnabled(has_selection and not operation_excluded)
     _apply_menu_status(
         (
             ("루틴마감", action_early_routine),
@@ -324,6 +365,124 @@ def _add_individual_liquidation_menu(
     }
 
 
+def _add_ats_settings_menu(
+    menu: QMenu,
+    *,
+    has_selection: bool,
+    state_getter: Callable[[], dict[str, bool]] | None,
+    toggle: Callable[[str, bool, str], None] | None,
+    liquidation_available_getter: Callable[[], bool] | None,
+):
+    visible_keys = manual_ats_visible_session_keys()
+    labels = manual_ats_session_labels()
+    initial_state = state_getter() if state_getter is not None else {}
+    current_state = dict(initial_state) if isinstance(initial_state, dict) else {}
+    ats_menu = menu.addMenu("ATS설정")
+    ats_menu.setEnabled(has_selection and bool(visible_keys))
+
+    session_actions: list[tuple[str, str, object]] = []
+    for key in visible_keys:
+        label = str(labels.get(key, key))
+        action = ats_menu.addAction(label)
+        selected = bool(current_state.get(key, False))
+        action.setIcon(_menu_status_icon(selected))
+        action.setProperty("atsSessionCurrent", selected)
+        action.setProperty("atsSessionKey", key)
+        session_actions.append((key, label, action))
+
+    ats_menu.addSeparator()
+    action_market = ats_menu.addAction("시장가")
+    action_current = ats_menu.addAction("현재가")
+
+    def refresh_liquidation_actions() -> None:
+        enabled = bool(
+            liquidation_available_getter is not None
+            and liquidation_available_getter()
+        )
+        action_market.setEnabled(enabled)
+        action_current.setEnabled(enabled)
+
+    def refresh_session_status() -> None:
+        refreshed_value = state_getter() if state_getter is not None else current_state
+        refreshed = (
+            dict(refreshed_value)
+            if isinstance(refreshed_value, dict)
+            else dict(current_state)
+        )
+        current_state.clear()
+        current_state.update(refreshed)
+        for action_key, _label, action in session_actions:
+            selected = bool(current_state.get(action_key, False))
+            action.setIcon(_menu_status_icon(selected))
+            action.setProperty("atsSessionCurrent", selected)
+        refresh_liquidation_actions()
+
+    def toggle_session(key: str, label: str) -> None:
+        if toggle is None:
+            return
+        toggle(key, not bool(current_state.get(key, False)), label)
+        refresh_session_status()
+
+    install_event_filter = getattr(ats_menu, "installEventFilter", None)
+    if callable(install_event_filter) and isinstance(ats_menu, QObject):
+        toggle_filter = _PersistentAtsToggleFilter(ats_menu)
+        for key, label, action in session_actions:
+            toggle_filter.register(
+                action,
+                lambda key=key, label=label: toggle_session(key, label),
+            )
+        install_event_filter(toggle_filter)
+        ats_menu._ats_toggle_filter = toggle_filter
+
+    refresh_liquidation_actions()
+    return {
+        "menu": ats_menu,
+        "visible_keys": visible_keys,
+        "current_state": current_state,
+        "session_actions": tuple(session_actions),
+        "toggle_session": toggle_session,
+        "market": action_market,
+        "current": action_current,
+    }
+
+
+def _dispatch_ats_settings_action(
+    chosen,
+    actions: dict[str, object],
+    *,
+    toggle: Callable[[str, bool, str], None] | None,
+    liquidate: Callable[
+        [str, dict[str, bool], tuple[str, ...], tuple[str, ...]],
+        None,
+    ] | None,
+) -> bool:
+    current_state = dict(actions["current_state"])
+    for key, label, action in actions["session_actions"]:
+        if chosen == action:
+            toggle_session = actions.get("toggle_session")
+            if callable(toggle_session):
+                toggle_session(key, label)
+            elif toggle is not None:
+                toggle(key, not bool(current_state.get(key, False)), label)
+            return True
+
+    method = ""
+    if chosen == actions["market"]:
+        method = "시장가"
+    elif chosen == actions["current"]:
+        method = "현재가"
+    if not method:
+        return False
+
+    if liquidate is not None:
+        visible_keys = tuple(actions["visible_keys"])
+        selected_sessions = tuple(
+            key for key in visible_keys if bool(current_state.get(key, False))
+        )
+        liquidate(method, current_state, visible_keys, selected_sessions)
+    return True
+
+
 def show_monitor_stock_context_menu(
     parent,
     global_pos,
@@ -338,18 +497,22 @@ def show_monitor_stock_context_menu(
     menu = _new_stock_context_menu(parent)
     operation_policy = _context_menu_operation_policy()
 
-    action_stock_register = None
-    if callbacks.stock_register is not None:
-        action_stock_register = menu.addAction("종목등록")
-        action_stock_register.setEnabled(has_selection)
-
     action_start = None
     if callbacks.start is not None:
         action_start = menu.addAction("운영시작")
         action_start.setEnabled(has_selection)
+    action_emergency_stop = None
+    if callbacks.emergency_stop is not None:
+        action_emergency_stop = menu.addAction("긴급정지")
+        action_emergency_stop.setEnabled(has_selection)
+    action_emergency_release = None
+    if callbacks.emergency_release is not None:
+        action_emergency_release = menu.addAction("정지해제")
+        action_emergency_release.setEnabled(has_selection)
+    if action_start is not None:
         menu.addSeparator()
     action_select_all = menu.addAction("전체선택")
-    action_clear_selection = menu.addAction("전체해제")
+    action_clear_selection = menu.addAction("선택해제")
 
     action_set_exclusion = None
     action_clear_exclusion = None
@@ -360,14 +523,11 @@ def show_monitor_stock_context_menu(
         action_set_exclusion = menu.addAction("운영제외")
         action_set_exclusion.setEnabled(has_selection)
 
-    action_unregister = None
-    if callbacks.unregister is not None:
-        action_unregister = menu.addAction("등록해제")
-        action_unregister.setEnabled(has_selection)
     menu.addSeparator()
     early_close = _add_early_close_menu(
         menu,
         has_selection=has_selection,
+        operation_excluded=operation_excluded,
         operation_policy=operation_policy,
     )
 
@@ -379,7 +539,7 @@ def show_monitor_stock_context_menu(
 
     action_time_change = None
     action_time_reset = None
-    action_ats_settings = None
+    ats_settings = None
     selected_modes = set(selected_modes or ())
     if selected_modes == {"SCHEDULED"}:
         menu.addSeparator()
@@ -387,13 +547,34 @@ def show_monitor_stock_context_menu(
         action_time_reset = menu.addAction("변경리셋")
     elif selected_modes == {"CONTINUOUS"}:
         menu.addSeparator()
-        action_ats_settings = menu.addAction("ATS설정")
+        ats_settings = _add_ats_settings_menu(
+            menu,
+            has_selection=has_selection,
+            state_getter=callbacks.ats_state,
+            toggle=callbacks.ats_toggle,
+            liquidation_available_getter=callbacks.ats_liquidation_available,
+        )
+
+    action_stock_register = None
+    action_unregister = None
+    if callbacks.stock_register is not None or callbacks.unregister is not None:
+        menu.addSeparator()
+        if callbacks.stock_register is not None:
+            action_stock_register = menu.addAction("종목등록")
+            action_stock_register.setEnabled(has_selection)
+        if callbacks.unregister is not None:
+            action_unregister = menu.addAction("등록해제")
+            action_unregister.setEnabled(has_selection)
 
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
     if action_start is not None and chosen == action_start:
         callbacks.start()
+    elif action_emergency_stop is not None and chosen == action_emergency_stop:
+        callbacks.emergency_stop()
+    elif action_emergency_release is not None and chosen == action_emergency_release:
+        callbacks.emergency_release()
     elif action_stock_register is not None and chosen == action_stock_register:
         callbacks.stock_register()
     elif chosen == action_select_all:
@@ -426,9 +607,13 @@ def show_monitor_stock_context_menu(
     elif action_time_reset is not None and chosen == action_time_reset:
         if callbacks.time_reset is not None:
             callbacks.time_reset()
-    elif action_ats_settings is not None and chosen == action_ats_settings:
-        if callbacks.ats_settings is not None:
-            callbacks.ats_settings()
+    elif ats_settings is not None and _dispatch_ats_settings_action(
+        chosen,
+        ats_settings,
+        toggle=callbacks.ats_toggle,
+        liquidate=callbacks.ats_liquidation,
+    ):
+        return
     else:
         for minute, action in individual["time_actions"]:
             if chosen == action:
@@ -448,6 +633,10 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
 
     selected = window.selected_stock_infos()
     has_selection = bool(selected)
+    operation_excluded = has_selection and all(
+        is_operation_excluded(read_json_dict(stock_dir / "config.json"))
+        for stock_dir, _code, _name in selected
+    )
     selected_modes = window.selected_operation_mode_set(selected)
     has_emergency, has_non_emergency = _selected_emergency_state(selected)
     status_filter = str(getattr(window, "_stock_status_filter", "") or "").strip().lower()
@@ -469,7 +658,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         action_emergency_release.setEnabled(has_selection)
     menu.addSeparator()
     action_select_all = menu.addAction("전체선택")
-    action_clear_selection = menu.addAction("전체해제")
+    action_clear_selection = menu.addAction("선택해제")
     action_set_exclusion = None
     action_unregister = None
     action_clear_exclusion = None
@@ -480,17 +669,15 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         if running_view:
             action_set_exclusion = menu.addAction("운영제외")
             action_set_exclusion.setEnabled(has_selection)
-        action_unregister = menu.addAction("등록해제")
-        action_unregister.setEnabled(has_selection)
     action_stock_register = None
+    action_unregister = None
     stock_register_target = _stock_register_context_instance_metadata(window)
-    if not excluded_view and stock_register_target is not None:
-        action_stock_register = menu.addAction("종목등록")
 
     menu.addSeparator()
     early_close = _add_early_close_menu(
         menu,
         has_selection=has_selection,
+        operation_excluded=operation_excluded,
         operation_policy=operation_policy,
     )
 
@@ -502,7 +689,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
 
     action_time_change = None
     action_time_reset = None
-    action_ats_settings = None
+    ats_settings = None
 
     if selected_modes == {"SCHEDULED"}:
         menu.addSeparator()
@@ -510,7 +697,24 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         action_time_reset = menu.addAction("변경리셋")
     elif selected_modes == {"CONTINUOUS"}:
         menu.addSeparator()
-        action_ats_settings = menu.addAction("ATS설정")
+        ats_settings = _add_ats_settings_menu(
+            menu,
+            has_selection=has_selection,
+            state_getter=lambda: window.selected_manual_ats_state(selected),
+            toggle=window.set_selected_manual_ats_flag,
+            liquidation_available_getter=lambda: (
+                window.selected_manual_ats_liquidation_available(selected)
+            ),
+        )
+
+    if not excluded_view and (
+        stock_register_target is not None or has_selection
+    ):
+        menu.addSeparator()
+        if stock_register_target is not None:
+            action_stock_register = menu.addAction("종목등록")
+        action_unregister = menu.addAction("등록해제")
+        action_unregister.setEnabled(has_selection)
 
     chosen = menu.exec_(window.stock_table.viewport().mapToGlobal(pos))
     if chosen is None:
@@ -572,5 +776,18 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         window.set_selected_individual_schedule_time()
     elif action_time_reset is not None and chosen == action_time_reset:
         window.reset_selected_schedule_to_global()
-    elif action_ats_settings is not None and chosen == action_ats_settings:
-        window.open_selected_manual_ats_settings_dialog()
+    elif ats_settings is not None and _dispatch_ats_settings_action(
+        chosen,
+        ats_settings,
+        toggle=window.set_selected_manual_ats_flag,
+        liquidate=lambda method, state, visible_keys, selected_sessions: (
+            window.execute_selected_manual_ats_liquidation(
+                method,
+                state,
+                selected,
+                visible_keys,
+                selected_sessions,
+            )
+        ),
+    ):
+        return

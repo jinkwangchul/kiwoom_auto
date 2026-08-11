@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QStyle,
+    QTableWidget,
+    QTableWidgetItem,
     QWidget,
 )
 
@@ -846,7 +848,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         ):
             counts = gui_main_table_loader._instance_stock_counts()
 
-        self.assertEqual(1, counts[instance.instance_id]["registered"])
+        self.assertEqual(2, counts[instance.instance_id]["registered"])
+        self.assertEqual(1, counts[instance.instance_id]["operation_or_stopped"])
+        self.assertEqual(1, counts[instance.instance_id]["review"])
         self.assertEqual(10_000, counts[instance.instance_id]["consumed_amount"])
         self.assertEqual(10_000, counts[instance.instance_id]["profit_cost_basis"])
         self.assertAlmostEqual(352, counts[instance.instance_id]["profit_amount"])
@@ -909,12 +913,79 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             counts = gui_main_table_loader._instance_stock_counts()
 
         instance_count = counts[instance.instance_id]
-        self.assertEqual(3, instance_count["registered"])
-        self.assertEqual(3, instance_count["stopped"])
+        self.assertEqual(5, instance_count["registered"])
+        self.assertEqual(3, instance_count["operation_or_stopped"])
+        self.assertEqual(2, instance_count["review"])
+        self.assertEqual(
+            instance_count["registered"],
+            instance_count["excluded"]
+            + instance_count["operation_or_stopped"]
+            + instance_count["review"],
+        )
         self.assertEqual(
             {"111110", "111111", "111112"},
             {stock["code"] for stock in instance_count["stocks"]},
         )
+
+    def test_instance_stock_counts_use_exclusive_priority(self) -> None:
+        instance = SimpleNamespace(instance_id="instance-a")
+        stock_records = [
+            {
+                "code": str(index + 1).zfill(6),
+                "name": name,
+                "stock_path": f"stocks/{name}",
+            }
+            for index, name in enumerate(
+                ("normal", "excluded", "review", "excluded-review")
+            )
+        ]
+        review_names = {"review", "excluded-review"}
+
+        def read_json(path):
+            stock_name = Path(path).parent.name
+            if Path(path).name == "config.json":
+                return {
+                    "assigned_routine_instance_id": instance.instance_id,
+                    "operation_excluded": stock_name in {"excluded", "excluded-review"},
+                }
+            return {
+                "status": "ERROR" if stock_name in review_names else "RUNNING",
+                "review_required": stock_name in review_names,
+                "trade_started": stock_name == "normal",
+            }
+
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=[instance],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "read_base_stocks",
+                return_value=stock_records,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "read_json_dict",
+                side_effect=read_json,
+            ),
+        ):
+            count = gui_main_table_loader._instance_stock_counts()[instance.instance_id]
+            review_names.remove("excluded-review")
+            released_count = gui_main_table_loader._instance_stock_counts()[instance.instance_id]
+
+        self.assertEqual(4, count["registered"])
+        self.assertEqual(1, count["excluded"])
+        self.assertEqual(2, count["review"])
+        self.assertEqual(1, count["operation_or_stopped"])
+        self.assertEqual(1, count["operation_running"])
+        self.assertEqual(
+            count["registered"],
+            count["review"] + count["excluded"] + count["operation_or_stopped"],
+        )
+        self.assertEqual(2, released_count["excluded"])
+        self.assertEqual(1, released_count["review"])
 
     def test_profit_signal_uses_gross_and_net_rates_without_cost_hardcoding(self) -> None:
         self.assertEqual(routine_profit_signal(-1.25, -1.4)[0:2], ("LOSS", "-1.25%"))
@@ -951,18 +1022,18 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             widget = gui_main_table_loader.create_routine_instance_status_widget(
                 status,
                 registered=4,
-                running=4,
-                stopped=1,
-                error=0,
+                excluded=1,
+                operation_or_stopped=3,
+                review=0,
                 enabled=True,
             )
             stamp = widget.findChild(QWidget, "routineInstanceStatusStamp")
             dot = widget.findChild(QLabel, "routineInstanceStatusDot")
             status_text = widget.findChild(QLabel, "routineInstanceStatusText")
-            registered = widget.findChild(QLabel, "routineInstanceRegistered")
-            running = widget.findChild(QLabel, "routineInstanceRunning")
-            stopped = widget.findChild(QLabel, "routineInstanceStopped")
-            error = widget.findChild(QLabel, "routineInstanceError")
+            registered = widget.findChild(QWidget, "routineInstanceRegistered")
+            excluded = widget.findChild(QWidget, "routineInstanceExcluded")
+            operation = widget.findChild(QWidget, "routineInstanceOperationOrStopped")
+            review = widget.findChild(QWidget, "routineInstanceReview")
             self.assertIsNone(dot)
             self.assertEqual(status, status_text.text())
             self.assertEqual(
@@ -972,10 +1043,27 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual(22, stamp.height())
             self.assertIn(f"border: 1px solid {color}", stamp.styleSheet())
             self.assertIn(f"color: {color}", status_text.styleSheet())
-            self.assertEqual("\uB4F1\uB85D(4)", registered.text())
-            self.assertEqual("\uC2E4\uD589(4)", running.text())
-            self.assertEqual("\uC815\uC9C0(1)", stopped.text())
-            self.assertEqual("\uC624\uB958(0)", error.text())
+            def aggregate_metric_text(metric_widget):
+                object_name = metric_widget.objectName()
+                return "".join(
+                    metric_widget.findChild(QLabel, f"{object_name}{suffix}").text()
+                    for suffix in ("Label", "OpenParen", "Number", "CloseParen")
+                )
+
+            self.assertEqual("\uB4F1\uB85D(4)", aggregate_metric_text(registered))
+            self.assertEqual("\uC81C\uC678(1)", aggregate_metric_text(excluded))
+            expected_label = "\uC6B4\uC601" if status == gui_main_table_loader.ROUTINE_STATUS_RUNNING else "\uC815\uC9C0"
+            self.assertEqual(f"{expected_label}(3)", aggregate_metric_text(operation))
+            self.assertEqual("\uAC80\uD1A0(0)", aggregate_metric_text(review))
+            for metric_widget in (registered, excluded, operation, review):
+                number_label = metric_widget.findChild(
+                    QLabel,
+                    f"{metric_widget.objectName()}Number",
+                )
+                self.assertEqual(
+                    int(Qt.AlignCenter),
+                    int(number_label.alignment()),
+                )
             self.assertEqual(
                 gui_main_table_loader.routine_instance_grid_columns(widget.font())[
                     "registered"
@@ -983,7 +1071,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 registered.width(),
             )
             separators = widget.findChildren(QLabel, "routineInstanceSeparator")
-            self.assertEqual(6, len(separators))
+            self.assertEqual(5, len(separators))
             self.assertTrue(all(separator.text() == "|" for separator in separators))
         self.assertEqual(("", ""), gui_main_table_loader.routine_status_stamp_spec("UNKNOWN"))
 
@@ -991,9 +1079,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         first = gui_main_table_loader.create_routine_instance_status_widget(
             "?? 지",
             registered=0,
-            running=0,
-            stopped=0,
-            error=0,
+            excluded=0,
+            operation_or_stopped=0,
+            review=0,
             buy_limit_text="?�도(미설??",
             consumed_text="?�모(0 / -)",
             profit_text="?�익(0 / 0.00%)",
@@ -1002,9 +1090,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         second = gui_main_table_loader.create_routine_instance_status_widget(
             "?? ??",
             registered=125,
-            running=120,
-            stopped=5,
-            error=2,
+            excluded=2,
+            operation_or_stopped=121,
+            review=2,
             buy_limit_text="?�도(100,000,000)",
             consumed_text="?�모(98,765,432 / 98.8%)",
             profit_text="?�익(-1,250,000 / -12.50%)",
@@ -1018,13 +1106,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         try:
             for object_name in (
                 "routineInstanceRegistered",
-                "routineInstanceRunning",
-                "routineInstanceStopped",
-                "routineInstanceError",
+                "routineInstanceExcluded",
+                "routineInstanceOperationOrStopped",
+                "routineInstanceReview",
             ):
                 self.assertEqual(
-                    first.findChild(QLabel, object_name).x(),
-                    second.findChild(QLabel, object_name).x(),
+                    first.findChild(QWidget, object_name).x(),
+                    second.findChild(QWidget, object_name).x(),
                 )
             for object_name in ("routineInstanceBuyLimit", "routineInstanceProfit"):
                 self.assertEqual(
@@ -1035,20 +1123,30 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertIsNotNone(second.findChild(QWidget, "routineInstanceConsumed"))
             first_separators = first.findChildren(QLabel, "routineInstanceSeparator")
             second_separators = second.findChildren(QLabel, "routineInstanceSeparator")
-            self.assertEqual(6, len(first_separators))
-            self.assertEqual(7, len(second_separators))
+            self.assertEqual(5, len(first_separators))
+            self.assertEqual(6, len(second_separators))
             for first_separator, second_separator in zip(first_separators, second_separators):
                 self.assertEqual(first_separator.x(), second_separator.x())
+            self.assertEqual(
+                gui_main_table_loader.routine_aggregate_slot_lefts(
+                    gui_main_table_loader.ROUTINE_INSTANCE_NAME_WIDTH,
+                    first.font(),
+                ),
+                gui_main_table_loader.routine_aggregate_slot_lefts(
+                    gui_main_table_loader.ROUTINE_INSTANCE_NAME_WIDTH,
+                    second.font(),
+                ),
+            )
             column_widths = gui_main_table_loader.routine_instance_grid_columns(
                 second.font()
             )
             for key, object_name in (
                 ("registered", "routineInstanceRegistered"),
-                ("running", "routineInstanceRunning"),
-                ("stopped", "routineInstanceStopped"),
-                ("error", "routineInstanceError"),
+                ("excluded", "routineInstanceExcluded"),
+                ("operation_or_stopped", "routineInstanceOperationOrStopped"),
+                ("review", "routineInstanceReview"),
             ):
-                label = second.findChild(QLabel, object_name)
+                label = second.findChild(QWidget, object_name)
                 sample = gui_main_table_loader.ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES[key]
                 self.assertEqual(column_widths[key], label.width())
                 self.assertGreaterEqual(
@@ -1077,12 +1175,208 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertEqual(number_widths[key], label.width())
                 self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, label.alignment())
             self.assertEqual(
-                {gui_main_table_loader.routine_instance_separator_width(first.font())},
+                {gui_main_table_loader.routine_aggregate_separator_width(first.font())},
                 {separator.width() for separator in first_separators},
             )
+            self.assertEqual(
+                gui_main_table_loader.routine_instance_separator_width(first.font())
+                + (gui_main_table_loader.ROUTINE_INSTANCE_SEPARATOR_PADDING * 2),
+                gui_main_table_loader.routine_aggregate_separator_width(first.font()),
+            )
+            slot_lefts = gui_main_table_loader.routine_aggregate_slot_lefts(
+                gui_main_table_loader.ROUTINE_INSTANCE_NAME_WIDTH,
+                first.font(),
+            )
+            aggregate_separator_width = (
+                gui_main_table_loader.routine_aggregate_separator_width(first.font())
+            )
+            for index, column_key in enumerate(
+                gui_main_table_loader.ROUTINE_AGGREGATE_COLUMN_KEYS[:-1]
+            ):
+                self.assertEqual(
+                    column_widths[column_key] + aggregate_separator_width,
+                    slot_lefts[index + 1] - slot_lefts[index],
+                )
         finally:
             first.close()
             second.close()
+
+    def test_parent_and_instance_aggregate_slots_share_gap_contract(self) -> None:
+        widgets = [
+            gui_main_table_loader.create_routine_instance_status_widget(
+                gui_main_table_loader.ROUTINE_STATUS_STOPPED,
+                registered=value,
+                excluded=value,
+                operation_or_stopped=value,
+                review=value,
+                enabled=True,
+            )
+            for value in (0, 1, 9, 10, 15, 99, 100, 123, 199, 999)
+        ]
+        for widget in widgets:
+            widget.show()
+        self.app.processEvents()
+        try:
+            object_names = (
+                "routineInstanceRegistered",
+                "routineInstanceExcluded",
+                "routineInstanceOperationOrStopped",
+                "routineInstanceReview",
+            )
+            reference_x = tuple(
+                widgets[0].findChild(QWidget, name).x() for name in object_names
+            )
+            status_stamp = widgets[0].findChild(
+                QWidget,
+                "routineInstanceStatusStamp",
+            )
+            self.assertEqual(
+                gui_main_table_loader.ROUTINE_AGGREGATE_LEADING_GAP,
+                reference_x[0] - (status_stamp.x() + status_stamp.width()),
+            )
+            for widget in widgets[1:]:
+                self.assertEqual(
+                    reference_x,
+                    tuple(widget.findChild(QWidget, name).x() for name in object_names),
+                )
+            for widget in widgets:
+                for object_name in object_names:
+                    metric_widget = widget.findChild(QWidget, object_name)
+                    label = metric_widget.findChild(QLabel, f"{object_name}Label")
+                    open_paren = metric_widget.findChild(
+                        QLabel,
+                        f"{object_name}OpenParen",
+                    )
+                    number_label = metric_widget.findChild(
+                        QLabel,
+                        f"{object_name}Number",
+                    )
+                    close_paren = metric_widget.findChild(
+                        QLabel,
+                        f"{object_name}CloseParen",
+                    )
+                    self.assertEqual(
+                        gui_main_table_loader.routine_aggregate_number_slot_width(
+                            widget.font()
+                        ),
+                        number_label.width(),
+                    )
+                    self.assertEqual(int(Qt.AlignCenter), int(number_label.alignment()))
+                    self.assertEqual(label.x() + label.width(), open_paren.x())
+                    self.assertEqual(
+                        open_paren.x() + open_paren.width(),
+                        number_label.x(),
+                    )
+                    self.assertEqual(
+                        number_label.x() + number_label.width(),
+                        close_paren.x(),
+                    )
+
+            separator_width = gui_main_table_loader.routine_aggregate_separator_width(
+                widgets[0].font()
+            )
+            self.assertEqual(
+                gui_main_table_loader.routine_instance_separator_width(widgets[0].font())
+                + (gui_main_table_loader.ROUTINE_INSTANCE_SEPARATOR_PADDING * 2),
+                separator_width,
+            )
+            self.assertEqual(
+                gui_main_table_loader.ROUTINE_INSTANCE_SEPARATOR_PADDING * 2,
+                separator_width
+                - QFontMetrics(widgets[0].font()).horizontalAdvance("|"),
+            )
+            for widget in widgets:
+                self.assertEqual(
+                    {separator_width},
+                    {
+                        separator.width()
+                        for separator in widget.findChildren(
+                            QLabel,
+                            "routineInstanceSeparator",
+                        )
+                    },
+                )
+            reference_separator_x = tuple(
+                separator.x()
+                for separator in widgets[0].findChildren(
+                    QLabel,
+                    "routineInstanceSeparator",
+                )
+            )
+            for widget in widgets[1:]:
+                self.assertEqual(
+                    reference_separator_x,
+                    tuple(
+                        separator.x()
+                        for separator in widget.findChildren(
+                            QLabel,
+                            "routineInstanceSeparator",
+                        )
+                    ),
+                )
+
+            parent_slot_lefts = [
+                gui_main_table_loader.routine_aggregate_slot_lefts(
+                    gui_main_table_loader.ROUTINE_INSTANCE_NAME_WIDTH,
+                    widgets[0].font(),
+                )
+                for _value in (0, 1, 9, 10, 15, 99, 100, 123, 199, 999)
+            ]
+            self.assertTrue(
+                all(lefts == parent_slot_lefts[0] for lefts in parent_slot_lefts[1:])
+            )
+            self.assertEqual(
+                gui_main_table_loader.ROUTINE_AGGREGATE_LEADING_GAP,
+                parent_slot_lefts[0][0]
+                - gui_main_table_loader.ROUTINE_INSTANCE_NAME_WIDTH,
+            )
+            column_widths = gui_main_table_loader.routine_instance_grid_columns(
+                widgets[0].font()
+            )
+            for index, column_key in enumerate(
+                gui_main_table_loader.ROUTINE_AGGREGATE_COLUMN_KEYS[:-1]
+            ):
+                self.assertEqual(
+                    column_widths[column_key] + separator_width,
+                    parent_slot_lefts[0][index + 1] - parent_slot_lefts[0][index],
+                )
+        finally:
+            for widget in widgets:
+                widget.close()
+
+    def test_child_name_keeps_arrow_space_without_stock_rows(self) -> None:
+        table = QTableWidget(2, 1)
+        table.setColumnWidth(0, 300)
+        for row, has_stocks in enumerate((True, False)):
+            item = QTableWidgetItem("인스턴스")
+            item.setData(gui_main_table_loader.ROUTINE_CHILD_HAS_STOCKS_ROLE, has_stocks)
+            table.setItem(row, 0, item)
+        table.resize(320, 120)
+        table.show()
+        self.app.processEvents()
+        try:
+            controller = gui_windows._RoutineTreeInteractionController(
+                SimpleNamespace(routine_table=table)
+            )
+            with_stocks = controller._child_name_rect(table.model().index(0, 0))
+            without_stocks = controller._child_name_rect(table.model().index(1, 0))
+            self.assertEqual(with_stocks.left(), without_stocks.left())
+            self.assertFalse(
+                controller._child_expand_rect(table.model().index(0, 0)).isNull()
+            )
+            self.assertTrue(
+                controller._child_expand_rect(table.model().index(1, 0)).isNull()
+            )
+        finally:
+            table.close()
+
+    def test_child_arrow_is_visible_but_disabled_without_stock_rows(self) -> None:
+        delegate = gui_windows._RoutineTreeItemDelegate()
+
+        self.assertEqual(delegate._child_arrow_state(True, True), ("▶", True))
+        self.assertEqual(delegate._child_arrow_state(True, False), ("▼", True))
+        self.assertEqual(delegate._child_arrow_state(False, True), ("▶", False))
+        self.assertEqual(delegate._child_arrow_state(False, False), ("▶", False))
 
     def test_main_window_routine_headers_match_monitoring_contract(self) -> None:
         self.assertEqual(
@@ -1091,9 +1385,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "\uB8E8\uD2F4\uBA85",
                 "\uC0C1\uD0DC",
                 "\uB4F1\uB85D",
-                "\uC2E4\uD589",
-                "\uC815\uC9C0",
-                "\uC624\uB958",
+                "\uC81C\uC678",
+                "\uC6B4\uC601/\uC815\uC9C0",
+                "\uAC80\uD1A0\uAD00\uB9AC",
                 "\uC0AC\uC6A9\uAE08\uC561",
                 "\uB9E4\uC218\uD55C\uB3C4",
                 "\uC0AC\uC6A9\uB960",
@@ -1949,9 +2243,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         widget = gui_main_table_loader.create_routine_instance_status_widget(
             "?? 지",
             registered=0,
-            running=0,
-            stopped=0,
-            error=0,
+            excluded=0,
+            operation_or_stopped=0,
+            review=0,
             buy_limit_text="\uD55C\uB3C4(\uBBF8\uC124\uC815)",
             profit_text="\uC218\uC775(0 / 0.00%)",
             enabled=True,
@@ -1970,6 +2264,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             _main_routine_sort_column=-1,
             _main_routine_sort_order=0,
             _collapsed_routine_definition_ids=set(),
+            _update_main_routine_excluded_count=MagicMock(),
         )
 
         definition = RoutineDefinitionRecord(
@@ -1998,7 +2293,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             patch.object(
                 gui_main_table_loader,
                 "_instance_stock_counts",
-                return_value={},
+                return_value={"instance": {"excluded": 2}},
             ),
             patch.object(
                 gui_main_table_loader,
@@ -2009,6 +2304,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_main_table_loader.main_load_routine_table(window)
 
         self.assertEqual(table.row_count, 1)
+        window._update_main_routine_excluded_count.assert_called_once_with(2)
         self.assertEqual(table.columnCount(), 10)
         row_texts = [table.item(0, col).text() for col in range(10)]
         self.assertTrue(row_texts[0])
@@ -2137,10 +2433,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "_instance_stock_counts",
                 return_value={
                     instance.instance_id: {
-                        "registered": 2,
-                        "running": 1,
-                        "stopped": 1,
-                        "error": 0,
+                        "registered": 4,
+                        "excluded": 1,
+                        "operation_or_stopped": 2,
+                        "operation_running": 1,
+                        "review": 1,
                         "consumed_amount": 7_843_650,
                         "consumed_unknown": False,
                         "profit_amount": 35_200,
@@ -2155,7 +2452,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
         self.assertEqual(2, table.row_count)
         self.assertEqual(
-            {instance.instance_id: 2},
+            {instance.instance_id: 4},
             window._routine_assigned_stock_count_by_instance,
         )
         self.assertEqual(28, table.row_heights[0])
@@ -2176,21 +2473,37 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
 
 
-        self.assertTrue(table.item(1, 0).data(gui_main_table_loader.ROUTINE_CHILD_AGGREGATE_ROLE))
-
-
-
-
+        expected_aggregate = "등록(4) | 제외(1) | 운영(2) | 검토(1)"
+        self.assertEqual(
+            expected_aggregate,
+            table.item(0, 0).data(gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_ROLE),
+        )
+        self.assertEqual(
+            (("등록", "4"), ("제외", "1"), ("운영", "2"), ("검토", "1")),
+            table.item(0, 0).data(
+                gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
+            ),
+        )
+        self.assertEqual(
+            expected_aggregate,
+            table.item(1, 0).data(gui_main_table_loader.ROUTINE_CHILD_AGGREGATE_ROLE),
+        )
+        for aggregate in (
+            table.item(0, 0).data(gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_ROLE),
+            table.item(1, 0).data(gui_main_table_loader.ROUTINE_CHILD_AGGREGATE_ROLE),
+        ):
+            self.assertNotIn("오류", aggregate)
+            self.assertNotIn("실행", aggregate)
 
         status_widget = table.cellWidget(1, 1)
         self.assertIsNotNone(status_widget)
         stamp = status_widget.findChild(QWidget, "routineInstanceStatusStamp")
         dot = status_widget.findChild(QLabel, "routineInstanceStatusDot")
         status_text = status_widget.findChild(QLabel, "routineInstanceStatusText")
-        registered = status_widget.findChild(QLabel, "routineInstanceRegistered")
-        running = status_widget.findChild(QLabel, "routineInstanceRunning")
-        stopped = status_widget.findChild(QLabel, "routineInstanceStopped")
-        error = status_widget.findChild(QLabel, "routineInstanceError")
+        registered = status_widget.findChild(QWidget, "routineInstanceRegistered")
+        excluded = status_widget.findChild(QWidget, "routineInstanceExcluded")
+        operation = status_widget.findChild(QWidget, "routineInstanceOperationOrStopped")
+        review = status_widget.findChild(QWidget, "routineInstanceReview")
         buy_limit = status_widget.findChild(QWidget, "routineInstanceBuyLimit")
         consumed = status_widget.findChild(QWidget, "routineInstanceConsumed")
         profit = status_widget.findChild(QWidget, "routineInstanceProfit")
@@ -2213,10 +2526,25 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual(22, stamp.height())
         self.assertIn("border: 1px solid #16A34A", stamp.styleSheet())
         self.assertIn("color: #16A34A", status_text.styleSheet())
-        self.assertEqual("\uB4F1\uB85D(2)", registered.text())
-        self.assertEqual("\uC2E4\uD589(1)", running.text())
-        self.assertEqual("\uC815\uC9C0(1)", stopped.text())
-        self.assertEqual("\uC624\uB958(0)", error.text())
+        self.assertEqual(
+            "4",
+            registered.findChild(QLabel, "routineInstanceRegisteredNumber").text(),
+        )
+        self.assertEqual(
+            "1",
+            excluded.findChild(QLabel, "routineInstanceExcludedNumber").text(),
+        )
+        self.assertEqual(
+            "2",
+            operation.findChild(
+                QLabel,
+                "routineInstanceOperationOrStoppedNumber",
+            ).text(),
+        )
+        self.assertEqual(
+            "1",
+            review.findChild(QLabel, "routineInstanceReviewNumber").text(),
+        )
         self.assertEqual("12,000,000", buy_limit_amount.text())
         self.assertEqual("7,843,650", consumed_amount.text())
         self.assertEqual("65.4%", consumed_rate.text())
@@ -2229,9 +2557,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         for key, label in (
             ("registered", registered),
-            ("running", running),
-            ("stopped", stopped),
-            ("error", error),
+            ("excluded", excluded),
+            ("operation_or_stopped", operation),
+            ("review", review),
         ):
             self.assertEqual(column_widths[key], label.width())
         for key, label in (
@@ -2253,7 +2581,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual(number_widths[key], label.width())
             self.assertEqual(Qt.AlignRight | Qt.AlignVCenter, label.alignment())
         separators = status_widget.findChildren(QLabel, "routineInstanceSeparator")
-        self.assertEqual(7, len(separators))
+        self.assertEqual(6, len(separators))
         self.assertTrue(all(separator.text() == "|" for separator in separators))
         self.assertTrue(table.item(0, 0).data(gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_ROLE))
 
@@ -2266,6 +2594,142 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual("", table.item(0, 8).text())
         self.assertEqual("", table.item(0, 0).toolTip())
         self.assertIn("\n\n", table.item(1, 0).toolTip())
+
+    def test_parent_aggregate_uses_all_children_before_visible_filter(self) -> None:
+        table = FakeRoutineTable()
+        window = SimpleNamespace(
+            routine_table=table,
+            _main_routine_sort_column=-1,
+            _main_routine_sort_order=Qt.AscendingOrder,
+            _collapsed_routine_definition_ids=set(),
+            _collapsed_routine_instance_ids={"visible", "review-only"},
+            _main_routine_display_level="routine",
+            _main_routine_display_level_applied=True,
+            _main_routine_valid_only=False,
+            _main_routine_excluded_only=False,
+        )
+        definition = RoutineDefinitionRecord(
+            definition_id="definition",
+            display_name="Parent",
+            package_dir=Path("routine-path"),
+            schema_version="1.0",
+            version="1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="routine",
+            settings_ui="",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="Parent",
+        )
+
+        def instance(instance_id: str) -> RoutineInstanceRecord:
+            return RoutineInstanceRecord(
+                instance_id=instance_id,
+                definition_id="definition",
+                display_name=instance_id,
+                source_routine_name="Parent",
+                persisted=True,
+                source="PERSISTED",
+                enabled=True,
+                real_trade_allowed=False,
+                description="",
+                buy_limit_enabled=False,
+                buy_limit_amount=None,
+                rules_path=Path(f"{instance_id}.json"),
+            )
+
+        instances = [instance("visible"), instance("review-only")]
+        counts = {
+            "visible": {
+                "registered": 10,
+                "excluded": 2,
+                "operation_or_stopped": 7,
+                "operation_running": 0,
+                "review": 1,
+                "stocks": [{"code": "000001", "name": "Visible"}],
+            },
+            "review-only": {
+                "registered": 4,
+                "excluded": 0,
+                "operation_or_stopped": 0,
+                "operation_running": 0,
+                "review": 4,
+                "stocks": [],
+            },
+        }
+        stock_row = {
+            "kind": gui_main_table_loader.ROUTINE_ROW_STOCK,
+            "definition_id": "definition",
+            "instance_id": "visible",
+        }
+
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_routine_definitions",
+                return_value=[definition],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=instances,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_instance_stock_counts",
+                return_value=counts,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_routine_tree_stock_row",
+                return_value=stock_row,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "current_stock_trade_counts_by_code",
+                return_value={},
+            ),
+        ):
+            gui_main_table_loader.main_load_routine_table(window)
+            before = table.item(0, 0).data(
+                gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
+            )
+            self.assertEqual(3, table.row_count)
+
+            window._main_routine_valid_only = True
+            gui_main_table_loader.main_load_routine_table(window)
+            after = table.item(0, 0).data(
+                gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
+            )
+
+            aggregates_by_level = {}
+            window._main_routine_valid_only = False
+            for level in ("group", "routine", "stock"):
+                window._main_routine_display_level = level
+                gui_main_table_loader.main_load_routine_table(window)
+                aggregates_by_level[level] = table.item(0, 0).data(
+                    gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
+                )
+
+            window._main_routine_display_level = "group"
+            window._main_routine_valid_only = True
+            window._main_routine_excluded_only = True
+            gui_main_table_loader.main_load_routine_table(window)
+            excluded_view = table.item(0, 0).data(
+                gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
+            )
+
+        self.assertEqual(before, after)
+        self.assertTrue(
+            all(value == before for value in aggregates_by_level.values())
+        )
+        self.assertEqual(before, excluded_view)
+        self.assertEqual(
+            (("등록", "14"), ("제외", "2"), ("정지", "7"), ("검토", "5")),
+            after,
+        )
+        self.assertEqual(2, table.row_count)
 
 
 

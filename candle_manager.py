@@ -13,6 +13,7 @@ from typing import Any
 
 
 CANDLES_FILENAME = "candles.json"
+DEFAULT_CANDLES_MAX_COUNT = 600
 
 
 def _safe_float(value: Any) -> float | None:
@@ -60,7 +61,7 @@ def load_candles(stock_dir: str | Path) -> list[dict[str, Any]]:
 def save_candles(
     stock_dir: str | Path,
     candles: list[dict[str, Any]],
-    max_count: int = 300,
+    max_count: int = DEFAULT_CANDLES_MAX_COUNT,
 ) -> list[dict[str, Any]]:
     """Save validated candles as a JSON list and return the saved candles."""
     path = Path(stock_dir)
@@ -70,7 +71,7 @@ def save_candles(
     try:
         limit = max(int(max_count), 0)
     except (TypeError, ValueError):
-        limit = 300
+        limit = DEFAULT_CANDLES_MAX_COUNT
     if limit:
         clean_candles = clean_candles[-limit:]
 
@@ -84,7 +85,7 @@ def save_candles(
 def append_candle(
     stock_dir: str | Path,
     candle: dict[str, Any],
-    max_count: int = 300,
+    max_count: int = DEFAULT_CANDLES_MAX_COUNT,
 ) -> list[dict[str, Any]]:
     """Append one valid candle, save, and return the saved candle list."""
     if not validate_candle(candle):

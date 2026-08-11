@@ -496,7 +496,6 @@ class GlobalReviewRequiredWindow(QDialog):
             self._clear_review_state(state)
             state["status"] = "MONITORING"
             state["trade_enabled"] = False
-            state["buy_enabled"] = False
             state["startup_reset_reason"] = ""
 
             try:
@@ -562,7 +561,6 @@ class GlobalReviewRequiredWindow(QDialog):
             self._clear_review_state(state)
             state["status"] = "STOPPED"
             state["trade_enabled"] = False
-            state["buy_enabled"] = False
             state["active_routine"] = ""
             state["routine_name"] = ""
 

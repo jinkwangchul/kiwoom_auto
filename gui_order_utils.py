@@ -8,6 +8,7 @@ UI에 의존하지 않는다.
 
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -668,8 +669,38 @@ def daily_settlement_line(orders: list[dict[str, object]]) -> str:
     )
 
 
-def date_range_for_mode(filter_mode: str) -> tuple[date | None, date | None]:
-    today = date.today()
+def _inclusive_month_range_start(today: date, months: int) -> date:
+    month_index = today.year * 12 + today.month - 1 - months
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(today.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day) + timedelta(days=1)
+
+
+def date_range_for_mode(
+    filter_mode: str,
+    *,
+    today_value: date | None = None,
+) -> tuple[date | None, date | None]:
+    today = today_value or date.today()
+
+    if filter_mode == "오늘":
+        return today, today
+
+    if filter_mode == "1주":
+        return today - timedelta(days=6), today
+
+    if filter_mode == "1개월":
+        return today - timedelta(days=29), today
+
+    if filter_mode == "3개월":
+        return _inclusive_month_range_start(today, 3), today
+
+    if filter_mode == "6개월":
+        return _inclusive_month_range_start(today, 6), today
+
+    if filter_mode == "전체":
+        return None, None
 
     if filter_mode == "이번주":
         start_date = today - timedelta(days=today.weekday())
@@ -677,9 +708,6 @@ def date_range_for_mode(filter_mode: str) -> tuple[date | None, date | None]:
 
     if filter_mode == "이번달":
         return today.replace(day=1), today
-
-    if filter_mode == "3개월":
-        return today - timedelta(days=89), today
 
     return None, None
 

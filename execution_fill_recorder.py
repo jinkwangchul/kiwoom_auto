@@ -453,6 +453,7 @@ def _fill_record(
     event_type: str,
     received_at: str,
     recorded_at: str,
+    routine_instance_id: str = "",
 ) -> dict[str, Any]:
     fill_id = _fill_id(event, event_type, received_at)
     execution_identity_source, execution_identity = _raw_event_identity(event)
@@ -479,6 +480,7 @@ def _fill_record(
         "order_price": event.get("order_price"),
         "received_at": received_at,
         "recorded_at": recorded_at,
+        "routine_instance_id": _clean_text(routine_instance_id),
         "normalized_event": deepcopy(event),
     }
 
@@ -526,6 +528,7 @@ def record_execution_fill(
         event_type=event_type,
         received_at=received_at,
         recorded_at=now,
+        routine_instance_id=_clean_text(_as_dict(context).get("routine_instance_id")),
     )
 
     try:

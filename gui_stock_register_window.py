@@ -66,6 +66,7 @@ from integrity_checker import (
     LOCAL_STATUS_INTEGRITY_ISSUE,
     LOCAL_STATUS_PASS,
     LOCAL_STATUS_REVIEW_REQUIRED,
+    SERVER_STATUS_NOT_CHECKED,
     apply_integrity_review_required_issues,
     run_local_stock_integrity_check,
 )
@@ -188,12 +189,10 @@ from state_policy import (
     write_global_schedule,
 )
 from gui_ats_utils import (
-    ManualAtsSettingsDialog,
     auto_trade_setting_regular_market_active_now,
     manual_ats_active_now,
     manual_ats_enabled_labels,
     manual_ats_session_labels,
-    manual_ats_source,
 )
 from gui_auto_trade_display import (
     apply_auto_trade_setting_activity_style,
@@ -593,23 +592,52 @@ def stock_reset_eligibility(code: str, name: str) -> dict[str, object]:
     return _stock_reset_initializable(stock_dir)
 
 
-def confirm_stock_reset(parent: QWidget, code: str, name: str) -> bool:
+def _confirm_stock_project_reset(
+    parent: QWidget,
+    *,
+    title: str,
+    text: str,
+) -> bool:
     dialog = QMessageBox(parent)
     dialog.setIcon(QMessageBox.Warning)
-    dialog.setWindowTitle("⚠ 종목초기화 확인")
-    dialog.setText(
-        "해당 종목의 모든 기록을 삭제하고\n"
-        "미등록 상태로 초기화합니다.\n\n"
-        "이 작업은 되돌릴 수 없으며\n"
-        "삭제된 데이터는 복구할 수 없습니다.\n\n"
-        f"초기화 대상:\n{code} {name}"
-    )
+    dialog.setWindowTitle(title)
+    dialog.setText(text)
     confirm_button = dialog.addButton("확인", QMessageBox.AcceptRole)
     cancel_button = dialog.addButton("취소", QMessageBox.RejectRole)
     dialog.setDefaultButton(cancel_button)
     dialog.setEscapeButton(cancel_button)
     dialog.exec_()
     return dialog.clickedButton() is confirm_button
+
+
+def _stock_reset_confirmation_text(targets: list[tuple[str, str]]) -> str:
+    target_text = "\n".join(f"{code} {name}" for code, name in targets)
+    return (
+        "해당 종목의 모든 기록을 삭제하고\n"
+        "미등록 상태로 초기화합니다.\n\n"
+        "이 작업은 되돌릴 수 없으며\n"
+        "삭제된 데이터는 복구할 수 없습니다.\n\n"
+        f"초기화 대상:\n{target_text}"
+    )
+
+
+def confirm_stock_reset(parent: QWidget, code: str, name: str) -> bool:
+    return _confirm_stock_project_reset(
+        parent,
+        title="⚠ 종목초기화 확인",
+        text=_stock_reset_confirmation_text([(code, name)]),
+    )
+
+
+def confirm_force_stock_reset(
+    parent: QWidget,
+    targets: list[tuple[str, str]],
+) -> bool:
+    return _confirm_stock_project_reset(
+        parent,
+        title="강제초기화 확인",
+        text=_stock_reset_confirmation_text(targets),
+    )
 
 
 def _stock_reset_failure_message() -> str:
@@ -651,6 +679,111 @@ def _stock_reset_target_still_exists_in_base_stocks(code: str, name: str) -> boo
         if str(stock.get("code", "")).strip() == code and str(stock.get("name", "")).strip() == name:
             return True
     return False
+
+
+def force_stock_reset_preflight(
+    code: str,
+    name: str,
+    selected_stock_dir: Path,
+) -> dict[str, object]:
+    """검토관리 강제초기화 대상의 identity와 삭제 경로만 검증한다."""
+    try:
+        stock_dirs = stock_reset_stock_dirs_for_stock(code, name)
+    except Exception as exc:
+        LOGGER.exception(
+            "forced stock reset failed to resolve target: code=%s name=%s error=%s",
+            code,
+            name,
+            exc,
+        )
+        return _stock_reset_not_initializable("종목 저장 위치 확인 실패", None)
+
+    if not stock_dirs:
+        return _stock_reset_not_initializable("종목 저장 위치 없음", None)
+    if len(stock_dirs) != 1:
+        return _stock_reset_not_initializable("종목 저장 위치 중복", None)
+
+    stock_dir = Path(stock_dirs[0])
+    try:
+        if stock_dir.resolve(strict=True) != Path(selected_stock_dir).resolve(strict=True):
+            return _stock_reset_not_initializable("선택 대상 identity 불일치", stock_dir)
+    except Exception:
+        return _stock_reset_not_initializable("선택 대상 경로 확인 실패", stock_dir)
+
+    if not is_review_protected_stock_dir(stock_dir):
+        return _stock_reset_not_initializable("검토관리 대상이 아님", stock_dir)
+
+    path_ok, path_reason = _validate_stock_reset_delete_path(code, name, stock_dir)
+    if not path_ok:
+        LOGGER.error(
+            "forced stock reset path validation failed: code=%s name=%s stock_dir=%s reason=%s",
+            code,
+            name,
+            stock_dir,
+            path_reason,
+        )
+        return _stock_reset_not_initializable(path_reason, stock_dir)
+
+    return _stock_reset_initializable(stock_dir)
+
+
+def delete_stock_project_data(code: str, name: str, stock_dir: Path) -> dict[str, object]:
+    """검증된 중앙 종목 폴더를 삭제하고 등록/연결 제거를 read-back한다."""
+    path_ok, path_reason = _validate_stock_reset_delete_path(code, name, stock_dir)
+    if not path_ok:
+        LOGGER.error(
+            "stock reset path validation failed: code=%s name=%s stock_dir=%s reason=%s",
+            code,
+            name,
+            stock_dir,
+            path_reason,
+        )
+        return {"status": "FAILED", "reason": path_reason}
+
+    try:
+        shutil.rmtree(stock_dir)
+    except Exception as exc:
+        LOGGER.exception(
+            "stock reset failed to remove stock dir: code=%s name=%s stock_dir=%s error=%s",
+            code,
+            name,
+            stock_dir,
+            exc,
+        )
+        return {"status": "FAILED", "reason": "종목 데이터 삭제 실패"}
+
+    if stock_dir.exists():
+        LOGGER.error(
+            "stock reset delete verification failed: directory still exists code=%s name=%s stock_dir=%s",
+            code,
+            name,
+            stock_dir,
+        )
+        return {"status": "FAILED", "reason": "삭제 경로 잔존"}
+
+    try:
+        still_registered = _stock_reset_target_still_exists_in_base_stocks(code, name)
+        remaining_runtime_dirs = stock_runtime_dirs_for_stock(code, name)
+    except Exception as exc:
+        LOGGER.exception(
+            "stock reset post-delete readback failed: code=%s name=%s error=%s",
+            code,
+            name,
+            exc,
+        )
+        return {"status": "FAILED", "reason": "삭제 후 상태 확인 실패"}
+
+    if still_registered or remaining_runtime_dirs:
+        LOGGER.error(
+            "stock reset post-delete verification failed: code=%s name=%s still_registered=%s remaining_runtime_dirs=%s",
+            code,
+            name,
+            still_registered,
+            remaining_runtime_dirs,
+        )
+        return {"status": "FAILED", "reason": "등록 또는 루틴 연결 잔존"}
+
+    return {"status": "DELETED", "reason": ""}
 
 
 def runtime_delete_block_reasons(stock_dir: Path) -> list[str]:
@@ -1718,7 +1851,7 @@ class StockRegisterWindow(QDialog):
         return container
 
     def _integrity_status_reserved_width(self) -> int:
-        text = "검토관리 005930 삼성전자 외 99종목"
+        text = "서버/로컬 상태 : 서버 정합성 미확인"
         margins = self._integrity_status_container.layout().contentsMargins()
         spacing = self._integrity_status_container.layout().spacing()
         return (
@@ -1729,30 +1862,23 @@ class StockRegisterWindow(QDialog):
             + 12
         )
 
-    def _integrity_status_icon(self, message: str) -> tuple[str, str]:
-        text = str(message or "").strip()
-        if not text:
-            return "", ""
-        if text.startswith("검토관리"):
-            return "⚠", "#d97706"
-        if text.startswith("로컬 의미 무결성 문제"):
-            return "⚠", "#d97706"
-        if text == "검사 대상 종목 없음":
-            return "ⓘ", "#475569"
-        if "실패" in text or "오류" in text:
-            return "✕", "#dc2626"
-        if text.startswith("로컬 무결성 통과"):
-            return "✓", "#15803d"
-        return "", ""
-
-    def _set_integrity_status_text(self, message: str) -> None:
+    def _set_integrity_status_text(self, message: str, *, dot_color: str) -> None:
         display_message = str(message or "").strip()
-        icon, color = self._integrity_status_icon(display_message)
-        self.integrity_status_icon_label.setText(icon)
+        dot = auto_trade_status_dot("등록대기") if display_message else ""
+        self.integrity_status_icon_label.setText(dot)
+        self.integrity_status_icon_label.setFont(self.stock_table.font())
+        dot_metrics = self.integrity_status_icon_label.fontMetrics()
+        self.integrity_status_icon_label.setFixedSize(
+            dot_metrics.horizontalAdvance(dot),
+            dot_metrics.height(),
+        )
         self.integrity_status_icon_label.setStyleSheet(
-            f"background: transparent; color: {color}; font-size: 19px; font-weight: 700;"
-            if icon
+            f"background: transparent; color: {dot_color};"
+            if dot
             else "background: transparent;"
+        )
+        self._integrity_status_container.layout().setSpacing(
+            dot_metrics.horizontalAdvance(" ")
         )
         self.integrity_status_label.setText(display_message)
         label_width = (
@@ -1763,9 +1889,22 @@ class StockRegisterWindow(QDialog):
         self.integrity_status_label.setFixedWidth(label_width)
         self.integrity_status_label.setStyleSheet("background: transparent; color: #202124;")
         self._integrity_status_container.adjustSize()
-        tooltip = f"{icon} {display_message}".strip()
+        tooltip = f"{dot} {display_message}".strip()
         self.integrity_status_icon_label.setToolTip(tooltip)
         self.integrity_status_label.setToolTip(tooltip)
+
+    def _set_server_local_integrity_status(self, server_status: object) -> None:
+        normalized_status = str(server_status or "").strip().upper()
+        display_by_status = {
+            SERVER_STATUS_NOT_CHECKED: "서버 정합성 미확인",
+        }
+        display_status = display_by_status.get(normalized_status)
+        if display_status is None:
+            return
+        self._set_integrity_status_text(
+            f"서버/로컬 상태 : {display_status}",
+            dot_color=auto_trade_status_color("등록대기"),
+        )
 
     def _show_integrity_toast(self, message: str) -> None:
         self._last_integrity_toast_message = message
@@ -1820,15 +1959,14 @@ class StockRegisterWindow(QDialog):
         return False
 
     def run_initial_integrity_check(self) -> None:
-        self._set_integrity_status_text("무결성 검사 중...")
         try:
             result = run_local_stock_integrity_check(PROJECT_ROOT)
+            self._set_server_local_integrity_status(result.get("server_status"))
             checked_count = int(result.get("checked_stock_count", 0) or 0)
             local_status = str(result.get("local_status", "") or "").strip().upper()
 
             if checked_count == 0:
                 self._last_integrity_check_result = result
-                self._set_integrity_status_text("검사 대상 종목 없음")
                 self._show_integrity_toast("검사 대상 종목이 없습니다.")
                 return
 
@@ -1836,7 +1974,6 @@ class StockRegisterWindow(QDialog):
                 writer = self._review_writer_callback()
                 if writer is None:
                     self._last_integrity_check_result = result
-                    self._set_integrity_status_text("무결성 문제 발견 | 검토관리 반영 실패")
                     self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
                     return
 
@@ -1849,34 +1986,27 @@ class StockRegisterWindow(QDialog):
                 self._last_integrity_check_result = result
                 self.refresh_stock_table()
                 if self._integrity_writer_failed(result):
-                    self._set_integrity_status_text("무결성 문제 발견 | 검토관리 반영 실패")
                     self._show_integrity_toast("무결성 검사 처리 오류 | 검토관리 반영에 실패했습니다.")
                     return
-                self._set_integrity_status_text(self._review_required_stock_summary(result))
                 self._show_integrity_toast("무결성 검사 완료 | 검토관리 대상 종목이 있습니다.")
                 return
 
             self._last_integrity_check_result = result
             if local_status == LOCAL_STATUS_CHECK_ERROR:
-                self._set_integrity_status_text("무결성 검사 실패")
                 self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
                 return
 
             if local_status == LOCAL_STATUS_INTEGRITY_ISSUE:
-                self._set_integrity_status_text("로컬 의미 무결성 문제 발견")
                 self._show_integrity_toast("로컬 의미 무결성 검사 완료 | 종목 상태값을 확인하세요.")
                 return
 
             if local_status == LOCAL_STATUS_PASS:
-                self._set_integrity_status_text("로컬 무결성 통과 | 서버 정합성 미확인")
                 self._show_integrity_toast("로컬 무결성 검사 완료 | 서버 정합성 검사는 실행하지 않았습니다.")
                 return
 
-            self._set_integrity_status_text("무결성 검사 실패")
             self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
         except Exception:
             LOGGER.exception("Stock register integrity auto check failed")
-            self._set_integrity_status_text("무결성 검사 실패")
             self._show_integrity_toast("무결성 검사 오류 | 종목관리창을 다시 실행하세요.")
 
 
@@ -2340,68 +2470,8 @@ class StockRegisterWindow(QDialog):
             show_toast(self, _stock_reset_failure_message())
             return
 
-        path_ok, path_reason = _validate_stock_reset_delete_path(code, name, verified_stock_dir)
-        if not path_ok:
-            LOGGER.error(
-                "stock reset path validation failed: code=%s name=%s stock_dir=%s reason=%s",
-                code,
-                name,
-                verified_stock_dir,
-                path_reason,
-            )
-            show_toast(self, _stock_reset_failure_message())
-            return
-
-        try:
-            shutil.rmtree(verified_stock_dir)
-        except Exception as exc:
-            LOGGER.exception(
-                "stock reset failed to remove stock dir: code=%s name=%s stock_dir=%s error=%s",
-                code,
-                name,
-                verified_stock_dir,
-                exc,
-            )
-            try:
-                self.refresh_stock_table()
-            except Exception:
-                LOGGER.exception("stock reset refresh failed after remove exception")
-            show_toast(self, _stock_reset_failure_message())
-            return
-
-        if verified_stock_dir.exists():
-            LOGGER.error(
-                "stock reset delete verification failed: directory still exists code=%s name=%s stock_dir=%s",
-                code,
-                name,
-                verified_stock_dir,
-            )
-            self.refresh_stock_table()
-            show_toast(self, _stock_reset_failure_message())
-            return
-
-        try:
-            still_registered = _stock_reset_target_still_exists_in_base_stocks(code, name)
-            remaining_runtime_dirs = stock_runtime_dirs_for_stock(code, name)
-        except Exception as exc:
-            LOGGER.exception(
-                "stock reset post-delete readback failed: code=%s name=%s error=%s",
-                code,
-                name,
-                exc,
-            )
-            self.refresh_stock_table()
-            show_toast(self, _stock_reset_failure_message())
-            return
-
-        if still_registered or remaining_runtime_dirs:
-            LOGGER.error(
-                "stock reset post-delete verification failed: code=%s name=%s still_registered=%s remaining_runtime_dirs=%s",
-                code,
-                name,
-                still_registered,
-                remaining_runtime_dirs,
-            )
+        delete_result = delete_stock_project_data(code, name, verified_stock_dir)
+        if delete_result.get("status") != "DELETED":
             self.refresh_stock_table()
             show_toast(self, _stock_reset_failure_message())
             return

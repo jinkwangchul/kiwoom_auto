@@ -80,8 +80,6 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
             "status": "MONITORING",
             "trade_enabled": True,
             "real_trade_enabled": False,
-            "buy_enabled": False,
-            "sell_enabled": False,
             "holding_qty": holding_qty,
         }
         candles = [{"time": "2026-07-03 09:00:00", "close": 100.0}]

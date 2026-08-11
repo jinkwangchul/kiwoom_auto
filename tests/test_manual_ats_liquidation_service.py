@@ -12,11 +12,14 @@ from manual_ats_liquidation_service import (
     METHOD_MARKET,
     build_manual_ats_liquidation_preview,
     commit_manual_ats_liquidation_preview,
+    ensure_manual_ats_liquidation_request,
 )
 from operation_command_service import MANUAL_ATS_LIQUIDATION_REQUEST_KEY
 from operation_command_service import StockOperationCommandResult
 from order_hoga_mapper import map_order_hoga_preview
-from manual_ats_runtime import current_program_session_id
+
+
+TEST_PROGRAM_SESSION_ID = "test-program-session"
 
 
 class ManualAtsLiquidationServiceTest(unittest.TestCase):
@@ -55,7 +58,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                         "selected_sessions": ["extra1"],
                         "trade_date": trade_date,
                         "program_session_id": (
-                            program_session_id or current_program_session_id()
+                            program_session_id or TEST_PROGRAM_SESSION_ID
                         ),
                         "source": "ATS_SETTINGS",
                     },
@@ -120,6 +123,45 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
         self.assertEqual("LIMIT", mapped["hoga"])
         self.assertFalse(mapped["unresolved"])
 
+    def test_reconciled_holding_override_replaces_stale_state_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp), holding_qty=100)
+            with patch(
+                "manual_ats_liquidation_service.manual_ats_session_definition",
+                side_effect=self._session,
+            ):
+                market = build_manual_ats_liquidation_preview(
+                    stock,
+                    "005930",
+                    "삼성전자",
+                    ["extra1"],
+                    "시장가",
+                    now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
+                    holding_qty_override=70,
+                    latest_price_reader=lambda _code, _name: 72500,
+                )
+                current = build_manual_ats_liquidation_preview(
+                    stock,
+                    "005930",
+                    "삼성전자",
+                    ["extra1"],
+                    "현재가",
+                    now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
+                    holding_qty_override=110,
+                    latest_price_reader=lambda _code, _name: 72500,
+                )
+
+        self.assertEqual(70, market["order_candidate"]["quantity"])
+        self.assertEqual(0, market["order_candidate"]["price"])
+        self.assertEqual("MARKET", market["order_candidate"]["hoga"])
+        self.assertEqual(110, current["order_candidate"]["quantity"])
+        self.assertEqual(72500, current["order_candidate"]["price"])
+        self.assertEqual("CURRENT_PRICE", current["order_candidate"]["hoga"])
+        self.assertEqual(
+            "positions_broker_reconciliation",
+            market["order_candidate"]["holding_source"],
+        )
+
     def test_preview_is_fail_closed_outside_ats_or_without_real_holding(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp), holding_qty=0)
@@ -147,9 +189,9 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
             preview["blocked_reasons"],
         )
 
-    def test_preview_rejects_previous_day_or_previous_program_selection(self) -> None:
+    def test_preview_accepts_persisted_selection_from_previous_day_or_program(self) -> None:
         for trade_date, session_id in (
-            ("2026-07-24", current_program_session_id()),
+            ("2026-07-24", TEST_PROGRAM_SESSION_ID),
             ("2026-07-25", "previous-program"),
         ):
             with self.subTest(trade_date=trade_date, session_id=session_id):
@@ -172,11 +214,9 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                             now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
                             latest_price_reader=lambda _code, _name: 72500,
                         )
-                self.assertFalse(preview["ok"])
-                self.assertIn(
-                    "selected ATS sessions do not match current runtime state",
-                    preview["blocked_reasons"],
-                )
+                self.assertTrue(preview["ok"])
+                self.assertEqual(trade_date, preview["trade_date"])
+                self.assertEqual(session_id, preview["program_session_id"])
 
     def test_commit_records_command_then_uses_existing_approval_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -223,14 +263,14 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
             committed_candidate["manual_ats_liquidation"]["trade_date"],
         )
         self.assertEqual(
-            current_program_session_id(),
+            TEST_PROGRAM_SESSION_ID,
             committed_candidate["manual_ats_liquidation"]["program_session_id"],
         )
         request = state[MANUAL_ATS_LIQUIDATION_REQUEST_KEY]
         self.assertEqual("ORDER_EXECUTABLE", request["status"])
         self.assertEqual("ats-commit-1", request["command_id"])
         self.assertEqual("2026-07-25", request["trade_date"])
-        self.assertEqual(current_program_session_id(), request["program_session_id"])
+        self.assertEqual(TEST_PROGRAM_SESSION_ID, request["program_session_id"])
 
     def test_runtime_status_readback_failure_blocks_send_order_entry(self) -> None:
         preview = {
@@ -285,6 +325,41 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual("runtime_status_readback", result["stage"])
         self.assertIn("read-back verification failed", result["blocked_reasons"])
+
+    def test_waiting_duplicate_request_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = Path(temp) / "005930_삼성전자"
+            stock.mkdir()
+            (stock / "state.json").write_text(
+                json.dumps(
+                    {
+                        MANUAL_ATS_LIQUIDATION_REQUEST_KEY: {
+                            "command_id": "ats-duplicate-waiting",
+                            "status": "WAITING_CANCEL_CONFIRMATION",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            preview = {
+                "ok": True,
+                "command_id": "ats-new-click-while-waiting",
+                "stock_dir": str(stock),
+                "requested_at": "2026-08-09T16:00:00+09:00",
+                "sell_method": "MARKET",
+                "selected_ats_sessions": ["extra2"],
+            }
+            command_service = MagicMock()
+            result = ensure_manual_ats_liquidation_request(
+                preview,
+                project_root=temp,
+                command_service_factory=lambda _root: command_service,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("runtime_request", result["stage"])
+        self.assertIn("already waiting", result["blocked_reasons"][0])
+        command_service.apply_manual_ats_liquidation.assert_not_called()
 
 
 if __name__ == "__main__":

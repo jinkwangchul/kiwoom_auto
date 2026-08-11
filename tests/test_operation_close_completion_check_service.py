@@ -23,6 +23,7 @@ from operation_close_completion_evaluator import (
     STATUS_PENDING_ORDER,
     STATUS_REVIEW_REQUIRED,
     STATUS_UNKNOWN,
+    today_text,
 )
 from operation_close_completion_check_service import (
     SOURCE_BROKER_HOLDING_COMMIT,
@@ -44,13 +45,18 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
             for path in sorted(root.rglob("*.json"))
         }
 
-    def _runtime_root(self, root: Path) -> tuple[Path, Path]:
+    def _runtime_root(
+        self,
+        root: Path,
+        *,
+        operation_date: str = "2026-07-30",
+    ) -> tuple[Path, Path]:
         runtime = root / "runtime"
         stocks = root / "stocks"
         runtime.mkdir()
         stocks.mkdir()
         self._write_json(runtime / "operation_state.json", {
-            "operation_date": "2026-07-30",
+            "operation_date": operation_date,
             "operation_status": "CLOSING",
             "operation_participant_stock_codes": ["111111"],
         })
@@ -399,7 +405,7 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
     def test_order_fill_commit_confirmed_completion_writes_normal_ended(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            runtime, stocks = self._runtime_root(root)
+            runtime, stocks = self._runtime_root(root, operation_date=today_text())
             queue_path = runtime / "order_queue.json"
             self._write_json(queue_path, {
                 "version": 1,
@@ -552,7 +558,7 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
     def test_startup_recovery_closing_runs_completion_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            runtime, stocks = self._runtime_root(root)
+            runtime, stocks = self._runtime_root(root, operation_date=today_text())
             with patch.object(
                 operator_reconciliation_service,
                 "check_global_close_completion_after_durable_update",
@@ -575,7 +581,7 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
     def test_startup_recovery_closing_complete_writes_normal_ended(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            runtime, stocks = self._runtime_root(root)
+            runtime, stocks = self._runtime_root(root, operation_date=today_text())
             result = operator_reconciliation_service.assess_startup_recovery(
                 queue_path=runtime / "order_queue.json",
                 fills_path=runtime / "fills.json",

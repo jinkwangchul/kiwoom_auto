@@ -21,10 +21,18 @@ from runtime_io import read_json_dict
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
+    is_review_required_state,
     is_review_required_stock_dir,
+    restart_initial_review_reason_for_stock,
 )
 from gui_auto_trade_policy import auto_trade_setting_trade_started
+from gui_order_utils import order_current_pending_qty
 from gui_review_utils import review_required_for_start
+from execution_queue_writer import read_execution_queue_records
+from operation_close_completion_evaluator import (
+    ACTIVE_QUEUE_STATUSES,
+    CLOSED_QUEUE_STATUSES,
+)
 from operation_policy_gate import (
     is_emergency_stop,
     read_operation_state,
@@ -35,7 +43,10 @@ from state_policy import (
     real_trade_enabled,
     trade_permission_display,
     auto_trade_status_display,
+    effective_schedule_times,
+    in_regular_manual_session,
     normalize_operation_mode,
+    seconds_from_hhmmss,
     status_after_operation_mode_change,
 )
 
@@ -45,6 +56,225 @@ CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 LOGGER = logging.getLogger(__name__)
 START_REQUEST_SINGLE = "single"
 START_REQUEST_MULTIPLE = "multiple"
+ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+
+_ACTIVE_CLOSE_STATUSES = {
+    "AUTO_CLOSE",
+    "AUTO_CLOSING",
+    "EARLY_CLOSE",
+    "EARLY_CLOSING",
+    "LIQUIDATION",
+    "LIQUIDATING",
+}
+_LIQUIDATION_REQUEST_KEYS = (
+    "immediate_liquidation_request",
+    "individual_liquidation_request",
+    "manual_ats_liquidation_request",
+)
+_LIQUIDATION_REQUEST_TERMINAL_STATUSES = {
+    "COMPLETED",
+    "FAILED",
+    "ORDER_BLOCKED",
+}
+
+
+def current_datetime() -> datetime:
+    """운영시작 Guard와 저장 정책이 공유하는 현재시각 경계."""
+    return datetime.now()
+
+
+def _normalized_stock_code(value: object) -> str:
+    text = re.sub(r"[^0-9]", "", str(value or ""))
+    return text[-6:] if text else ""
+
+
+def _queue_named_values(value: object, key: str) -> list[object]:
+    found: list[object] = []
+    if isinstance(value, dict):
+        for current_key, current_value in value.items():
+            if str(current_key).strip().lower() == key:
+                found.append(current_value)
+            if isinstance(current_value, (dict, list, tuple)):
+                found.extend(_queue_named_values(current_value, key))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.extend(_queue_named_values(item, key))
+    return found
+
+
+def _queue_record_stock_code(record: dict[str, object]) -> str:
+    for key in ("stock_code", "code", "종목코드"):
+        for value in _queue_named_values(record, key.lower()):
+            code = _normalized_stock_code(value)
+            if code:
+                return code
+    return ""
+
+
+def _queue_record_action(record: dict[str, object]) -> str:
+    actions = {
+        str(value or "").strip().upper()
+        for value in _queue_named_values(record, "order_action")
+        if str(value or "").strip()
+    }
+    if "CANCEL" in actions:
+        return "CANCEL"
+    return next(iter(actions), "")
+
+
+def _today_normal_ended(
+    operation_state: dict[str, object],
+    now_dt: datetime,
+) -> bool:
+    return (
+        str(operation_state.get("operation_date") or "").strip()
+        == now_dt.date().isoformat()
+        and str(operation_state.get("operation_status") or "").strip().upper()
+        == "NORMAL_ENDED"
+    )
+
+
+def _close_completion_evidence_for_today(
+    state: dict[str, object],
+    now_dt: datetime,
+) -> bool:
+    today = now_dt.date().isoformat()
+    for key in (
+        "liquidation_completed_at",
+        "liquidation_finished_at",
+        "daily_liquidation_completed_at",
+        "ats_sell_completed_at",
+    ):
+        if str(state.get(key) or "").strip().startswith(today):
+            return True
+    if str(state.get("daily_liquidation_completed_date") or "").strip() == today:
+        return True
+    return bool(state.get("daily_liquidation_completed", False)) and not str(
+        state.get("daily_liquidation_completed_at") or ""
+    ).strip()
+
+
+def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> bool:
+    status = str(state.get("status") or "").strip().upper()
+    if status in _ACTIVE_CLOSE_STATUSES:
+        return True
+    if bool(state.get("liquidation_policy_forced", False)):
+        return True
+    if bool(state.get("close_routine_final_sell_ordered", False)) or str(
+        state.get("close_routine_final_sell_ordered_at") or ""
+    ).strip():
+        return True
+    for key in _LIQUIDATION_REQUEST_KEYS:
+        request = state.get(key)
+        if not isinstance(request, dict):
+            continue
+        request_status = str(request.get("status") or "REQUESTED").strip().upper()
+        if request_status not in _LIQUIDATION_REQUEST_TERMINAL_STATUSES:
+            return True
+
+    command_mode = str(state.get("operation_command_mode") or "").strip().upper()
+    if command_mode == "EARLY_CLOSE":
+        notice = str(state.get("operation_notice") or "").strip().upper()
+        if notice != "EARLY_CLOSE_NO_TARGET" and not _close_completion_evidence_for_today(
+            state, now_dt
+        ):
+            return True
+    return False
+
+
+def _active_queue_reason(
+    stock_code: str,
+    order_queue_path: str | Path,
+) -> str:
+    queue_path = Path(order_queue_path)
+    snapshot = read_execution_queue_records(queue_path)
+    if snapshot.get("ok") is not True:
+        return "RUNTIME_DAMAGED"
+    expected_code = _normalized_stock_code(stock_code)
+    for record in snapshot.get("records", ()):
+        if not isinstance(record, dict):
+            return "RUNTIME_DAMAGED"
+        if _queue_record_stock_code(record) != expected_code:
+            continue
+        status = str(
+            record.get("status") or record.get("order_status") or ""
+        ).strip().upper()
+        pending_qty, unknown = order_current_pending_qty(record)
+        unresolved = (
+            status in ACTIVE_QUEUE_STATUSES
+            or unknown
+            or pending_qty > 0
+            or not status
+            or status not in CLOSED_QUEUE_STATUSES
+        )
+        if not unresolved:
+            continue
+        if status == "CANCEL_REQUESTED" or _queue_record_action(record) == "CANCEL":
+            return "PENDING_CANCEL"
+        return "PENDING_ORDER"
+    return ""
+
+
+def auto_trade_same_day_restart_guard(
+    *,
+    stock_dir: str | Path,
+    stock_code: str,
+    config: dict[str, object],
+    state: dict[str, object],
+    operation_state: dict[str, object],
+    now_dt: datetime | None = None,
+    order_queue_path: str | Path = ORDER_QUEUE_PATH,
+) -> dict[str, object]:
+    """동일 거래일 명시적 운영시작을 위한 read-only 공통 Guard."""
+    current = now_dt or current_datetime()
+
+    def blocked(reason: str) -> dict[str, object]:
+        return {"allowed": False, "reason": reason}
+
+    if _today_normal_ended(operation_state, current):
+        return blocked("NORMAL_ENDED")
+    if is_emergency_stop(operation_state):
+        return blocked("GLOBAL_EMERGENCY_STOP")
+    if is_emergency_stopped_state(state):
+        return blocked("EMERGENCY_STOPPED")
+    if is_review_required_state(state):
+        return blocked("REVIEW_REQUIRED")
+
+    mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+    if mode == "CONTINUOUS":
+        if not in_regular_manual_session(current):
+            return blocked("OUTSIDE_OPERATION_TIME")
+    else:
+        start_time, end_buy_time, _custom = effective_schedule_times(config)
+        current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+        start_seconds = seconds_from_hhmmss(start_time, "09:00:00")
+        end_seconds = seconds_from_hhmmss(end_buy_time, "13:30:00")
+        if not start_seconds <= current_seconds < end_seconds:
+            return blocked("OUTSIDE_OPERATION_TIME")
+
+    review_needed, _review_reason, details = restart_initial_review_reason_for_stock(
+        Path(stock_dir), state
+    )
+    holding_qty = details.get("holding_qty")
+    buy_pending_qty = details.get("buy_pending_qty")
+    sell_pending_qty = details.get("sell_pending_qty")
+    if isinstance(holding_qty, int) and holding_qty > 0:
+        return blocked("HOLDING_EXISTS")
+    if buy_pending_qty == "?" or sell_pending_qty == "?":
+        return blocked("PENDING_ORDER_UNKNOWN")
+    if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:
+        return blocked("PENDING_BUY")
+    if isinstance(sell_pending_qty, int) and sell_pending_qty > 0:
+        return blocked("PENDING_SELL")
+    if review_needed:
+        return blocked("RUNTIME_DAMAGED")
+
+    queue_reason = _active_queue_reason(stock_code, order_queue_path)
+    if queue_reason:
+        return blocked(queue_reason)
+    if _active_close_or_liquidation(state, current):
+        return blocked("CLOSE_LIQUIDATION_ACTIVE")
+    return {"allowed": True, "reason": "ALLOWED"}
 
 
 def startup_recovery_operation_block_message(action: str, reason: str = "") -> str:
@@ -258,6 +488,18 @@ def _start_failure_user_message(
             "모든 등록 종목이 검토 대상으로 분리되었습니다.\n"
             "검토관리에서 처리한 뒤 다시 시도하십시오."
         )
+    if "NORMAL_ENDED" in reasons:
+        return "오늘의 정상 운영이 이미 종료되었습니다.\n다음 거래일에 운영을 시작하십시오."
+    if reasons & {"OUTSIDE_OPERATION_TIME"}:
+        return "현재는 선택한 종목의 운영시작 가능 시간이 아닙니다."
+    if reasons & {"HOLDING_EXISTS"}:
+        return "보유수량이 남아 있어 운영을 다시 시작할 수 없습니다."
+    if reasons & {"PENDING_BUY", "PENDING_SELL", "PENDING_ORDER", "PENDING_ORDER_UNKNOWN"}:
+        return "미체결 주문이 남아 있어 운영을 다시 시작할 수 없습니다."
+    if reasons & {"PENDING_CANCEL"}:
+        return "취소 처리 중인 주문이 있어 운영을 다시 시작할 수 없습니다."
+    if reasons & {"CLOSE_LIQUIDATION_ACTIVE"}:
+        return "마감 또는 청산 절차가 진행 중이어서 운영을 다시 시작할 수 없습니다."
     if reasons & {"RUNTIME_MISSING", "RUNTIME_DAMAGED"}:
         return (
             "종목의 운영 상태 데이터를 읽을 수 없습니다.\n"
@@ -373,6 +615,18 @@ def _single_start_failure_user_message(
             f"{label}의 Recovery에 실패했습니다.\n"
             "검토관리에서 상태를 확인하십시오."
         )
+    if reason == "NORMAL_ENDED":
+        return "오늘의 정상 운영이 이미 종료되었습니다.\n다음 거래일에 운영을 시작하십시오."
+    if reason == "OUTSIDE_OPERATION_TIME":
+        return f"{subject} 현재 운영시작 가능 시간이 아닙니다."
+    if reason == "HOLDING_EXISTS":
+        return f"{subject} 보유수량이 남아 있어 운영을 다시 시작할 수 없습니다."
+    if reason in {"PENDING_BUY", "PENDING_SELL", "PENDING_ORDER", "PENDING_ORDER_UNKNOWN"}:
+        return f"{subject} 미체결 주문이 남아 있어 운영을 다시 시작할 수 없습니다."
+    if reason == "PENDING_CANCEL":
+        return f"{subject} 취소 처리 중인 주문이 있어 운영을 다시 시작할 수 없습니다."
+    if reason == "CLOSE_LIQUIDATION_ACTIVE":
+        return f"{subject} 마감 또는 청산 절차가 진행 중입니다."
     if reason in {"TARGET_CLASSIFICATION_FAILED", "INTERNAL_EXCEPTION"}:
         return (
             f"{label}의 운영 상태를 확인하는 중 오류가 발생했습니다.\n"
@@ -594,8 +848,6 @@ def start_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
                 "status": "MONITORING",
                 "trade_enabled": True,
                 "real_trade_enabled": False,
-                "buy_enabled": False,
-                "sell_enabled": False,
                 "review_required": False,
                 "review_status": "",
                 "review_reason": "",
@@ -645,8 +897,6 @@ def stop_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
                 "status": "STOPPED",
                 "trade_enabled": False,
                 "real_trade_enabled": False,
-                "buy_enabled": False,
-                "sell_enabled": False,
                 "signal_probe_only": False,
                 "signal_probe_stopped_at": stopped_at,
                 "updated_at": stopped_at,
@@ -727,7 +977,46 @@ def auto_trade_start_selected_auto_trades(
     if request_scope == START_REQUEST_SINGLE and len(selected) != 1:
         request_scope = START_REQUEST_MULTIPLE
 
-    if is_emergency_stop(read_operation_state()):
+    operation_state = read_operation_state()
+    request_now = current_datetime()
+    if _today_normal_ended(operation_state, request_now):
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+        result = {
+            "ok": False,
+            "reason": "NORMAL_ENDED",
+            "user_message": (
+                "오늘의 정상 운영이 이미 종료되었습니다.\n"
+                "다음 거래일에 운영을 시작하십시오."
+            ),
+            "requested": requested,
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "review_required": (),
+            "failed": (),
+            "skipped": (),
+            "operation": "START",
+            "requested_count": len(requested),
+            "started_count": 0,
+            "excluded_review_count": 0,
+            "excluded_validation_count": 0,
+            "failed_count": 0,
+            "global_failure_reason": "NORMAL_ENDED",
+            "internal_reason": ("NORMAL_ENDED",),
+            "blocked": True,
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            global_failure=True,
+        )
+        _show_start_failure_once(window, result)
+        return result
+
+    if is_emergency_stop(operation_state):
         requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
         result = {
             "ok": False,
@@ -1077,8 +1366,26 @@ def auto_trade_start_selected_auto_trades(
                 failure_reasons.append("REVIEW_STATE_SAVE_FAILED")
             continue
 
+        guard = auto_trade_same_day_restart_guard(
+            stock_dir=stock_dir,
+            stock_code=code,
+            config=config,
+            state=state,
+            operation_state=operation_state,
+            now_dt=request_now,
+            order_queue_path=ORDER_QUEUE_PATH,
+        )
+        if guard.get("allowed") is not True:
+            failed.append(f"{code} {name}")
+            failure_reasons.append(str(guard.get("reason") or "START_GUARD_BLOCKED"))
+            continue
+
         operation_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-        start_status = status_after_operation_mode_change(operation_mode, config)
+        start_status = (
+            "RUNNING"
+            if real_trade_enabled(config)
+            else status_after_operation_mode_change(operation_mode, config)
+        )
         mode_display = operation_mode_display(operation_mode)
         trade_permission_text, _, _ = trade_permission_display(config)
         started_at = now_text()
@@ -1445,8 +1752,6 @@ def auto_trade_stop_selected_auto_trades(
             "review_reason": "",
             "review_detail": "",
             "trade_enabled": False,
-            "buy_enabled": False,
-            "sell_enabled": False,
             "trade_stopped_at": now_text(),
             "early_close_requested_at": "",
             "early_close_source": "",

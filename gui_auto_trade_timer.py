@@ -12,9 +12,13 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from gui_ats_utils import manual_ats_market_day_closed
-from manual_ats_runtime import reset_expired_manual_ats_runtime_selections
 from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
+from gui_auto_trade_ats_ops import auto_trade_continue_pending_manual_ats_liquidations
+
+try:
+    from auto_candle_refresh import refresh_operation_candles
+except Exception:
+    refresh_operation_candles = None
 
 try:
     from routine_signal_probe import probe_all_enabled_routine_stocks_once
@@ -153,6 +157,75 @@ def auto_trade_on_time_policy_gui_timer_tick(window) -> None:
     window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
 
 
+def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
+    signal_result: dict[str, object] = {}
+    if not callable(probe_all_enabled_routine_stocks_once):
+        return signal_result
+    try:
+        probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
+        logged_count = int(probe_result.get("logged", 0) or 0)
+        error_count = int(probe_result.get("error", 0) or 0)
+        if logged_count > 0 or error_count > 0:
+            window.statusBarMessage(
+                f"루틴 신호 로그: 기록 {logged_count}개"
+                + (f" / 오류 {error_count}개" if error_count else "")
+            )
+        if (
+            callable(consume_pending_routine_signals_dry_run)
+            and (
+                auto_trade_signal_probe_only_active(window)
+                or auto_trade_real_execution_active(window)
+            )
+        ):
+            consumer_result = consume_pending_routine_signals_dry_run(
+                limit=5,
+                mark_previewed=True,
+                write_order_queue=True,
+                apply_approval=True,
+            )
+            summary = (
+                consumer_result.get("summary", {})
+                if isinstance(consumer_result, dict)
+                else {}
+            )
+            checked = int(summary.get("signals_checked", 0) or 0)
+            blocked = int(summary.get("blocked", 0) or 0)
+            allowed = int(summary.get("allowed", 0) or 0)
+            errors = int(summary.get("errors", 0) or 0)
+            orders_created = int(summary.get("orders_created", 0) or 0)
+            approval_checked = int(summary.get("approval_checked", 0) or 0)
+            approved = int(summary.get("approved", 0) or 0)
+            if checked > 0 or errors > 0:
+                window.statusBarMessage(
+                    f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
+                    f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
+                )
+            signal_result = dict(summary)
+            if auto_trade_real_execution_active(window):
+                auto_executor = getattr(
+                    window,
+                    "auto_process_executable_orders_for_real_trade",
+                    None,
+                )
+                if callable(auto_executor):
+                    auto_result = auto_executor(limit=5)
+                    processed = int(auto_result.get("processed", 0) or 0)
+                    auto_blocked = int(auto_result.get("blocked", 0) or 0)
+                    signal_result["orders_processed"] = processed
+                    signal_result["orders_blocked"] = auto_blocked
+                    if processed > 0 or auto_blocked > 0:
+                        window.statusBarMessage(
+                            f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
+                        )
+    except Exception:
+        LOGGER.exception("Routine signal operation cycle failed")
+        window.statusBarMessage(
+            "주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오."
+        )
+        signal_result = {"errors": 1}
+    return signal_result
+
+
 def auto_trade_run_operation_cycle(window) -> dict[str, object]:
     """Run the durable operation cycle independently from GUI visibility."""
     recovery_check = getattr(window, "startup_recovery_session_ready", None)
@@ -183,11 +256,6 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
     if callable(rebind_recovery):
         rebind_recovery()
 
-    reset_expired_manual_ats_runtime_selections(
-        Path(__file__).resolve().parent / "stocks",
-        market_closed=manual_ats_market_day_closed(),
-    )
-
     close_result = auto_trade_continue_pending_close_liquidations(window, limit=5)
     close_processed = int(close_result.get("processed", 0) or 0)
     close_blocked = int(close_result.get("blocked", 0) or 0)
@@ -197,72 +265,82 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             f"진행 {close_processed} / 차단 {close_blocked}"
         )
 
-    signal_result: dict[str, object] = {}
-    if callable(probe_all_enabled_routine_stocks_once):
-        try:
-            probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
-            logged_count = int(probe_result.get("logged", 0) or 0)
-            error_count = int(probe_result.get("error", 0) or 0)
-            if logged_count > 0 or error_count > 0:
-                window.statusBarMessage(
-                    f"루틴 신호 로그: 기록 {logged_count}개"
-                    + (f" / 오류 {error_count}개" if error_count else "")
-                )
-            if (
-                callable(consume_pending_routine_signals_dry_run)
-                and (
-                    auto_trade_signal_probe_only_active(window)
-                    or auto_trade_real_execution_active(window)
-                )
-            ):
-                consumer_result = consume_pending_routine_signals_dry_run(
-                    limit=5,
-                    mark_previewed=True,
-                    write_order_queue=True,
-                    apply_approval=True,
-                )
-                summary = (
-                    consumer_result.get("summary", {})
-                    if isinstance(consumer_result, dict)
-                    else {}
-                )
-                checked = int(summary.get("signals_checked", 0) or 0)
-                blocked = int(summary.get("blocked", 0) or 0)
-                allowed = int(summary.get("allowed", 0) or 0)
-                errors = int(summary.get("errors", 0) or 0)
-                orders_created = int(summary.get("orders_created", 0) or 0)
-                approval_checked = int(summary.get("approval_checked", 0) or 0)
-                approved = int(summary.get("approved", 0) or 0)
-                if checked > 0 or errors > 0:
-                    window.statusBarMessage(
-                        f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
-                        f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
-                    )
-                signal_result = dict(summary)
-                if auto_trade_real_execution_active(window):
-                    auto_executor = getattr(
-                        window,
-                        "auto_process_executable_orders_for_real_trade",
-                        None,
-                    )
-                    if callable(auto_executor):
-                        auto_result = auto_executor(limit=5)
-                        processed = int(auto_result.get("processed", 0) or 0)
-                        auto_blocked = int(auto_result.get("blocked", 0) or 0)
-                        signal_result["orders_processed"] = processed
-                        signal_result["orders_blocked"] = auto_blocked
-                        if processed > 0 or auto_blocked > 0:
-                            window.statusBarMessage(
-                                f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
-                            )
-        except Exception:
-            LOGGER.exception("Routine signal operation cycle failed")
-            window.statusBarMessage(
-                "주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오."
-            )
-            signal_result = {"errors": 1}
+    ats_result = auto_trade_continue_pending_manual_ats_liquidations(window, limit=5)
+    ats_processed = int(ats_result.get("processed", 0) or 0)
+    ats_failed = int(ats_result.get("failed", 0) or 0)
+    if ats_processed > 0 or ats_failed > 0:
+        window.statusBarMessage(
+            "ATS 청산 Command 처리: "
+            f"진행 {ats_processed} / 실패 {ats_failed}"
+        )
 
-    if callable(rebind_recovery):
+    signal_result: dict[str, object] = {}
+    candle_refresh_result: dict[str, object] = {}
+    signal_cycle_completed = False
+    deferred_cycle_completion_pending = False
+    deferred_cycle_completion = getattr(
+        window,
+        "complete_deferred_operation_cycle",
+        None,
+    )
+
+    def operation_cycle_result() -> dict[str, object]:
+        return {
+            "processed": True,
+            "reason_code": "OPERATION_CYCLE_COMPLETED",
+            "minute_key": minute_key,
+            "changed": changed_count,
+            "failed": failed_count,
+            "close_processed": close_processed,
+            "close_blocked": close_blocked,
+            "candle_refresh_result": dict(candle_refresh_result),
+            "signal_result": dict(signal_result),
+        }
+
+    def continue_after_candle_refresh(_refresh_result: dict[str, object]) -> None:
+        nonlocal candle_refresh_result, signal_result, signal_cycle_completed
+        if isinstance(_refresh_result, dict):
+            candle_refresh_result = dict(_refresh_result)
+        signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+        signal_cycle_completed = True
+        if callable(rebind_recovery):
+            rebind_recovery()
+        if deferred_cycle_completion_pending and callable(
+            deferred_cycle_completion
+        ):
+            try:
+                deferred_cycle_completion(operation_cycle_result())
+            except Exception:
+                LOGGER.exception("Deferred operation cycle completion notify failed")
+
+    if callable(refresh_operation_candles):
+        try:
+            candle_refresh_result = refresh_operation_candles(
+                window,
+                minute_key,
+                on_complete=continue_after_candle_refresh,
+            )
+        except Exception:
+            LOGGER.exception("Automatic minute candle refresh failed")
+            candle_refresh_result = {
+                "accepted": False,
+                "completed": False,
+                "reason_code": "CANDLE_REFRESH_FAILED",
+            }
+            signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+        else:
+            if (
+                candle_refresh_result.get("accepted") is False
+                and candle_refresh_result.get("completed") is False
+            ):
+                signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+            elif candle_refresh_result.get("completed") is not True:
+                signal_result = {"deferred_for_candle_refresh": True}
+                deferred_cycle_completion_pending = True
+    else:
+        signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+
+    if callable(rebind_recovery) and not signal_cycle_completed:
         rebind_recovery()
 
     if changed_count > 0 or failed_count > 0:
@@ -271,16 +349,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             + (f" / 실패 {failed_count}개" if failed_count else "")
         )
 
-    return {
-        "processed": True,
-        "reason_code": "OPERATION_CYCLE_COMPLETED",
-        "minute_key": minute_key,
-        "changed": changed_count,
-        "failed": failed_count,
-        "close_processed": close_processed,
-        "close_blocked": close_blocked,
-        "signal_result": signal_result,
-    }
+    return operation_cycle_result()
 
 
 

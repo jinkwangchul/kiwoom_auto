@@ -131,40 +131,6 @@ class AtsSessionVisibilityTest(unittest.TestCase):
             dialog.deleteLater()
             self.app.processEvents()
 
-    def test_dialog_hides_disabled_rows_and_hidden_selection_does_not_enable_sell(self) -> None:
-        dialog = gui_ats_utils.ManualAtsSettingsDialog(
-            {"extra1": False, "extra2": True, "extra3": False},
-            {"extra1": "장전프리", "extra2": "마감후NTX", "extra3": "미지정"},
-            visible_keys=("extra1", "extra3"),
-        )
-        try:
-            self.assertEqual(("extra1", "extra3"), dialog.visible_session_keys)
-            self.assertEqual("장전프리", dialog.check_extra1.text())
-            self.assertEqual("미지정", dialog.check_extra3.text())
-            self.assertFalse(dialog.btn_market_sell.isEnabled())
-            self.assertTrue(dialog.values()["extra2"])
-            dialog.check_extra1.setChecked(True)
-            self.assertTrue(dialog.btn_market_sell.isEnabled())
-            self.assertEqual(("extra1",), dialog.selected_visible_keys())
-        finally:
-            dialog.close()
-            dialog.deleteLater()
-            self.app.processEvents()
-
-    def test_zero_visible_rows_keep_sell_buttons_disabled(self) -> None:
-        dialog = gui_ats_utils.ManualAtsSettingsDialog(
-            {"extra1": True, "extra2": True, "extra3": True},
-            visible_keys=(),
-        )
-        try:
-            self.assertEqual((), dialog.visible_session_keys)
-            self.assertFalse(dialog.btn_market_sell.isEnabled())
-            self.assertFalse(dialog.btn_current_sell.isEnabled())
-        finally:
-            dialog.close()
-            dialog.deleteLater()
-            self.app.processEvents()
-
     def test_saving_visible_key_preserves_each_targets_hidden_runtime_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

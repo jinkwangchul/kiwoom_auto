@@ -79,6 +79,8 @@ DEFAULT_HIDDEN_EVENT_TYPES = frozenset({
     "RECOVERY_COMPLETED",
     "SEND_ORDER_REQUEST_ACCEPTED",
 })
+EVENT_LIST_PANEL_FIXED_WIDTH = 1170
+EVENT_DETAIL_PANEL_MINIMUM_WIDTH = 380
 
 
 class _EventRecordItem(QTableWidgetItem):
@@ -163,14 +165,28 @@ class EventRecordPrototypeWindow(QDialog):
         filter_layout.addWidget(self.search_edit)
         root.addWidget(filter_group)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._create_event_list_panel())
-        splitter.addWidget(self._create_detail_panel())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([1170, 380])
-        root.addWidget(splitter, 1)
+        self.event_splitter = QSplitter(Qt.Horizontal)
+        self.event_splitter.setChildrenCollapsible(False)
+        self.event_list_panel = self._create_event_list_panel()
+        self.event_list_panel.setFixedWidth(EVENT_LIST_PANEL_FIXED_WIDTH)
+        self.event_detail_panel = self._create_detail_panel()
+        self.event_detail_panel.setMinimumWidth(EVENT_DETAIL_PANEL_MINIMUM_WIDTH)
+        self.event_splitter.addWidget(self.event_list_panel)
+        self.event_splitter.addWidget(self.event_detail_panel)
+        self.event_splitter.setStretchFactor(0, 0)
+        self.event_splitter.setStretchFactor(1, 1)
+        self.event_splitter.setSizes(
+            [EVENT_LIST_PANEL_FIXED_WIDTH, EVENT_DETAIL_PANEL_MINIMUM_WIDTH]
+        )
+        root.addWidget(self.event_splitter, 1)
+        margins = root.contentsMargins()
+        self.setMinimumWidth(
+            EVENT_LIST_PANEL_FIXED_WIDTH
+            + EVENT_DETAIL_PANEL_MINIMUM_WIDTH
+            + self.event_splitter.handleWidth()
+            + margins.left()
+            + margins.right()
+        )
         bottom = QHBoxLayout()
         self.result_count_label = QLabel()
         self.result_count_label.setStyleSheet("color: #6B7280;")
@@ -323,7 +339,7 @@ class EventRecordPrototypeWindow(QDialog):
                 item.setData(Qt.UserRole + 1, sort_values[column])
                 if column == 0:
                     item.setData(Qt.UserRole, event)
-                if column in {1, 2, 5}:
+                if column in {1, 2, 3, 4, 5}:
                     item.setTextAlignment(Qt.AlignCenter)
                 if column == 2 and severity in SEVERITY_COLORS:
                     item.setForeground(SEVERITY_COLORS[severity])

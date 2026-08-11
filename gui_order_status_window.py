@@ -14,6 +14,7 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QDate
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -118,8 +119,12 @@ class OrderStatusWindow(QDialog):
         self.status_title_container.setLayout(self.status_title_layout)
         self.timeline_summary_label = QLabel("")
         self.range_combo = QComboBox()
-        self.range_combo.addItems(["이번주", "이번달", "3개월", "직접입력"])
-        self.range_combo.setCurrentText("이번주")
+        self.range_combo.addItems(["오늘", "1주", "1개월", "3개월", "6개월", "전체"])
+        self.range_combo.setCurrentText("1주")
+        self.range_combo.hide()
+        self.range_buttons: dict[str, QPushButton] = {}
+        self._range_button_group = QButtonGroup(self)
+        self._range_button_group.setExclusive(True)
         self.custom_start_date: date | None = None
         self.custom_end_date: date | None = None
         self.order_table = QTableWidget()
@@ -151,10 +156,21 @@ class OrderStatusWindow(QDialog):
         )
 
         timeline_header_layout.setContentsMargins(0, 14, 0, 3)
+        timeline_header_layout.setSpacing(6)
         timeline_header_layout.addWidget(QLabel("매매 타임라인"))
         timeline_header_layout.addStretch(1)
         timeline_header_layout.addWidget(QLabel("기간설정"))
-        timeline_header_layout.addWidget(self.range_combo)
+        for mode in ("오늘", "1주", "1개월", "3개월", "6개월", "전체"):
+            button = QPushButton(mode)
+            button.setCheckable(True)
+            button.setFixedWidth(58)
+            button.setChecked(mode == self.range_combo.currentText())
+            button.clicked.connect(
+                lambda _checked=False, value=mode: self.range_combo.setCurrentText(value)
+            )
+            self.range_buttons[mode] = button
+            self._range_button_group.addButton(button)
+            timeline_header_layout.addWidget(button)
 
         button_layout.addStretch(1)
         button_layout.addWidget(self.btn_export)
@@ -222,6 +238,9 @@ class OrderStatusWindow(QDialog):
                 self.custom_start_date = None
                 self.custom_end_date = None
 
+        current_mode = self.range_combo.currentText()
+        if current_mode in self.range_buttons:
+            self.range_buttons[current_mode].setChecked(True)
         self.load_orders()
 
     def select_custom_range(self) -> None:

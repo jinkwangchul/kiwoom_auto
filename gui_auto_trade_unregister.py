@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QMessageBox
 from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_base_stock_service import update_base_stock_routines as update_base_stock_routines_from_service
 from gui_toast import show_toast
+from gui_operation_ui_context import operation_dialog_parent
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
@@ -74,9 +75,10 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     - 보유·미체결, 운영 중, 긴급정지, 검토관리, 무결성 오류는 등록해제하지 않는다.
     - 차단 종목의 state.json과 orders.json은 변경하지 않는다.
     """
+    message_parent = operation_dialog_parent(window)
     selected = window.selected_stock_infos()
     if not selected:
-        QMessageBox.warning(window, "선택 오류", "등록해제할 종목을 1개 이상 선택하세요.")
+        QMessageBox.warning(message_parent, "선택 오류", "등록해제할 종목을 1개 이상 선택하세요.")
         return
     routine_name = window.current_selected_routine_name()
     if not routine_name and bool(getattr(window, "_all_stocks_scope_active", False)):
@@ -103,7 +105,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     process_items = immediate_items
     if not process_items:
         show_toast(
-            window,
+            message_parent,
             unregister_result_toast_text(
                 0,
                 len(blocked_items),
@@ -125,7 +127,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
 
     if not completed_items:
         show_toast(
-            window,
+            message_parent,
             unregister_result_toast_text(
                 0,
                 len(blocked_items),
@@ -145,7 +147,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         parent.refresh_all()
     window.refresh_all()
     show_toast(
-        window,
+        message_parent,
         unregister_result_toast_text(
             len(completed_items),
             len(blocked_items),

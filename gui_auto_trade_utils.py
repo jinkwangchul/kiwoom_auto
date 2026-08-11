@@ -72,8 +72,6 @@ def mark_pending_order_integrity_review_required(
             "review_checked_at": timestamp,
             "updated_at": timestamp,
             "trade_enabled": False,
-            "buy_enabled": False,
-            "sell_enabled": False,
         }
     )
     if before_status not in {"REVIEW_REQUIRED", "REVIEW"}:

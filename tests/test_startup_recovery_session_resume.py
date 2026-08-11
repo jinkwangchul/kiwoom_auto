@@ -433,15 +433,13 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         timer_window = TimerWindow()
 
-        with (
-            patch("gui_auto_trade_timer.reset_expired_manual_ats_runtime_selections") as reset_ats,
-            patch("gui_auto_trade_timer.probe_all_enabled_routine_stocks_once") as probe,
-        ):
+        with patch(
+            "gui_auto_trade_timer.probe_all_enabled_routine_stocks_once"
+        ) as probe:
             auto_trade_on_time_policy_timer_tick(timer_window)
 
         timer_window.recalculate_all_status_by_operation_policy.assert_not_called()
         timer_window.refresh_all.assert_not_called()
-        reset_ats.assert_not_called()
         probe.assert_not_called()
         timer_window.stop_operation_timers.assert_called_once_with()
 

@@ -26,6 +26,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from candle_timeframe_aggregation import (
+    candle_market_datetime,
+    completed_timeframe_candles,
+    parse_market_datetime,
+)
 from gui_auto_trade_runtime import all_registered_stock_dirs
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
 from order_candidate_engine import read_latest_price
@@ -181,6 +186,7 @@ def _maybe_enqueue_signal(
     tick_key: str,
     routine_type: str = "",
     routine_instance_id: str = "",
+    candles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not callable(enqueue_routine_signal):
         return None
@@ -191,6 +197,8 @@ def _maybe_enqueue_signal(
             queue_payload.setdefault("routine_type", routine_type)
         if routine_instance_id:
             queue_payload.setdefault("routine_instance_id", routine_instance_id)
+        marker = _signal_marker_snapshot(result, candles or [])
+        queue_payload.update(marker)
         return enqueue_routine_signal(
             queue_payload,
             routine=routine_name,
@@ -204,6 +212,37 @@ def _maybe_enqueue_signal(
             "status": "error",
             "reason": f"신호큐 저장 예외: {exc}",
         }
+
+
+def _signal_marker_snapshot(
+    result: dict[str, Any],
+    candles: list[dict[str, Any]],
+) -> dict[str, Any]:
+    index = result.get("signal_index")
+    if not isinstance(index, int) or isinstance(index, bool):
+        return {}
+    if not candles or not -len(candles) <= index < len(candles):
+        return {}
+    candle = candles[index]
+    bar_time = candle_market_datetime(candle)
+    close = candle.get("close") if isinstance(candle, dict) else None
+    timeframe = candle.get("timeframe_minutes") if isinstance(candle, dict) else None
+    trade_date = str(candle.get("trade_date") or "").strip() if isinstance(candle, dict) else ""
+    if bar_time is None or close in (None, "") or timeframe in (None, ""):
+        return {}
+    marker: dict[str, Any] = {
+        "signal_bar_time": bar_time.isoformat(timespec="seconds"),
+        "signal_bar_close": close,
+        "signal_timeframe_minutes": timeframe,
+        "signal_trade_date": trade_date or bar_time.date().isoformat(),
+    }
+    try:
+        from market_evidence_store import market_window_hash
+
+        marker["signal_input_hash"] = market_window_hash(candles)
+    except Exception:
+        pass
+    return marker
 
 
 def probe_routine_for_stock(
@@ -236,9 +275,28 @@ def probe_routine_for_stock(
             "name": name,
         }
     else:
-        candles = _load_candles_from_stock_dir(stock_dir)
+        raw_candles = _load_candles_from_stock_dir(stock_dir)
+        instance_rules = _load_instance_rules(routine_instance_id)
+        try:
+            candles = completed_timeframe_candles(
+                raw_candles,
+                instance_rules,
+                now=parse_market_datetime(tick_key),
+            )
+            candle_projection_error = ""
+        except ValueError as exc:
+            candles = []
+            candle_projection_error = str(exc)
         evaluate = getattr(routine_module, "evaluate", None)
-        if not callable(evaluate):
+        if candle_projection_error:
+            result = {
+                "signal": "ERROR",
+                "reason": f"거래기준봉 변환 실패: {candle_projection_error}",
+                "routine": routine_name,
+                "code": code,
+                "name": name,
+            }
+        elif not callable(evaluate):
             result = {
                 "signal": "ERROR",
                 "reason": "evaluate 함수 없음",
@@ -260,7 +318,6 @@ def probe_routine_for_stock(
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
             }
-            instance_rules = _load_instance_rules(routine_instance_id)
             if isinstance(instance_rules, dict):
                 context["rules"] = instance_rules
                 context["rules_source"] = "ROUTINE_INSTANCE_RULES"
@@ -323,6 +380,7 @@ def probe_routine_for_stock(
                     tick_key=tick_key,
                     routine_type=routine_type,
                     routine_instance_id=routine_instance_id,
+                    candles=candles,
                 )
                 if isinstance(queue_result, dict):
                     result["queue_status"] = queue_result.get("status")

@@ -27,8 +27,6 @@ class PendingOrderIntegrityReviewWriterTest(unittest.TestCase):
                 {
                     "status": "STOPPED",
                     "trade_enabled": True,
-                    "buy_enabled": True,
-                    "sell_enabled": True,
                     "extension": "preserved",
                 },
             )
@@ -58,11 +56,44 @@ class PendingOrderIntegrityReviewWriterTest(unittest.TestCase):
         )
         self.assertEqual("2026-08-06 12:34:56", saved["review_entered_at"])
         self.assertFalse(saved["trade_enabled"])
-        self.assertFalse(saved["buy_enabled"])
-        self.assertFalse(saved["sell_enabled"])
+        self.assertNotIn("buy_enabled", saved)
+        self.assertNotIn("sell_enabled", saved)
         self.assertEqual("preserved", saved["extension"])
         stock_log.assert_called_once()
         self.assertEqual("ERROR", stock_log.call_args.args[1])
+
+    def test_existing_legacy_permission_keys_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir = self._stock_dir(
+                root,
+                {
+                    "status": "STOPPED",
+                    "trade_enabled": True,
+                    "buy_enabled": True,
+                    "sell_enabled": False,
+                },
+            )
+            with (
+                patch("gui_auto_trade_utils.now_text", return_value="2026-08-06 12:34:56"),
+                patch("gui_auto_trade_utils.append_stock_log"),
+            ):
+                ok = mark_pending_order_integrity_review_required(
+                    "루틴A",
+                    stock_dir,
+                    "000001",
+                    "테스트",
+                    ["PENDING_ORDER_QTY_MISSING"],
+                    source="focused-test",
+                )
+            saved = json.loads(
+                (stock_dir / "state.json").read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(ok)
+        self.assertIs(saved["buy_enabled"], True)
+        self.assertIs(saved["sell_enabled"], False)
+        self.assertEqual("REVIEW_REQUIRED", saved["status"])
+        self.assertIs(saved["trade_enabled"], False)
 
     def test_same_review_reason_is_idempotent(self) -> None:
         reason = "PENDING_ORDER_DATA_INTEGRITY: LEGACY_PENDING_SUMMARY_ONLY"

@@ -17,8 +17,11 @@ from PyQt5.QtWidgets import QMessageBox
 from gui_common_utils import safe_int_value
 from gui_order_utils import (
     directional_value_color,
+    format_signed_money,
+    format_signed_percent,
     pending_order_side_quantities,
 )
+from confirmable_pnl_cycle_service import project_confirmable_cumulative_pnl
 from gui_config_utils import default_config
 from gui_review_utils import (
     average_price_from_state,
@@ -263,8 +266,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     state = clear_early_close_runtime_metadata_only(dict(state))
                     state["status"] = "MONITORING"
                     state["trade_set_status"] = "WAIT_BUY"
-                    state["buy_enabled"] = False
-                    state["sell_enabled"] = False
                     state_changed_after_regular_end = True
 
                 if state_changed_after_regular_end:
@@ -503,6 +504,19 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     sell_pending_qty=sell_pending_qty,
                 )
             )
+            cycle_pnl = project_confirmable_cumulative_pnl(
+                code,
+                current_price,
+                project_root=Path(__file__).resolve().parent,
+            )
+            if cycle_pnl.get("available") is True:
+                profit_amount = float(cycle_pnl.get("cumulative_profit") or 0)
+                cycle_rate = cycle_pnl.get("cumulative_rate")
+                rate_text = format_signed_percent(cycle_rate, digits=2) if cycle_rate is not None else "-"
+                profit_text = f"손익 {format_signed_money(profit_amount)} / {rate_text}"
+            else:
+                profit_amount = 0
+                profit_text = "손익 확인 필요 / -"
 
             values = [
                 code,

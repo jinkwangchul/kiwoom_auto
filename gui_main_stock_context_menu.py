@@ -17,7 +17,6 @@ from gui_auto_trade_close import (
     auto_trade_cancel_selected_early_close,
 )
 from gui_auto_trade_run_control import (
-    auto_trade_start_selected_auto_trades,
     auto_trade_stop_selected_auto_trades,
     show_auto_trade_operation_failure_dialog,
     startup_recovery_operation_block_message,
@@ -28,9 +27,10 @@ from gui_auto_trade_status_ops import (
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
-    auto_trade_open_selected_manual_ats_settings_dialog,
     auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
+    auto_trade_set_selected_manual_ats_flag,
 )
 from gui_auto_trade_context_menu import (
     StockContextMenuCallbacks,
@@ -40,6 +40,7 @@ from gui_config_utils import default_config
 from gui_schedule_utils import schedule_config_updates
 from gui_schedule_window import ScheduleOperationDialog
 from gui_auto_trade_integrity import (
+    is_emergency_stopped_state,
     is_operation_excluded,
     is_review_required_stock_dir,
 )
@@ -196,6 +197,10 @@ class MainMonitoringStockOperationAdapter:
             for target in self._targets
         ]
 
+    @property
+    def btn_start(self):
+        return self._window.btn_start
+
     def selected_operation_mode_set(
         self,
         selected: list[tuple[Path, str, str]] | None = None,
@@ -311,10 +316,26 @@ class MainMonitoringStockOperationAdapter:
 
         return AutoTradeSettingWindow.registered_operation_targets(self)
 
+    def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.registered_operation_start_targets(self)
+
     def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
         return AutoTradeSettingWindow.running_registered_operation_targets(self)
+
+    def update_global_operation_button_state(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        AutoTradeSettingWindow.update_global_operation_button_state(self)
+        window = getattr(self._window, "auto_trade_setting_window", None)
+        if window is None or sip.isdeleted(window):
+            return
+        update = getattr(window, "update_global_operation_button_state", None)
+        if callable(update):
+            update()
 
     def set_selected_stock_operation_exclusions(self) -> None:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
@@ -325,6 +346,27 @@ class MainMonitoringStockOperationAdapter:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
         AutoTradeSettingWindow.clear_selected_stock_operation_exclusions(self)
+
+    def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.emergency_stop_selected_auto_trade_stocks(
+            self
+        )
+
+    def release_selected_emergency_stopped_auto_trade_stocks(
+        self,
+    ) -> dict[str, object]:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        return AutoTradeSettingWindow.release_selected_emergency_stopped_auto_trade_stocks(
+            self
+        )
+
+    def unregister_selected_auto_trade_stocks(self) -> None:
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        AutoTradeSettingWindow.unregister_selected_auto_trade_stocks(self)
 
     def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
         self._last_operation_user_message = str(message or "").strip()
@@ -492,10 +534,15 @@ class MainMonitoringStockOperationAdapter:
         self._window.open_review_required_window()
 
     def start_selected_auto_trades(self) -> dict[str, object]:
-        return auto_trade_start_selected_auto_trades(
-            self,
-            request_scope=self._request_scope,
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        result = AutoTradeSettingWindow.start_selected_rows_auto_trades(
+            self
         )
+        return result if isinstance(result, dict) else {
+            "ok": False,
+            "reason": "NO_STARTABLE_TARGETS",
+        }
 
     def set_selected_individual_schedule_time(self) -> None:
         selected = self.target_snapshot()
@@ -574,15 +621,39 @@ class MainMonitoringStockOperationAdapter:
             selected if selected is not None else self.target_snapshot(),
         )
 
+    def selected_manual_ats_liquidation_available(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> bool:
+        return auto_trade_selected_manual_ats_liquidation_available(
+            self,
+            selected if selected is not None else self.target_snapshot(),
+        )
+
     def save_selected_manual_ats_state(
         self,
         ats_state: dict[str, bool],
         selected: list[tuple[Path, str, str]] | None = None,
+        editable_keys: tuple[str, ...] | None = None,
     ) -> int:
         return auto_trade_save_selected_manual_ats_state(
             self,
             ats_state,
             selected if selected is not None else self.target_snapshot(),
+            editable_keys,
+        )
+
+    def set_selected_manual_ats_flag(
+        self,
+        flag_key: str,
+        enabled: bool,
+        label: str,
+    ) -> None:
+        auto_trade_set_selected_manual_ats_flag(
+            self,
+            flag_key,
+            enabled,
+            label,
         )
 
     def execute_selected_manual_ats_liquidation(
@@ -590,16 +661,17 @@ class MainMonitoringStockOperationAdapter:
         method: str,
         ats_state: dict[str, bool],
         selected: list[tuple[Path, str, str]] | None = None,
+        editable_keys: tuple[str, ...] | None = None,
+        selected_sessions: tuple[str, ...] | None = None,
     ) -> None:
         auto_trade_execute_selected_manual_ats_liquidation(
             self,
             method,
             ats_state,
             selected if selected is not None else self.target_snapshot(),
+            editable_keys,
+            selected_sessions,
         )
-
-    def open_selected_manual_ats_settings_dialog(self) -> None:
-        auto_trade_open_selected_manual_ats_settings_dialog(self)
 
     def stop_selected_auto_trades(self) -> dict[str, object]:
         return auto_trade_stop_selected_auto_trades(self)
@@ -628,23 +700,30 @@ class MainMonitoringStockOperationAdapter:
         *,
         source: str = "우클릭",
         extra_policy: dict[str, object] | None = None,
-    ) -> None:
-        auto_trade_apply_selected_early_close(
+        show_error_dialog: bool = True,
+        show_result_toast: bool = True,
+    ) -> dict[str, object]:
+        return auto_trade_apply_selected_early_close(
             self,
             method,
             source=source,
             extra_policy=extra_policy,
+            show_error_dialog=show_error_dialog,
+            show_result_toast=show_result_toast,
         )
 
     def apply_selected_individual_liquidation_method(
         self,
         method: str,
         minutes: str,
-    ) -> None:
-        auto_trade_apply_selected_individual_liquidation_method(
+        *,
+        show_error_dialog: bool = True,
+    ) -> dict[str, object]:
+        return auto_trade_apply_selected_individual_liquidation_method(
             self,
             method,
             minutes,
+            show_error_dialog=show_error_dialog,
         )
 
 
@@ -664,10 +743,26 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
 
     adapter = MainMonitoringStockOperationAdapter(window, targets)
     window._main_monitoring_stock_operation_adapter = adapter
+    emergency_states = tuple(
+        is_emergency_stopped_state(
+            read_json_dict(target.stock_dir / "state.json")
+        )
+        for target in targets
+    )
     callbacks = StockContextMenuCallbacks(
         select_all=lambda: select_all_visible_main_monitoring_stocks(window),
         clear_selection=lambda: clear_main_monitoring_stock_selection(window),
         start=adapter.start_selected_auto_trades,
+        emergency_stop=(
+            adapter.emergency_stop_selected_auto_trade_stocks
+            if any(not state for state in emergency_states)
+            else None
+        ),
+        emergency_release=(
+            adapter.release_selected_emergency_stopped_auto_trade_stocks
+            if any(emergency_states)
+            else None
+        ),
         stock_register=lambda target_instance_id=context_target.routine_instance_id: (
             window.open_routine_instance_stock_register_from_main_table(
                 target_instance_id
@@ -682,9 +777,25 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         individual_liquidation=adapter.apply_selected_individual_liquidation_method,
         time_change=adapter.set_selected_individual_schedule_time,
         time_reset=adapter.reset_selected_schedule_to_global,
-        ats_settings=adapter.open_selected_manual_ats_settings_dialog,
+        ats_state=adapter.selected_manual_ats_state,
+        ats_toggle=adapter.set_selected_manual_ats_flag,
+        ats_liquidation_available=(
+            adapter.selected_manual_ats_liquidation_available
+        ),
+        ats_liquidation=(
+            lambda method, state, visible_keys, selected_sessions: (
+                adapter.execute_selected_manual_ats_liquidation(
+                    method,
+                    state,
+                    adapter.target_snapshot(),
+                    visible_keys,
+                    selected_sessions,
+                )
+            )
+        ),
         set_operation_exclusion=adapter.set_selected_stock_operation_exclusions,
         clear_operation_exclusion=adapter.clear_selected_stock_operation_exclusions,
+        unregister=adapter.unregister_selected_auto_trade_stocks,
     )
     show_monitor_stock_context_menu(
         window,

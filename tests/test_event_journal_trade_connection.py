@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from event_journal_reader import EventJournalReader
 from event_journal_writer import EventJournalWriter
+from event_journal_contract import EVENT_TYPE_LABELS
 import event_journal_production as production
 import event_journal_trade_observer as trade_observer
 import decision_trace_stage_observer as stage_observer
@@ -82,6 +83,48 @@ class EventJournalTradeConnectionTest(unittest.TestCase):
         self.assertEqual(["BUY_SIGNAL_DETECTED", "SELL_SIGNAL_DETECTED"], [item["event_type"] for item in events])
         self.assertTrue(all(item["severity"] == "NOTICE" for item in events))
         self.assertEqual(["SIGNAL-BUY-1", "SIGNAL-SELL-1"], [item["signal_id"] for item in events])
+
+    def test_manual_ats_outcome_is_durable_deduped_by_command_id(self) -> None:
+        fields = {
+            "command_id": "ats-command-1",
+            "stock_code": "005930",
+            "stock_name": "삼성전자",
+            "result": "REQUESTED",
+            "reason_code": "ORDER_REQUESTED",
+            "details": {
+                "liquidation_method": "MARKET",
+                "resolved_liquidation_qty": 70,
+            },
+        }
+        first = trade_observer.observe_manual_ats_liquidation_outcome(**fields)
+        second = trade_observer.observe_manual_ats_liquidation_outcome(**fields)
+
+        self.assertTrue(first["appended"])
+        self.assertTrue(second["duplicate"])
+        events = self.events()
+        self.assertEqual(1, len(events))
+        self.assertEqual("MANUAL_ATS_LIQUIDATION", events[0]["event_type"])
+        self.assertEqual("ATS 즉시청산", EVENT_TYPE_LABELS[events[0]["event_type"]])
+        self.assertEqual("REQUESTED", events[0]["result"])
+        self.assertEqual("manual-ats-liquidation:ats-command-1", events[0]["event_id"])
+        self.assertEqual(70, events[0]["details"]["resolved_liquidation_qty"])
+
+    def test_manual_ats_outcome_observer_is_fail_open(self) -> None:
+        with patch.object(
+            trade_observer,
+            "append_production_event",
+            side_effect=RuntimeError("journal unavailable"),
+        ):
+            result = trade_observer.observe_manual_ats_liquidation_outcome(
+                command_id="ats-command-fail-open",
+                stock_code="005930",
+                stock_name="삼성전자",
+                result="FAILED",
+                reason_code="ORDER_REQUEST_FAILED",
+                details={},
+            )
+
+        self.assertTrue(result["write_failed"])
 
     def test_approval_and_policy_record_only_blocked_final_results(self) -> None:
         order = self.order()

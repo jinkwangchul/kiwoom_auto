@@ -39,6 +39,10 @@ from pathlib import Path
 from typing import Any
 
 from execution_queue_writer import mutate_order_queue
+from gui_auto_trade_policy import (
+    auto_trade_setting_close_routine_mode_active,
+    auto_trade_setting_close_routine_order_allowed,
+)
 from runtime_atomic_writer import write_json_atomic
 
 
@@ -464,17 +468,23 @@ def evaluate_operation_policy(order: dict[str, Any]) -> dict[str, Any]:
             "policy_reason": "청산중 종목",
         }
 
-    if side == "BUY" and is_early_close(stock_state):
-        return {
-            "policy_status": "BLOCKED_POLICY",
-            "policy_reason": "조기마감 상태 신규매수 금지",
-        }
-
-    if side == "BUY" and is_auto_close(stock_state):
-        return {
-            "policy_status": "BLOCKED_POLICY",
-            "policy_reason": "자동마감 상태 신규매수 금지",
-        }
+    if (
+        side in {"BUY", "SELL"}
+        and auto_trade_setting_close_routine_mode_active(
+            stock_state,
+            display_status=str(stock_state.get("status") or ""),
+        )
+    ):
+        order_allowed, order_reason = auto_trade_setting_close_routine_order_allowed(
+            stock_state,
+            side,
+            display_status=str(stock_state.get("status") or ""),
+        )
+        if not order_allowed:
+            return {
+                "policy_status": "BLOCKED_POLICY",
+                "policy_reason": order_reason,
+            }
 
     return {
         "policy_status": "EXECUTABLE",

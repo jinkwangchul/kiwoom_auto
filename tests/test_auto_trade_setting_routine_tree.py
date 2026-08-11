@@ -2,7 +2,7 @@
 import json
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -48,6 +48,26 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._app_env_patcher.stop()
+
+    def test_review_button_count_uses_review_window_collector(self) -> None:
+        rows = [
+            {"code": "005930"},
+            {"code": "000660"},
+        ]
+        window = SimpleNamespace(btn_review_view=QLabel())
+        window.review_required_stock_count = (
+            lambda: AutoTradeSettingWindow.review_required_stock_count(window)
+        )
+
+        with patch.object(
+            setting_window,
+            "collect_global_review_required_rows",
+            return_value=rows,
+        ) as collector:
+            AutoTradeSettingWindow.update_review_required_button_text(window)
+
+        collector.assert_called_once_with()
+        self.assertEqual("검토관리(2)", window.btn_review_view.text())
 
     def test_operation_environment_uses_routine_close_display_terms_only(
         self,
@@ -221,100 +241,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                         datetime(2026, 7, 24, 13, 31),
                     ),
                 )
-
-    def test_buy_end_context_writer_uses_auto_close_status(self) -> None:
-        import gui_auto_trade_status_ops as status_ops
-
-        class FakeBox:
-            Question = 4
-            AcceptRole = 0
-            RejectRole = 1
-
-            def __init__(self, _parent):
-                self._clicked = None
-
-            def setIcon(self, _icon):
-                pass
-
-            def setWindowTitle(self, _title):
-                pass
-
-            def setText(self, _text):
-                pass
-
-            def addButton(self, _text, role):
-                button = object()
-                if role == self.AcceptRole:
-                    self._clicked = button
-                return button
-
-            def setDefaultButton(self, _button):
-                pass
-
-            def exec_(self):
-                pass
-
-            def clickedButton(self):
-                return self._clicked
-
-        class FakeTable:
-            def viewport(self):
-                return self
-
-            def update(self):
-                pass
-
-            def repaint(self):
-                pass
-
-        class FakeWindow:
-            def __init__(self, stock_dir: Path) -> None:
-                self.stock_dir = stock_dir
-                self.stock_table = FakeTable()
-                self.calls = []
-
-            def selected_stock_infos(self):
-                return [(self.stock_dir, "005930", "삼성전자")]
-
-            def current_selected_routine_name(self):
-                return "루틴A"
-
-            def update_stock_status(self, stock_dir, code, name, status, metadata, log_suffix):
-                self.calls.append((stock_dir, code, name, status, metadata, log_suffix))
-                return True
-
-            def refresh_all(self):
-                pass
-
-            def statusBarMessage(self, _message):
-                pass
-
-        with TemporaryDirectory() as temp:
-            stock_dir = Path(temp) / "005930_삼성전자"
-            stock_dir.mkdir()
-            (stock_dir / "state.json").write_text(
-                json.dumps({"status": "RUNNING"}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            window = FakeWindow(stock_dir)
-
-            with (
-                patch.object(status_ops, "QMessageBox", FakeBox),
-                patch.object(
-                    status_ops,
-                    "read_operation_policy",
-                    return_value={"auto_close": {"method": "현재가", "profit_percent": "1.0"}},
-                ),
-                patch.object(status_ops, "append_changelog"),
-            ):
-                status_ops.auto_trade_set_selected_stocks_buy_end(window)
-
-        self.assertEqual(len(window.calls), 1)
-        _stock_dir, _code, _name, status, metadata, _log_suffix = window.calls[0]
-        self.assertEqual("AUTO_CLOSE", status)
-        self.assertEqual("USER_CONTEXT_MENU", metadata["auto_close_source"])
-        self.assertEqual("현재가", metadata["auto_close_method"])
-        self.assertEqual("1.0", metadata["auto_close_policy"]["profit_percent"])
 
     def _definition(self) -> RoutineDefinitionRecord:
         return RoutineDefinitionRecord(
@@ -4692,6 +4618,90 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertTrue(hasattr(dialog, "btn_export"))
         self.assertTrue(hasattr(dialog, "timeline_text"))
 
+    def test_stock_history_period_filter_uses_performance_badge_format(self) -> None:
+        import gui_order_status_window as order_status_window
+        from gui_order_utils import date_range_for_mode
+
+        with TemporaryDirectory() as temp_dir:
+            dialog = order_status_window.OrderStatusWindow(
+                stock_dir=Path(temp_dir),
+                routine_name="지표추종매매B",
+                stock_code="005930",
+                stock_name="삼성전자",
+            )
+        self.addCleanup(dialog.close)
+
+        modes = ("오늘", "1주", "1개월", "3개월", "6개월", "전체")
+        self.assertEqual(modes, tuple(dialog.range_buttons))
+        self.assertTrue(dialog.range_combo.isHidden())
+        for mode in modes:
+            self.assertTrue(dialog.range_buttons[mode].isCheckable())
+            self.assertEqual(58, dialog.range_buttons[mode].width())
+        self.assertTrue(dialog.range_buttons["1주"].isChecked())
+
+        dialog.range_buttons["1개월"].click()
+        self.assertEqual("1개월", dialog.range_combo.currentText())
+        self.assertTrue(dialog.range_buttons["1개월"].isChecked())
+        self.assertFalse(
+            any(mode in dialog.range_buttons for mode in ("이번주", "이번달", "직접입력"))
+        )
+
+        reference_day = date(2026, 8, 7)
+        self.assertEqual((reference_day, reference_day), date_range_for_mode("오늘", today_value=reference_day))
+        self.assertEqual((date(2026, 8, 1), reference_day), date_range_for_mode("1주", today_value=reference_day))
+        self.assertEqual((date(2026, 7, 9), reference_day), date_range_for_mode("1개월", today_value=reference_day))
+        self.assertEqual((date(2026, 5, 8), reference_day), date_range_for_mode("3개월", today_value=reference_day))
+        self.assertEqual((date(2026, 2, 8), reference_day), date_range_for_mode("6개월", today_value=reference_day))
+        self.assertEqual((None, None), date_range_for_mode("전체", today_value=reference_day))
+
+    def test_stock_history_period_badges_filter_timeline_and_refresh_keeps_selection(self) -> None:
+        import gui_order_status_window as order_status_window
+
+        today = date.today()
+        orders = [
+            {
+                "order_time": datetime.combine(today - timedelta(days=offset), datetime.min.time()).isoformat(),
+                "side": "BUY",
+                "order_qty": 1,
+                "filled_qty": 0,
+                "pending_qty": 1,
+                "status": "OPEN",
+            }
+            for offset in (0, 10, 40, 100, 200)
+        ]
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        stock_dir = Path(temp_dir.name)
+        (stock_dir / "orders.json").write_text(
+            json.dumps({"orders": orders}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        dialog = order_status_window.OrderStatusWindow(
+            stock_dir=stock_dir,
+            routine_name="지표추종매매B",
+            stock_code="005930",
+            stock_name="삼성전자",
+        )
+        self.addCleanup(dialog.close)
+
+        expected_counts = {
+            "오늘": 1,
+            "1주": 1,
+            "1개월": 2,
+            "3개월": 3,
+            "6개월": 4,
+            "전체": 5,
+        }
+        for mode, count in expected_counts.items():
+            with self.subTest(mode=mode):
+                dialog.range_buttons[mode].click()
+                self.assertIn(f"주문건수 {count}건 / 전체 5건", dialog.timeline_text.toPlainText())
+
+        dialog.btn_refresh.click()
+        self.assertEqual("전체", dialog.range_combo.currentText())
+        self.assertTrue(dialog.range_buttons["전체"].isChecked())
+        self.assertIn("주문건수 5건 / 전체 5건", dialog.timeline_text.toPlainText())
+
     def test_stock_register_open_selected_stock_history_blocks_unavailable_targets(self) -> None:
         import gui_stock_register_window as stock_register_window
 
@@ -4998,7 +5008,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.addCleanup(window.close)
         window.show()
         QApplication.processEvents()
-        window._set_integrity_status_text("로컬 무결성 통과 | 서버 정합성 미확인")
+        window._set_server_local_integrity_status("SERVER_NOT_CHECKED")
         QApplication.processEvents()
         window._position_stock_performance_sort_badges()
         QApplication.processEvents()
@@ -5073,10 +5083,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         status_layout = integrity_container.layout()
         margins = status_layout.contentsMargins()
         self.assertEqual((18, 0, 0, 0), (margins.left(), margins.top(), margins.right(), margins.bottom()))
-        self.assertEqual(6, status_layout.spacing())
-        self.assertEqual((20, stock_register_window.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT), (integrity_icon.width(), integrity_icon.height()))
-        self.assertEqual("✓", integrity_icon.text())
-        self.assertIn("#15803d", integrity_icon.styleSheet())
+        dot_metrics = integrity_icon.fontMetrics()
+        self.assertEqual(dot_metrics.horizontalAdvance(" "), status_layout.spacing())
+        self.assertEqual(
+            (dot_metrics.horizontalAdvance("●"), dot_metrics.height()),
+            (integrity_icon.width(), integrity_icon.height()),
+        )
+        self.assertEqual("●", integrity_icon.text())
+        self.assertIn("#9ca3af", integrity_icon.styleSheet())
         icon_x = integrity_icon.mapTo(window, QPoint(0, 0)).x()
         self.assertLess(icon_x - window.stock_search_input.geometry().right(), 33)
         self.assertGreaterEqual(icon_x - window.stock_search_input.geometry().right(), 24)

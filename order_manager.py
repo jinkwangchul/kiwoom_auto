@@ -20,13 +20,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 from gui_auto_trade_policy import (
-    auto_trade_setting_close_routine_mode_active,
-    auto_trade_setting_close_routine_order_allowed,
     auto_trade_setting_mark_close_routine_final_sell_ordered,
 )
+from operation_policy_gate import read_operation_state
+from routine_order_permission import canonical_routine_order_permission
 from gui_auto_trade_runtime import write_state_json
 from runtime_io import read_json_dict
 
@@ -46,20 +47,14 @@ def normalize_routine_signal(signal_type: Any) -> str:
     return upper_text
 
 
-def _state_flag_enabled(state: dict[str, Any], key: str, default: bool = True) -> bool:
-    """state의 boolean 계열 값을 안전하게 읽는다."""
-    if key not in state:
-        return default
-    value = state.get(key)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() not in {"", "0", "false", "no", "n", "off", "정지"}
-
-
 def decide_routine_order(
     state: dict[str, Any] | None,
     signal_type: Any,
     display_status: str = "",
+    *,
+    config: dict[str, Any] | None = None,
+    operation_state: dict[str, Any] | None = None,
+    now_dt: datetime | None = None,
 ) -> dict[str, Any]:
     """루틴 신호에 대한 메인프로그램 주문판정 결과를 반환한다.
 
@@ -85,54 +80,18 @@ def decide_routine_order(
             "mark_close_final_sell_after_order": False,
         }
 
-    if not _state_flag_enabled(state_dict, "trade_enabled", default=True):
-        return {
-            "allowed": False,
-            "signal_type": signal,
-            "reason": "매매 비활성 상태",
-            "mark_close_final_sell_after_order": False,
-        }
-
-    close_allowed, close_reason = auto_trade_setting_close_routine_order_allowed(
-        state_dict,
-        signal,
+    return canonical_routine_order_permission(
+        state=state_dict,
+        signal_type=signal,
         display_status=display_status,
-    )
-    if not close_allowed:
-        return {
-            "allowed": False,
-            "signal_type": signal,
-            "reason": close_reason,
-            "mark_close_final_sell_after_order": False,
-        }
-
-    if signal == "BUY" and not _state_flag_enabled(state_dict, "buy_enabled", default=True):
-        return {
-            "allowed": False,
-            "signal_type": signal,
-            "reason": "매수 비활성 상태",
-            "mark_close_final_sell_after_order": False,
-        }
-
-    if signal == "SELL" and not _state_flag_enabled(state_dict, "sell_enabled", default=True):
-        return {
-            "allowed": False,
-            "signal_type": signal,
-            "reason": "매도 비활성 상태",
-            "mark_close_final_sell_after_order": False,
-        }
-
-    mark_final_sell = bool(
-        signal == "SELL"
-        and auto_trade_setting_close_routine_mode_active(state_dict, display_status=display_status)
+        config=config,
+        operation_state=operation_state,
+        now_dt=now_dt,
     )
 
-    return {
-        "allowed": True,
-        "signal_type": signal,
-        "reason": close_reason if mark_final_sell else "주문판정 통과",
-        "mark_close_final_sell_after_order": mark_final_sell,
-    }
+
+def current_datetime() -> datetime:
+    return datetime.now()
 
 
 def mark_order_accepted(
@@ -174,7 +133,15 @@ def decide_routine_order_for_stock_dir(
     """
     path = Path(stock_dir)
     state = read_json_dict(path / "state.json")
-    decision = decide_routine_order(state, signal_type, display_status=display_status)
+    config = read_json_dict(path / "config.json")
+    decision = decide_routine_order(
+        state,
+        signal_type,
+        display_status=display_status,
+        config=config,
+        operation_state=read_operation_state(),
+        now_dt=current_datetime(),
+    )
     decision["stock_dir"] = str(path)
     return decision
 

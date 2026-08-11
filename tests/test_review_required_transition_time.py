@@ -394,8 +394,6 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
                         "emergency_stopped_at": "2026-08-02 12:34:55",
                         "emergency_reason": "운영 데이터 불일치",
                         "trade_enabled": False,
-                        "buy_enabled": False,
-                        "sell_enabled": False,
                     },
                     ensure_ascii=False,
                 ),
@@ -438,8 +436,6 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
                         "emergency_stopped_at": "2026-08-02 12:44:55",
                         "emergency_reason": "운영 데이터 불일치",
                         "trade_enabled": False,
-                        "buy_enabled": False,
-                        "sell_enabled": False,
                     },
                     ensure_ascii=False,
                 ),
@@ -673,6 +669,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             with (
                 patch.object(review_window, "collect_global_review_required_rows", return_value=[row]),
                 patch.object(review_window.QMessageBox, "information"),
+                patch.object(review_window, "append_production_event"),
             ):
                 window = review_window.GlobalReviewRequiredWindow()
                 window.table.selectRow(0)
@@ -687,6 +684,19 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
         with TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "100010_해결"
             stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "routine_instance_name": "A루틴",
+                        "assigned_routine_instance_id": "routine-a",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "orders.json").write_text(
+                json.dumps({"orders": []}, ensure_ascii=False), encoding="utf-8"
+            )
             (stock_dir / "state.json").write_text(
                 json.dumps(
                     {
@@ -695,6 +705,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
                         "review_status": "RESOLVED",
                         "review_reason": "기존 사유",
                         "review_location": "운영시작",
+                        "holding_qty": 0,
                     },
                     ensure_ascii=False,
                 ),
@@ -713,14 +724,18 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             with (
                 patch.object(review_window, "collect_global_review_required_rows", return_value=[row]),
                 patch.object(review_window.QMessageBox, "information"),
+                patch.object(review_window, "append_production_event"),
             ):
                 window = review_window.GlobalReviewRequiredWindow()
                 window.table.selectRow(0)
                 window.return_selected_items_to_auto_list()
 
             state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
-            self.assertEqual("MONITORING", state["status"])
+            self.assertEqual("STOPPED", state["status"])
             self.assertFalse(state["review_required"])
+            self.assertEqual("A루틴", state["review_routine"])
+            config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual("routine-a", config["assigned_routine_instance_id"])
             window.close()
 
     def test_writer_preserves_current_entry_and_reentry_gets_new_time(self) -> None:

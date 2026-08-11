@@ -198,14 +198,19 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
 
         button = MainWindow._create_main_routine_excluded_badge(host)
         try:
-            self.assertEqual("제외종목", button.text())
+            self.assertEqual("제외종목(0)", button.text())
             self.assertEqual(
                 round(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT * 1.1),
                 button.height(),
             )
             self.assertGreaterEqual(
                 button.width(),
-                button.fontMetrics().horizontalAdvance(button.text()) + 28,
+                (
+                    button.fontMetrics().horizontalAdvance(f"{button.LABEL}(")
+                    + table_loader.routine_aggregate_number_slot_width(button.font())
+                    + button.fontMetrics().horizontalAdvance(")")
+                    + 28
+                ),
             )
 
             original_sorts = (
@@ -228,6 +233,43 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
             MainWindow._set_main_routine_excluded_only(host, False)
             self.assertFalse(host._main_routine_excluded_only)
             self.assertEqual(2, host._reload_main_routine_table_preserving_view.call_count)
+        finally:
+            button.close()
+            button.deleteLater()
+
+    def test_excluded_badge_uses_fixed_three_digit_centered_number_slot(self) -> None:
+        host = SimpleNamespace(
+            _set_main_routine_excluded_only=MagicMock(),
+            _main_routine_excluded_button=None,
+        )
+        button = MainWindow._create_main_routine_excluded_badge(host)
+        try:
+            expected_width = button.width()
+            expected_rects = button.content_rects()
+            expected_number_width = table_loader.routine_aggregate_number_slot_width(
+                button.count_font()
+            )
+            for count in (0, 1, 2, 9, 10, 15, 99, 100, 123, 999):
+                button.set_excluded_count(count)
+                label_rect, left_paren_rect, number_rect, right_paren_rect = (
+                    button.content_rects()
+                )
+                self.assertEqual(expected_width, button.width())
+                self.assertEqual(expected_rects, button.content_rects())
+                self.assertEqual(expected_number_width, number_rect.width())
+                self.assertEqual(label_rect.right() + 1, left_paren_rect.left())
+                self.assertEqual(left_paren_rect.right() + 1, number_rect.left())
+                self.assertEqual(number_rect.right() + 1, right_paren_rect.left())
+                number_width = button.fontMetrics().horizontalAdvance(str(count))
+                left_space = (number_rect.width() - number_width) // 2
+                right_space = number_rect.width() - number_width - left_space
+                self.assertLessEqual(abs(left_space - right_space), 1)
+                self.assertEqual(f"제외종목({count})", button.text())
+            self.assertAlmostEqual(
+                button.font().pointSizeF() - 1.0,
+                button.count_font().pointSizeF(),
+                places=4,
+            )
         finally:
             button.close()
             button.deleteLater()

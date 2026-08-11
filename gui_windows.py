@@ -26,7 +26,7 @@ from pathlib import Path
 
 from PyQt5 import sip
 from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt, QTimer
-from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
+from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPalette, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -43,7 +43,10 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QComboBox,
     QTableWidget,
+    QTableWidgetItem,
     QStyle,
+    QStyleOptionButton,
+    QStylePainter,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QVBoxLayout,
@@ -78,6 +81,7 @@ from gui_main_table_loader import (
     ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
     ROUTINE_MONITORING_HEADERS,
     ROUTINE_PARENT_AGGREGATE_ROLE,
+    ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
     ROUTINE_PARENT_COLLAPSED_ROLE,
     ROUTINE_PARENT_NAME_ROLE,
     ROUTINE_COMPLETION_STATUSES,
@@ -101,7 +105,13 @@ from gui_main_table_loader import (
     ROUTINE_STOCK_TEXT_OFFSET,
     ROUTINE_STOCK_VALUES_ROLE,
     routine_instance_separator_width,
+    routine_aggregate_separator_width,
+    routine_instance_grid_columns,
+    routine_aggregate_slot_lefts,
+    routine_aggregate_label_width,
+    routine_aggregate_number_slot_width,
     routine_instance_number_widths,
+    main_refresh_pnl_only,
     routine_stock_column_widths,
     routine_stock_position_value_widths,
     ROUTINE_STATUS_DEFAULT,
@@ -114,7 +124,9 @@ from gui_main_table_loader import (
     main_load_routine_table,
     main_load_running_stock_table,
     main_monitoring_table_font,
+    main_monitoring_cell_font,
 )
+from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
 from gui_main_budget_panel import update_main_budget_panel
 from account_funds_foundation import (
     DISCONNECTED as ACCOUNT_FUNDS_DISCONNECTED,
@@ -140,6 +152,7 @@ from gui_auto_trade_run_control import show_auto_trade_operation_failure_dialog
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
 from gui_event_record_window import open_event_record_prototype
+from gui_stock_instance_chart_window import open_stock_instance_chart
 from event_journal_production import append_owner_event_once
 from runtime_io import read_json_dict
 from gui_review_utils import current_price_from_state
@@ -203,13 +216,13 @@ from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import (
     COMMAND_IMMEDIATE_LIQUIDATION,
     MODE_EARLY_CLOSE,
-    OperationCommandRequest,
     OperationCommandService,
     RESULT_FAILED,
     RESULT_PARTIAL_SUCCESS,
     SCOPE_ROUTINE_INSTANCE,
 )
 from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -778,9 +791,7 @@ class _RoutineTreeInteractionController(QObject):
             + ROUTINE_PROFIT_LED_BOX_SIZE
             + ROUTINE_PROFIT_LED_GAP
         )
-        name_left = text_left
-        if bool(index.data(ROUTINE_CHILD_HAS_STOCKS_ROLE)):
-            name_left += metrics.horizontalAdvance("▶") + 4
+        name_left = text_left + metrics.horizontalAdvance("▶") + 4
         return QRect(
             name_left,
             cell_rect.top(),
@@ -1036,6 +1047,12 @@ class _RoutineBuyLimitValueEditFilter(QObject):
 
 class _RoutineTreeItemDelegate(QStyledItemDelegate):
     """Paint the first-column hierarchy without text-based indentation."""
+
+    @staticmethod
+    def _child_arrow_state(has_stocks: bool, collapsed: bool) -> tuple[str, bool]:
+        if not has_stocks:
+            return "▶", False
+        return ("▶" if collapsed else "▼"), True
 
     @staticmethod
     def _stock_token(tokens: object, column: int) -> dict[str, object]:
@@ -1359,30 +1376,34 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         visually_enabled = index.data(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE) is not False
         text_left_offset = content_offset
         if row_kind == ROUTINE_ROW_CHILD:
-            if bool(index.data(ROUTINE_CHILD_HAS_STOCKS_ROLE)):
-                collapsed = bool(index.data(ROUTINE_CHILD_COLLAPSED_ROLE))
-                arrow = "▶" if collapsed else "▼"
-                arrow_rect = option.rect.adjusted(
-                    text_left_offset,
-                    0,
-                    -4,
-                    0,
-                )
-                painter.save()
-                painter.setFont(option.font)
-                if not visually_enabled:
-                    painter.setPen(QColor("#9ca3af"))
-                elif option.state & QStyle.State_Selected:
-                    painter.setPen(option.palette.highlightedText().color())
-                else:
-                    painter.setPen(option.palette.text().color())
-                painter.drawText(
-                    arrow_rect,
-                    Qt.AlignLeft | Qt.AlignVCenter,
-                    arrow,
-                )
-                painter.restore()
-                text_left_offset += QFontMetrics(option.font).horizontalAdvance("▶") + 4
+            has_stocks = bool(index.data(ROUTINE_CHILD_HAS_STOCKS_ROLE))
+            arrow, arrow_enabled = self._child_arrow_state(
+                has_stocks,
+                bool(index.data(ROUTINE_CHILD_COLLAPSED_ROLE)),
+            )
+            arrow_rect = option.rect.adjusted(
+                text_left_offset,
+                0,
+                -4,
+                0,
+            )
+            painter.save()
+            painter.setFont(option.font)
+            if not arrow_enabled:
+                painter.setPen(option.palette.color(QPalette.Disabled, QPalette.Text))
+            elif not visually_enabled:
+                painter.setPen(QColor("#9ca3af"))
+            elif option.state & QStyle.State_Selected:
+                painter.setPen(option.palette.highlightedText().color())
+            else:
+                painter.setPen(option.palette.text().color())
+            painter.drawText(
+                arrow_rect,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                arrow,
+            )
+            painter.restore()
+            text_left_offset += QFontMetrics(option.font).horizontalAdvance("▶") + 4
             led_state = str(index.data(ROUTINE_CHILD_PROFIT_LED_ROLE) or "gray")
             led_box_left = option.rect.left() + text_left_offset
             _draw_routine_profit_led(
@@ -1426,24 +1447,102 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
             )
             display_text = self.display_text(index, option.widget)
             if display_text != parent_text:
-                aggregate = display_text[len(parent_text) :].lstrip()
-                aggregate_left = (
-                    text_rect.left()
-                    + QFontMetrics(parent_font).horizontalAdvance(parent_text)
-                    + 16
-                )
-                aggregate_rect = QRect(
-                    aggregate_left,
-                    text_rect.top(),
-                    max(0, text_rect.right() - aggregate_left),
-                    text_rect.height(),
-                )
-                painter.setFont(option.font)
-                painter.drawText(
-                    aggregate_rect,
-                    Qt.AlignLeft | Qt.AlignVCenter,
-                    aggregate,
-                )
+                aggregate_font = main_monitoring_cell_font()
+                painter.setFont(aggregate_font)
+                aggregate_values = index.data(ROUTINE_PARENT_AGGREGATE_VALUES_ROLE)
+                if isinstance(aggregate_values, (list, tuple)) and len(aggregate_values) == 4:
+                    column_widths = routine_instance_grid_columns(aggregate_font)
+                    separator_width = routine_aggregate_separator_width(aggregate_font)
+                    aggregate_left = option.rect.left() + ROUTINE_INSTANCE_NAME_WIDTH
+                    slot_lefts = routine_aggregate_slot_lefts(
+                        aggregate_left,
+                        aggregate_font,
+                    )
+                    metrics = QFontMetrics(aggregate_font)
+                    open_paren_width = metrics.horizontalAdvance("(")
+                    close_paren_width = metrics.horizontalAdvance(")")
+                    number_slot_width = routine_aggregate_number_slot_width(
+                        aggregate_font
+                    )
+                    for slot_index, (column_key, value, slot_left) in enumerate(
+                        zip(
+                            ("registered", "excluded", "operation_or_stopped", "review"),
+                            aggregate_values,
+                            slot_lefts,
+                        )
+                    ):
+                        label_text, number_text = value
+                        slot_width = column_widths[column_key]
+                        label_width = routine_aggregate_label_width(
+                            column_key,
+                            aggregate_font,
+                        )
+                        label_rect = QRect(
+                            slot_left,
+                            text_rect.top(),
+                            label_width,
+                            text_rect.height(),
+                        )
+                        painter.drawText(
+                            label_rect,
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            str(label_text),
+                        )
+                        open_paren_rect = QRect(
+                            label_rect.right() + 1,
+                            text_rect.top(),
+                            open_paren_width,
+                            text_rect.height(),
+                        )
+                        painter.drawText(
+                            open_paren_rect,
+                            Qt.AlignCenter,
+                            "(",
+                        )
+                        number_rect = QRect(
+                            open_paren_rect.right() + 1,
+                            text_rect.top(),
+                            number_slot_width,
+                            text_rect.height(),
+                        )
+                        painter.drawText(
+                            number_rect,
+                            Qt.AlignCenter,
+                            str(number_text),
+                        )
+                        close_paren_rect = QRect(
+                            number_rect.right() + 1,
+                            text_rect.top(),
+                            close_paren_width,
+                            text_rect.height(),
+                        )
+                        painter.drawText(
+                            close_paren_rect,
+                            Qt.AlignCenter,
+                            ")",
+                        )
+                        if slot_index < 3:
+                            separator_rect = QRect(
+                                slot_left + slot_width,
+                                text_rect.top(),
+                                separator_width,
+                                text_rect.height(),
+                            )
+                            painter.drawText(separator_rect, Qt.AlignCenter, "|")
+                else:
+                    aggregate = display_text[len(parent_text) :].lstrip()
+                    aggregate_left = option.rect.left() + ROUTINE_INSTANCE_NAME_WIDTH
+                    aggregate_rect = QRect(
+                        aggregate_left,
+                        text_rect.top(),
+                        max(0, text_rect.right() - aggregate_left),
+                        text_rect.height(),
+                    )
+                    painter.drawText(
+                        aggregate_rect,
+                        Qt.AlignLeft | Qt.AlignVCenter,
+                        aggregate,
+                    )
         else:
             painter.setFont(option.font)
             child_text = self.display_text(index, option.widget)
@@ -1458,6 +1557,80 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                 child_text,
             )
         painter.restore()
+
+
+class _MainRoutineExcludedBadge(QPushButton):
+    LABEL = "제외종목"
+
+    def __init__(self) -> None:
+        super().__init__(f"{self.LABEL}(0)")
+        self._excluded_count = 0
+
+    def set_excluded_count(self, count: int) -> None:
+        self._excluded_count = max(0, int(count))
+        self.setText(f"{self.LABEL}({self._excluded_count})")
+        self.update()
+
+    def count_font(self) -> QFont:
+        font = QFont(self.font())
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(1.0, font.pointSizeF() - 1.0))
+        elif font.pixelSize() > 0:
+            font.setPixelSize(max(1, font.pixelSize() - 1))
+        return font
+
+    def content_rects(self) -> tuple[QRect, QRect, QRect, QRect]:
+        label_metrics = self.fontMetrics()
+        count_font = self.count_font()
+        count_metrics = QFontMetrics(count_font)
+        label_width = label_metrics.horizontalAdvance(self.LABEL)
+        left_paren_width = count_metrics.horizontalAdvance("(")
+        number_width = routine_aggregate_number_slot_width(count_font)
+        right_paren_width = count_metrics.horizontalAdvance(")")
+        content_width = (
+            label_width + left_paren_width + number_width + right_paren_width
+        )
+        left = max(0, (self.width() - content_width) // 2)
+        top = 0
+        height = self.height()
+        label_rect = QRect(left, top, label_width, height)
+        left_paren_rect = QRect(label_rect.right() + 1, top, left_paren_width, height)
+        number_rect = QRect(left_paren_rect.right() + 1, top, number_width, height)
+        right_paren_rect = QRect(number_rect.right() + 1, top, right_paren_width, height)
+        return label_rect, left_paren_rect, number_rect, right_paren_rect
+
+    def paintEvent(self, event) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.text = ""
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.CE_PushButton, option)
+        painter.setPen(option.palette.buttonText().color())
+        label_rect, left_paren_rect, number_rect, right_paren_rect = (
+            self.content_rects()
+        )
+        painter.setFont(self.font())
+        painter.drawText(
+            label_rect,
+            Qt.AlignLeft | Qt.AlignVCenter,
+            self.LABEL,
+        )
+        painter.setFont(self.count_font())
+        painter.drawText(
+            left_paren_rect,
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "(",
+        )
+        painter.drawText(
+            number_rect,
+            Qt.AlignCenter,
+            str(self._excluded_count),
+        )
+        painter.drawText(
+            right_paren_rect,
+            Qt.AlignLeft | Qt.AlignVCenter,
+            ")",
+        )
 
 
 def append_base_stock(code: str, name: str) -> None:
@@ -1591,10 +1764,11 @@ class MainWindow(QMainWindow):
         self._production_recovery_identity = None
         self._production_recovery_parts: dict[str, BrokerSnapshotPart] = {}
 
+        self.btn_start = QPushButton("▶ 운영시작")
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
         self.btn_initialize = QPushButton("초기화")
         self.btn_log_view = QPushButton("이벤트기록")
-        self.btn_review_required = QPushButton("검토관리종목")
+        self.btn_review_required = QPushButton("검토관리(0)")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = QPushButton("긴급정지")
 
@@ -1607,6 +1781,10 @@ class MainWindow(QMainWindow):
         normalize_base_stock_single_routine_file()
         self.refresh_startup_recovery_status()
         self.refresh_all()
+        self._pnl_refresh_timer = QTimer(self)
+        self._pnl_refresh_timer.setInterval(PNL_REFRESH_INTERVAL_MS)
+        self._pnl_refresh_timer.timeout.connect(lambda: main_refresh_pnl_only(self))
+        self._pnl_refresh_timer.start()
         append_owner_event_once(
             self,
             "app_started",
@@ -1770,10 +1948,10 @@ class MainWindow(QMainWindow):
         return layout
 
     def _create_main_routine_excluded_badge(self) -> QPushButton:
-        button = self._create_main_routine_filter_badge(
-            "제외종목",
-            "mainRoutineExcludedStockBadge",
-        )
+        button = _MainRoutineExcludedBadge()
+        button.setObjectName("mainRoutineExcludedStockBadge")
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setCursor(Qt.PointingHandCursor)
         button.setCheckable(True)
         font = button.font()
         point_size = font.pointSizeF()
@@ -1783,11 +1961,21 @@ class MainWindow(QMainWindow):
             font.setPixelSize(max(1, round(font.pixelSize() * 1.1)))
         button.setFont(font)
         button.setFixedHeight(round(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT * 1.1))
-        text_width = button.fontMetrics().horizontalAdvance(button.text())
-        button.setFixedWidth(max(button.sizeHint().width(), text_width + 28))
+        metrics = button.fontMetrics()
+        content_width = (
+            metrics.horizontalAdvance(f"{button.LABEL}(")
+            + routine_aggregate_number_slot_width(button.font())
+            + metrics.horizontalAdvance(")")
+        )
+        button.setFixedWidth(content_width + 28)
         button.clicked.connect(self._set_main_routine_excluded_only)
         self._main_routine_excluded_button = button
         return button
+
+    def _update_main_routine_excluded_count(self, count: int) -> None:
+        button = getattr(self, "_main_routine_excluded_button", None)
+        if isinstance(button, _MainRoutineExcludedBadge):
+            button.set_excluded_count(count)
 
     def _create_routine_filter_badge_area(self) -> QWidget:
         badge_area = QWidget()
@@ -2158,6 +2346,8 @@ class MainWindow(QMainWindow):
         clean_level = str(level or "").strip()
         if clean_level not in {"group", "routine", "stock"}:
             return
+
+
         definition_ids = set(self._routine_instance_ids_by_definition)
         instance_ids = {
             instance_id
@@ -2241,6 +2431,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         buttons = [
+            self.btn_start,
             self.btn_auto_trade_setting,
             self.btn_initialize,
             self.btn_log_view,
@@ -2437,6 +2628,7 @@ class MainWindow(QMainWindow):
         if account_changed is not None:
             account_changed.connect(self.on_kiwoom_account_changed)
         self.btn_emergency_stop.clicked.connect(self.on_emergency_stop_clicked)
+        self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
         self.btn_initialize.clicked.connect(self.not_implemented)
         self.btn_log_view.clicked.connect(self.open_event_record_window)
@@ -2448,6 +2640,28 @@ class MainWindow(QMainWindow):
             self._routine_tree_interaction_controller
         )
         self.running_stock_table.horizontalHeader().sectionClicked.connect(self.sort_main_running_table_by_column)
+        self.running_stock_table.itemDoubleClicked.connect(
+            self.on_running_stock_table_item_double_clicked
+        )
+
+    def on_running_stock_table_item_double_clicked(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        """Open the common instance chart only from the stock-code column."""
+        if item.column() != 0:
+            return
+        row = item.row()
+        if row < 0 or row >= self.running_stock_table.rowCount():
+            return
+        stock_code = item.text().strip()
+        if not stock_code:
+            return
+        open_stock_instance_chart(
+            stock_code,
+            trade_date=None,
+            parent=self,
+        )
 
     def startup_recovery_stock_state_paths(self) -> list[Path]:
         return [stock_dir / "state.json" for stock_dir in self.all_runtime_stock_dirs()]
@@ -3443,6 +3657,15 @@ class MainWindow(QMainWindow):
         self.update_budget_panel()
         self.update_emergency_button_state()
         self.update_review_required_button_text()
+        self.update_global_operation_button_state()
+
+    def update_global_operation_button_state(self) -> None:
+        adapter = MainMonitoringStockOperationAdapter(self, [])
+        adapter.update_global_operation_button_state()
+
+    def start_global_auto_trades(self) -> None:
+        adapter = MainMonitoringStockOperationAdapter(self, [])
+        AutoTradeSettingWindow.start_selected_auto_trades(adapter)
 
     def refresh_auto_trade_assignment_views(self) -> None:
         """Refresh monitoring and an already-open auto-trade settings window once."""
@@ -3466,7 +3689,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "btn_review_required"):
             return
         count = self.review_required_stock_count()
-        self.btn_review_required.setText(f"검토관리종목({count})" if count else "검토관리종목")
+        self.btn_review_required.setText(f"검토관리({count})")
 
     def sort_main_routine_table_by_column(self, column: int) -> None:
         main_sort_routine_table_by_column(self, column)
@@ -4723,7 +4946,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        service = OperationCommandService(PROJECT_ROOT)
         applied_count = 0
         partial_count = 0
         failed_count = 0
@@ -4732,7 +4954,7 @@ class MainWindow(QMainWindow):
         for instance_id in instance_ids:
             if not self._production_recovery_allows_routine_operation(
                 instance_id,
-                command=command,
+                command=MODE_EARLY_CLOSE,
                 caller_name=(
                     "EARLY_CLOSE_ROUTINE_DEFINITION"
                     if command == MODE_EARLY_CLOSE
@@ -4742,26 +4964,20 @@ class MainWindow(QMainWindow):
                 failed_count += 1
                 recovery_blocked_count += 1
                 continue
-            if command == MODE_EARLY_CLOSE:
-                intent_result = apply_close_intent(
-                    intent=CLOSE_INTENT_EARLY_CLOSE,
-                    target_scope=SCOPE_ROUTINE_INSTANCE,
-                    target_id=instance_id,
-                    source="main_routine_parent_context_menu",
-                    requested_policy="",
-                    project_root=PROJECT_ROOT,
-                    operation_command_service_factory=OperationCommandService,
-                )
-                result = intent_result.get("command_result")
-            else:
-                result = service.apply(
-                    OperationCommandRequest(
-                        target_scope=SCOPE_ROUTINE_INSTANCE,
-                        target_id=instance_id,
-                        command=command,
-                        source="main_routine_parent_context_menu",
-                    )
-                )
+            intent_result = apply_close_intent(
+                intent=CLOSE_INTENT_EARLY_CLOSE,
+                target_scope=SCOPE_ROUTINE_INSTANCE,
+                target_id=instance_id,
+                source="main_routine_parent_context_menu",
+                requested_policy=(
+                    "시장가"
+                    if command == COMMAND_IMMEDIATE_LIQUIDATION
+                    else "루틴"
+                ),
+                project_root=PROJECT_ROOT,
+                operation_command_service_factory=OperationCommandService,
+            )
+            result = intent_result.get("command_result")
             if result is None:
                 failed_count += 1
                 command_failed_count += 1
@@ -4774,6 +4990,12 @@ class MainWindow(QMainWindow):
                 partial_count += 1
             else:
                 applied_count += 1
+            if command == COMMAND_IMMEDIATE_LIQUIDATION:
+                auto_trade_continue_pending_close_liquidations(
+                    self,
+                    limit=None,
+                    target_routine_instance_ids={instance_id},
+                )
 
         self.load_routine_table()
         self.update_review_required_button_text()
@@ -4817,7 +5039,7 @@ class MainWindow(QMainWindow):
 
         if not self._production_recovery_allows_routine_operation(
             instance_id,
-            command=command,
+            command=MODE_EARLY_CLOSE,
             caller_name=(
                 "EARLY_CLOSE_ROUTINE_INSTANCE"
                 if command == MODE_EARLY_CLOSE
@@ -4831,26 +5053,20 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if command == MODE_EARLY_CLOSE:
-            intent_result = apply_close_intent(
-                intent=CLOSE_INTENT_EARLY_CLOSE,
-                target_scope=SCOPE_ROUTINE_INSTANCE,
-                target_id=instance_id,
-                source="main_routine_context_menu",
-                requested_policy="",
-                project_root=PROJECT_ROOT,
-                operation_command_service_factory=OperationCommandService,
-            )
-            result = intent_result.get("command_result")
-        else:
-            result = OperationCommandService(PROJECT_ROOT).apply(
-                OperationCommandRequest(
-                    target_scope=SCOPE_ROUTINE_INSTANCE,
-                    target_id=instance_id,
-                    command=command,
-                    source="main_routine_context_menu",
-                )
-            )
+        intent_result = apply_close_intent(
+            intent=CLOSE_INTENT_EARLY_CLOSE,
+            target_scope=SCOPE_ROUTINE_INSTANCE,
+            target_id=instance_id,
+            source="main_routine_context_menu",
+            requested_policy=(
+                "시장가"
+                if command == COMMAND_IMMEDIATE_LIQUIDATION
+                else "루틴"
+            ),
+            project_root=PROJECT_ROOT,
+            operation_command_service_factory=OperationCommandService,
+        )
+        result = intent_result.get("command_result")
         if result is None:
             self.update_review_required_button_text()
             QMessageBox.warning(
@@ -4867,6 +5083,13 @@ class MainWindow(QMainWindow):
                 result.error or "명령을 적용할 대상 또는 결과를 확인하지 못했습니다.",
             )
             return
+
+        if command == COMMAND_IMMEDIATE_LIQUIDATION:
+            auto_trade_continue_pending_close_liquidations(
+                self,
+                limit=None,
+                target_routine_instance_ids={instance_id},
+            )
 
         self.load_routine_table()
         self.update_review_required_button_text()
@@ -4959,6 +5182,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Stop the single operation host only when the main program closes."""
         self._main_window_closing = True
+        timer = getattr(self, "_pnl_refresh_timer", None)
+        if timer is not None:
+            timer.stop()
         host = getattr(self, "_main_monitoring_auto_trade_operation_host", None)
         shutdown = getattr(host, "shutdown", None)
         if callable(shutdown):

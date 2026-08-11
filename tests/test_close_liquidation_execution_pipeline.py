@@ -17,10 +17,68 @@ from gui_auto_trade_policy import (
 from close_liquidation_execution_pipeline import (
     build_close_liquidation_candidate_preview,
     commit_close_liquidation_candidate_preview,
+    normalize_direct_liquidation_method,
 )
 
 
 class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
+    def test_broker_acceptance_marks_first_routine_close_sell_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stock_dir = Path(tmp) / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {"assigned_routine_instance_id": "routine-instance-1"},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state_path = stock_dir / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "EARLY_CLOSE",
+                        "trade_enabled": True,
+                        "early_close_requested_at": "2026-08-10 10:00:00",
+                        "early_close_method": "루틴",
+                        "close_routine_final_sell_ordered": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            order = {
+                "source": "routine_signals",
+                "side": "SELL",
+                "code": "005930",
+                "routine_instance_id": "routine-instance-1",
+            }
+
+            with patch.object(gui, "all_registered_stock_dirs", return_value=[stock_dir]):
+                send_call_only = gui._mark_close_routine_final_sell_from_broker_acceptance(
+                    order,
+                    {"event_type": ""},
+                    {"event_type": ""},
+                )
+                accepted = gui._mark_close_routine_final_sell_from_broker_acceptance(
+                    order,
+                    {"event_type": "ORDER_ACCEPTED"},
+                    {"event_type": "ORDER_ACCEPTED", "recorded": True},
+                )
+
+            self.assertFalse(send_call_only["attempted"])
+            self.assertTrue(accepted["marked"], accepted)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(saved["close_routine_final_sell_ordered"])
+            self.assertEqual("kiwoom_chejan", saved["close_routine_final_sell_source"])
+
+    def test_direct_liquidation_normalizer_accepts_legacy_aliases(self):
+        self.assertEqual("MARKET", normalize_direct_liquidation_method("시장가즉시"))
+        self.assertEqual(
+            "CURRENT_PRICE",
+            normalize_direct_liquidation_method("현재가즉시"),
+        )
+
     @staticmethod
     def _stock(root: Path, name: str = "005930_Samsung") -> Path:
         stock = root / name
@@ -250,6 +308,155 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         window.process_executable_order_for_auto_trade.assert_called_once_with(
             "CLOSE_LIQUIDATION_command-1"
         )
+
+    def test_legacy_aliases_enter_direct_candidate_pipeline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            for method, expected in (
+                ("시장가즉시", "MARKET"),
+                ("현재가즉시", "CURRENT_PRICE"),
+            ):
+                with self.subTest(method=method):
+                    window = Mock()
+                    window.queue_pending_order_cancellations_for_stock_automatically.return_value = {
+                        "ok": True,
+                        "cancel_requested": 0,
+                        "cancel_pending": 0,
+                    }
+                    window.process_executable_order_for_auto_trade.return_value = {
+                        "processed": True,
+                        "stage": "send_order",
+                    }
+                    with (
+                        patch.object(
+                            close,
+                            "pending_order_side_quantities",
+                            return_value=(0, 0),
+                        ),
+                        patch.object(
+                            close,
+                            "read_execution_queue_records",
+                            return_value={"ok": True, "records": ()},
+                        ),
+                        patch.object(
+                            close,
+                            "build_close_liquidation_candidate_preview",
+                            return_value={"ok": True},
+                        ) as builder,
+                        patch.object(
+                            close,
+                            "commit_close_liquidation_candidate_preview",
+                            return_value={
+                                "ok": True,
+                                "stage": "executable",
+                                "order_id": f"CLOSE_LIQUIDATION_{expected}",
+                            },
+                        ),
+                    ):
+                        result = close._start_close_liquidation_execution(
+                            window,
+                            stock_dir=stock,
+                            code="005930",
+                            name="Samsung",
+                            method=method,
+                            command_id=expected,
+                            requested_at="2026-07-27 13:30:00",
+                            routine_instance_id="routine-instance-1",
+                            reason="EARLY_CLOSE",
+                        )
+
+                    self.assertTrue(result["ok"])
+                    self.assertNotEqual("policy_runtime_only", result["stage"])
+                    self.assertEqual(expected, builder.call_args.args[3])
+
+    def test_pending_early_close_recovery_canonicalizes_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update(
+                {
+                    "status": "EARLY_CLOSE",
+                    "early_close_requested_at": "2026-07-27 13:30:00",
+                    "early_close_method": "시장가즉시",
+                    "operation_command_id": "legacy-command",
+                }
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "executable"},
+                ) as execute,
+                patch.object(close, "_persist_early_close_execution_result", return_value=True),
+                patch.object(
+                    close,
+                    "check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+            ):
+                result = close.auto_trade_continue_pending_close_liquidations(Mock())
+
+        self.assertEqual(1, result["processed"])
+        self.assertEqual("시장가", execute.call_args.kwargs["method"])
+
+    def test_pending_close_continuation_filters_to_requested_routine_instance(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = self._stock(root, "005930_Target")
+            other = self._stock(root, "000660_Other")
+            other_config = json.loads((other / "config.json").read_text(encoding="utf-8"))
+            other_config["assigned_routine_instance_id"] = "routine-instance-2"
+            (other / "config.json").write_text(
+                json.dumps(other_config),
+                encoding="utf-8",
+            )
+            for stock, command_id in ((target, "target-command"), (other, "other-command")):
+                state = json.loads((stock / "state.json").read_text(encoding="utf-8"))
+                state.update(
+                    {
+                        "status": "EARLY_CLOSE",
+                        "early_close_requested_at": "2026-07-27 10:00:00",
+                        "early_close_method": "시장가",
+                        "operation_command_id": command_id,
+                    }
+                )
+                (stock / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[target, other],
+                ),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    return_value={"ok": True, "stage": "executable"},
+                ) as execute,
+                patch.object(close, "_persist_early_close_execution_result", return_value=True),
+                patch.object(
+                    close,
+                    "check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+            ):
+                result = close.auto_trade_continue_pending_close_liquidations(
+                    Mock(),
+                    limit=None,
+                    target_routine_instance_ids={"routine-instance-1"},
+                )
+
+        self.assertEqual(1, result["processed"])
+        execute.assert_called_once()
+        self.assertEqual("005930", execute.call_args.kwargs["code"])
+        self.assertEqual("시장가", execute.call_args.kwargs["method"])
 
     def test_cancel_confirmation_must_precede_liquidation_queue_entry(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -554,6 +761,16 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
         self.assertEqual(result["cancel_requested"], 1)
+        self.assertEqual(
+            result["cancel_order_identities"],
+            [
+                {
+                    "order_queued_id": "ORDER_SOURCE",
+                    "order_id": "ORDER_SOURCE",
+                    "broker_order_no": "12345",
+                }
+            ],
+        )
         commit.assert_called_once()
         window.send_order_for_order_queued_automatically.assert_called_once()
 
@@ -695,23 +912,39 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(start.call_args.kwargs["code"], "005930")
 
-    def test_early_close_sell_can_reach_existing_auto_execution_gate(self):
+    def test_routine_close_orders_follow_final_sell_marker_at_auto_execution_gate(self):
         window = Mock()
-        window.auto_trade_runtime_state_for_order.return_value = {
-            "found": True,
-            "state": {
-                "status": "EARLY_CLOSE",
-                "trade_enabled": True,
-                "real_trade_enabled": True,
-                "signal_probe_only": False,
-                "review_required": False,
-            },
+        base_state = {
+            "status": "EARLY_CLOSE",
+            "trade_enabled": True,
+            "real_trade_enabled": True,
+            "signal_probe_only": False,
+            "review_required": False,
+            "early_close_requested_at": "2026-08-10 10:00:00",
+            "early_close_method": "루틴",
         }
-        reasons = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
-            window,
-            {"side": "SELL"},
-        )
-        self.assertEqual(reasons, [])
+
+        for side in ("BUY", "SELL"):
+            window.auto_trade_runtime_state_for_order.return_value = {
+                "found": True,
+                "state": dict(base_state, close_routine_final_sell_ordered=False),
+            }
+            reasons = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
+                window,
+                {"side": side},
+            )
+            self.assertEqual(reasons, [], side)
+
+            window.auto_trade_runtime_state_for_order.return_value = {
+                "found": True,
+                "state": dict(base_state, close_routine_final_sell_ordered=True),
+            }
+            blocked = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
+                window,
+                {"side": side},
+            )
+            self.assertEqual(len(blocked), 1, side)
+            self.assertIn("추가 주문 차단", blocked[0])
 
         cancel_reasons = (
             gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
@@ -728,6 +961,29 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             )
         )
         self.assertEqual(cancel_reasons, [])
+
+    def test_auto_close_routine_allows_buy_before_final_sell_at_auto_execution_gate(self):
+        window = Mock()
+        window.auto_trade_runtime_state_for_order.return_value = {
+            "found": True,
+            "state": {
+                "status": "AUTO_CLOSE",
+                "trade_enabled": True,
+                "real_trade_enabled": True,
+                "signal_probe_only": False,
+                "review_required": False,
+                "auto_close_requested_at": "2026-08-10 15:20:00",
+                "auto_close_method": "루틴매도신호",
+                "close_routine_final_sell_ordered": False,
+            },
+        }
+        self.assertEqual(
+            [],
+            gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
+                window,
+                {"side": "BUY"},
+            ),
+        )
 
 
 if __name__ == "__main__":

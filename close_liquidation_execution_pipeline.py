@@ -16,6 +16,11 @@ from order_candidate_engine import get_real_holding_qty, read_latest_price
 from order_queue import append_order_candidates
 from operation_policy_gate import apply_operation_policy_gate_for_order
 from runtime_io import read_json_dict
+from close_liquidation_transition_service import (
+    POLICY_CURRENT_PRICE,
+    POLICY_MARKET,
+    normalize_direct_close_policy_alias,
+)
 
 
 METHOD_MARKET = "MARKET"
@@ -23,10 +28,14 @@ METHOD_CURRENT_PRICE = "CURRENT_PRICE"
 
 
 def normalize_direct_liquidation_method(value: object) -> str:
-    normalized = str(value or "").strip().upper().replace(" ", "_")
-    if normalized in {"시장가", "MARKET"}:
+    normalized = normalize_direct_close_policy_alias(value)
+    normalized_upper = normalized.upper().replace(" ", "_")
+    if normalized == POLICY_MARKET or normalized_upper == "MARKET":
         return METHOD_MARKET
-    if normalized in {"현재가", "CURRENT", "CURRENT_PRICE"}:
+    if normalized == POLICY_CURRENT_PRICE or normalized_upper in {
+        "CURRENT",
+        "CURRENT_PRICE",
+    }:
         return METHOD_CURRENT_PRICE
     return ""
 

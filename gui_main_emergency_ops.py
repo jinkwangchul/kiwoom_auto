@@ -13,23 +13,36 @@ MainWindow 긴급정지/정지해제 처리 전용 모듈.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtWidgets import QMessageBox
 
 from gui_toast import show_toast
+from gui_operation_ui_context import operation_dialog_parent
 from gui_common_utils import safe_int_value
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     is_emergency_stopped_state,
     is_review_required_state,
 )
+from gui_auto_trade_run_control import (
+    ORDER_QUEUE_PATH,
+    _active_close_or_liquidation,
+    _active_queue_reason,
+)
 from gui_config_utils import default_state
 from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
+from gui_review_required_window import auto_trade_setting_server_mismatch_detected
 from runtime_io import read_json_dict, read_orders_data
 from gui_auto_trade_runtime import write_state_json
+from gui_base_stock_service import update_base_stock_routines
 from operation_policy_gate import read_operation_state, write_global_emergency_stop_state
 from event_journal_production import append_production_event
+from production_recovery_state_registry import (
+    check_production_recovery_gate,
+    production_recovery_registry,
+)
 from gui_auto_trade_setting_window import (
     append_changelog,
     append_stock_log,
@@ -98,6 +111,138 @@ def emergency_review_reason_for_stock(stock_dir: Path) -> tuple[bool, str]:
     return False, "긴급정지 해제 무결성 정상"
 
 
+def _recovery_gate_for_emergency_release(window, stock_code: str):
+    """Return the existing Production Recovery gate decision for either GUI path."""
+    owners = [window]
+    parent_getter = getattr(window, "parent", None)
+    if callable(parent_getter):
+        try:
+            parent = parent_getter()
+        except Exception:
+            parent = None
+        if parent is not None and parent is not window:
+            owners.append(parent)
+
+    for owner in owners:
+        checker = getattr(owner, "production_recovery_gate_for_stock", None)
+        if not callable(checker):
+            continue
+        try:
+            return checker(
+                stock_code,
+                caller_name="gui_main_emergency_ops.release_emergency_stop_target",
+            )
+        except Exception:
+            return None
+
+    for owner in owners:
+        api = getattr(owner, "kiwoom_api", None)
+        account_reader = getattr(owner, "selected_account_no", None)
+        if api is None or not callable(account_reader):
+            continue
+        login_reader = getattr(api, "login_session_id", None)
+        try:
+            context = production_recovery_registry.snapshot()
+            return check_production_recovery_gate(
+                login_session_id=login_reader() if callable(login_reader) else "",
+                account_no=account_reader(),
+                trading_day=datetime.now().date().isoformat(),
+                stock_code=stock_code,
+                recovery_session_id=(
+                    context.identity.recovery_session_id if context is not None else ""
+                ),
+                caller_name="gui_main_emergency_ops.release_emergency_stop_target",
+            )
+        except Exception:
+            return None
+
+    # Lightweight/non-MainWindow callers retain the existing readiness adapter.
+    checker = getattr(window, "startup_recovery_session_ready", None)
+    if callable(checker):
+        try:
+            return bool(checker(refresh=False))
+        except Exception:
+            return False
+    return None
+
+
+def emergency_release_common_guard(
+    window,
+    stock_dir: Path,
+    stock_code: str,
+    *,
+    order_queue_path: str | Path | None = None,
+    now_dt: datetime | None = None,
+) -> tuple[bool, str]:
+    """Fail closed on canonical evidence that makes emergency release unsafe."""
+    has_stock_problem, stock_reason = emergency_review_reason_for_stock(
+        Path(stock_dir)
+    )
+    if has_stock_problem:
+        return False, stock_reason
+
+    state = read_json_dict(Path(stock_dir) / "state.json")
+    if not isinstance(state, dict):
+        return False, "state.json 이상"
+
+    queue_reason = _active_queue_reason(
+        stock_code,
+        ORDER_QUEUE_PATH if order_queue_path is None else order_queue_path,
+    )
+    if queue_reason:
+        return False, queue_reason
+
+    if _active_close_or_liquidation(state, now_dt or datetime.now()):
+        return False, "ACTIVE_CLOSE_OR_LIQUIDATION"
+
+    if auto_trade_setting_server_mismatch_detected(state):
+        return False, "SERVER_MISMATCH"
+
+    recovery = _recovery_gate_for_emergency_release(window, stock_code)
+    if isinstance(recovery, bool):
+        if not recovery:
+            return False, "RECOVERY_NOT_READY"
+    elif recovery is None:
+        return False, "RECOVERY_NOT_READY"
+    elif getattr(recovery, "allowed", False) is not True:
+        return False, str(
+            getattr(recovery, "reason_code", "RECOVERY_NOT_READY")
+            or "RECOVERY_NOT_READY"
+        )
+    return True, ""
+
+
+def _record_emergency_release_guard_failure(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    reason: str,
+) -> bool:
+    """Persist the existing fail-closed emergency Review contract."""
+    return update_runtime_stock_status(
+        window,
+        Path(stock_dir),
+        code,
+        name,
+        "EMERGENCY_STOPPED",
+        {
+            "review_required": True,
+            "review_status": "PENDING",
+            "review_location": "긴급정지해제",
+            "review_reason": reason,
+            "review_entered_at": now_text(),
+            "review_checked_at": now_text(),
+            "review_routine": _routine_name_for_emergency_release(Path(stock_dir)),
+            "review_detail": f"{code} {name} / {reason}",
+            "trade_enabled": False,
+        },
+        reason,
+        verify_readback=True,
+        allow_review_state_transition=True,
+    )
+
+
 def _routine_name_for_emergency_release(stock_dir: Path) -> str:
     """Return persisted routine metadata without depending on a GUI window."""
     config = read_json_dict(Path(stock_dir) / "config.json")
@@ -125,6 +270,7 @@ def update_runtime_stock_status(
     log_suffix: str = "",
     *,
     verify_readback: bool = False,
+    allow_review_state_transition: bool = False,
 ) -> bool:
     """메인창 긴급정지/정지해제 전용 state.json 상태 저장."""
     state_path = stock_dir / "state.json"
@@ -139,7 +285,11 @@ def update_runtime_stock_status(
     if extra_state:
         state.update(extra_state)
 
-    if not write_state_json(stock_dir, state):
+    if not write_state_json(
+        stock_dir,
+        state,
+        allow_review_state_transition=allow_review_state_transition,
+    ):
         QMessageBox.critical(
             window,
             "상태 저장 오류",
@@ -166,6 +316,125 @@ def update_runtime_stock_status(
     suffix_text = f" / {log_suffix}" if log_suffix else ""
     append_stock_log(stock_dir, "GUI", f"긴급정지 상태 변경: {before_status} -> {new_status}{suffix_text}")
     return True
+
+
+def normalize_review_emergency_target(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    *,
+    destination: str = "RESTORE",
+) -> dict[str, object]:
+    """Normalize one reviewed/emergency-stopped stock after the shared integrity check."""
+    normalized_destination = str(destination or "RESTORE").strip().upper()
+    if normalized_destination not in {"RESTORE", "UNASSIGNED"}:
+        return {"status": "FAILED", "reason": "지원하지 않는 정상화 목적지입니다."}
+
+    stock_dir = Path(stock_dir)
+    state_before = read_json_dict(stock_dir / "state.json")
+    if not isinstance(state_before, dict):
+        return {"status": "FAILED", "reason": "state.json 이상"}
+    if not (
+        is_emergency_stopped_state(state_before)
+        or is_review_required_state(state_before)
+    ):
+        return {"status": "SKIPPED", "reason": "정상화 대상 상태가 아닙니다."}
+
+    has_problem, reason = emergency_review_reason_for_stock(stock_dir)
+    if has_problem:
+        if not is_review_required_state(state_before):
+            current_status = str(
+                state_before.get("status", "EMERGENCY_STOPPED")
+                or "EMERGENCY_STOPPED"
+            ).strip()
+            if not update_runtime_stock_status(
+                window,
+                stock_dir,
+                code,
+                name,
+                current_status,
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "review_location": "긴급정지해제",
+                    "review_reason": reason,
+                    "review_entered_at": now_text(),
+                    "review_checked_at": now_text(),
+                    "review_routine": _routine_name_for_emergency_release(stock_dir),
+                    "review_detail": f"{code} {name} / {reason}",
+                    "trade_enabled": False,
+                },
+                reason,
+                verify_readback=True,
+            ):
+                return {"status": "FAILED", "reason": "검토관리 상태 저장 실패"}
+        return {"status": "BLOCKED", "reason": reason}
+
+    routine_name = _routine_name_for_emergency_release(stock_dir)
+    metadata = {
+        "emergency_released_at": now_text(),
+        "emergency_release_check": "PASSED",
+        "emergency_stopped_at": "",
+        "emergency_reason": "",
+        "trade_enabled": False,
+        "operation_notice": "",
+        "operation_notice_reason": "",
+        "operation_notice_at": "",
+        "early_close_requested_at": "",
+        "early_close_source": "",
+        "early_close_method": "",
+        "early_close_policy": {},
+        "auto_close_method": "",
+        "auto_close_policy": {},
+        "liquidation_policy_forced": False,
+        "liquidation_policy_reason": "",
+        "review_required": False,
+        "review_status": "",
+        "review_location": "",
+        "review_reason": "",
+        "review_detail": "",
+        "review_entered_at": "",
+        "review_checked_at": now_text(),
+        "review_routine": routine_name,
+        "startup_reset_reason": "",
+    }
+    if normalized_destination == "UNASSIGNED":
+        metadata.update(
+            {"active_routine": "", "routine_name": "", "review_routine": ""}
+        )
+
+    if not update_runtime_stock_status(
+        window,
+        stock_dir,
+        code,
+        name,
+        "STOPPED",
+        metadata,
+        "검토관리 정상화",
+        verify_readback=True,
+        allow_review_state_transition=True,
+    ):
+        return {"status": "FAILED", "reason": "상태 저장 실패"}
+
+    if normalized_destination == "UNASSIGNED" and not update_base_stock_routines(
+        code,
+        name,
+        [],
+    ):
+        write_state_json(
+            stock_dir,
+            state_before,
+            allow_review_state_transition=True,
+        )
+        return {"status": "FAILED", "reason": "루틴 연결 해제 실패"}
+
+    return {
+        "status": "NORMALIZED",
+        "reason": reason,
+        "destination": normalized_destination,
+        "routine_name": routine_name,
+    }
 
 
 def execute_emergency_stop(window) -> None:
@@ -221,10 +490,8 @@ def execute_emergency_stop(window) -> None:
                 "review_routine": _routine_name_for_emergency_release(stock_dir),
                 # 긴급정지는 즉시 매매 시작 플래그를 끈다.
                 # 정지해제 후 자동복귀 금지 정책과 현황색 판정이 어긋나지 않도록
-                # trade_enabled/buy_enabled/sell_enabled를 모두 False로 고정한다.
+                # canonical trade_enabled를 False로 고정한다.
                 "trade_enabled": False,
-                "buy_enabled": False,
-                "sell_enabled": False,
                 # 긴급정지 진입 시 과거 마감/청산 표시 잔존 메타도 제거한다.
                 # 이 값이 남아 있으면 시작 OFF 상태에서도 현황이 주황으로 보일 수 있다.
                 "operation_notice": "",
@@ -307,8 +574,6 @@ def execute_selected_emergency_stop(
                 "review_checked_at": now_text(),
                 "review_routine": _routine_name_for_emergency_release(stock_dir),
                 "trade_enabled": False,
-                "buy_enabled": False,
-                "sell_enabled": False,
                 "operation_notice": "",
                 "operation_notice_reason": "",
                 "operation_notice_at": "",
@@ -344,7 +609,7 @@ def execute_selected_emergency_stop(
         )
     if changed:
         show_toast(
-            parent=window,
+            parent=operation_dialog_parent(window),
             message=f"긴급정지 완료 | 대상종목 : {len(changed)}개 | 매수/매도 : 차단",
             duration_ms=2500,
             position="center",
@@ -368,7 +633,6 @@ def release_emergency_stop_target(
 ) -> str:
     """긴급정지 해제 안전성검사를 종목 하나에 적용한다."""
     stock_dir = Path(stock_dir)
-    routine_name = _routine_name_for_emergency_release(stock_dir)
     state_before = read_json_dict(stock_dir / "state.json")
     registry_checker = getattr(
         window,
@@ -378,75 +642,34 @@ def release_emergency_stop_target(
     already_in_review = is_review_required_state(state_before) or (
         bool(registry_checker(code)) if callable(registry_checker) else False
     )
-    has_problem, reason = emergency_review_reason_for_stock(stock_dir)
-    if has_problem:
-        metadata = {
-            "review_required": True,
-            "review_status": "PENDING",
-            "review_location": "긴급정지해제",
-            "review_reason": reason,
-            "review_entered_at": now_text(),
-            "review_checked_at": now_text(),
-            "review_routine": routine_name,
-            "review_detail": f"{code} {name} / {reason}",
-            "trade_enabled": False,
-            "buy_enabled": False,
-            "sell_enabled": False,
-        }
-        if update_runtime_stock_status(
+    release_allowed, guard_reason = emergency_release_common_guard(
+        window,
+        stock_dir,
+        code,
+    )
+    if not release_allowed:
+        if not _record_emergency_release_guard_failure(
             window,
             stock_dir,
             code,
             name,
-            "REVIEW_REQUIRED",
-            metadata,
-            reason,
-            verify_readback=True,
+            guard_reason,
         ):
-            return "review_existing" if already_in_review else "review"
-        return "failed"
+            return "failed"
+        return "review_existing" if already_in_review else "review"
 
-    metadata = {
-        "emergency_released_at": now_text(),
-        "emergency_release_check": "PASSED",
-        # 정지해제는 자동 매매 재개가 아니다.
-        # 정상 종목도 시작 OFF 상태로 복귀해야 하므로
-        # trade_started 판정에 쓰이는 플래그를 명시적으로 끈다.
-        "trade_enabled": False,
-        "buy_enabled": False,
-        "sell_enabled": False,
-        # 정지해제 성공 종목은 시작 OFF 상태로 돌아가야 하므로
-        # 과거 자동/조기마감 대상 없음 알림 메타를 함께 제거한다.
-        "operation_notice": "",
-        "operation_notice_reason": "",
-        "operation_notice_at": "",
-        "early_close_requested_at": "",
-        "early_close_source": "",
-        "early_close_method": "",
-        "early_close_policy": {},
-        "auto_close_method": "",
-        "auto_close_policy": {},
-        "liquidation_policy_forced": False,
-        "liquidation_policy_reason": "",
-        "review_required": False,
-        "review_status": "",
-        "review_location": "",
-        "review_reason": "",
-        "review_detail": "",
-        "review_checked_at": now_text(),
-        "review_routine": routine_name,
-    }
-    if update_runtime_stock_status(
+    result = normalize_review_emergency_target(
         window,
         stock_dir,
         code,
         name,
-        "STOPPED",
-        metadata,
-        reason,
-        verify_readback=True,
-    ):
+        destination="RESTORE",
+    )
+    status = str(result.get("status", "") or "")
+    if status == "NORMALIZED":
         return "normal"
+    if status == "BLOCKED":
+        return "review_existing" if already_in_review else "review"
     return "failed"
 
 
@@ -498,7 +721,7 @@ def execute_selected_emergency_release(
         )
     if normal or review:
         show_toast(
-            parent=window,
+            parent=operation_dialog_parent(window),
             message=(
                 f"정지해제 완료 | 감시/대기 전환 : {len(normal)}종목"
                 f" | 검토관리 : {len(review)}종목"

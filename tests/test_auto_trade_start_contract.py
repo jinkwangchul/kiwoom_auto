@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -116,6 +117,13 @@ class _ReviewWindow:
 
 class AutoTradeStartContractTest(unittest.TestCase):
     def setUp(self) -> None:
+        self._start_clock_patcher = patch.object(
+            run_control,
+            "current_datetime",
+            return_value=datetime(2026, 8, 10, 10, 0, 0),
+        )
+        self._start_clock_patcher.start()
+        self.addCleanup(self._start_clock_patcher.stop)
         self._runtime_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._runtime_temp.cleanup)
         operation_state_path = Path(self._runtime_temp.name) / "operation_state.json"
@@ -186,8 +194,8 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertEqual(["EMERGENCY_STOPPED", "REVIEW_REQUIRED"], window.status_updates)
         self.assertIn("emergency_stopped_at", saved_state)
         self.assertFalse(saved_state["trade_enabled"])
-        self.assertFalse(saved_state["buy_enabled"])
-        self.assertFalse(saved_state["sell_enabled"])
+        self.assertIs(saved_state["buy_enabled"], True)
+        self.assertIs(saved_state["sell_enabled"], True)
 
     def test_running_policy_recalculation_data_mismatch_uses_running_detection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -239,8 +247,8 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertEqual("운영 데이터 불일치", saved_state["emergency_reason"])
         self.assertEqual(["EMERGENCY_STOPPED", "REVIEW_REQUIRED"], window.status_updates)
         self.assertFalse(saved_state["trade_enabled"])
-        self.assertFalse(saved_state["buy_enabled"])
-        self.assertFalse(saved_state["sell_enabled"])
+        self.assertIs(saved_state["buy_enabled"], True)
+        self.assertIs(saved_state["sell_enabled"], True)
 
     def test_start_requested_recalculation_does_not_relabel_as_running_detection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -388,6 +396,8 @@ class AutoTradeStartContractTest(unittest.TestCase):
         )
         for _stock_dir, _code, _name, _source, metadata in window.recalculate_calls:
             self.assertTrue(metadata["trade_enabled"])
+            self.assertNotIn("buy_enabled", metadata)
+            self.assertNotIn("sell_enabled", metadata)
             self.assertEqual(
                 metadata["trade_started_at"],
                 metadata["ignore_signals_before"],

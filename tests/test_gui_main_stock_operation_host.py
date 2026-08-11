@@ -49,6 +49,7 @@ class _Menu:
         self.title = title
         self.actions = []
         self.submenus = []
+        self.sequence = []
         self.enabled = True
         if not title:
             _Menu.root = self
@@ -59,16 +60,19 @@ class _Menu:
     def addAction(self, text: str):
         action = _Action(text)
         self.actions.append(action)
+        self.sequence.append(text)
         return action
 
     def addSeparator(self):
         action = _Action("", separator=True)
         self.actions.append(action)
+        self.sequence.append("<separator>")
         return action
 
     def addMenu(self, title: str):
         menu = _Menu(title=title)
         self.submenus.append(menu)
+        self.sequence.append(title)
         return menu
 
     def setEnabled(self, enabled: bool) -> None:
@@ -90,7 +94,6 @@ def _callbacks() -> context_menu.StockContextMenuCallbacks:
         individual_liquidation=Mock(),
         time_change=Mock(),
         time_reset=Mock(),
-        ats_settings=Mock(),
     )
 
 
@@ -234,9 +237,6 @@ class MainStockOperationHostTest(unittest.TestCase):
             return_value="2026-08-08 10:00",
         ), patch.object(
             gui_auto_trade_timer,
-            "reset_expired_manual_ats_runtime_selections",
-        ), patch.object(
-            gui_auto_trade_timer,
             "auto_trade_continue_pending_close_liquidations",
             return_value={"processed": 0, "blocked": 0},
         ), patch.object(
@@ -289,14 +289,14 @@ class MainStockOperationHostTest(unittest.TestCase):
             [
                 "운영시작",
                 "전체선택",
-                "전체해제",
-                "등록해제",
+                "선택해제",
                 "시간변경",
                 "변경리셋",
+                "등록해제",
             ],
             commands,
         )
-        self.assertEqual(3, sum(action.separator for action in _Menu.root.actions))
+        self.assertEqual(4, sum(action.separator for action in _Menu.root.actions))
 
     def test_monitor_menu_matches_continuous_and_mixed_profiles(self) -> None:
         with patch.object(context_menu, "QMenu", _Menu):
@@ -312,7 +312,11 @@ class MainStockOperationHostTest(unittest.TestCase):
             for action in _Menu.root.actions
             if not action.separator
         ]
-        self.assertEqual("ATS설정", continuous[-1])
+        self.assertEqual("등록해제", continuous[-1])
+        self.assertIn(
+            "ATS설정",
+            [submenu.title for submenu in _Menu.root.submenus],
+        )
         self.assertNotIn("시간변경", continuous)
 
         with patch.object(context_menu, "QMenu", _Menu):
@@ -329,8 +333,12 @@ class MainStockOperationHostTest(unittest.TestCase):
             if not action.separator
         ]
         self.assertNotIn("ATS설정", mixed)
+        self.assertNotIn(
+            "ATS설정",
+            [submenu.title for submenu in _Menu.root.submenus],
+        )
         self.assertNotIn("시간변경", mixed)
-        self.assertEqual(2, sum(action.separator for action in _Menu.root.actions))
+        self.assertEqual(3, sum(action.separator for action in _Menu.root.actions))
 
     def test_monitor_and_settings_menu_structures_match(self) -> None:
         for modes in ({"SCHEDULED"}, {"CONTINUOUS"}, set()):
@@ -370,6 +378,79 @@ class MainStockOperationHostTest(unittest.TestCase):
                     _menu_signature(_Menu.root),
                     monitor_signature,
                 )
+
+    def test_monitor_and_settings_full_menu_order_matches(self) -> None:
+        callbacks = context_menu.StockContextMenuCallbacks(
+            start=Mock(),
+            emergency_stop=Mock(),
+            select_all=Mock(),
+            clear_selection=Mock(),
+            set_operation_exclusion=Mock(),
+            early_close=Mock(),
+            early_close_profit_loss=Mock(),
+            early_close_cancel=Mock(),
+            individual_liquidation=Mock(),
+            time_change=Mock(),
+            time_reset=Mock(),
+            stock_register=Mock(),
+            unregister=Mock(),
+        )
+        expected = [
+            "운영시작",
+            "긴급정지",
+            "<separator>",
+            "전체선택",
+            "선택해제",
+            "운영제외",
+            "<separator>",
+            "조기마감",
+            "개별청산",
+            "<separator>",
+            "시간변경",
+            "변경리셋",
+            "<separator>",
+            "종목등록",
+            "등록해제",
+        ]
+
+        with patch.object(context_menu, "QMenu", _Menu):
+            context_menu.show_monitor_stock_context_menu(
+                Mock(),
+                QPoint(),
+                has_selection=True,
+                callbacks=callbacks,
+                selected_modes={"SCHEDULED"},
+            )
+            monitor_sequence = list(_Menu.root.sequence)
+
+            settings_window = Mock()
+            settings_window.stock_table.itemAt.return_value = None
+            settings_window.stock_table.viewport.return_value.mapToGlobal.return_value = (
+                QPoint()
+            )
+            settings_window.selected_stock_infos.return_value = [
+                (Path("stocks") / "005930_test", "005930", "test")
+            ]
+            settings_window.selected_operation_mode_set.return_value = {"SCHEDULED"}
+            settings_window._stock_status_filter = "running"
+            settings_window._all_stocks_scope_active = False
+            settings_window.current_selected_routine_row_metadata.return_value = {
+                "row_kind": "instance",
+                "instance_id": "instance",
+            }
+            with patch.object(
+                context_menu,
+                "_selected_emergency_state",
+                return_value=(False, True),
+            ):
+                context_menu.show_auto_trade_stock_context_menu(
+                    settings_window,
+                    QPoint(),
+                )
+            settings_sequence = list(_Menu.root.sequence)
+
+        self.assertEqual(expected, monitor_sequence)
+        self.assertEqual(expected, settings_sequence)
 
     def test_start_split_uses_only_explicit_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -426,7 +426,6 @@ def auto_trade_setting_early_close_progress_text(
 def clear_auto_close_runtime_metadata(state: dict[str, object]) -> dict[str, object]:
     """보유/미체결이 없는 마감 상태를 감시/대기로 되돌릴 때 잔여 메타를 제거한다."""
     state["status"] = "WAIT_BUY"
-    state["buy_enabled"] = False
     state["early_close_requested_at"] = ""
     state["early_close_source"] = ""
     state["early_close_method"] = ""
@@ -580,8 +579,6 @@ def auto_trade_setting_mark_close_routine_final_sell_ordered(
     state["close_routine_final_sell_ordered_at"] = now_text()
     state["close_routine_final_sell_source"] = str(source or "routine").strip() or "routine"
     state["close_routine_final_sell_reason"] = str(reason or "루틴 매도신호").strip() or "루틴 매도신호"
-    state["buy_enabled"] = False
-    state["sell_enabled"] = False
     state["updated_at"] = now_text()
     return state
 
@@ -1077,8 +1074,6 @@ def auto_trade_setting_mark_liquidation_result_for_display(
 
     if result in {"SUCCESS", "CURRENT_CARRYOVER"}:
         state["status"] = "WAIT_BUY"
-        state["buy_enabled"] = False
-        state["sell_enabled"] = False
         state["liquidation_policy_forced"] = False
         state["liquidation_policy_reason"] = ""
         state["early_close_requested_at"] = ""

@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from runtime_atomic_writer import STATUS_OK, write_json_atomic
 from event_journal_trade_observer import observe_liquidation_requested
+from close_liquidation_transition_service import normalize_direct_close_policy_alias
 
 
 SCOPE_STOCK = "STOCK"
@@ -36,6 +37,10 @@ MANUAL_ATS_LIQUIDATION_REQUEST_KEY = "manual_ats_liquidation_request"
 MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
 MANUAL_ATS_LIQUIDATION_RESULT_STATUSES = frozenset(
     {
+        "WAITING_CANCEL_CONFIRMATION",
+        "READY_TO_RESUME",
+        "COMPLETED",
+        "FAILED",
         "ORDER_BLOCKED",
         "ORDER_EXECUTABLE",
         "SEND_CALL_ACCEPTED",
@@ -209,6 +214,9 @@ class OperationCommandService:
         *,
         order_id: str = "",
         detail: str = "",
+        cancel_order_identities: list[dict[str, str]] | None = None,
+        holding_readback: dict[str, Any] | None = None,
+        cancel_readback: dict[str, Any] | None = None,
     ) -> StockOperationCommandResult:
         targets, error = self._resolve_targets(SCOPE_STOCK, stock_target)
         if error or len(targets) != 1:
@@ -249,6 +257,35 @@ class OperationCommandService:
                     "result_detail": str(detail or "").strip(),
                 }
             )
+            if cancel_order_identities is not None:
+                next_request["cancel_order_identities"] = [
+                    {
+                        "order_queued_id": str(item.get("order_queued_id") or "").strip(),
+                        "order_id": str(item.get("order_id") or "").strip(),
+                        "broker_order_no": str(item.get("broker_order_no") or "").strip(),
+                    }
+                    for item in cancel_order_identities
+                    if isinstance(item, dict)
+                ]
+            if holding_readback is not None:
+                for key in (
+                    "holding_checked_at",
+                    "position_qty",
+                    "broker_holding_qty",
+                    "resolved_liquidation_qty",
+                    "reconciliation_result",
+                ):
+                    if key in holding_readback:
+                        next_request[key] = holding_readback[key]
+            if cancel_readback is not None:
+                for key in (
+                    "initial_holding_qty",
+                    "pending_order_count",
+                    "cancel_requested_count",
+                    "cancel_pending_count",
+                ):
+                    if key in cancel_readback:
+                        next_request[key] = cancel_readback[key]
             next_state = dict(state)
             next_state[MANUAL_ATS_LIQUIDATION_REQUEST_KEY] = next_request
             next_state["updated_at"] = recorded_at
@@ -622,7 +659,9 @@ class OperationCommandService:
         source = str(request.source).strip()
         if mode == MODE_EARLY_CLOSE:
             compatibility = early_close_compatibility or EarlyCloseCompatibility()
-            method = str(compatibility.method or "").strip() or "루틴"
+            method = normalize_direct_close_policy_alias(
+                compatibility.method
+            ) or "루틴"
             policy = {"method": method, **dict(compatibility.policy or {})}
             if not compatibility.has_close_progress_quantity:
                 state.update(
@@ -634,8 +673,6 @@ class OperationCommandService:
                         "review_reason": "",
                         "review_detail": "",
                         "trade_enabled": True,
-                        "buy_enabled": False,
-                        "sell_enabled": False,
                         "early_close_requested_at": "",
                         "early_close_source": "",
                         "early_close_method": "",
@@ -662,14 +699,16 @@ class OperationCommandService:
                     "trade_enabled": True,
                     "startup_reset_reason": "",
                     "startup_reset_cleared_at": "",
-                    "buy_enabled": True,
-                    "sell_enabled": True,
                     "early_close_requested_at": applied_at,
                     "early_close_source": source,
                     "early_close_method": method,
                     "early_close_policy": policy,
-                    "liquidation_policy_forced": True,
-                    "liquidation_policy_reason": "EARLY_CLOSE",
+                    "liquidation_policy_forced": method in {"시장가", "현재가"},
+                    "liquidation_policy_reason": (
+                        "EARLY_CLOSE"
+                        if method in {"시장가", "현재가"}
+                        else ""
+                    ),
                     "operation_notice": "",
                     "operation_notice_reason": "",
                     "operation_notice_at": "",

@@ -132,6 +132,68 @@ class OperationPolicyGateSingleOrderTests(unittest.TestCase):
         self.assertEqual("BLOCKED_POLICY", order.get("policy_status"))
         self.assertFalse(order.get("execution_enabled"))
 
+    def test_early_close_routine_allows_buy_and_sell_before_final_sell(self) -> None:
+        self._write_state(
+            status="EARLY_CLOSE",
+            trade_enabled=True,
+            buy_enabled=True,
+            sell_enabled=True,
+            early_close_requested_at="2026-08-10 10:00:00",
+            early_close_method="루틴",
+            close_routine_final_sell_ordered=False,
+        )
+
+        for side in ("BUY", "SELL"):
+            order = self._order()
+            order["side"] = side
+            result = operation_policy_gate.evaluate_operation_policy(order)
+            self.assertEqual("EXECUTABLE", result["policy_status"], side)
+
+    def test_early_close_routine_blocks_buy_and_sell_after_final_sell(self) -> None:
+        self._write_state(
+            status="EARLY_CLOSE",
+            trade_enabled=True,
+            buy_enabled=False,
+            sell_enabled=False,
+            early_close_requested_at="2026-08-10 10:00:00",
+            early_close_method="루틴",
+            close_routine_final_sell_ordered=True,
+            close_routine_final_sell_ordered_at="2026-08-10 10:15:00",
+        )
+
+        for side in ("BUY", "SELL"):
+            order = self._order()
+            order["side"] = side
+            result = operation_policy_gate.evaluate_operation_policy(order)
+            self.assertEqual("BLOCKED_POLICY", result["policy_status"], side)
+
+    def test_auto_close_routine_uses_same_before_and_after_final_sell_contract(self) -> None:
+        base_state = {
+            "status": "AUTO_CLOSE",
+            "trade_enabled": True,
+            "buy_enabled": True,
+            "sell_enabled": True,
+            "auto_close_requested_at": "2026-08-10 15:20:00",
+            "auto_close_method": "루틴매도신호",
+        }
+        self._write_state(**base_state, close_routine_final_sell_ordered=False)
+        buy_order = self._order()
+        buy_order["side"] = "BUY"
+        self.assertEqual(
+            "EXECUTABLE",
+            operation_policy_gate.evaluate_operation_policy(buy_order)["policy_status"],
+        )
+
+        self._write_state(
+            **base_state,
+            close_routine_final_sell_ordered=True,
+            close_routine_final_sell_ordered_at="2026-08-10 15:25:00",
+        )
+        self.assertEqual(
+            "BLOCKED_POLICY",
+            operation_policy_gate.evaluate_operation_policy(buy_order)["policy_status"],
+        )
+
     def test_global_emergency_stop_writer_blocks_operation_policy_gate(self) -> None:
         self._write_state()
         self._write_queue(status="APPROVED")

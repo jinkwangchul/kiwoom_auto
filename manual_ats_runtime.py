@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Current-process runtime ownership for per-stock manual ATS selections."""
+"""Persistent per-stock manual ATS selection storage and normalization."""
 
 from __future__ import annotations
 
@@ -14,10 +14,6 @@ from runtime_io import read_json_dict
 MANUAL_ATS_SELECTION_KEY = "manual_ats_selection"
 VALID_SESSION_KEYS = ("extra1", "extra2", "extra3")
 PROGRAM_SESSION_ID = uuid4().hex
-
-
-def current_program_session_id() -> str:
-    return PROGRAM_SESSION_ID
 
 
 def _current(now_dt: datetime | None = None) -> datetime:
@@ -40,17 +36,11 @@ def manual_ats_runtime_selected_keys(
     now_dt: datetime | None = None,
     program_session_id: str | None = None,
 ) -> tuple[str, ...]:
+    """Return the persisted ATS selection regardless of its write date/session."""
     if not isinstance(state, dict):
         return ()
     selection = state.get(MANUAL_ATS_SELECTION_KEY)
     if not isinstance(selection, dict):
-        return ()
-
-    current = _current(now_dt)
-    expected_session_id = str(program_session_id or PROGRAM_SESSION_ID)
-    if str(selection.get("trade_date", "") or "") != current.date().isoformat():
-        return ()
-    if str(selection.get("program_session_id", "") or "") != expected_session_id:
         return ()
     return normalized_manual_ats_session_keys(selection.get("selected_sessions"))
 
@@ -99,50 +89,3 @@ def clear_manual_ats_runtime_selection(stock_dir: str | Path) -> bool:
         return True
     state.pop(MANUAL_ATS_SELECTION_KEY, None)
     return write_json_atomic(state_path, state).get("status") == STATUS_OK
-
-
-def reset_manual_ats_runtime_selections(stocks_dir: str | Path) -> dict[str, int]:
-    """Clear previous process/day selections without touching operation mode."""
-    root = Path(stocks_dir)
-    result = {"cleared": 0, "failed": 0}
-    if not root.exists():
-        return result
-    for stock_dir in root.iterdir():
-        if not stock_dir.is_dir():
-            continue
-        state = read_json_dict(stock_dir / "state.json")
-        if MANUAL_ATS_SELECTION_KEY not in state:
-            continue
-        if clear_manual_ats_runtime_selection(stock_dir):
-            result["cleared"] += 1
-        else:
-            result["failed"] += 1
-    return result
-
-
-def reset_expired_manual_ats_runtime_selections(
-    stocks_dir: str | Path,
-    *,
-    now_dt: datetime | None = None,
-    market_closed: bool = False,
-) -> dict[str, int]:
-    """Remove selections invalid for this date/process or after market close."""
-    root = Path(stocks_dir)
-    result = {"cleared": 0, "failed": 0}
-    if not root.exists():
-        return result
-    current = _current(now_dt)
-    for stock_dir in root.iterdir():
-        if not stock_dir.is_dir():
-            continue
-        state = read_json_dict(stock_dir / "state.json")
-        if MANUAL_ATS_SELECTION_KEY not in state:
-            continue
-        valid = bool(manual_ats_runtime_selected_keys(state, now_dt=current))
-        if valid and not market_closed:
-            continue
-        if clear_manual_ats_runtime_selection(stock_dir):
-            result["cleared"] += 1
-        else:
-            result["failed"] += 1
-    return result

@@ -23,6 +23,7 @@ except Exception as exc:  # pragma: no cover - depends on Windows/COM runtime.
 else:
     _QAX_IMPORT_ERROR = None
 
+from candle_manager import DEFAULT_CANDLES_MAX_COUNT
 from kiwoom_candle_adapter import save_minute_candles_for_stock
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
@@ -91,6 +92,7 @@ class KiwoomApi(QObject):
     ACCOUNT_FUNDS_SCREEN_NO = "9103"
     RECOVERY_TR_TIMEOUT_MS = 15_000
     ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
+    MINUTE_CANDLE_TR_TIMEOUT_MS = 10_000
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -268,6 +270,7 @@ class KiwoomApi(QObject):
         name: str = "",
         interval: int = 1,
         count: int = 300,
+        max_count: int = DEFAULT_CANDLES_MAX_COUNT,
         screen_no: str = "9001",
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
@@ -297,6 +300,10 @@ class KiwoomApi(QObject):
             clean_count = max(int(count), 1)
         except (TypeError, ValueError):
             clean_count = 300
+        try:
+            clean_max_count = max(int(max_count), clean_count)
+        except (TypeError, ValueError):
+            clean_max_count = DEFAULT_CANDLES_MAX_COUNT
 
         rqname = f"opt10080_{clean_code}_{datetime.now().strftime('%H%M%S%f')}"
         self._pending_tr[rqname] = {
@@ -305,6 +312,7 @@ class KiwoomApi(QObject):
             "name": str(name or "").strip(),
             "interval": clean_interval,
             "count": clean_count,
+            "max_count": clean_max_count,
             "screen_no": str(screen_no or "9001"),
             "callback": callback,
             "rows": [],
@@ -335,7 +343,28 @@ class KiwoomApi(QObject):
                 {"ok": False, "code": clean_code, "rqname": rqname, "result": result},
             )
 
+        QTimer.singleShot(
+            self.MINUTE_CANDLE_TR_TIMEOUT_MS,
+            lambda request_name=rqname: self._expire_minute_candle_request(request_name),
+        )
         return {"ok": True, "code": clean_code, "rqname": rqname, "result": result}
+
+    def _expire_minute_candle_request(self, rqname: str) -> None:
+        pending = self._pending_tr.pop(str(rqname), None)
+        if not pending or pending.get("type") != "minute_candles":
+            return
+        callback = pending.get("callback")
+        self._finish_callback(
+            callback if callable(callback) else None,
+            {
+                "ok": False,
+                "type": "minute_candles",
+                "code": pending.get("code", ""),
+                "name": pending.get("name", ""),
+                "rqname": str(rqname),
+                "error": "minute candle request timed out",
+            },
+        )
 
     def request_account_holdings_snapshot(
         self,
@@ -747,7 +776,7 @@ class KiwoomApi(QObject):
                 str(pending.get("code", "")),
                 str(pending.get("name", "")),
                 rows,
-                max_count=int(pending.get("count") or 300),
+                max_count=int(pending.get("max_count") or DEFAULT_CANDLES_MAX_COUNT),
             )
             result = {
                 "ok": True,

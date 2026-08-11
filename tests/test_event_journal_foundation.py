@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from event_journal_contract import (
     CATEGORIES,
+    EVENT_TYPE_CATEGORIES,
     EVENT_TYPE_LABELS,
     SCHEMA_VERSION,
     new_app_session_id,
@@ -198,6 +199,87 @@ class EventJournalFoundationTests(unittest.TestCase):
         )
         self.assertEqual("삼성전자 주문이 누적 20/100주 체결되었습니다.", with_total["summary"])
         self.assertEqual("삼성전자 주문이 누적 20주 체결되었습니다.", without_total["summary"])
+
+    def test_13c_review_management_event_contracts(self) -> None:
+        contracts = {
+            "REVIEW_RETURNED": (
+                "검토관리 복귀",
+                "삼성전자 검토종목이 기존 운영관계로 복귀되었습니다.",
+                "COMPLETED",
+            ),
+            "REVIEW_UNASSIGNED": (
+                "검토관리 미지정",
+                "삼성전자 검토종목이 미지정으로 전환되었습니다.",
+                "BLOCKED",
+            ),
+            "REVIEW_FORCE_RESET": (
+                "검토관리 강제초기화",
+                "삼성전자 검토종목이 강제초기화되었습니다.",
+                "FAILED",
+            ),
+        }
+        for event_type, (label, summary, result) in contracts.items():
+            with self.subTest(event_type=event_type):
+                self.assertEqual("SETTING", EVENT_TYPE_CATEGORIES[event_type])
+                self.assertEqual(label, EVENT_TYPE_LABELS[event_type])
+                rendered = render_summary(event_type, {"stock_name": "삼성전자"})
+                self.assertTrue(rendered["rendered"])
+                self.assertEqual(summary, rendered["summary"])
+                appended = self._append(
+                    event_type=event_type,
+                    template_args={"stock_name": "삼성전자"},
+                    result=result,
+                    target_type="STOCK",
+                    target_id="005930",
+                    target_name="삼성전자",
+                    stock_code="005930",
+                    stock_name="삼성전자",
+                )
+                self.assertTrue(appended["appended"])
+                self.assertEqual("SETTING", appended["event"]["category"])
+                self.assertEqual(result, appended["event"]["result"])
+
+    def test_13d_review_management_summary_requires_stock_name(self) -> None:
+        for event_type in (
+            "REVIEW_RETURNED",
+            "REVIEW_UNASSIGNED",
+            "REVIEW_FORCE_RESET",
+        ):
+            with self.subTest(event_type=event_type):
+                rendered = render_summary(event_type)
+                self.assertFalse(rendered["rendered"])
+                self.assertIn("stock_name", rendered["error"])
+                appended = self._append(event_type=event_type)
+                self.assertTrue(appended["invalid"])
+
+    def test_13e_manual_ats_liquidation_event_contract(self) -> None:
+        self.assertEqual("OPERATION", EVENT_TYPE_CATEGORIES["MANUAL_ATS_LIQUIDATION"])
+        self.assertEqual("ATS 즉시청산", EVENT_TYPE_LABELS["MANUAL_ATS_LIQUIDATION"])
+        rendered = render_summary(
+            "MANUAL_ATS_LIQUIDATION",
+            {"stock_name": "삼성전자"},
+        )
+        self.assertTrue(rendered["rendered"])
+        self.assertEqual(
+            "삼성전자 ATS 즉시청산 결과가 기록되었습니다.",
+            rendered["summary"],
+        )
+        for result in ("REQUESTED", "BLOCKED", "FAILED", "COMPLETED"):
+            with self.subTest(result=result):
+                appended = self._append(
+                    event_type="MANUAL_ATS_LIQUIDATION",
+                    event_id=f"ats-{result}",
+                    template_args={"stock_name": "삼성전자"},
+                    result=result,
+                    target_type="STOCK",
+                    target_id="005930",
+                    stock_code="005930",
+                    stock_name="삼성전자",
+                    command_id=f"command-{result}",
+                    details={"liquidation_method": "MARKET"},
+                )
+                self.assertTrue(appended["appended"])
+                self.assertEqual("OPERATION", appended["event"]["category"])
 
     def test_14_optional_identities_are_preserved(self) -> None:
         result = self._append(

@@ -136,6 +136,100 @@ class EventRecordProductionReaderTest(unittest.TestCase):
         self.assertEqual(period_height, self.window.category_combo.height())
         self.assertEqual(period_height, self.window.severity_combo.height())
 
+    def test_target_and_event_cells_are_centered_without_changing_columns(self) -> None:
+        expected_widths = tuple(
+            self.window.event_table.columnWidth(column)
+            for column in range(self.window.event_table.columnCount())
+        )
+        self.window.select_period("전체")
+
+        self.assertGreater(self.window.event_table.rowCount(), 0)
+        for row in range(self.window.event_table.rowCount()):
+            for column in (3, 4):
+                self.assertEqual(
+                    Qt.AlignCenter,
+                    self.window.event_table.item(row, column).textAlignment(),
+                )
+        self.assertNotEqual(
+            Qt.AlignCenter,
+            self.window.event_table.item(0, 0).textAlignment(),
+        )
+        self.assertNotEqual(
+            Qt.AlignCenter,
+            self.window.event_table.item(0, 6).textAlignment(),
+        )
+        self.assertEqual(
+            expected_widths,
+            tuple(
+                self.window.event_table.columnWidth(column)
+                for column in range(self.window.event_table.columnCount())
+            ),
+        )
+
+    def test_event_list_panel_width_stays_fixed_for_selection_and_window_resize(self) -> None:
+        expected_column_widths = (190, 66, 70, 210, 190, 76)
+        self.window.show()
+        self.app.processEvents()
+
+        margins = self.window.layout().contentsMargins()
+        expected_minimum_width = (
+            event_ui.EVENT_LIST_PANEL_FIXED_WIDTH
+            + event_ui.EVENT_DETAIL_PANEL_MINIMUM_WIDTH
+            + self.window.event_splitter.handleWidth()
+            + margins.left()
+            + margins.right()
+        )
+        self.assertEqual(expected_minimum_width, self.window.minimumWidth())
+        self.assertEqual(
+            event_ui.EVENT_DETAIL_PANEL_MINIMUM_WIDTH,
+            self.window.event_detail_panel.minimumWidth(),
+        )
+
+        self.assertEqual(event_ui.EVENT_LIST_PANEL_FIXED_WIDTH, self.window.event_list_panel.width())
+        self.assertEqual(
+            event_ui.EVENT_LIST_PANEL_FIXED_WIDTH,
+            self.window.event_list_panel.minimumWidth(),
+        )
+        self.assertEqual(
+            event_ui.EVENT_LIST_PANEL_FIXED_WIDTH,
+            self.window.event_list_panel.maximumWidth(),
+        )
+
+        self.window.select_period("전체")
+        for row in range(self.window.event_table.rowCount()):
+            self.window.event_table.selectRow(row)
+            self.app.processEvents()
+            self.assertEqual(
+                event_ui.EVENT_LIST_PANEL_FIXED_WIDTH,
+                self.window.event_list_panel.width(),
+            )
+
+        for width in (expected_minimum_width, 1800):
+            self.window.resize(width, 800)
+            self.app.processEvents()
+            self.assertEqual(
+                event_ui.EVENT_LIST_PANEL_FIXED_WIDTH,
+                self.window.event_list_panel.width(),
+            )
+            self.assertGreaterEqual(
+                self.window.event_detail_panel.width(),
+                event_ui.EVENT_DETAIL_PANEL_MINIMUM_WIDTH,
+            )
+            list_right = (
+                self.window.event_list_panel.geometry().x()
+                + self.window.event_list_panel.geometry().width()
+            )
+            self.assertGreaterEqual(
+                self.window.event_detail_panel.geometry().x(),
+                list_right + self.window.event_splitter.handleWidth(),
+            )
+
+        self.assertEqual(
+            expected_column_widths,
+            tuple(self.window.event_table.columnWidth(column) for column in range(6)),
+        )
+        self.assertEqual(Qt.ScrollBarAsNeeded, self.window.event_table.horizontalScrollBarPolicy())
+
     def test_category_uses_function_areas_and_severity_keeps_warning_and_error(self) -> None:
         categories = [
             self.window.category_combo.itemData(index)
@@ -265,6 +359,62 @@ class EventRecordProductionReaderTest(unittest.TestCase):
                 self.window.search_edit.setText(label)
                 self.assertEqual(1, self.window.event_table.rowCount())
                 self.assertEqual(label, self.window.event_table.item(0, 4).text())
+
+    def test_review_action_event_shows_label_result_summary_and_details(self) -> None:
+        self._append(
+            self.writer,
+            "REVIEW_RETURNED",
+            "2026-08-08T12:00:00+09:00",
+            severity="WARNING",
+            result="BLOCKED",
+            template_args={"stock_name": "삼성전자"},
+            target_type="STOCK",
+            target_id="005930",
+            target_name="삼성전자",
+            stock_code="005930",
+            stock_name="삼성전자",
+            details={"reason": "보유잔량 존재"},
+        )
+        self.window.apply_filters()
+        self.window.search_edit.setText("검토관리 복귀")
+
+        self.assertEqual(1, self.window.event_table.rowCount())
+        self.assertEqual("설정", self.window.event_table.item(0, 1).text())
+        self.assertEqual("삼성전자 (005930)", self.window.event_table.item(0, 3).text())
+        self.assertEqual("검토관리 복귀", self.window.event_table.item(0, 4).text())
+        self.assertEqual("차단", self.window.event_table.item(0, 5).text())
+        self.assertIn("기존 운영관계로 복귀", self.window.event_table.item(0, 6).text())
+        self.window.event_table.selectRow(0)
+        self.window._show_selected_event()
+        self.assertIn("보유잔량 존재", self.window.detail_text.toPlainText())
+
+    def test_review_force_reset_event_is_visible_with_details(self) -> None:
+        self._append(
+            self.writer,
+            "REVIEW_FORCE_RESET",
+            "2026-08-08T12:05:00+09:00",
+            severity="ERROR",
+            result="FAILED",
+            template_args={"stock_name": "삼성전자"},
+            target_type="STOCK",
+            target_id="005930",
+            target_name="삼성전자",
+            stock_code="005930",
+            stock_name="삼성전자",
+            details={"review_reason": "상태 불일치", "reason": "삭제 후 상태 확인 실패"},
+        )
+        self.window.apply_filters()
+        self.window.search_edit.setText("검토관리 강제초기화")
+
+        self.assertEqual(1, self.window.event_table.rowCount())
+        self.assertEqual("설정", self.window.event_table.item(0, 1).text())
+        self.assertEqual("검토관리 강제초기화", self.window.event_table.item(0, 4).text())
+        self.assertEqual("실패", self.window.event_table.item(0, 5).text())
+        self.window.event_table.selectRow(0)
+        self.window._show_selected_event()
+        detail = self.window.detail_text.toPlainText()
+        self.assertIn("상태 불일치", detail)
+        self.assertIn("삭제 후 상태 확인 실패", detail)
 
     def test_stage6_scenario_display_count_drops_from_40_to_33(self) -> None:
         stage6_event_types = (

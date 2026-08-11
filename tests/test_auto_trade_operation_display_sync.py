@@ -20,8 +20,6 @@ from gui_auto_trade_display import create_auto_trade_setting_activity_status_ite
 from gui_auto_trade_policy import auto_trade_operation_display
 from manual_ats_runtime import (
     clear_manual_ats_runtime_selection,
-    current_program_session_id,
-    reset_manual_ats_runtime_selections,
     write_manual_ats_runtime_selection,
 )
 from runtime_io import read_json_dict
@@ -185,7 +183,7 @@ def _runtime_ats_state(*keys: str) -> dict[str, object]:
         "manual_ats_selection": {
             "selected_sessions": list(keys),
             "trade_date": datetime.now().astimezone().date().isoformat(),
-            "program_session_id": current_program_session_id(),
+            "program_session_id": "test-program-session",
         }
     }
 
@@ -729,7 +727,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     _main_table_status_item(window),
                 )
 
-                reset_manual_ats_runtime_selections(root / "stocks")
+                self.assertTrue(clear_manual_ats_runtime_selection(stock_dir))
                 gui_main_table_loader.main_load_running_stock_table(window)
                 self.assertEqual(
                     "수동",
@@ -865,6 +863,84 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
         self.assertEqual(1, result["succeeded"])
         window.load_selected_routine_stocks.assert_called_once()
         parent.refresh_all.assert_called_once()
+
+    def test_after_regular_end_cleanup_does_not_create_legacy_permission_keys(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        _ = app
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_삼성전자"
+            stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "operation_mode": "SCHEDULED",
+                        "assigned_routine_instance_id": "instance-a",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "EARLY_CLOSE",
+                        "trade_enabled": True,
+                        "early_close_requested_at": "2026-08-10 13:20:00",
+                        "early_close_method": "루틴",
+                        "operation_notice": "EARLY_CLOSE_WAITING",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            window = SimpleNamespace(
+                stock_table=QTableWidget(),
+                _all_stocks_scope_active=True,
+                _stock_status_filter="all",
+                _stock_visual_order=[],
+                current_selected_routine_dir=lambda: None,
+                current_selected_routine_name=lambda: "",
+                capture_stock_table_view_state=lambda: (set(), 0),
+                restore_stock_table_view_state=lambda *_args: None,
+                update_selected_routine_status_bar=lambda: None,
+                all_registered_instance_ids=lambda: ["instance-a"],
+                update_action_buttons=lambda: None,
+            )
+            window.stock_table.setColumnCount(11)
+            stock = {
+                "code": "005930",
+                "name": "삼성전자",
+                "stock_path": str(stock_dir),
+                "assigned_routine_instance_id": "instance-a",
+            }
+
+            with (
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "read_base_stocks",
+                    return_value=[stock],
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "pending_order_side_quantities",
+                    return_value=(0, 0),
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "auto_trade_setting_is_after_regular_end",
+                    return_value=True,
+                ),
+            ):
+                gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(
+                    window
+                )
+
+            saved = read_json_dict(stock_dir / "state.json")
+            self.assertEqual("MONITORING", saved["status"])
+            self.assertEqual("WAIT_BUY", saved["trade_set_status"])
+            self.assertEqual("", saved["early_close_requested_at"])
+            self.assertNotIn("buy_enabled", saved)
+            self.assertNotIn("sell_enabled", saved)
 
 
 if __name__ == "__main__":

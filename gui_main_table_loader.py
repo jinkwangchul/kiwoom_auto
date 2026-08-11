@@ -32,9 +32,12 @@ from gui_stock_data import stock_runtime_dir_for_routine
 from gui_order_utils import (
     pending_order_side_quantities,
     format_number_value,
+    format_signed_money,
     format_signed_percent,
 )
 from gui_review_utils import average_price_from_state, current_price_from_state, safe_float_value
+from confirmable_pnl_cycle_service import project_confirmable_cumulative_pnl
+from pnl_ui_refresh import project_current_stock_pnl
 from gui_operation_environment import (
     effective_amount_starting_budget,
     starting_budget_defaults,
@@ -100,9 +103,9 @@ ROUTINE_MONITORING_HEADERS = (
     "루틴명",
     "상태",
     "등록",
-    "실행",
-    "정지",
-    "오류",
+    "제외",
+    "운영/정지",
+    "검토관리",
     "사용금액",
     "매수한도",
     "사용률",
@@ -167,6 +170,7 @@ ROUTINE_STOCK_METRICS_ROLE = Qt.UserRole + 217
 ROUTINE_STOCK_PROFIT_LED_ROLE = Qt.UserRole + 218
 ROUTINE_STOCK_INITIAL_BUY_ROLE = Qt.UserRole + 219
 ROUTINE_STOCK_DISPLAY_ROLE = Qt.UserRole + 220
+ROUTINE_PARENT_AGGREGATE_VALUES_ROLE = Qt.UserRole + 221
 ROUTINE_ROW_PARENT = "definition"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
@@ -188,9 +192,9 @@ ROUTINE_STATUS_STAMP_HEIGHT = 22
 ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES = {
     "status": "[기본운영]",
     "registered": "등록(99)",
-    "running": "실행(99)",
-    "stopped": "정지(99)",
-    "error": "오류(99)",
+    "excluded": "제외(99)",
+    "operation_or_stopped": "운영(99)",
+    "review": "검토(99)",
     "limit": "한도(99,999,999)",
     "consumed": "소모(99,999,999 / 100.0%)",
     "profit": "수익(-99,999,999 / -99.99%)",
@@ -198,7 +202,8 @@ ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES = {
 ROUTINE_INSTANCE_GRID_PADDING = 12
 ROUTINE_INSTANCE_COUNT_GRID_PADDING = 4
 ROUTINE_INSTANCE_GRID_SPACING = 0
-ROUTINE_INSTANCE_SEPARATOR_PADDING = 0
+ROUTINE_INSTANCE_SEPARATOR_PADDING = 8
+ROUTINE_AGGREGATE_LEADING_GAP = 14
 ROUTINE_INSTANCE_NUMBER_PADDING = 4
 ROUTINE_INSTANCE_MONEY_OUTER_PADDING = 5
 ROUTINE_INSTANCE_NUMBER_PADDING_BY_KEY = {
@@ -209,8 +214,21 @@ ROUTINE_INSTANCE_NUMBER_PADDING_BY_KEY = {
     "profit_rate": 0,
 }
 ROUTINE_INSTANCE_COMPACT_COLUMNS = frozenset(
-    {"registered", "running", "stopped", "error"}
+    {"registered", "excluded", "operation_or_stopped", "review"}
 )
+ROUTINE_AGGREGATE_COLUMN_KEYS = (
+    "registered",
+    "excluded",
+    "operation_or_stopped",
+    "review",
+)
+ROUTINE_AGGREGATE_LABELS = {
+    "registered": ("등록",),
+    "excluded": ("제외",),
+    "operation_or_stopped": ("운영", "정지"),
+    "review": ("검토",),
+}
+ROUTINE_AGGREGATE_NUMBER_SAMPLES = ("199", "999")
 ROUTINE_INSTANCE_AMOUNT_SAMPLES = {
     "limit_amount": ("-99,999,999", "99,999,999", "미사용", "확인 필요"),
     "consumed_amount": ("99,999,999",),
@@ -239,6 +257,8 @@ def routine_instance_grid_columns(font: QFont | None = None) -> dict[str, int]:
         key: metrics.horizontalAdvance(sample) + routine_instance_grid_padding(key)
         for key, sample in ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES.items()
     }
+    for column_key in ROUTINE_AGGREGATE_COLUMN_KEYS:
+        columns[column_key] = routine_aggregate_metric_width(column_key, font)
     number_widths = routine_instance_number_widths(font)
     columns["limit"] = (
         metrics.horizontalAdvance("한도(")
@@ -265,6 +285,52 @@ def routine_instance_grid_columns(font: QFont | None = None) -> dict[str, int]:
         )
     )
     return columns
+
+
+def routine_aggregate_number_slot_width(font: QFont | None = None) -> int:
+    metrics = QFontMetrics(font or QFont())
+    return max(
+        metrics.horizontalAdvance(sample)
+        for sample in ROUTINE_AGGREGATE_NUMBER_SAMPLES
+    )
+
+
+def routine_aggregate_label_width(
+    column_key: str,
+    font: QFont | None = None,
+) -> int:
+    metrics = QFontMetrics(font or QFont())
+    return max(
+        metrics.horizontalAdvance(label)
+        for label in ROUTINE_AGGREGATE_LABELS[column_key]
+    )
+
+
+def routine_aggregate_metric_width(
+    column_key: str,
+    font: QFont | None = None,
+) -> int:
+    metrics = QFontMetrics(font or QFont())
+    return (
+        routine_aggregate_label_width(column_key, font)
+        + metrics.horizontalAdvance("(")
+        + routine_aggregate_number_slot_width(font)
+        + metrics.horizontalAdvance(")")
+    )
+
+
+def routine_aggregate_slot_lefts(
+    start_x: int,
+    font: QFont | None = None,
+) -> tuple[int, ...]:
+    column_widths = routine_instance_grid_columns(font)
+    separator_width = routine_aggregate_separator_width(font)
+    left = int(start_x) + ROUTINE_AGGREGATE_LEADING_GAP
+    result: list[int] = []
+    for column_key in ROUTINE_AGGREGATE_COLUMN_KEYS:
+        result.append(left)
+        left += column_widths[column_key] + separator_width
+    return tuple(result)
 
 
 def routine_instance_number_widths(font: QFont | None = None) -> dict[str, int]:
@@ -498,9 +564,9 @@ def sort_routine_stock_rows_by_initial_buy_mode(
 ROUTINE_INSTANCE_GRID_COLUMNS = {
     "status": ROUTINE_STATUS_STAMP_WIDTH,
     "registered": 60,
-    "running": 60,
-    "stopped": 60,
-    "error": 60,
+    "excluded": 60,
+    "operation_or_stopped": 60,
+    "review": 78,
     "limit": 148,
     "consumed": 226,
     "profit": 238,
@@ -532,6 +598,13 @@ def routine_instance_separator_width(font: QFont | None = None) -> int:
     return metrics.horizontalAdvance("|")
 
 
+def routine_aggregate_separator_width(font: QFont | None = None) -> int:
+    return (
+        routine_instance_separator_width(font)
+        + (ROUTINE_INSTANCE_SEPARATOR_PADDING * 2)
+    )
+
+
 def routine_status_stamp_spec(status: object) -> tuple[str, str]:
     display_status = str(status or "").strip()
     color = ROUTINE_STATUS_STAMP_COLORS.get(display_status, "")
@@ -543,11 +616,58 @@ def routine_instance_count_display(value: object) -> str:
         count = int(value)
     except (TypeError, ValueError):
         return "-"
-    if count > 99:
-        return "99"
+    if count > 999:
+        return "999"
     if count < 0:
         return "0"
     return str(count)
+
+
+def _routine_aggregate_metric_widget(
+    *,
+    object_name: str,
+    column_key: str,
+    label_text: str,
+    count: object,
+    font: QFont,
+    color_value: str,
+) -> QWidget:
+    widget = QWidget()
+    widget.setObjectName(object_name)
+    widget.setFont(font)
+    widget.setFixedWidth(routine_aggregate_metric_width(column_key, font))
+    _set_fixed_metric_widget_policy(widget)
+    widget.setFocusPolicy(Qt.NoFocus)
+    widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    layout = QHBoxLayout(widget)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    parts = (
+        ("Label", label_text, routine_aggregate_label_width(column_key, font), Qt.AlignLeft),
+        ("OpenParen", "(", QFontMetrics(font).horizontalAdvance("("), Qt.AlignCenter),
+        (
+            "Number",
+            routine_instance_count_display(count),
+            routine_aggregate_number_slot_width(font),
+            Qt.AlignCenter,
+        ),
+        ("CloseParen", ")", QFontMetrics(font).horizontalAdvance(")"), Qt.AlignCenter),
+    )
+    for suffix, text, width, alignment in parts:
+        label = QLabel(text)
+        label.setObjectName(f"{object_name}{suffix}")
+        label.setFont(font)
+        label.setFixedWidth(width)
+        label.setAlignment(alignment | Qt.AlignVCenter)
+        label.setFocusPolicy(Qt.NoFocus)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setStyleSheet(
+            f"QLabel {{ color: {color_value}; }}"
+            "QLabel:disabled { color: #9CA3AF; }"
+        )
+        layout.addWidget(label)
+    return widget
 
 
 def _split_wrapped_metric_text(text: object, label: str) -> str:
@@ -828,9 +948,9 @@ def create_routine_instance_status_widget(
     *,
     instance_id: str = "",
     registered: int,
-    running: int,
-    stopped: int,
-    error: int,
+    excluded: int,
+    operation_or_stopped: int,
+    review: int,
     buy_limit_text: str = "",
     consumed_text: str = "",
     profit_text: str = "",
@@ -841,6 +961,7 @@ def create_routine_instance_status_widget(
     on_status_double_click: Callable[[], None] | None = None,
 ) -> QWidget:
     display_status, color = routine_status_stamp_spec(status)
+    operation_label = "운영" if display_status == ROUTINE_STATUS_RUNNING else "정지"
     container = QWidget()
     container.setObjectName("routineInstanceStatusContainer")
     container.setFont(main_monitoring_cell_font())
@@ -895,7 +1016,7 @@ def create_routine_instance_status_widget(
     layout.addWidget(stamp, 0, Qt.AlignVCenter)
     column_widths = routine_instance_grid_columns(container.font())
     number_widths = routine_instance_number_widths(container.font())
-    separator_width = routine_instance_separator_width(container.font())
+    separator_width = routine_aggregate_separator_width(container.font())
     metric_specs = [
         (
             "routineInstanceRegistered",
@@ -904,21 +1025,21 @@ def create_routine_instance_status_widget(
             "#374151",
         ),
         (
-            "routineInstanceRunning",
-            "running",
-            f"실행({routine_instance_count_display(running)})",
+            "routineInstanceExcluded",
+            "excluded",
+            f"제외({routine_instance_count_display(excluded)})",
             "#374151",
         ),
         (
-            "routineInstanceStopped",
-            "stopped",
-            f"정지({routine_instance_count_display(stopped)})",
+            "routineInstanceOperationOrStopped",
+            "operation_or_stopped",
+            f"{operation_label}({routine_instance_count_display(operation_or_stopped)})",
             "#374151",
         ),
         (
-            "routineInstanceError",
-            "error",
-            f"오류({routine_instance_count_display(error)})",
+            "routineInstanceReview",
+            "review",
+            f"검토({routine_instance_count_display(review)})",
             "#374151",
         ),
         (
@@ -933,7 +1054,21 @@ def create_routine_instance_status_widget(
         metric_specs.append(
             ("routineInstanceConsumed", "consumed", f"{consumed_text}", "#374151")
         )
-    for object_name, column_key, text, color_value in metric_specs:
+    aggregate_labels = {
+        "registered": "등록",
+        "excluded": "제외",
+        "operation_or_stopped": operation_label,
+        "review": "검토",
+    }
+    aggregate_counts = {
+        "registered": registered,
+        "excluded": excluded,
+        "operation_or_stopped": operation_or_stopped,
+        "review": review,
+    }
+    for metric_index, (object_name, column_key, text, color_value) in enumerate(
+        metric_specs
+    ):
         separator = QLabel("|")
         separator.setObjectName("routineInstanceSeparator")
         separator.setAlignment(Qt.AlignCenter)
@@ -945,7 +1080,16 @@ def create_routine_instance_status_widget(
             "QLabel#routineInstanceSeparator { color: #9CA3AF; }"
             "QLabel#routineInstanceSeparator:disabled { color: #D1D5DB; }"
         )
-        if column_key == "limit":
+        if column_key in ROUTINE_AGGREGATE_COLUMN_KEYS:
+            metric_widget = _routine_aggregate_metric_widget(
+                object_name=object_name,
+                column_key=column_key,
+                label_text=aggregate_labels[column_key],
+                count=aggregate_counts[column_key],
+                font=container.font(),
+                color_value=color_value,
+            )
+        elif column_key == "limit":
             metric_widget = _routine_limit_metric_widget(
                 str(text or ""),
                 width=column_widths[column_key],
@@ -996,9 +1140,12 @@ def create_routine_instance_status_widget(
                 f"QLabel#{object_name} {{ color: {color_value}; }}"
                 f"QLabel#{object_name}:disabled {{ color: #9CA3AF; }}"
             )
-        layout.addSpacing(ROUTINE_INSTANCE_GRID_SPACING)
-        layout.addWidget(separator, 0, Qt.AlignVCenter)
-        layout.addSpacing(ROUTINE_INSTANCE_GRID_SPACING)
+        if metric_index == 0:
+            layout.addSpacing(ROUTINE_AGGREGATE_LEADING_GAP)
+        else:
+            layout.addSpacing(ROUTINE_INSTANCE_GRID_SPACING)
+            layout.addWidget(separator, 0, Qt.AlignVCenter)
+            layout.addSpacing(ROUTINE_INSTANCE_GRID_SPACING)
         layout.addWidget(metric_widget, 0, Qt.AlignVCenter)
     layout.addStretch(1)
     container.setEnabled(bool(enabled))
@@ -1138,18 +1285,12 @@ def _instance_stock_counts(
             continue
         operation_excluded = is_operation_excluded(config)
         review_required = is_review_required_state(state)
-        if operation_excluded_only is not None and (
-            review_required
-            or operation_excluded != bool(operation_excluded_only)
-        ):
-            continue
         item = counts.setdefault(
             instance_id,
             {
                 "registered": 0,
-                "running": 0,
-                "stopped": 0,
-                "error": 0,
+                "operation_or_stopped": 0,
+                "operation_running": 0,
                 "normal": 0,
                 "excluded": 0,
                 "review": 0,
@@ -1164,15 +1305,22 @@ def _instance_stock_counts(
         item["registered"] += 1
         if review_required:
             item["review"] += 1
-            item["error"] += 1
-            continue
-        if operation_excluded:
+        elif operation_excluded:
             item["excluded"] += 1
         else:
             item["normal"] += 1
+            item["operation_or_stopped"] += 1
+            if auto_trade_setting_trade_started(state):
+                item["operation_running"] += 1
+        if review_required:
+            continue
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
-        if code or name:
+        include_stock_row = not review_required and (
+            operation_excluded_only is None
+            or operation_excluded == bool(operation_excluded_only)
+        )
+        if include_stock_row and (code or name):
             item["stocks"].append(
                 {
                     "code": code,
@@ -1182,27 +1330,22 @@ def _instance_stock_counts(
                     "enabled": bool(stock.get("enabled", True)),
                 }
             )
-        status = str(state.get("status", "") or "").strip().upper()
-        running = auto_trade_setting_trade_started(state)
-        if running:
-            item["running"] += 1
-        else:
-            item["stopped"] += 1
-        if status == "ERROR":
-            item["error"] += 1
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
         avg_price = average_price_from_state(state)
+        current_price = current_price_from_state(state)
+        cycle_pnl = project_confirmable_cumulative_pnl(
+            code,
+            current_price,
+            project_root=Path(__file__).resolve().parent,
+        )
+        if cycle_pnl.get("available") is True:
+            item["profit_amount"] = float(item["profit_amount"]) + float(cycle_pnl.get("cumulative_profit") or 0)
+            item["profit_cost_basis"] = float(item["profit_cost_basis"]) + float(cycle_pnl.get("completed_buy_cost") or 0) + float(cycle_pnl.get("open_cost") or 0)
+        else:
+            item["profit_unknown"] = True
         if holding_qty > 0 and avg_price > 0:
             cost_basis = holding_qty * avg_price
             item["consumed_amount"] = float(item["consumed_amount"]) + cost_basis
-            item["profit_cost_basis"] = float(item["profit_cost_basis"]) + cost_basis
-            current_price = current_price_from_state(state)
-            if current_price is None:
-                item["profit_unknown"] = True
-            else:
-                item["profit_amount"] = float(item["profit_amount"]) + (
-                    (current_price - avg_price) * holding_qty
-                )
         elif holding_qty > 0:
             item["consumed_unknown"] = True
             item["profit_unknown"] = True
@@ -1216,6 +1359,46 @@ def _instance_stock_counts(
                 )
             )
     return counts
+
+
+def main_refresh_pnl_only(window) -> None:
+    """Refresh monitoring stock/instance PnL without rebuilding either table."""
+    instance_counts = _instance_stock_counts()
+    changed = False
+    for row in range(window.routine_table.rowCount()):
+        item = window.routine_table.item(row, 0)
+        if item is None:
+            continue
+        kind = item.data(ROUTINE_ROW_KIND_ROLE)
+        if kind == ROUTINE_ROW_STOCK:
+            code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+            metrics = item.data(ROUTINE_STOCK_METRICS_ROLE)
+            if not code or not isinstance(metrics, tuple) or len(metrics) < 3:
+                continue
+            result = project_current_stock_pnl(code, project_root=Path(__file__).resolve().parent)
+            if result.get("available") is not True:
+                continue
+            amount = float(result.get("cumulative_profit") or 0)
+            rate = result.get("cumulative_rate")
+            updated = list(metrics)
+            updated[2] = replace(updated[2], value1=format_signed_money(amount), value2=format_signed_percent(rate, digits=2) if rate is not None else "-")
+            if tuple(updated) != metrics:
+                item.setData(ROUTINE_STOCK_METRICS_ROLE, tuple(updated))
+                changed = True
+        elif kind == ROUTINE_ROW_CHILD:
+            instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+            count = instance_counts.get(instance_id)
+            widget = window.routine_table.cellWidget(row, 1)
+            label = widget.findChild(QLabel, "routineInstanceProfit") if widget is not None else None
+            if not count or label is None:
+                continue
+            text, color = routine_instance_profit_text(profit_amount=count.get("profit_amount", 0), cost_basis=count.get("profit_cost_basis", 0), unknown=bool(count.get("profit_unknown")))
+            if label.text() != text:
+                label.setText(text)
+                label.setStyleSheet(f"color: {color}; border: none; background: transparent;")
+                changed = True
+    if changed:
+        window.routine_table.viewport().update()
 
 
 def _routine_tree_stock_display_values(
@@ -1571,6 +1754,23 @@ def _routine_tree_stock_metric_values(
         )
     )
     profit_metric = replace(profit_metric, label="수익")
+    cycle_pnl = project_confirmable_cumulative_pnl(
+        str(stock.get("code") or ""),
+        current_price,
+        project_root=Path(__file__).resolve().parent,
+    )
+    if cycle_pnl.get("available") is True:
+        profit_amount = float(cycle_pnl.get("cumulative_profit") or 0)
+        profit_rate = cycle_pnl.get("cumulative_rate")
+        profit_metric = replace(
+            profit_metric,
+            value1=format_signed_money(profit_amount),
+            value2=format_signed_percent(profit_rate, digits=2) if profit_rate is not None else "-",
+        )
+    else:
+        profit_amount = 0.0
+        profit_rate = 0.0
+        profit_metric = replace(profit_metric, value1="확인 필요", value2="-")
     buy_trade_count, sell_trade_count = trade_counts
     trade_metric = RatioMetricDisplay(
         label="매매",
@@ -1741,9 +1941,9 @@ def _routine_tree_stock_row(
         "description": "",
         "operation_status": "",
         "registered": 0,
-        "running": 0,
-        "stopped": 0,
-        "error": 0,
+        "excluded": 0,
+        "operation_or_stopped": 0,
+        "review": 0,
         "buy_limit_display": "",
         "consumed_display": "",
         "profit_display": "",
@@ -1801,7 +2001,13 @@ def _routine_monitor_sort_value(row: dict[str, object], column: int):
     if column == 1:
         return str(row.get("operation_status", "")).casefold()
     if column in {2, 3, 4, 5}:
-        return int(row.get(("registered", "running", "stopped", "error")[column - 2], 0) or 0)
+        return int(
+            row.get(
+                ("registered", "excluded", "operation_or_stopped", "review")[column - 2],
+                0,
+            )
+            or 0
+        )
     if column == 7:
         return int(row.get("buy_limit_amount", 0) or 0)
     return str(row.get("values", [""] * len(ROUTINE_MONITORING_HEADERS))[column]).casefold()
@@ -1820,6 +2026,18 @@ def main_load_routine_table(window) -> None:
         getattr(window, "_main_routine_excluded_only", False)
     )
     instance_counts = _instance_stock_counts(operation_excluded_only)
+    update_excluded_count = getattr(
+        window,
+        "_update_main_routine_excluded_count",
+        None,
+    )
+    if callable(update_excluded_count):
+        update_excluded_count(
+            sum(
+                int(values.get("excluded", 0) or 0)
+                for values in instance_counts.values()
+            )
+        )
     definitions = load_routine_definitions()
     instances = load_persisted_routine_instances()
     trade_counts_by_code = current_stock_trade_counts_by_code()
@@ -1874,7 +2092,7 @@ def main_load_routine_table(window) -> None:
                     "registered": 0,
                     "running": 0,
                     "stopped": 0,
-                    "error": 0,
+                    "review": 0,
                     "consumed_amount": 0,
                     "consumed_unknown": False,
                     "profit_amount": 0,
@@ -1924,15 +2142,27 @@ def main_load_routine_table(window) -> None:
                     "name": instance.display_name,
                     "description": instance.description,
                     "operation_status": routine_instance_operation_status(
-                        count["running"],
+                        count.get("operation_running", count.get("running", 0)),
                     ),
                     "registered": int(count["registered"]),
-                    "running": int(count["running"]),
-                    "stopped": int(count["stopped"]),
-                    "error": int(count["error"]),
+                    "operation_running": int(
+                        count.get("operation_running", count.get("running", 0)) or 0
+                    ),
+                    "review": int(count.get("review", count.get("error", 0)) or 0),
+                    "operation_or_stopped": int(
+                        count.get(
+                            "operation_or_stopped",
+                            max(
+                                0,
+                                int(count.get("registered", 0) or 0)
+                                - int(count.get("excluded", 0) or 0)
+                                - int(count.get("review", count.get("error", 0)) or 0),
+                            ),
+                        )
+                        or 0
+                    ),
                     "normal": int(count.get("normal", 0) or 0),
                     "excluded": int(count.get("excluded", 0) or 0),
-                    "review": int(count.get("review", count.get("error", 0)) or 0),
                     "buy_limit_enabled": instance.buy_limit_enabled,
                     "buy_limit_amount": instance.buy_limit_amount,
                     "buy_limit_configured": buy_limit_configured,
@@ -1951,6 +2181,7 @@ def main_load_routine_table(window) -> None:
                 }
             )
 
+        all_children = tuple(children)
         if bool(getattr(window, "_main_routine_valid_only", False)):
             if display_level == "group" and operation_excluded_only:
                 children = [
@@ -1968,23 +2199,31 @@ def main_load_routine_table(window) -> None:
                 if not children:
                     continue
 
-        parent_registered = sum(int(item["registered"]) for item in children)
-        parent_running = sum(int(item["running"]) for item in children)
-        parent_error = sum(int(item["error"]) for item in children)
-        parent_normal = sum(int(item.get("normal", 0) or 0) for item in children)
-        parent_excluded = sum(int(item.get("excluded", 0) or 0) for item in children)
-        parent_review = sum(int(item.get("review", item.get("error", 0)) or 0) for item in children)
-        parent_stopped = max(0, parent_registered - parent_running)
+        parent_registered = sum(int(item["registered"]) for item in all_children)
+        parent_operation_running = sum(
+            int(item["operation_running"]) for item in all_children
+        )
+        parent_operation_or_stopped = sum(
+            int(item["operation_or_stopped"]) for item in all_children
+        )
+        parent_normal = sum(
+            int(item.get("normal", 0) or 0) for item in all_children
+        )
+        parent_excluded = sum(
+            int(item.get("excluded", 0) or 0) for item in all_children
+        )
+        parent_review = sum(int(item["review"]) for item in all_children)
         groups.append(
             {
                 "kind": ROUTINE_ROW_PARENT,
                 "definition_id": definition.definition_id,
                 "name": definition.display_name,
-                "operation_status": "",
+                "operation_status": routine_instance_operation_status(
+                    parent_operation_running
+                ),
                 "registered": parent_registered,
-                "running": parent_running,
-                "stopped": parent_stopped,
-                "error": parent_error,
+                "operation_running": parent_operation_running,
+                "operation_or_stopped": parent_operation_or_stopped,
                 "normal": parent_normal,
                 "excluded": parent_excluded,
                 "review": parent_review,
@@ -2154,15 +2393,26 @@ def main_load_routine_table(window) -> None:
         usage_rate_text = ""
         profit_signal, profit_text, _profit_color = routine_profit_signal()
 
-        parent_aggregate = (
-            f"등록({row_data['registered']}) | 실행({row_data['running']}) | "
-            f"정지({row_data['stopped']}) | 오류({row_data['error']})"
+        operation_label = (
+            "운영"
+            if row_data.get("operation_status") == ROUTINE_STATUS_RUNNING
+            else "정지"
         )
-        child_aggregate = (
-            f"| 등록({row_data['registered']}) | 실행({row_data['running']}) | "
-            f"정지({row_data['stopped']}) | "
-            f"오류({row_data['error']})"
+        aggregate_values = (
+            ("등록", routine_instance_count_display(row_data.get("registered", 0))),
+            ("제외", routine_instance_count_display(row_data.get("excluded", 0))),
+            (
+                operation_label,
+                routine_instance_count_display(row_data.get("operation_or_stopped", 0)),
+            ),
+            ("검토", routine_instance_count_display(row_data.get("review", 0))),
         )
+        aggregate_slots = tuple(
+            f"{label}({number})" for label, number in aggregate_values
+        )
+        aggregate_text = " | ".join(aggregate_slots)
+        parent_aggregate = aggregate_text
+        child_aggregate = aggregate_text
         values = (
             [f"{prefix}{row_data['name']}"] + ([""] * 9)
             if is_parent
@@ -2170,9 +2420,9 @@ def main_load_routine_table(window) -> None:
                 str(row_data["name"]),
                 str(row_data.get("operation_status", "")),
                 str(row_data["registered"]),
-                str(row_data["running"]),
-                str(row_data["stopped"]),
-                str(row_data["error"]),
+                str(row_data["excluded"]),
+                str(row_data["operation_or_stopped"]),
+                str(row_data["review"]),
                 used_amount_text,
                 buy_limit_text,
                 usage_rate_text,
@@ -2201,6 +2451,10 @@ def main_load_routine_table(window) -> None:
                 if is_parent:
                     item.setData(ROUTINE_PARENT_NAME_ROLE, str(row_data["name"]))
                     item.setData(ROUTINE_PARENT_AGGREGATE_ROLE, parent_aggregate)
+                    item.setData(
+                        ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
+                        aggregate_values,
+                    )
                     item.setData(
                         ROUTINE_PARENT_COLLAPSED_ROLE,
                         bool(row_data.get("collapsed")),
@@ -2262,9 +2516,9 @@ def main_load_routine_table(window) -> None:
                     row_data.get("operation_status", ""),
                     instance_id=str(row_data.get("instance_id", "")),
                     registered=int(row_data["registered"]),
-                    running=int(row_data["running"]),
-                    stopped=int(row_data["stopped"]),
-                    error=int(row_data["error"]),
+                    excluded=int(row_data["excluded"]),
+                    operation_or_stopped=int(row_data["operation_or_stopped"]),
+                    review=int(row_data["review"]),
                     buy_limit_text=str(row_data.get("buy_limit_display", "")),
                     consumed_text=str(row_data.get("consumed_display", "")),
                     profit_text=str(row_data.get("profit_display", "")),

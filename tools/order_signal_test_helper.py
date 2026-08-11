@@ -90,8 +90,6 @@ def main() -> int:
     before_state = read_json_dict(stock_dir / "state.json")
     before_marker = {
         "status": before_state.get("status"),
-        "buy_enabled": before_state.get("buy_enabled"),
-        "sell_enabled": before_state.get("sell_enabled"),
         "close_routine_final_sell_ordered": before_state.get("close_routine_final_sell_ordered"),
         "close_routine_final_sell_ordered_at": before_state.get("close_routine_final_sell_ordered_at"),
     }
@@ -113,8 +111,6 @@ def main() -> int:
     after_state = read_json_dict(stock_dir / "state.json")
     after_marker = {
         "status": after_state.get("status"),
-        "buy_enabled": after_state.get("buy_enabled"),
-        "sell_enabled": after_state.get("sell_enabled"),
         "close_routine_final_sell_ordered": after_state.get("close_routine_final_sell_ordered"),
         "close_routine_final_sell_ordered_at": after_state.get("close_routine_final_sell_ordered_at"),
     }
