@@ -491,6 +491,8 @@ def show_monitor_stock_context_menu(
     callbacks: StockContextMenuCallbacks,
     selected_modes: set[str] | None = None,
     operation_excluded: bool = False,
+    operation_exclusion_action: str | None = None,
+    stock_register_enabled: bool | None = None,
 ) -> None:
     """Show the monitoring stock-row profile with the shared menu form."""
 
@@ -516,10 +518,13 @@ def show_monitor_stock_context_menu(
 
     action_set_exclusion = None
     action_clear_exclusion = None
-    if operation_excluded and callbacks.clear_operation_exclusion is not None:
+    exclusion_action = str(operation_exclusion_action or "").strip().lower()
+    if not exclusion_action:
+        exclusion_action = "clear" if operation_excluded else "set"
+    if exclusion_action == "clear" and callbacks.clear_operation_exclusion is not None:
         action_clear_exclusion = menu.addAction("제외해제")
         action_clear_exclusion.setEnabled(has_selection)
-    elif callbacks.set_operation_exclusion is not None:
+    elif exclusion_action == "set" and callbacks.set_operation_exclusion is not None:
         action_set_exclusion = menu.addAction("운영제외")
         action_set_exclusion.setEnabled(has_selection)
 
@@ -561,7 +566,11 @@ def show_monitor_stock_context_menu(
         menu.addSeparator()
         if callbacks.stock_register is not None:
             action_stock_register = menu.addAction("종목등록")
-            action_stock_register.setEnabled(has_selection)
+            action_stock_register.setEnabled(
+                has_selection
+                if stock_register_enabled is None
+                else bool(stock_register_enabled)
+            )
         if callbacks.unregister is not None:
             action_unregister = menu.addAction("등록해제")
             action_unregister.setEnabled(has_selection)
@@ -643,151 +652,87 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
     excluded_view = status_filter == "excluded"
     running_view = status_filter in {"running", "stopped"}
 
-    menu = _new_stock_context_menu(window)
-    operation_policy = _context_menu_operation_policy()
-
-    action_start = menu.addAction("운영시작")
-    action_start.setEnabled(has_selection)
-    action_emergency_stop = None
-    if has_non_emergency:
-        action_emergency_stop = menu.addAction("긴급정지")
-        action_emergency_stop.setEnabled(has_selection)
-    action_emergency_release = None
-    if has_emergency:
-        action_emergency_release = menu.addAction("정지해제")
-        action_emergency_release.setEnabled(has_selection)
-    menu.addSeparator()
-    action_select_all = menu.addAction("전체선택")
-    action_clear_selection = menu.addAction("선택해제")
-    action_set_exclusion = None
-    action_unregister = None
-    action_clear_exclusion = None
-    if excluded_view:
-        action_clear_exclusion = menu.addAction("제외해제")
-        action_clear_exclusion.setEnabled(has_selection)
-    else:
-        if running_view:
-            action_set_exclusion = menu.addAction("운영제외")
-            action_set_exclusion.setEnabled(has_selection)
-    action_stock_register = None
-    action_unregister = None
     stock_register_target = _stock_register_context_instance_metadata(window)
 
-    menu.addSeparator()
-    early_close = _add_early_close_menu(
-        menu,
-        has_selection=has_selection,
-        operation_excluded=operation_excluded,
-        operation_policy=operation_policy,
-    )
+    def window_callback(name: str):
+        callback = getattr(window, name, None)
+        return callback if callable(callback) else (lambda *_args, **_kwargs: None)
 
-    individual = _add_individual_liquidation_menu(
-        menu,
-        has_selection=has_selection,
-        operation_policy=operation_policy,
-    )
-
-    action_time_change = None
-    action_time_reset = None
-    ats_settings = None
-
-    if selected_modes == {"SCHEDULED"}:
-        menu.addSeparator()
-        action_time_change = menu.addAction("시간변경")
-        action_time_reset = menu.addAction("변경리셋")
-    elif selected_modes == {"CONTINUOUS"}:
-        menu.addSeparator()
-        ats_settings = _add_ats_settings_menu(
-            menu,
-            has_selection=has_selection,
-            state_getter=lambda: window.selected_manual_ats_state(selected),
-            toggle=window.set_selected_manual_ats_flag,
-            liquidation_available_getter=lambda: (
-                window.selected_manual_ats_liquidation_available(selected)
-            ),
-        )
-
-    if not excluded_view and (
-        stock_register_target is not None or has_selection
-    ):
-        menu.addSeparator()
-        if stock_register_target is not None:
-            action_stock_register = menu.addAction("종목등록")
-        action_unregister = menu.addAction("등록해제")
-        action_unregister.setEnabled(has_selection)
-
-    chosen = menu.exec_(window.stock_table.viewport().mapToGlobal(pos))
-    if chosen is None:
-        return
-
-    for minute, action in individual["time_actions"]:
-        if chosen == action:
-            window.apply_selected_individual_liquidation_method(
-                individual["method"],
-                minute,
+    callbacks = StockContextMenuCallbacks(
+        select_all=window_callback("select_all_current_routine_stocks"),
+        clear_selection=window_callback("clear_current_routine_stock_selection"),
+        start=window_callback("start_selected_rows_auto_trades"),
+        emergency_stop=(
+            window_callback("emergency_stop_selected_auto_trade_stocks")
+            if has_non_emergency
+            else None
+        ),
+        emergency_release=(
+            window_callback("release_selected_emergency_stopped_auto_trade_stocks")
+            if has_emergency
+            else None
+        ),
+        stock_register=(
+            (
+                lambda target=stock_register_target: (
+                    window.open_instance_stock_search_register_window(target)
+                )
             )
-            return
-
-    if chosen == action_start:
-        window.start_selected_rows_auto_trades()
-    elif action_emergency_stop is not None and chosen == action_emergency_stop:
-        window.emergency_stop_selected_auto_trade_stocks()
-    elif action_emergency_release is not None and chosen == action_emergency_release:
-        window.release_selected_emergency_stopped_auto_trade_stocks()
-    elif chosen == action_select_all:
-        window.select_all_current_routine_stocks()
-    elif chosen == action_clear_selection:
-        window.clear_current_routine_stock_selection()
-    elif action_set_exclusion is not None and chosen == action_set_exclusion:
-        window.set_selected_stock_operation_exclusions()
-    elif action_unregister is not None and chosen == action_unregister:
-        window.unregister_selected_auto_trade_stocks()
-    elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
-        window.clear_selected_stock_operation_exclusions()
-    elif action_stock_register is not None and chosen == action_stock_register:
-        window.open_instance_stock_search_register_window(stock_register_target)
-    elif chosen == individual["market"]:
-        window.apply_selected_individual_liquidation_method(
-            "시장가",
-            individual["minutes"],
-        )
-    elif chosen == individual["current"]:
-        window.apply_selected_individual_liquidation_method(
-            "현재가",
-            individual["minutes"],
-        )
-    elif chosen == individual["carry"]:
-        window.apply_selected_individual_liquidation_method(
-            "이월",
-            individual["minutes"],
-        )
-    elif _dispatch_early_close_action(
-        chosen,
-        early_close,
-        apply_method=lambda method: window.apply_selected_early_close(
+            if not excluded_view and stock_register_target is not None
+            else None
+        ),
+        unregister=(
+            window_callback("unregister_selected_auto_trade_stocks")
+            if not excluded_view and (stock_register_target is not None or has_selection)
+            else None
+        ),
+        early_close=lambda method: window_callback("apply_selected_early_close")(
             method,
             source="우클릭",
         ),
-        apply_profit_loss=window.apply_selected_early_close_profit_loss,
-        cancel=window.cancel_selected_early_close,
-    ):
-        return
-    elif action_time_change is not None and chosen == action_time_change:
-        window.set_selected_individual_schedule_time()
-    elif action_time_reset is not None and chosen == action_time_reset:
-        window.reset_selected_schedule_to_global()
-    elif ats_settings is not None and _dispatch_ats_settings_action(
-        chosen,
-        ats_settings,
-        toggle=window.set_selected_manual_ats_flag,
-        liquidate=lambda method, state, visible_keys, selected_sessions: (
-            window.execute_selected_manual_ats_liquidation(
-                method,
-                state,
-                selected,
-                visible_keys,
-                selected_sessions,
+        early_close_profit_loss=window_callback("apply_selected_early_close_profit_loss"),
+        early_close_cancel=window_callback("cancel_selected_early_close"),
+        individual_liquidation=window_callback(
+            "apply_selected_individual_liquidation_method"
+        ),
+        time_change=window_callback("set_selected_individual_schedule_time"),
+        time_reset=window_callback("reset_selected_schedule_to_global"),
+        ats_state=lambda: window_callback("selected_manual_ats_state")(selected),
+        ats_toggle=window_callback("set_selected_manual_ats_flag"),
+        ats_liquidation_available=lambda: (
+            window_callback("selected_manual_ats_liquidation_available")(selected)
+        ),
+        ats_liquidation=(
+            lambda method, state, visible_keys, selected_sessions: (
+                window_callback("execute_selected_manual_ats_liquidation")(
+                    method,
+                    state,
+                    selected,
+                    visible_keys,
+                    selected_sessions,
+                )
             )
         ),
-    ):
-        return
+        set_operation_exclusion=(
+            window_callback("set_selected_stock_operation_exclusions")
+            if running_view and not excluded_view
+            else None
+        ),
+        clear_operation_exclusion=(
+            window_callback("clear_selected_stock_operation_exclusions")
+            if excluded_view
+            else None
+        ),
+    )
+    show_monitor_stock_context_menu(
+        window,
+        window.stock_table.viewport().mapToGlobal(pos),
+        has_selection=has_selection,
+        callbacks=callbacks,
+        selected_modes=selected_modes,
+        operation_excluded=operation_excluded,
+        operation_exclusion_action=(
+            "clear" if excluded_view else "set" if running_view else "none"
+        ),
+        stock_register_enabled=stock_register_target is not None,
+    )

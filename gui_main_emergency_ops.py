@@ -19,6 +19,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import QMessageBox
 
 from gui_toast import show_toast
+from gui_operation_ui_context import refresh_auto_trade_views
 from gui_operation_ui_context import operation_dialog_parent
 from gui_common_utils import safe_int_value
 from gui_auto_trade_integrity import (
@@ -31,11 +32,13 @@ from gui_auto_trade_run_control import (
     _active_close_or_liquidation,
     _active_queue_reason,
 )
-from gui_config_utils import default_state
 from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
 from gui_review_required_window import auto_trade_setting_server_mismatch_detected
 from runtime_io import read_json_dict, read_orders_data
 from gui_auto_trade_runtime import write_state_json
+from gui_auto_trade_status_ops import append_changelog, append_stock_log, now_text
+from gui_auto_trade_runtime import parse_stock_folder_name
+from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_base_stock_service import update_base_stock_routines
 from operation_policy_gate import read_operation_state, write_global_emergency_stop_state
 from event_journal_production import append_production_event
@@ -43,14 +46,6 @@ from production_recovery_state_registry import (
     check_production_recovery_gate,
     production_recovery_registry,
 )
-from gui_auto_trade_setting_window import (
-    append_changelog,
-    append_stock_log,
-    now_text,
-    parse_stock_folder_name,
-)
-
-
 def has_emergency_stopped_stock(window) -> bool:
     """MainWindow 전체 종목 중 긴급정지 상태가 하나라도 있는지 확인한다."""
     for stock_dir in window.all_runtime_stock_dirs():
@@ -273,23 +268,16 @@ def update_runtime_stock_status(
     allow_review_state_transition: bool = False,
 ) -> bool:
     """메인창 긴급정지/정지해제 전용 state.json 상태 저장."""
-    state_path = stock_dir / "state.json"
-    state = read_json_dict(state_path)
-    if not isinstance(state, dict):
-        state = default_state()
-
-    before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-    state["status"] = new_status
-    state["updated_at"] = now_text()
-
-    if extra_state:
-        state.update(extra_state)
-
-    if not write_state_json(
+    mutation_result = mutate_runtime_stock_state(
         stock_dir,
-        state,
+        new_status,
+        extra_state,
+        updated_at=now_text(),
+        verify_readback=verify_readback,
         allow_review_state_transition=allow_review_state_transition,
-    ):
+    )
+    before_status = mutation_result.before_status
+    if not mutation_result.ok and mutation_result.reason == "WRITE_FAILED":
         QMessageBox.critical(
             window,
             "상태 저장 오류",
@@ -298,20 +286,13 @@ def update_runtime_stock_status(
         append_stock_log(stock_dir, "ERROR", f"상태 저장 실패: {before_status} -> {new_status}")
         return False
 
-    if verify_readback:
-        saved_state = read_json_dict(state_path)
-        expected_values = {"status": new_status}
-        if extra_state:
-            expected_values.update(extra_state)
-        if not isinstance(saved_state, dict) or any(
-            saved_state.get(key) != value for key, value in expected_values.items()
-        ):
-            append_stock_log(
-                stock_dir,
-                "ERROR",
-                f"상태 저장 재조회 불일치: {before_status} -> {new_status}",
-            )
-            return False
+    if not mutation_result.ok:
+        append_stock_log(
+            stock_dir,
+            "ERROR",
+            f"상태 저장 재조회 불일치: {before_status} -> {new_status}",
+        )
+        return False
 
     suffix_text = f" / {log_suffix}" if log_suffix else ""
     append_stock_log(stock_dir, "GUI", f"긴급정지 상태 변경: {before_status} -> {new_status}{suffix_text}")
@@ -597,9 +578,7 @@ def execute_selected_emergency_stop(
     if changed:
         append_changelog("UPDATE", "state.json", f"종목 긴급정지 실행: {' / '.join(changed)}")
 
-    refresh_all = getattr(window, "refresh_all", None)
-    if callable(refresh_all):
-        refresh_all()
+    refresh_auto_trade_views(window)
     status_message = getattr(window, "statusBarMessage", None)
     if callable(status_message):
         status_message(
@@ -709,9 +688,7 @@ def execute_selected_emergency_release(
             f"정상 {len(normal)}개 / 검토관리 {len(review)}개 / 실패 {len(failed)}개",
         )
 
-    refresh_all = getattr(window, "refresh_all", None)
-    if callable(refresh_all):
-        refresh_all()
+    refresh_auto_trade_views(window)
     status_message = getattr(window, "statusBarMessage", None)
     if callable(status_message):
         status_message(

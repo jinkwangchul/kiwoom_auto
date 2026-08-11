@@ -12,6 +12,7 @@ from event_journal_writer import EventJournalWriter
 import event_journal_production as production
 import gui_auto_trade_operation_host as operation_host_module
 import gui_auto_trade_setting_window as setting_window_module
+import gui_auto_trade_status_ops as status_ops_module
 import gui_main_emergency_ops as emergency_module
 
 
@@ -142,10 +143,10 @@ class EventJournalProductionConnectionTest(unittest.TestCase):
         )
         target = (stock_dir, "005930", "삼성전자")
         with (
-            patch.object(setting_window_module, "append_stock_log"),
-            patch.object(setting_window_module, "append_changelog"),
-            patch.object(setting_window_module, "show_toast"),
-            patch.object(setting_window_module, "append_production_event") as append,
+            patch.object(status_ops_module, "append_stock_log"),
+            patch.object(status_ops_module, "append_changelog"),
+            patch.object(status_ops_module, "show_toast"),
+            patch.object(status_ops_module, "append_production_event") as append,
         ):
             self.assertTrue(
                 setting_window_module.AutoTradeSettingWindow.set_stock_operation_exclusion(

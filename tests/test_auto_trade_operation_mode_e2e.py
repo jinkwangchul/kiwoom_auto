@@ -21,6 +21,15 @@ from state_policy import operation_mode_change_decision
 
 class AutoTradeOperationModeE2ETest(unittest.TestCase):
     def setUp(self) -> None:
+        self.isolated_project = tempfile.TemporaryDirectory()
+        self.addCleanup(self.isolated_project.cleanup)
+        self.changelog_patch = patch.object(
+            status_ops,
+            "CHANGELOG_PATH",
+            Path(self.isolated_project.name) / "PROJECT_CHANGELOG.txt",
+        )
+        self.changelog_patch.start()
+        self.addCleanup(self.changelog_patch.stop)
         self.clock_patch = patch.object(
             status_ops,
             "current_datetime",
@@ -821,6 +830,189 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_not_called()
+
+    def test_common_schedule_backend_applies_and_finalizes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, parent = self._window(stock_dir)
+            target = (stock_dir, "111111", "테스트종목")
+
+            with (
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+                patch.object(status_ops.QMessageBox, "warning") as warning,
+            ):
+                result = status_ops.auto_trade_apply_schedule_times_to_targets(
+                    window,
+                    [target],
+                    "09:10",
+                    "13:40:00",
+                )
+                window.refresh_all.assert_not_called()
+                parent.refresh_all.assert_not_called()
+                warning.assert_not_called()
+                status_ops.auto_trade_finalize_operation_mode_result(window, result)
+
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(1, result["succeeded"])
+        self.assertEqual(0, result["failed"])
+        self.assertEqual("SCHEDULED", saved["operation_mode"])
+        self.assertEqual("09:10:00", saved["start_time"])
+        self.assertEqual("13:40:00", saved["end_buy_time"])
+        window.refresh_all.assert_called_once_with()
+        parent.refresh_all.assert_called_once_with()
+
+    def test_common_schedule_backend_rejects_invalid_and_continuous_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scheduled_dir = self._stock(root / "scheduled")
+            continuous_dir = self._stock(root / "continuous", mode="CONTINUOUS")
+            window, _parent = self._window(scheduled_dir)
+            window.update_stock_operation_mode = Mock()
+            targets = [
+                (scheduled_dir, "111111", "시간종목"),
+                (continuous_dir, "222222", "수동종목"),
+            ]
+
+            invalid = status_ops.auto_trade_apply_schedule_times_to_targets(
+                window,
+                targets,
+                "13:30:00",
+                "09:00:00",
+            )
+            mixed = status_ops.auto_trade_apply_schedule_times_to_targets(
+                window,
+                [(continuous_dir, "222222", "수동종목")],
+                "09:00:00",
+                "13:30:00",
+            )
+
+        self.assertEqual(2, invalid["failed"])
+        self.assertEqual(0, invalid["succeeded"])
+        self.assertEqual(1, mixed["failed"])
+        self.assertIn("시간운영", mixed["results"][0]["reason"])
+        window.update_stock_operation_mode.assert_not_called()
+
+    def test_common_schedule_reset_uses_global_schedule_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock_dir = self._stock(Path(temp))
+            window, _parent = self._window(stock_dir)
+            target = (stock_dir, "111111", "테스트종목")
+
+            with (
+                patch.object(
+                    status_ops,
+                    "read_global_schedule",
+                    return_value={
+                        "start_time": "09:20:00",
+                        "end_buy_time": "14:10:00",
+                    },
+                ) as global_schedule,
+                patch.object(status_ops, "append_stock_log"),
+                patch.object(status_ops, "append_changelog"),
+            ):
+                result = status_ops.auto_trade_reset_schedule_times_for_targets(
+                    window,
+                    [target],
+                )
+
+            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+
+        global_schedule.assert_called_once_with()
+        self.assertEqual(1, result["succeeded"])
+        self.assertEqual("09:20:00", saved["start_time"])
+        self.assertEqual("14:10:00", saved["end_buy_time"])
+
+    def test_both_ui_adapters_delegate_schedule_apply_to_common_backend(self) -> None:
+        from PyQt5.QtWidgets import QDialog
+        import gui_auto_trade_setting_window as setting_window_module
+        import gui_main_stock_context_menu as monitoring_menu
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        target = (Path("stocks/111111_테스트종목"), "111111", "테스트종목")
+        result = {"requested": 1, "succeeded": 1, "failed": 0, "results": []}
+        dialog = Mock()
+        dialog.exec_.return_value = QDialog.Accepted
+        dialog.start_time.return_value = "09:10:00"
+        dialog.end_buy_time.return_value = "13:40:00"
+        setting_window = SimpleNamespace(
+            selected_stock_infos=lambda: [target],
+            parent=lambda: None,
+            refresh_all=Mock(),
+        )
+        monitoring_adapter = SimpleNamespace(
+            target_snapshot=lambda: [target],
+            _window=Mock(),
+            parent=lambda: None,
+            refresh_all=Mock(),
+        )
+
+        with (
+            patch.object(setting_window_module, "read_json_dict", return_value={"operation_mode": "SCHEDULED"}),
+            patch.object(setting_window_module, "effective_schedule_times", return_value=("09:00:00", "13:30:00", False)),
+            patch.object(setting_window_module, "ScheduleOperationDialog", return_value=dialog),
+            patch.object(setting_window_module, "auto_trade_apply_schedule_times_to_targets", return_value=result) as setting_backend,
+            patch.object(setting_window_module, "auto_trade_finalize_operation_mode_result") as setting_finalize,
+            patch.object(monitoring_menu, "read_json_dict", return_value={"operation_mode": "SCHEDULED"}),
+            patch.object(monitoring_menu, "effective_schedule_times", return_value=("09:00:00", "13:30:00", False)),
+            patch.object(monitoring_menu, "ScheduleOperationDialog", return_value=dialog),
+            patch.object(monitoring_menu, "auto_trade_apply_schedule_times_to_targets", return_value=result) as monitoring_backend,
+            patch.object(monitoring_menu, "auto_trade_finalize_operation_mode_result") as monitoring_finalize,
+        ):
+            AutoTradeSettingWindow.set_selected_individual_schedule_time(setting_window)
+            monitoring_menu.MainMonitoringStockOperationAdapter.set_selected_individual_schedule_time(
+                monitoring_adapter
+            )
+
+        setting_backend.assert_called_once_with(
+            setting_window,
+            [target],
+            "09:10:00",
+            "13:40:00",
+        )
+        monitoring_backend.assert_called_once_with(
+            monitoring_adapter,
+            [target],
+            "09:10:00",
+            "13:40:00",
+        )
+        setting_finalize.assert_called_once_with(setting_window, result)
+        monitoring_finalize.assert_called_once_with(monitoring_adapter, result)
+
+    def test_both_ui_adapters_delegate_schedule_reset_to_common_backend(self) -> None:
+        import gui_auto_trade_setting_window as setting_window_module
+        import gui_main_stock_context_menu as monitoring_menu
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        target = (Path("stocks/111111_테스트종목"), "111111", "테스트종목")
+        result = {"requested": 1, "succeeded": 1, "failed": 0, "results": []}
+        setting_window = SimpleNamespace(
+            selected_stock_infos=lambda: [target],
+            parent=lambda: None,
+            refresh_all=Mock(),
+        )
+        monitoring_adapter = SimpleNamespace(
+            target_snapshot=lambda: [target],
+            parent=lambda: None,
+            refresh_all=Mock(),
+        )
+
+        with (
+            patch.object(setting_window_module, "auto_trade_reset_schedule_times_for_targets", return_value=result) as setting_backend,
+            patch.object(setting_window_module, "auto_trade_finalize_operation_mode_result") as setting_finalize,
+            patch.object(monitoring_menu, "auto_trade_reset_schedule_times_for_targets", return_value=result) as monitoring_backend,
+            patch.object(monitoring_menu, "auto_trade_finalize_operation_mode_result") as monitoring_finalize,
+        ):
+            AutoTradeSettingWindow.reset_selected_schedule_to_global(setting_window)
+            monitoring_menu.MainMonitoringStockOperationAdapter.reset_selected_schedule_to_global(
+                monitoring_adapter
+            )
+
+        setting_backend.assert_called_once_with(setting_window, [target])
+        monitoring_backend.assert_called_once_with(monitoring_adapter, [target])
+        setting_finalize.assert_called_once_with(setting_window, result)
+        monitoring_finalize.assert_called_once_with(monitoring_adapter, result)
 
     def test_cancelled_schedule_dialog_does_not_write_or_refresh(self) -> None:
         from PyQt5.QtWidgets import QDialog

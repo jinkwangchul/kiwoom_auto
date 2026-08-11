@@ -2686,7 +2686,7 @@ class MainWindow(QMainWindow):
         """Refresh monitoring from canonical readers after an operation cycle."""
         if getattr(self, "_main_window_closing", False):
             return
-        self.refresh_all()
+        self.refresh_auto_trade_assignment_views()
 
     def _production_recovery_status_result(self) -> dict[str, object]:
         context = production_recovery_registry.snapshot()
@@ -3662,6 +3662,12 @@ class MainWindow(QMainWindow):
     def update_global_operation_button_state(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(self, [])
         adapter.update_global_operation_button_state()
+        window = getattr(self, "auto_trade_setting_window", None)
+        if window is None or sip.isdeleted(window):
+            return
+        update = getattr(window, "update_global_operation_button_state", None)
+        if callable(update):
+            update()
 
     def start_global_auto_trades(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(self, [])

@@ -152,6 +152,33 @@ class OperationCommandServiceTest(unittest.TestCase):
         self.assertFalse(state["buy_enabled"])
         self.assertTrue(state["sell_enabled"])
 
+    def test_early_close_no_target_cleanup_is_committed_by_command_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock = self._stock(root, "005930_Samsung")
+
+            result = self._service(root).apply_early_close(
+                OperationCommandRequest(
+                    SCOPE_STOCK,
+                    "005930",
+                    MODE_EARLY_CLOSE,
+                    "monitoring_window",
+                ),
+                EarlyCloseCompatibility(
+                    method="루틴",
+                    has_close_progress_quantity=False,
+                ),
+            )
+            state = self._state(stock)
+
+        self.assertEqual(RESULT_SUCCESS, result.status)
+        self.assertEqual("WAIT_BUY", state["status"])
+        self.assertTrue(state["trade_enabled"])
+        self.assertEqual("EARLY_CLOSE_NO_TARGET", state["operation_notice"])
+        self.assertEqual("", state["early_close_requested_at"])
+        self.assertEqual("", state["early_close_method"])
+        self.assertEqual({}, state["early_close_policy"])
+
     def test_duplicate_command_id_does_not_increment_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1787,6 +1814,8 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         ]
 
         with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(unregister, "CHANGELOG_PATH", Path(temp) / "PROJECT_CHANGELOG.txt"),
             patch.object(
                 unregister,
                 "auto_trade_unregister_category",
@@ -2629,6 +2658,7 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
 
             with (
                 patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
+                patch("gui_auto_trade_close.CHANGELOG_PATH", Path(temp) / "PROJECT_CHANGELOG.txt"),
                 patch("gui_auto_trade_close.OperationCommandService", return_value=OperationCommandService(Path(temp))),
             ):
                 auto_trade_cancel_selected_early_close(window)

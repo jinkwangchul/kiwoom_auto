@@ -78,7 +78,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             target = self._target(root, "000001")
             window = self._window()
             with (
-                patch.object(emergency_ops, "write_state_json", return_value=False),
+                patch("runtime_stock_state_mutation.write_state_json", return_value=False),
                 patch.object(emergency_ops.QMessageBox, "critical"),
                 patch.object(emergency_ops, "append_changelog"),
                 patch.object(emergency_ops, "append_stock_log"),
@@ -100,7 +100,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 "read_json_dict",
                 side_effect=[dict(initial), dict(initial), dict(initial)],
             ),
-            patch.object(emergency_ops, "write_state_json", return_value=True),
+            patch("runtime_stock_state_mutation.write_state_json", return_value=True),
             patch.object(emergency_ops, "_routine_name_for_emergency_release", return_value=""),
             patch.object(emergency_ops, "append_changelog"),
             patch.object(emergency_ops, "append_stock_log"),
@@ -172,7 +172,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                     dict(initial),
                 ],
             ),
-            patch.object(emergency_ops, "write_state_json", return_value=True),
+            patch("runtime_stock_state_mutation.write_state_json", return_value=True),
             patch.object(emergency_ops, "emergency_review_reason_for_stock", return_value=(False, "정상")),
             patch.object(emergency_ops, "_routine_name_for_emergency_release", return_value=""),
             patch.object(emergency_ops, "append_changelog"),

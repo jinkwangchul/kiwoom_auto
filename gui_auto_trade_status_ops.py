@@ -13,7 +13,9 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtWidgets import QMessageBox
-from gui_operation_ui_context import operation_dialog_parent
+from gui_operation_ui_context import operation_dialog_parent, refresh_auto_trade_views
+from gui_toast import show_toast
+from event_journal_production import append_production_event
 
 from gui_config_utils import default_config, default_state
 from gui_review_utils import review_reason_summary
@@ -22,7 +24,8 @@ from gui_schedule_utils import (
     schedule_config_updates,
 )
 from runtime_io import read_json_dict
-from gui_auto_trade_runtime import get_stock_dirs_in_routine, write_state_json
+from gui_auto_trade_runtime import get_stock_dirs_in_routine
+from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_order_utils import pending_order_side_quantities
 from gui_ats_utils import manual_ats_active_now
 from manual_ats_runtime import (
@@ -56,6 +59,7 @@ from gui_auto_trade_policy import (
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     is_emergency_stopped_state,
+    is_operation_excluded,
     is_review_required_state,
 )
 
@@ -73,6 +77,7 @@ EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
         "RECOVERY_IN_PROGRESS",
     }
 )
+OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -116,6 +121,158 @@ def append_stock_log(stock_dir: Path, event_type: str, message: str) -> Path | N
         return log_path
     except Exception:
         return None
+
+
+def auto_trade_stock_operation_excluded(stock_dir: Path) -> bool:
+    config = read_json_dict(Path(stock_dir) / "config.json")
+    return is_operation_excluded(config)
+
+
+def set_auto_trade_stock_operation_excluded(stock_dir: Path, excluded: bool) -> bool:
+    config_path = Path(stock_dir) / "config.json"
+    config = read_json_dict(config_path)
+    if not config_path.exists() or not isinstance(config, dict):
+        return False
+    if is_operation_excluded(config) == bool(excluded):
+        return True
+    config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
+    config["updated_at"] = now_text()
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
+def auto_trade_set_stock_operation_exclusion(
+    window,
+    target: tuple[Path, str, str],
+    excluded: bool,
+    *,
+    notify: bool = True,
+    refresh: bool = True,
+) -> bool:
+    message_parent_getter = getattr(window, "operation_message_parent", None)
+    message_parent = message_parent_getter() if callable(message_parent_getter) else window
+    stock_dir, code, name = target
+    config_path = stock_dir / "config.json"
+    config = read_json_dict(config_path) or default_config()
+    exclusion_changed = is_operation_excluded(config) != bool(excluded)
+    config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
+    config["updated_at"] = now_text()
+
+    try:
+        config_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        QMessageBox.critical(
+            message_parent,
+            "저장 오류",
+            f"{code} {name} 운영 제외 설정 저장 중 오류가 발생했습니다.\n\n{exc}",
+        )
+        return False
+
+    label = "운영 제외" if excluded else "운영 제외 해제"
+    toast_message = "운영종목에서 제외됐습니다." if excluded else "운영종목으로 전환됐습니다."
+    if exclusion_changed:
+        append_production_event(
+            "OPERATION_EXCLUDED" if excluded else "OPERATION_EXCLUSION_RELEASED",
+            result="COMPLETED",
+            source="AutoTradeSettingWindow.set_stock_operation_exclusion",
+            template_args={"stock_name": str(name or code)},
+            target_type="STOCK",
+            target_id=str(code),
+            target_name=str(name),
+            stock_code=str(code),
+            stock_name=str(name),
+        )
+    append_stock_log(stock_dir, "GUI", f"{label}: {code} {name}")
+    append_changelog("UPDATE", "config.json", f"{label}: {code} {name}")
+    if notify:
+        window.statusBarMessage(f"{code} {name} {label}")
+        show_toast(message_parent, toast_message)
+    if refresh:
+        refresh_auto_trade_views(window)
+    return True
+
+
+def auto_trade_toggle_stock_operation_exclusion(
+    window,
+    target: tuple[Path, str, str],
+) -> bool:
+    stock_dir, _code, _name = target
+    config = read_json_dict(stock_dir / "config.json") or default_config()
+    return auto_trade_set_stock_operation_exclusion(
+        window,
+        target,
+        not is_operation_excluded(config),
+    )
+
+
+def _set_selected_stock_operation_exclusions(window, excluded: bool) -> None:
+    message_parent_getter = getattr(window, "operation_message_parent", None)
+    message_parent = message_parent_getter() if callable(message_parent_getter) else window
+    selected = window.selected_stock_infos()
+    if not selected:
+        return
+
+    succeeded: list[str] = []
+    failed = 0
+    seen: set[str] = set()
+    for target in selected:
+        stock_dir, code, name = target
+        key = str(Path(stock_dir).resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        state = read_json_dict(stock_dir / "state.json")
+        config = read_json_dict(stock_dir / "config.json") or default_config()
+        if (
+            is_review_required_state(state)
+            or is_operation_excluded(config) == bool(excluded)
+        ):
+            failed += 1
+            continue
+        if auto_trade_set_stock_operation_exclusion(
+            window,
+            target,
+            excluded,
+            notify=False,
+            refresh=False,
+        ):
+            succeeded.append(name or code)
+        else:
+            failed += 1
+
+    if succeeded:
+        refresh_auto_trade_views(window)
+        if excluded:
+            one_message = f"{succeeded[0]}을 운영제외했습니다."
+            many_message = f"{len(succeeded)}개 종목을 운영제외했습니다."
+        else:
+            one_message = f"{succeeded[0]}의 운영제외를 해제했습니다."
+            many_message = f"{len(succeeded)}개 종목의 운영제외를 해제했습니다."
+        if len(succeeded) == 1 and failed == 0:
+            show_toast(message_parent, one_message)
+        elif failed:
+            show_toast(message_parent, f"{many_message} 실패 {failed}개")
+        else:
+            show_toast(message_parent, many_message)
+    elif failed:
+        show_toast(
+            message_parent,
+            "운영제외에 실패했습니다." if excluded else "운영제외 해제에 실패했습니다.",
+        )
+
+
+def auto_trade_set_selected_stock_operation_exclusions(window) -> None:
+    _set_selected_stock_operation_exclusions(window, True)
+
+
+def auto_trade_clear_selected_stock_operation_exclusions(window) -> None:
+    _set_selected_stock_operation_exclusions(window, False)
 
 
 
@@ -221,19 +378,20 @@ def auto_trade_update_stock_status(
     new_status_key = str(new_status or "").strip().upper()
     updated_at = now_text()
 
-    state["status"] = new_status
-    state["updated_at"] = updated_at
-
-    if extra_state:
-        state.update(extra_state)
-
+    mutation_metadata = dict(extra_state or {})
     if new_status_key in {"REVIEW_REQUIRED", "REVIEW"}:
         if before_status not in {"REVIEW_REQUIRED", "REVIEW"}:
-            state["review_entered_at"] = requested_review_entered_at or updated_at
+            mutation_metadata["review_entered_at"] = requested_review_entered_at or updated_at
         else:
-            state["review_entered_at"] = previous_review_entered_at
+            mutation_metadata["review_entered_at"] = previous_review_entered_at
 
-    if not write_state_json(stock_dir, state):
+    mutation_result = mutate_runtime_stock_state(
+        stock_dir,
+        new_status,
+        mutation_metadata,
+        updated_at=updated_at,
+    )
+    if not mutation_result.ok:
         if not bool(getattr(window, "_operation_start_batch_active", False)):
             QMessageBox.critical(
                 window,
@@ -827,6 +985,8 @@ def auto_trade_set_operation_mode_for_targets(
     selected: list[tuple[Path, str, str]],
     operation_mode: str,
     config_updates: dict[str, object] | None = None,
+    *,
+    finalize: bool = True,
 ) -> dict[str, object]:
     """Apply one operation-mode request to a fixed target snapshot."""
     targets = list(selected)
@@ -918,39 +1078,130 @@ def auto_trade_set_operation_mode_for_targets(
         )
         result["succeeded"] = int(result["succeeded"]) + 1
 
-    window.refresh_all()
-    parent = window.parent()
-    refresh_parent = getattr(parent, "refresh_all", None)
-    if callable(refresh_parent):
-        refresh_parent()
-
-    failed = int(result["failed"])
-    succeeded = int(result["succeeded"])
-    if failed:
-        failed_lines = [
-            f"{item['stock_code']} {item['stock_name']}: {item['reason']}"
-            for item in target_results
-            if not bool(item.get("success"))
-        ]
-        if len(targets) == 1:
-            message = "선택한 종목을 변경할 수 없습니다."
-        elif succeeded:
-            message = (
-                f"일부 종목의 운영방식/시간 설정을 변경하지 못했습니다.\n\n"
-                f"성공 {succeeded}개 / 실패 {failed}개\n"
-                + "\n".join(failed_lines[:10])
-            )
-        else:
-            message = (
-                "선택한 종목의 운영방식/시간 설정을 변경할 수 없습니다.\n\n"
-                + "\n".join(failed_lines[:10])
-            )
-        QMessageBox.warning(
-            dialog_parent,
-            "운영방식 변경",
-            message,
-        )
+    if finalize:
+        auto_trade_finalize_operation_mode_result(window, result)
     return result
+
+
+def auto_trade_finalize_operation_mode_result(
+    window,
+    result: dict[str, object],
+) -> None:
+    """Refresh UI adapters and present the existing operation-mode failure contract."""
+
+    refresh_auto_trade_views(window)
+
+    failed = int(result.get("failed", 0) or 0)
+    if not failed:
+        return
+
+    target_results = result.get("results")
+    items = target_results if isinstance(target_results, list) else []
+    failed_lines = [
+        f"{item['stock_code']} {item['stock_name']}: {item['reason']}"
+        for item in items
+        if isinstance(item, dict) and not bool(item.get("success"))
+    ]
+    requested = int(result.get("requested", 0) or 0)
+    succeeded = int(result.get("succeeded", 0) or 0)
+    if requested == 1:
+        message = "선택한 종목을 변경할 수 없습니다."
+    elif succeeded:
+        message = (
+            f"일부 종목의 운영방식/시간 설정을 변경하지 못했습니다.\n\n"
+            f"성공 {succeeded}개 / 실패 {failed}개\n"
+            + "\n".join(failed_lines[:10])
+        )
+    else:
+        message = (
+            "선택한 종목의 운영방식/시간 설정을 변경할 수 없습니다.\n\n"
+            + "\n".join(failed_lines[:10])
+        )
+    QMessageBox.warning(
+        operation_dialog_parent(window),
+        "운영방식 변경",
+        message,
+    )
+
+
+def auto_trade_apply_schedule_times_to_targets(
+    window,
+    selected: list[tuple[Path, str, str]],
+    start_time: object,
+    end_buy_time: object,
+) -> dict[str, object]:
+    """Apply one validated individual schedule request without UI side effects."""
+
+    targets = list(selected)
+    result: dict[str, object] = {
+        "requested": len(targets),
+        "succeeded": 0,
+        "failed": 0,
+        "results": [],
+    }
+    if not targets:
+        return result
+
+    valid, validation_reason = validate_buy_time_range(start_time, end_buy_time)
+    normalized_start = normalized_hhmmss_or_empty(start_time)
+    normalized_end = normalized_hhmmss_or_empty(end_buy_time)
+    eligible: list[tuple[Path, str, str]] = []
+    target_results = result["results"]
+    assert isinstance(target_results, list)
+
+    for stock_dir, code, name in targets:
+        reason = ""
+        if not valid:
+            reason = validation_reason
+        else:
+            config = read_json_dict(Path(stock_dir) / "config.json") or default_config()
+            if normalize_operation_mode(config.get("operation_mode", "SCHEDULED")) != "SCHEDULED":
+                reason = "시간 설정은 시간운영 종목에만 적용할 수 있습니다."
+        if reason:
+            target_results.append(
+                {
+                    "stock_code": code,
+                    "stock_name": name,
+                    "stock_dir": str(stock_dir),
+                    "success": False,
+                    "reason": reason,
+                }
+            )
+            result["failed"] = int(result["failed"]) + 1
+        else:
+            eligible.append((stock_dir, code, name))
+
+    if not eligible:
+        return result
+
+    applied = auto_trade_set_operation_mode_for_targets(
+        window,
+        eligible,
+        "SCHEDULED",
+        schedule_config_updates(normalized_start, normalized_end),
+        finalize=False,
+    )
+    applied_results = applied.get("results")
+    if isinstance(applied_results, list):
+        target_results.extend(applied_results)
+    result["succeeded"] = int(applied.get("succeeded", 0) or 0)
+    result["failed"] = int(result["failed"]) + int(applied.get("failed", 0) or 0)
+    return result
+
+
+def auto_trade_reset_schedule_times_for_targets(
+    window,
+    selected: list[tuple[Path, str, str]],
+) -> dict[str, object]:
+    """Reset individual schedules from the canonical global schedule source."""
+
+    global_schedule = read_global_schedule()
+    return auto_trade_apply_schedule_times_to_targets(
+        window,
+        selected,
+        global_schedule["start_time"],
+        global_schedule["end_buy_time"],
+    )
 
 
 def auto_trade_set_selected_operation_mode(

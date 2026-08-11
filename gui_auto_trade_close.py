@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from gui_operation_ui_context import operation_dialog_parent
+from gui_operation_ui_context import operation_dialog_parent, refresh_auto_trade_views
 
 from gui_common_utils import safe_int_value
 from gui_config_utils import default_config
@@ -992,7 +992,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
         }
 
     selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.refresh_all()
+    refresh_auto_trade_views(window)
     window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
     window._runtime_file_snapshot = window.current_runtime_file_signature()
     window.update_action_buttons()
@@ -1333,7 +1333,7 @@ def auto_trade_cancel_selected_early_close(window) -> None:
         return
 
     append_changelog("UPDATE", "state.json", f"조기마감 취소: {' / '.join(completed)}")
-    window.refresh_all()
+    refresh_auto_trade_views(window)
     window.stock_table.viewport().update()
     window.stock_table.repaint()
     notify(success_message)
@@ -1655,7 +1655,7 @@ def auto_trade_apply_selected_early_close(
             f"조기마감 상태 변경: {routine_name or '전체'} -> {' | '.join(changelog_parts)}",
         )
 
-    window.refresh_all()
+    refresh_auto_trade_views(window)
     window.stock_table.viewport().update()
     window.stock_table.repaint()
 

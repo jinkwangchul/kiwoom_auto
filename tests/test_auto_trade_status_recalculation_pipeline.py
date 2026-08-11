@@ -576,7 +576,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
-                patch.object(status_ops, "write_state_json", return_value=True),
+                patch("runtime_stock_state_mutation.write_state_json", return_value=True),
                 patch.object(status_ops, "append_stock_log"),
                 patch.object(status_ops, "append_changelog"),
             ):

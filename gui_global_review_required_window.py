@@ -36,6 +36,7 @@ from gui_order_utils import pending_order_side_quantities, format_number_value
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
 from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
+from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_auto_trade_setting_window import (
     append_changelog,
     append_stock_log,
@@ -499,10 +500,16 @@ class GlobalReviewRequiredWindow(QDialog):
             state["startup_reset_reason"] = ""
 
             try:
-                state_path.write_text(
-                    json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+                mutation_result = mutate_runtime_stock_state(
+                    stock_dir,
+                    "MONITORING",
+                    state,
+                    updated_at=str(state.get("updated_at", "") or ""),
+                    allow_review_state_transition=True,
                 )
+                if not mutation_result.ok:
+                    failed += 1
+                    continue
                 append_stock_log(stock_dir, "GUI", f"검토관리 복귀: {before_status} -> MONITORING")
                 changed += 1
             except Exception:
@@ -566,10 +573,16 @@ class GlobalReviewRequiredWindow(QDialog):
 
             try:
                 update_base_stock_routines(code, name, [])
-                state_path.write_text(
-                    json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+                mutation_result = mutate_runtime_stock_state(
+                    stock_dir,
+                    "STOPPED",
+                    state,
+                    updated_at=str(state.get("updated_at", "") or ""),
+                    allow_review_state_transition=True,
                 )
+                if not mutation_result.ok:
+                    failed += 1
+                    continue
                 append_stock_log(stock_dir, "GUI", f"검토관리 미지정 전환: {before_status} -> STOPPED")
                 changed += 1
             except Exception:

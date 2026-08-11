@@ -30,16 +30,13 @@ from gui_review_utils import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_runtime import (
-    now_text,
     parse_stock_folder_name,
     assigned_stock_dirs_in_routine,
-    write_state_json,
 )
 from gui_base_stock_service import read_base_stocks
 from state_policy import (
-    status_after_operation_mode_change,
+    status_after_operation_mode_change,  # compatibility patch point; projection delegates below
     operation_text_and_color,
-    normalize_operation_mode,
     operation_mode_display,
     real_trade_enabled,
     trade_permission_display,
@@ -53,7 +50,6 @@ from gui_auto_trade_display import (
     auto_trade_setting_status_sort_rank,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
-    display_status_text_for_gui,
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
@@ -62,7 +58,6 @@ from gui_auto_trade_display import (
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_policy import (
-    auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
     auto_trade_setting_early_close_metadata_is_stale,
@@ -70,11 +65,9 @@ from gui_auto_trade_policy import (
     auto_trade_setting_early_close_requested,
     auto_trade_setting_effective_liquidation_method,
     auto_trade_setting_has_close_progress_quantity,
-    auto_trade_setting_has_unresolved_quantity,
     auto_trade_setting_is_after_regular_end,
     auto_trade_setting_liquidation_active,
     auto_trade_setting_liquidation_completed_today,
-    auto_trade_setting_liquidation_phase_active,
     auto_trade_setting_liquidation_result_policy,
     auto_trade_setting_liquidation_text,
     auto_trade_setting_mark_liquidation_result_for_display,
@@ -238,17 +231,9 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
             holding_qty = safe_int_value(state.get("holding_qty"), 0)
             avg_price = average_price_from_state(state)
-            has_unresolved_qty = auto_trade_setting_has_unresolved_quantity(
-                holding_qty,
-                buy_pending_qty,
-                sell_pending_qty,
-            )
-
-            # 정규장 설정 종료 이후에는 마감/주황/조기마감 표시 원인을 화면/상태에 남기지 않는다.
-            # 마감 이벤트는 정규장 안에서만 유효하며, 장 종료 후에는 감시/대기 기준으로 복귀한다.
+            # 정규장 설정 종료 이후에는 마감/주황/조기마감 표시 원인을 화면에 남기지 않는다.
+            # 이 loader는 표시 projection만 계산하며 Runtime state는 변경하지 않는다.
             if auto_trade_setting_is_after_regular_end():
-                state_changed_after_regular_end = False
-
                 if str(state.get("operation_notice", "")).strip().upper() in {
                     "NO_CLOSE_TARGET",
                     "AUTO_CLOSE_NO_TARGET",
@@ -260,23 +245,16 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     state["operation_notice"] = ""
                     state["operation_notice_reason"] = ""
                     state["operation_notice_at"] = ""
-                    state_changed_after_regular_end = True
 
                 if auto_trade_setting_early_close_requested(state):
                     state = clear_early_close_runtime_metadata_only(dict(state))
                     state["status"] = "MONITORING"
                     state["trade_set_status"] = "WAIT_BUY"
-                    state_changed_after_regular_end = True
 
-                if state_changed_after_regular_end:
-                    state["updated_at"] = now_text()
-                    write_state_json(stock_dir, state)
-
-            # 정상 복귀/재시작/새 매매시작 이후 남은 조기마감 메타는 화면 표시 전에 정리한다.
+            # 정상 복귀/재시작/새 매매시작 이후 남은 조기마감 메타는
+            # persistence가 아니라 현재 표시 projection에서만 제외한다.
             if auto_trade_setting_early_close_metadata_is_stale(state):
-                clean_state = clear_early_close_runtime_metadata_only(dict(state))
-                if write_state_json(stock_dir, clean_state):
-                    state = clean_state
+                state = clear_early_close_runtime_metadata_only(dict(state))
 
             raw_status_for_cleanup = str(state.get("status", "")).strip().upper()
             close_runtime_active = auto_trade_setting_early_close_requested(state) or raw_status_for_cleanup in {
@@ -307,9 +285,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 and not has_close_progress_qty
                 and auto_trade_setting_no_next_step_notice(state)
             ):
-                clean_state = clear_auto_close_runtime_metadata(dict(state))
-                if write_state_json(stock_dir, clean_state):
-                    state = clean_state
+                state = clear_auto_close_runtime_metadata(dict(state))
 
             # 운영중 발생한 보유/미체결은 정상 매매 흐름이다.
             # 기존에는 아래 조건만으로 검토관리로 보냈다.
@@ -324,55 +300,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             # - 실제 청산 완료 후 잔여 확인 루틴
             # 따라서 refresh_all()/표시 갱신 경로에서는 보유/미체결만 보고 REVIEW_REQUIRED로 바꾸지 않는다.
 
-            # 화면 표시 상태는 state.json의 과거 status를 그대로 쓰지 않는다.
-            # 단, 매매시작 대상에서 제외된 종목(trade_enabled=False/STOPPED)은
-            # 현재 시간정책으로 다시 실행상태처럼 보이면 안 된다.
-            raw_state_status = state.get("status", "STOPPED")
             trade_started = auto_trade_setting_trade_started(state)
-            raw_status_key = str(raw_state_status or "STOPPED").strip().upper() or "STOPPED"
-
-            liquidation_phase_active = (
-                trade_started
-                and auto_trade_setting_liquidation_phase_active(config, holding_qty, state=state)
-            )
-
-            # 조기/자동마감 요청 후 진행 대상이 없으면 상태를 매수/매도로 재판정하지 않는다.
-            # 현황은 주황, 상태는 감시/대기, 방식/청산은 비활성으로 고정한다.
-            # 청산 절차에 들어가면 자동마감/조기마감 표시는 종료하고 감시/대기로 표시한다.
-            if auto_trade_setting_no_next_step_notice(state):
-                raw_display_status = display_status_text_for_gui("WAIT_BUY")
-            elif liquidation_phase_active:
-                raw_display_status = display_status_text_for_gui("WAIT_BUY")
-            elif (
-                not auto_trade_setting_is_after_regular_end()
-                and auto_trade_setting_early_close_requested(state)
-                and auto_trade_setting_has_close_progress_quantity(holding_qty, sell_pending_qty)
-            ):
-                raw_display_status = "조기마감"
-            elif auto_trade_setting_should_preserve_raw_status(state, raw_state_status):
-                raw_display_status = display_status_text_for_gui(raw_state_status)
-            elif raw_status_key in {"STOPPED", "STOP", "MANUAL_STOPPED"} or not trade_started:
-                raw_display_status = display_status_text_for_gui("STOPPED")
-            else:
-                mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-                policy_status = status_after_operation_mode_change(mode, config)
-                policy_display = auto_trade_setting_display_status(
-                    display_status_text_for_gui(policy_status)
-                )
-
-                # 시간정책 표시 원칙:
-                # - 시간운영: 개별/전역 매매 가능 시간 안에서만 매수/매도.
-                # - 수동운영: 정규장 또는 수동운영 추가시간 체크 구간 안에서만 매수/매도.
-                # - 시간 밖이면 현황 녹색/주황/시작 ON이어도 감시/대기로 표시한다.
-                # - 보유/미수/미도 유무만으로 감시/대기/매수매도를 바꾸지 않는다.
-                # - 자동마감/조기마감 상태 자체를 매수차단 사유로 보지 않는다.
-                # - 단, 실제 잔여 수량이 없으면 기존처럼 감시/대기로 표시한다.
-                if policy_display in ("자동마감", "조기마감") and not has_unresolved_qty:
-                    raw_display_status = display_status_text_for_gui("WAIT_BUY")
-                else:
-                    raw_display_status = display_status_text_for_gui(policy_status)
-
-            display_status = auto_trade_setting_display_status(raw_display_status)
             current_session_trade_started = auto_trade_setting_current_session_trade_started(
                 window,
                 trade_started,

@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QMessageBox
 from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_base_stock_service import update_base_stock_routines as update_base_stock_routines_from_service
 from gui_toast import show_toast
+from gui_operation_ui_context import refresh_auto_trade_views
 from gui_operation_ui_context import operation_dialog_parent
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -142,10 +143,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     )
 
     window.statusBar_message(f"루틴 등록해제 완료: {len(completed_items)}개")
-    parent = window.parent()
-    if parent is not None and hasattr(parent, "refresh_all"):
-        parent.refresh_all()
-    window.refresh_all()
+    refresh_auto_trade_views(window)
     show_toast(
         message_parent,
         unregister_result_toast_text(

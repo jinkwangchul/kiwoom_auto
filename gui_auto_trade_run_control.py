@@ -11,21 +11,33 @@ import math
 import re
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 
-from PyQt5.QtWidgets import QMessageBox, QWidget
+from PyQt5.QtWidgets import (
+    QMessageBox,
+    QWidget,
+)
 
 from gui_toast import show_toast
+from gui_operation_ui_context import refresh_auto_trade_views
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
-from gui_auto_trade_runtime import write_state_json
+from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_review_required_state,
     is_review_required_stock_dir,
     restart_initial_review_reason_for_stock,
 )
-from gui_auto_trade_policy import auto_trade_setting_trade_started
+from gui_auto_trade_policy import (
+    auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_trade_started,
+)
+from gui_auto_trade_runtime import all_registered_stock_dirs, parse_stock_folder_name
+from gui_auto_trade_status_ops import (
+    auto_trade_stock_operation_excluded,
+    set_auto_trade_stock_operation_excluded,
+)
 from gui_order_utils import order_current_pending_qty
 from gui_review_utils import review_required_for_start
 from execution_queue_writer import read_execution_queue_records
@@ -76,6 +88,126 @@ _LIQUIDATION_REQUEST_TERMINAL_STATUSES = {
     "FAILED",
     "ORDER_BLOCKED",
 }
+
+
+def today_global_operation_status(operation_state: dict[str, object]) -> str:
+    if not isinstance(operation_state, dict):
+        return ""
+    operation_date = str(operation_state.get("operation_date") or "").strip()
+    if operation_date != date.today().isoformat():
+        return ""
+    return str(operation_state.get("operation_status") or "").strip().upper()
+
+
+def auto_trade_registered_operation_targets() -> list[tuple[Path, str, str]]:
+    targets: list[tuple[Path, str, str]] = []
+    for stock_dir in all_registered_stock_dirs():
+        code, name = parse_stock_folder_name(stock_dir.name)
+        if code:
+            targets.append((stock_dir, code, name))
+    return targets
+
+
+def auto_trade_registered_operation_start_targets(window=None) -> list[tuple[Path, str, str]]:
+    target_getter = getattr(window, "registered_operation_targets", None)
+    registered = (
+        list(target_getter())
+        if callable(target_getter)
+        else auto_trade_registered_operation_targets()
+    )
+    return [
+        target
+        for target in registered
+        if not auto_trade_stock_operation_excluded(target[0])
+    ]
+
+
+def auto_trade_running_registered_operation_targets(window) -> list[tuple[Path, str, str]]:
+    running: list[tuple[Path, str, str]] = []
+    target_getter = getattr(window, "registered_operation_targets", None)
+    registered = (
+        list(target_getter())
+        if callable(target_getter)
+        else auto_trade_registered_operation_targets()
+    )
+    for target in registered:
+        if auto_trade_stock_operation_excluded(target[0]):
+            continue
+        state = read_json_dict(target[0] / "state.json")
+        if auto_trade_setting_current_session_trade_started(
+            window,
+            auto_trade_setting_trade_started(state),
+        ):
+            running.append(target)
+    return running
+
+
+def auto_trade_update_global_operation_button_state(window) -> None:
+    registered_getter = getattr(window, "registered_operation_targets", None)
+    running_getter = getattr(window, "running_registered_operation_targets", None)
+    registered = (
+        list(registered_getter())
+        if callable(registered_getter)
+        else auto_trade_registered_operation_targets()
+    )
+    running = (
+        list(running_getter())
+        if callable(running_getter)
+        else auto_trade_running_registered_operation_targets(window)
+    )
+    operation_state = read_operation_state()
+    operation_status = today_global_operation_status(operation_state)
+    global_normal_ended = operation_status == "NORMAL_ENDED"
+    global_running = operation_status in {"RUNNING", "CLOSING"}
+    global_emergency_stop = operation_state.get("emergency_stop") is True
+    if global_normal_ended:
+        text, foreground, background, hover_background = (
+            "운영종료", "#374151", "#F3F4F6", "#F3F4F6"
+        )
+    elif global_emergency_stop:
+        text, foreground, background, hover_background = (
+            "긴급정지", "#991B1B", "#FEF2F2", "#FEF2F2"
+        )
+    elif running or global_running:
+        text, foreground, background, hover_background = (
+            "운영중", "#374151", "#F3F4F6", "#F3F4F6"
+        )
+    else:
+        text, foreground, background, hover_background = (
+            "▶ 운영시작", "#15803D", "#F0FDF4", "#DCFCE7"
+        )
+
+    window.btn_start.setText(text)
+    window.btn_start.setStyleSheet(
+        "QPushButton {"
+        f"color: {foreground};"
+        f"border: 1px solid {foreground};"
+        f"background-color: {background};"
+        "font-weight: 600;"
+        "}"
+        "QPushButton:hover {"
+        f"color: {foreground};"
+        f"border-color: {foreground};"
+        f"background-color: {hover_background};"
+        "}"
+        "QPushButton:pressed {"
+        f"color: {foreground};"
+        f"border-color: {foreground};"
+        f"background-color: {hover_background};"
+        "}"
+        "QPushButton:disabled {"
+        "color: #9CA3AF;"
+        "border-color: #D1D5DB;"
+        "background-color: #F3F4F6;"
+        "}"
+    )
+    window.btn_start.setEnabled(
+        bool(registered)
+        and not bool(running)
+        and not global_running
+        and not global_emergency_stop
+        and not global_normal_ended
+    )
 
 
 def current_datetime() -> datetime:
@@ -858,7 +990,12 @@ def start_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
             }
         )
 
-        if write_state_json(stock_dir, state):
+        if mutate_runtime_stock_state(
+            stock_dir,
+            "MONITORING",
+            state,
+            updated_at=started_at,
+        ).ok:
             started.append(f"{code} {name}")
         else:
             failed.append(f"{code} {name}")
@@ -903,7 +1040,12 @@ def stop_signal_probe_only_for_selected_stocks(window) -> dict[str, object]:
             }
         )
 
-        if write_state_json(stock_dir, state):
+        if mutate_runtime_stock_state(
+            stock_dir,
+            "STOPPED",
+            state,
+            updated_at=stopped_at,
+        ).ok:
             stopped.append(f"{code} {name}")
         else:
             failed.append(f"{code} {name}")
@@ -1468,7 +1610,7 @@ def auto_trade_start_selected_auto_trades(
             LOGGER.exception("운영 시작 결과 로그 기록 실패")
 
     try:
-        window.refresh_all()
+        refresh_auto_trade_views(window)
         window.stock_table.viewport().update()
         window.stock_table.repaint()
     except Exception:
@@ -1582,6 +1724,110 @@ def auto_trade_start_selected_auto_trades(
         _show_start_failure_once(window, result)
     if review_required:
         window.open_review_required_window()
+    return result
+
+
+def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | None:
+    selected_targets = window.selected_stock_infos()
+    if not selected_targets:
+        return None
+
+    running_targets = window.running_registered_operation_targets()
+    global_running = today_global_operation_status(
+        read_operation_state()
+    ) in {"RUNNING", "CLOSING"}
+    running_keys = {
+        str(code or "").strip() or str(Path(stock_dir).resolve())
+        for stock_dir, code, _name in running_targets
+    }
+
+    if not running_targets and not global_running:
+        start_targets: list[tuple[Path, str, str]] = []
+        selected_keys: set[str] = set()
+        for target in selected_targets:
+            stock_dir, code, _name = target
+            key = str(code or "").strip() or str(Path(stock_dir).resolve())
+            selected_keys.add(key)
+            if auto_trade_stock_operation_excluded(stock_dir):
+                if not set_auto_trade_stock_operation_excluded(stock_dir, False):
+                    continue
+                if auto_trade_stock_operation_excluded(stock_dir):
+                    continue
+            start_targets.append(target)
+
+        if not start_targets:
+            refresh_auto_trade_views(window)
+            return None
+
+        result = auto_trade_start_selected_auto_trades(
+            window,
+            request_scope="multiple",
+            selected_targets=start_targets,
+            source="auto_trade_context_menu",
+        )
+        if result.get("ok") is True:
+            for stock_dir, code, _name in window.registered_operation_targets():
+                key = str(code or "").strip() or str(Path(stock_dir).resolve())
+                if key in selected_keys or is_review_required_stock_dir(stock_dir):
+                    continue
+                config = read_json_dict(stock_dir / "config.json")
+                if not str(config.get("assigned_routine_instance_id", "") or "").strip():
+                    continue
+                set_auto_trade_stock_operation_excluded(stock_dir, True)
+            refresh_auto_trade_views(window)
+            status_message = getattr(window, "statusBarMessage", None)
+            if callable(status_message):
+                status_message("정상 운영시작 되었습니다.")
+        window.update_global_operation_button_state()
+        return result
+
+    selected_running: list[tuple[Path, str, str]] = []
+    selected_inactive: list[tuple[Path, str, str]] = []
+    for target in selected_targets:
+        stock_dir, code, _name = target
+        key = str(code or "").strip() or str(Path(stock_dir).resolve())
+        if key in running_keys:
+            selected_running.append(target)
+        else:
+            selected_inactive.append(target)
+
+    if selected_running and not selected_inactive:
+        status_message = getattr(window, "statusBarMessage", None)
+        if callable(status_message):
+            status_message("운영중인 종목입니다.")
+        return {"ok": False, "reason": "ALREADY_RUNNING"}
+
+    if selected_running and selected_inactive:
+        status_message = getattr(window, "statusBarMessage", None)
+        if callable(status_message):
+            status_message("운영중인 종목이 포함되어 있습니다.")
+        return {"ok": False, "reason": "MIXED_RUNNING_SELECTION"}
+
+    start_targets: list[tuple[Path, str, str]] = []
+    for target in selected_inactive:
+        stock_dir, _code, _name = target
+        if auto_trade_stock_operation_excluded(stock_dir):
+            if not set_auto_trade_stock_operation_excluded(stock_dir, False):
+                continue
+            if auto_trade_stock_operation_excluded(stock_dir):
+                continue
+        start_targets.append(target)
+
+    if not start_targets:
+        refresh_auto_trade_views(window)
+        return None
+
+    result = auto_trade_start_selected_auto_trades(
+        window,
+        request_scope="multiple",
+        selected_targets=start_targets,
+        source="auto_trade_context_menu",
+    )
+    if result.get("ok") is True:
+        status_message = getattr(window, "statusBarMessage", None)
+        if callable(status_message):
+            status_message("정상 운영시작 되었습니다.")
+    window.update_global_operation_button_state()
     return result
 
 
@@ -1794,7 +2040,7 @@ def auto_trade_stop_selected_auto_trades(
             f"{' | '.join(changelog_parts)}",
         )
 
-    window.refresh_all()
+    refresh_auto_trade_views(window)
     window.stock_table.viewport().update()
     window.stock_table.repaint()
 

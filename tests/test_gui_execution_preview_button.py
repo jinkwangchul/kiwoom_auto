@@ -340,6 +340,17 @@ class _FakeDialog:
 
 
 class GuiExecutionPreviewButtonTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._realized_pnl_temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._realized_pnl_temp_dir.cleanup)
+        self._realized_pnl_path_patcher = mock.patch.object(
+            gui,
+            "REALIZED_PNL_LEDGER_PATH",
+            Path(self._realized_pnl_temp_dir.name) / "realized_pnl.json",
+        )
+        self._realized_pnl_path_patcher.start()
+        self.addCleanup(self._realized_pnl_path_patcher.stop)
+
     def test_startup_recovery_approval_is_bound_to_runtime_snapshot(self) -> None:
         window = main_gui.MainWindow.__new__(main_gui.MainWindow)
         window._startup_recovery_approved = True
@@ -510,7 +521,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         parent.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(parent)
         window.parent = lambda: parent
-        window.real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
+        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
         window.read_order_from_queue_by_id = lambda order_id, queue_path: {
             "ok": True,
             "order": {"id": str(order_id), "code": "005930"},
@@ -547,7 +558,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         parent.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(parent)
         window.parent = lambda: parent
-        window.real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
+        window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
         return window
 
     def _queue_write_preview_result(self) -> dict[str, object]:
@@ -1414,7 +1425,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_runtime_commit_helper_writes_existing_runtime_files_and_returns_identity(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         order = {
             "id": "ORDER_1",
             "status": "REAL_READY",
@@ -1467,7 +1478,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_runtime_commit_helper_initializes_missing_runtime_files_after_confirmation(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = lambda **kwargs: True
         order = {
             "id": "ORDER_1",
@@ -1508,7 +1519,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_runtime_file_init_cancel_blocks_without_creating_files(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = lambda **kwargs: False
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
@@ -1587,7 +1598,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_partial_runtime_files_create_only_missing_file_without_overwrite(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
@@ -1613,7 +1624,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_partial_runtime_files_create_missing_executions_without_overwriting_locks(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
@@ -1637,7 +1648,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_partial_runtime_files_block_when_existing_file_is_invalid(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
@@ -1657,7 +1668,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
     def test_invalid_existing_runtime_files_block_without_overwrite(self) -> None:
         window = self._window_for_queue_commit()
-        window.execution_runtime_environment_flags = self._runtime_environment_flags
+        window.order_execution_boundary().execution_runtime_environment_flags = self._runtime_environment_flags
         window.confirm_execution_runtime_file_init = mock.Mock(return_value=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             executions_path = gui.Path(temp_dir) / "order_executions.json"
@@ -2509,7 +2520,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                     current_queue_path,
                 )
             )
-            window.build_manual_final_send_gate_result = lambda *_args, **_kwargs: {
+            window.order_execution_boundary().build_manual_final_send_gate_result = lambda *_args, **_kwargs: {
                 "final_send_gate_ok": False,
                 "blocked_reasons": ["forced final gate failure"],
             }

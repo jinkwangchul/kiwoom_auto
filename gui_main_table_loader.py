@@ -68,15 +68,10 @@ from gui_auto_trade_display import (
     SORT_ROLE,
     SortableTableWidgetItem,
 )
-from gui_auto_trade_setting_window import (
-    auto_trade_setting_trade_started,
-    create_auto_trade_situation_item,
-    get_routine_dirs,
-    is_review_required_state,
-    routine_display_name,
-)
-from gui_auto_trade_integrity import is_operation_excluded
+from gui_auto_trade_situation import create_auto_trade_situation_item
+from gui_auto_trade_integrity import is_operation_excluded, is_review_required_state
 from gui_auto_trade_policy import (
+    auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
 )

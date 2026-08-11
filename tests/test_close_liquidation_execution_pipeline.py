@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import gui_auto_trade_close as close
 import gui_auto_trade_setting_window as gui
+import auto_trade_order_execution_boundary as execution_boundary
 import operation_policy_gate
 import order_queue
 from gui_auto_trade_policy import (
@@ -722,18 +723,19 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             "code": "000660",
         }
         window = Mock()
-        window._queue_data_for_manual_order_action.return_value = (
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
+        boundary._queue_data_for_manual_order_action = Mock(return_value=(
             {},
             [source, other],
             [],
-        )
-        window._pending_cancel_duplicate_reason.return_value = ""
-        window._build_manual_cancel_order_queued_preview.return_value = {
+        ))
+        boundary._pending_cancel_duplicate_reason = Mock(return_value="")
+        boundary._build_manual_cancel_order_queued_preview = Mock(return_value={
             "order_queued_record_preview": {"id": "ORDER_QUEUED_CANCEL"}
-        }
-        window.send_order_for_order_queued_automatically.return_value = {
+        })
+        boundary.send_order_for_order_queued_automatically = Mock(return_value={
             "queue_result_recorded": True
-        }
+        })
         with (
             patch.object(
                 gui.AutoTradeSettingWindow,
@@ -741,7 +743,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                 return_value={"revision": 1, "sha256": "same"},
             ),
             patch.object(
-                gui,
+                execution_boundary,
                 "commit_execution_queue_write",
                 return_value={
                     "committed": True,
@@ -772,7 +774,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             ],
         )
         commit.assert_called_once()
-        window.send_order_for_order_queued_automatically.assert_called_once()
+        boundary.send_order_for_order_queued_automatically.assert_called_once()
 
     def test_cancel_pipeline_rejects_display_name_as_routine_identity(self):
         source = {
@@ -787,11 +789,12 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             "order_action": "NEW",
         }
         window = Mock()
-        window._queue_data_for_manual_order_action.return_value = (
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
+        boundary._queue_data_for_manual_order_action = Mock(return_value=(
             {},
             [source],
             [],
-        )
+        ))
         result = (
             gui.AutoTradeSettingWindow
             .queue_pending_order_cancellations_for_stock_automatically(
@@ -822,11 +825,12 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             "order_action": "NEW",
         }
         window = Mock()
-        window._queue_data_for_manual_order_action.return_value = (
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
+        boundary._queue_data_for_manual_order_action = Mock(return_value=(
             {},
             [source],
             [],
-        )
+        ))
         result = (
             gui.AutoTradeSettingWindow
             .queue_pending_order_cancellations_for_stock_automatically(
@@ -839,7 +843,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["cancel_requested"], 0)
-        window._build_manual_cancel_order_queued_preview.assert_not_called()
+        self.assertNotIn("_build_manual_cancel_order_queued_preview", boundary.__dict__)
 
     def test_cancel_pipeline_fails_closed_when_scope_identity_is_missing(self):
         source = {
@@ -854,11 +858,12 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             "order_action": "NEW",
         }
         window = Mock()
-        window._queue_data_for_manual_order_action.return_value = (
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
+        boundary._queue_data_for_manual_order_action = Mock(return_value=(
             {},
             [source],
             [],
-        )
+        ))
         result = (
             gui.AutoTradeSettingWindow
             .queue_pending_order_cancellations_for_stock_automatically(
@@ -914,6 +919,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
 
     def test_routine_close_orders_follow_final_sell_marker_at_auto_execution_gate(self):
         window = Mock()
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
         base_state = {
             "status": "EARLY_CLOSE",
             "trade_enabled": True,
@@ -925,20 +931,20 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         }
 
         for side in ("BUY", "SELL"):
-            window.auto_trade_runtime_state_for_order.return_value = {
+            boundary.auto_trade_runtime_state_for_order = Mock(return_value={
                 "found": True,
                 "state": dict(base_state, close_routine_final_sell_ordered=False),
-            }
+            })
             reasons = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
                 window,
                 {"side": side},
             )
             self.assertEqual(reasons, [], side)
 
-            window.auto_trade_runtime_state_for_order.return_value = {
+            boundary.auto_trade_runtime_state_for_order = Mock(return_value={
                 "found": True,
                 "state": dict(base_state, close_routine_final_sell_ordered=True),
-            }
+            })
             blocked = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
                 window,
                 {"side": side},
@@ -964,7 +970,8 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
 
     def test_auto_close_routine_allows_buy_before_final_sell_at_auto_execution_gate(self):
         window = Mock()
-        window.auto_trade_runtime_state_for_order.return_value = {
+        boundary = gui.AutoTradeSettingWindow.order_execution_boundary(window)
+        boundary.auto_trade_runtime_state_for_order = Mock(return_value={
             "found": True,
             "state": {
                 "status": "AUTO_CLOSE",
@@ -976,7 +983,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                 "auto_close_method": "루틴매도신호",
                 "close_routine_final_sell_ordered": False,
             },
-        }
+        })
         self.assertEqual(
             [],
             gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(

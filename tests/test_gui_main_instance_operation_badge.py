@@ -203,8 +203,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
         with (
             patch.object(
-                gui_windows.AutoTradeSettingWindow,
-                "start_selected_rows_auto_trades",
+                context_menu,
+                "auto_trade_start_selected_rows_auto_trades",
                 return_value={"ok": True, "reason": "STARTED"},
             ) as start_orchestration,
             patch.object(
@@ -268,13 +268,13 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             ]
             adapter.registered_operation_targets = lambda: registered
             adapter.running_registered_operation_targets = lambda: []
-            adapter.refresh_all = Mock()
+            adapter.refresh_auto_trade_assignment_views = Mock()
             adapter.update_global_operation_button_state = Mock()
 
             with (
-                patch.object(setting_window, "read_operation_state", return_value={}),
+                patch.object(run_control, "read_operation_state", return_value={}),
                 patch.object(
-                    setting_window,
+                    run_control,
                     "auto_trade_start_selected_auto_trades",
                     return_value={"ok": True, "reason": "STARTED"},
                 ) as start_backend,
@@ -339,13 +339,13 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             adapter.running_registered_operation_targets = lambda: [
                 (targets[0].stock_dir, targets[0].code, targets[0].name)
             ]
-            adapter.refresh_all = Mock()
+            adapter.refresh_auto_trade_assignment_views = Mock()
             adapter.update_global_operation_button_state = Mock()
 
             with (
-                patch.object(setting_window, "read_operation_state", return_value={}),
+                patch.object(run_control, "read_operation_state", return_value={}),
                 patch.object(
-                    setting_window,
+                    run_control,
                     "auto_trade_start_selected_auto_trades",
                     return_value={"ok": True, "reason": "STARTED"},
                 ) as start_backend,
@@ -391,8 +391,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         ]
 
         with (
-            patch.object(setting_window, "read_operation_state", return_value={}),
-            patch.object(setting_window, "auto_trade_start_selected_auto_trades") as backend,
+            patch.object(run_control, "read_operation_state", return_value={}),
+            patch.object(run_control, "auto_trade_start_selected_auto_trades") as backend,
         ):
             result = adapter.start_selected_auto_trades()
 
@@ -401,21 +401,49 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         backend.assert_not_called()
         parent.close()
 
-    def test_monitor_operation_adapter_refreshes_both_open_windows(self) -> None:
+    def test_monitor_operation_adapter_requests_owner_view_synchronization(self) -> None:
         parent = QWidget()
         parent.routine_table = QTableWidget()
         parent.refresh_all = Mock()
-        setting_window_widget = QWidget()
-        setting_window_widget.refresh_all = Mock()
-        parent.auto_trade_setting_window = setting_window_widget
+        parent.refresh_auto_trade_assignment_views = Mock()
         adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [])
 
         adapter.refresh_all()
 
-        parent.refresh_all.assert_called_once_with()
+        parent.refresh_auto_trade_assignment_views.assert_called_once_with()
+        parent.refresh_all.assert_not_called()
+        parent.close()
+
+    def test_owner_synchronization_refreshes_each_open_view_once(self) -> None:
+        setting_window_widget = QWidget()
+        setting_window_widget.refresh_all = Mock()
+        owner = SimpleNamespace(
+            refresh_all=Mock(),
+            auto_trade_setting_window=setting_window_widget,
+        )
+
+        with patch.object(gui_windows.sip, "isdeleted", return_value=False):
+            gui_windows.MainWindow.refresh_auto_trade_assignment_views(owner)
+
+        owner.refresh_all.assert_called_once_with()
         setting_window_widget.refresh_all.assert_called_once_with()
         setting_window_widget.close()
-        parent.close()
+
+    def test_owner_synchronization_drops_deleted_settings_window(self) -> None:
+        setting_window_widget = QWidget()
+        setting_window_widget.refresh_all = Mock()
+        owner = SimpleNamespace(
+            refresh_all=Mock(),
+            auto_trade_setting_window=setting_window_widget,
+        )
+
+        with patch.object(gui_windows.sip, "isdeleted", return_value=True):
+            gui_windows.MainWindow.refresh_auto_trade_assignment_views(owner)
+
+        owner.refresh_all.assert_called_once_with()
+        setting_window_widget.refresh_all.assert_not_called()
+        self.assertIsNone(owner.auto_trade_setting_window)
+        setting_window_widget.close()
 
     def test_monitoring_bottom_start_reuses_setting_global_orchestration(self) -> None:
         window = SimpleNamespace()
@@ -461,7 +489,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
             with (
                 patch.object(
-                    setting_window,
+                    run_control,
                     "all_registered_stock_dirs",
                     return_value=[included_dir, excluded_dir],
                 ),
@@ -503,7 +531,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             running_registered_operation_targets=adapter.running_registered_operation_targets,
         )
 
-        with patch.object(setting_window, "read_operation_state", return_value={}):
+        with patch.object(run_control, "read_operation_state", return_value={}):
             setting_window.AutoTradeSettingWindow.update_global_operation_button_state(
                 setting_host
             )
@@ -564,14 +592,14 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
         with (
             patch(
-                "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                "gui_auto_trade_run_control.all_registered_stock_dirs",
                 return_value=stock_dirs,
             ),
             patch(
                 "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
             ) as start_backend,
             patch(
-                "gui_auto_trade_setting_window.auto_trade_stock_operation_excluded",
+                "gui_auto_trade_run_control.auto_trade_stock_operation_excluded",
                 return_value=False,
             ),
         ):
@@ -622,7 +650,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
             with (
                 patch(
-                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    "gui_auto_trade_run_control.all_registered_stock_dirs",
                     return_value=[included_dir, excluded_dir],
                 ),
                 patch(
@@ -673,7 +701,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
             with (
                 patch(
-                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    "gui_auto_trade_run_control.all_registered_stock_dirs",
                     return_value=[running_dir, stopped_dir],
                 ),
                 patch(
@@ -728,7 +756,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
 
         with patch(
-            "gui_auto_trade_setting_window.all_registered_stock_dirs",
+            "gui_auto_trade_run_control.all_registered_stock_dirs",
             return_value=[Path("stocks/005930_삼성전자")],
         ):
             gui_windows.AutoTradeSettingWindow.update_startup_recovery_controls(window)
@@ -766,11 +794,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
             with (
                 patch(
-                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    "gui_auto_trade_run_control.all_registered_stock_dirs",
                     return_value=[running_dir, stopped_dir],
                 ),
                 patch(
-                    "gui_auto_trade_setting_window.read_operation_state",
+                    "gui_auto_trade_run_control.read_operation_state",
                     return_value={"emergency_stop": False, "operation_status": ""},
                 ),
             ):
@@ -788,11 +816,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window.btn_start.reset_mock()
             with (
                 patch(
-                    "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                    "gui_auto_trade_run_control.all_registered_stock_dirs",
                     return_value=[running_dir, stopped_dir],
                 ),
                 patch(
-                    "gui_auto_trade_setting_window.read_operation_state",
+                    "gui_auto_trade_run_control.read_operation_state",
                     return_value={"emergency_stop": False, "operation_status": ""},
                 ),
             ):
@@ -946,26 +974,33 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertEqual(set(), window._operation_start_inflight_stock_codes)
 
     def test_selected_rows_context_start_is_always_multiple(self) -> None:
-        selected = [(Path("stocks/005930_삼성전자"), "005930", "삼성전자")]
-        window = SimpleNamespace(
-            selected_stock_infos=Mock(return_value=selected),
-            running_registered_operation_targets=Mock(return_value=[]),
-            registered_operation_targets=Mock(return_value=selected),
-            refresh_all=Mock(),
-            update_global_operation_button_state=Mock(),
-        )
+        with TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(
+                json.dumps({"operation_excluded": False}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            selected = [(stock_dir, "005930", "삼성전자")]
+            window = SimpleNamespace(
+                selected_stock_infos=Mock(return_value=selected),
+                running_registered_operation_targets=Mock(return_value=[]),
+                registered_operation_targets=Mock(return_value=selected),
+                refresh_all=Mock(),
+                update_global_operation_button_state=Mock(),
+            )
 
-        with (
-            patch(
-                "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades",
-                return_value={"ok": False},
-            ) as backend,
-            patch(
-                "gui_auto_trade_setting_window.read_operation_state",
-                return_value={},
-            ),
-        ):
-            gui_windows.AutoTradeSettingWindow.start_selected_rows_auto_trades(window)
+            with (
+                patch(
+                    "gui_auto_trade_run_control.auto_trade_start_selected_auto_trades",
+                    return_value={"ok": False},
+                ) as backend,
+                patch(
+                    "gui_auto_trade_run_control.read_operation_state",
+                    return_value={},
+                ),
+            ):
+                gui_windows.AutoTradeSettingWindow.start_selected_rows_auto_trades(window)
 
         call = backend.call_args
         self.assertEqual("multiple", call.kwargs["request_scope"])
@@ -980,7 +1015,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         window = SimpleNamespace(selected_stock_infos=Mock(return_value=selected))
 
         with patch(
-            "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
+            "gui_auto_trade_run_control.auto_trade_start_selected_auto_trades"
         ) as backend:
             with self.assertRaises(AttributeError):
                 gui_windows.AutoTradeSettingWindow.start_selected_rows_auto_trades(window)

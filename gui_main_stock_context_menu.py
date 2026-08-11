@@ -6,9 +6,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from PyQt5 import sip
 from PyQt5.QtCore import QItemSelectionModel
-from PyQt5.QtWidgets import QDialog
+from PyQt5.QtWidgets import (
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+)
 
 from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close,
@@ -17,13 +23,30 @@ from gui_auto_trade_close import (
     auto_trade_cancel_selected_early_close,
 )
 from gui_auto_trade_run_control import (
+    auto_trade_registered_operation_start_targets,
+    auto_trade_registered_operation_targets,
+    auto_trade_running_registered_operation_targets,
+    auto_trade_start_selected_rows_auto_trades,
     auto_trade_stop_selected_auto_trades,
+    auto_trade_update_global_operation_button_state,
     show_auto_trade_operation_failure_dialog,
     startup_recovery_operation_block_message,
 )
 from gui_auto_trade_status_ops import (
+    auto_trade_apply_schedule_times_to_targets,
+    auto_trade_clear_selected_stock_operation_exclusions,
+    auto_trade_finalize_operation_mode_result,
+    auto_trade_reset_schedule_times_for_targets,
+    auto_trade_set_selected_stock_operation_exclusions,
+    auto_trade_set_stock_operation_exclusion,
+    auto_trade_toggle_stock_operation_exclusion,
     auto_trade_set_operation_mode_for_targets,
     handle_auto_trade_operation_mode_double_click,
+)
+from gui_auto_trade_unregister import unregister_selected_auto_trade_stocks
+from gui_main_emergency_ops import (
+    execute_selected_emergency_release,
+    execute_selected_emergency_stop,
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
@@ -37,7 +60,6 @@ from gui_auto_trade_context_menu import (
     show_monitor_stock_context_menu,
 )
 from gui_config_utils import default_config
-from gui_schedule_utils import schedule_config_updates
 from gui_schedule_window import ScheduleOperationDialog
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
@@ -56,7 +78,6 @@ from runtime_io import read_json_dict
 from state_policy import (
     effective_schedule_times,
     normalize_operation_mode,
-    read_global_schedule,
 )
 
 
@@ -69,6 +90,97 @@ class MainMonitoringStockTarget:
     code: str
     name: str
     routine_instance_id: str
+
+
+def _confirm_monitoring_stop_targets_once(adapter, selected) -> bool:
+    stop_items: list[str] = []
+    review_items: list[str] = []
+    for stock_dir, code, name in selected:
+        risk_parts = adapter.stop_risk_parts(stock_dir)
+        target_text = f"{code} {name}"
+        if risk_parts:
+            review_items.append(f"{target_text}({', '.join(risk_parts)})")
+        else:
+            stop_items.append(target_text)
+
+    def preview_lines(title: str, items: list[str]) -> str:
+        if not items:
+            return f"{title}: 없음"
+        preview = "\n".join(f"- {item}" for item in items[:12])
+        if len(items) > 12:
+            preview += f"\n- 외 {len(items) - 12}개"
+        return f"{title}:\n{preview}"
+
+    dialog = QDialog(adapter.operation_message_parent())
+    dialog.setWindowTitle("강제종료 확인")
+    dialog.resize(420, 360)
+    layout = QVBoxLayout()
+    layout.setContentsMargins(18, 16, 18, 14)
+    layout.setSpacing(10)
+    title_label = QLabel("강제종료 선택종목")
+    title_font = title_label.font()
+    title_font.setBold(True)
+    title_font.setPointSize(title_font.pointSize() + 1)
+    title_label.setFont(title_font)
+    layout.addWidget(title_label)
+    body = QTextEdit()
+    body.setReadOnly(True)
+    body.setPlainText(
+        f"{preview_lines('중지 대상', stop_items)}\n\n"
+        f"{preview_lines('검토관리 대상', review_items)}"
+    )
+    body.setMinimumHeight(210)
+    body.setLineWrapMode(QTextEdit.NoWrap)
+    layout.addWidget(body)
+    layout.addWidget(QLabel("진행하시겠습니까?"))
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    proceed_button = QPushButton("진행")
+    cancel_button = QPushButton("취소")
+    proceed_button.setMinimumWidth(80)
+    cancel_button.setMinimumWidth(80)
+    proceed_button.clicked.connect(dialog.accept)
+    cancel_button.clicked.connect(dialog.reject)
+    buttons.addWidget(proceed_button)
+    buttons.addWidget(cancel_button)
+    layout.addLayout(buttons)
+    dialog.setLayout(layout)
+    return dialog.exec_() == QDialog.Accepted
+
+
+def _show_monitoring_auto_trade_result_dialog(
+    parent,
+    title: str,
+    heading: str,
+    lines: list[str],
+) -> None:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(420, 320)
+    layout = QVBoxLayout()
+    layout.setContentsMargins(18, 16, 18, 14)
+    layout.setSpacing(10)
+    title_label = QLabel(heading)
+    title_font = title_label.font()
+    title_font.setBold(True)
+    title_font.setPointSize(title_font.pointSize() + 1)
+    title_label.setFont(title_font)
+    layout.addWidget(title_label)
+    body = QTextEdit()
+    body.setReadOnly(True)
+    body.setPlainText("\n".join(lines))
+    body.setMinimumHeight(180)
+    body.setLineWrapMode(QTextEdit.NoWrap)
+    layout.addWidget(body)
+    buttons = QHBoxLayout()
+    buttons.addStretch(1)
+    ok_button = QPushButton("확인")
+    ok_button.setMinimumWidth(80)
+    ok_button.clicked.connect(dialog.accept)
+    buttons.addWidget(ok_button)
+    layout.addLayout(buttons)
+    dialog.setLayout(layout)
+    dialog.exec_()
 
 
 def _stock_target_for_row(window, row: int) -> MainMonitoringStockTarget | None:
@@ -260,14 +372,20 @@ class MainMonitoringStockOperationAdapter:
         self.stock_table.verticalScrollBar().setValue(scroll_value)
 
     def refresh_all(self) -> None:
+        self.refresh_auto_trade_assignment_views()
+
+    def refresh_auto_trade_assignment_views(self) -> None:
         selected_paths, scroll_value = self.capture_stock_table_view_state()
-        self._window.refresh_all()
+        refresh_views = getattr(
+            self._window,
+            "refresh_auto_trade_assignment_views",
+            None,
+        )
+        if callable(refresh_views):
+            refresh_views()
+        else:
+            self._window.refresh_all()
         self.restore_stock_table_view_state(selected_paths, scroll_value)
-        window = getattr(self._window, "auto_trade_setting_window", None)
-        if window is not None and not sip.isdeleted(window):
-            refresh = getattr(window, "refresh_all", None)
-            if callable(refresh):
-                refresh()
 
     def update_action_buttons(self) -> None:
         return
@@ -290,9 +408,7 @@ class MainMonitoringStockOperationAdapter:
         notify: bool = True,
         refresh: bool = True,
     ) -> bool:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.set_stock_operation_exclusion(
+        return auto_trade_set_stock_operation_exclusion(
             self,
             target,
             excluded,
@@ -304,69 +420,36 @@ class MainMonitoringStockOperationAdapter:
         self,
         target: tuple[Path, str, str],
     ) -> bool:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.toggle_stock_operation_exclusion(
-            self,
-            target,
-        )
+        return auto_trade_toggle_stock_operation_exclusion(self, target)
 
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.registered_operation_targets(self)
+        return auto_trade_registered_operation_targets()
 
     def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.registered_operation_start_targets(self)
+        return auto_trade_registered_operation_start_targets(self)
 
     def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.running_registered_operation_targets(self)
+        return auto_trade_running_registered_operation_targets(self)
 
     def update_global_operation_button_state(self) -> None:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        AutoTradeSettingWindow.update_global_operation_button_state(self)
-        window = getattr(self._window, "auto_trade_setting_window", None)
-        if window is None or sip.isdeleted(window):
-            return
-        update = getattr(window, "update_global_operation_button_state", None)
-        if callable(update):
-            update()
+        auto_trade_update_global_operation_button_state(self)
 
     def set_selected_stock_operation_exclusions(self) -> None:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        AutoTradeSettingWindow.set_selected_stock_operation_exclusions(self)
+        auto_trade_set_selected_stock_operation_exclusions(self)
 
     def clear_selected_stock_operation_exclusions(self) -> None:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        AutoTradeSettingWindow.clear_selected_stock_operation_exclusions(self)
+        auto_trade_clear_selected_stock_operation_exclusions(self)
 
     def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.emergency_stop_selected_auto_trade_stocks(
-            self
-        )
+        return execute_selected_emergency_stop(self, self.selected_stock_infos())
 
     def release_selected_emergency_stopped_auto_trade_stocks(
         self,
     ) -> dict[str, object]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        return AutoTradeSettingWindow.release_selected_emergency_stopped_auto_trade_stocks(
-            self
-        )
+        return execute_selected_emergency_release(self, self.selected_stock_infos())
 
     def unregister_selected_auto_trade_stocks(self) -> None:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        AutoTradeSettingWindow.unregister_selected_auto_trade_stocks(self)
+        unregister_selected_auto_trade_stocks(self)
 
     def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
         self._last_operation_user_message = str(message or "").strip()
@@ -411,6 +494,15 @@ class MainMonitoringStockOperationAdapter:
 
     def _execution_host(self):
         return self._window.main_monitoring_auto_trade_operation_host()
+
+    def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+        checker = getattr(self._window, "startup_recovery_session_ready", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(refresh=refresh))
+        except Exception:
+            return False
 
     def require_startup_recovery_session(self, action_name: str) -> bool:
         checker = getattr(self._window, "startup_recovery_session_ready", None)
@@ -513,7 +605,7 @@ class MainMonitoringStockOperationAdapter:
         return self._execution_host().stop_risk_parts(stock_dir)
 
     def confirm_stop_targets_once(self, selected) -> bool:
-        return self._execution_host().confirm_stop_targets_once(selected)
+        return _confirm_monitoring_stop_targets_once(self, selected)
 
     def show_auto_trade_result_dialog(
         self,
@@ -521,9 +613,7 @@ class MainMonitoringStockOperationAdapter:
         heading: str,
         lines: list[str],
     ) -> None:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        AutoTradeSettingWindow.show_auto_trade_result_dialog(
+        _show_monitoring_auto_trade_result_dialog(
             self._window,
             title,
             heading,
@@ -534,11 +624,7 @@ class MainMonitoringStockOperationAdapter:
         self._window.open_review_required_window()
 
     def start_selected_auto_trades(self) -> dict[str, object]:
-        from gui_auto_trade_setting_window import AutoTradeSettingWindow
-
-        result = AutoTradeSettingWindow.start_selected_rows_auto_trades(
-            self
-        )
+        result = auto_trade_start_selected_rows_auto_trades(self)
         return result if isinstance(result, dict) else {
             "ok": False,
             "reason": "NO_STARTABLE_TARGETS",
@@ -561,30 +647,23 @@ class MainMonitoringStockOperationAdapter:
         dialog.setWindowTitle("종목 시간 예외 설정")
         if dialog.exec_() != QDialog.Accepted:
             return
-        auto_trade_set_operation_mode_for_targets(
+        result = auto_trade_apply_schedule_times_to_targets(
             self,
             selected,
-            "SCHEDULED",
-            schedule_config_updates(
-                dialog.start_time(),
-                dialog.end_buy_time(),
-            ),
+            dialog.start_time(),
+            dialog.end_buy_time(),
         )
+        auto_trade_finalize_operation_mode_result(self, result)
 
     def reset_selected_schedule_to_global(self) -> None:
         selected = self.target_snapshot()
         if not selected:
             return
-        global_schedule = read_global_schedule()
-        auto_trade_set_operation_mode_for_targets(
+        result = auto_trade_reset_schedule_times_for_targets(
             self,
             selected,
-            "SCHEDULED",
-            schedule_config_updates(
-                global_schedule["start_time"],
-                global_schedule["end_buy_time"],
-            ),
         )
+        auto_trade_finalize_operation_mode_result(self, result)
 
     def set_selected_continuous_operation_mode(self) -> dict[str, object]:
         selected = self.target_snapshot()

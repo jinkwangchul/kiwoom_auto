@@ -10,10 +10,12 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import gui_auto_trade_run_control as run_control
 import gui_main_emergency_ops as emergency_ops
+import gui_main_stock_context_menu as monitoring_context_menu
 import gui_auto_trade_setting_window as setting_window
 import gui_auto_trade_status_ops as status_ops
 import operation_policy_gate
@@ -231,9 +233,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             for index in range(1, 13)
         ]
         self.window = _OperationButtonHarness()
-        self.addCleanup(self.window.close)
+        self.addCleanup(self._dispose_window)
         self.registered_patcher = patch.object(
-            setting_window,
+            run_control,
             "all_registered_stock_dirs",
             return_value=[target[0] for target in self.targets],
         )
@@ -250,6 +252,12 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.operation_state_patcher.start()
         self.addCleanup(self.operation_state_patcher.stop)
         self.window.update_global_operation_button_state()
+
+    def _dispose_window(self) -> None:
+        self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.processEvents()
 
     def _create_stock(self, index: int):
         code = f"{index:06d}"
@@ -407,7 +415,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
     def test_bottom_button_shows_global_emergency_disabled_when_global_latch_true(self) -> None:
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             return_value={"emergency_stop": True},
         ):
@@ -418,7 +426,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
     def test_bottom_button_keeps_existing_start_contract_when_global_latch_false(self) -> None:
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             return_value={"emergency_stop": False},
         ):
@@ -431,7 +439,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self._write_state(self.targets[0][0], status="RUNNING", trade_enabled=True)
 
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             return_value={"emergency_stop": False},
         ):
@@ -440,9 +448,54 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertEqual("운영중", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
 
+    def test_monitoring_and_setting_buttons_share_owner_recovery_context(self) -> None:
+        self._write_state(
+            self.targets[0][0],
+            status="RUNNING",
+            trade_enabled=True,
+        )
+        owner = QWidget()
+        self.addCleanup(owner.close)
+        owner.routine_table = QTableWidget(0, 1, owner)
+        owner.btn_start = QPushButton("▶ 운영시작", owner)
+        owner.startup_recovery_session_ready = Mock(return_value=False)
+        adapter = monitoring_context_menu.MainMonitoringStockOperationAdapter(owner, [])
+        setting_button = QPushButton("▶ 운영시작", owner)
+        setting_host = Mock()
+        setting_host.btn_start = setting_button
+        setting_host.registered_operation_targets.return_value = self.targets
+        setting_host.running_registered_operation_targets = lambda: (
+            run_control.auto_trade_running_registered_operation_targets(setting_host)
+        )
+        setting_host.startup_recovery_session_ready.return_value = False
+
+        with patch.object(run_control, "read_operation_state", return_value={}):
+            adapter.update_global_operation_button_state()
+            run_control.auto_trade_update_global_operation_button_state(setting_host)
+
+        self.assertEqual("▶ 운영시작", owner.btn_start.text())
+        self.assertTrue(owner.btn_start.isEnabled())
+        self.assertEqual(setting_button.text(), owner.btn_start.text())
+        self.assertEqual(setting_button.isEnabled(), owner.btn_start.isEnabled())
+        owner.startup_recovery_session_ready.assert_called_with(refresh=False)
+
+    def test_running_targets_exclude_operation_excluded_stock(self) -> None:
+        stock_dir = self.targets[0][0]
+        self._write_state(stock_dir, status="RUNNING", trade_enabled=True)
+        config = read_json_dict(stock_dir / "config.json")
+        config["operation_excluded"] = True
+        (stock_dir / "config.json").write_text(
+            json.dumps(config, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        running = run_control.auto_trade_running_registered_operation_targets(self.window)
+
+        self.assertNotIn(self.targets[0], running)
+
     def test_bottom_button_startup_restore_from_global_operation_state(self) -> None:
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             side_effect=[
                 {"emergency_stop": True},
@@ -459,7 +512,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
     def test_bottom_button_returns_to_existing_contract_after_global_release(self) -> None:
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             side_effect=[
                 {"emergency_stop": True},
@@ -479,7 +532,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             self._write_state(target[0], status="EMERGENCY_STOPPED", trade_enabled=False)
 
         with patch.object(
-            setting_window,
+            run_control,
             "read_operation_state",
             return_value={"emergency_stop": False},
         ):
@@ -493,7 +546,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         with (
             patch.object(
-                setting_window,
+                run_control,
                 "read_operation_state",
                 return_value={"emergency_stop": False},
             ),
@@ -923,7 +976,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             return {"ok": True}
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             side_effect=start_side_effect,
         ) as start_backend:
@@ -956,7 +1009,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = selected_targets
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={"ok": True},
         ) as start_backend:
@@ -975,7 +1028,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = [selected_target]
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={"ok": True},
         ) as start_backend:
@@ -995,7 +1048,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = [selected_target]
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={"ok": False, "reason": "START_FAILED"},
         ) as start_backend:
@@ -1013,7 +1066,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = selected_targets
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={
                 "ok": True,
@@ -1049,7 +1102,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = [selected_target]
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={"ok": True},
         ):
@@ -1076,7 +1129,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = [add_target]
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
             return_value={"ok": True},
         ) as start_backend:
@@ -1633,9 +1686,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window.stock_table.setItem(0, 1, name_item)
 
         with (
-            patch("gui_auto_trade_setting_window.append_stock_log"),
-            patch("gui_auto_trade_setting_window.append_changelog"),
-            patch("gui_auto_trade_setting_window.show_toast"),
+            patch("gui_auto_trade_status_ops.append_stock_log"),
+            patch("gui_auto_trade_status_ops.append_changelog"),
+            patch("gui_auto_trade_status_ops.show_toast"),
         ):
             self.window.on_stock_table_name_item_double_clicked(name_item)
 

@@ -67,7 +67,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
         with (
             patch("gui_auto_trade_setting_window.auto_trade_start_status_indicator") as start_indicator,
-            patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
+            patch("gui_auto_trade_run_control.auto_trade_start_selected_auto_trades") as start_backend,
             patch("gui_auto_trade_setting_window.auto_trade_stop_selected_auto_trades") as stop_backend,
         ):
             AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
@@ -119,10 +119,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             target = (stock_dir, "111111", "Test")
 
             with (
-                patch("gui_auto_trade_setting_window.append_stock_log"),
-                patch("gui_auto_trade_setting_window.append_changelog"),
-                patch("gui_auto_trade_setting_window.now_text", return_value="now"),
-                patch("gui_auto_trade_setting_window.show_toast") as toast,
+                patch("gui_auto_trade_status_ops.append_stock_log"),
+                patch("gui_auto_trade_status_ops.append_changelog"),
+                patch("gui_auto_trade_status_ops.now_text", return_value="now"),
+                patch("gui_auto_trade_status_ops.show_toast") as toast,
             ):
                 enabled = AutoTradeSettingWindow.toggle_stock_operation_exclusion(
                     window,
@@ -181,10 +181,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             )
 
             with (
-                patch("gui_auto_trade_setting_window.append_stock_log"),
-                patch("gui_auto_trade_setting_window.append_changelog"),
-                patch("gui_auto_trade_setting_window.now_text", return_value="now"),
-                patch("gui_auto_trade_setting_window.show_toast") as toast,
+                patch("gui_auto_trade_status_ops.append_stock_log"),
+                patch("gui_auto_trade_status_ops.append_changelog"),
+                patch("gui_auto_trade_status_ops.now_text", return_value="now"),
+                patch("gui_auto_trade_status_ops.show_toast") as toast,
             ):
                 AutoTradeSettingWindow.clear_selected_stock_operation_exclusions(window)
 
@@ -216,7 +216,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 window,
             )
 
-            with patch("gui_auto_trade_setting_window.show_toast") as toast:
+            with patch("gui_auto_trade_status_ops.show_toast") as toast:
                 AutoTradeSettingWindow.clear_selected_stock_operation_exclusions(window)
 
             saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
@@ -261,10 +261,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             )
 
             with (
-                patch("gui_auto_trade_setting_window.append_stock_log"),
-                patch("gui_auto_trade_setting_window.append_changelog"),
-                patch("gui_auto_trade_setting_window.now_text", return_value="now"),
-                patch("gui_auto_trade_setting_window.show_toast") as toast,
+                patch("gui_auto_trade_status_ops.append_stock_log"),
+                patch("gui_auto_trade_status_ops.append_changelog"),
+                patch("gui_auto_trade_status_ops.now_text", return_value="now"),
+                patch("gui_auto_trade_status_ops.show_toast") as toast,
             ):
                 AutoTradeSettingWindow.set_selected_stock_operation_exclusions(window)
 
@@ -296,7 +296,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 window,
             )
 
-            with patch("gui_auto_trade_setting_window.show_toast") as toast:
+            with patch("gui_auto_trade_status_ops.show_toast") as toast:
                 AutoTradeSettingWindow.set_selected_stock_operation_exclusions(window)
 
             saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
@@ -403,8 +403,8 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
             with (
                 patch("pathlib.Path.write_text", side_effect=OSError("boom")),
-                patch("gui_auto_trade_setting_window.QMessageBox.critical") as critical,
-                patch("gui_auto_trade_setting_window.show_toast") as toast,
+                patch("gui_auto_trade_status_ops.QMessageBox.critical") as critical,
+                patch("gui_auto_trade_status_ops.show_toast") as toast,
             ):
                 result = AutoTradeSettingWindow.toggle_stock_operation_exclusion(
                     window,
@@ -1355,7 +1355,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 AutoTradeSettingWindow.registered_operation_start_targets(window)
             )
             with patch(
-                "gui_auto_trade_setting_window.all_registered_stock_dirs",
+                "gui_auto_trade_run_control.all_registered_stock_dirs",
                 return_value=[stock_dir],
             ):
                 start_targets = window.registered_operation_start_targets()

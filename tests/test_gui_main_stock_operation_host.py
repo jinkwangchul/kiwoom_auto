@@ -18,7 +18,9 @@ from PyQt5.QtWidgets import QApplication, QWidget
 import gui_auto_trade_context_menu as context_menu
 import gui_auto_trade_timer
 import gui_windows
+from auto_trade_order_execution_boundary import AutoTradeOrderExecutionBoundary
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+from gui_auto_trade_setting_window import AutoTradeSettingWindow
 from gui_main_stock_context_menu import MainMonitoringStockOperationAdapter
 
 
@@ -126,10 +128,86 @@ class MainStockOperationHostTest(unittest.TestCase):
         setting_window.assert_not_called()
         self.assertIs(owner, host.parent())
 
+    def test_host_has_no_dynamic_setting_window_method_provider(self) -> None:
+        source = inspect.getsource(AutoTradeOperationHost)
+
+        self.assertNotIn("def __getattr__", source)
+        self.assertNotIn("MethodType", source)
+        self.assertNotIn("from gui_auto_trade_setting_window import", source)
+
+    def test_host_order_entries_delegate_to_shared_boundary(self) -> None:
+        host = AutoTradeOperationHost(Mock())
+        boundary = Mock()
+        boundary.process_executable_order_for_auto_trade.return_value = {
+            "processed": False,
+            "stage": "test",
+        }
+        host._order_execution_boundary = boundary
+
+        result = host.process_executable_order_for_auto_trade(
+            "ORDER_1",
+            send_order_callable_override=Mock(),
+        )
+
+        self.assertEqual("test", result["stage"])
+        boundary.process_executable_order_for_auto_trade.assert_called_once()
+
+    def test_settings_and_host_use_same_order_execution_boundary_class(self) -> None:
+        host = AutoTradeOperationHost(Mock())
+        settings_window = Mock()
+
+        settings_boundary = AutoTradeSettingWindow.order_execution_boundary(
+            settings_window
+        )
+
+        self.assertIsInstance(
+            host._order_execution_boundary,
+            AutoTradeOrderExecutionBoundary,
+        )
+        self.assertIsInstance(
+            settings_boundary,
+            AutoTradeOrderExecutionBoundary,
+        )
+
     def test_monitor_operation_adapter_is_widget_free(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(Mock(), [])
 
         self.assertNotIsInstance(adapter, QWidget)
+
+    def test_monitor_adapter_has_no_direct_settings_window_refresh_coupling(self) -> None:
+        source = inspect.getsource(MainMonitoringStockOperationAdapter)
+
+        self.assertNotIn("auto_trade_setting_window", source)
+        self.assertIn("refresh_auto_trade_assignment_views", source)
+
+    def test_operation_cycle_completion_uses_owner_view_synchronization(self) -> None:
+        owner = SimpleNamespace(
+            _main_window_closing=False,
+            refresh_auto_trade_assignment_views=Mock(),
+            refresh_all=Mock(),
+        )
+
+        gui_windows.MainWindow._on_main_operation_cycle_completed(owner, {})
+
+        owner.refresh_auto_trade_assignment_views.assert_called_once_with()
+        owner.refresh_all.assert_not_called()
+
+    def test_monitor_refresh_preserves_selection_and_scroll_around_owner_sync(self) -> None:
+        owner = SimpleNamespace(
+            routine_table=Mock(),
+            refresh_auto_trade_assignment_views=Mock(),
+        )
+        adapter = MainMonitoringStockOperationAdapter(owner, [])
+        adapter.capture_stock_table_view_state = Mock(return_value=({"stock-a"}, 17))
+        adapter.restore_stock_table_view_state = Mock()
+
+        adapter.refresh_all()
+
+        owner.refresh_auto_trade_assignment_views.assert_called_once_with()
+        adapter.restore_stock_table_view_state.assert_called_once_with(
+            {"stock-a"},
+            17,
+        )
 
     def test_main_window_host_factory_never_constructs_setting_window(self) -> None:
         owner = SimpleNamespace()
@@ -378,6 +456,46 @@ class MainStockOperationHostTest(unittest.TestCase):
                     _menu_signature(_Menu.root),
                     monitor_signature,
                 )
+
+    def test_settings_stock_menu_delegates_to_shared_renderer(self) -> None:
+        settings_window = Mock()
+        settings_window.stock_table.itemAt.return_value = None
+        settings_window.stock_table.viewport.return_value.mapToGlobal.return_value = (
+            QPoint()
+        )
+        settings_window.selected_stock_infos.return_value = [
+            (Path("stocks") / "005930_test", "005930", "test")
+        ]
+        settings_window.selected_operation_mode_set.return_value = {"SCHEDULED"}
+        settings_window._stock_status_filter = "running"
+        settings_window._all_stocks_scope_active = False
+        settings_window.current_selected_routine_row_metadata.return_value = {
+            "row_kind": "instance",
+            "instance_id": "instance",
+        }
+
+        with patch.object(
+            context_menu,
+            "_selected_emergency_state",
+            return_value=(False, True),
+        ), patch.object(
+            context_menu,
+            "show_monitor_stock_context_menu",
+        ) as shared_renderer:
+            context_menu.show_auto_trade_stock_context_menu(
+                settings_window,
+                QPoint(),
+            )
+
+        shared_renderer.assert_called_once()
+        kwargs = shared_renderer.call_args.kwargs
+        self.assertIsInstance(
+            kwargs["callbacks"],
+            context_menu.StockContextMenuCallbacks,
+        )
+        self.assertEqual({"SCHEDULED"}, kwargs["selected_modes"])
+        self.assertEqual("set", kwargs["operation_exclusion_action"])
+        self.assertTrue(kwargs["stock_register_enabled"])
 
     def test_monitor_and_settings_full_menu_order_matches(self) -> None:
         callbacks = context_menu.StockContextMenuCallbacks(

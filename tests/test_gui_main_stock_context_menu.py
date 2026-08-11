@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 
 import gui_auto_trade_context_menu as common_menu
 import gui_auto_trade_close as close_ops
+import gui_auto_trade_run_control as run_control
 import gui_auto_trade_status_ops as status_ops
 import gui_auto_trade_unregister as unregister_ops
 import gui_main_emergency_ops as emergency_ops
@@ -353,14 +354,10 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         import gui_auto_trade_setting_window as setting_window
 
         with (
-            patch.object(
-                setting_window.AutoTradeSettingWindow,
-                "running_registered_operation_targets",
-                return_value=[],
-            ),
-            patch.object(setting_window, "append_stock_log"),
-            patch.object(setting_window, "append_changelog"),
-            patch.object(setting_window, "show_toast"),
+            patch.object(monitoring_menu, "auto_trade_running_registered_operation_targets", return_value=[]),
+            patch.object(status_ops, "append_stock_log"),
+            patch.object(status_ops, "append_changelog"),
+            patch.object(status_ops, "show_toast"),
         ):
             self.assertTrue(
                 gui_windows.MainWindow.handle_routine_stock_name_double_click(
@@ -401,12 +398,15 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         status_bar = Mock()
         self.window.statusBar = Mock(return_value=status_bar)
 
-        import gui_auto_trade_setting_window as setting_window
-
-        with patch.object(
-            setting_window.AutoTradeSettingWindow,
-            "running_registered_operation_targets",
-            return_value=[(stock_dir, "005930", "삼성전자")],
+        with (
+            patch.object(
+                monitoring_menu,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[(stock_dir, "005930", "삼성전자")],
+            ),
+            patch.object(status_ops, "append_stock_log"),
+            patch.object(status_ops, "append_changelog"),
+            patch.object(status_ops, "show_toast"),
         ):
             self.assertTrue(
                 gui_windows.MainWindow.handle_routine_stock_name_double_click(
@@ -1030,9 +1030,9 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
 
         with (
             patch.object(common_menu, "QMenu", _FakeMenu),
-            patch.object(setting_window, "append_stock_log"),
-            patch.object(setting_window, "append_changelog"),
-            patch.object(setting_window, "show_toast") as toast,
+            patch.object(status_ops, "append_stock_log"),
+            patch.object(status_ops, "append_changelog"),
+            patch.object(status_ops, "show_toast") as toast,
         ):
             _FakeMenu.chosen_text = "운영제외"
             self.assertTrue(
@@ -1101,7 +1101,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             self.window,
             [target],
         )
-        adapter.refresh_all = Mock()
+        adapter.refresh_auto_trade_assignment_views = Mock()
         adapter.statusBarMessage = Mock()
 
         with (
@@ -1134,7 +1134,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             self.window,
             [target],
         )
-        adapter.refresh_all = Mock()
+        adapter.refresh_auto_trade_assignment_views = Mock()
         adapter.statusBar_message = Mock()
         self.window.refresh_all = Mock()
 
@@ -1179,7 +1179,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             self.window,
             [target],
         )
-        adapter.refresh_all = Mock()
+        adapter.refresh_auto_trade_assignment_views = Mock()
         adapter.statusBarMessage = Mock()
 
         with (
