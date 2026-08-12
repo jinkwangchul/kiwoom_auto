@@ -201,6 +201,8 @@ def auto_trade_set_stock_operation_exclusion(
 def auto_trade_toggle_stock_operation_exclusion(
     window,
     target: tuple[Path, str, str],
+    *,
+    refresh: bool = True,
 ) -> bool:
     stock_dir, _code, _name = target
     config = read_json_dict(stock_dir / "config.json") or default_config()
@@ -208,6 +210,7 @@ def auto_trade_toggle_stock_operation_exclusion(
         window,
         target,
         not is_operation_excluded(config),
+        refresh=refresh,
     )
 
 
@@ -748,7 +751,7 @@ def auto_trade_recalculate_stock_status_by_operation_policy(
         return "failed"
 
     if new_status == before_status:
-        # 상태가 같아도 매매시작/강제종료 계열의 메타값은 반드시 저장한다.
+        # 상태가 같아도 운영시작/정책 재판정 메타값은 반드시 저장한다.
         # 예: 감시/대기 -> 감시/대기 상태유지여도 trade_enabled=True가 저장되어야
         # 현황 컬럼이 즉시 켜지고 이후 시간정책 자동판정 대상이 된다.
         if extra_state or snapshot_metadata:

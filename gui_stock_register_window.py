@@ -125,6 +125,7 @@ from gui_auto_trade_utils import (
     auto_trade_unregister_category,
     mark_pending_order_integrity_review_required,
 )
+from gui_auto_trade_run_control import auto_trade_running_registered_operation_targets
 from gui_review_utils import (
     build_review_required_item,
     compact_time_text,
@@ -158,6 +159,10 @@ from gui_routine_service import (
     ensure_single_real_trade_routine_for_stock,
 )
 from gui_toast import show_toast
+from gui_window_policy import (
+    configure_persistent_feature_window,
+    persistent_feature_owner,
+)
 from runtime_io import (
     read_json_dict,
     read_orders_data,
@@ -246,7 +251,6 @@ from gui_auto_trade_setting_window import (
     auto_trade_setting_server_mismatch_detected,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_today_date_text,
-    auto_trade_setting_trade_started,
     base_stock_routine_assignments,
     clear_auto_close_runtime_metadata,
     clear_early_close_runtime_metadata_only,
@@ -988,14 +992,20 @@ def stock_register_unavailable_reason(code: str, name: str) -> tuple[str, str, l
     return "immediate", title, ["보유·미체결 없음"], runtime_dirs
 
 
-def active_stock_register_status_display(code: str, name: str, routine_name: str) -> str:
+def active_stock_register_status_display(
+    code: str,
+    name: str,
+    routine_name: str,
+    *,
+    current_running: bool = False,
+) -> str:
     """
     종목관리 창의 운영자 관점 운영 단계 표시용 문구를 반환한다.
 
     원칙:
     - 루틴 미연결 종목은 미지정으로 표시한다.
     - 검토관리/긴급정지는 생명주기 보호 상태로 우선 표시한다.
-    - 루틴 등록 종목은 기존 매매시작 판정으로 운영중/운영정지를 표시한다.
+    - 루틴 등록 종목은 공통 현재 세션 참가 판정으로 운영중/운영정지를 표시한다.
     """
     routine_name = str(routine_name).strip()
     if not routine_name or routine_name in {"미등록", "등록대기"}:
@@ -1019,7 +1029,7 @@ def active_stock_register_status_display(code: str, name: str, routine_name: str
         return "검토종목"
     if display_status == "긴급정지":
         return "긴급정지"
-    if auto_trade_setting_trade_started(state):
+    if current_running:
         return "운영중"
     return "운영정지"
 
@@ -1342,7 +1352,8 @@ class StockRegisterWindow(QDialog):
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
 
         self.setWindowTitle("종목관리")
 
@@ -1908,7 +1919,7 @@ class StockRegisterWindow(QDialog):
 
     def _show_integrity_toast(self, message: str) -> None:
         self._last_integrity_toast_message = message
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         popup = getattr(parent, "showAutoTradePopupMessage", None)
         if callable(popup):
             popup(message)
@@ -1916,7 +1927,7 @@ class StockRegisterWindow(QDialog):
         show_toast(self, message, duration_ms=2500, position="bottom_right")
 
     def _review_writer_callback(self):
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         writer = getattr(parent, "mark_review_required", None)
         return writer if callable(writer) else None
 
@@ -2076,7 +2087,18 @@ class StockRegisterWindow(QDialog):
             stock_name=name,
             parent=self,
         )
-        dialog.exec_()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        windows = getattr(self, "_order_status_windows", None)
+        if not isinstance(windows, set):
+            windows = set()
+            self._order_status_windows = windows
+        windows.add(dialog)
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: windows.discard(target)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def on_stock_table_item_clicked(self, item: QTableWidgetItem) -> None:
         """
@@ -2261,7 +2283,7 @@ class StockRegisterWindow(QDialog):
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
 
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
             parent.refresh_auto_trade_assignment_views()
         elif parent is not None and hasattr(parent, "refresh_all"):
@@ -2350,7 +2372,7 @@ class StockRegisterWindow(QDialog):
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
 
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
             parent.refresh_auto_trade_assignment_views()
         elif parent is not None and hasattr(parent, "refresh_all"):
@@ -2481,7 +2503,7 @@ class StockRegisterWindow(QDialog):
         self.btn_delete_stock.setEnabled(False)
         self.btn_stock_history.setEnabled(False)
 
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
             parent.refresh_auto_trade_assignment_views()
         elif parent is not None and hasattr(parent, "refresh_all"):
@@ -2515,6 +2537,17 @@ class StockRegisterWindow(QDialog):
 
     def refresh_stock_table(self) -> None:
         stocks = read_base_stocks()
+        owner = persistent_feature_owner(self)
+        running_targets = (
+            auto_trade_running_registered_operation_targets(owner)
+            if owner is not None
+            else []
+        )
+        current_running_codes: set[str] = set()
+        for _stock_dir, code, _name in running_targets:
+            normalized_code = normalize_stock_code(code)
+            if normalized_code:
+                current_running_codes.add(normalized_code)
         keyword_text = self.stock_search_input.text().strip().lower() if hasattr(self, "stock_search_input") else ""
         keywords = [part.strip() for part in keyword_text.split(",") if part.strip()]
 
@@ -2526,7 +2559,12 @@ class StockRegisterWindow(QDialog):
             routine_list = [str(item).strip() for item in routines if str(item).strip()] if isinstance(routines, list) else []
             registered_routine = stock_register_routine_display_name(stock).lower()
             status_routine = routine_list[0] if routine_list else "등록대기"
-            operation_status = active_stock_register_status_display(code, name, status_routine).lower()
+            operation_status = active_stock_register_status_display(
+                code,
+                name,
+                status_routine,
+                current_running=normalize_stock_code(code) in current_running_codes,
+            ).lower()
 
             searchable_values = [
                 code,
@@ -2579,7 +2617,12 @@ class StockRegisterWindow(QDialog):
             registered_routine = stock_register_routine_display_name(stock)
             routine_tooltip = registered_routine
             status_routine = routine_list[0] if routine_list else "등록대기"
-            operation_status = active_stock_register_status_display(code, name, status_routine)
+            operation_status = active_stock_register_status_display(
+                code,
+                name,
+                status_routine,
+                current_running=normalize_stock_code(code) in current_running_codes,
+            )
             performance = stock_register_performance_display(stock)
 
             values = [
@@ -2678,8 +2721,19 @@ class StockRegisterWindow(QDialog):
                 "definition_name": "등록대기",
             },
         )
-        dialog.exec_()
-        self.refresh_stock_table()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.manual_register_window = dialog
+        dialog.finished.connect(lambda _result: self.refresh_stock_table())
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: (
+                setattr(self, "manual_register_window", None)
+                if getattr(self, "manual_register_window", None) is target
+                else None
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def is_duplicate_stock(self, code: str, name: str) -> bool:
         stocks = read_base_stocks()

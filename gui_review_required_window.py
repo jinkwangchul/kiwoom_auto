@@ -42,6 +42,10 @@ from gui_review_utils import safe_float_value
 from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
 from gui_table_utils import next_sort_order
 from gui_toast import show_toast
+from gui_window_policy import (
+    configure_persistent_feature_window,
+    persistent_feature_owner,
+)
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
@@ -586,7 +590,7 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     """키움 서버 정보와 프로그램 내부 정보 불일치/서버 불안 표시 여부.
 
     실제 키움 연동 단계에서 아래 플래그 중 하나가 저장되면 현황을 빨강으로 표시한다.
-    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/무결성 확인 대상이라는 뜻이다.
+    빨강은 자동 검토관리 이동이 아니라 긴급정지/무결성 확인 대상이라는 뜻이다.
     """
     if not isinstance(state, dict):
         return False
@@ -714,7 +718,8 @@ class GlobalReviewRequiredWindow(QDialog):
         self,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.setWindowTitle("검토종목 관리")
         self.resize(1100, 620)
 
@@ -956,10 +961,15 @@ class GlobalReviewRequiredWindow(QDialog):
 
     def _refresh_after_review_action(self) -> None:
         self.load_review_items()
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         if hasattr(parent, "refresh_all"):
             try:
                 parent.refresh_all()
+            except Exception:
+                pass
+        elif hasattr(parent, "refresh_auto_trade_assignment_views"):
+            try:
+                parent.refresh_auto_trade_assignment_views()
             except Exception:
                 pass
 

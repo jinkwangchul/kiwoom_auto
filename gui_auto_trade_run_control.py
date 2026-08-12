@@ -481,8 +481,7 @@ def format_auto_trade_operation_failure_dialog(
             getattr(window, "_last_operation_user_message", "") or ""
         ).strip()
     if user_message:
-        title = "운영 시작 불가" if action == "운영시작" else "운영 정지 불가"
-        return title, user_message
+        return "운영 시작 불가", user_message
 
     if reason in {
         "RECOVERY_NOT_READY",
@@ -494,7 +493,6 @@ def format_auto_trade_operation_failure_dialog(
         token in reason
         for token in ("INVALID_RUNTIME", "REVIEW_REQUIRED", "EMERGENCY_STOPPED")
     ):
-        title = "운영 시작 불가" if action == "운영시작" else "운영 정지 불가"
         message = startup_recovery_operation_block_message(action, reason)
         if reason == "REVIEW_REQUIRED":
             details: list[str] = []
@@ -515,27 +513,16 @@ def format_auto_trade_operation_failure_dialog(
                     + "\n\n".join(details)
                     + "\n\n검토관리에서 해당 종목을 처리한 후 다시 시도하십시오."
                 )
-        return title, message
+        return "운영 시작 불가", message
 
     identities = _target_identity_lines(targets)
     if reason == "NO_TARGETS":
-        return "선택 오류", (
-            "감시를 시작할 종목을 1개 이상 선택하세요."
-            if action == "운영시작"
-            else "감시를 종료할 종목을 1개 이상 선택하세요."
-        )
-    if reason in {"NO_STARTABLE_TARGETS", "NO_STOPPABLE_TARGETS"}:
-        message = (
-            "운영 시작 가능한 종목이 없습니다."
-            if action == "운영시작"
-            else "운영 정지 가능한 종목이 없습니다."
-        )
+        return "선택 오류", "감시를 시작할 종목을 1개 이상 선택하세요."
+    if reason == "NO_STARTABLE_TARGETS":
+        message = "운영 시작 가능한 종목이 없습니다."
         if identities:
             message += "\n\n" + "\n".join(identities)
-        return (
-            "운영 시작 불가" if action == "운영시작" else "운영 정지 불가",
-            message,
-        )
+        return "운영 시작 불가", message
     if reason:
         message = f"{action}을 처리하지 못했습니다."
         if not _is_internal_reason_code(reason):
@@ -544,10 +531,7 @@ def format_auto_trade_operation_failure_dialog(
             message += "\n\n로그인, 계좌 및 운영 상태를 확인한 후 다시 시도하십시오."
         if identities:
             message += "\n\n대상:\n" + "\n".join(identities)
-        return (
-            "운영 시작 불가" if action == "운영시작" else "운영 정지 불가",
-            message,
-        )
+        return "운영 시작 불가", message
     return None
 
 
@@ -568,10 +552,7 @@ def show_auto_trade_operation_failure_dialog(
     if dialog is None:
         return False
     title, message = dialog
-    if action == "운영시작":
-        _show_operation_start_failure_toast(window, message)
-    else:
-        _show_operation_warning(window, title, message)
+    _show_operation_start_failure_toast(window, message)
     return True
 
 
@@ -1905,159 +1886,3 @@ def auto_trade_start_status_indicator(
         return failed_result
     finally:
         inflight.discard(code)
-
-
-
-def auto_trade_stop_selected_auto_trades(
-    window,
-    *,
-    selected_targets=None,
-    source: str = "",
-) -> dict[str, object]:
-    selected = (
-        list(selected_targets)
-        if selected_targets is not None
-        else window.selected_stock_infos()
-    )
-    routine_name = window.current_selected_routine_name()
-
-    if not selected or (selected_targets is None and not routine_name):
-        _show_operation_warning(
-            window,
-            "선택 오류",
-            "감시를 종료할 종목을 1개 이상 선택하세요.",
-        )
-        return {"ok": False, "reason": "NO_TARGETS", "completed": ()}
-
-    stop_targets, skipped = window.split_stop_targets(selected)
-    if not stop_targets:
-        window.statusBarMessage("강제종료 대상 없음: 이미 중지된 종목")
-        return {
-            "ok": False,
-            "reason": "NO_STOPPABLE_TARGETS",
-            "completed": (),
-            "skipped": tuple(skipped),
-        }
-
-    if not window.confirm_stop_targets_once(stop_targets):
-        window.statusBarMessage("강제종료 취소")
-        return {"ok": False, "reason": "CANCELLED", "completed": ()}
-
-    completed: list[str] = []
-    review_moved: list[str] = []
-    affected_routine_names: list[str] = []
-
-    for stock_dir, code, name in stop_targets:
-        config = read_json_dict(stock_dir / "config.json")
-        target_routine_name = str(
-            config.get("routine_instance_name")
-            or config.get("routine")
-            or config.get("routine_name")
-            or config.get("assigned_routine_instance_id")
-            or routine_name
-            or "전체 등록 대상"
-        ).strip()
-        if target_routine_name not in affected_routine_names:
-            affected_routine_names.append(target_routine_name)
-        risk_parts = window.stop_risk_parts(stock_dir)
-
-        if risk_parts:
-            reason_text = "강제종료 요청: " + " + ".join(risk_parts)
-            metadata = {
-                "review_required": True,
-                "review_status": "PENDING",
-                "review_location": "강제종료",
-                "review_reason": reason_text,
-                "review_entered_at": now_text(),
-                "review_checked_at": now_text(),
-                "review_routine": target_routine_name,
-                "review_detail": f"{code} {name} / {reason_text}",
-                "trade_enabled": False,
-                "trade_stopped_at": now_text(),
-            }
-            if window.update_stock_status(stock_dir, code, name, "REVIEW_REQUIRED", metadata, reason_text):
-                review_moved.append(f"{code} {name}")
-                append_production_event(
-                    "OPERATION_STOPPED",
-                    result="COMPLETED",
-                    source=str(source or "auto_trade_stop_selected_auto_trades"),
-                    template_args={"target": f"{code} {name}".strip()},
-                    target_type="STOCK",
-                    target_id=str(code),
-                    target_name=str(name),
-                    stock_code=str(code),
-                    stock_name=str(name),
-                    reason_code="REVIEW_REQUIRED",
-                )
-            continue
-
-        metadata = {
-            "review_required": False,
-            "review_status": "",
-            "review_location": "",
-            "review_reason": "",
-            "review_detail": "",
-            "trade_enabled": False,
-            "trade_stopped_at": now_text(),
-            "early_close_requested_at": "",
-            "early_close_source": "",
-            "early_close_method": "",
-            "early_close_policy": {},
-            "liquidation_policy_forced": False,
-            "liquidation_policy_reason": "",
-            "operation_notice": "",
-            "operation_notice_reason": "",
-            "operation_notice_at": "",
-        }
-        if window.update_stock_status(stock_dir, code, name, "STOPPED", metadata, "강제종료"):
-            completed.append(f"{code} {name}")
-            append_production_event(
-                "OPERATION_STOPPED",
-                result="COMPLETED",
-                source=str(source or "auto_trade_stop_selected_auto_trades"),
-                template_args={"target": f"{code} {name}".strip()},
-                target_type="STOCK",
-                target_id=str(code),
-                target_name=str(name),
-                stock_code=str(code),
-                stock_name=str(name),
-            )
-
-    if completed or review_moved:
-        changelog_parts: list[str] = []
-        if completed:
-            changelog_parts.append(f"강제종료: {' / '.join(completed)}")
-        if review_moved:
-            changelog_parts.append(f"별도 확인: {' / '.join(review_moved)}")
-        if skipped:
-            changelog_parts.append(f"제외: {' / '.join(skipped)}")
-
-        append_changelog(
-            "UPDATE",
-            "state.json",
-            "강제종료 상태 변경: "
-            f"{' / '.join(affected_routine_names) or routine_name} -> "
-            f"{' | '.join(changelog_parts)}",
-        )
-
-    refresh_auto_trade_views(window)
-    window.stock_table.viewport().update()
-    window.stock_table.repaint()
-
-    result_lines = [f"강제종료 처리 완료: 중지 {len(completed)}개"]
-    if review_moved:
-        result_lines.append(f"검토관리 {len(review_moved)}개")
-    if skipped:
-        result_lines.append(f"제외 {len(skipped)}개")
-    window.statusBarMessage(" / ".join(result_lines))
-
-    if review_moved:
-        window.open_review_required_window()
-    return {
-        "ok": bool(completed or review_moved),
-        "reason": "STOPPED" if completed or review_moved else "STOP_FAILED",
-        "completed": tuple(completed),
-        "review_required": tuple(review_moved),
-        "skipped": tuple(skipped),
-        "request_source": str(source or ""),
-    }

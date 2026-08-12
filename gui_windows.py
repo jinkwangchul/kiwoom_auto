@@ -141,6 +141,7 @@ from gui_main_stock_context_menu import (
     MainMonitoringStockOperationAdapter,
     MainMonitoringStockTarget,
     _stock_target_for_row,
+    clear_main_monitoring_chart_open_selection,
     show_main_monitoring_stock_context_menu,
 )
 from gui_auto_trade_display import (
@@ -148,11 +149,19 @@ from gui_auto_trade_display import (
     draw_stock_position_metric,
     draw_stock_position_metric_display,
 )
-from gui_auto_trade_run_control import show_auto_trade_operation_failure_dialog
+from gui_auto_trade_run_control import (
+    auto_trade_running_registered_operation_targets,
+    show_auto_trade_operation_failure_dialog,
+)
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
 from gui_event_record_window import open_event_record_prototype
-from gui_stock_instance_chart_window import open_stock_instance_chart
+from gui_stock_instance_chart_window import (
+    CHART_OPEN_STOCK_CODE_COLOR,
+    open_stock_instance_chart,
+    stock_instance_chart_is_open,
+)
+from gui_window_policy import close_persistent_feature_windows
 from event_journal_production import append_owner_event_once
 from runtime_io import read_json_dict
 from gui_review_utils import current_price_from_state
@@ -184,7 +193,6 @@ from gui_main_routine_selection import (
     routine_definition_enabled,
     routine_instance_checked,
 )
-from gui_auto_trade_policy import auto_trade_setting_trade_started
 from kiwoom_api import KiwoomApi
 from operator_reconciliation_service import assess_startup_recovery
 from broker_holding_recorder import write_production_recovery_review
@@ -415,13 +423,49 @@ def _routine_stock_name_rect(table, index) -> QRect:
         + ROUTINE_PROFIT_LED_GAP
     )
     if code:
-        text_left += QFontMetrics(table.font()).horizontalAdvance(f"{code} ")
+        code_font, _code_color = _routine_stock_code_chart_style(table.font(), code)
+        text_left += QFontMetrics(code_font).horizontalAdvance(f"{code} ")
     return QRect(
         text_left,
         token_rect.top(),
         max(0, token_rect.right() - text_left + 1),
         token_rect.height(),
     )
+
+
+def _routine_stock_code_rect(table, index) -> QRect:
+    token_rect = _routine_stock_token_rect(
+        table,
+        index,
+        ROUTINE_STOCK_NAME_TOKEN_INDEX,
+    )
+    if token_rect.isNull():
+        return QRect()
+    code = str(index.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+    if not code:
+        return QRect()
+    text_left = (
+        token_rect.left()
+        + ROUTINE_PROFIT_LED_BOX_SIZE
+        + ROUTINE_PROFIT_LED_GAP
+    )
+    code_font, _code_color = _routine_stock_code_chart_style(table.font(), code)
+    return QRect(
+        text_left,
+        token_rect.top(),
+        QFontMetrics(code_font).horizontalAdvance(code),
+        token_rect.height(),
+    )
+
+
+def _routine_stock_code_chart_style(
+    base_font: QFont,
+    stock_code: str,
+) -> tuple[QFont, QColor | None]:
+    font = QFont(base_font)
+    if not stock_instance_chart_is_open(stock_code):
+        return font, None
+    return font, QColor(CHART_OPEN_STOCK_CODE_COLOR)
 
 
 def _initial_buy_component_rects(cell_rect: QRect) -> dict[str, QRect]:
@@ -894,6 +938,16 @@ class _RoutineTreeInteractionController(QObject):
                         event.type() == QEvent.MouseButtonDblClick
                         and event.button() == Qt.LeftButton
                     ):
+                        if _routine_stock_code_rect(
+                            self.table,
+                            index,
+                        ).contains(event.pos()):
+                            if self.window.handle_routine_stock_code_double_click(
+                                index.row()
+                            ):
+                                event.accept()
+                                return True
+                            return super().eventFilter(watched, event)
                         operation_rect = _routine_stock_token_rect(
                             self.table,
                             index,
@@ -1215,18 +1269,48 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         -2,
                         0,
                     )
-                    elided = painter.fontMetrics().elidedText(
-                        text,
-                        Qt.ElideRight,
-                        max(0, text_rect.width()),
+                    stock_code = str(
+                        index.data(ROUTINE_STOCK_CODE_ROLE) or ""
+                    ).strip()
+                    code_font, chart_open_color = _routine_stock_code_chart_style(
+                        token_font,
+                        stock_code,
                     )
-                    painter.setFont(token_font)
-                    painter.setPen(token_pen)
-                    painter.drawText(
-                        text_rect,
-                        Qt.AlignLeft | Qt.AlignVCenter,
-                        elided,
-                    )
+                    if chart_open_color is not None and text.startswith(stock_code):
+                        painter.setFont(code_font)
+                        painter.setPen(chart_open_color)
+                        painter.drawText(
+                            text_rect,
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            stock_code,
+                        )
+                        code_width = QFontMetrics(code_font).horizontalAdvance(stock_code)
+                        remainder = text[len(stock_code) :]
+                        remainder_rect = text_rect.adjusted(code_width, 0, 0, 0)
+                        painter.setFont(token_font)
+                        painter.setPen(token_pen)
+                        painter.drawText(
+                            remainder_rect,
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            painter.fontMetrics().elidedText(
+                                remainder,
+                                Qt.ElideRight,
+                                max(0, remainder_rect.width()),
+                            ),
+                        )
+                    else:
+                        elided = painter.fontMetrics().elidedText(
+                            text,
+                            Qt.ElideRight,
+                            max(0, text_rect.width()),
+                        )
+                        painter.setFont(token_font)
+                        painter.setPen(token_pen)
+                        painter.drawText(
+                            text_rect,
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            elided,
+                        )
                     continue
                 if column == 1:
                     initial_buy = index.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
@@ -1766,7 +1850,8 @@ class MainWindow(QMainWindow):
 
         self.btn_start = QPushButton("▶ 운영시작")
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
-        self.btn_initialize = QPushButton("초기화")
+        self.btn_close_all_windows = QPushButton("모든창닫기")
+        self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트기록")
         self.btn_review_required = QPushButton("검토관리(0)")
         self.btn_exit = QPushButton("종료")
@@ -2433,9 +2518,9 @@ class MainWindow(QMainWindow):
         buttons = [
             self.btn_start,
             self.btn_auto_trade_setting,
-            self.btn_initialize,
             self.btn_log_view,
             self.btn_review_required,
+            self.btn_close_all_windows,
             self.btn_exit,
         ]
 
@@ -2630,7 +2715,9 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.clicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
-        self.btn_initialize.clicked.connect(self.not_implemented)
+        self.btn_close_all_windows.clicked.connect(
+            self.close_all_persistent_feature_windows
+        )
         self.btn_log_view.clicked.connect(self.open_event_record_window)
         self.btn_review_required.clicked.connect(self.open_review_required_window)
         self.routine_table.horizontalHeader().sectionClicked.connect(self.sort_main_routine_table_by_column)
@@ -2662,6 +2749,27 @@ class MainWindow(QMainWindow):
             trade_date=None,
             parent=self,
         )
+
+    def handle_routine_stock_code_double_click(self, row: int) -> bool:
+        """Open the chart from the visible monitoring routine-tree code token."""
+        item = self.routine_table.item(row, 0)
+        if (
+            item is None
+            or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_STOCK
+        ):
+            return False
+        stock_code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+        if not stock_code:
+            return False
+        opened = open_stock_instance_chart(
+            stock_code,
+            trade_date=None,
+            parent=self,
+        )
+        if opened is None:
+            return False
+        clear_main_monitoring_chart_open_selection(self)
+        return True
 
     def startup_recovery_stock_state_paths(self) -> list[Path]:
         return [stock_dir / "state.json" for stock_dir in self.all_runtime_stock_dirs()]
@@ -3846,7 +3954,18 @@ class MainWindow(QMainWindow):
             instance_id=instance.instance_id if instance is not None else "",
             settings_mode="edit" if instance is not None else "registration",
         )
-        dialog.exec_()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        windows = getattr(self, "_routine_settings_windows", None)
+        if not isinstance(windows, set):
+            windows = set()
+            self._routine_settings_windows = windows
+        windows.add(dialog)
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: windows.discard(target)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def toggle_routine_expansion(self, row: int) -> None:
         item = self.routine_table.item(row, 0)
@@ -4563,7 +4682,13 @@ class MainWindow(QMainWindow):
 
         targets: list[MainMonitoringStockTarget] = []
         operational_targets: list[MainMonitoringStockTarget] = []
-        any_running = False
+        current_running_stock_dirs = {
+            str(Path(stock_dir).resolve())
+            for stock_dir, _code, _name in (
+                auto_trade_running_registered_operation_targets(self)
+            )
+        }
+        current_running_targets: list[MainMonitoringStockTarget] = []
         for stock_dir in self._routine_instance_stock_dirs(instance_id):
             code, separator, name = stock_dir.name.partition("_")
             if not separator or not code or not name:
@@ -4590,7 +4715,10 @@ class MainWindow(QMainWindow):
             ):
                 continue
             operational_targets.append(target)
-            any_running = any_running or auto_trade_setting_trade_started(state)
+            if str(stock_dir.resolve()) in current_running_stock_dirs:
+                current_running_targets.append(target)
+
+        any_running = bool(current_running_targets)
 
         if not targets:
             result = {
@@ -4613,19 +4741,20 @@ class MainWindow(QMainWindow):
             self._reload_main_routine_table_preserving_view()
             return
 
+        if any_running:
+            self.statusBar().showMessage("운영 중단은 긴급정지를 사용하십시오.")
+            return
+
         adapter = MainMonitoringStockOperationAdapter(
             self,
             operational_targets,
             request_scope="multiple",
-            recovery_action_label="" if any_running else "루틴 재시작",
+            recovery_action_label="루틴 재시작",
         )
         self._main_monitoring_stock_operation_adapter = adapter
-        requested_action = "운영정지" if any_running else "운영시작"
+        requested_action = "운영시작"
         try:
-            if any_running:
-                operation_result = adapter.stop_selected_auto_trades()
-            else:
-                operation_result = adapter.start_selected_auto_trades()
+            operation_result = adapter.start_selected_auto_trades()
         except Exception:
             LOGGER.exception(
                 "루틴 %s %s 처리 오류",
@@ -4647,15 +4776,17 @@ class MainWindow(QMainWindow):
             )
             return
 
-        running_after = any(
-            auto_trade_setting_trade_started(
-                read_json_dict(stock_dir / "state.json")
+        running_after_stock_dirs = {
+            str(Path(stock_dir).resolve())
+            for stock_dir, _code, _name in (
+                auto_trade_running_registered_operation_targets(self)
             )
+        }
+        running_after = any(
+            str(stock_dir.resolve()) in running_after_stock_dirs
             for stock_dir in self._routine_instance_stock_dirs(instance_id)
         )
-        transition_succeeded = (
-            not running_after if any_running else running_after
-        )
+        transition_succeeded = running_after
         self._reload_main_routine_table_preserving_view()
         if transition_succeeded:
             user_message = (
@@ -4667,7 +4798,7 @@ class MainWindow(QMainWindow):
                 user_message
                 or (
                     f"{instance.display_name} {requested_action} 완료 "
-                    f"(대상 {len(targets)}종목)"
+                    f"(대상 {len(operational_targets)}종목)"
                 )
             )
             return
@@ -5126,8 +5257,25 @@ class MainWindow(QMainWindow):
         return True
 
     def open_stock_register_window(self) -> None:
-        self.stock_register_window = StockRegisterWindow(self)
-        self.stock_register_window.show()
+        window = getattr(self, "stock_register_window", None)
+        if window is not None and not sip.isdeleted(window) and window.isVisible():
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            return
+        window = StockRegisterWindow(self)
+        window.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.stock_register_window = window
+        window.destroyed.connect(
+            lambda _obj=None, target=window: (
+                setattr(self, "stock_register_window", None)
+                if getattr(self, "stock_register_window", None) is target
+                else None
+            )
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def open_auto_trade_setting_window(self) -> None:
         window = getattr(self, "auto_trade_setting_window", None)
@@ -5188,6 +5336,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Stop the single operation host only when the main program closes."""
         self._main_window_closing = True
+        close_persistent_feature_windows(self)
         timer = getattr(self, "_pnl_refresh_timer", None)
         if timer is not None:
             timer.stop()
@@ -5208,15 +5357,30 @@ class MainWindow(QMainWindow):
             )
 
     def open_review_required_window(self) -> None:
-        self.review_required_window = GlobalReviewRequiredWindow(self)
-        self.review_required_window.show()
+        window = getattr(self, "review_required_window", None)
+        if window is not None and not sip.isdeleted(window) and window.isVisible():
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            return
+        window = GlobalReviewRequiredWindow(self)
+        window.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.review_required_window = window
+        window.destroyed.connect(
+            lambda _obj=None, target=window: (
+                setattr(self, "review_required_window", None)
+                if getattr(self, "review_required_window", None) is target
+                else None
+            )
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def open_event_record_window(self) -> None:
         open_event_record_prototype(self)
 
-    def not_implemented(self) -> None:
-        QMessageBox.information(
-            self,
-            "안내",
-            "이 기능은 다음 단계에서 구현합니다.",
-        )
+    def close_all_persistent_feature_windows(self) -> None:
+        """Close persistent feature windows without closing MainWindow."""
+
+        close_persistent_feature_windows(self)

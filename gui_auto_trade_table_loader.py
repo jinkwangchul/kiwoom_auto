@@ -57,6 +57,10 @@ from gui_auto_trade_display import (
     yes_no_display,
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
+from gui_stock_instance_chart_window import (
+    CHART_OPEN_STOCK_CODE_COLOR,
+    stock_instance_chart_is_open,
+)
 from gui_auto_trade_policy import (
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
@@ -89,6 +93,37 @@ from gui_auto_trade_integrity import (
     is_operation_excluded,
     is_review_required_state,
 )
+
+
+_CHART_OPEN_CODE_BASE_STYLE_ROLE = Qt.UserRole + 1001
+
+
+def refresh_auto_trade_chart_open_code_styles(window) -> None:
+    """Project the live chart registry onto Settings stock-code items only."""
+    table = getattr(window, "stock_table", None)
+    if table is None:
+        return
+    for row in range(table.rowCount()):
+        item = table.item(row, 0)
+        if item is None:
+            continue
+        stock_code = str(item.text() or "").strip()
+        baseline = item.data(_CHART_OPEN_CODE_BASE_STYLE_ROLE)
+        chart_open = stock_instance_chart_is_open(stock_code)
+        if chart_open:
+            if baseline is None:
+                baseline = (
+                    item.data(Qt.ForegroundRole),
+                    item.data(Qt.FontRole),
+                )
+                item.setData(_CHART_OPEN_CODE_BASE_STYLE_ROLE, baseline)
+            item.setForeground(QColor(CHART_OPEN_STOCK_CODE_COLOR))
+        elif baseline is not None:
+            foreground, font = baseline
+            item.setData(Qt.ForegroundRole, foreground)
+            item.setData(Qt.FontRole, font)
+            item.setData(_CHART_OPEN_CODE_BASE_STYLE_ROLE, None)
+    table.viewport().update()
 from gui_ats_utils import (
     auto_trade_setting_regular_market_active_now,
     manual_ats_active_now,
@@ -296,7 +331,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             # - 프로그램 시작/재시작 안전초기화
             # - 운영 시작 전 안정성/무결성 검사
             # - 긴급정지 해제 복구 검사
-            # - 강제종료 처리
+            # - 긴급정지 해제 복구 처리
             # - 실제 청산 완료 후 잔여 확인 루틴
             # 따라서 refresh_all()/표시 갱신 경로에서는 보유/미체결만 보고 REVIEW_REQUIRED로 바꾸지 않는다.
 
@@ -505,7 +540,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
                 if col == 2:
                     if liquidation_result_policy == "RED_STOP":
-                        item.setToolTip("청산 결과 불안정\n\n시장가 청산 잔여 또는 미수 발생 - 운영정지 후 무결성 확인 필요")
+                        item.setToolTip("청산 결과 불안정\n\n시장가 청산 잔여 또는 미수 발생 - 긴급정지 후 무결성 확인 필요")
                     elif liquidation_result_policy == "CURRENT_CARRYOVER":
                         item.setToolTip("현재가 청산 잔여\n\n이월 취급 / 시간외·ATS 재진입 금지")
                     elif liquidation_completed_today:
@@ -565,4 +600,5 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
         window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
 
 
+    refresh_auto_trade_chart_open_code_styles(window)
     window.update_action_buttons()

@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_auto_trade_display import profit_loss_value_color
+from gui_window_policy import configure_persistent_feature_window
 
 
 PROTOTYPE_STOCK_CODE = "293490"
@@ -362,7 +363,8 @@ class StockPerformancePrototypeWindow(QDialog):
     """카카오게임즈 더미 데이터로 구성한 조회 전용 종목실적 창."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.setWindowTitle(f"종목실적 - {PROTOTYPE_STOCK_CODE} {PROTOTYPE_STOCK_NAME}")
         self.resize(1520, 880)
         self.setMinimumSize(1420, 780)
@@ -718,5 +720,27 @@ def open_stock_performance_prototype(window: QWidget) -> None:
         QMessageBox.warning(window, "선택 오류", "실적을 확인할 종목을 1개 선택하세요.")
         return
 
+    existing = getattr(window, "__dict__", {}).get("stock_performance_window")
+    if existing is not None:
+        try:
+            if existing.isVisible():
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+        except RuntimeError:
+            pass
+
     dialog = StockPerformancePrototypeWindow(parent=window)
-    dialog.exec_()
+    dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+    window.stock_performance_window = dialog
+    dialog.destroyed.connect(
+        lambda _obj=None, target=dialog: (
+            setattr(window, "stock_performance_window", None)
+            if getattr(window, "stock_performance_window", None) is target
+            else None
+        )
+    )
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()

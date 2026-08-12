@@ -1392,10 +1392,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             def __init__(self, parent, *, instance_metadata):
                 self.parent = parent
                 self.instance_metadata = instance_metadata
+                self.finished = MagicMock()
+                self.destroyed = MagicMock()
+                self.setAttribute = MagicMock()
+                self.show = MagicMock()
+                self.raise_ = MagicMock()
+                self.activateWindow = MagicMock()
                 created.append(self)
-
-            def exec_(self):
-                return 0
 
         host = QWidget()
         host.refresh_stock_table = MagicMock()
@@ -1411,6 +1414,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("unassigned", created[0].instance_metadata["target_kind"])
         self.assertEqual("등록대기", created[0].instance_metadata["instance_name"])
         self.assertEqual("", created[0].instance_metadata["instance_id"])
+        created[0].show.assert_called_once_with()
+        created[0].raise_.assert_called_once_with()
+        created[0].activateWindow.assert_called_once_with()
+        host.refresh_stock_table.assert_not_called()
+        finished_callback = created[0].finished.connect.call_args.args[0]
+        finished_callback(0)
         host.refresh_stock_table.assert_called_once_with()
 
     def test_unassigned_stock_register_dialog_uses_existing_search_dialog_title(self) -> None:
@@ -4599,7 +4608,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             stock_name="삼성전자",
             parent=window,
         )
-        dialog.exec_.assert_called_once_with()
+        dialog.show.assert_called_once_with()
+        dialog.raise_.assert_called_once_with()
+        dialog.activateWindow.assert_called_once_with()
+        dialog.exec_.assert_not_called()
 
     def test_stock_history_window_uses_stock_history_title(self) -> None:
         import gui_order_status_window as order_status_window
@@ -4770,10 +4782,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             SimpleNamespace(instance_id="inst-coin", display_name="동전주"),
             SimpleNamespace(instance_id="inst-follow", display_name="지표추종매매B"),
         ]
-        status_calls: list[tuple[str, str, str]] = []
+        status_calls: list[tuple[str, str, str, bool]] = []
 
-        def fake_status(code: str, name: str, routine_name: str) -> str:
-            status_calls.append((code, name, routine_name))
+        def fake_status(
+            code: str,
+            name: str,
+            routine_name: str,
+            *,
+            current_running: bool = False,
+        ) -> str:
+            status_calls.append((code, name, routine_name, current_running))
             return "미지정" if routine_name == "등록대기" else "운영정지"
 
         with (
@@ -4800,10 +4818,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(["● 운영정지", "● 운영정지", "● 운영정지", "미지정"], displayed_statuses)
         self.assertEqual(
             [
-                ("111111", "동전테스트", "지표추종매매"),
-                ("222222", "지표테스트", "지표추종매매"),
-                ("333333", "구형테스트", "구형루틴"),
-                ("444444", "대기테스트", "등록대기"),
+                ("111111", "동전테스트", "지표추종매매", False),
+                ("222222", "지표테스트", "지표추종매매", False),
+                ("333333", "구형테스트", "구형루틴", False),
+                ("444444", "대기테스트", "등록대기", False),
             ],
             status_calls,
         )
@@ -4844,6 +4862,45 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(1, window.stock_table.rowCount())
         self.assertEqual("111111", window.stock_table.item(0, 0).text())
         self.assertEqual("동전주", window.stock_table.item(0, 2).text())
+
+    def test_stock_register_refresh_uses_common_current_running_targets_once(self) -> None:
+        import gui_stock_register_window as stock_register_window
+
+        stocks = [
+            {"code": "111111", "name": "현재참가", "routines": ["지표추종매매"]},
+            {"code": "222222", "name": "과거참가", "routines": ["지표추종매매"]},
+        ]
+        owner = object()
+
+        def fake_status(
+            _code: str,
+            _name: str,
+            _routine_name: str,
+            *,
+            current_running: bool = False,
+        ) -> str:
+            return "운영중" if current_running else "운영정지"
+
+        with (
+            patch.object(stock_register_window, "read_base_stocks", return_value=stocks),
+            patch.object(stock_register_window, "persistent_feature_owner", return_value=owner),
+            patch.object(
+                stock_register_window,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[(Path("runtime/111111_현재참가"), "111111", "현재참가")],
+            ) as running_targets,
+            patch.object(
+                stock_register_window,
+                "active_stock_register_status_display",
+                side_effect=fake_status,
+            ),
+        ):
+            window = stock_register_window.StockRegisterWindow()
+        self.addCleanup(window.close)
+
+        running_targets.assert_called_once_with(owner)
+        self.assertEqual("● 운영중", window.stock_table.item(0, 3).text())
+        self.assertEqual("● 운영정지", window.stock_table.item(1, 3).text())
 
     def test_stock_register_operation_status_uses_operator_stage_display(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -4894,11 +4951,20 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 self.assertEqual(
+                    "운영정지",
+                    stock_register_window.active_stock_register_status_display(
+                        "111111",
+                        "테스트",
+                        "지표추종매매",
+                    ),
+                )
+                self.assertEqual(
                     "운영중",
                     stock_register_window.active_stock_register_status_display(
                         "111111",
                         "테스트",
                         "지표추종매매",
+                        current_running=True,
                     ),
                 )
 
@@ -4915,6 +4981,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                         "111111",
                         "테스트",
                         "지표추종매매",
+                        current_running=True,
                     ),
                 )
 
@@ -4935,6 +5002,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                         "111111",
                         "테스트",
                         "지표추종매매",
+                        current_running=True,
                     ),
                 )
                 self.assertIsNone(

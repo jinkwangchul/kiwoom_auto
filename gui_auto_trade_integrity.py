@@ -339,7 +339,7 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     """키움 서버 정보와 프로그램 내부 정보 불일치/서버 불안 표시 여부.
 
     실제 키움 연동 단계에서 아래 플래그 중 하나가 저장되면 현황을 빨강으로 표시한다.
-    빨강은 자동 검토관리 이동이 아니라 즉시 운영정지/무결성 확인 대상이라는 뜻이다.
+    빨강은 자동 검토관리 이동이 아니라 긴급정지/무결성 확인 대상이라는 뜻이다.
     """
     if not isinstance(state, dict):
         return False

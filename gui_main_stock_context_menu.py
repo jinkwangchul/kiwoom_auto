@@ -27,7 +27,6 @@ from gui_auto_trade_run_control import (
     auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
     auto_trade_start_selected_rows_auto_trades,
-    auto_trade_stop_selected_auto_trades,
     auto_trade_update_global_operation_button_state,
     show_auto_trade_operation_failure_dialog,
     startup_recovery_operation_block_message,
@@ -57,6 +56,7 @@ from gui_auto_trade_ats_ops import (
 )
 from gui_auto_trade_context_menu import (
     StockContextMenuCallbacks,
+    open_selected_stock_instance_charts,
     show_monitor_stock_context_menu,
 )
 from gui_config_utils import default_config
@@ -90,62 +90,6 @@ class MainMonitoringStockTarget:
     code: str
     name: str
     routine_instance_id: str
-
-
-def _confirm_monitoring_stop_targets_once(adapter, selected) -> bool:
-    stop_items: list[str] = []
-    review_items: list[str] = []
-    for stock_dir, code, name in selected:
-        risk_parts = adapter.stop_risk_parts(stock_dir)
-        target_text = f"{code} {name}"
-        if risk_parts:
-            review_items.append(f"{target_text}({', '.join(risk_parts)})")
-        else:
-            stop_items.append(target_text)
-
-    def preview_lines(title: str, items: list[str]) -> str:
-        if not items:
-            return f"{title}: 없음"
-        preview = "\n".join(f"- {item}" for item in items[:12])
-        if len(items) > 12:
-            preview += f"\n- 외 {len(items) - 12}개"
-        return f"{title}:\n{preview}"
-
-    dialog = QDialog(adapter.operation_message_parent())
-    dialog.setWindowTitle("강제종료 확인")
-    dialog.resize(420, 360)
-    layout = QVBoxLayout()
-    layout.setContentsMargins(18, 16, 18, 14)
-    layout.setSpacing(10)
-    title_label = QLabel("강제종료 선택종목")
-    title_font = title_label.font()
-    title_font.setBold(True)
-    title_font.setPointSize(title_font.pointSize() + 1)
-    title_label.setFont(title_font)
-    layout.addWidget(title_label)
-    body = QTextEdit()
-    body.setReadOnly(True)
-    body.setPlainText(
-        f"{preview_lines('중지 대상', stop_items)}\n\n"
-        f"{preview_lines('검토관리 대상', review_items)}"
-    )
-    body.setMinimumHeight(210)
-    body.setLineWrapMode(QTextEdit.NoWrap)
-    layout.addWidget(body)
-    layout.addWidget(QLabel("진행하시겠습니까?"))
-    buttons = QHBoxLayout()
-    buttons.addStretch(1)
-    proceed_button = QPushButton("진행")
-    cancel_button = QPushButton("취소")
-    proceed_button.setMinimumWidth(80)
-    cancel_button.setMinimumWidth(80)
-    proceed_button.clicked.connect(dialog.accept)
-    cancel_button.clicked.connect(dialog.reject)
-    buttons.addWidget(proceed_button)
-    buttons.addWidget(cancel_button)
-    layout.addLayout(buttons)
-    dialog.setLayout(layout)
-    return dialog.exec_() == QDialog.Accepted
 
 
 def _show_monitoring_auto_trade_result_dialog(
@@ -272,6 +216,26 @@ def clear_main_monitoring_stock_selection(window) -> None:
             index,
             QItemSelectionModel.Deselect | QItemSelectionModel.Rows,
         )
+
+
+def clear_main_monitoring_chart_open_selection(window) -> None:
+    """Clear the visible monitoring table's transient chart-launch selection."""
+
+    selection_model = window.routine_table.selectionModel()
+    selection_model.clearSelection()
+    selection_model.clearCurrentIndex()
+
+
+def open_selected_main_monitoring_stock_instance_charts(
+    window,
+    selected: list[tuple[Path, str, str]],
+) -> list[object]:
+    """Open the snapshotted targets, then clear only successful launch selection."""
+
+    opened = open_selected_stock_instance_charts(window, selected)
+    if opened:
+        clear_main_monitoring_chart_open_selection(window)
+    return opened
 
 
 class MainMonitoringStockOperationAdapter:
@@ -419,8 +383,14 @@ class MainMonitoringStockOperationAdapter:
     def toggle_stock_operation_exclusion(
         self,
         target: tuple[Path, str, str],
+        *,
+        refresh: bool = True,
     ) -> bool:
-        return auto_trade_toggle_stock_operation_exclusion(self, target)
+        return auto_trade_toggle_stock_operation_exclusion(
+            self,
+            target,
+            refresh=refresh,
+        )
 
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_targets()
@@ -583,9 +553,6 @@ class MainMonitoringStockOperationAdapter:
     def split_start_targets(self, selected):
         return self._execution_host().split_start_targets(selected)
 
-    def split_stop_targets(self, selected):
-        return self._execution_host().split_stop_targets(selected)
-
     def pre_start_review_check(self, *args, **kwargs):
         return self._execution_host().pre_start_review_check(*args, **kwargs)
 
@@ -600,12 +567,6 @@ class MainMonitoringStockOperationAdapter:
 
     def rebind_startup_recovery_after_trusted_runtime_update(self) -> None:
         self._execution_host().rebind_startup_recovery_after_trusted_runtime_update()
-
-    def stop_risk_parts(self, stock_dir: Path) -> list[str]:
-        return self._execution_host().stop_risk_parts(stock_dir)
-
-    def confirm_stop_targets_once(self, selected) -> bool:
-        return _confirm_monitoring_stop_targets_once(self, selected)
 
     def show_auto_trade_result_dialog(
         self,
@@ -752,9 +713,6 @@ class MainMonitoringStockOperationAdapter:
             selected_sessions,
         )
 
-    def stop_selected_auto_trades(self) -> dict[str, object]:
-        return auto_trade_stop_selected_auto_trades(self)
-
     def show_operation_failure_dialog(
         self,
         action: str,
@@ -854,6 +812,10 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         early_close_profit_loss=adapter.apply_selected_early_close_profit_loss,
         early_close_cancel=adapter.cancel_selected_early_close,
         individual_liquidation=adapter.apply_selected_individual_liquidation_method,
+        open_charts=lambda: open_selected_main_monitoring_stock_instance_charts(
+            window,
+            adapter.selected_stock_infos(),
+        ),
         time_change=adapter.set_selected_individual_schedule_time,
         time_reset=adapter.reset_selected_schedule_to_global,
         ats_state=adapter.selected_manual_ats_state,

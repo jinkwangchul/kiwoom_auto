@@ -94,6 +94,7 @@ def _callbacks() -> context_menu.StockContextMenuCallbacks:
         early_close_profit_loss=Mock(),
         early_close_cancel=Mock(),
         individual_liquidation=Mock(),
+        open_charts=Mock(),
         time_change=Mock(),
         time_reset=Mock(),
     )
@@ -371,10 +372,11 @@ class MainStockOperationHostTest(unittest.TestCase):
                 "시간변경",
                 "변경리셋",
                 "등록해제",
+                "간이차트",
             ],
             commands,
         )
-        self.assertEqual(4, sum(action.separator for action in _Menu.root.actions))
+        self.assertEqual(5, sum(action.separator for action in _Menu.root.actions))
 
     def test_monitor_menu_matches_continuous_and_mixed_profiles(self) -> None:
         with patch.object(context_menu, "QMenu", _Menu):
@@ -390,7 +392,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             for action in _Menu.root.actions
             if not action.separator
         ]
-        self.assertEqual("등록해제", continuous[-1])
+        self.assertEqual("간이차트", continuous[-1])
         self.assertIn(
             "ATS설정",
             [submenu.title for submenu in _Menu.root.submenus],
@@ -416,7 +418,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             [submenu.title for submenu in _Menu.root.submenus],
         )
         self.assertNotIn("시간변경", mixed)
-        self.assertEqual(3, sum(action.separator for action in _Menu.root.actions))
+        self.assertEqual(4, sum(action.separator for action in _Menu.root.actions))
 
     def test_monitor_and_settings_menu_structures_match(self) -> None:
         for modes in ({"SCHEDULED"}, {"CONTINUOUS"}, set()):
@@ -508,6 +510,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             early_close_profit_loss=Mock(),
             early_close_cancel=Mock(),
             individual_liquidation=Mock(),
+            open_charts=Mock(),
             time_change=Mock(),
             time_reset=Mock(),
             stock_register=Mock(),
@@ -529,6 +532,8 @@ class MainStockOperationHostTest(unittest.TestCase):
             "<separator>",
             "종목등록",
             "등록해제",
+            "<separator>",
+            "간이차트",
         ]
 
         with patch.object(context_menu, "QMenu", _Menu):

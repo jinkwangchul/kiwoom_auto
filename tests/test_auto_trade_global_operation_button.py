@@ -122,12 +122,6 @@ class _OperationButtonHarness(QWidget):
     ) -> bool:
         return False
 
-    def split_stop_targets(self, selected):
-        return setting_window.AutoTradeSettingWindow.split_stop_targets(
-            self,
-            selected,
-        )
-
     def pre_start_review_check(self, routine_name, stock_dir, code, name):
         return {"routine_name": routine_name, "review_reasons": []}
 
@@ -171,12 +165,6 @@ class _OperationButtonHarness(QWidget):
             extra_state,
             silent_unchanged,
         )
-
-    def stop_risk_parts(self, _stock_dir: Path) -> list[str]:
-        return []
-
-    def confirm_stop_targets_once(self, _selected) -> bool:
-        return True
 
     def refresh_all(self) -> None:
         self.update_global_operation_button_state()
@@ -1224,14 +1212,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 trade_enabled=True,
             )
 
-        with patch.object(
-            setting_window,
-            "auto_trade_stop_selected_auto_trades",
-            wraps=run_control.auto_trade_stop_selected_auto_trades,
-        ) as stop_backend:
-            self.window.start_selected_auto_trades()
-
-        stop_backend.assert_not_called()
+        self.window.start_selected_auto_trades()
         self.assertTrue(
             all(
                 read_json_dict(target[0] / "state.json").get("trade_enabled")
@@ -1372,7 +1353,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             patch("gui_main_emergency_ops.show_toast"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:03:00"),
             patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
-            patch("gui_auto_trade_setting_window.auto_trade_stop_selected_auto_trades") as stop_backend,
         ):
             result = self.window.release_selected_emergency_stopped_auto_trade_stocks()
 
@@ -1388,7 +1368,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertNotIn("buy_enabled", state)
         self.assertNotIn("sell_enabled", state)
         start_backend.assert_not_called()
-        stop_backend.assert_not_called()
 
     def test_context_emergency_release_failure_moves_to_review_required_without_restart(self) -> None:
         target = self.targets[0]
@@ -1413,7 +1392,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             patch("gui_main_emergency_ops.show_toast"),
             patch("gui_main_emergency_ops.now_text", return_value="2026-07-29 10:04:00"),
             patch("gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades") as start_backend,
-            patch("gui_auto_trade_setting_window.auto_trade_stop_selected_auto_trades") as stop_backend,
         ):
             result = self.window.release_selected_emergency_stopped_auto_trade_stocks()
 
@@ -1430,7 +1408,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertNotIn("buy_enabled", state)
         self.assertNotIn("sell_enabled", state)
         start_backend.assert_not_called()
-        stop_backend.assert_not_called()
 
     def test_context_emergency_release_multi_selection_only_releases_selected_emergency(self) -> None:
         release_target = self.targets[0]

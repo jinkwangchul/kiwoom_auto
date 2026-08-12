@@ -70,6 +70,7 @@ from gui_auto_trade_display import (
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_integrity import is_operation_excluded, is_review_required_state
+from gui_auto_trade_run_control import auto_trade_running_registered_operation_targets
 from gui_auto_trade_policy import (
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
@@ -1263,8 +1264,18 @@ def _routine_stock_counts_from_base_stocks() -> dict[str, int]:
 
 def _instance_stock_counts(
     operation_excluded_only: bool | None = None,
+    *,
+    window=None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
+    current_running_stock_dirs = {
+        str(Path(stock_dir).resolve())
+        for stock_dir, _code, _name in (
+            auto_trade_running_registered_operation_targets(window)
+            if window is not None
+            else []
+        )
+    }
     valid_instance_ids = {
         instance.instance_id for instance in load_persisted_routine_instances()
     }
@@ -1305,7 +1316,7 @@ def _instance_stock_counts(
         else:
             item["normal"] += 1
             item["operation_or_stopped"] += 1
-            if auto_trade_setting_trade_started(state):
+            if str(stock_dir.resolve()) in current_running_stock_dirs:
                 item["operation_running"] += 1
         if review_required:
             continue
@@ -1345,6 +1356,11 @@ def _instance_stock_counts(
             item["consumed_unknown"] = True
             item["profit_unknown"] = True
     for item in counts.values():
+        item["running"] = int(item.get("operation_running", 0) or 0)
+        item["stopped"] = max(
+            0,
+            int(item.get("normal", 0) or 0) - int(item["running"]),
+        )
         stocks = item.get("stocks")
         if isinstance(stocks, list):
             stocks.sort(
@@ -1760,12 +1776,19 @@ def _routine_tree_stock_metric_values(
         profit_metric = replace(
             profit_metric,
             value1=format_signed_money(profit_amount),
-            value2=format_signed_percent(profit_rate, digits=2) if profit_rate is not None else "-",
+            value2=format_signed_percent(
+                profit_rate if profit_rate is not None else 0.0,
+                digits=2,
+            ),
         )
     else:
         profit_amount = 0.0
         profit_rate = 0.0
-        profit_metric = replace(profit_metric, value1="확인 필요", value2="-")
+        profit_metric = replace(
+            profit_metric,
+            value1=format_signed_money(profit_amount),
+            value2=format_signed_percent(profit_rate, digits=2),
+        )
     buy_trade_count, sell_trade_count = trade_counts
     trade_metric = RatioMetricDisplay(
         label="매매",
@@ -1874,6 +1897,11 @@ def _routine_tree_stock_row(
         stock,
         trade_counts=trade_counts,
     )
+    profit_metric = stock_metrics[2] if len(stock_metrics) > 2 else None
+    if isinstance(profit_metric, RatioMetricDisplay) and len(stock_values) > 9:
+        stock_values[9] = (
+            f"{profit_metric.label}({profit_metric.value1} / {profit_metric.value2})"
+        )
     stock_values = [
         *stock_values,
         limit_text,
@@ -1885,6 +1913,14 @@ def _routine_tree_stock_row(
         stock_values,
         trade_counts=trade_counts,
     )
+    if len(stock_display_tokens) > 9:
+        profit_token = dict(stock_display_tokens[9])
+        profit_token["text"] = stock_values[9]
+        profit_token["tooltip"] = stock_values[9]
+        profit_token["foreground"] = profit_loss_value_color(
+            sort_values.get("profit", 0)
+        ).lower()
+        stock_display_tokens[9] = profit_token
     situation_sort_value = (
         stock_display_tokens[3].get("sort_value", 0)
         if len(stock_display_tokens) > 3
@@ -2020,7 +2056,10 @@ def main_load_routine_table(window) -> None:
     operation_excluded_only = bool(
         getattr(window, "_main_routine_excluded_only", False)
     )
-    instance_counts = _instance_stock_counts(operation_excluded_only)
+    instance_counts = _instance_stock_counts(
+        operation_excluded_only,
+        window=window,
+    )
     update_excluded_count = getattr(
         window,
         "_update_main_routine_excluded_count",
@@ -2129,6 +2168,31 @@ def main_load_routine_table(window) -> None:
                 for stock in count.get("stocks", [])
                 if isinstance(stock, dict)
             ]
+            operation_running_count = int(
+                count.get("operation_running", count.get("running", 0)) or 0
+            )
+            operation_or_stopped_count = (
+                operation_running_count
+                if operation_running_count > 0
+                else int(
+                    count.get(
+                        "operation_or_stopped",
+                        max(
+                            0,
+                            int(count.get("registered", 0) or 0)
+                            - int(count.get("excluded", 0) or 0)
+                            - int(
+                                count.get(
+                                    "review",
+                                    count.get("error", 0),
+                                )
+                                or 0
+                            ),
+                        ),
+                    )
+                    or 0
+                )
+            )
             children.append(
                 {
                     "kind": ROUTINE_ROW_CHILD,
@@ -2137,25 +2201,12 @@ def main_load_routine_table(window) -> None:
                     "name": instance.display_name,
                     "description": instance.description,
                     "operation_status": routine_instance_operation_status(
-                        count.get("operation_running", count.get("running", 0)),
+                        operation_running_count,
                     ),
                     "registered": int(count["registered"]),
-                    "operation_running": int(
-                        count.get("operation_running", count.get("running", 0)) or 0
-                    ),
+                    "operation_running": operation_running_count,
                     "review": int(count.get("review", count.get("error", 0)) or 0),
-                    "operation_or_stopped": int(
-                        count.get(
-                            "operation_or_stopped",
-                            max(
-                                0,
-                                int(count.get("registered", 0) or 0)
-                                - int(count.get("excluded", 0) or 0)
-                                - int(count.get("review", count.get("error", 0)) or 0),
-                            ),
-                        )
-                        or 0
-                    ),
+                    "operation_or_stopped": operation_or_stopped_count,
                     "normal": int(count.get("normal", 0) or 0),
                     "excluded": int(count.get("excluded", 0) or 0),
                     "buy_limit_enabled": instance.buy_limit_enabled,
@@ -2198,8 +2249,10 @@ def main_load_routine_table(window) -> None:
         parent_operation_running = sum(
             int(item["operation_running"]) for item in all_children
         )
-        parent_operation_or_stopped = sum(
-            int(item["operation_or_stopped"]) for item in all_children
+        parent_operation_or_stopped = (
+            parent_operation_running
+            if parent_operation_running > 0
+            else sum(int(item["operation_or_stopped"]) for item in all_children)
         )
         parent_normal = sum(
             int(item.get("normal", 0) or 0) for item in all_children

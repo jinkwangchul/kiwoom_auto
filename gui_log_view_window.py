@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui_window_policy import configure_persistent_feature_window
 
 
 class LogViewWindow(QDialog):
@@ -37,7 +38,8 @@ class LogViewWindow(QDialog):
         stock_name: str,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
 
         self.stock_dir = stock_dir
         self.routine_name = routine_name

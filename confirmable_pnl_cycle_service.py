@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -17,6 +18,16 @@ from runtime_atomic_writer import write_json_atomic
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_LEDGER_PATH = PROJECT_ROOT / "runtime" / "pnl_cycle_boundaries.json"
 _LOCK = RLock()
+
+
+@dataclass(frozen=True)
+class ConfirmablePnlRuntimeSnapshot:
+    boundaries: tuple[dict[str, Any], ...]
+    fills_data: dict[str, Any]
+    realized_data: dict[str, Any]
+    positions_data: dict[str, Any]
+    broker_data: dict[str, Any]
+    runtime_error: str = ""
 
 
 def _text(value: Any) -> str:
@@ -119,26 +130,82 @@ def bootstrap_pnl_cycle(stock_code: str, *, clean_integrity_confirmed: bool, evi
     return _append_boundary({"stock_code": code, "boundary_id": f"PNL-BOOTSTRAP-{evidence_id[:20]}", "boundary_at": when, "boundary_reason": "CLEAN_RUNTIME_BOOTSTRAP", "completion_mode": "", "completion_evidence_id": evidence_id, "bootstrap": True, "created_at": when}, ledger_path)
 
 
-def project_confirmable_cumulative_pnl(stock_code: str, evaluation_price: Any, *, project_root: str | Path = PROJECT_ROOT, ledger_path: str | Path | None = None) -> dict[str, Any]:
+def load_confirmable_pnl_runtime_snapshot(
+    *,
+    project_root: str | Path = PROJECT_ROOT,
+    ledger_path: str | Path | None = None,
+) -> ConfirmablePnlRuntimeSnapshot:
     root = Path(project_root)
+    ledger = read_pnl_cycle_ledger(
+        ledger_path or root / "runtime" / "pnl_cycle_boundaries.json"
+    )
+
+    def load_runtime(name: str, default: dict[str, Any]) -> dict[str, Any]:
+        path = root / "runtime" / name
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+
+    try:
+        fills_data = load_runtime("fills.json", {"fills": []})
+        realized_data = load_runtime("realized_pnl.json", {"records": []})
+        positions_data = load_runtime("positions.json", {"positions": []})
+        broker_data = load_runtime("broker_holdings.json", {"holdings": []})
+        runtime_error = ""
+    except Exception as exc:
+        fills_data = {"fills": []}
+        realized_data = {"records": []}
+        positions_data = {"positions": []}
+        broker_data = {"holdings": []}
+        runtime_error = str(exc)
+    boundaries = ledger.get("boundaries", [])
+    if not isinstance(boundaries, list):
+        boundaries = []
+    return ConfirmablePnlRuntimeSnapshot(
+        boundaries=tuple(item for item in boundaries if isinstance(item, dict)),
+        fills_data=fills_data,
+        realized_data=realized_data,
+        positions_data=positions_data,
+        broker_data=broker_data,
+        runtime_error=runtime_error,
+    )
+
+
+def project_confirmable_cumulative_pnl_from_snapshot(
+    stock_code: str,
+    evaluation_price: Any,
+    snapshot: ConfirmablePnlRuntimeSnapshot,
+) -> dict[str, Any]:
     code = _text(stock_code).lstrip("A")
-    boundary = latest_pnl_cycle_boundary(code, ledger_path or root / "runtime" / "pnl_cycle_boundaries.json")
+    matching_boundaries = [
+        item
+        for item in snapshot.boundaries
+        if _text(item.get("stock_code")).lstrip("A") == code
+    ]
+    boundary = (
+        max(
+            matching_boundaries,
+            key=lambda item: (
+                _text(item.get("boundary_at")),
+                _text(item.get("boundary_id")),
+            ),
+        )
+        if matching_boundaries
+        else None
+    )
     unavailable = {"available": False, "realized_profit": None, "unrealized_profit": None, "cumulative_profit": None, "cumulative_rate": None, "completed_buy_cost": None, "open_cost": None, "boundary_id": _text((boundary or {}).get("boundary_id")), "evaluation_price": evaluation_price, "reconciliation_status": "UNAVAILABLE"}
     if not boundary:
         return {**unavailable, "reason": "PNL_CYCLE_BOOTSTRAP_REQUIRED"}
     price = _decimal(evaluation_price)
     if price is None or price <= 0:
         return {**unavailable, "reason": "EVALUATION_PRICE_UNAVAILABLE"}
-    def load_runtime(name: str, default: dict[str, Any]) -> dict[str, Any]:
-        path = root / "runtime" / name
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
-    try:
-        fills_data = load_runtime("fills.json", {"fills": []})
-        realized_data = load_runtime("realized_pnl.json", {"records": []})
-        positions_data = load_runtime("positions.json", {"positions": []})
-        broker_data = load_runtime("broker_holdings.json", {"holdings": []})
-    except Exception as exc:
-        return {**unavailable, "reason": f"RUNTIME_EVIDENCE_UNAVAILABLE:{exc}"}
+    if snapshot.runtime_error:
+        return {
+            **unavailable,
+            "reason": f"RUNTIME_EVIDENCE_UNAVAILABLE:{snapshot.runtime_error}",
+        }
+    fills_data = snapshot.fills_data
+    realized_data = snapshot.realized_data
+    positions_data = snapshot.positions_data
+    broker_data = snapshot.broker_data
     boundary_at = _text(boundary.get("boundary_at"))
     fills = [item for item in fills_data.get("fills", []) if isinstance(item, dict) and _text(item.get("code")).lstrip("A") == code and _text(item.get("received_at") or item.get("recorded_at")) > boundary_at]
     fills.sort(key=lambda item: (_text(item.get("received_at") or item.get("recorded_at")), _text(item.get("fill_id"))))
@@ -175,3 +242,15 @@ def project_confirmable_cumulative_pnl(stock_code: str, evaluation_price: Any, *
     realized = sum((_decimal(item.get("gross_realized_profit")) or Decimal("0") for item in records), Decimal("0"))
     unrealized = (price - average) * qty if qty else Decimal("0"); cumulative = realized + unrealized; denominator = completed_cost + open_cost
     return {"available": True, "reason": "" if denominator > 0 else "ZERO_COST_DENOMINATOR", "realized_profit": _number(realized), "unrealized_profit": _number(unrealized), "cumulative_profit": _number(cumulative), "cumulative_rate": _number(cumulative / denominator * 100) if denominator > 0 else None, "completed_buy_cost": _number(completed_cost), "open_cost": _number(open_cost), "boundary_id": boundary["boundary_id"], "boundary_at": boundary_at, "evaluation_price": _number(price), "reconciliation_status": "CONSISTENT"}
+
+
+def project_confirmable_cumulative_pnl(stock_code: str, evaluation_price: Any, *, project_root: str | Path = PROJECT_ROOT, ledger_path: str | Path | None = None) -> dict[str, Any]:
+    snapshot = load_confirmable_pnl_runtime_snapshot(
+        project_root=project_root,
+        ledger_path=ledger_path,
+    )
+    return project_confirmable_cumulative_pnl_from_snapshot(
+        stock_code,
+        evaluation_price,
+        snapshot,
+    )

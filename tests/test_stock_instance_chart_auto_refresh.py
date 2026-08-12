@@ -146,13 +146,13 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             self.assertEqual(2, len(window.chart.close_series))
             self.assertEqual(1, len(window.chart.buy_series))
             self.assertEqual(1, len(window.chart.sell_series))
-            self.assertEqual("+2,000원 (+2.00%)", window.info_labels["cumulative_pnl"].text())
+            self.assertEqual("+2,000(+2.00%)", window.info_labels["cumulative_pnl"].text())
             self.assertNotIn("refresh_button", vars(window))
 
             window.refresh_projection()
             self.assertEqual(3, len(window.chart.close_series))
             self.assertEqual(
-                "루틴-005930 / 시간운영 / 5분봉 / 매수 2 / 매도 1",
+                "005930 종목005930 / 루틴-005930 / 시간운영 / 5분봉 / 매수 2 / 매도 1",
                 window.windowTitle(),
             )
             self.assertEqual(3, loader.call_count)
@@ -176,9 +176,9 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
                 ):
                     window = StockInstanceChartWindow("005930", TODAY, owner)
                     owner.operation_host.operation_cycle_completed.emit(_completed_result())
-                    self.assertEqual("+1,000원 (+1.00%)", window.info_labels["cumulative_pnl"].text())
+                    self.assertEqual("+1,000(+1.00%)", window.info_labels["cumulative_pnl"].text())
                     owner.operation_host.operation_cycle_completed.emit(_completed_result())
-                    self.assertEqual("+2,000원 (+1.00%)", window.info_labels["cumulative_pnl"].text())
+                    self.assertEqual("+2,000(+1.00%)", window.info_labels["cumulative_pnl"].text())
                     window.close()
                 owner.close()
 

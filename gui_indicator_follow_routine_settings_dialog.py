@@ -65,6 +65,10 @@ from gui_indicator_follow_control_tab import IndicatorFollowControlTabMixin
 from gui_indicator_follow_buy_controls import IndicatorFollowBuyControlsMixin
 from gui_indicator_follow_sell_controls import IndicatorFollowSellControlsMixin
 from gui_routine_registry import get_routine_records
+from gui_window_policy import (
+    configure_persistent_feature_window,
+    persistent_feature_owner,
+)
 import rule_approval_session_file_service as rule_approval_session_file_service
 from routine_instance_registry import load_persisted_routine_instances, load_routine_definitions
 from routine_instance_repository import RoutineInstanceRepository
@@ -120,7 +124,8 @@ class IndicatorFollowRoutineSettingsDialog(
         instance_id=None,
         settings_mode=None,
     ):
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.routine_path = Path(routine_path) if routine_path else None
         self.routine_name = str(routine_name or "").strip()
         self.definition_id = str(definition_id or "").strip()
@@ -692,7 +697,7 @@ class IndicatorFollowRoutineSettingsDialog(
             return None
 
         self.last_registered_instance_id = result.instance.instance_id
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         refresh_all = getattr(parent, "refresh_all", None)
         if callable(refresh_all):
             refresh_all()

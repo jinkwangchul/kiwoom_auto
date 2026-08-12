@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui_window_policy import configure_persistent_feature_window
 
 from event_journal_contract import EVENT_TYPE_LABELS, event_target_display, parse_aware_timestamp
 from event_journal_reader import EventJournalReader
@@ -102,7 +103,8 @@ class EventRecordPrototypeWindow(QDialog):
         reader: EventJournalReader | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.reader = reader or EventJournalReader()
         self._now_provider = now_provider or (lambda: datetime.now().astimezone())
         self.setWindowTitle("이벤트기록")

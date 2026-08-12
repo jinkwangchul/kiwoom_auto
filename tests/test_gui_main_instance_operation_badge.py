@@ -78,7 +78,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         window = SimpleNamespace(
             btn_start=QPushButton("▶ 운영시작"),
             btn_auto_trade_setting=QPushButton("자동매매설정"),
-            btn_initialize=QPushButton("초기화"),
+            btn_close_all_windows=QPushButton("모든창닫기"),
             btn_log_view=QPushButton("이벤트기록"),
             btn_review_required=QPushButton("검토관리(0)"),
             btn_exit=QPushButton("종료"),
@@ -90,23 +90,23 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             [
                 "▶ 운영시작",
                 "자동매매설정",
-                "초기화",
                 "이벤트기록",
                 "검토관리(0)",
+                "모든창닫기",
                 "종료",
             ],
             [layout.itemAt(index).widget().text() for index in range(layout.count())],
         )
 
-    def test_badge_click_selects_and_double_click_requests_toggle(self) -> None:
+    def test_badge_click_selects_and_double_click_requests_action(self) -> None:
         on_click = MagicMock()
         on_double_click = MagicMock()
         widget = table_loader.create_routine_instance_status_widget(
             table_loader.ROUTINE_STATUS_RUNNING,
             registered=1,
-            running=1,
-            stopped=0,
-            error=0,
+            excluded=0,
+            operation_or_stopped=1,
+            review=0,
             on_status_click=on_click,
             on_status_double_click=on_double_click,
         )
@@ -190,7 +190,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
         )
 
-    def test_run_control_adapter_reuses_setting_start_orchestration_and_stop_backend(self) -> None:
+    def test_run_control_adapter_reuses_setting_start_orchestration(self) -> None:
         parent = QWidget()
         parent.routine_table = MagicMock()
         target = context_menu.MainMonitoringStockTarget(
@@ -207,19 +207,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "auto_trade_start_selected_rows_auto_trades",
                 return_value={"ok": True, "reason": "STARTED"},
             ) as start_orchestration,
-            patch.object(
-                context_menu,
-                "auto_trade_stop_selected_auto_trades",
-                return_value={"ok": True, "reason": "STOPPED"},
-            ) as stop_backend,
         ):
             start_result = adapter.start_selected_auto_trades()
-            stop_result = adapter.stop_selected_auto_trades()
 
         start_orchestration.assert_called_once_with(adapter)
-        stop_backend.assert_called_once_with(adapter)
         self.assertEqual("STARTED", start_result["reason"])
-        self.assertEqual("STOPPED", stop_result["reason"])
         adapter.close()
         parent.close()
 
@@ -705,38 +697,13 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     return_value=[running_dir, stopped_dir],
                 ),
                 patch(
-                    "gui_auto_trade_setting_window.auto_trade_stop_selected_auto_trades"
-                ) as stop_backend,
-                patch(
                     "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
                 ) as start_backend,
             ):
                 gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
 
             start_backend.assert_not_called()
-            stop_backend.assert_not_called()
             window.update_global_operation_button_state.assert_called_once_with()
-
-    def test_stop_backend_accepts_explicit_targets_without_current_routine(self) -> None:
-        target = (Path("stocks/005930_삼성전자"), "005930", "삼성전자")
-        window = SimpleNamespace(
-            selected_stock_infos=Mock(),
-            current_selected_routine_name=Mock(return_value=""),
-            split_stop_targets=Mock(return_value=([target], [])),
-            confirm_stop_targets_once=Mock(return_value=False),
-            statusBarMessage=Mock(),
-        )
-
-        result = run_control.auto_trade_stop_selected_auto_trades(
-            window,
-            selected_targets=[target],
-            source="auto_trade_global_stop_button",
-        )
-
-        self.assertEqual("CANCELLED", result["reason"])
-        window.selected_stock_infos.assert_not_called()
-        window.split_stop_targets.assert_called_once_with([target])
-        window.confirm_stop_targets_once.assert_called_once_with([target])
 
     def test_global_start_button_stays_enabled_before_recovery_when_targets_exist(
         self,
@@ -858,7 +825,10 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     item,
                 )
 
-        window.toggle_stock_operation_exclusion.assert_called_once_with(target)
+        window.toggle_stock_operation_exclusion.assert_called_once_with(
+            target,
+            refresh=False,
+        )
         adapter.assert_not_called()
 
     def test_running_status_indicator_does_not_call_start_backend(self) -> None:
@@ -1129,7 +1099,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         adapter.close()
         parent.close()
 
-    def test_instance_toggle_uses_runtime_readback_to_choose_backend(self) -> None:
+    def test_stopped_instance_badge_starts_instance(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             stopped_dir = root / "005930_삼성전자"
@@ -1138,13 +1108,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 json.dumps({"status": "STOPPED", "trade_enabled": False}),
                 encoding="utf-8",
             )
-            running_dir = root / "000660_SK하이닉스"
-            running_dir.mkdir()
-            (running_dir / "state.json").write_text(
-                json.dumps({"status": "RUNNING", "trade_enabled": True}),
-                encoding="utf-8",
-            )
-
             adapter = MagicMock()
             status_bar = MagicMock()
             window = SimpleNamespace(
@@ -1158,6 +1121,14 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(
+                    gui_windows,
+                    "auto_trade_running_registered_operation_targets",
+                    side_effect=[
+                        [],
+                        [(stopped_dir, "005930", "삼성전자")],
+                    ],
+                ),
                 patch.object(
                     gui_windows,
                     "MainMonitoringStockOperationAdapter",
@@ -1178,7 +1149,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 )
 
             adapter.start_selected_auto_trades.assert_called_once()
-            adapter.stop_selected_auto_trades.assert_not_called()
             targets = adapter_factory.call_args.args[1]
             self.assertEqual(["005930"], [target.code for target in targets])
             self.assertEqual(
@@ -1192,37 +1162,121 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             self.assertIn("운영시작 완료", status_bar.showMessage.call_args.args[0])
 
-            adapter.reset_mock()
-            window._routine_instance_stock_dirs = lambda _instance_id: [running_dir]
+    def test_running_instance_badge_does_not_mutate_or_open_stop_dialog(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_specs = (
+                ("000001", "현재운영1", True),
+                ("000002", "현재운영2", True),
+                ("000003", "과거운영", True),
+                ("000004", "정지", False),
+            )
+            stock_dirs = []
+            for code, name, persisted_running in stock_specs:
+                stock_dir = root / f"{code}_{name}"
+                stock_dir.mkdir()
+                (stock_dir / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "RUNNING" if persisted_running else "STOPPED",
+                            "trade_enabled": persisted_running,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                stock_dirs.append(stock_dir)
+
+            before_states = {
+                stock_dir: (stock_dir / "state.json").read_text(encoding="utf-8")
+                for stock_dir in stock_dirs
+            }
+            status_bar = MagicMock()
+            window = SimpleNamespace(
+                _routine_instance_stock_dirs=lambda _instance_id: stock_dirs,
+                _reload_main_routine_table_preserving_view=MagicMock(),
+                statusBar=lambda: status_bar,
+            )
+            instance = SimpleNamespace(
+                instance_id="instance-a",
+                display_name="테스트 루틴",
+            )
+            current_running = [
+                (stock_dirs[0], "000001", "현재운영1"),
+                (stock_dirs[1], "000002", "현재운영2"),
+            ]
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(
+                    gui_windows,
+                    "auto_trade_running_registered_operation_targets",
+                    return_value=current_running,
+                ),
+                patch.object(
+                    gui_windows,
+                    "MainMonitoringStockOperationAdapter",
+                ) as adapter_factory,
+            ):
+                gui_windows.MainWindow.toggle_routine_instance_operation(
+                    window,
+                    "instance-a",
+                )
+
+            adapter_factory.assert_not_called()
+            self.assertEqual(
+                before_states,
+                {
+                    stock_dir: (stock_dir / "state.json").read_text(encoding="utf-8")
+                    for stock_dir in stock_dirs
+                },
+            )
+            self.assertIn(
+                "긴급정지",
+                status_bar.showMessage.call_args.args[0],
+            )
+
+    def test_stale_running_instance_uses_start_direction(self) -> None:
+        with TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "068270_셀트리온"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                json.dumps({"status": "RUNNING", "trade_enabled": True}),
+                encoding="utf-8",
+            )
+            adapter = MagicMock()
+            adapter.start_selected_auto_trades.return_value = {
+                "ok": False,
+                "reason": "BLOCKED_RECOVERY",
+            }
+            status_bar = MagicMock()
+            window = SimpleNamespace(
+                _routine_instance_stock_dirs=lambda _instance_id: [stock_dir],
+                _reload_main_routine_table_preserving_view=MagicMock(),
+                statusBar=lambda: status_bar,
+            )
+            instance = SimpleNamespace(
+                instance_id="instance-a",
+                display_name="테스트 루틴",
+            )
+            with (
+                patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(
+                    gui_windows,
+                    "auto_trade_running_registered_operation_targets",
+                    return_value=[],
+                ),
                 patch.object(
                     gui_windows,
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ),
             ):
-                def stop_instance() -> dict[str, object]:
-                    (running_dir / "state.json").write_text(
-                        json.dumps({"status": "STOPPED", "trade_enabled": False}),
-                        encoding="utf-8",
-                    )
-                    return {"ok": True, "reason": "STOPPED"}
-
-                adapter.stop_selected_auto_trades.side_effect = stop_instance
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
                     "instance-a",
                 )
 
-            adapter.stop_selected_auto_trades.assert_called_once()
-            adapter.start_selected_auto_trades.assert_not_called()
-            self.assertFalse(
-                table_loader.auto_trade_setting_trade_started(
-                    json.loads((running_dir / "state.json").read_text(encoding="utf-8"))
-                )
-            )
-            self.assertIn("운영정지 완료", status_bar.showMessage.call_args.args[0])
+            adapter.start_selected_auto_trades.assert_called_once()
 
     def test_blocked_start_keeps_official_state_and_reports_reason(self) -> None:
         with TemporaryDirectory() as temp:
@@ -2298,7 +2352,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 )
 
             adapter.start_selected_auto_trades.assert_called_once()
-            adapter.stop_selected_auto_trades.assert_not_called()
             targets = adapter_factory.call_args.args[1]
             self.assertEqual(
                 {"005930"},

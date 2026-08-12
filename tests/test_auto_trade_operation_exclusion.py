@@ -52,7 +52,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 item,
             )
 
-        window.toggle_stock_operation_exclusion.assert_called_once_with(target)
+        window.toggle_stock_operation_exclusion.assert_called_once_with(
+            target,
+            refresh=False,
+        )
         start_indicator.assert_not_called()
 
     def test_name_double_click_while_running_does_not_toggle_or_start(self) -> None:
@@ -68,7 +71,6 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         with (
             patch("gui_auto_trade_setting_window.auto_trade_start_status_indicator") as start_indicator,
             patch("gui_auto_trade_run_control.auto_trade_start_selected_auto_trades") as start_backend,
-            patch("gui_auto_trade_setting_window.auto_trade_stop_selected_auto_trades") as stop_backend,
         ):
             AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
                 window,
@@ -78,7 +80,6 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         window.toggle_stock_operation_exclusion.assert_not_called()
         start_indicator.assert_not_called()
         start_backend.assert_not_called()
-        stop_backend.assert_not_called()
         window.statusBarMessage.assert_called_once()
 
     def test_non_name_double_click_does_not_toggle_operation_exclusion(self) -> None:

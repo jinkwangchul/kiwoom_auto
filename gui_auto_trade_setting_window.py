@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import shutil
+from PyQt5 import sip
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -128,7 +129,6 @@ from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_review_utils import (
     build_review_required_item,
     compact_time_text,
-    pending_order_summary,
     review_required_for_start,
     review_reason_summary,
     safe_float_value,
@@ -195,7 +195,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
         *,
         instance_metadata: dict[str, object] | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.instance_metadata = dict(instance_metadata or {})
         self.setWindowTitle(self._window_title())
         self.resize(520, 420)
@@ -425,7 +426,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return assigned_instance_id
 
     def _refresh_parent_views(self) -> None:
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         if parent is not None and hasattr(parent, "refresh_all"):
             try:
                 parent.refresh_all()
@@ -1084,6 +1085,9 @@ from gui_ats_utils import (
     manual_ats_session_labels,
 )
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
+    AUTO_TRADE_SETTING_BADGE_HEIGHT,
+    AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
     auto_trade_setting_display_status,
@@ -1144,6 +1148,10 @@ from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
 )
 from gui_stock_performance_window import open_stock_performance_prototype
+from gui_window_policy import (
+    configure_persistent_feature_window,
+    persistent_feature_owner,
+)
 from gui_auto_trade_unregister import (
     unregister_selected_auto_trade_stocks,
 )
@@ -1180,6 +1188,7 @@ from gui_auto_trade_timer import (
     auto_trade_on_runtime_file_timer_tick,
     auto_trade_on_time_policy_gui_timer_tick,
 )
+from gui_operation_ui_context import refresh_auto_trade_views
 from gui_auto_trade_status_ops import (
     OPERATION_EXCLUDED_CONFIG_KEY,
     append_changelog,
@@ -1209,7 +1218,6 @@ from gui_auto_trade_run_control import (
     auto_trade_start_selected_auto_trades,
     auto_trade_start_selected_rows_auto_trades,
     auto_trade_start_status_indicator,
-    auto_trade_stop_selected_auto_trades,
     auto_trade_update_global_operation_button_state,
     startup_recovery_operation_block_message,
     today_global_operation_status as _today_global_operation_status,
@@ -1302,11 +1310,9 @@ ROUTINE_STATUS_DEFAULT = "기본운영"
 ROUTINE_TREE_TITLE_DISPLAY_CHARS = 6
 ROUTINE_TREE_TITLE_PREFIX_CHARS = 6
 ROUTINE_TREE_TITLE_CELL_PADDING = 12
-AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
-AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
-AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = 22
+AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = AUTO_TRADE_SETTING_BADGE_HEIGHT
 AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
 AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
@@ -1695,7 +1701,7 @@ def startup_recovery_action_allowed(window, action: str) -> bool:
     if not isinstance(window, AutoTradeSettingWindow):
         return True
     try:
-        parent = window.parent()
+        parent = persistent_feature_owner(window)
     except Exception:
         return True
     if "_startup_recovery_result" not in getattr(parent, "__dict__", {}):
@@ -2311,7 +2317,19 @@ def handle_stock_name_operation_exclusion_double_click(
                 "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
             )
         return False
-    return bool(host.toggle_stock_operation_exclusion(target))
+    changed = bool(host.toggle_stock_operation_exclusion(target, refresh=False))
+    if not changed:
+        return False
+
+    def refresh_after_double_click(context=host) -> None:
+        try:
+            refresh_auto_trade_views(context)
+        except RuntimeError:
+            # The originating window may close before the queued UI refresh runs.
+            return
+
+    QTimer.singleShot(0, refresh_after_double_click)
+    return True
 
 
 class AutoTradeSettingWindow(QDialog):
@@ -2326,7 +2344,8 @@ class AutoTradeSettingWindow(QDialog):
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
 
         self.setObjectName("autoTradeSettingWindow")
         self.setWindowTitle("자동매매설정")
@@ -3239,7 +3258,7 @@ class AutoTradeSettingWindow(QDialog):
 
     def refresh_all(self) -> None:
         # 자동매매설정 창 전체 갱신 전 하단 종목표 위치를 보존한다.
-        # 시간변경/운영시작/강제종료 후 종목표가 맨 위로 튀는 문제를 막는다.
+        # 시간변경/운영시작 등 상태 갱신 후 종목표가 맨 위로 튀는 문제를 막는다.
         selected_stock_paths, stock_scroll_value = self.capture_stock_table_view_state()
 
         normalize_base_stock_single_routine_file()
@@ -3314,7 +3333,7 @@ class AutoTradeSettingWindow(QDialog):
             )
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         checker = getattr(parent, "startup_recovery_session_ready", None)
         if not callable(checker):
             return False
@@ -3324,7 +3343,7 @@ class AutoTradeSettingWindow(QDialog):
             return False
 
     def rebind_startup_recovery_after_trusted_runtime_update(self) -> bool:
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         rebind = getattr(
             parent,
             "rebind_startup_recovery_after_trusted_runtime_update",
@@ -3341,7 +3360,7 @@ class AutoTradeSettingWindow(QDialog):
         if self.startup_recovery_session_ready(refresh=True):
             self._last_operation_block_reason = ""
             return True
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         reason_getter = getattr(parent, "startup_recovery_block_reason", None)
         reason = ""
         if callable(reason_getter):
@@ -3362,7 +3381,7 @@ class AutoTradeSettingWindow(QDialog):
     ) -> bool:
         if is_review_required_stock_dir(stock_dir):
             return True
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         checker = getattr(
             parent,
             "production_recovery_stock_is_review_required",
@@ -3376,7 +3395,7 @@ class AutoTradeSettingWindow(QDialog):
         *,
         action: str,
     ) -> dict[str, object]:
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         filter_targets = getattr(
             parent,
             "filter_start_targets_by_production_recovery",
@@ -3619,8 +3638,17 @@ class AutoTradeSettingWindow(QDialog):
             refresh=refresh,
         )
 
-    def toggle_stock_operation_exclusion(self, target: tuple[Path, str, str]) -> bool:
-        return auto_trade_toggle_stock_operation_exclusion(self, target)
+    def toggle_stock_operation_exclusion(
+        self,
+        target: tuple[Path, str, str],
+        *,
+        refresh: bool = True,
+    ) -> bool:
+        return auto_trade_toggle_stock_operation_exclusion(
+            self,
+            target,
+            refresh=refresh,
+        )
 
     def set_selected_stock_operation_exclusions(self) -> None:
         auto_trade_set_selected_stock_operation_exclusions(self)
@@ -4489,7 +4517,7 @@ class AutoTradeSettingWindow(QDialog):
     def _routine_instance_operation_counts(self) -> dict[str, dict[str, object]]:
         from gui_main_table_loader import _instance_stock_counts
 
-        return _instance_stock_counts()
+        return _instance_stock_counts(window=self)
 
     def _is_default_operation_instance(self, metadata: dict[str, object]) -> bool:
         definition_id = str(metadata.get("definition_id", "") or "").strip()
@@ -6309,7 +6337,7 @@ class AutoTradeSettingWindow(QDialog):
             return boundary
 
         def api_object():
-            parent = self.parent()
+            parent = persistent_feature_owner(self)
             return getattr(parent, "kiwoom_api", None)
 
         def kiwoom_connected() -> bool:
@@ -6318,7 +6346,7 @@ class AutoTradeSettingWindow(QDialog):
             return bool(checker()) if callable(checker) else False
 
         def account_numbers() -> list[str]:
-            parent = self.parent()
+            parent = persistent_feature_owner(self)
             getter = getattr(parent, "kiwoom_account_numbers", None)
             if callable(getter):
                 values = getter()
@@ -6329,7 +6357,7 @@ class AutoTradeSettingWindow(QDialog):
             return list(values) if isinstance(values, list) else []
 
         def selected_account_no() -> str:
-            parent = self.parent()
+            parent = persistent_feature_owner(self)
             getter = getattr(parent, "selected_account_no", None)
             return str(getter() or "").strip() if callable(getter) else ""
 
@@ -6720,7 +6748,18 @@ class AutoTradeSettingWindow(QDialog):
             instance_id="" if registration else instance.instance_id,
             settings_mode="registration" if registration else "edit",
         )
-        dialog.exec_()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        windows = getattr(self, "_routine_settings_windows", None)
+        if not isinstance(windows, set):
+            windows = set()
+            self._routine_settings_windows = windows
+        windows.add(dialog)
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: windows.discard(target)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def open_routine_registration(self, metadata: dict[str, object]) -> None:
         if str(metadata.get("row_kind", "") or "") != "definition":
@@ -6964,7 +7003,7 @@ class AutoTradeSettingWindow(QDialog):
             return
 
         _stock_dir, code, name = selected
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         api = getattr(parent, "kiwoom_api", None)
         if api is None:
             self.statusBarMessage("키움 API가 초기화되지 않았습니다.")
@@ -9066,16 +9105,44 @@ class AutoTradeSettingWindow(QDialog):
 
     def open_operation_environment_settings(self) -> None:
         """스케줄매매관리 대체: 운영환경설정 창을 연다."""
+        existing = getattr(self, "operation_environment_settings_window", None)
+        if existing is not None and not sip.isdeleted(existing) and existing.isVisible():
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
         dialog = OperationEnvironmentSettingsDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.operation_environment_settings_window = dialog
+
+        def settings_saved() -> None:
             self.statusBarMessage("환경설정 저장 완료")
             self.refresh_all()
 
+        dialog.accepted.connect(settings_saved)
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: (
+                setattr(self, "operation_environment_settings_window", None)
+                if getattr(self, "operation_environment_settings_window", None) is target
+                else None
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def open_stock_register_window(self) -> None:
         """관제창과 동일한 중앙 종목 등록 창을 연다."""
+        owner = persistent_feature_owner(self)
+        owner_opener = getattr(owner, "open_stock_register_window", None)
+        if callable(owner_opener):
+            owner_opener()
+            self.stock_register_window = getattr(owner, "stock_register_window", None)
+            return
         from gui_stock_register_window import StockRegisterWindow
 
         self.stock_register_window = StockRegisterWindow(self)
+        self.stock_register_window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.stock_register_window.finished.connect(
             lambda _result: self.refresh_all()
         )
@@ -9155,7 +9222,7 @@ class AutoTradeSettingWindow(QDialog):
         운영시작 대상과 제외 대상을 분리한다.
 
         정책:
-        - STOPPED: 강제종료/정지 상태이므로 운영시작 가능
+        - STOPPED: 운영 전/마감 후 상태이므로 운영시작 가능
         - MONITORING/WATCHING/WATCH/WATCH_BUY: 화면상 감시/대기지만 주문 비활성 상태이므로
           운영시작 버튼으로 현재 시간/운영방식에 맞게 재판정 가능
         - RUNNING/SELL_ONLY/REVIEW_REQUIRED/EMERGENCY 계열은 보호 상태로 제외
@@ -9188,120 +9255,8 @@ class AutoTradeSettingWindow(QDialog):
 
         return targets, skipped
 
-    def split_stop_targets(
-        self,
-        selected: list[tuple[Path, str, str]],
-    ) -> tuple[list[tuple[Path, str, str]], list[str]]:
-        """
-        강제종료 대상과 제외 대상을 분리한다.
-
-        강제종료는 최상위 중지 명령이다.
-        조기마감/자동마감/청산중처럼 trade_enabled=False가 될 수 있는 상태도
-        현재 동작을 끊기 위해 강제종료 대상에 포함한다.
-
-        제외 기준은 상태값 자체가 STOPPED 계열인 경우만 사용한다.
-        """
-        targets: list[tuple[Path, str, str]] = []
-        skipped: list[str] = []
-
-        stopped_statuses = {
-            "STOPPED",
-            "STOP",
-        }
-
-        for stock_dir, code, name in selected:
-            state = read_json_dict(stock_dir / "state.json")
-            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-
-            if status in stopped_statuses:
-                skipped.append(f"{code} {name}(이미 중지됨)")
-                continue
-
-            targets.append((stock_dir, code, name))
-
-        return targets, skipped
-
-    def stop_risk_parts(self, stock_dir: Path) -> list[str]:
-        """강제종료 시 검토관리로 보내야 하는 보유/미체결 사유."""
-        state = read_json_dict(stock_dir / "state.json")
-        holding_qty = safe_int_value(state.get("holding_qty"), 0)
-        pending_exists, pending_qty = pending_order_summary(stock_dir, state)
-
-        parts: list[str] = []
-        if holding_qty > 0:
-            parts.append(f"보유 {holding_qty:,}주")
-        if pending_exists:
-            parts.append(f"미체결 {pending_qty:,}주")
-        return parts
-
-    def stop_warning_items(self, selected: list[tuple[Path, str, str]]) -> list[str]:
-        """
-        강제종료 전 검토관리 이동 예정 종목을 반환한다.
-        """
-        items: list[str] = []
-        for stock_dir, code, name in selected:
-            parts = self.stop_risk_parts(stock_dir)
-            if parts:
-                items.append(f"{code} {name}({', '.join(parts)})")
-        return items
-
-    def confirm_stop_targets_once(self, selected: list[tuple[Path, str, str]]) -> bool:
-        """강제종료 전 확인창은 1개만 표시한다."""
-        stop_items: list[str] = []
-        review_items: list[str] = []
-        for stock_dir, code, name in selected:
-            risk_parts = self.stop_risk_parts(stock_dir)
-            if risk_parts:
-                review_items.append(f"{code} {name}({', '.join(risk_parts)})")
-            else:
-                stop_items.append(f"{code} {name}")
-
-        def preview_lines(title: str, items: list[str]) -> str:
-            if not items:
-                return f"{title}: 없음"
-            preview = "\n".join(f"- {item}" for item in items[:12])
-            if len(items) > 12:
-                preview += f"\n- 외 {len(items) - 12}개"
-            return f"{title}:\n{preview}"
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("강제종료 확인")
-        dialog.resize(420, 360)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(18, 16, 18, 14)
-        layout.setSpacing(10)
-        title_label = QLabel("강제종료 선택종목")
-        title_font = title_label.font()
-        title_font.setBold(True)
-        title_font.setPointSize(title_font.pointSize() + 1)
-        title_label.setFont(title_font)
-        layout.addWidget(title_label)
-        body = QTextEdit()
-        body.setReadOnly(True)
-        body.setPlainText(
-            f"{preview_lines('중지 대상', stop_items)}\n\n"
-            f"{preview_lines('검토관리 대상', review_items)}"
-        )
-        body.setMinimumHeight(210)
-        body.setLineWrapMode(QTextEdit.NoWrap)
-        layout.addWidget(body)
-        layout.addWidget(QLabel("진행하시겠습니까?"))
-        button_layout = QHBoxLayout()
-        button_layout.addStretch(1)
-        proceed_button = QPushButton("진행")
-        cancel_button = QPushButton("취소")
-        proceed_button.setMinimumWidth(80)
-        cancel_button.setMinimumWidth(80)
-        proceed_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-        button_layout.addWidget(proceed_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-        dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
-
     def show_auto_trade_result_dialog(self, title: str, heading: str, lines: list[str]) -> None:
-        """강제종료 확인창과 같은 형식의 결과 표시 전용 창."""
+        """복수 종목 처리 결과를 표시하는 공용 창."""
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
         dialog.resize(420, 320)
@@ -9428,9 +9383,6 @@ class AutoTradeSettingWindow(QDialog):
             source=source,
             extra_policy=extra_policy,
         )
-    def stop_selected_auto_trades(self) -> None:
-        auto_trade_stop_selected_auto_trades(self)
-
     def open_review_required_window(self, _checked: object | None = None) -> None:
         auto_trade_open_review_required_window(self)
 
@@ -9439,7 +9391,7 @@ class AutoTradeSettingWindow(QDialog):
 
         분리 모듈에서는 MainWindow를 직접 참조하지 않는다.
         """
-        parent = self.parent()
+        parent = persistent_feature_owner(self)
         status_bar_getter = getattr(parent, "statusBar", None)
         if callable(status_bar_getter):
             try:

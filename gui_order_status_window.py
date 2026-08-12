@@ -42,6 +42,7 @@ from gui_order_utils import (
     settlement_summary_text,
     today_orders,
 )
+from gui_window_policy import configure_persistent_feature_window
 from runtime_io import read_json_dict, read_orders_data
 from state_policy import auto_trade_status_color, auto_trade_status_display
 
@@ -102,7 +103,8 @@ class OrderStatusWindow(QDialog):
         stock_name: str,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
 
         self.stock_dir = stock_dir
         self.routine_name = routine_name

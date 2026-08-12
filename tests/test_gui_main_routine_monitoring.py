@@ -509,7 +509,16 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             (100, DIRECTIONAL_NEUTRAL_COLOR),
         )
         for current_price, expected_color in cases:
-            with self.subTest(current_price=current_price):
+            profit_amount = (current_price - 100) * 10
+            with self.subTest(current_price=current_price), patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value={
+                    "available": True,
+                    "cumulative_profit": profit_amount,
+                    "cumulative_rate": float(current_price - 100),
+                },
+            ):
                 row = gui_main_table_loader._routine_tree_stock_row(
                     SimpleNamespace(startup_recovery_session_ready=lambda **_kwargs: True),
                     definition_id="indicator_follow",
@@ -537,7 +546,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertEqual(profit_text, profit_token["text"])
                 self.assertEqual(profit_text, profit_token["tooltip"])
                 self.assertEqual(
-                    QColor(profit_loss_value_color((current_price - 100) * 10)).name().lower(),
+                    QColor(profit_loss_value_color(profit_amount)).name().lower(),
                     profit_token["foreground"],
                 )
                 self.assertEqual(QColor(expected_color).name().lower(), profit_token["foreground"])
@@ -674,6 +683,184 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertEqual("90,000", low_current[0][1].value1)
         self.assertEqual("1,500", low_current[0][1].value2)
+
+    def test_main_stock_profit_metric_uses_numeric_zero_when_pnl_unavailable(self) -> None:
+        unavailable = {
+            "available": False,
+            "reason": "BROKER_NOT_CONNECTED",
+        }
+        stock = {
+            "code": "005930",
+            "name": "삼성전자",
+            "stock_path": "",
+            "state": {
+                "holding_qty": 0,
+                "avg_price": 0,
+                "current_price": None,
+            },
+            "config": {},
+        }
+
+        for connected in (False, True):
+            window = SimpleNamespace(
+                kiwoom_api=SimpleNamespace(is_connected=lambda: connected)
+            )
+            with patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value=unavailable,
+            ):
+                metrics, _led, _limit, _consumed, sort_values = (
+                    gui_main_table_loader._routine_tree_stock_metric_values(
+                        window,
+                        stock,
+                    )
+                )
+
+            profit_metric = metrics[2]
+            self.assertEqual(("0", "0.00%"), (profit_metric.value1, profit_metric.value2))
+            self.assertNotIn("확인", f"{profit_metric.value1} / {profit_metric.value2}")
+            self.assertNotIn("-", f"{profit_metric.value1} / {profit_metric.value2}")
+            self.assertEqual(0, sort_values["profit"])
+        self.assertEqual(
+            {"available": False, "reason": "BROKER_NOT_CONNECTED"},
+            unavailable,
+        )
+
+    def test_main_stock_profit_row_preserves_numeric_value_and_direction_color(self) -> None:
+        cases = (
+            (
+                {"available": True, "cumulative_profit": 1_250, "cumulative_rate": 0.53},
+                "수익(+1,250 / +0.53%)",
+                DIRECTIONAL_NEGATIVE_COLOR,
+            ),
+            (
+                {"available": True, "cumulative_profit": -2_340, "cumulative_rate": -0.97},
+                "수익(-2,340 / -0.97%)",
+                DIRECTIONAL_POSITIVE_COLOR,
+            ),
+            (
+                {"available": True, "cumulative_profit": 0, "cumulative_rate": None},
+                "수익(0 / 0.00%)",
+                DIRECTIONAL_NEUTRAL_COLOR,
+            ),
+        )
+        stock = {
+            "code": "005930",
+            "name": "삼성전자",
+            "stock_path": "",
+            "state": {},
+            "config": {},
+        }
+
+        for projection, expected_text, expected_color in cases:
+            with self.subTest(expected_text=expected_text), patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value=projection,
+            ):
+                row = gui_main_table_loader._routine_tree_stock_row(
+                    SimpleNamespace(),
+                    definition_id="indicator_follow",
+                    instance_id="instance-a",
+                    stock=stock,
+                )
+
+            self.assertEqual(expected_text, row["stock_values"][9])
+            self.assertEqual(expected_text, row["stock_display_tokens"][9]["text"])
+            self.assertEqual(expected_text, row["stock_display_tokens"][9]["tooltip"])
+            self.assertEqual(
+                expected_color.lower(),
+                row["stock_display_tokens"][9]["foreground"],
+            )
+
+    def test_visible_main_window_stock_row_uses_numeric_profit_fallback(self) -> None:
+        api = SimpleNamespace(
+            unavailable_reason=lambda: "test double",
+            login_state_changed=None,
+            raw_chejan_received=None,
+        )
+        host = SimpleNamespace(
+            operation_cycle_completed=SimpleNamespace(connect=MagicMock()),
+            shutdown=MagicMock(),
+        )
+        stock = {
+            "code": "005930",
+            "name": "삼성전자",
+            "stock_path": "",
+            "state": {},
+            "config": {},
+        }
+
+        with (
+            patch.object(gui_windows, "KiwoomApi", return_value=api),
+            patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
+            patch.object(
+                gui_windows.MainWindow,
+                "main_monitoring_auto_trade_operation_host",
+                return_value=host,
+            ),
+            patch.object(
+                gui_windows.MainWindow,
+                "refresh_startup_recovery_status",
+                return_value={},
+            ),
+            patch.object(gui_windows.MainWindow, "refresh_all"),
+            patch.object(gui_windows, "append_owner_event_once"),
+            patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value={"available": False, "reason": "BROKER_NOT_CONNECTED"},
+            ),
+        ):
+            window = gui_windows.MainWindow()
+            try:
+                row = gui_main_table_loader._routine_tree_stock_row(
+                    window,
+                    definition_id="indicator_follow",
+                    instance_id="instance-a",
+                    stock=stock,
+                )
+                item = QTableWidgetItem("")
+                item.setData(
+                    gui_main_table_loader.ROUTINE_ROW_KIND_ROLE,
+                    gui_main_table_loader.ROUTINE_ROW_STOCK,
+                )
+                item.setData(
+                    gui_main_table_loader.ROUTINE_STOCK_VALUES_ROLE,
+                    row["stock_values"],
+                )
+                item.setData(
+                    gui_main_table_loader.ROUTINE_STOCK_METRICS_ROLE,
+                    row["stock_metrics"],
+                )
+                item.setData(
+                    gui_main_table_loader.ROUTINE_STOCK_DISPLAY_ROLE,
+                    row["stock_display_tokens"],
+                )
+                item.setData(
+                    gui_main_table_loader.ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
+                    True,
+                )
+                window.routine_table.setRowCount(1)
+                window.routine_table.setItem(0, 0, item)
+                window.resize(1280, 720)
+                window.show()
+                self.app.processEvents()
+
+                visible_metrics = gui_windows._routine_stock_metric_texts(
+                    list(
+                        item.data(gui_main_table_loader.ROUTINE_STOCK_VALUES_ROLE)
+                    ),
+                    tuple(
+                        item.data(gui_main_table_loader.ROUTINE_STOCK_METRICS_ROLE)
+                    ),
+                )
+                self.assertTrue(window.routine_table.isVisible())
+                self.assertEqual("수익(0 / 0.00%)", visible_metrics[2])
+                self.assertNotIn("확인 필요", " | ".join(visible_metrics))
+            finally:
+                window.close()
 
     def test_initial_buy_slot_fits_maximum_amount_and_share_text(self) -> None:
         font_metrics = QFontMetrics(QFont("Malgun Gothic", 9))
@@ -970,10 +1157,27 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "read_json_dict",
                 side_effect=read_json,
             ),
+            patch.object(
+                gui_main_table_loader,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[
+                    (
+                        Path(gui_main_table_loader.__file__).resolve().parent
+                        / "stocks"
+                        / "normal",
+                        "000001",
+                        "normal",
+                    )
+                ],
+            ),
         ):
-            count = gui_main_table_loader._instance_stock_counts()[instance.instance_id]
+            count = gui_main_table_loader._instance_stock_counts(
+                window=SimpleNamespace()
+            )[instance.instance_id]
             review_names.remove("excluded-review")
-            released_count = gui_main_table_loader._instance_stock_counts()[instance.instance_id]
+            released_count = gui_main_table_loader._instance_stock_counts(
+                window=SimpleNamespace()
+            )[instance.instance_id]
 
         self.assertEqual(4, count["registered"])
         self.assertEqual(1, count["excluded"])
@@ -986,6 +1190,228 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertEqual(2, released_count["excluded"])
         self.assertEqual(1, released_count["review"])
+
+    def test_instance_stock_counts_ignore_stale_running_outside_current_session(self) -> None:
+        instance = SimpleNamespace(instance_id="instance-a")
+        codes = (
+            "000660",
+            "003550",
+            "005930",
+            "012330",
+            "068270",
+            "086520",
+            "247540",
+            "323410",
+        )
+        review_codes = {"000660", "323410"}
+        stale_running_codes = {"068270", "086520", "247540"}
+        stock_records = [
+            {
+                "code": code,
+                "name": f"stock-{code}",
+                "stock_path": f"stocks/{code}_stock-{code}",
+            }
+            for code in codes
+        ]
+
+        def read_json(path):
+            code = Path(path).parent.name.split("_", 1)[0]
+            if Path(path).name == "config.json":
+                return {
+                    "assigned_routine_instance_id": instance.instance_id,
+                    "operation_excluded": code == "000660",
+                }
+            if code in review_codes:
+                return {
+                    "status": "REVIEW_REQUIRED",
+                    "review_required": True,
+                    "trade_enabled": False,
+                }
+            return {
+                "status": "RUNNING" if code in stale_running_codes else "STOPPED",
+                "trade_enabled": code in stale_running_codes,
+            }
+
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=[instance],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "read_base_stocks",
+                return_value=stock_records,
+            ),
+            patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                gui_main_table_loader,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value={"available": False},
+            ),
+        ):
+            count = gui_main_table_loader._instance_stock_counts(
+                window=SimpleNamespace()
+            )[instance.instance_id]
+
+        self.assertEqual(8, count["registered"])
+        self.assertEqual(0, count["excluded"])
+        self.assertEqual(2, count["review"])
+        self.assertEqual(6, count["normal"])
+        self.assertEqual(0, count["operation_running"])
+        self.assertEqual(0, count["running"])
+        self.assertEqual(6, count["stopped"])
+        self.assertEqual(
+            gui_main_table_loader.ROUTINE_STATUS_STOPPED,
+            gui_main_table_loader.routine_instance_operation_status(
+                count["operation_running"]
+            ),
+        )
+        widget = gui_main_table_loader.create_routine_instance_status_widget(
+            gui_main_table_loader.ROUTINE_STATUS_STOPPED,
+            registered=count["registered"],
+            excluded=count["excluded"],
+            operation_or_stopped=count["stopped"],
+            review=count["review"],
+        )
+        self.assertEqual(
+            "정지",
+            widget.findChild(
+                QLabel,
+                "routineInstanceOperationOrStoppedLabel",
+            ).text(),
+        )
+        widget.close()
+
+    def test_instance_stock_counts_filter_current_running_by_instance(self) -> None:
+        instances = [
+            SimpleNamespace(instance_id="instance-a"),
+            SimpleNamespace(instance_id="instance-b"),
+        ]
+        stock_records = [
+            {
+                "code": f"00000{index + 1}",
+                "name": f"stock-{index + 1}",
+                "stock_path": f"stocks/stock-{index + 1}",
+            }
+            for index in range(4)
+        ]
+        project_root = Path(gui_main_table_loader.__file__).resolve().parent
+        running_paths = {
+            str((project_root / "stocks" / "stock-1").resolve()),
+            str((project_root / "stocks" / "stock-2").resolve()),
+        }
+
+        def read_json(path):
+            stock_number = int(Path(path).parent.name.rsplit("-", 1)[-1])
+            if Path(path).name == "config.json":
+                return {
+                    "assigned_routine_instance_id": (
+                        "instance-a" if stock_number <= 3 else "instance-b"
+                    )
+                }
+            return {"status": "RUNNING", "trade_enabled": True}
+
+        current_running = [
+            (Path(path), Path(path).name, Path(path).name)
+            for path in sorted(running_paths)
+        ]
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=instances,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "read_base_stocks",
+                return_value=stock_records,
+            ),
+            patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                gui_main_table_loader,
+                "auto_trade_running_registered_operation_targets",
+                return_value=current_running,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value={"available": False},
+            ),
+        ):
+            counts = gui_main_table_loader._instance_stock_counts(
+                window=SimpleNamespace()
+            )
+
+        self.assertEqual(2, counts["instance-a"]["operation_running"])
+        self.assertEqual(1, counts["instance-a"]["stopped"])
+        self.assertEqual(0, counts["instance-b"]["operation_running"])
+        self.assertEqual(1, counts["instance-b"]["stopped"])
+
+    def test_main_and_setting_instance_counts_share_current_running_source(self) -> None:
+        instance = SimpleNamespace(instance_id="instance-a")
+        stock_record = {
+            "code": "005930",
+            "name": "삼성전자",
+            "stock_path": "stocks/005930_삼성전자",
+        }
+        stock_dir = (
+            Path(gui_main_table_loader.__file__).resolve().parent
+            / stock_record["stock_path"]
+        )
+        main_window = SimpleNamespace(name="main")
+        setting_window = SimpleNamespace(name="setting")
+
+        def read_json(path):
+            if Path(path).name == "config.json":
+                return {"assigned_routine_instance_id": instance.instance_id}
+            return {"status": "RUNNING", "trade_enabled": True}
+
+        with (
+            patch.object(
+                gui_main_table_loader,
+                "load_persisted_routine_instances",
+                return_value=[instance],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "read_base_stocks",
+                return_value=[stock_record],
+            ),
+            patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                gui_main_table_loader,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[(stock_dir, "005930", "삼성전자")],
+            ) as current_running,
+            patch.object(
+                gui_main_table_loader,
+                "project_confirmable_cumulative_pnl",
+                return_value={"available": False},
+            ),
+        ):
+            main_counts = gui_main_table_loader._instance_stock_counts(
+                window=main_window
+            )
+            setting_counts = (
+                gui_windows.AutoTradeSettingWindow._routine_instance_operation_counts(
+                    setting_window
+                )
+            )
+
+        self.assertEqual(
+            main_counts[instance.instance_id]["operation_running"],
+            setting_counts[instance.instance_id]["operation_running"],
+        )
+        self.assertEqual(
+            [main_window, setting_window],
+            [call.args[0] for call in current_running.call_args_list],
+        )
 
     def test_profit_signal_uses_gross_and_net_rates_without_cost_hardcoding(self) -> None:
         self.assertEqual(routine_profit_signal(-1.25, -1.4)[0:2], ("LOSS", "-1.25%"))
@@ -2473,13 +2899,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
 
 
-        expected_aggregate = "등록(4) | 제외(1) | 운영(2) | 검토(1)"
+        expected_aggregate = "등록(4) | 제외(1) | 운영(1) | 검토(1)"
         self.assertEqual(
             expected_aggregate,
             table.item(0, 0).data(gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_ROLE),
         )
         self.assertEqual(
-            (("등록", "4"), ("제외", "1"), ("운영", "2"), ("검토", "1")),
+            (("등록", "4"), ("제외", "1"), ("운영", "1"), ("검토", "1")),
             table.item(0, 0).data(
                 gui_main_table_loader.ROUTINE_PARENT_AGGREGATE_VALUES_ROLE
             ),
@@ -2535,7 +2961,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             excluded.findChild(QLabel, "routineInstanceExcludedNumber").text(),
         )
         self.assertEqual(
-            "2",
+            "1",
             operation.findChild(
                 QLabel,
                 "routineInstanceOperationOrStoppedNumber",

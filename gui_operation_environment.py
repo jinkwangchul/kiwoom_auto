@@ -43,6 +43,10 @@ from PyQt5.QtWidgets import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 from state_policy import normalized_hhmmss_or_empty
 from gui_toast import show_toast
+from gui_window_policy import (
+    configure_persistent_feature_window,
+    persistent_feature_owner,
+)
 
 
 OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
@@ -342,7 +346,8 @@ class OperationEnvironmentSettingsDialog(QDialog):
     LIQUIDATION_METHODS = ["이월", "시장가", "현재가"]
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+        super().__init__(None)
+        configure_persistent_feature_window(self, parent)
         self.setWindowTitle("환경설정")
         self.setStyleSheet("""
             QDialog, QWidget, QLabel, QCheckBox, QComboBox, QLineEdit, QPushButton {
@@ -601,7 +606,8 @@ class OperationEnvironmentSettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"추가시간 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
-        toast_parent = self.parentWidget() or self
+        logical_owner = persistent_feature_owner(self)
+        toast_parent = logical_owner if logical_owner is not None else self
         show_toast(
             parent=toast_parent,
             message="환경설정을 저장했습니다.",
@@ -967,12 +973,12 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.load_policy_to_widgets()
 
     def _main_window_kiwoom_api(self) -> object | None:
-        current: QWidget | None = self
+        current: QWidget | None = persistent_feature_owner(self)
         while current is not None:
             api = getattr(current, "kiwoom_api", None)
             if api is not None:
                 return api
-            current = current.parentWidget()
+            current = persistent_feature_owner(current)
         return None
 
     def _request_program_factory_reset(self) -> None:
@@ -1229,7 +1235,8 @@ class OperationEnvironmentSettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"환경설정 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
-        toast_parent = self.parentWidget() or self
+        logical_owner = persistent_feature_owner(self)
+        toast_parent = logical_owner if logical_owner is not None else self
         show_toast(
             parent=toast_parent,
             message="환경설정을 저장했습니다.",

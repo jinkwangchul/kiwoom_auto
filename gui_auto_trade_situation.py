@@ -71,7 +71,7 @@ def create_auto_trade_situation_item(
         if mismatch_reasons:
             item.setToolTip("현황: 내부 데이터 불일치 - " + ", ".join(mismatch_reasons))
         else:
-            item.setToolTip("현황: 서버/프로그램 정보 불일치 또는 서버 불안 - 운영정지 후 무결성 확인 필요")
+            item.setToolTip("현황: 서버/프로그램 정보 불일치 또는 서버 불안 - 긴급정지 후 무결성 확인 필요")
         item.setData(SORT_ROLE, 3)
         return item
 

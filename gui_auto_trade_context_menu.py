@@ -9,10 +9,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Callable
+from typing import Callable, Iterable
 
 from PyQt5.QtCore import QEvent, QObject, Qt
-from PyQt5.QtGui import QColor, QIcon, QIconEngine, QPainter, QPixmap
+from PyQt5.QtGui import (
+    QColor,
+    QIcon,
+    QIconEngine,
+    QPainter,
+    QPixmap,
+)
 from PyQt5.QtWidgets import QMenu
 
 from gui_auto_trade_integrity import (
@@ -24,6 +30,7 @@ from gui_ats_utils import (
     manual_ats_visible_session_keys,
 )
 from gui_operation_environment import OPERATION_POLICY_PATH
+from gui_stock_data import is_valid_stock_code, normalize_stock_code
 from runtime_io import read_json_dict
 
 
@@ -52,6 +59,25 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
     "30",
 )
 
+def tile_new_stock_instance_charts(
+    parent,
+    windows: Iterable[object],
+    *,
+    screens=None,
+    primary_screen=None,
+    gap: int | None = None,
+) -> list[object]:
+    """Compatibility wrapper for the common chart placement policy."""
+    from gui_stock_instance_chart_window import place_new_stock_instance_charts
+
+    placement_options = {
+        "screens": screens,
+        "primary_screen": primary_screen,
+    }
+    if gap is not None:
+        placement_options["gap"] = gap
+    return place_new_stock_instance_charts(parent, windows, **placement_options)
+
 @dataclass(frozen=True)
 class StockContextMenuCallbacks:
     select_all: Callable[[], None]
@@ -60,6 +86,7 @@ class StockContextMenuCallbacks:
     early_close_profit_loss: Callable[[], None]
     early_close_cancel: Callable[[], None]
     individual_liquidation: Callable[[str, str], None]
+    open_charts: Callable[[], None] | None = None
     start: Callable[[], None] | None = None
     emergency_stop: Callable[[], None] | None = None
     emergency_release: Callable[[], None] | None = None
@@ -76,6 +103,33 @@ class StockContextMenuCallbacks:
     ] | None = None
     set_operation_exclusion: Callable[[], None] | None = None
     clear_operation_exclusion: Callable[[], None] | None = None
+
+
+def open_selected_stock_instance_charts(
+    parent,
+    selected: Iterable[tuple[object, str, str]],
+) -> list[object]:
+    """Open each valid selected stock through the common singleton opener."""
+    from gui_stock_instance_chart_window import open_stock_instance_chart
+
+    opened: list[object] = []
+    seen_codes: set[str] = set()
+    for _stock_dir, raw_code, _stock_name in selected:
+        stock_code = normalize_stock_code(str(raw_code or ""))
+        if not is_valid_stock_code(stock_code) or stock_code in seen_codes:
+            continue
+        seen_codes.add(stock_code)
+        try:
+            window = open_stock_instance_chart(
+                stock_code,
+                trade_date=None,
+                parent=parent,
+            )
+            opened.append(window)
+        except Exception:
+            # A single damaged target must not prevent the remaining charts.
+            continue
+    return opened
 
 
 class _MenuStatusIconEngine(QIconEngine):
@@ -575,6 +629,12 @@ def show_monitor_stock_context_menu(
             action_unregister = menu.addAction("등록해제")
             action_unregister.setEnabled(has_selection)
 
+    action_open_charts = None
+    if callbacks.open_charts is not None:
+        menu.addSeparator()
+        action_open_charts = menu.addAction("간이차트")
+        action_open_charts.setEnabled(has_selection)
+
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
@@ -596,6 +656,8 @@ def show_monitor_stock_context_menu(
         callbacks.clear_operation_exclusion()
     elif action_unregister is not None and chosen == action_unregister:
         callbacks.unregister()
+    elif action_open_charts is not None and chosen == action_open_charts:
+        callbacks.open_charts()
     elif _dispatch_early_close_action(
         chosen,
         early_close,
@@ -695,6 +757,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         individual_liquidation=window_callback(
             "apply_selected_individual_liquidation_method"
         ),
+        open_charts=lambda: open_selected_stock_instance_charts(window, selected),
         time_change=window_callback("set_selected_individual_schedule_time"),
         time_reset=window_callback("reset_selected_schedule_to_global"),
         ats_state=lambda: window_callback("selected_manual_ats_state")(selected),

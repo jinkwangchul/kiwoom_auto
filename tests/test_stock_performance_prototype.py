@@ -425,7 +425,10 @@ class StockPerformancePrototypeTests(unittest.TestCase):
             open_stock_performance_prototype(window)
 
         dialog_class.assert_called_once_with(parent=window)
-        dialog_class.return_value.exec_.assert_called_once_with()
+        dialog_class.return_value.show.assert_called_once_with()
+        dialog_class.return_value.raise_.assert_called_once_with()
+        dialog_class.return_value.activateWindow.assert_called_once_with()
+        dialog_class.return_value.exec_.assert_not_called()
 
     def test_no_selection_keeps_existing_single_selection_guard(self) -> None:
         window = Mock()

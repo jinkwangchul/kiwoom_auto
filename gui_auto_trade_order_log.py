@@ -7,6 +7,7 @@ gui_auto_trade_order_log.py
 
 from __future__ import annotations
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QMessageBox
 
 from gui_log_view_window import LogViewWindow
@@ -34,7 +35,18 @@ def open_auto_trade_log_view_window(window) -> None:
             stock_name=name,
             parent=window,
         )
-        dialog.exec_()
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        windows = getattr(window, "_log_view_windows", None)
+        if not isinstance(windows, set):
+            windows = set()
+            window._log_view_windows = windows
+        windows.add(dialog)
+        dialog.destroyed.connect(
+            lambda _obj=None, target=dialog: windows.discard(target)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     except Exception as exc:
         QMessageBox.critical(
             window,

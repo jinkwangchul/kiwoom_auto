@@ -149,7 +149,7 @@ class StockInstanceChartEntryConnectionTests(unittest.TestCase):
             self.assertEqual(1, operation_handler.call_count)
         parent.close()
 
-    def test_parent_ownership_keeps_repeated_windows_and_both_views_share_projection(self) -> None:
+    def test_both_views_reuse_one_program_wide_window_for_the_same_stock(self) -> None:
         monitoring, monitoring_table = _table_parent("running_stock_table")
         setting, setting_table = _table_parent("stock_table")
         projected = _projection()
@@ -157,7 +157,11 @@ class StockInstanceChartEntryConnectionTests(unittest.TestCase):
             chart_window,
             "project_stock_instance_day",
             return_value=projected,
-        ) as loader:
+        ) as loader, patch.object(
+            chart_window,
+            "_today_trade_date",
+            return_value="2026-08-10",
+        ):
             MainWindow.on_running_stock_table_item_double_clicked(
                 monitoring,
                 monitoring_table.item(0, 0),
@@ -172,21 +176,17 @@ class StockInstanceChartEntryConnectionTests(unittest.TestCase):
             )
             self.app.processEvents()
 
-        monitoring_windows = monitoring.findChildren(StockInstanceChartWindow)
-        setting_windows = setting.findChildren(StockInstanceChartWindow)
-        self.assertEqual(2, len(monitoring_windows))
-        self.assertEqual(1, len(setting_windows))
-        self.assertTrue(all(window.isVisible() for window in monitoring_windows))
-        self.assertTrue(setting_windows[0].isVisible())
-        self.assertEqual(projected, monitoring_windows[0].last_projection)
-        self.assertEqual(
-            monitoring_windows[0].last_projection,
-            setting_windows[0].last_projection,
-        )
+        chart = chart_window._OPEN_STOCK_INSTANCE_CHARTS["005930"]
+        self.assertIsNone(chart.parent())
+        self.assertIs(chart_window.persistent_feature_owner(chart), monitoring)
+        self.assertTrue(chart.isVisible())
+        self.assertEqual(projected, chart.last_projection)
         self.assertEqual(3, loader.call_count)
         self.assertTrue(
             all(call.args == ("005930", "2026-08-10") for call in loader.call_args_list)
         )
+        chart.close()
+        self.app.processEvents()
         monitoring.close()
         setting.close()
 

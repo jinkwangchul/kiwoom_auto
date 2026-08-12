@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QEvent, QItemSelectionModel, QPoint, QPointF, Qt
 from PyQt5.QtGui import QMouseEvent, QPainter, QPixmap
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -22,6 +23,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QWidget,
+    QWidgetAction,
 )
 
 import gui_auto_trade_context_menu as common_menu
@@ -271,6 +273,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.window._main_routine_initial_buy_badge_enabled = Mock(return_value=False)
         self.window.handle_routine_stock_operation_double_click = Mock(return_value=True)
         self.window.handle_routine_stock_name_double_click = Mock(return_value=True)
+        self.window.handle_routine_stock_code_double_click = Mock(return_value=True)
         controller = gui_windows._RoutineTreeInteractionController(self.window)
         self.app.processEvents()
 
@@ -294,13 +297,13 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.window.handle_routine_stock_name_double_click.assert_called_once_with(row)
 
         self.window.handle_routine_stock_name_double_click.reset_mock()
-        name_rect = gui_windows._routine_stock_name_rect(
+        code_rect = gui_windows._routine_stock_code_rect(
             self.window.routine_table,
             index,
         )
         code_event = QMouseEvent(
             QEvent.MouseButtonDblClick,
-            QPointF(name_rect.left() - 2, name_rect.center().y()),
+            QPointF(code_rect.center()),
             Qt.LeftButton,
             Qt.LeftButton,
             Qt.NoModifier,
@@ -310,8 +313,9 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             code_event,
         )
 
-        self.assertFalse(handled)
+        self.assertTrue(handled)
         self.window.handle_routine_stock_name_double_click.assert_not_called()
+        self.window.handle_routine_stock_code_double_click.assert_called_once_with(row)
 
     def test_stock_name_double_click_uses_common_operation_exclusion_contract(self) -> None:
         row = self._add_row(
@@ -339,6 +343,116 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             adapter,
             (target.stock_dir, "005930", "삼성전자"),
         )
+
+    def test_visible_code_mouse_double_click_opens_then_clears_selection(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        self.window.handle_routine_stock_code_double_click = (
+            lambda target_row: gui_windows.MainWindow.handle_routine_stock_code_double_click(
+                self.window,
+                target_row,
+            )
+        )
+        controller = gui_windows._RoutineTreeInteractionController(self.window)
+        self.window.routine_table.viewport().installEventFilter(controller)
+        self._select_rows(row)
+        self.window.routine_table.setCurrentCell(row, 0)
+        index = self.window.routine_table.model().index(row, 0)
+        code_rect = gui_windows._routine_stock_code_rect(
+            self.window.routine_table,
+            index,
+        )
+
+        with patch.object(
+            gui_windows,
+            "open_stock_instance_chart",
+            return_value=object(),
+        ) as opener:
+            QTest.mouseDClick(
+                self.window.routine_table.viewport(),
+                Qt.LeftButton,
+                Qt.NoModifier,
+                code_rect.center(),
+            )
+            self.app.processEvents()
+
+        opener.assert_called_once_with(
+            "005930",
+            trade_date=None,
+            parent=self.window,
+        )
+        self.assertEqual([], self.window.routine_table.selectionModel().selectedRows())
+        self.assertFalse(self.window.routine_table.currentIndex().isValid())
+
+    def test_visible_code_double_click_clears_selection_only_after_chart_open(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        self._select_rows(row)
+        self.window.routine_table.setCurrentCell(row, 0)
+        chart = object()
+
+        with patch.object(
+            gui_windows,
+            "open_stock_instance_chart",
+            return_value=chart,
+        ) as opener:
+            handled = gui_windows.MainWindow.handle_routine_stock_code_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        opener.assert_called_once_with(
+            "005930",
+            trade_date=None,
+            parent=self.window,
+        )
+        self.assertEqual([], self.window.routine_table.selectionModel().selectedRows())
+        self.assertFalse(self.window.routine_table.currentIndex().isValid())
+
+        self._select_rows(row)
+        self.window.routine_table.setCurrentCell(row, 0)
+        with patch.object(
+            gui_windows,
+            "open_stock_instance_chart",
+            return_value=chart,
+        ):
+            handled = gui_windows.MainWindow.handle_routine_stock_code_double_click(
+                self.window,
+                row,
+            )
+        self.assertTrue(handled)
+        self.assertEqual([], self.window.routine_table.selectionModel().selectedRows())
+        self.assertFalse(self.window.routine_table.currentIndex().isValid())
+
+        self._select_rows(row)
+        self.window.routine_table.setCurrentCell(row, 0)
+        with patch.object(
+            gui_windows,
+            "open_stock_instance_chart",
+            return_value=None,
+        ):
+            handled = gui_windows.MainWindow.handle_routine_stock_code_double_click(
+                self.window,
+                row,
+            )
+        self.assertFalse(handled)
+        self.assertEqual(
+            [row],
+            [
+                index.row()
+                for index in self.window.routine_table.selectionModel().selectedRows()
+            ],
+        )
+        self.assertTrue(self.window.routine_table.currentIndex().isValid())
 
     def test_stock_name_double_click_toggles_shared_config_through_setting_backend(self) -> None:
         row = self._add_row(
@@ -370,6 +484,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                     "operation_excluded"
                 ]
             )
+            self.app.processEvents()
 
             self.assertTrue(
                 gui_windows.MainWindow.handle_routine_stock_name_double_click(
@@ -382,6 +497,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                     "operation_excluded"
                 ]
             )
+            self.app.processEvents()
 
         self.assertEqual(2, self.window.refresh_all.call_count)
 
@@ -964,12 +1080,12 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
 
         self.assertTrue(opened)
         self.assertEqual(
-            ["종목등록", "등록해제"],
+            ["종목등록", "등록해제", "간이차트"],
             [
                 action.text
                 for action in _FakeMenu.root.actions
                 if not action.separator
-            ][-2:],
+            ][-3:],
         )
         self.window.open_routine_instance_stock_register_from_main_table.assert_called_once_with(
             "instance-a"
@@ -1243,12 +1359,12 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["종목등록", "등록해제"],
+            ["종목등록", "등록해제", "간이차트"],
             [
                 action.text
                 for action in _FakeMenu.root.actions
                 if not action.separator
-            ][-2:],
+            ][-3:],
         )
         self.window.open_routine_instance_stock_register_from_main_table.assert_called_once_with(
             "instance-a"
@@ -1389,6 +1505,227 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                     else "set_operation_exclusion"
                 )
                 getattr(callbacks, other_name).assert_not_called()
+
+    def test_settings_chart_action_opens_all_selected_targets(self) -> None:
+        selected = [
+            (self.root / "005930_삼성전자", "005930", "삼성전자"),
+            (self.root / "012330_현대모비스", "012330", "현대모비스"),
+            (self.root / "086520_에코프로", "086520", "에코프로"),
+        ]
+        window = Mock()
+        window._all_stocks_scope_active = True
+        window._stock_status_filter = "running"
+        window.stock_table.itemAt.return_value = None
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window.selected_stock_infos.return_value = selected
+        window.selected_operation_mode_set.return_value = set()
+        _FakeMenu.chosen_text = "간이차트"
+
+        with (
+            patch.object(common_menu, "QMenu", _FakeMenu),
+            patch.object(
+                common_menu,
+                "open_selected_stock_instance_charts",
+            ) as batch_open,
+        ):
+            common_menu.show_auto_trade_stock_context_menu(window, QPoint())
+
+        batch_open.assert_called_once_with(window, selected)
+        chart_action = _FakeMenu.root.actions[-1]
+        self.assertEqual("간이차트", chart_action.text)
+        self.assertFalse(chart_action.separator)
+        self.assertTrue(_FakeMenu.root.actions[-2].separator)
+        self.assertIsNone(chart_action.property("stockChartActionColor"))
+
+    def test_real_chart_action_uses_native_qaction_appearance(self) -> None:
+        menu = common_menu._new_stock_context_menu(self.window)
+        normal_action = menu.addAction("등록해제")
+        separator = menu.addSeparator()
+        chart_action = menu.addAction("간이차트")
+
+        self.assertEqual([normal_action, separator, chart_action], menu.actions())
+        self.assertTrue(separator.isSeparator())
+        self.assertNotIsInstance(chart_action, QWidgetAction)
+        self.assertEqual(normal_action.font(), chart_action.font())
+        self.assertTrue(chart_action.icon().isNull())
+        self.assertIsNone(chart_action.property("stockChartActionColor"))
+        menu.close()
+
+    def test_real_chart_action_preserves_native_row_geometry_and_click_target(self) -> None:
+        menu = common_menu._new_stock_context_menu(self.window)
+        menu.addAction("등록해제")
+        menu.addSeparator()
+        chart_action = menu.addAction("간이차트")
+        triggered = Mock()
+        chart_action.triggered.connect(triggered)
+
+        menu.popup(QPoint(20, 20))
+        self.app.processEvents()
+        normal_rect = menu.actionGeometry(menu.actions()[0])
+        row_rect = menu.actionGeometry(chart_action)
+        self.assertTrue(row_rect.isValid())
+        self.assertEqual(normal_rect.height(), row_rect.height())
+        QTest.mouseClick(
+            menu,
+            Qt.LeftButton,
+            pos=QPoint(row_rect.right() - 2, row_rect.center().y()),
+        )
+        self.app.processEvents()
+
+        triggered.assert_called_once_with(False)
+        menu.close()
+
+    def test_main_visible_selection_chart_action_uses_canonical_roles(self) -> None:
+        rows = [
+            self._add_row(
+                kind=ROUTINE_ROW_STOCK,
+                code=code,
+                name=name,
+                instance_id="instance-a",
+            )
+            for code, name in (
+                ("005930", "삼성전자"),
+                ("012330", "현대모비스"),
+                ("086520", "에코프로"),
+            )
+        ]
+        selection_model = self.window.routine_table.selectionModel()
+        for row in rows:
+            selection_model.select(
+                self.window.routine_table.model().index(row, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+        self.app.processEvents()
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(rows[0], 0)
+        ).center()
+        _FakeMenu.chosen_text = "간이차트"
+
+        with (
+            patch.object(common_menu, "QMenu", _FakeMenu),
+            patch.object(
+                monitoring_menu,
+                "open_selected_stock_instance_charts",
+                return_value=[object(), object(), object()],
+            ) as batch_open,
+        ):
+            opened = monitoring_menu.show_main_monitoring_stock_context_menu(
+                self.window,
+                position,
+            )
+
+        self.assertTrue(opened)
+        parent, selected = batch_open.call_args.args
+        self.assertIs(self.window, parent)
+        self.assertEqual(
+            ["005930", "012330", "086520"],
+            [code for _stock_dir, code, _name in selected],
+        )
+        self.assertEqual([], selection_model.selectedRows())
+        self.assertFalse(self.window.routine_table.currentIndex().isValid())
+        chart_action = _FakeMenu.root.actions[-1]
+        self.assertEqual("간이차트", chart_action.text)
+        self.assertFalse(chart_action.separator)
+        self.assertTrue(_FakeMenu.root.actions[-2].separator)
+        self.assertIsNone(chart_action.property("stockChartActionColor"))
+
+    def test_main_batch_chart_failure_preserves_selection(self) -> None:
+        rows = [
+            self._add_row(
+                kind=ROUTINE_ROW_STOCK,
+                code=code,
+                name=name,
+                instance_id="instance-a",
+            )
+            for code, name in (
+                ("005930", "삼성전자"),
+                ("012330", "현대모비스"),
+            )
+        ]
+        self._select_rows(*rows)
+        self.window.routine_table.selectionModel().setCurrentIndex(
+            self.window.routine_table.model().index(rows[0], 0),
+            QItemSelectionModel.NoUpdate,
+        )
+        selected = [
+            (
+                Path(str(self.window.routine_table.item(row, 0).data(ROUTINE_STOCK_PATH_ROLE))),
+                str(self.window.routine_table.item(row, 0).data(ROUTINE_STOCK_CODE_ROLE)),
+                str(self.window.routine_table.item(row, 0).data(ROUTINE_STOCK_NAME_ROLE)),
+            )
+            for row in rows
+        ]
+
+        with patch.object(
+            monitoring_menu,
+            "open_selected_stock_instance_charts",
+            return_value=[],
+        ):
+            opened = monitoring_menu.open_selected_main_monitoring_stock_instance_charts(
+                self.window,
+                selected,
+            )
+
+        self.assertEqual([], opened)
+        self.assertEqual(
+            rows,
+            [
+                index.row()
+                for index in self.window.routine_table.selectionModel().selectedRows()
+            ],
+        )
+        self.assertTrue(self.window.routine_table.currentIndex().isValid())
+
+    def test_batch_chart_open_deduplicates_and_isolates_invalid_target(self) -> None:
+        selected = [
+            (Path("first"), "005930", "삼성전자"),
+            (Path("duplicate"), "005930", "삼성전자 중복"),
+            (Path("invalid"), "", "코드없음"),
+            (Path("bad"), "BAD", "잘못된코드"),
+            (Path("failure"), "012330", "현대모비스"),
+            (Path("last"), "086520", "에코프로"),
+        ]
+        opened_window = object()
+
+        def open_chart(code, trade_date=None, parent=None):
+            if code == "012330":
+                raise RuntimeError("damaged target")
+            return opened_window
+
+        with patch(
+            "gui_stock_instance_chart_window.open_stock_instance_chart",
+            side_effect=open_chart,
+        ) as opener:
+            opened = common_menu.open_selected_stock_instance_charts(
+                self.window,
+                selected,
+            )
+
+        self.assertEqual([opened_window, opened_window], opened)
+        self.assertEqual(
+            ["005930", "012330", "086520"],
+            [call.args[0] for call in opener.call_args_list],
+        )
+        self.assertTrue(
+            all(call.kwargs["parent"] is self.window for call in opener.call_args_list)
+        )
+
+    def test_batch_chart_open_accepts_thirty_distinct_stocks(self) -> None:
+        selected = [
+            (Path(str(index)), f"{index + 1:06d}", f"종목{index + 1}")
+            for index in range(30)
+        ]
+        with patch(
+            "gui_stock_instance_chart_window.open_stock_instance_chart",
+            side_effect=lambda code, **_kwargs: code,
+        ) as opener:
+            opened = common_menu.open_selected_stock_instance_charts(
+                self.window,
+                selected,
+            )
+
+        self.assertEqual(30, len(opened))
+        self.assertEqual(30, opener.call_count)
 
     def test_monitor_excluded_selection_disables_only_early_close_menu(self) -> None:
         callbacks = common_menu.StockContextMenuCallbacks(

@@ -88,39 +88,6 @@ class _PersistingStartWindow(_StartWindow):
         )
 
 
-class _PersistingStopWindow:
-    def __init__(self, target: tuple[Path, str, str]) -> None:
-        self.target = target
-        self.stock_table = _StockTable()
-        self.statusBarMessage = Mock()
-        self.refresh_all = Mock()
-        self.open_review_required_window = Mock()
-
-    def current_selected_routine_name(self) -> str:
-        return ""
-
-    def split_stop_targets(self, selected):
-        return list(selected), []
-
-    def confirm_stop_targets_once(self, _targets) -> bool:
-        return True
-
-    def stop_risk_parts(self, _stock_dir):
-        return []
-
-    def update_stock_status(
-        self, stock_dir, _code, _name, new_status, extra_state=None, _reason=""
-    ) -> bool:
-        state_path = Path(stock_dir) / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["status"] = new_status
-        state.update(dict(extra_state or {}))
-        state_path.write_text(
-            json.dumps(state, ensure_ascii=False), encoding="utf-8"
-        )
-        return True
-
-
 class SameDayRestartGuardTest(unittest.TestCase):
     NOW = datetime(2026, 8, 10, 10, 0, 0)
 
@@ -318,39 +285,6 @@ class SameDayRestartGuardTest(unittest.TestCase):
         self.assertNotIn("sell_enabled", saved)
         self.assertEqual(1, window.state_write_count)
         global_write.assert_called_once()
-
-    def test_normal_stop_writes_only_canonical_permission_state(self) -> None:
-        (self.stock_dir / "config.json").write_text(
-            json.dumps(self.config, ensure_ascii=False), encoding="utf-8"
-        )
-        (self.stock_dir / "state.json").write_text(
-            json.dumps(
-                {"status": "RUNNING", "trade_enabled": True},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        target = (self.stock_dir, "005930", "삼성전자")
-        window = _PersistingStopWindow(target)
-
-        with (
-            patch.object(run_control, "append_changelog"),
-            patch.object(run_control, "append_production_event"),
-        ):
-            result = run_control.auto_trade_stop_selected_auto_trades(
-                window,
-                selected_targets=[target],
-                source="same-day-restart-test",
-            )
-
-        self.assertTrue(result["ok"])
-        saved = json.loads(
-            (self.stock_dir / "state.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual("STOPPED", saved["status"])
-        self.assertIs(saved["trade_enabled"], False)
-        self.assertNotIn("buy_enabled", saved)
-        self.assertNotIn("sell_enabled", saved)
 
     def test_normal_ended_blocks_every_common_entry_source_without_state_write(self) -> None:
         (self.stock_dir / "config.json").write_text(

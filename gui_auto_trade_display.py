@@ -29,6 +29,11 @@ from gui_order_utils import (
 )
 
 SORT_ROLE = Qt.UserRole + 100
+AUTO_TRADE_SETTING_BADGE_HEIGHT = 22
+AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
+AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
+AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR = "#AFB2B9"
+AUTO_TRADE_SETTING_AMBER_TEXT_COLOR = "#D97706"
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -851,6 +856,24 @@ def auto_trade_setting_status_color(display_status: str) -> str:
     return color_map.get(normalized, auto_trade_status_color(normalized))
 
 
+def auto_trade_operation_identity_color(
+    *,
+    operation_excluded: bool,
+    review_managed: bool,
+    emergency_stopped: bool,
+    current_running: bool,
+) -> str:
+    """Return the shared protected/emergency/running/stopped identity palette."""
+
+    if operation_excluded or review_managed:
+        return AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR
+    if emergency_stopped:
+        return auto_trade_setting_status_color("긴급정지")
+    if current_running:
+        return auto_trade_setting_status_color("감시/대기")
+    return AUTO_TRADE_SETTING_AMBER_TEXT_COLOR
+
+
 def auto_trade_setting_status_sort_rank(display_status: object) -> int:
     """Return the semantic ordering used by auto-trade status columns."""
     normalized = str(display_status or "").strip()
@@ -907,7 +930,7 @@ def create_auto_trade_operation_item(
     if liquidation_result_policy == "RED_STOP":
         item.setToolTip(
             "청산 결과 불안정\n\n"
-            "시장가 청산 잔여 또는 미수 발생 - 운영정지 후 무결성 확인 필요"
+            "시장가 청산 잔여 또는 미수 발생 - 긴급정지 후 무결성 확인 필요"
         )
     elif liquidation_result_policy == "CURRENT_CARRYOVER":
         item.setToolTip("현재가 청산 잔여\n\n이월 취급 / 시간외·ATS 재진입 금지")
@@ -960,7 +983,7 @@ def apply_auto_trade_setting_activity_style(item: QTableWidgetItem, active: bool
         item.setBackground(QColor("#FFFFFF"))
         return
     item.setBackground(QColor("#F4F5F7"))
-    item.setForeground(QColor("#AFB2B9"))
+    item.setForeground(QColor(AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR))
 
 
 def apply_auto_trade_setting_protection_row_style(
@@ -1007,7 +1030,7 @@ def apply_auto_trade_setting_liquidation_style(
             item.setBackground(QColor("#FFFFFF"))
         else:
             item.setBackground(QColor("#F4F5F7"))
-        item.setForeground(QColor("#D97706"))
+        item.setForeground(QColor(AUTO_TRADE_SETTING_AMBER_TEXT_COLOR))
         return
 
     if active:

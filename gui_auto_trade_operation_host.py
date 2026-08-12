@@ -35,7 +35,6 @@ from gui_auto_trade_status_ops import (
 from gui_auto_trade_timer import auto_trade_current_runtime_file_signature
 from gui_review_utils import (
     build_review_required_item,
-    pending_order_summary,
     safe_float_value,
     safe_int_value,
 )
@@ -336,18 +335,6 @@ class AutoTradeOperationHost(QObject):
                 skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
         return targets, skipped
 
-    def split_stop_targets(self, selected):
-        targets = []
-        skipped = []
-        for stock_dir, code, name in selected:
-            state = read_json_dict(Path(stock_dir) / "state.json")
-            status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-            if status in {"STOPPED", "STOP"}:
-                skipped.append(f"{code} {name}(이미 중지됨)")
-            else:
-                targets.append((stock_dir, code, name))
-        return targets, skipped
-
     def pre_start_review_check(
         self,
         routine_name: str,
@@ -448,17 +435,3 @@ class AutoTradeOperationHost(QObject):
             None,
         )
         return callback() if callable(callback) else False
-
-    def stop_risk_parts(self, stock_dir: Path) -> list[str]:
-        state = read_json_dict(stock_dir / "state.json")
-        try:
-            holding_qty = int(state.get("holding_qty", 0) or 0)
-        except (TypeError, ValueError):
-            holding_qty = 0
-        pending_exists, pending_qty = pending_order_summary(stock_dir, state)
-        parts = []
-        if holding_qty > 0:
-            parts.append(f"보유 {holding_qty:,}주")
-        if pending_exists:
-            parts.append(f"미체결 {pending_qty:,}주")
-        return parts

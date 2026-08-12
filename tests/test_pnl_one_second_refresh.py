@@ -20,7 +20,7 @@ class PnlOneSecondRefreshTests(unittest.TestCase):
         self.assertEqual(1000, PNL_REFRESH_INTERVAL_MS)
         self.assertIn("PNL_REFRESH_INTERVAL_MS", inspect.getsource(settings.AutoTradeSettingWindow.__init__))
         self.assertIn("PNL_REFRESH_INTERVAL_MS", inspect.getsource(gui_windows.MainWindow.__init__))
-        self.assertIn("PNL_REFRESH_INTERVAL_MS", inspect.getsource(chart_module.StockInstanceChartWindow.__init__))
+        self.assertIn("PNL_REFRESH_INTERVAL_MS", inspect.getsource(chart_module._common_pnl_refresh_timer))
 
     def test_chart_pnl_tick_does_not_reload_candle_projection(self):
         calls = []
@@ -28,19 +28,26 @@ class PnlOneSecondRefreshTests(unittest.TestCase):
             calls.append((code, trade_date))
             return {"stock_code": code, "trade_date": trade_date, "candles": [], "buy_signal_markers": [], "sell_signal_markers": [], "diagnostics": {}, "pnl_available": False}
         with mock.patch.object(chart_module, "project_current_stock_pnl", return_value={"available": True, "cumulative_profit": 1234, "cumulative_rate": 1.25, "boundary_id": "B1", "evaluation_price": 50000, "evaluation_price_at": "2026-08-11T10:00:00+09:00"}):
-            window = chart_module.StockInstanceChartWindow("005930", chart_module._today_trade_date(), projection_provider=provider)
+            with mock.patch.object(chart_module, "project_stock_instance_day", side_effect=provider):
+                window = chart_module.open_stock_instance_chart("005930", chart_module._today_trade_date())
+            self.assertEqual("0(0.00%)", window.info_labels["cumulative_pnl"].text())
             initial_calls = len(calls)
-            self.assertTrue(window._pnl_refresh_timer.isActive())
-            self.assertEqual(1000, window._pnl_refresh_timer.interval())
+            timer = chart_module._common_pnl_refresh_timer()
+            self.assertTrue(timer.isActive())
+            self.assertEqual(1000, timer.interval())
+            self.assertFalse(hasattr(window, "_pnl_refresh_timer"))
             window.refresh_pnl_only()
             self.assertEqual(initial_calls, len(calls))
-            self.assertIn("1,234", window.info_labels["cumulative_pnl"].text())
+            self.assertEqual("+1,234(+1.25%)", window.info_labels["cumulative_pnl"].text())
             window.close()
-            self.assertFalse(window._pnl_refresh_timer.isActive())
+            self.assertFalse(timer.isActive())
 
     def test_past_chart_has_no_pnl_timer(self):
-        window = chart_module.StockInstanceChartWindow("005930", "2000-01-01", projection_provider=lambda c, d: {"stock_code": c, "trade_date": d, "candles": [], "buy_signal_markers": [], "sell_signal_markers": [], "diagnostics": {}, "pnl_available": False})
-        self.assertFalse(window._pnl_refresh_timer.isActive())
+        with mock.patch.object(chart_module, "project_stock_instance_day", side_effect=lambda c, d: {"stock_code": c, "trade_date": d, "candles": [], "buy_signal_markers": [], "sell_signal_markers": [], "diagnostics": {}, "pnl_available": False}):
+            window = chart_module.open_stock_instance_chart("005930", "2000-01-01")
+        timer = chart_module._common_pnl_refresh_timer()
+        self.assertTrue(timer is None or not timer.isActive())
+        self.assertFalse(hasattr(window, "_pnl_refresh_timer"))
         window.close()
 
 
