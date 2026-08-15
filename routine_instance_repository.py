@@ -13,6 +13,8 @@ import shutil
 from typing import Any, Callable
 from uuid import uuid4
 
+from event_journal_production import append_production_event
+
 from routine_instance_registry import (
     RoutineInstanceRecord,
     load_persisted_routine_instances,
@@ -23,6 +25,53 @@ from routine_instance_registry import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 INSTANCE_SCHEMA_VERSION = "1.0"
+
+
+def _append_instance_setting_changed(
+    *,
+    instance_id: str,
+    display_name: str,
+    changes: list[dict[str, object]],
+) -> None:
+    if not changes:
+        return
+    append_production_event(
+        "SETTING_CHANGED",
+        result="SUCCESS",
+        source="ROUTINE_INSTANCE_REPOSITORY",
+        template_args={"target": "등록 루틴"},
+        target_type="ROUTINE_INSTANCE",
+        target_id=str(instance_id or "").strip(),
+        target_name=str(display_name or "").strip(),
+        routine=str(display_name or "").strip(),
+        changes=changes,
+    )
+
+
+def _append_instance_lifecycle_event(
+    event_type: str,
+    *,
+    instance: RoutineInstanceRecord,
+) -> None:
+    created = event_type == "ROUTINE_INSTANCE_CREATED"
+    append_production_event(
+        event_type,
+        result="SUCCESS",
+        source="ROUTINE_INSTANCE_REPOSITORY",
+        template_args={"routine": instance.display_name},
+        target_type="ROUTINE_INSTANCE",
+        target_id=instance.instance_id,
+        target_name=instance.display_name,
+        routine=instance.display_name,
+        details={"definition_id": instance.definition_id},
+        changes=[
+            {
+                "field_key": "lifecycle_state",
+                "before": "ABSENT" if created else "CREATED",
+                "after": "CREATED" if created else "ABSENT",
+            }
+        ],
+    )
 
 
 @dataclass(frozen=True)
@@ -180,6 +229,10 @@ class RoutineInstanceRepository:
             instance = self.get_instance(instance_id)
             if instance is None:
                 raise RuntimeError("저장된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            _append_instance_lifecycle_event(
+                "ROUTINE_INSTANCE_CREATED",
+                instance=instance,
+            )
             return RoutineInstanceCreateResult(True, instance=instance)
         except Exception as exc:
             if temp_dir.exists():
@@ -243,6 +296,17 @@ class RoutineInstanceRepository:
             renamed = self.get_instance(instance.instance_id)
             if renamed is None or renamed.display_name != new_name:
                 raise RuntimeError("변경된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            _append_instance_setting_changed(
+                instance_id=instance.instance_id,
+                display_name=renamed.display_name,
+                changes=[
+                    {
+                        "field_key": "display_name",
+                        "before": instance.display_name,
+                        "after": renamed.display_name,
+                    }
+                ],
+            )
             return RoutineInstanceRenameResult(True, instance=renamed)
         except Exception as exc:
             if temp_path.exists():
@@ -269,6 +333,12 @@ class RoutineInstanceRepository:
             if self.get_instance(instance.instance_id) is not None:
                 raise RuntimeError("등록 삭제 후 재조회 검증에 실패했습니다.")
             shutil.rmtree(staged_dir)
+            if instance_dir.exists() or staged_dir.exists():
+                raise RuntimeError("등록 삭제 후 저장소 제거 검증에 실패했습니다.")
+            _append_instance_lifecycle_event(
+                "ROUTINE_INSTANCE_DELETED",
+                instance=instance,
+            )
             return RoutineInstanceDeleteResult(True)
         except Exception as exc:
             if staged_dir.exists() and not instance_dir.exists():
@@ -332,6 +402,28 @@ class RoutineInstanceRepository:
                 or updated.buy_limit_amount != clean_amount
             ):
                 raise RuntimeError("변경된 매수한도 값이 재읽기 검증과 일치하지 않습니다.")
+            changes: list[dict[str, object]] = []
+            if instance.buy_limit_enabled != updated.buy_limit_enabled:
+                changes.append(
+                    {
+                        "field_key": "buy_limit_enabled",
+                        "before": instance.buy_limit_enabled,
+                        "after": updated.buy_limit_enabled,
+                    }
+                )
+            if instance.buy_limit_amount != updated.buy_limit_amount:
+                changes.append(
+                    {
+                        "field_key": "buy_limit_amount",
+                        "before": instance.buy_limit_amount,
+                        "after": updated.buy_limit_amount,
+                    }
+                )
+            _append_instance_setting_changed(
+                instance_id=instance.instance_id,
+                display_name=updated.display_name,
+                changes=changes,
+            )
             return RoutineInstanceBuyLimitResult(True, instance=updated)
         except Exception as exc:
             if temp_path.exists():

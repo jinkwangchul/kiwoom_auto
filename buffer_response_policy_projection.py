@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """Read-only buffer-response policy projection.
 
-This module only combines the live settings-surface widget state with already
-projected Production snapshots.  It deliberately owns no persistence,
+Production combines the persisted canonical settings with already projected
+snapshots.  The widget reader remains only for editor/test snapshots and is
+never the Production Source of Truth.  This module owns no persistence,
 runtime mutation, close command, cancellation, or order execution path.
 """
 
@@ -10,6 +11,11 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
+
+from gui_operation_environment import (
+    read_buffer_response_policy,
+    validate_buffer_response_policy,
+)
 
 
 MODE_UNIFIED = "UNIFIED"
@@ -88,7 +94,7 @@ def _current_text(widget: object) -> str:
 
 
 def read_buffer_response_settings(surface: object) -> dict[str, object]:
-    """Read only the currently visible settings surface; never invent defaults."""
+    """Read an editor snapshot only; never use it as Production policy."""
     if surface is None:
         return _unavailable("BUFFER_RESPONSE_SETTINGS_SURFACE_MISSING")
     visibility_reader = getattr(surface, "isVisible", None)
@@ -153,6 +159,29 @@ def read_buffer_response_settings(surface: object) -> dict[str, object]:
     }
 
 
+def _persisted_settings(
+    settings_policy: Mapping[str, object] | object,
+) -> dict[str, object]:
+    if not isinstance(settings_policy, Mapping):
+        return _unavailable("BUFFER_RESPONSE_POLICY_NOT_CONFIGURED")
+    if settings_policy.get("available") is False:
+        return _unavailable(
+            _text(settings_policy.get("reason"))
+            or "BUFFER_RESPONSE_POLICY_UNAVAILABLE"
+        )
+    try:
+        normalized = validate_buffer_response_policy(settings_policy)
+    except ValueError:
+        return _unavailable("BUFFER_RESPONSE_POLICY_MALFORMED")
+    return {
+        "available": True,
+        "application_mode": normalized["application_mode"],
+        "configured_threshold": normalized["threshold_percent"],
+        "strategies": normalized["strategies"],
+        "reason": "",
+    }
+
+
 def _project_pnl_inputs(
     pnl_by_stock: Mapping[str, Mapping[str, object]] | object,
 ) -> tuple[Decimal, dict[str, Mapping[str, object]]] | None:
@@ -176,12 +205,20 @@ def _project_pnl_inputs(
 
 def project_buffer_response_policy(
     *,
-    settings_surface: object,
     pnl_by_stock: Mapping[str, Mapping[str, object]] | object,
     budget_activity: Mapping[str, object] | object,
+    settings_policy: Mapping[str, object] | object | None = None,
+    settings_surface: object | None = None,
 ) -> dict[str, object]:
-    """Project the current effective response without executing or persisting it."""
-    settings = read_buffer_response_settings(settings_surface)
+    """Project the effective response without executing or persisting it."""
+    if settings_policy is not None:
+        settings = _persisted_settings(settings_policy)
+    elif settings_surface is not None:
+        # Compatibility for editor-focused tests only. Production coordinators
+        # always pass the result of the canonical persisted-policy reader.
+        settings = read_buffer_response_settings(settings_surface)
+    else:
+        settings = _persisted_settings(read_buffer_response_policy())
     if settings.get("available") is not True:
         return _unavailable(_text(settings.get("reason")))
 

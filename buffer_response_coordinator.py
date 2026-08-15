@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -50,6 +51,7 @@ from buffer_response_ownership_service import (
     BufferResponseOwnershipService,
 )
 from buffer_response_policy_projection import project_buffer_response_policy
+from gui_operation_environment import read_buffer_response_policy
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
 )
@@ -57,6 +59,7 @@ from gui_main_budget_panel import (
     collect_main_budget_summary,
     project_main_budget_activity,
 )
+from event_journal_production import observe_owner_failure_transition
 from pnl_ui_refresh import project_current_stock_pnl_snapshot
 from operation_close_completion_evaluator import evaluate_operation_close_completion
 from production_recovery_contract import ACCOUNT_COMPLETED, STOCK_RESTORED
@@ -70,6 +73,27 @@ ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
 _INTEGRATION_READY_WINDOW_IDS: set[int] = set()
+
+_P3_BUDGET_EVIDENCE_STAGES = frozenset(
+    {"runtime_snapshot", "budget_consumption", "budget_activity"}
+)
+_P3_BUFFER_EVIDENCE_STAGES = frozenset(
+    {"buy_contributors", "pnl_candidates", "stable_observation"}
+)
+_P3_BUFFER_RESPONSE_FAILURE_REASONS = frozenset(
+    {
+        "BUFFER_RESPONSE_POLICY_MALFORMED",
+        "BUFFER_RESPONSE_POLICY_READ_FAILED",
+        "CONFIRMABLE_PNL_SNAPSHOT_UNAVAILABLE",
+        "BUFFER_RESPONSE_FACTOR_VALUE_UNAVAILABLE",
+        "BUFFER_RESPONSE_STRATEGY_SELECTION_INVALID",
+        "OWNERSHIP_UNAVAILABLE",
+        "OWNERSHIP_SCHEMA_NOT_ESCALATABLE",
+        "OWNERSHIP_EVENTS_INVALID",
+        "CRASH_BRIDGE_FAILED",
+        "CLOSE_COMPLETION_PROJECTION_FAILED",
+    }
+)
 
 
 def _text(value: object) -> str:
@@ -148,6 +172,7 @@ class BufferResponseCoordinator:
         completion_projector: Callable[..., dict[str, object]] = (
             evaluate_operation_close_completion
         ),
+        policy_reader: Callable[[], dict[str, object]] = read_buffer_response_policy,
     ) -> None:
         self.ingress = ingress_service or BufferResponseIngressStateService()
         self.ownership = ownership_service or BufferResponseOwnershipService()
@@ -155,6 +180,26 @@ class BufferResponseCoordinator:
         self._candidate_selector = candidate_selector
         self._escalation_selector = escalation_selector
         self._completion_projector = completion_projector
+        self._policy_reader = policy_reader
+
+    def _project_persisted_policy(
+        self,
+        *,
+        pnl_by_stock: Mapping[str, Mapping[str, object]] | object,
+        budget_activity: Mapping[str, object] | object,
+    ) -> dict[str, object]:
+        try:
+            settings_policy = self._policy_reader()
+        except Exception as exc:
+            settings_policy = {
+                "available": False,
+                "reason": _text(exc) or "BUFFER_RESPONSE_POLICY_READ_FAILED",
+            }
+        return self._policy_projector(
+            settings_policy=settings_policy,
+            pnl_by_stock=pnl_by_stock,
+            budget_activity=budget_activity,
+        )
 
     def reconcile_completion_and_escalate(
         self,
@@ -162,7 +207,6 @@ class BufferResponseCoordinator:
         account_no: object,
         trading_day: object,
         budget_activity: Mapping[str, object] | object,
-        settings_surface: object,
         pnl_by_stock: Mapping[str, Mapping[str, object]] | object,
         candidates: Iterable[Mapping[str, object]] | object,
         completion_projection: Mapping[str, object] | object,
@@ -277,8 +321,7 @@ class BufferResponseCoordinator:
             result["reason"] = "BUFFER_NOT_ENTERED"
             return result
 
-        policy = self._policy_projector(
-            settings_surface=settings_surface,
+        policy = self._project_persisted_policy(
             pnl_by_stock=pnl_by_stock,
             budget_activity=budget_activity,
         )
@@ -397,7 +440,6 @@ class BufferResponseCoordinator:
         *,
         observation: Mapping[str, object],
         budget_activity: Mapping[str, object],
-        settings_surface: object,
         pnl_by_stock: Mapping[str, Mapping[str, object]] | object,
         candidates: Iterable[Mapping[str, object]] | object,
     ) -> dict[str, object]:
@@ -436,8 +478,7 @@ class BufferResponseCoordinator:
             )
             return result
 
-        policy = self._policy_projector(
-            settings_surface=settings_surface,
+        policy = self._project_persisted_policy(
             pnl_by_stock=pnl_by_stock,
             budget_activity=budget_activity,
         )
@@ -703,6 +744,8 @@ def collect_main_window_stable_buffer_context(
 ) -> dict[str, object]:
     """Collect one double-read stable Production observation without mutation."""
 
+    failure_stage = "account_identity"
+    activity: Mapping[str, object] | None = None
     try:
         selected_reader = getattr(window, "selected_account_no", None)
         account_no = _text(selected_reader()) if callable(selected_reader) else ""
@@ -710,6 +753,7 @@ def collect_main_window_stable_buffer_context(
             raise ValueError("selected account is unavailable")
         if getattr(window, "_main_budget_orderable_valid", None) is not True:
             raise ValueError("orderable amount and budget validation are incomplete")
+        failure_stage = "recovery"
         recovery = production_recovery_registry.snapshot()
         window_identity = getattr(window, "_production_recovery_identity", None)
         if (
@@ -737,6 +781,7 @@ def collect_main_window_stable_buffer_context(
         queue_path = Path(order_queue_path)
         position_path = Path(positions_path)
         fill_path = Path(fills_path)
+        failure_stage = "runtime_snapshot"
         before = _read_runtime_bundle(
             order_queue_path=queue_path,
             positions_path=position_path,
@@ -747,6 +792,7 @@ def collect_main_window_stable_buffer_context(
             queue=before["queue"],
             hashes=before["hashes"],
         )
+        failure_stage = "budget_consumption"
         consumption = project_account_auto_trade_budget_consumption(
             account_no=account_no,
             positions_path=position_path,
@@ -754,6 +800,12 @@ def collect_main_window_stable_buffer_context(
             recovery_complete=True,
             reconciled_stock_codes=reconciled,
         )
+        summary = collect_main_budget_summary()
+        failure_stage = "budget_activity"
+        activity = project_main_budget_activity(summary, consumption)
+        if activity.get("available") is not True or activity.get("entry_amount") is None:
+            raise ValueError("buffer budget activity is unavailable")
+        failure_stage = "buy_contributors"
         contributors = collect_confirmed_contributing_buy_ids(
             account_no=account_no,
             positions_snapshot=before["positions"],
@@ -761,12 +813,9 @@ def collect_main_window_stable_buffer_context(
             fills_snapshot=before["fills"],
             reconciled_stock_codes=reconciled,
         )
-        summary = collect_main_budget_summary()
-        activity = project_main_budget_activity(summary, consumption)
-        if activity.get("available") is not True or activity.get("entry_amount") is None:
-            raise ValueError("buffer budget activity is unavailable")
         if contributors.get("available") is not True:
             raise ValueError(_text(contributors.get("reason")) or "BUY contributor evidence is unavailable")
+        failure_stage = "pnl_candidates"
         pnl_by_stock, candidates = _production_candidate_inputs(
             window,
             account_no=account_no,
@@ -775,6 +824,7 @@ def collect_main_window_stable_buffer_context(
             order_queue_snapshot=before["queue"],
             project_root=root,
         )
+        failure_stage = "runtime_snapshot"
         after = _read_runtime_bundle(
             order_queue_path=queue_path,
             positions_path=position_path,
@@ -785,6 +835,7 @@ def collect_main_window_stable_buffer_context(
             queue=after["queue"],
             hashes=after["hashes"],
         )
+        failure_stage = "stable_observation"
         built = build_stable_buffer_observation(
             account_no=account_no,
             trading_day=recovery.identity.trading_day,
@@ -805,9 +856,17 @@ def collect_main_window_stable_buffer_context(
             "candidates": candidates,
         }
     except Exception as exc:
+        buffer_entry_active = False
+        if isinstance(activity, Mapping):
+            try:
+                buffer_entry_active = Decimal(str(activity.get("entry_amount"))) > 0
+            except Exception:
+                buffer_entry_active = False
         return {
             "available": False,
             "reason": _text(exc) or "stable Production observation is unavailable",
+            "failure_stage": failure_stage,
+            "buffer_entry_active": buffer_entry_active,
             "observation": None,
             "budget_activity": None,
             "pnl_by_stock": None,
@@ -819,6 +878,98 @@ def main_window_buffer_response_integration_ready(window: object) -> bool:
     """Reject incomplete/test-only Qt shells before touching Production readers."""
 
     return id(window) in _INTEGRATION_READY_WINDOW_IDS
+
+
+def _observe_main_window_buffer_evidence_state(
+    window: object,
+    collected: Mapping[str, object],
+) -> None:
+    if collected.get("available") is True:
+        observe_owner_failure_transition(
+            window,
+            "budget_evidence_unavailable",
+            active=False,
+        )
+        observe_owner_failure_transition(
+            window,
+            "buffer_response_evidence_unavailable",
+            active=False,
+        )
+        return
+
+    stage = _text(collected.get("failure_stage"))
+    if stage in _P3_BUDGET_EVIDENCE_STAGES:
+        observe_owner_failure_transition(
+            window,
+            "budget_evidence_unavailable",
+            active=True,
+            signature=stage,
+            event_type="RUNTIME_WARNING",
+            severity="WARNING",
+            result="BLOCKED",
+            source="buffer_response_coordinator.collect_main_window_stable_buffer_context",
+            template_args={"target": "예산 소모 현황"},
+            target_type="BUDGET_PROJECTION",
+            target_id="main_budget_activity",
+            target_name="예산 소모 현황",
+            reason_code="BUDGET_EVIDENCE_UNAVAILABLE",
+            details={"stage": stage},
+        )
+        return
+
+    if (
+        stage in _P3_BUFFER_EVIDENCE_STAGES
+        and collected.get("buffer_entry_active") is True
+    ):
+        observe_owner_failure_transition(
+            window,
+            "buffer_response_evidence_unavailable",
+            active=True,
+            signature=stage,
+            event_type="RUNTIME_WARNING",
+            severity="WARNING",
+            result="BLOCKED",
+            source="buffer_response_coordinator.collect_main_window_stable_buffer_context",
+            template_args={"target": "완충대응"},
+            target_type="BUFFER_RESPONSE",
+            target_id="buffer_response",
+            target_name="완충대응",
+            reason_code="BUFFER_RESPONSE_EVIDENCE_UNAVAILABLE",
+            details={"stage": stage},
+        )
+
+
+def _observe_main_window_buffer_policy_state(
+    window: object,
+    *,
+    collected: Mapping[str, object],
+    lifecycle: Mapping[str, object],
+) -> None:
+    activity = collected.get("budget_activity")
+    entry_active = False
+    if isinstance(activity, Mapping):
+        try:
+            entry_active = Decimal(str(activity.get("entry_amount"))) > 0
+        except Exception:
+            entry_active = False
+    reason_code = _text(lifecycle.get("reason"))
+    active = entry_active and reason_code in _P3_BUFFER_RESPONSE_FAILURE_REASONS
+    observe_owner_failure_transition(
+        window,
+        "buffer_response_policy_failure",
+        active=active,
+        signature=reason_code,
+        event_type="RUNTIME_WARNING",
+        severity="WARNING",
+        result="BLOCKED",
+        source="buffer_response_coordinator.reconcile_main_window_buffer_response_cycle",
+        template_args={"target": "완충대응"},
+        target_type="BUFFER_RESPONSE",
+        target_id="buffer_response",
+        target_name="완충대응",
+        reason_code=reason_code,
+        details={"stage": "buffer_response_policy"},
+    )
 
 
 def register_main_window_buffer_response_integration(window: object) -> None:
@@ -853,9 +1004,6 @@ def _reconcile_collected_main_window_buffer_response(
         account_no=observation.get("account_no"),
         trading_day=observation.get("trading_day"),
         budget_activity=collected.get("budget_activity"),
-        settings_surface=getattr(
-            window, "_main_buffer_response_settings_surface", None
-        ),
         pnl_by_stock=collected.get("pnl_by_stock"),
         candidates=collected.get("candidates"),
         completion_projection=completion_projection,
@@ -914,19 +1062,27 @@ def reconcile_main_window_buffer_response_cycle(window: object) -> dict[str, obj
         return {"ok": False, "reason": "BUFFER_RESPONSE_INTEGRATION_NOT_READY"}
     collected = collect_main_window_stable_buffer_context(window)
     if collected.get("available") is not True:
+        _observe_main_window_buffer_evidence_state(window, collected)
         return {
             "ok": False,
             "reason": _text(collected.get("reason")),
         }
+    _observe_main_window_buffer_evidence_state(window, collected)
     coordinator = getattr(window, "_buffer_response_coordinator", None)
     if not isinstance(coordinator, BufferResponseCoordinator):
         coordinator = BufferResponseCoordinator()
         setattr(window, "_buffer_response_coordinator", coordinator)
-    return _reconcile_collected_main_window_buffer_response(
+    lifecycle = _reconcile_collected_main_window_buffer_response(
         window,
         coordinator=coordinator,
         collected=collected,
     )
+    _observe_main_window_buffer_policy_state(
+        window,
+        collected=collected,
+        lifecycle=lifecycle,
+    )
+    return lifecycle
 
 
 def coordinate_main_window_buffer_response(
@@ -942,11 +1098,13 @@ def coordinate_main_window_buffer_response(
         return _result("CHEJAN_RECONCILIATION_INCOMPLETE")
     collected = collect_main_window_stable_buffer_context(window)
     if collected.get("available") is not True:
+        _observe_main_window_buffer_evidence_state(window, collected)
         return _result(
             _text(collected.get("reason")),
             observed=True,
             stable=False,
         )
+    _observe_main_window_buffer_evidence_state(window, collected)
     coordinator = getattr(window, "_buffer_response_coordinator", None)
     if not isinstance(coordinator, BufferResponseCoordinator):
         coordinator = BufferResponseCoordinator()
@@ -956,11 +1114,14 @@ def coordinate_main_window_buffer_response(
         coordinator=coordinator,
         collected=collected,
     )
-    surface = getattr(window, "_main_buffer_response_settings_surface", None)
+    _observe_main_window_buffer_policy_state(
+        window,
+        collected=collected,
+        lifecycle=ownership_lifecycle,
+    )
     result = coordinator.process_stable_observation(
         observation=collected["observation"],
         budget_activity=collected["budget_activity"],
-        settings_surface=surface,
         pnl_by_stock=collected["pnl_by_stock"],
         candidates=collected["candidates"],
     )

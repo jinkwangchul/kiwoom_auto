@@ -825,6 +825,7 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
     if not config:
         config = default_config()
 
+    before_config = dict(config)
     before_mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
     target_config = dict(config)
     if config_updates:
@@ -921,6 +922,39 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
                 f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}",
             )
             return False
+
+    tracked_keys = (
+        "operation_mode",
+        "start_time",
+        "trade_start_time",
+        "end_buy_time",
+        "buy_end_time",
+    )
+    changes = [
+        {
+            "field_key": key,
+            "before": config_value,
+            "after": saved_config.get(key),
+        }
+        for key in tracked_keys
+        for config_value in [
+            before_config.get(key) if key != "operation_mode" else before_mode
+        ]
+        if config_value != saved_config.get(key)
+    ]
+    if changes:
+        append_production_event(
+            "TRADING_TIME_CHANGED",
+            result="SUCCESS",
+            source="STOCK_OPERATION_MODE_WRITER",
+            template_args={},
+            target_type="STOCK",
+            target_id=str(code or "").strip(),
+            target_name=str(name or "").strip(),
+            stock_code=str(code or "").strip(),
+            stock_name=str(name or "").strip(),
+            changes=changes,
+        )
 
     append_stock_log(stock_dir, "GUI", f"운영방식 변경: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)}")
     return True

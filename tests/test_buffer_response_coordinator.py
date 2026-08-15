@@ -62,6 +62,33 @@ class _Surface:
         return "UNIFIED"
 
 
+def _policy_from_surface(surface: _Surface) -> dict[str, object]:
+    ratio_text = surface.buffer_close_ratio_combo.currentText()
+    factor, direction = surface.strategy_rows["unified"][0]
+    return {
+        "available": True,
+        "application_mode": "UNIFIED",
+        "threshold_percent": int(ratio_text.rstrip("%")),
+        "strategies": {
+            "unified": {
+                "evaluation_factor": factor.currentText(),
+                "direction": direction.currentText(),
+                "response_mode": surface.strategy_action_badges["unified"].text(),
+            },
+            "profit": {
+                "evaluation_factor": "손익금액",
+                "direction": "높은순",
+                "response_mode": "조기마감",
+            },
+            "loss": {
+                "evaluation_factor": "손익금액",
+                "direction": "낮은순",
+                "response_mode": "즉시청산",
+            },
+        },
+    }
+
+
 def _evidence(revision: int, marker: str) -> dict[str, object]:
     return {
         "recovery_session_id": "RECOVERY-1",
@@ -173,11 +200,12 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             self.ownership_path,
             now_factory=lambda: "2026-08-15T10:30:00+09:00",
         )
+        self.surface = _Surface()
         self.coordinator = BufferResponseCoordinator(
             ingress_service=self.ingress,
             ownership_service=self.ownership,
+            policy_reader=lambda: _policy_from_surface(self.surface),
         )
-        self.surface = _Surface()
         self.pnl = {
             "000001": _pnl(300, 3.0, 1000),
             "000002": _pnl(200, 2.0, 2000),
@@ -200,7 +228,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
         self,
         observation: dict[str, object],
         *,
-        surface: object | None = None,
         candidates: object | None = None,
         ratio: float = 50.0,
     ) -> dict[str, object]:
@@ -209,7 +236,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             budget_activity=self._activity(
                 int(observation["confirmed_entry_amount"]), ratio=ratio
             ),
-            settings_surface=self.surface if surface is None else surface,
             pnl_by_stock=self.pnl,
             candidates=self.candidates if candidates is None else candidates,
         )
@@ -332,17 +358,23 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
     def test_missing_settings_consumes_event_once_without_ownership(self) -> None:
         self._baseline()
         observation = _observation(100, ("O1",), revision=2, marker="D")
-        first = self.coordinator.process_stable_observation(
+        missing_policy_coordinator = BufferResponseCoordinator(
+            ingress_service=self.ingress,
+            ownership_service=self.ownership,
+            policy_reader=lambda: {
+                "available": False,
+                "reason": "BUFFER_RESPONSE_POLICY_NOT_CONFIGURED",
+            },
+        )
+        first = missing_policy_coordinator.process_stable_observation(
             observation=observation,
             budget_activity=self._activity(100),
-            settings_surface=None,
             pnl_by_stock=self.pnl,
             candidates=self.candidates,
         )
-        repeated = self.coordinator.process_stable_observation(
+        repeated = missing_policy_coordinator.process_stable_observation(
             observation=observation,
             budget_activity=self._activity(100),
-            settings_surface=None,
             pnl_by_stock=self.pnl,
             candidates=self.candidates,
         )
@@ -431,16 +463,16 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                     runtime / "ownership.json",
                     now_factory=lambda: "2026-08-15T11:00:00+09:00",
                 )
+                surface = _Surface(threshold)
                 coordinator = BufferResponseCoordinator(
                     ingress_service=ingress,
                     ownership_service=ownership,
+                    policy_reader=lambda surface=surface: _policy_from_surface(surface),
                 )
-                surface = _Surface(threshold)
 
                 baseline = coordinator.process_stable_observation(
                     observation=_observation(0, (), revision=1, marker="A"),
                     budget_activity=self._activity(0, ratio=0.0),
-                    settings_surface=surface,
                     pnl_by_stock=self.pnl,
                     candidates=self.candidates,
                 )
@@ -448,7 +480,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                 below = coordinator.process_stable_observation(
                     observation=_observation(100, ("O1",), revision=2, marker="D"),
                     budget_activity=self._activity(100, ratio=threshold - 0.001),
-                    settings_surface=surface,
                     pnl_by_stock=self.pnl,
                     candidates=self.candidates,
                 )
@@ -457,7 +488,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                         200, ("O1", "O2"), revision=3, marker="E"
                     ),
                     budget_activity=self._activity(200, ratio=float(threshold)),
-                    settings_surface=surface,
                     pnl_by_stock=self.pnl,
                     candidates=self.candidates,
                 )
@@ -484,7 +514,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                 account_no=ACCOUNT,
                 trading_day=DAY,
                 budget_activity=self._activity(0, ratio=0.0),
-                settings_surface=self.surface,
                 pnl_by_stock=self.pnl,
                 candidates=candidates,
                 completion_projection=_completion_projection({"000001": status}),
@@ -498,7 +527,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(0, ratio=0.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=candidates,
             completion_projection=_completion_projection({"000001": "DONE"}),
@@ -511,12 +539,12 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
         restarted = BufferResponseCoordinator(
             ingress_service=self.ingress,
             ownership_service=BufferResponseOwnershipService(self.ownership_path),
+            policy_reader=lambda: _policy_from_surface(self.surface),
         )
         repeated = restarted.reconcile_completion_and_escalate(
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(90, ratio=90.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=self.candidates,
             completion_projection=_completion_projection({"000001": "DONE"}),
@@ -545,7 +573,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                 "predicted_entry_ratio": 0.0,
                 "estimated_recovery_amount": 999999999,
             },
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=candidates,
             completion_projection=not_complete,
@@ -566,7 +593,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(90, ratio=90.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=candidates,
             completion_projection=not_complete,
@@ -579,7 +605,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(85, ratio=85.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=candidates,
             completion_projection=_completion_projection(
@@ -608,7 +633,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(70, ratio=70.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=candidates,
             completion_projection=_completion_projection(
@@ -643,7 +667,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(90, ratio=90.0),
-            settings_surface=self.surface,
             pnl_by_stock={**self.pnl, "999999": _pnl(999999, 999.0, 999999)},
             candidates=candidates,
             completion_projection=_completion_projection(
@@ -662,7 +685,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(90, ratio=90.0),
-            settings_surface=self.surface,
             pnl_by_stock=repriced_pnl,
             candidates=candidates,
             completion_projection=_completion_projection(
@@ -684,7 +706,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(0, ratio=0.0),
-            settings_surface=self.surface,
             pnl_by_stock=self.pnl,
             candidates=[base],
             completion_projection=not_complete,
@@ -703,7 +724,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
                     account_no=ACCOUNT,
                     trading_day=DAY,
                     budget_activity=self._activity(90, ratio=90.0),
-                    settings_surface=self.surface,
                     pnl_by_stock=self.pnl,
                     candidates=[candidate, _candidate("999999")],
                     completion_projection=not_complete,
@@ -715,7 +735,6 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
             account_no=ACCOUNT,
             trading_day=DAY,
             budget_activity=self._activity(90, ratio=90.0),
-            settings_surface=self.surface,
             pnl_by_stock={**self.pnl, "999999": _pnl(999999, 999.0, 999999)},
             candidates=[base, _candidate("999999")],
             completion_projection=_completion_projection({"000001": "DONE"}),
@@ -822,6 +841,7 @@ class BufferResponseCoordinatorTests(unittest.TestCase):
 
     def test_main_window_prepares_immediate_only_after_claim_and_ingress_commit(self) -> None:
         surface = _Surface(response_label="\uc989\uc2dc\uccad\uc0b0")
+        self.surface = surface
         window = type("Window", (), {})()
         window._buffer_response_coordinator = self.coordinator
         window._main_buffer_response_settings_surface = surface

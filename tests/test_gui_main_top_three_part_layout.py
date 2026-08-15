@@ -57,31 +57,140 @@ class MainTopThreePartLayoutTests(unittest.TestCase):
         window._account_memo_settings = _Settings()
         return window
 
-    def test_top_row_uses_three_named_parts_and_existing_widgets(self) -> None:
+    def test_top_row_splits_budget_and_empty_performance_parts(self) -> None:
         window = self._create_window()
         try:
-            window.resize(1920, 720)
+            window.resize(2560, 720)
             window.show()
             self.app.processEvents()
 
-            connection, basic, budget = window._main_top_part_boxes
+            connection, basic, budget, performance = window._main_top_part_boxes
             self.assertEqual(
                 (
                     "시스템",
                     "현황정보",
                     "예산설정",
+                    "실적",
                 ),
-                (connection.title(), basic.title(), budget.title()),
+                (
+                    connection.title(),
+                    basic.title(),
+                    budget.title(),
+                    performance.title(),
+                ),
             )
             self.assertEqual(
                 (
                     "mainServerConnectionStatusPart",
                     "mainServerBasicInfoPart",
                     "mainBudgetSettingPart",
+                    "mainPerformancePart",
                 ),
-                (connection.objectName(), basic.objectName(), budget.objectName()),
+                (
+                    connection.objectName(),
+                    basic.objectName(),
+                    budget.objectName(),
+                    performance.objectName(),
+                ),
             )
             self.assertTrue(all(isinstance(part, QGroupBox) for part in window._main_top_part_boxes))
+            self.assertTrue(budget.isAncestorOf(window.budget_total_label))
+            self.assertTrue(budget.isAncestorOf(window.budget_buffer_response_button))
+            self.assertEqual("누적", window.performance_cumulative_title_label.text())
+            self.assertEqual("현재", window.performance_current_title_label.text())
+            self.assertEqual(
+                "0 (0.00%)",
+                window.performance_cumulative_value_label.text(),
+            )
+            self.assertEqual(
+                "0 (0.00%)",
+                window.performance_current_value_label.text(),
+            )
+            self.assertEqual(
+                window.performance_cumulative_title_label.width(),
+                window.performance_current_title_label.width(),
+            )
+            for label in (
+                window.performance_cumulative_title_label,
+                window.performance_current_title_label,
+            ):
+                self.assertEqual(Qt.AlignCenter, label.alignment())
+            for label in (
+                window.performance_cumulative_value_label,
+                window.performance_current_value_label,
+            ):
+                self.assertEqual(
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    label.alignment(),
+                )
+            self.assertIn(
+                "#22b14c",
+                window.performance_cumulative_title_label.styleSheet().lower(),
+            )
+            self.assertIn(
+                "#ff7f27",
+                window.performance_current_title_label.styleSheet().lower(),
+            )
+            self.assertLess(
+                window.performance_cumulative_title_label.font().pointSize(),
+                window.performance_current_title_label.font().pointSize(),
+            )
+            self.assertLess(
+                window.performance_cumulative_value_label.font().pointSize(),
+                window.performance_current_value_label.font().pointSize(),
+            )
+            self.assertEqual(
+                window.performance_cumulative_title_label.geometry().left(),
+                window.performance_current_title_label.geometry().left(),
+            )
+            self.assertEqual(
+                window.performance_cumulative_value_label.geometry().right(),
+                window.performance_current_value_label.geometry().right(),
+            )
+
+            gui_windows.MainWindow._set_main_performance_value(
+                window.performance_cumulative_value_label,
+                "+1,546,700 (+1.30%)",
+                1_546_700,
+            )
+            self.assertEqual(
+                "+1,546,700 (+1.30%)",
+                window.performance_cumulative_value_label.text(),
+            )
+            self.assertIn(
+                "#ed1c24",
+                window.performance_cumulative_value_label.styleSheet().lower(),
+            )
+            gui_windows.MainWindow._set_main_performance_value(
+                window.performance_cumulative_value_label,
+                "-23,567,900 (-256.7%)",
+                -23_567_900,
+            )
+            self.assertEqual(
+                "-23,567,900 (-256.7%)",
+                window.performance_cumulative_value_label.text(),
+            )
+            self.assertIn(
+                "#3f48cc",
+                window.performance_cumulative_value_label.styleSheet().lower(),
+            )
+            gui_windows.MainWindow._set_main_performance_value(
+                window.performance_cumulative_value_label,
+                "-",
+                None,
+            )
+            self.assertEqual(
+                "0 (0.00%)",
+                window.performance_cumulative_value_label.text(),
+            )
+            self.assertNotIn(
+                "#ed1c24",
+                window.performance_cumulative_value_label.styleSheet().lower(),
+            )
+            self.assertNotIn(
+                "#3f48cc",
+                window.performance_cumulative_value_label.styleSheet().lower(),
+            )
 
             self.assertIs(connection, window.btn_kiwoom_login.parentWidget())
             self.assertIs(basic, window.btn_emergency_stop.parentWidget())
@@ -358,14 +467,20 @@ class MainTopThreePartLayoutTests(unittest.TestCase):
 
             self.assertEqual(connection.geometry().top(), basic.geometry().top())
             self.assertEqual(basic.geometry().top(), budget.geometry().top())
+            self.assertEqual(budget.geometry().top(), performance.geometry().top())
             self.assertEqual(connection.geometry().bottom(), basic.geometry().bottom())
             self.assertEqual(basic.geometry().bottom(), budget.geometry().bottom())
+            self.assertEqual(budget.geometry().bottom(), performance.geometry().bottom())
             for part in window._main_top_part_boxes:
+                self.assertEqual(131, part.height())
                 self.assertGreaterEqual(part.height(), part.minimumSizeHint().height())
             self.assertLess(connection.geometry().right(), basic.geometry().left())
             self.assertLess(basic.geometry().right(), budget.geometry().left())
+            self.assertLess(budget.geometry().right(), performance.geometry().left())
             self.assertLess(basic.width(), connection.width())
             self.assertGreater(budget.width(), basic.width())
+            self.assertIsNotNone(performance.layout())
+            self.assertEqual(2, performance.layout().count())
             routine_table_top = window.routine_table.mapTo(
                 window,
                 window.routine_table.rect().topLeft(),

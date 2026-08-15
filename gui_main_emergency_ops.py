@@ -41,7 +41,10 @@ from gui_auto_trade_runtime import parse_stock_folder_name
 from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_base_stock_service import update_base_stock_routines
 from operation_policy_gate import read_operation_state, write_global_emergency_stop_state
-from event_journal_production import append_production_event
+from event_journal_production import (
+    append_production_event,
+    observe_owner_failure_transition,
+)
 from production_recovery_state_registry import (
     check_production_recovery_gate,
     production_recovery_registry,
@@ -238,6 +241,21 @@ def _record_emergency_release_guard_failure(
     )
 
 
+def _emergency_release_integrity_reason_code(reason: str) -> str:
+    clean_reason = str(reason or "").strip()
+    if clean_reason == "state.json 이상":
+        return "STOCK_STATE_INVALID"
+    if clean_reason == "config.json 이상":
+        return "STOCK_CONFIG_INVALID"
+    if clean_reason == "orders.json 누락":
+        return "STOCK_ORDERS_MISSING"
+    if clean_reason.startswith("PENDING_ORDER_DATA_INTEGRITY"):
+        return "PENDING_ORDER_DATA_INTEGRITY"
+    if clean_reason == "SERVER_MISMATCH":
+        return "OPERATION_DATA_SERVER_MISMATCH"
+    return ""
+
+
 def _routine_name_for_emergency_release(stock_dir: Path) -> str:
     """Return persisted routine metadata without depending on a GUI window."""
     config = read_json_dict(Path(stock_dir) / "config.json")
@@ -277,6 +295,36 @@ def update_runtime_stock_status(
         allow_review_state_transition=allow_review_state_transition,
     )
     before_status = mutation_result.before_status
+    failure_scope = f"emergency_stock_state:{str(code or '').strip()}:{new_status}"
+    if not mutation_result.ok:
+        reason_code = str(mutation_result.reason or "STATE_WRITE_FAILED").strip()
+        observe_owner_failure_transition(
+            window,
+            failure_scope,
+            active=True,
+            signature=reason_code,
+            event_type="PROCESSING_ERROR",
+            severity="ERROR",
+            result="FAILED",
+            source="gui_main_emergency_ops.update_runtime_stock_status",
+            template_args={"target": f"{code} {name}".strip()},
+            target_type="STOCK",
+            target_id=str(code or "").strip(),
+            target_name=str(name or "").strip(),
+            stock_code=str(code or "").strip(),
+            stock_name=str(name or "").strip(),
+            reason_code=reason_code,
+            details={
+                "stage": "emergency_stock_state_write",
+                "requested_status": str(new_status or "").strip(),
+            },
+        )
+    else:
+        observe_owner_failure_transition(
+            window,
+            failure_scope,
+            active=False,
+        )
     if not mutation_result.ok and mutation_result.reason == "WRITE_FAILED":
         QMessageBox.critical(
             window,
@@ -426,6 +474,22 @@ def execute_emergency_stop(window) -> None:
         timestamp=now_text(),
     )
     if not global_result.get("ok"):
+        observe_owner_failure_transition(
+            window,
+            "emergency_global_stop_write",
+            active=True,
+            signature="GLOBAL_EMERGENCY_STOP_WRITE_FAILED",
+            event_type="PROCESSING_ERROR",
+            severity="ERROR",
+            result="FAILED",
+            source="gui_main_emergency_ops.execute_emergency_stop",
+            template_args={"target": "전역 긴급정지 상태"},
+            target_type="GLOBAL_OPERATION",
+            target_id="global_operation",
+            target_name="전역 긴급정지 상태",
+            reason_code="GLOBAL_EMERGENCY_STOP_WRITE_FAILED",
+            details={"stage": "emergency_global_stop_write"},
+        )
         message = "전역 긴급정지 기록에 실패했습니다. 종목별 긴급정지를 시작하지 않았습니다."
         QMessageBox.critical(window, "긴급정지 오류", message)
         window.statusBar().showMessage(message)
@@ -437,6 +501,12 @@ def execute_emergency_stop(window) -> None:
             position="center",
         )
         return
+
+    observe_owner_failure_transition(
+        window,
+        "emergency_global_stop_write",
+        active=False,
+    )
 
     if not emergency_was_stopped:
         append_production_event(
@@ -635,7 +705,35 @@ def release_emergency_stop_target(
             guard_reason,
         ):
             return "failed"
+        integrity_reason_code = _emergency_release_integrity_reason_code(
+            guard_reason
+        )
+        if integrity_reason_code:
+            observe_owner_failure_transition(
+                window,
+                f"emergency_release_integrity:{code}",
+                active=True,
+                signature=integrity_reason_code,
+                event_type="INTEGRITY_WARNING",
+                severity="WARNING",
+                result="BLOCKED",
+                source="gui_main_emergency_ops.release_emergency_stop_target",
+                template_args={"target": f"{code} {name}".strip()},
+                target_type="STOCK",
+                target_id=str(code or "").strip(),
+                target_name=str(name or "").strip(),
+                stock_code=str(code or "").strip(),
+                stock_name=str(name or "").strip(),
+                reason_code=integrity_reason_code,
+                details={"stage": "emergency_release_integrity_guard"},
+            )
         return "review_existing" if already_in_review else "review"
+
+    observe_owner_failure_transition(
+        window,
+        f"emergency_release_integrity:{code}",
+        active=False,
+    )
 
     result = normalize_review_emergency_target(
         window,
@@ -743,14 +841,36 @@ def release_emergency_stop(window) -> None:
         )
         if not global_result.get("ok"):
             failed_count += 1
-        elif emergency_was_stopped:
-            append_production_event(
-                "EMERGENCY_RELEASED",
-                result="COMPLETED",
+            observe_owner_failure_transition(
+                window,
+                "emergency_global_release_write",
+                active=True,
+                signature="GLOBAL_EMERGENCY_RELEASE_WRITE_FAILED",
+                event_type="PROCESSING_ERROR",
+                severity="ERROR",
+                result="FAILED",
                 source="gui_main_emergency_ops.release_emergency_stop",
+                template_args={"target": "전역 긴급정지 해제 상태"},
                 target_type="GLOBAL_OPERATION",
                 target_id="global_operation",
+                target_name="전역 긴급정지 해제 상태",
+                reason_code="GLOBAL_EMERGENCY_RELEASE_WRITE_FAILED",
+                details={"stage": "emergency_global_release_write"},
             )
+        else:
+            observe_owner_failure_transition(
+                window,
+                "emergency_global_release_write",
+                active=False,
+            )
+            if emergency_was_stopped:
+                append_production_event(
+                    "EMERGENCY_RELEASED",
+                    result="COMPLETED",
+                    source="gui_main_emergency_ops.release_emergency_stop",
+                    target_type="GLOBAL_OPERATION",
+                    target_id="global_operation",
+                )
 
     append_changelog(
         "UPDATE",

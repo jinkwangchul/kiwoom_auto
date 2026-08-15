@@ -845,5 +845,6 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         callbacks=callbacks,
         selected_modes=adapter.selected_operation_mode_set(),
         operation_excluded=adapter.selected_stocks_are_operation_excluded(),
+        selected_targets=adapter.target_snapshot(),
     )
     return True

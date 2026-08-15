@@ -37,6 +37,7 @@ from runtime_io import read_json_dict
 from gui_auto_trade_runtime import parse_stock_folder_name
 from gui_auto_trade_table_loader import _selected_instance_stock_dirs
 from gui_toast import show_toast
+from event_journal_production import append_production_event
 from state_policy import auto_trade_status_display
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
@@ -1058,10 +1059,35 @@ def _kiwoom_server_login_block_message(window) -> str:
 def auto_trade_apply_selected_early_close_profit_loss(window) -> None:
     """우클릭 조기마감 > 손/익절: 익절/손절 비율을 분리 입력 후 전환한다."""
     dialog = ProfitLossEarlyCloseDialog(operation_dialog_parent(window))
-    if dialog.exec_() != QDialog.Accepted:
+    dialog_result = dialog.exec_()
+    profit_text, loss_text = dialog.values()
+    accepted = dialog_result == QDialog.Accepted
+    details: dict[str, object] = {
+        "interaction_type": "INPUT",
+        "prompt_key": "PROFIT_LOSS_EARLY_CLOSE",
+        "prompt_title": "손/익절 조기마감",
+        "prompt_summary": "익절/손절 비율을 적용한 조기마감",
+        "offered_options": ["확인", "취소"],
+        "selected_option": "확인" if accepted else "취소",
+    }
+    if accepted:
+        input_value: dict[str, float] = {}
+        if profit_text:
+            input_value["profit_percent"] = abs(float(profit_text))
+        if loss_text:
+            input_value["loss_percent"] = abs(float(loss_text))
+        details["input_value"] = input_value
+    append_production_event(
+        "OPERATOR_OPERATION_DECISION",
+        result="ACCEPTED" if accepted else "CANCELLED",
+        source="gui_auto_trade_close.auto_trade_apply_selected_early_close_profit_loss",
+        target_type="STOCK_SELECTION",
+        target_name="손익비율 조기마감 대상",
+        details=details,
+    )
+    if not accepted:
         return
 
-    profit_text, loss_text = dialog.values()
     window.apply_selected_early_close(
         "손/익절",
         source="우클릭",
@@ -1468,7 +1494,30 @@ def auto_trade_apply_selected_early_close(
         box.addButton("취소", QMessageBox.RejectRole)
         box.setDefaultButton(proceed_button)
         box.exec_()
-        if box.clickedButton() != proceed_button:
+        accepted = box.clickedButton() == proceed_button
+        single_target = close_targets[0] if len(close_targets) == 1 else None
+        append_production_event(
+            "OPERATOR_OPERATION_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_close.auto_trade_apply_selected_early_close",
+            target_type="STOCK_SELECTION",
+            target_id=single_target[1] if single_target is not None else None,
+            target_name=single_target[2] if single_target is not None else "선택 조기마감 대상",
+            stock_code=single_target[1] if single_target is not None else None,
+            stock_name=single_target[2] if single_target is not None else None,
+            routine=routine_name or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "EARLY_CLOSE_CONFIRM",
+                "prompt_title": "조기마감 확인",
+                "prompt_summary": "선택 종목의 조기마감 절차 시작",
+                "offered_options": ["진행", "취소"],
+                "selected_option": "진행" if accepted else "취소",
+                "method": method_text,
+                "target_count": len(close_targets),
+            },
+        )
+        if not accepted:
             window.statusBarMessage("조기마감 취소")
             return {"ok": False, "cancelled": True, "message": "조기마감 취소"}
 

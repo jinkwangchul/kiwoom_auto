@@ -386,14 +386,23 @@ class _MainTotalBudgetPopup(QFrame):
 
 
 class _BufferResponseSettingsSurface(QDialog):
-    """Wide, non-modal UI prototype matching the environment-settings layout."""
+    """Wide non-modal editor for the persisted buffer-response policy."""
 
     MODE_NONE = "NONE"
     MODE_UNIFIED = "UNIFIED"
     MODE_SEGMENTED = "SEGMENTED"
 
-    def __init__(self, owner: "MainWindow") -> None:
+    def __init__(
+        self,
+        owner: "MainWindow",
+        *,
+        policy_path: Path | None = None,
+    ) -> None:
         super().__init__(owner)
+        self._policy_path = policy_path
+        self._persisted_baseline: dict[str, object] | None = None
+        self._loading_policy = True
+        self._last_save_error = ""
         self.setObjectName("mainBufferResponseSettingsSurface")
         self.setWindowTitle("완충대응 설정")
         self.setModal(False)
@@ -522,14 +531,26 @@ class _BufferResponseSettingsSurface(QDialog):
         self.cancel_button.setText("취소")
         self.save_button.setMinimumWidth(110)
         self.cancel_button.setMinimumWidth(110)
-        self.save_button.setEnabled(False)
+        self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         root.addWidget(self.button_box)
 
         self._mode_syncing = False
         self.unified_checkbox.toggled.connect(self._on_unified_toggled)
         self.segmented_checkbox.toggled.connect(self._on_segmented_toggled)
-        self.set_application_mode(self.MODE_UNIFIED)
+        for rows in self.strategy_rows.values():
+            for factor_combo, direction_combo in rows:
+                factor_combo.currentTextChanged.connect(
+                    lambda _text: self._refresh_save_enabled()
+                )
+                direction_combo.currentTextChanged.connect(
+                    lambda _text: self._refresh_save_enabled()
+                )
+        self.buffer_close_ratio_combo.currentTextChanged.connect(
+            lambda _text: self._refresh_save_enabled()
+        )
+        self._loading_policy = False
+        self.reload_from_persisted()
 
     def _make_strategy_row(
         self,
@@ -604,6 +625,7 @@ class _BufferResponseSettingsSurface(QDialog):
                 (index + 1) % len(BUFFER_RESPONSE_ACTION_MODES)
             ]
         )
+        self._refresh_save_enabled()
 
     def _on_unified_toggled(self, checked: bool) -> None:
         if self._mode_syncing:
@@ -632,6 +654,7 @@ class _BufferResponseSettingsSurface(QDialog):
         segmented = mode == self.MODE_SEGMENTED
         self.profit_strategy_row.setEnabled(segmented)
         self.loss_strategy_row.setEnabled(segmented)
+        self._refresh_save_enabled()
 
     def application_mode(self) -> str:
         if self.unified_checkbox.isChecked():
@@ -639,6 +662,90 @@ class _BufferResponseSettingsSurface(QDialog):
         if self.segmented_checkbox.isChecked():
             return self.MODE_SEGMENTED
         return self.MODE_NONE
+
+    def _editor_policy(self) -> dict[str, object]:
+        strategies: dict[str, dict[str, str]] = {}
+        for key in ("unified", "profit", "loss"):
+            factor_combo, direction_combo = self.strategy_rows[key][0]
+            strategies[key] = {
+                "evaluation_factor": factor_combo.currentText().strip(),
+                "direction": direction_combo.currentText().strip(),
+                "response_mode": self.strategy_action_badges[key].text().strip(),
+            }
+        ratio_text = self.buffer_close_ratio_combo.currentText().strip()
+        threshold: object = ratio_text[:-1] if ratio_text.endswith("%") else ratio_text
+        return {
+            "application_mode": self.application_mode(),
+            "threshold_percent": threshold,
+            "strategies": strategies,
+        }
+
+    def _apply_editor_policy(self, policy: object) -> None:
+        normalized = validate_buffer_response_policy(policy)
+        self._loading_policy = True
+        try:
+            self.set_application_mode(str(normalized["application_mode"]))
+            strategies = normalized["strategies"]
+            assert isinstance(strategies, dict)
+            for key in ("unified", "profit", "loss"):
+                strategy = strategies[key]
+                factor_combo, direction_combo = self.strategy_rows[key][0]
+                factor_combo.setCurrentText(strategy["evaluation_factor"])
+                direction_combo.setCurrentText(strategy["direction"])
+                self.strategy_action_badges[key].setText(strategy["response_mode"])
+            self.buffer_close_ratio_combo.setCurrentText(
+                f"{normalized['threshold_percent']}%"
+            )
+        finally:
+            self._loading_policy = False
+        self._refresh_save_enabled()
+
+    def reload_from_persisted(self) -> None:
+        persisted = read_buffer_response_policy(path=self._policy_path)
+        if persisted.get("available") is True:
+            normalized = validate_buffer_response_policy(persisted)
+            self._persisted_baseline = normalized
+            self._apply_editor_policy(normalized)
+            return
+        self._persisted_baseline = None
+        self._apply_editor_policy(default_buffer_response_policy())
+
+    def _refresh_save_enabled(self) -> None:
+        if self._loading_policy or not hasattr(self, "save_button"):
+            return
+        try:
+            current = validate_buffer_response_policy(self._editor_policy())
+        except ValueError:
+            self.save_button.setEnabled(False)
+            return
+        self.save_button.setEnabled(
+            self._persisted_baseline is None
+            or current != self._persisted_baseline
+        )
+
+    def accept(self) -> None:
+        try:
+            current = validate_buffer_response_policy(self._editor_policy())
+            saved = write_buffer_response_policy(
+                current,
+                path=self._policy_path,
+            )
+        except Exception as exc:
+            self._last_save_error = str(exc).strip() or "BUFFER_RESPONSE_POLICY_SAVE_FAILED"
+            self._refresh_save_enabled()
+            return
+        self._last_save_error = ""
+        self._persisted_baseline = saved
+        self._refresh_save_enabled()
+        super().accept()
+
+    def reject(self) -> None:
+        self.reload_from_persisted()
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        self.reload_from_persisted()
+        super().closeEvent(event)
 
 
 class _AccountPopupDisplayDelegate(QStyledItemDelegate):
@@ -924,9 +1031,13 @@ from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
 from gui_review_utils import current_price_from_state
 from gui_operation_environment import (
+    default_buffer_response_policy,
     effective_amount_starting_budget,
+    read_buffer_response_policy,
     starting_budget_defaults,
     suggested_buy_limit,
+    validate_buffer_response_policy,
+    write_buffer_response_policy,
 )
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
@@ -1005,6 +1116,10 @@ EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
     }
 )
 MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR = "#404040"
+MAIN_PERFORMANCE_CUMULATIVE_TITLE_COLOR = "#22B14C"
+MAIN_PERFORMANCE_CURRENT_TITLE_COLOR = "#FF7F27"
+MAIN_PERFORMANCE_PROFIT_COLOR = "#ED1C24"
+MAIN_PERFORMANCE_LOSS_COLOR = "#3F48CC"
 MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL = {
     "group": frozenset(),
     "routine": frozenset(("profit", "limit")),
@@ -2677,10 +2792,12 @@ class MainWindow(QMainWindow):
         server_connection_box = self._create_top_status_box()
         server_basic_info_box = self._create_account_funds_box()
         budget_setting_box = self._create_budget_status_box()
+        performance_box = self._create_performance_box()
         self._main_top_part_boxes = (
             server_connection_box,
             server_basic_info_box,
             budget_setting_box,
+            performance_box,
         )
         top_layout = QHBoxLayout()
         top_layout.setSpacing(6)
@@ -2692,9 +2809,20 @@ class MainWindow(QMainWindow):
             QSizePolicy.Maximum,
             QSizePolicy.Preferred,
         )
+        budget_setting_box.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+        performance_box.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+        for top_part_box in self._main_top_part_boxes:
+            top_part_box.setFixedHeight(131)
         top_layout.addWidget(server_connection_box, 0)
         top_layout.addWidget(server_basic_info_box, 0)
         top_layout.addWidget(budget_setting_box, 1)
+        top_layout.addWidget(performance_box, 1)
 
         table_layout = self._create_table_area()
         button_layout = self._create_button_area()
@@ -2964,6 +3092,113 @@ class MainWindow(QMainWindow):
         box.setLayout(layout)
         return box
 
+    def _create_performance_box(self) -> QGroupBox:
+        box = QGroupBox("실적")
+        box.setObjectName("mainPerformancePart")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
+
+        cumulative_font = QFont(box.font())
+        cumulative_font.setPointSize(13)
+        cumulative_font.setBold(True)
+        current_font = QFont(box.font())
+        current_font.setPointSize(16)
+        current_font.setBold(True)
+        title_width = max(
+            QFontMetrics(cumulative_font).horizontalAdvance("누적"),
+            QFontMetrics(current_font).horizontalAdvance("현재"),
+        ) + 16
+
+        self.performance_cumulative_title_label = QLabel("누적")
+        self.performance_cumulative_title_label.setObjectName(
+            "mainPerformanceCumulativeTitle"
+        )
+        self.performance_cumulative_value_label = QLabel("0 (0.00%)")
+        self.performance_cumulative_value_label.setObjectName(
+            "mainPerformanceCumulativeValue"
+        )
+        self.performance_current_title_label = QLabel("현재")
+        self.performance_current_title_label.setObjectName(
+            "mainPerformanceCurrentTitle"
+        )
+        self.performance_current_value_label = QLabel("0 (0.00%)")
+        self.performance_current_value_label.setObjectName(
+            "mainPerformanceCurrentValue"
+        )
+
+        for title_label, font, color in (
+            (
+                self.performance_cumulative_title_label,
+                cumulative_font,
+                MAIN_PERFORMANCE_CUMULATIVE_TITLE_COLOR,
+            ),
+            (
+                self.performance_current_title_label,
+                current_font,
+                MAIN_PERFORMANCE_CURRENT_TITLE_COLOR,
+            ),
+        ):
+            title_label.setFixedWidth(title_width)
+            title_label.setAlignment(Qt.AlignCenter)
+            title_label.setFont(font)
+            title_label.setStyleSheet(f"color: {color};")
+
+        for value_label, font in (
+            (self.performance_cumulative_value_label, cumulative_font),
+            (self.performance_current_value_label, current_font),
+        ):
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value_label.setFont(font)
+            MainWindow._set_main_performance_value(
+                value_label,
+                "0 (0.00%)",
+                0,
+            )
+
+        for title_label, value_label in (
+            (
+                self.performance_cumulative_title_label,
+                self.performance_cumulative_value_label,
+            ),
+            (
+                self.performance_current_title_label,
+                self.performance_current_value_label,
+            ),
+        ):
+            row_layout = QHBoxLayout()
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(0)
+            row_layout.addWidget(title_label)
+            row_layout.addStretch(1)
+            row_layout.addWidget(value_label)
+            layout.addLayout(row_layout, 1)
+
+        box.setLayout(layout)
+        return box
+
+    @staticmethod
+    def _set_main_performance_value(
+        label: QLabel,
+        display_text: str,
+        profit_amount: object | None,
+    ) -> None:
+        text = str(display_text or "").strip()
+        if not text or text == "-":
+            text = "0 (0.00%)"
+        color = profit_loss_value_color(0)
+        if profit_amount is not None:
+            try:
+                amount = float(str(profit_amount).replace(",", "").strip())
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount > 0:
+                color = MAIN_PERFORMANCE_PROFIT_COLOR
+            elif amount < 0:
+                color = MAIN_PERFORMANCE_LOSS_COLOR
+        label.setText(text)
+        label.setStyleSheet(f"color: {color};")
+
     def _create_budget_status_box(self) -> QGroupBox:
         """관제창 예산 현황 UI.
 
@@ -3097,7 +3332,7 @@ class MainWindow(QMainWindow):
             "mainBudgetBufferResponseEntry"
         )
         self.budget_buffer_response_button.setCursor(Qt.PointingHandCursor)
-        self.budget_buffer_response_button.setToolTip("완충대응 설정 준비 중")
+        self.budget_buffer_response_button.setToolTip("완충대응 설정")
         self.budget_warning_row_widget = QWidget()
         self.budget_warning_row_widget.setSizePolicy(
             QSizePolicy.Fixed,
@@ -3449,28 +3684,6 @@ class MainWindow(QMainWindow):
                 self._activate_main_routine_summary_badge(target_key, bool(checked))
             )
 
-        profit_separator = create_summary_separator(
-            "mainRoutineSummaryProfitSeparator"
-        )
-        layout.addWidget(profit_separator)
-        profit_label = QPushButton("수익 0 / 0.00%")
-        profit_label.setObjectName("mainRoutineSummaryProfit")
-        profit_label.setFont(summary_font)
-        profit_label.setFocusPolicy(Qt.NoFocus)
-        profit_label.setCursor(Qt.PointingHandCursor)
-        profit_label.setCheckable(True)
-        profit_width = max(
-            metrics.horizontalAdvance("수익 +99,999,999 / +99.99%"),
-            metrics.horizontalAdvance("수익 -99,999,999 / -99.99%"),
-        ) + badge_horizontal_padding * 2
-        profit_label.setFixedSize(profit_width, badge_height)
-        profit_label.clicked.connect(
-            lambda _checked=False: self._activate_main_routine_summary_badge(
-                "profit",
-                bool(_checked),
-            )
-        )
-        layout.addWidget(profit_label)
         self._main_routine_summary_count_labels = count_labels
         self._main_routine_summary_count_buttons = count_buttons
         self._main_routine_level_buttons = {
@@ -3479,16 +3692,12 @@ class MainWindow(QMainWindow):
         }
         self._main_routine_summary_count_badge_width = count_badge_width
         self._main_routine_summary_number_slot_width = number_slot_width
-        self._main_routine_summary_profit_separator = profit_separator
-        self._main_routine_summary_profit_label = profit_label
-        self._main_routine_summary_profit_color = profit_loss_value_color(0)
         self._main_routine_summary_widget = summary
         MainWindow._update_main_routine_summary_badge_styles(self)
         return summary
 
     def _update_main_routine_summary(self, projection: dict[str, object]) -> None:
         count_labels = getattr(self, "_main_routine_summary_count_labels", {})
-        profit_label = getattr(self, "_main_routine_summary_profit_label", None)
         badges = projection.get("count_badges")
         if isinstance(count_labels, dict) and isinstance(badges, tuple):
             for key, label_text, value in badges:
@@ -3498,13 +3707,6 @@ class MainWindow(QMainWindow):
                 label, value_label = labels
                 label.setText(str(label_text))
                 value_label.setText(str(max(0, int(value or 0))))
-        if isinstance(profit_label, QPushButton):
-            profit_label.setText(
-                f"수익 {str(projection.get('profit_value_text') or '0 / 0.00%')}"
-            )
-            self._main_routine_summary_profit_color = str(
-                projection.get("profit_color") or profit_loss_value_color(0)
-            )
         MainWindow._update_main_routine_summary_badge_styles(self)
 
     def _activate_main_routine_summary_badge(
@@ -3522,9 +3724,6 @@ class MainWindow(QMainWindow):
             return
         if clean_key in {"operation", "excluded", "review"}:
             self._set_main_routine_stock_scope(clean_key, checked)
-            return
-        if clean_key == "profit":
-            self._set_main_routine_metric_sort("profit")
 
     def _update_main_routine_summary_badge_styles(self) -> None:
         buttons = getattr(self, "_main_routine_summary_count_buttons", {})
@@ -3563,37 +3762,6 @@ class MainWindow(QMainWindow):
                 f" color: {color}; border: none; background: transparent; padding: 0;"
                 "}"
             )
-
-        profit_button = getattr(self, "_main_routine_summary_profit_label", None)
-        if not isinstance(profit_button, QPushButton):
-            return
-        profit_enabled = "profit" in MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL.get(
-            level,
-            frozenset(),
-        )
-        profit_active = bool(
-            profit_enabled
-            and getattr(self, "_main_routine_metric_sort_active", False)
-            and str(getattr(self, "_main_routine_metric_sort_key", "") or "")
-            == "profit"
-        )
-        profit_button.setEnabled(profit_enabled)
-        profit_button.setCursor(Qt.PointingHandCursor if profit_enabled else Qt.ArrowCursor)
-        profit_button.setChecked(profit_active)
-        profit_border = (
-            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-            if profit_active
-            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
-        )
-        profit_button.setStyleSheet(
-            "QPushButton#mainRoutineSummaryProfit {"
-            " background-color: transparent;"
-            f" color: {str(getattr(self, '_main_routine_summary_profit_color', '') or profit_loss_value_color(0))};"
-            f" border: 1px solid {profit_border};"
-            " border-radius: 4px; padding: 0;"
-            "}"
-            "QPushButton#mainRoutineSummaryProfit:disabled { color: #9CA3AF; }"
-        )
 
     def _create_routine_filter_badge_area(self) -> QWidget:
         badge_area = QWidget()
@@ -5174,12 +5342,29 @@ class MainWindow(QMainWindow):
             return
 
         message = detail + "\n\n현재 evidence를 기준으로 자동매매 운영을 재개하시겠습니까?"
-        if QMessageBox.question(
+        answer = QMessageBox.question(
             self,
             "Startup Recovery",
             message,
             QMessageBox.Yes | QMessageBox.No,
-        ) != QMessageBox.Yes:
+        )
+        append_production_event(
+            "OPERATOR_SYSTEM_DECISION",
+            result="ACCEPTED" if answer == QMessageBox.Yes else "REJECTED",
+            source="gui_windows.MainWindow.review_startup_recovery",
+            target_type="RECOVERY_SESSION",
+            target_name="Startup Recovery",
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "STARTUP_RECOVERY_APPROVAL",
+                "prompt_title": "Startup Recovery",
+                "prompt_summary": "확인된 Runtime evidence 기준 운영 재개 승인",
+                "offered_options": ["예", "아니오"],
+                "selected_option": "예" if answer == QMessageBox.Yes else "아니오",
+                "recovery_status": status,
+            },
+        )
+        if answer != QMessageBox.Yes:
             self.statusBar().showMessage("운영 재개 승인이 취소되었습니다.")
             return
 
@@ -5581,6 +5766,8 @@ class MainWindow(QMainWindow):
         account = str(account_no or "").strip()
         if not account or account in set(self.kiwoom_account_numbers()):
             return False
+        before_exists = account in set(self.remembered_account_numbers())
+        before_memo_exists = account in self.account_memos()
         remembered = [
             value for value in self.remembered_account_numbers() if value != account
         ]
@@ -5601,6 +5788,26 @@ class MainWindow(QMainWindow):
             json.dumps(memos, ensure_ascii=False, sort_keys=True),
         )
         settings.sync()
+        if account in set(self.remembered_account_numbers()) or account in self.account_memos():
+            return False
+        if before_exists or before_memo_exists:
+            account_display = masked_account_no(account)
+            append_production_event(
+                "SETTING_CHANGED",
+                result="SUCCESS",
+                source="SAVED_ACCOUNT_INFO_WRITER",
+                template_args={"target": "저장 계좌정보"},
+                target_type="ACCOUNT",
+                target_id=account_display,
+                target_name=account_display,
+                changes=[
+                    {
+                        "field_key": "saved_account_info",
+                        "before": True,
+                        "after": False,
+                    }
+                ],
+            )
         if str(getattr(self, "_account_memo_edit_account_no", "") or "") == account:
             self._account_memo_loading = True
             try:
@@ -6187,11 +6394,13 @@ class MainWindow(QMainWindow):
             )
 
     def on_main_budget_buffer_response_entry_clicked(self) -> None:
-        """Open the memory-only prototype without executing or saving a strategy."""
+        """Open one editor whose baseline always comes from persisted policy."""
         surface = getattr(self, "_main_buffer_response_settings_surface", None)
         if surface is None or sip.isdeleted(surface):
             surface = _BufferResponseSettingsSurface(self)
             self._main_buffer_response_settings_surface = surface
+        elif not surface.isVisible():
+            surface.reload_from_persisted()
         surface.show()
         surface.raise_()
         surface.activateWindow()
@@ -7519,7 +7728,29 @@ class MainWindow(QMainWindow):
                     ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
                 )
             )
-            menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+            chosen = menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+            if chosen in (early_close_action, immediate_action):
+                market_selected = chosen == immediate_action
+                append_production_event(
+                    "OPERATOR_OPERATION_DECISION",
+                    result="ACCEPTED",
+                    source="gui_windows.MainWindow.open_routine_context_menu",
+                    target_type="ROUTINE_DEFINITION",
+                    target_id=definition_id,
+                    target_name=definition.display_name,
+                    routine=definition.display_name,
+                    details={
+                        "interaction_type": "SELECTION",
+                        "prompt_key": "ROUTINE_DEFINITION_CONTEXT_MENU",
+                        "prompt_title": "루틴 카테고리 메뉴",
+                        "prompt_summary": "루틴 카테고리 운영 action 선택",
+                        "offered_options": ["조기마감", "즉시청산"],
+                        "selected_option": (
+                            "EARLY_CLOSE_MARKET" if market_selected else "EARLY_CLOSE_ROUTINE"
+                        ),
+                        "method": "market" if market_selected else "routine",
+                    },
+                )
             return
         if row_kind != ROUTINE_ROW_CHILD:
             return
@@ -7574,7 +7805,29 @@ class MainWindow(QMainWindow):
                 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
             )
         )
-        menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+        chosen = menu.exec_(self.routine_table.viewport().mapToGlobal(position))
+        if chosen in (early_close_action, immediate_action):
+            market_selected = chosen == immediate_action
+            append_production_event(
+                "OPERATOR_OPERATION_DECISION",
+                result="ACCEPTED",
+                source="gui_windows.MainWindow.open_routine_context_menu",
+                target_type="ROUTINE_INSTANCE",
+                target_id=instance_id,
+                target_name=instance.display_name,
+                routine=instance.display_name,
+                details={
+                    "interaction_type": "SELECTION",
+                    "prompt_key": "ROUTINE_INSTANCE_CONTEXT_MENU",
+                    "prompt_title": "등록 루틴 메뉴",
+                    "prompt_summary": "등록 루틴 운영 action 선택",
+                    "offered_options": ["조기마감", "즉시청산"],
+                    "selected_option": (
+                        "EARLY_CLOSE_MARKET" if market_selected else "EARLY_CLOSE_ROUTINE"
+                    ),
+                    "method": "market" if market_selected else "routine",
+                },
+            )
 
     def open_routine_instance_stock_register_from_main_table(self, instance_id: str) -> None:
         clean_instance_id = str(instance_id or "").strip()
@@ -7638,6 +7891,26 @@ class MainWindow(QMainWindow):
             ).exec_()
         else:
             answer = _create_routine_operation_confirmation(self, display_status).exec_()
+        accepted = answer == QMessageBox.Yes
+        append_production_event(
+            "OPERATOR_OPERATION_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_windows.MainWindow.request_routine_definition_operation",
+            target_type="ROUTINE_DEFINITION",
+            target_id=definition_id,
+            target_name=display_name,
+            routine=display_name,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "ROUTINE_DEFINITION_EARLY_CLOSE_CONFIRM",
+                "prompt_title": "즉시청산" if market_requested else "조기마감",
+                "prompt_summary": "루틴 카테고리 조기마감 적용",
+                "offered_options": ["진행", "취소"],
+                "selected_option": "진행" if accepted else "취소",
+                "operation": "EARLY_CLOSE",
+                "method": "market" if market_requested else "routine",
+            },
+        )
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(
                 f"카테고리 {command_label} 취소: {display_name}"
@@ -7721,6 +7994,26 @@ class MainWindow(QMainWindow):
         command_label = display_status
         market_requested = requested_policy == POLICY_MARKET
         answer = _create_routine_operation_confirmation(self, display_status).exec_()
+        accepted = answer == QMessageBox.Yes
+        append_production_event(
+            "OPERATOR_OPERATION_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_windows.MainWindow.request_routine_operation",
+            target_type="ROUTINE_INSTANCE",
+            target_id=instance_id,
+            target_name=display_name,
+            routine=display_name,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "ROUTINE_INSTANCE_EARLY_CLOSE_CONFIRM",
+                "prompt_title": "즉시청산" if market_requested else "조기마감",
+                "prompt_summary": "등록 루틴 조기마감 적용",
+                "offered_options": ["진행", "취소"],
+                "selected_option": "진행" if accepted else "취소",
+                "operation": "EARLY_CLOSE",
+                "method": "market" if market_requested else "routine",
+            },
+        )
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
             return
@@ -7941,7 +8234,23 @@ class MainWindow(QMainWindow):
         dialog.setDefaultButton(cancel_button)
         dialog.setEscapeButton(cancel_button)
         dialog.exec_()
-        return dialog.clickedButton() is exit_button
+        accepted = dialog.clickedButton() is exit_button
+        append_production_event(
+            "OPERATOR_SYSTEM_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_windows.MainWindow._confirm_main_window_exit_if_required",
+            target_type="APPLICATION",
+            target_name="메인 관제창",
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "MAIN_WINDOW_EXIT_WHILE_RUNNING",
+                "prompt_title": "프로그램 종료",
+                "prompt_summary": "운영 중 프로그램 종료",
+                "offered_options": ["종료", "취소"],
+                "selected_option": "종료" if accepted else "취소",
+            },
+        )
+        return accepted
 
     def closeEvent(self, event) -> None:
         """Stop the single operation host only when the main program closes."""

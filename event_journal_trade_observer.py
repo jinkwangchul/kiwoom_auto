@@ -454,11 +454,30 @@ def _stock_metadata(stock_path: str) -> tuple[str, str]:
 
 
 @_fail_open_observer
-def observe_liquidation_requested(request: Any, command_result: Any) -> list[dict[str, Any]]:
-    """Record only newly persisted one-shot liquidation REQUESTED commands."""
+def observe_liquidation_requested(
+    request: Any,
+    command_result: Any,
+    *,
+    early_close_compatibility: Any = None,
+) -> list[dict[str, Any]]:
+    """Record newly persisted canonical direct-liquidation requests."""
 
     command = _text(getattr(request, "command", "")).upper()
-    if command not in {"INDIVIDUAL_LIQUIDATION", "MANUAL_ATS_LIQUIDATION"}:
+    direct_method = ""
+    if command == "EARLY_CLOSE":
+        direct_method = _text(getattr(early_close_compatibility, "method", ""))
+        normalized_method = direct_method.upper().replace(" ", "_")
+        has_close_target = getattr(
+            early_close_compatibility,
+            "has_close_progress_quantity",
+            False,
+        )
+        if (
+            direct_method not in {"시장가", "현재가"}
+            and normalized_method not in {"MARKET", "CURRENT_PRICE"}
+        ) or has_close_target is not True:
+            return []
+    elif command not in {"INDIVIDUAL_LIQUIDATION", "MANUAL_ATS_LIQUIDATION"}:
         return []
     command_id = _text(getattr(command_result, "command_id", ""))
     outputs = []
@@ -482,7 +501,10 @@ def observe_liquidation_requested(request: Any, command_result: Any) -> list[dic
                 stock_name=name or None,
                 routine=routine or None,
                 command_id=command_id or None,
-                details={"command": command},
+                details={
+                    "command": command,
+                    "method": direct_method or None,
+                },
             )
         )
     return outputs

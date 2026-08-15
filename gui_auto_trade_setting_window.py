@@ -82,6 +82,28 @@ QLineEdit:focus {
 """
 
 
+def _setting_leaf_changes(
+    before: object,
+    after: object,
+    *,
+    prefix: str,
+) -> list[dict[str, object]]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes: list[dict[str, object]] = []
+        for key in sorted(set(before) | set(after)):
+            changes.extend(
+                _setting_leaf_changes(
+                    before.get(key),
+                    after.get(key),
+                    prefix=f"{prefix}.{key}" if prefix else str(key),
+                )
+            )
+        return changes
+    if before == after:
+        return []
+    return [{"field_key": prefix, "before": before, "after": after}]
+
+
 from gui_styles import (
     PLAIN_HEADER_GRID_COLOR_PROPERTY,
     PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY,
@@ -2270,21 +2292,70 @@ class StockPolicyOverrideDialog(QDialog):
             encoding="utf-8",
         )
 
+    def _append_override_changed(
+        self,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> None:
+        changes: list[dict[str, object]] = []
+        for key in self.OVERRIDE_KEYS:
+            changes.extend(
+                _setting_leaf_changes(
+                    before.get(key),
+                    after.get(key),
+                    prefix=key,
+                )
+            )
+        before_memo = bool(str(before.get("policy_override_memo") or "").strip())
+        after_memo = bool(str(after.get("policy_override_memo") or "").strip())
+        if before_memo != after_memo:
+            changes.append(
+                {
+                    "field_key": "policy_override_memo_present",
+                    "before": before_memo,
+                    "after": after_memo,
+                }
+            )
+        if not changes:
+            return
+        append_production_event(
+            "SETTING_CHANGED",
+            result="SUCCESS",
+            source="STOCK_POLICY_OVERRIDE_DIALOG",
+            template_args={"target": "개별종목 설정"},
+            target_type="STOCK",
+            target_id=self.code,
+            target_name=self.name,
+            stock_code=self.code,
+            stock_name=self.name,
+            changes=changes,
+        )
+
     def save_override(self) -> None:
+        before = deepcopy(self.config)
         self.config["policy_override_enabled"] = self.use_override.isChecked()
         self.config["policy_override_memo"] = self.memo.toPlainText().strip()
         self.config["policy_override_updated_at"] = now_text()
         try:
             self.write_config()
+            saved = read_json_dict(self.config_path)
+            if any(saved.get(key) != self.config.get(key) for key in self.OVERRIDE_KEYS):
+                raise RuntimeError("개별종목 설정 저장 후 검증이 일치하지 않습니다.")
+            if str(saved.get("policy_override_memo") or "") != str(
+                self.config.get("policy_override_memo") or ""
+            ):
+                raise RuntimeError("개별종목 메모 저장 후 검증이 일치하지 않습니다.")
             append_stock_log(self.stock_dir, "GUI", "개별종목 설정 저장")
             append_changelog("UPDATE", "config.json", f"개별종목 설정 저장: {self.code} {self.name}")
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"개별종목 설정 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
+        self._append_override_changed(before, saved)
         QMessageBox.information(self, "저장 완료", "개별종목 설정을 저장했습니다.")
         self.accept()
 
     def reset_all_to_global(self) -> None:
+        before = deepcopy(self.config)
         for key in self.OVERRIDE_KEYS:
             self.config.pop(key, None)
         self.config.pop("policy_override_memo", None)
@@ -2292,11 +2363,19 @@ class StockPolicyOverrideDialog(QDialog):
         self.config["policy_override_reset_at"] = now_text()
         try:
             self.write_config()
+            saved = read_json_dict(self.config_path)
+            if bool(saved.get("policy_override_enabled", False)):
+                raise RuntimeError("개별종목 설정 리셋 후 검증이 일치하지 않습니다.")
+            if any(key in saved for key in self.OVERRIDE_KEYS[1:]):
+                raise RuntimeError("개별종목 설정 리셋 후 예외값이 남아 있습니다.")
+            if str(saved.get("policy_override_memo") or ""):
+                raise RuntimeError("개별종목 설정 리셋 후 메모가 남아 있습니다.")
             append_stock_log(self.stock_dir, "GUI", "개별종목 설정 전체 리셋")
             append_changelog("UPDATE", "config.json", f"개별종목 설정 전체 리셋: {self.code} {self.name}")
         except Exception as exc:
             QMessageBox.critical(self, "리셋 오류", f"개별종목 설정 리셋 중 오류가 발생했습니다.\n\n{exc}")
             return
+        self._append_override_changed(before, saved)
         QMessageBox.information(self, "리셋 완료", "해당 종목의 개별설정을 환경설정값으로 전체 리셋했습니다.")
         self.accept()
 
@@ -7143,7 +7222,29 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        order_id = str(enable_preview_result.get("order_id") or order.get("id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_execution_enable_commit",
+            target_type="ORDER",
+            target_id=order_id or None,
+            target_name="Execution Enable",
+            order_id=order_id or None,
+            signal_id=str(order.get("source_signal_id") or "").strip() or None,
+            stock_code=str(order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "EXECUTION_ENABLE_COMMIT",
+                "prompt_title": "execution_enabled 수동 활성화 확인",
+                "prompt_summary": "실주문 후보 execution enable 승인",
+                "offered_options": ["수동 실주문 후보 활성화", "취소"],
+                "selected_option": "수동 실주문 후보 활성화" if accepted else "취소",
+                "approval_stage": "EXECUTION_ENABLE",
+            },
+        )
+        return accepted
 
     def show_execution_enable_result(self, result: dict[str, object]) -> None:
         lines = [
@@ -7377,7 +7478,29 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        order_id = str(preflight_preview_result.get("order_id") or order.get("id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_real_preflight_commit",
+            target_type="ORDER",
+            target_id=order_id or None,
+            target_name="REAL_READY preflight",
+            order_id=order_id or None,
+            signal_id=str(order.get("source_signal_id") or "").strip() or None,
+            stock_code=str(order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "REAL_READY_PREFLIGHT_COMMIT",
+                "prompt_title": "REAL_READY 수동 점검 확인",
+                "prompt_summary": "REAL_READY 수동 preflight 승인",
+                "offered_options": ["REAL_READY 수동 점검 실행", "취소"],
+                "selected_option": "REAL_READY 수동 점검 실행" if accepted else "취소",
+                "approval_stage": "REAL_READY_PREFLIGHT",
+            },
+        )
+        return accepted
 
     def show_real_preflight_result(self, result: dict[str, object]) -> None:
         lines = [
@@ -7658,7 +7781,31 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        order_id = str(order.get("id") or order.get("order_id") or "").strip()
+        execution_id = str(guard.get("execution_id") or order.get("execution_id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_execution_runtime_commit",
+            target_type="EXECUTION",
+            target_id=execution_id or order_id or None,
+            target_name="Execution Runtime Commit",
+            order_id=order_id or None,
+            execution_id=execution_id or None,
+            signal_id=str(order.get("source_signal_id") or "").strip() or None,
+            stock_code=str(order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "EXECUTION_RUNTIME_COMMIT",
+                "prompt_title": "Execution Runtime Commit Confirmation",
+                "prompt_summary": "Execution Runtime 및 Queue preview commit 승인",
+                "offered_options": ["Confirm runtime and queue preview", "Cancel"],
+                "selected_option": "Confirm runtime and queue preview" if accepted else "Cancel",
+                "approval_stage": "RUNTIME_COMMIT",
+            },
+        )
+        return accepted
 
     def runtime_file_init_confirmation_text(
         self,
@@ -7717,7 +7864,24 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_execution_runtime_file_init",
+            target_type="EXECUTION_RUNTIME",
+            target_name="Execution Runtime 파일 초기화",
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "EXECUTION_RUNTIME_FILE_INIT",
+                "prompt_title": "Execution Runtime File Initialization",
+                "prompt_summary": "Execution Runtime 파일 초기화 승인",
+                "offered_options": ["Initialize runtime files", "Cancel"],
+                "selected_option": "Initialize runtime files" if accepted else "Cancel",
+                "approval_stage": "RUNTIME_FILE_INITIALIZATION",
+            },
+        )
+        return accepted
 
     def execution_runtime_environment_flags(self, *args, **kwargs):
         return AutoTradeSettingWindow.order_execution_boundary(self).execution_runtime_environment_flags(*args, **kwargs)
@@ -7980,7 +8144,38 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        queued_record = queue_write_preview_result.get("order_queued_record_preview")
+        queued_record = queued_record if isinstance(queued_record, dict) else {}
+        order_id = str(
+            queued_record.get("order_id")
+            or queued_record.get("id")
+            or queue_write_preview_result.get("order_id")
+            or ""
+        ).strip()
+        execution_id = str(queued_record.get("execution_id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_manual_queue_commit",
+            target_type="ORDER",
+            target_id=order_id or execution_id or None,
+            target_name="수동 Queue 저장",
+            order_id=order_id or None,
+            execution_id=execution_id or None,
+            signal_id=str(queued_record.get("source_signal_id") or "").strip() or None,
+            stock_code=str(queued_record.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "MANUAL_QUEUE_COMMIT",
+                "prompt_title": "수동 Queue 저장 확인",
+                "prompt_summary": "검증된 수동 주문 Queue 저장 승인",
+                "offered_options": ["수동 Queue 저장 실행", "취소"],
+                "selected_option": "수동 Queue 저장 실행" if accepted else "취소",
+                "approval_stage": "MANUAL_QUEUE_COMMIT",
+            },
+        )
+        return accepted
 
     def verify_manual_queue_commit_read_back(self, *args, **kwargs):
         return AutoTradeSettingWindow.order_execution_boundary(self).verify_manual_queue_commit_read_back(*args, **kwargs)
@@ -8229,7 +8424,31 @@ class AutoTradeSettingWindow(QDialog):
         layout.addLayout(button_layout)
 
         dialog.setLayout(layout)
-        return dialog.exec_() == QDialog.Accepted
+        accepted = dialog.exec_() == QDialog.Accepted
+        order_id = str(order.get("id") or order.get("order_id") or "").strip()
+        execution_id = str(order.get("execution_id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_manual_send_order",
+            target_type="ORDER",
+            target_id=order_id or None,
+            target_name="Manual SendOrder",
+            order_id=order_id or None,
+            execution_id=execution_id or None,
+            signal_id=str(order.get("source_signal_id") or "").strip() or None,
+            stock_code=str(order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "MANUAL_SEND_ORDER",
+                "prompt_title": "Manual Kiwoom SendOrder Confirmation",
+                "prompt_summary": "Queue 주문의 Kiwoom SendOrder 호출 승인",
+                "offered_options": ["Call SendOrder once", "Cancel"],
+                "selected_option": "Call SendOrder once" if accepted else "Cancel",
+                "approval_stage": "SEND_ORDER",
+            },
+        )
+        return accepted
 
     def build_manual_send_order_environment(self, *args, **kwargs):
         return AutoTradeSettingWindow.order_execution_boundary(self).build_manual_send_order_environment(*args, **kwargs)
@@ -8428,7 +8647,30 @@ class AutoTradeSettingWindow(QDialog):
                 f"code: {source_order.get('code', '-')}",
             ]
         )
-        return QMessageBox.question(self, "Manual Cancel", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+        answer = QMessageBox.question(self, "Manual Cancel", message, QMessageBox.Yes | QMessageBox.No)
+        accepted = answer == QMessageBox.Yes
+        source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "REJECTED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_manual_cancel_pending_order",
+            target_type="ORDER",
+            target_id=source_order_id or None,
+            target_name="Manual Cancel",
+            order_id=source_order_id or None,
+            broker_order_no=str(source_order.get("broker_order_no") or "").strip() or None,
+            stock_code=str(source_order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "MANUAL_ORDER_CANCEL",
+                "prompt_title": "Manual Cancel",
+                "prompt_summary": "미체결 원주문의 취소 Queue 생성",
+                "offered_options": ["예", "아니오"],
+                "selected_option": "예" if accepted else "아니오",
+                "order_action": "CANCEL",
+            },
+        )
+        return accepted
 
     def confirm_manual_modify_pending_order(self, source_order: dict[str, object], preview: dict[str, object]) -> bool:
         request_preview = preview["order_queued_record_preview"]["execution_request"]["request_preview"]
@@ -8446,7 +8688,34 @@ class AutoTradeSettingWindow(QDialog):
                 f"modify_price: {request_preview.get('price', '-')}",
             ]
         )
-        return QMessageBox.question(self, "Manual Modify", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+        answer = QMessageBox.question(self, "Manual Modify", message, QMessageBox.Yes | QMessageBox.No)
+        accepted = answer == QMessageBox.Yes
+        source_order_id = str(source_order.get("order_id") or source_order.get("id") or "").strip()
+        append_production_event(
+            "OPERATOR_ORDER_DECISION",
+            result="ACCEPTED" if accepted else "REJECTED",
+            source="gui_auto_trade_setting_window.AutoTradeSettingWindow.confirm_manual_modify_pending_order",
+            target_type="ORDER",
+            target_id=source_order_id or None,
+            target_name="Manual Modify",
+            order_id=source_order_id or None,
+            broker_order_no=str(source_order.get("broker_order_no") or "").strip() or None,
+            stock_code=str(source_order.get("code") or "").strip() or None,
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "MANUAL_ORDER_MODIFY",
+                "prompt_title": "Manual Modify",
+                "prompt_summary": "미체결 원주문의 정정 Queue 생성",
+                "offered_options": ["예", "아니오"],
+                "selected_option": "예" if accepted else "아니오",
+                "order_action": "MODIFY",
+                "input_value": {
+                    "quantity": request_preview.get("quantity"),
+                    "price": request_preview.get("price"),
+                },
+            },
+        )
+        return accepted
 
     def cancel_pending_order_manually(self) -> None:
         if not startup_recovery_action_allowed(self, "Manual Cancel"):

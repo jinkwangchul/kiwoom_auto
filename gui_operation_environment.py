@@ -18,6 +18,7 @@ import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
+from typing import Mapping
 
 from PyQt5.QtCore import Qt, QTime
 from PyQt5.QtWidgets import (
@@ -43,6 +44,7 @@ from PyQt5.QtWidgets import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 from state_policy import normalized_hhmmss_or_empty
 from gui_toast import show_toast
+from event_journal_production import append_production_event
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
@@ -63,6 +65,65 @@ SYSTEM_BUDGET_DEFAULTS = {
     "total_budget": 2_000_000,
     "available_budget_percent": 100,
 }
+BUFFER_RESPONSE_APPLICATION_MODES = ("UNIFIED", "SEGMENTED")
+BUFFER_RESPONSE_EVALUATION_FACTORS = ("손익비율", "손익금액", "투입금액")
+BUFFER_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
+BUFFER_RESPONSE_ACTION_MODES = ("조기마감", "즉시청산", "구간마감")
+BUFFER_RESPONSE_THRESHOLDS = tuple(range(10, 100, 10))
+BUFFER_RESPONSE_STRATEGY_KEYS = ("unified", "profit", "loss")
+
+
+def _journal_changes(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    *,
+    prefix: str = "",
+) -> list[dict[str, object]]:
+    """Return changed leaf settings in the Event Journal v1 shape."""
+
+    changes: list[dict[str, object]] = []
+    for key in sorted(set(before) | set(after)):
+        if key == "updated_at":
+            continue
+        field_key = f"{prefix}.{key}" if prefix else str(key)
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if isinstance(before_value, Mapping) and isinstance(after_value, Mapping):
+            changes.extend(
+                _journal_changes(before_value, after_value, prefix=field_key)
+            )
+        elif before_value != after_value:
+            changes.append(
+                {
+                    "field_key": field_key,
+                    "before": before_value,
+                    "after": after_value,
+                }
+            )
+    return changes
+
+
+def _append_setting_change(
+    event_type: str,
+    *,
+    source: str,
+    target: str,
+    target_id: str,
+    changes: list[dict[str, object]],
+) -> None:
+    if not changes:
+        return
+    template_args = {"target": target} if event_type == "SETTING_CHANGED" else {}
+    append_production_event(
+        event_type,
+        result="SUCCESS",
+        source=source,
+        template_args=template_args,
+        target_type="SYSTEM_SETTING",
+        target_id=target_id,
+        target_name=target,
+        changes=changes,
+    )
 
 
 def now_text() -> str:
@@ -162,14 +223,28 @@ def write_operation_policy(
     policy: dict[str, object],
     *,
     path: Path | None = None,
+    preserve_buffer_response: bool = True,
 ) -> None:
     policy = dict(policy)
     target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
-    if "system_budget" not in policy:
+    existing: dict[str, object] | None = None
+    if (
+        "system_budget" not in policy
+        or (preserve_buffer_response and "buffer_response" not in policy)
+    ):
         existing = read_operation_policy(path=target_path)
+    if "system_budget" not in policy:
+        assert existing is not None
         policy["system_budget"] = system_budget_policy(existing)
     else:
         policy["system_budget"] = system_budget_policy(policy)
+    if (
+        preserve_buffer_response
+        and "buffer_response" not in policy
+        and isinstance(existing, dict)
+        and "buffer_response" in existing
+    ):
+        policy["buffer_response"] = existing["buffer_response"]
     scheduled = policy.get("scheduled_operation")
     if isinstance(scheduled, dict):
         policy["scheduled_operation"] = {
@@ -260,6 +335,7 @@ def write_system_budget_policy(
     path: Path | None = None,
 ) -> dict[str, int]:
     """Persist the two canonical system-budget values through the policy writer."""
+    before = read_system_budget_policy(path=path)
     normalized = {
         "total_budget": validate_system_total_budget(total_budget),
         "available_budget_percent": validate_available_budget_percent(
@@ -269,7 +345,155 @@ def write_system_budget_policy(
     policy = read_operation_policy(path=path)
     policy["system_budget"] = dict(normalized)
     write_operation_policy(policy, path=path)
-    return normalized
+    saved = read_system_budget_policy(path=path)
+    if saved != normalized:
+        raise RuntimeError("system_budget read-back verification failed")
+    _append_setting_change(
+        "SETTING_CHANGED",
+        source="SYSTEM_BUDGET_WRITER",
+        target="예산설정",
+        target_id="SYSTEM_BUDGET",
+        changes=_journal_changes(before, saved),
+    )
+    return saved
+
+
+def default_buffer_response_policy() -> dict[str, object]:
+    """Return editor defaults without making them a configured policy."""
+
+    return {
+        "application_mode": "UNIFIED",
+        "threshold_percent": 80,
+        "strategies": {
+            "unified": {
+                "evaluation_factor": "손익금액",
+                "direction": "낮은순",
+                "response_mode": "조기마감",
+            },
+            "profit": {
+                "evaluation_factor": "손익금액",
+                "direction": "높은순",
+                "response_mode": "조기마감",
+            },
+            "loss": {
+                "evaluation_factor": "손익금액",
+                "direction": "낮은순",
+                "response_mode": "즉시청산",
+            },
+        },
+    }
+
+
+def validate_buffer_response_policy(
+    value: Mapping[str, object] | object,
+) -> dict[str, object]:
+    """Validate and normalize the complete persisted buffer-response section."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("buffer_response policy must be an object")
+    application_mode = str(value.get("application_mode") or "").strip().upper()
+    if application_mode not in BUFFER_RESPONSE_APPLICATION_MODES:
+        raise ValueError("buffer_response application_mode is invalid")
+
+    threshold_value = value.get(
+        "threshold_percent",
+        value.get("configured_threshold"),
+    )
+    threshold_percent = _strict_integer(threshold_value)
+    if threshold_percent not in BUFFER_RESPONSE_THRESHOLDS:
+        raise ValueError("buffer_response threshold_percent is invalid")
+
+    raw_strategies = value.get("strategies")
+    if not isinstance(raw_strategies, Mapping):
+        raise ValueError("buffer_response strategies are invalid")
+    strategies: dict[str, dict[str, str]] = {}
+    for key in BUFFER_RESPONSE_STRATEGY_KEYS:
+        raw_strategy = raw_strategies.get(key)
+        if not isinstance(raw_strategy, Mapping):
+            raise ValueError(f"buffer_response strategy {key} is invalid")
+        evaluation_factor = str(
+            raw_strategy.get("evaluation_factor") or ""
+        ).strip()
+        direction = str(raw_strategy.get("direction") or "").strip()
+        response_mode = str(raw_strategy.get("response_mode") or "").strip()
+        if evaluation_factor not in BUFFER_RESPONSE_EVALUATION_FACTORS:
+            raise ValueError(f"buffer_response strategy {key} factor is invalid")
+        if direction not in BUFFER_RESPONSE_SORT_DIRECTIONS:
+            raise ValueError(f"buffer_response strategy {key} direction is invalid")
+        if response_mode not in BUFFER_RESPONSE_ACTION_MODES:
+            raise ValueError(f"buffer_response strategy {key} response is invalid")
+        strategies[key] = {
+            "evaluation_factor": evaluation_factor,
+            "direction": direction,
+            "response_mode": response_mode,
+        }
+    return {
+        "application_mode": application_mode,
+        "threshold_percent": threshold_percent,
+        "strategies": strategies,
+    }
+
+
+def _buffer_response_unavailable(reason: str) -> dict[str, object]:
+    return {
+        "available": False,
+        "configured": False,
+        "application_mode": "",
+        "threshold_percent": None,
+        "configured_threshold": None,
+        "strategies": {},
+        "reason": reason,
+    }
+
+
+def read_buffer_response_policy(*, path: Path | None = None) -> dict[str, object]:
+    """Read only an explicitly persisted, fully valid buffer-response policy."""
+
+    policy = read_operation_policy(path=path)
+    if "buffer_response" not in policy:
+        return _buffer_response_unavailable("BUFFER_RESPONSE_POLICY_NOT_CONFIGURED")
+    try:
+        normalized = validate_buffer_response_policy(policy.get("buffer_response"))
+    except ValueError:
+        return _buffer_response_unavailable("BUFFER_RESPONSE_POLICY_MALFORMED")
+    return {
+        "available": True,
+        "configured": True,
+        **normalized,
+        "configured_threshold": normalized["threshold_percent"],
+        "reason": "",
+    }
+
+
+def write_buffer_response_policy(
+    policy: Mapping[str, object] | object,
+    *,
+    path: Path | None = None,
+) -> dict[str, object]:
+    """Persist one validated section while preserving all other policy keys."""
+
+    current_policy = read_operation_policy(path=path)
+    current_section = current_policy.get("buffer_response")
+    try:
+        before = validate_buffer_response_policy(current_section)
+    except ValueError:
+        before = {}
+    normalized = validate_buffer_response_policy(policy)
+    operation_policy = current_policy
+    operation_policy["buffer_response"] = normalized
+    write_operation_policy(operation_policy, path=path)
+    saved_policy = read_operation_policy(path=path)
+    saved = validate_buffer_response_policy(saved_policy.get("buffer_response"))
+    if saved != normalized:
+        raise RuntimeError("buffer_response read-back verification failed")
+    _append_setting_change(
+        "SETTING_CHANGED",
+        source="BUFFER_RESPONSE_POLICY_WRITER",
+        target="완충대응 설정",
+        target_id="BUFFER_RESPONSE",
+        changes=_journal_changes(before, saved),
+    )
+    return saved
 
 
 def _positive_decimal(value: object, fallback: float) -> float:
@@ -1083,7 +1307,28 @@ class OperationEnvironmentSettingsDialog(QDialog):
 
     def _request_program_factory_reset(self) -> None:
         confirmation = ProgramFactoryResetConfirmDialog(self)
-        if confirmation.exec_() != QDialog.Accepted:
+        dialog_result = confirmation.exec_()
+        accepted = dialog_result == QDialog.Accepted
+        confirmation_matched = (
+            confirmation.confirmation_input.text() == confirmation.CONFIRMATION_TEXT
+        )
+        append_production_event(
+            "OPERATOR_SETTING_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_operation_environment.OperationEnvironmentSettingsDialog._request_program_factory_reset",
+            target_type="APPLICATION_SETTINGS",
+            target_name="프로그램 전체 초기화",
+            details={
+                "interaction_type": "INPUT",
+                "prompt_key": "PROGRAM_FACTORY_RESET",
+                "prompt_title": "프로그램 초기화 확인",
+                "prompt_summary": "프로그램 종목·운영 데이터·사용자 설정 초기화",
+                "offered_options": ["초기화", "취소"],
+                "selected_option": "초기화" if accepted else "취소",
+                "confirmation_matched": confirmation_matched,
+            },
+        )
+        if not accepted:
             return
 
         api = self._main_window_kiwoom_api()
@@ -1330,12 +1575,61 @@ class OperationEnvironmentSettingsDialog(QDialog):
         if budget_defaults is None:
             return
         policy = self.build_policy_from_widgets(budget_defaults)
+        before_policy = read_operation_policy()
         try:
             write_operation_policy(policy)
+            saved_policy = read_operation_policy()
+            expected_policy = dict(policy)
+            expected_policy["system_budget"] = system_budget_policy(policy)
+            if (
+                "buffer_response" not in expected_policy
+                and "buffer_response" in before_policy
+            ):
+                expected_policy["buffer_response"] = before_policy["buffer_response"]
+            expected_scheduled = expected_policy.get("scheduled_operation")
+            if isinstance(expected_scheduled, dict):
+                expected_policy["scheduled_operation"] = {
+                    key: value
+                    for key, value in expected_scheduled.items()
+                    if key != "after_buy_end_status"
+                }
+            expected_policy.pop("updated_at", None)
+            comparable_saved = dict(saved_policy)
+            comparable_saved.pop("updated_at", None)
+            if comparable_saved != expected_policy:
+                raise RuntimeError("operation policy read-back verification failed")
             append_changelog("UPDATE", "operation_policy.json", "환경설정 저장")
         except Exception as exc:
             QMessageBox.critical(self, "저장 오류", f"환경설정 저장 중 오류가 발생했습니다.\n\n{exc}")
             return
+        trading_keys = ("regular_market", "extra_sessions", "scheduled_operation")
+        trading_before = {
+            key: before_policy.get(key) for key in trading_keys
+        }
+        trading_after = {
+            key: saved_policy.get(key) for key in trading_keys
+        }
+        _append_setting_change(
+            "TRADING_TIME_CHANGED",
+            source="OPERATION_ENVIRONMENT_DIALOG",
+            target="운영시간",
+            target_id="OPERATION_TIME_POLICY",
+            changes=_journal_changes(trading_before, trading_after),
+        )
+        excluded_keys = {*trading_keys, "system_budget", "buffer_response", "updated_at"}
+        settings_before = {
+            key: value for key, value in before_policy.items() if key not in excluded_keys
+        }
+        settings_after = {
+            key: value for key, value in saved_policy.items() if key not in excluded_keys
+        }
+        _append_setting_change(
+            "SETTING_CHANGED",
+            source="OPERATION_ENVIRONMENT_DIALOG",
+            target="환경설정",
+            target_id="OPERATION_POLICY",
+            changes=_journal_changes(settings_before, settings_after),
+        )
         logical_owner = persistent_feature_owner(self)
         toast_parent = logical_owner if logical_owner is not None else self
         show_toast(

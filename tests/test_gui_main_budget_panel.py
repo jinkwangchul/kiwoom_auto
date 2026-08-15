@@ -49,6 +49,15 @@ class MainBudgetPanelTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def _buffer_response_surface(self, owner: QWidget):
+        import gui_windows
+
+        temp_dir = self.enterContext(tempfile.TemporaryDirectory())
+        return gui_windows._BufferResponseSettingsSurface(
+            owner,
+            policy_path=Path(temp_dir) / "operation_policy.json",
+        )
+
     def test_global_total_budget_default_is_user_confirmed_two_million(self) -> None:
         policy = environment.default_operation_policy()
         self.assertEqual(
@@ -1125,11 +1134,11 @@ class MainBudgetPanelTests(unittest.TestCase):
         )
         box.deleteLater()
 
-    def test_buffer_response_surface_is_nonmodal_memory_only_ui(self) -> None:
+    def test_buffer_response_surface_layout_and_initial_unsaved_state(self) -> None:
         import gui_windows
 
         owner = QWidget()
-        surface = gui_windows._BufferResponseSettingsSurface(owner)
+        surface = self._buffer_response_surface(owner)
         try:
             surface.show()
             self.app.processEvents()
@@ -1272,7 +1281,7 @@ class MainBudgetPanelTests(unittest.TestCase):
                 "낮은순",
                 surface.strategy_rows["profit"][0][1].currentText(),
             )
-            self.assertFalse(surface.save_button.isEnabled())
+            self.assertTrue(surface.save_button.isEnabled())
 
             factors = set()
             for rows in surface.strategy_rows.values():
@@ -1304,7 +1313,7 @@ class MainBudgetPanelTests(unittest.TestCase):
         import gui_windows
 
         owner = QWidget()
-        surface = gui_windows._BufferResponseSettingsSurface(owner)
+        surface = self._buffer_response_surface(owner)
         try:
             surface.show()
             self.app.processEvents()
@@ -1372,7 +1381,7 @@ class MainBudgetPanelTests(unittest.TestCase):
         import gui_windows
 
         owner = QWidget()
-        surface = gui_windows._BufferResponseSettingsSurface(owner)
+        surface = self._buffer_response_surface(owner)
         try:
             surface.show()
             self.app.processEvents()

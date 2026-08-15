@@ -356,7 +356,14 @@ class OperationCommandService:
             command_id,
             tuple(results),
         )
-        observe_liquidation_requested(request, result)
+        if early_close_compatibility is None:
+            observe_liquidation_requested(request, result)
+        else:
+            observe_liquidation_requested(
+                request,
+                result,
+                early_close_compatibility=early_close_compatibility,
+            )
         return result
 
     def _validate_request(self, request: OperationCommandRequest) -> str:

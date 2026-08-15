@@ -74,3 +74,46 @@ def append_owner_event_once(
         return {"appended": False, "duplicate": True, "event_type": event_type}
     tokens.add(clean_token)
     return append_production_event(event_type, **kwargs)
+
+
+def observe_owner_failure_transition(
+    owner: object,
+    scope: str,
+    *,
+    active: bool,
+    signature: str = "",
+    event_type: str = "RUNTIME_WARNING",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Append once when one operational scope enters a confirmed failure state.
+
+    The state is process-local projection state only.  A successful observation
+    clears the scope so a later, genuinely new failure transition can be
+    recorded without turning polling refreshes into journal noise.
+    """
+
+    marker_name = "_event_journal_failure_transitions"
+    states = getattr(owner, marker_name, None)
+    if not isinstance(states, dict):
+        states = {}
+        setattr(owner, marker_name, states)
+    clean_scope = str(scope or "").strip()
+    if not clean_scope:
+        return {"appended": False, "error": "failure transition scope is required"}
+    if not active:
+        states.pop(clean_scope, None)
+        return {"appended": False, "cleared": True, "scope": clean_scope}
+
+    state_signature = (
+        str(event_type or "").strip(),
+        str(signature or "").strip(),
+    )
+    if states.get(clean_scope) == state_signature:
+        return {
+            "appended": False,
+            "duplicate": True,
+            "scope": clean_scope,
+            "event_type": event_type,
+        }
+    states[clean_scope] = state_signature
+    return append_production_event(event_type, **kwargs)

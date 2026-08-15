@@ -149,10 +149,42 @@ class EventJournalReader:
 
     @staticmethod
     def _search_text(record: dict[str, Any]) -> str:
+        details = record.get("details")
+        detail_parts: list[str] = []
+        if isinstance(details, dict):
+            for key in (
+                "prompt_title",
+                "prompt_summary",
+                "selected_option",
+                "interaction_type",
+                "reason",
+                "review_reason",
+                "stage",
+            ):
+                value = details.get(key)
+                if value not in (None, ""):
+                    detail_parts.append(str(value))
+        changes = record.get("changes")
+        change_parts: list[str] = []
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                for key in ("field_key", "before", "after"):
+                    value = change.get(key)
+                    if value not in (None, ""):
+                        change_parts.append(str(value))
         parts = (
             event_target_display(record),
+            str(record.get("event_type") or ""),
             EVENT_TYPE_LABELS.get(str(record.get("event_type") or ""), ""),
             str(record.get("summary") or ""),
             str(record.get("stock_code") or ""),
+            str(record.get("stock_name") or ""),
+            str(record.get("routine") or ""),
+            str(record.get("reason_code") or ""),
+            str(record.get("result") or ""),
+            *detail_parts,
+            *change_parts,
         )
         return " ".join(parts).casefold()

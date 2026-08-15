@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import os
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from decimal import Decimal
 
@@ -75,11 +77,20 @@ class BufferResponsePolicyProjectionTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication(sys.argv)
 
+    def _surface(self, owner: QWidget):
+        import gui_windows
+
+        temp_dir = self.enterContext(tempfile.TemporaryDirectory())
+        return gui_windows._BufferResponseSettingsSurface(
+            owner,
+            policy_path=Path(temp_dir) / "operation_policy.json",
+        )
+
     def test_reads_the_open_real_settings_surface_widget_state(self) -> None:
         import gui_windows
 
         owner = QWidget()
-        surface = gui_windows._BufferResponseSettingsSurface(owner)
+        surface = self._surface(owner)
         try:
             surface.show()
             self.app.processEvents()

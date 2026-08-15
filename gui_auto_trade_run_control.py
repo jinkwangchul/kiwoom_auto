@@ -20,7 +20,10 @@ from PyQt5.QtWidgets import (
 
 from gui_toast import show_toast
 from gui_operation_ui_context import refresh_auto_trade_views
-from event_journal_production import append_production_event
+from event_journal_production import (
+    append_production_event,
+    observe_owner_failure_transition,
+)
 from runtime_io import read_json_dict
 from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_auto_trade_integrity import (
@@ -70,6 +73,24 @@ LOGGER = logging.getLogger(__name__)
 START_REQUEST_SINGLE = "single"
 START_REQUEST_MULTIPLE = "multiple"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+
+_P3_OPERATION_START_RUNTIME_REASONS = frozenset(
+    {
+        "RUNTIME_MISSING",
+        "RUNTIME_DAMAGED",
+        "PENDING_ORDER_UNKNOWN",
+    }
+)
+_P3_OPERATION_START_ERROR_REASONS = frozenset(
+    {
+        "TARGET_COLLECTION_FAILED",
+        "TARGET_CLASSIFICATION_FAILED",
+        "RECOVERY_CHECK_FAILED",
+        "INTERNAL_EXCEPTION",
+        "REVIEW_STATE_SAVE_FAILED",
+        "STATE_SAVE_FAILED",
+    }
+)
 
 _ACTIVE_CLOSE_STATUSES = {
     "AUTO_CLOSE",
@@ -873,7 +894,61 @@ def _start_result_summary(
     return " · ".join(parts)
 
 
+def _operation_start_p3_reason(result: dict[str, object]) -> str:
+    candidates: list[str] = []
+    for key in ("global_failure_reason", "stock_failure"):
+        value = str(result.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    internal = result.get("internal_reason")
+    if isinstance(internal, (list, tuple, set)):
+        candidates.extend(str(item or "").strip() for item in internal)
+    candidates.append(str(result.get("reason") or "").strip())
+    supported = _P3_OPERATION_START_RUNTIME_REASONS | _P3_OPERATION_START_ERROR_REASONS
+    return next((reason for reason in candidates if reason in supported), "")
+
+
+def _record_operation_start_p3_result(
+    window,
+    result: dict[str, object],
+) -> None:
+    reason = _operation_start_p3_reason(result)
+    if not reason:
+        return
+    event_type = (
+        "RUNTIME_WARNING"
+        if reason in _P3_OPERATION_START_RUNTIME_REASONS
+        else "PROCESSING_ERROR"
+    )
+    stock_code = str(result.get("target_stock_code") or "").strip()
+    stock_name = str(result.get("target_stock_name") or "").strip()
+    target_name = " ".join(part for part in (stock_code, stock_name) if part)
+    observe_owner_failure_transition(
+        window,
+        "operation_start_failure",
+        active=True,
+        signature=f"{event_type}:{reason}:{stock_code}",
+        event_type=event_type,
+        severity="WARNING" if event_type == "RUNTIME_WARNING" else "ERROR",
+        result="BLOCKED" if event_type == "RUNTIME_WARNING" else "FAILED",
+        source="gui_auto_trade_run_control.auto_trade_start_selected_auto_trades",
+        template_args={"target": target_name or "자동매매 운영 시작"},
+        target_type="STOCK" if stock_code else "OPERATION_START",
+        target_id=stock_code or "operation_start",
+        target_name=target_name or "자동매매 운영 시작",
+        stock_code=stock_code,
+        stock_name=stock_name,
+        reason_code=reason,
+        details={
+            "stage": "operation_start",
+            "requested_count": int(result.get("requested_count") or 0),
+            "failed_count": int(result.get("failed_count") or 0),
+        },
+    )
+
+
 def _show_start_failure_once(window, result: dict[str, object]) -> None:
+    _record_operation_start_p3_result(window, result)
     message = str(result.get("user_message") or "").strip()
     status_message = getattr(window, "statusBarMessage", None)
     if message and callable(status_message):
@@ -1729,6 +1804,28 @@ def auto_trade_start_selected_auto_trades(
         stock_failure_reason=(failure_reasons[0] if failure_reasons else ""),
     )
     if completed:
+        observe_owner_failure_transition(
+            window,
+            "operation_start_failure",
+            active=False,
+        )
+        operation_state_failed = result.get("operation_state_write_failed") is True
+        observe_owner_failure_transition(
+            window,
+            "operation_start_global_state_write",
+            active=operation_state_failed,
+            signature="GLOBAL_OPERATION_STATE_WRITE_FAILED",
+            event_type="PROCESSING_ERROR",
+            severity="ERROR",
+            result="FAILED",
+            source="gui_auto_trade_run_control.auto_trade_start_selected_auto_trades",
+            template_args={"target": "전역 운영 상태"},
+            target_type="GLOBAL_OPERATION",
+            target_id="global_operation",
+            target_name="전역 운영 상태",
+            reason_code="GLOBAL_OPERATION_STATE_WRITE_FAILED",
+            details={"stage": "operation_start_global_state_write"},
+        )
         if result.get("operation_state_write_failed"):
             result_lines.append(
                 "전역 운영 상태 기록 실패: 종목 시작 상태는 유지됩니다."

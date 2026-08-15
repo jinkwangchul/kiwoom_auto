@@ -40,6 +40,7 @@ from operation_command_service import (
 from execution_queue_writer import read_execution_queue_records
 from operation_close_completion_evaluator import resolve_liquidation_holding_quantity
 from event_journal_trade_observer import observe_manual_ats_liquidation_outcome
+from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from manual_ats_runtime import (
     manual_ats_runtime_selected_keys,
@@ -211,6 +212,29 @@ def auto_trade_save_manual_ats_state_for_targets(
             )
             result["failed"] = int(result["failed"]) + 1
             continue
+
+        changes = [
+            {
+                "field_key": f"manual_ats.{key}",
+                "before": key in current_keys,
+                "after": bool(normalized.get(key, False)),
+            }
+            for key in all_keys
+            if (key in current_keys) != bool(normalized.get(key, False))
+        ]
+        if changes:
+            append_production_event(
+                "ATS_CHANGED",
+                result="SUCCESS",
+                source="MANUAL_ATS_RUNTIME_WRITER",
+                template_args={},
+                target_type="STOCK",
+                target_id=str(code or "").strip(),
+                target_name=str(name or "").strip(),
+                stock_code=str(code or "").strip(),
+                stock_name=str(name or "").strip(),
+                changes=changes,
+            )
 
         label_map = manual_ats_session_labels()
         enabled_labels = [
@@ -853,6 +877,28 @@ def auto_trade_execute_selected_manual_ats_liquidation(
         "요청은 기존 주문 승인·Queue·Dispatch Claim·SendOrder 안전 경계를 통과합니다.",
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.No,
+    )
+    single_preview = previews[0] if len(previews) == 1 else {}
+    append_production_event(
+        "OPERATOR_OPERATION_DECISION",
+        result="ACCEPTED" if answer == QMessageBox.Yes else "REJECTED",
+        source="gui_auto_trade_ats_ops.auto_trade_execute_selected_manual_ats_liquidation",
+        target_type="STOCK_SELECTION",
+        target_id=str(single_preview.get("code") or "").strip() or None,
+        target_name=str(single_preview.get("name") or "").strip() or "ATS 수동운영 종목",
+        stock_code=str(single_preview.get("code") or "").strip() or None,
+        stock_name=str(single_preview.get("name") or "").strip() or None,
+        command_id=str(single_preview.get("command_id") or "").strip() or None,
+        details={
+            "interaction_type": "CONFIRM",
+            "prompt_key": "ATS_LIQUIDATION_CONFIRM",
+            "prompt_title": f"ATS {method}매도 확인",
+            "prompt_summary": "선택 수동운영 종목의 ATS 청산 요청",
+            "offered_options": ["예", "아니오"],
+            "selected_option": "예" if answer == QMessageBox.Yes else "아니오",
+            "method": normalize_manual_ats_sell_method(method),
+            "target_count": len(previews),
+        },
     )
     if answer != QMessageBox.Yes:
         window.statusBarMessage(f"ATS {method}매도 취소")

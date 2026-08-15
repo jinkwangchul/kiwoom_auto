@@ -34,10 +34,55 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from event_journal_production import append_production_event
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCKS_DIR = PROJECT_ROOT / "stocks"
 ROUTINE_ASSIGNMENT_HISTORY_KEY = "routine_assignment_history"
+
+
+def _routine_assignment(config: dict[str, Any]) -> dict[str, str]:
+    return {
+        "routine": str(
+            config.get("routine_instance_name")
+            or config.get("routine_name")
+            or config.get("routine")
+            or ""
+        ).strip(),
+        "routine_instance_id": str(
+            config.get("assigned_routine_instance_id") or ""
+        ).strip(),
+    }
+
+
+def _append_routine_changed(
+    *,
+    code: str,
+    name: str,
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    changes = [
+        {"field_key": key, "before": before.get(key, ""), "after": after.get(key, "")}
+        for key in ("routine", "routine_instance_id")
+        if before.get(key, "") != after.get(key, "")
+    ]
+    if not changes:
+        return
+    append_production_event(
+        "ROUTINE_CHANGED",
+        result="SUCCESS",
+        source="STOCK_REPOSITORY",
+        template_args={"stock_name": str(name or code).strip()},
+        target_type="STOCK",
+        target_id=str(code or "").strip(),
+        target_name=str(name or "").strip(),
+        stock_code=str(code or "").strip(),
+        stock_name=str(name or "").strip(),
+        routine=after.get("routine", ""),
+        changes=changes,
+    )
 
 
 def now_text() -> str:
@@ -382,6 +427,7 @@ class StockRepository:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
+        before_assignment = _routine_assignment(config)
         changed_at = now_text()
         self._close_assignment_history(
             config,
@@ -408,6 +454,17 @@ class StockRepository:
 
         config["updated_at"] = changed_at
         write_json_dict(config_path, config)
+        saved = read_json_dict(config_path)
+        expected_assignment = _routine_assignment(config)
+        saved_assignment = _routine_assignment(saved)
+        if saved_assignment != expected_assignment:
+            return False
+        _append_routine_changed(
+            code=code,
+            name=name,
+            before=before_assignment,
+            after=saved_assignment,
+        )
         return True
 
     def update_stock_routine_instance(
@@ -439,6 +496,7 @@ class StockRepository:
             return False
         config_path = path / "config.json"
         config = read_json_dict(config_path)
+        before_assignment = _routine_assignment(config)
         changed_at = now_text()
         previous_instance_id = str(
             config.get("assigned_routine_instance_id", "") or ""
@@ -471,6 +529,17 @@ class StockRepository:
         config["routine_type"] = clean_routine_type
         config["updated_at"] = changed_at
         write_json_dict(config_path, config)
+        saved = read_json_dict(config_path)
+        expected_assignment = _routine_assignment(config)
+        saved_assignment = _routine_assignment(saved)
+        if saved_assignment != expected_assignment:
+            return False
+        _append_routine_changed(
+            code=code,
+            name=name,
+            before=before_assignment,
+            after=saved_assignment,
+        )
         return True
 
     def ensure_stock_folder(self, code: str, name: str, routine: str = "") -> Path:

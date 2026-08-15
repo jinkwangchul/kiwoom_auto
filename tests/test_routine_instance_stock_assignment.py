@@ -72,6 +72,9 @@ class _Item:
     def setForeground(self, *_args) -> None:
         return None
 
+    def setToolTip(self, *_args) -> None:
+        return None
+
 
 class RoutineInstanceStockAssignmentTest(unittest.TestCase):
     def _stock(self, root: Path, folder: str, config: dict) -> Path:
@@ -305,8 +308,8 @@ class RoutineInstanceStockAssignmentTest(unittest.TestCase):
                 ),
                 patch.object(
                     gui_main_table_loader,
-                    "create_auto_trade_setting_status_item",
-                    side_effect=lambda value: _Item(value),
+                    "create_auto_trade_setting_activity_status_item",
+                    side_effect=lambda value, *_args, **_kwargs: _Item(value),
                 ),
                 patch.object(
                     gui_main_table_loader,

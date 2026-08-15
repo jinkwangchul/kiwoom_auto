@@ -72,9 +72,32 @@ from gui_window_policy import (
 import rule_approval_session_file_service as rule_approval_session_file_service
 from routine_instance_registry import load_persisted_routine_instances, load_routine_definitions
 from routine_instance_repository import RoutineInstanceRepository
+from event_journal_production import append_production_event
 
 
 DEFAULT_BUY_SIGNAL_EXPR = "A and B and C and D"
+
+
+def _routine_setting_changes(
+    before: object,
+    after: object,
+    *,
+    prefix: str = "indicator_follow_ui_state",
+):
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes = []
+        for key in sorted(set(before) | set(after)):
+            changes.extend(
+                _routine_setting_changes(
+                    before.get(key),
+                    after.get(key),
+                    prefix=f"{prefix}.{key}",
+                )
+            )
+        return changes
+    if before == after:
+        return []
+    return [{"field_key": prefix, "before": before, "after": after}]
 
 
 def _is_restore_test_expression(value):
@@ -1635,6 +1658,13 @@ class IndicatorFollowRoutineSettingsDialog(
                 raise ValueError("rules.json root must be an object")
 
             before_core = {key: deepcopy(current_rules.get(key)) for key in core_keys}
+            before_ui_state = deepcopy(
+                (
+                    current_rules.get("indicator_follow_ui_state") or {}
+                ).get("state")
+                if isinstance(current_rules.get("indicator_follow_ui_state"), dict)
+                else None
+            )
             rules_copy = deepcopy(current_rules)
             rules_copy["indicator_follow_ui_state"] = {
                 "ui_state_version": "0.1",
@@ -1667,6 +1697,22 @@ class IndicatorFollowRoutineSettingsDialog(
 
             self.rules_data = saved_rules
             self.rules = saved_rules
+            saved_ui_state = (
+                saved_rules.get("indicator_follow_ui_state") or {}
+            ).get("state")
+            changes = _routine_setting_changes(before_ui_state, saved_ui_state)
+            if self.instance_id and changes:
+                append_production_event(
+                    "SETTING_CHANGED",
+                    result="SUCCESS",
+                    source="INDICATOR_FOLLOW_RULES_WRITER",
+                    template_args={"target": "루틴 설정"},
+                    target_type="ROUTINE_INSTANCE",
+                    target_id=self.instance_id,
+                    target_name=self.routine_name,
+                    routine=self.routine_name,
+                    changes=changes,
+                )
             result["success"] = True
         except Exception as exc:
             result["error"] = str(exc)

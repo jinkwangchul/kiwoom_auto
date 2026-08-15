@@ -333,7 +333,11 @@ def execute_program_factory_reset(
         from gui_operation_environment import default_operation_policy, write_operation_policy
         from state_policy import write_global_schedule
 
-        write_operation_policy(default_operation_policy(), path=root / "operation_policy.json")
+        write_operation_policy(
+            default_operation_policy(),
+            path=root / "operation_policy.json",
+            preserve_buffer_response=False,
+        )
         write_global_schedule("09:00:00", "13:30:00", path=root / "global_schedule.json")
         runtime_result = initialize_pristine_startup_runtime(root / "runtime")
         if runtime_result.get("status") != STATUS_INITIALIZED:

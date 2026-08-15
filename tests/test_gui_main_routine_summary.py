@@ -268,27 +268,6 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "profit_color": profit_loss_value_color(12500),
             }
             MainWindow._update_main_routine_summary(host, first)
-            self.assertIn(
-                profit_loss_value_color(0).lower(),
-                host._main_routine_summary_profit_label.styleSheet().lower(),
-            )
-            MainWindow._update_main_routine_summary(host, second)
-            self.assertIn(
-                profit_loss_value_color(12500).lower(),
-                host._main_routine_summary_profit_label.styleSheet().lower(),
-            )
-            negative = dict(second)
-            negative["profit_value_text"] = "-8,300 / -0.83%"
-            negative["profit_color"] = profit_loss_value_color(-8300)
-            MainWindow._update_main_routine_summary(host, negative)
-            self.assertEqual(
-                "수익 -8,300 / -0.83%",
-                host._main_routine_summary_profit_label.text(),
-            )
-            self.assertIn(
-                profit_loss_value_color(-8300).lower(),
-                host._main_routine_summary_profit_label.styleSheet().lower(),
-            )
             MainWindow._update_main_routine_summary(host, second)
 
             count_labels = host._main_routine_summary_count_labels
@@ -299,8 +278,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertEqual("1", count_labels["operation"][1].text())
             self.assertEqual("0", count_labels["excluded"][1].text())
             self.assertNotEqual("002", count_labels["routine"][1].text())
-            self.assertEqual("수익 +12,500 / +1.25%", host._main_routine_summary_profit_label.text())
-            all_labels = [host._main_routine_summary_profit_label]
+            self.assertFalse(hasattr(host, "_main_routine_summary_profit_label"))
+            self.assertIsNone(
+                summary.findChild(QWidget, "mainRoutineSummaryProfit")
+            )
+            self.assertIsNone(
+                summary.findChild(QWidget, "mainRoutineSummaryProfitSeparator")
+            )
+            all_labels = []
             for label, value in count_labels.values():
                 all_labels.extend((label, value))
             for label in all_labels:
@@ -343,10 +328,6 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertTrue(
                 all(expected_border in badge.styleSheet().lower() for badge in count_badges)
             )
-            self.assertIn(
-                expected_border,
-                host._main_routine_summary_profit_label.styleSheet().lower(),
-            )
             self.assertEqual(
                 host._main_routine_summary_count_badge_width,
                 count_badges[0].width(),
@@ -360,9 +341,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             group_label = count_labels["group"][0]
             valid_badge = host._main_routine_valid_button
             valid_separator = host._main_routine_summary_valid_separator
-            profit_separator = host._main_routine_summary_profit_separator
             review_badge = count_badges[-1]
-            profit_badge = host._main_routine_summary_profit_label
             valid_x = valid_badge.mapTo(summary, valid_badge.rect().topLeft()).x()
             separator_x = valid_separator.mapTo(
                 summary,
@@ -370,14 +349,6 @@ class MainRoutineSummaryTests(unittest.TestCase):
             ).x()
             badge_x = count_badges[0].mapTo(summary, count_badges[0].rect().topLeft()).x()
             review_x = review_badge.mapTo(summary, review_badge.rect().topLeft()).x()
-            profit_separator_x = profit_separator.mapTo(
-                summary,
-                profit_separator.rect().topLeft(),
-            ).x()
-            profit_x = profit_badge.mapTo(
-                summary,
-                profit_badge.rect().topLeft(),
-            ).x()
             group_text_x = group_label.mapTo(summary, group_label.rect().topLeft()).x()
             self.assertEqual(expected_valid_left_inset, valid_x)
             self.assertEqual(
@@ -396,28 +367,12 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 valid_separator.testAttribute(Qt.WA_TransparentForMouseEvents)
             )
             self.assertEqual(
-                review_x + review_badge.width() + summary.layout().spacing(),
-                profit_separator_x,
-            )
-            self.assertEqual(
-                profit_separator_x
-                + profit_separator.width()
-                + summary.layout().spacing(),
-                profit_x,
-            )
-            self.assertEqual("|", profit_separator.text())
-            self.assertEqual(valid_separator.size(), profit_separator.size())
-            self.assertEqual(valid_separator.font(), profit_separator.font())
-            self.assertTrue(
-                profit_separator.testAttribute(Qt.WA_TransparentForMouseEvents)
+                summary.layout().contentsRect().right(),
+                review_x + review_badge.width() - 1,
             )
             self.assertEqual(gui_windows.MAIN_ROUTINE_SUMMARY_VALID_BADGE_WIDTH, valid_badge.width())
             self.assertEqual(count_badges[0].height(), valid_badge.height())
             self.assertTrue(valid_badge.font().bold())
-            self.assertGreaterEqual(
-                host._main_routine_summary_profit_label.width(),
-                host._main_routine_summary_profit_label.sizeHint().width(),
-            )
             source = inspect.getsource(MainWindow._create_table_area)
             self.assertLess(
                 source.index("addWidget(self._create_main_routine_summary())"),
@@ -456,11 +411,8 @@ class MainRoutineSummaryTests(unittest.TestCase):
             filter_area = window.findChild(QWidget, "mainRoutineFilterBadgeArea")
             valid_badge = window._main_routine_valid_button
             valid_separator = window._main_routine_summary_valid_separator
-            profit_separator = window._main_routine_summary_profit_separator
             group_label = window._main_routine_summary_count_labels["group"][0]
             group_badge = group_label.parentWidget()
-            review_badge = window._main_routine_summary_count_buttons["review"]
-            profit_badge = window._main_routine_summary_profit_label
             table = window.routine_table
             summary_x = summary.mapTo(window, summary.rect().topLeft()).x()
             filter_area_x = filter_area.mapTo(window, filter_area.rect().topLeft()).x()
@@ -505,34 +457,15 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertEqual("|", valid_separator.text())
             self.assertFalse(valid_separator.font().bold())
             self.assertEqual(valid_badge.height(), valid_separator.height())
-            self.assertEqual("|", profit_separator.text())
-            self.assertEqual(valid_separator.size(), profit_separator.size())
-            self.assertEqual(valid_separator.font(), profit_separator.font())
-            self.assertEqual(
-                review_badge.mapTo(window, review_badge.rect().topRight()).x()
-                + 1
-                + summary.layout().spacing(),
-                profit_separator.mapTo(
-                    window,
-                    profit_separator.rect().topLeft(),
-                ).x(),
+            self.assertIsNone(
+                window.findChild(QWidget, "mainRoutineSummaryProfit")
             )
-            self.assertEqual(
-                profit_separator.mapTo(
-                    window,
-                    profit_separator.rect().topRight(),
-                ).x()
-                + 1
-                + summary.layout().spacing(),
-                profit_badge.mapTo(window, profit_badge.rect().topLeft()).x(),
+            self.assertIsNone(
+                window.findChild(QWidget, "mainRoutineSummaryProfitSeparator")
             )
             self.assertEqual(
                 valid_badge.mapTo(window, valid_badge.rect().center()).y(),
                 valid_separator.mapTo(window, valid_separator.rect().center()).y(),
-            )
-            self.assertEqual(
-                valid_separator.mapTo(window, valid_separator.rect().center()).y(),
-                profit_separator.mapTo(window, profit_separator.rect().center()).y(),
             )
             self.assertAlmostEqual(
                 QApplication.font().pointSizeF() * 1.3,
@@ -542,7 +475,6 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertTrue(group_label.font().bold())
             self.assertEqual(group_label.font(), valid_badge.font())
             badges = [valid_badge, *window._main_routine_summary_count_buttons.values()]
-            badges.append(window._main_routine_summary_profit_label)
             content_font_height = QFontMetrics(group_label.font()).height()
             expected_badge_height = max(
                 gui_windows.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
@@ -687,7 +619,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         self.assertTrue(all(token["foreground"] == "#ff8c00" for token in tokens))
         self.assertTrue(all("검토관리" in token["tooltip"] for token in tokens))
 
-    def test_summary_badges_share_existing_display_scope_excluded_and_profit_state(self) -> None:
+    def test_summary_badges_keep_existing_display_and_scope_state_without_profit_badge(self) -> None:
         api = SimpleNamespace(
             unavailable_reason=lambda: "test double",
             login_state_changed=None,
@@ -757,18 +689,15 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertEqual("normal", window._main_routine_stock_scope)
 
             window._main_routine_level_buttons["routine"].click()
-            profit = window._main_routine_summary_profit_label
-            self.assertTrue(profit.isEnabled())
-            profit.click()
-            self.assertEqual("profit", window._main_routine_metric_sort_key)
-            self.assertTrue(window._main_routine_metric_sort_active)
-            self.assertTrue(profit.isChecked())
-            self.assertIn(
-                gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
-                window._main_routine_metric_buttons["profit"].styleSheet(),
+            self.assertFalse(hasattr(window, "_main_routine_summary_profit_label"))
+            self.assertIsNone(
+                window.findChild(QWidget, "mainRoutineSummaryProfit")
+            )
+            self.assertIsNone(
+                window.findChild(QWidget, "mainRoutineSummaryProfitSeparator")
             )
 
-            self.assertGreaterEqual(reload_view.call_count, 8)
+            self.assertGreaterEqual(reload_view.call_count, 7)
         finally:
             window.close()
 

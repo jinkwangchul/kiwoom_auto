@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
-import json
 from typing import Callable
 
 from PyQt5.QtCore import Qt
@@ -82,6 +81,62 @@ DEFAULT_HIDDEN_EVENT_TYPES = frozenset({
 })
 EVENT_LIST_PANEL_FIXED_WIDTH = 1170
 EVENT_DETAIL_PANEL_MINIMUM_WIDTH = 380
+OPERATOR_EVENT_TYPES = frozenset({
+    "OPERATOR_SYSTEM_DECISION",
+    "OPERATOR_OPERATION_DECISION",
+    "OPERATOR_SETTING_DECISION",
+    "OPERATOR_ORDER_DECISION",
+})
+FIELD_LABELS = {
+    "total_budget": "전체예산",
+    "available_budget_percent": "가용 비율",
+    "threshold_percent": "구간마감 비율",
+    "application_mode": "적용 방식",
+    "display_name": "표시 이름",
+    "buy_limit_enabled": "매수 한도 사용",
+    "buy_limit_amount": "매수 한도금액",
+    "start_time": "운영 시작시간",
+    "end_buy_time": "매수 종료시간",
+    "routine": "적용 루틴",
+    "lifecycle_state": "생명주기 상태",
+    "saved_account_info": "저장 계좌정보",
+    "profit_percent": "수익률",
+    "loss_percent": "손실률",
+    "quantity": "수량",
+    "price": "가격",
+}
+DETAIL_LABELS = {
+    "interaction_type": "상호작용",
+    "prompt_title": "창 제목",
+    "prompt_summary": "질문",
+    "selected_option": "사용자 선택",
+    "input_value": "입력값",
+    "confirmation_matched": "확인문구 일치",
+    "method": "방식",
+    "operation": "작업",
+    "stage": "처리 단계",
+    "reason": "사유",
+    "review_reason": "검토 사유",
+    "requested_count": "요청 수",
+    "target_count": "대상 수",
+}
+_SENSITIVE_DETAIL_KEYS = frozenset({
+    "account",
+    "account_no",
+    "api_key",
+    "auth",
+    "broker_response",
+    "directory",
+    "file_path",
+    "password",
+    "path",
+    "raw",
+    "raw_response",
+    "secret",
+    "stack",
+    "token",
+    "traceback",
+})
 
 
 class _EventRecordItem(QTableWidgetItem):
@@ -159,8 +214,13 @@ class EventRecordPrototypeWindow(QDialog):
         self.severity_combo.currentIndexChanged.connect(self.apply_filters)
         filter_layout.addWidget(self.severity_combo)
         filter_layout.addStretch(1)
+        self.refresh_button = QPushButton("새로고침")
+        self.refresh_button.setObjectName("eventRecordRefreshButton")
+        self.refresh_button.setFixedHeight(control_height)
+        self.refresh_button.clicked.connect(self.apply_filters)
+        filter_layout.addWidget(self.refresh_button)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("대상·이벤트·내용·종목코드 검색")
+        self.search_edit.setPlaceholderText("대상·이벤트·종목·루틴·사유 검색")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMinimumWidth(240)
         self.search_edit.textChanged.connect(self.apply_filters)
@@ -240,8 +300,9 @@ class EventRecordPrototypeWindow(QDialog):
         detail_layout.setVerticalSpacing(8)
         self.detail_labels: dict[str, QLabel] = {}
         for key, title in (("occurred_at", "발생시각"), ("category", "구분"),
-                           ("severity", "중요도"), ("target", "대상"),
-                           ("event", "이벤트"), ("result", "결과")):
+                           ("severity", "중요도"), ("source", "발생 위치"),
+                           ("target", "대상"), ("event", "이벤트"),
+                           ("result", "결과"), ("reason_code", "사유 코드")):
             label = QLabel("-")
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             detail_layout.addRow(title, label)
@@ -307,7 +368,125 @@ class EventRecordPrototypeWindow(QDialog):
     @staticmethod
     def _display_time(value: object) -> str:
         parsed = parse_aware_timestamp(value)
-        return parsed.strftime("%Y-%m-%d %H:%M:%S") if parsed is not None else str(value or "")
+        return (
+            parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            if parsed is not None
+            else str(value or "")
+        )
+
+    @staticmethod
+    def _field_label(value: object) -> str:
+        key = str(value or "").strip()
+        if key in FIELD_LABELS:
+            return FIELD_LABELS[key]
+        leaf = key.rsplit(".", 1)[-1]
+        return FIELD_LABELS.get(leaf, key)
+
+    @staticmethod
+    def _safe_value(value: object) -> str:
+        if value in (None, ""):
+            return "없음"
+        if isinstance(value, bool):
+            return "사용" if value else "미사용"
+        if isinstance(value, dict):
+            parts = [
+                f"{EventRecordPrototypeWindow._field_label(key)}={EventRecordPrototypeWindow._safe_value(item)}"
+                for key, item in value.items()
+                if not EventRecordPrototypeWindow._sensitive_key(key)
+            ]
+            return ", ".join(parts) if parts else "-"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(EventRecordPrototypeWindow._safe_value(item) for item in value) or "없음"
+        text = str(value)
+        if "Traceback (most recent call last)" in text or ":\\" in text or ":/" in text:
+            return "[보안상 숨김]"
+        return text[:300] + ("…" if len(text) > 300 else "")
+
+    @classmethod
+    def _change_value(cls, field_key: object, value: object) -> str:
+        key = str(field_key or "").casefold()
+        if isinstance(value, int) and not isinstance(value, bool):
+            if any(token in key for token in ("budget", "amount", "price")):
+                return f"{value:,}"
+        return cls._safe_value(value)
+
+    @staticmethod
+    def _sensitive_key(value: object) -> bool:
+        key = str(value or "").strip().casefold()
+        tokens = {token for token in key.replace("-", "_").replace(".", "_").split("_") if token}
+        return (
+            key in _SENSITIVE_DETAIL_KEYS
+            or bool(tokens & _SENSITIVE_DETAIL_KEYS)
+            or "account" in key
+            or "계좌" in key
+        )
+
+    @classmethod
+    def _change_lines(cls, event: dict[str, object]) -> list[str]:
+        changes = event.get("changes")
+        if not isinstance(changes, list):
+            return []
+        lines: list[str] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            field_key = change.get("field_key")
+            if cls._sensitive_key(field_key):
+                continue
+            lines.append(
+                f"{cls._field_label(field_key)}: "
+                f"{cls._change_value(field_key, change.get('before'))} → "
+                f"{cls._change_value(field_key, change.get('after'))}"
+            )
+        return lines
+
+    @classmethod
+    def _operator_summary(cls, event: dict[str, object]) -> str:
+        details = event.get("details")
+        if not isinstance(details, dict):
+            return str(event.get("summary") or "")
+        title = cls._safe_value(details.get("prompt_title")) if details.get("prompt_title") else "사용자 선택"
+        selected = cls._safe_value(details.get("selected_option")) if details.get("selected_option") else "결과 미확인"
+        text = f"{title} — {selected}"
+        if details.get("input_value") not in (None, "", {}):
+            text += f" ({cls._safe_value(details.get('input_value'))})"
+        return text
+
+    @classmethod
+    def _summary_text(cls, event: dict[str, object]) -> str:
+        event_type = str(event.get("event_type") or "")
+        if event_type in OPERATOR_EVENT_TYPES:
+            return cls._operator_summary(event)
+        changes = cls._change_lines(event)
+        if changes:
+            return changes[0] + (f" 외 {len(changes) - 1}건" if len(changes) > 1 else "")
+        summary = str(event.get("summary") or "")
+        reason_code = str(event.get("reason_code") or "").strip()
+        return f"{summary} ({reason_code})" if reason_code else summary
+
+    @classmethod
+    def _detail_text_for_event(cls, event: dict[str, object]) -> str:
+        sections: list[str] = []
+        summary = str(event.get("summary") or "").strip()
+        if summary:
+            sections.extend(("[요약]", summary))
+        changes = cls._change_lines(event)
+        if changes:
+            sections.extend(("", "[변경 내용]", *changes))
+        details = event.get("details")
+        if isinstance(details, dict):
+            detail_lines: list[str] = []
+            for key, value in details.items():
+                if value in (None, "", [], {}) or cls._sensitive_key(key):
+                    continue
+                if key == "offered_options":
+                    continue
+                label = DETAIL_LABELS.get(str(key), cls._field_label(key))
+                detail_lines.append(f"{label}: {cls._safe_value(value)}")
+            if detail_lines:
+                heading = "[사용자 선택]" if str(event.get("event_type") or "") in OPERATOR_EVENT_TYPES else "[추가 정보]"
+                sections.extend(("", heading, *detail_lines))
+        return "\n".join(sections).strip()
 
     @staticmethod
     def _display_event(event: dict[str, object]) -> dict[str, object]:
@@ -319,10 +498,12 @@ class EventRecordPrototypeWindow(QDialog):
             "occurred_at": EventRecordPrototypeWindow._display_time(event.get("occurred_at")),
             "category": CATEGORY_LABELS.get(category, category),
             "severity": SEVERITY_LABELS.get(severity, severity),
+            "source": str(event.get("source") or "-"),
             "target": event_target_display(event) or "-",
             "event": EVENT_TYPE_LABELS.get(event_type, event_type),
             "result": RESULT_LABELS.get(result, result) if result else "-",
-            "summary": str(event.get("summary") or ""),
+            "reason_code": str(event.get("reason_code") or "-"),
+            "summary": EventRecordPrototypeWindow._summary_text(event),
         }
 
     def apply_filters(self, *_args) -> None:
@@ -334,7 +515,8 @@ class EventRecordPrototypeWindow(QDialog):
             values = tuple(display[key] for key in ("occurred_at", "category", "severity", "target", "event", "result", "summary"))
             severity = str(event.get("severity") or "")
             result = str(event.get("result") or "")
-            sort_values = (str(event.get("occurred_at") or ""), str(event.get("category") or ""),
+            occurred = parse_aware_timestamp(event.get("occurred_at"))
+            sort_values = ((occurred.timestamp() if occurred is not None else float("-inf")), str(event.get("category") or ""),
                            SEVERITY_SORT_RANK.get(severity, 99), values[3], values[4], result, values[6])
             for column, value in enumerate(values):
                 item = _EventRecordItem(str(value))
@@ -372,12 +554,7 @@ class EventRecordPrototypeWindow(QDialog):
         display = self._display_event(event)
         for key, label in self.detail_labels.items():
             label.setText(str(display.get(key, "-") or "-"))
-        details = event.get("details")
-        if isinstance(details, (dict, list)):
-            detail_text = json.dumps(details, ensure_ascii=False, indent=2)
-        else:
-            detail_text = str(details or event.get("summary") or "")
-        self.detail_text.setPlainText(detail_text)
+        self.detail_text.setPlainText(self._detail_text_for_event(event))
         for key, (title_label, value_label) in self.correlation_rows.items():
             value = str(event.get(key, "") or "").strip()
             title_label.setVisible(bool(value))

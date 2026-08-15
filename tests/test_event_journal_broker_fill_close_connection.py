@@ -11,6 +11,14 @@ from event_journal_writer import EventJournalWriter
 import event_journal_production as production
 import event_journal_trade_observer as observer
 from operation_close_completion_check_service import check_global_close_completion_after_durable_update
+from operation_command_service import (
+    EarlyCloseCompatibility,
+    MODE_EARLY_CLOSE,
+    OperationCommandRequest,
+    OperationCommandService,
+    RESULT_SUCCESS,
+    SCOPE_STOCK,
+)
 
 
 class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
@@ -173,7 +181,7 @@ class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
         )
 
         class Request:
-            command = "IMMEDIATE_LIQUIDATION"
+            command = "INDIVIDUAL_LIQUIDATION"
 
         class StockResult:
             stock_id = "005930"
@@ -207,6 +215,77 @@ class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
         self.assertEqual(
             ["AUTO_CLOSE_STARTED", "EARLY_CLOSE_STARTED", "LIQUIDATION_REQUESTED", "LIQUIDATION_COMPLETED"],
             [item["event_type"] for item in self.events()],
+        )
+
+    def test_early_close_direct_market_records_liquidation_but_routine_does_not(self) -> None:
+        project_root = Path(self.temp.name) / "project"
+        stock_dir = project_root / "stocks" / "005930_삼성전자"
+        stock_dir.mkdir(parents=True)
+        (stock_dir / "config.json").write_text(
+            '{"name":"삼성전자","routine_name":"기본루틴"}',
+            encoding="utf-8",
+        )
+        (stock_dir / "state.json").write_text(
+            '{"operation_sequence":0,"status":"RUNNING","trade_enabled":true}',
+            encoding="utf-8",
+        )
+        service = OperationCommandService(project_root)
+
+        market_result = service.apply_early_close(
+            OperationCommandRequest(
+                target_scope=SCOPE_STOCK,
+                target_id=str(stock_dir.resolve()),
+                command=MODE_EARLY_CLOSE,
+                source="TEST",
+                command_id="EARLY-MARKET-1",
+            ),
+            EarlyCloseCompatibility(method="시장가"),
+        )
+        self.assertEqual(RESULT_SUCCESS, market_result.status)
+        self.assertEqual(
+            ["LIQUIDATION_REQUESTED"],
+            [item["event_type"] for item in self.events()],
+        )
+
+        routine_result = service.apply_early_close(
+            OperationCommandRequest(
+                target_scope=SCOPE_STOCK,
+                target_id=str(stock_dir.resolve()),
+                command=MODE_EARLY_CLOSE,
+                source="TEST",
+                command_id="EARLY-ROUTINE-1",
+            ),
+            EarlyCloseCompatibility(method="루틴"),
+        )
+        self.assertEqual(RESULT_SUCCESS, routine_result.status)
+        self.assertEqual(
+            ["LIQUIDATION_REQUESTED"],
+            [item["event_type"] for item in self.events()],
+        )
+
+    def test_pnl_cycle_boundary_is_contract_valid_and_deduplicated(self) -> None:
+        boundary = {
+            "written": True,
+            "boundary": {
+                "stock_code": "005930",
+                "boundary_id": "PNL-BOUNDARY-1",
+                "boundary_reason": "OFFICIAL_CLOSE_COMPLETED",
+                "completion_evidence_id": "EVIDENCE-1",
+                "boundary_at": "2026-08-08T15:31:00+09:00",
+            },
+        }
+        observer.observe_pnl_cycle_boundaries([boundary])
+        observer.observe_pnl_cycle_boundaries([boundary])
+
+        events = self.events()
+        self.assertEqual(1, len(events))
+        self.assertEqual("PNL_CYCLE_BOUNDARY_CREATED", events[0]["event_type"])
+        self.assertEqual("OPERATION", events[0]["category"])
+        self.assertEqual("NOTICE", events[0]["severity"])
+        self.assertEqual("COMPLETED", events[0]["result"])
+        self.assertEqual(
+            "확정 가능한 PnL 주기 경계가 생성되었습니다.",
+            events[0]["summary"],
         )
 
     def test_journal_failure_is_fail_open(self) -> None:

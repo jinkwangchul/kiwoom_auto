@@ -60,6 +60,7 @@ from PyQt5.QtWidgets import (QFrame,
     QVBoxLayout,
     QWidget,
 )
+from event_journal_production import append_production_event
 
 from integrity_checker import (
     LOCAL_STATUS_CHECK_ERROR,
@@ -601,6 +602,8 @@ def _confirm_stock_project_reset(
     *,
     title: str,
     text: str,
+    targets: list[tuple[str, str]] | None = None,
+    reset_type: str = "STOCK_PROJECT_RESET",
 ) -> bool:
     dialog = QMessageBox(parent)
     dialog.setIcon(QMessageBox.Warning)
@@ -611,7 +614,31 @@ def _confirm_stock_project_reset(
     dialog.setDefaultButton(cancel_button)
     dialog.setEscapeButton(cancel_button)
     dialog.exec_()
-    return dialog.clickedButton() is confirm_button
+    accepted = dialog.clickedButton() is confirm_button
+    target_items = list(targets or [])
+    target_codes = [str(code or "").strip() for code, _name in target_items if str(code or "").strip()]
+    target_names = [str(name or "").strip() for _code, name in target_items if str(name or "").strip()]
+    correlation = {"stock_code": target_codes[0]} if len(target_codes) == 1 else {}
+    append_production_event(
+        "OPERATOR_SETTING_DECISION",
+        result="ACCEPTED" if accepted else "CANCELLED",
+        source="gui_stock_register_window._confirm_stock_project_reset",
+        target_type="STOCK_SELECTION",
+        target_id=",".join(target_codes) or None,
+        target_name=",".join(target_names) or "종목 초기화 대상",
+        details={
+            "interaction_type": "CONFIRM",
+            "prompt_key": reset_type,
+            "prompt_title": title,
+            "prompt_summary": "선택 종목의 프로젝트 기록 초기화",
+            "offered_options": ["확인", "취소"],
+            "selected_option": "확인" if accepted else "취소",
+            "reset_type": reset_type,
+            "target_count": len(target_items),
+        },
+        **correlation,
+    )
+    return accepted
 
 
 def _stock_reset_confirmation_text(targets: list[tuple[str, str]]) -> str:
@@ -630,6 +657,8 @@ def confirm_stock_reset(parent: QWidget, code: str, name: str) -> bool:
         parent,
         title="⚠ 종목초기화 확인",
         text=_stock_reset_confirmation_text([(code, name)]),
+        targets=[(code, name)],
+        reset_type="STOCK_PROJECT_RESET",
     )
 
 
@@ -641,6 +670,8 @@ def confirm_force_stock_reset(
         parent,
         title="강제초기화 확인",
         text=_stock_reset_confirmation_text(targets),
+        targets=targets,
+        reset_type="FORCE_STOCK_PROJECT_RESET",
     )
 
 

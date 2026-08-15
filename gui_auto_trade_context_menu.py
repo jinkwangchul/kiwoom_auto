@@ -32,6 +32,7 @@ from gui_ats_utils import (
 from gui_operation_environment import OPERATION_POLICY_PATH
 from gui_stock_data import is_valid_stock_code, normalize_stock_code
 from runtime_io import read_json_dict
+from event_journal_production import append_production_event
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -547,6 +548,7 @@ def show_monitor_stock_context_menu(
     operation_excluded: bool = False,
     operation_exclusion_action: str | None = None,
     stock_register_enabled: bool | None = None,
+    selected_targets: Iterable[tuple[object, str, str]] | None = None,
 ) -> None:
     """Show the monitoring stock-row profile with the shared menu form."""
 
@@ -638,6 +640,83 @@ def show_monitor_stock_context_menu(
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
+    selected_option = ""
+    decision_event_type = "OPERATOR_OPERATION_DECISION"
+    if action_start is not None and chosen == action_start:
+        selected_option = "OPERATION_START"
+    elif action_emergency_stop is not None and chosen == action_emergency_stop:
+        selected_option = "EMERGENCY_STOP"
+    elif action_emergency_release is not None and chosen == action_emergency_release:
+        selected_option = "EMERGENCY_RELEASE"
+    elif action_set_exclusion is not None and chosen == action_set_exclusion:
+        selected_option = "OPERATION_EXCLUDE"
+        decision_event_type = "OPERATOR_SETTING_DECISION"
+    elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
+        selected_option = "OPERATION_EXCLUSION_RELEASE"
+        decision_event_type = "OPERATOR_SETTING_DECISION"
+    elif chosen == early_close["routine"]:
+        selected_option = "EARLY_CLOSE_ROUTINE"
+    elif chosen == early_close["market"]:
+        selected_option = "EARLY_CLOSE_MARKET"
+    elif chosen == early_close["current"]:
+        selected_option = "EARLY_CLOSE_CURRENT"
+    elif chosen == early_close["profit_loss"]:
+        selected_option = "EARLY_CLOSE_PROFIT_LOSS"
+    elif chosen == early_close["carry"]:
+        selected_option = "EARLY_CLOSE_CARRY"
+    elif chosen == early_close["cancel"]:
+        selected_option = "EARLY_CLOSE_CANCEL"
+    elif chosen == individual["market"]:
+        selected_option = "LIQUIDATION_MARKET"
+    elif chosen == individual["current"]:
+        selected_option = "LIQUIDATION_CURRENT"
+    elif chosen == individual["carry"]:
+        selected_option = "LIQUIDATION_CARRY"
+    elif ats_settings is not None and chosen == ats_settings["market"]:
+        selected_option = "ATS_LIQUIDATION_MARKET"
+    elif ats_settings is not None and chosen == ats_settings["current"]:
+        selected_option = "ATS_LIQUIDATION_CURRENT"
+
+    if selected_option:
+        targets = list(selected_targets or [])
+        codes = [str(code or "").strip() for _path, code, _name in targets if str(code or "").strip()]
+        names = [str(name or "").strip() for _path, _code, name in targets if str(name or "").strip()]
+        correlation = {"stock_code": codes[0], "stock_name": names[0] if names else None} if len(codes) == 1 else {}
+        append_production_event(
+            decision_event_type,
+            result="ACCEPTED",
+            source="gui_auto_trade_context_menu.show_monitor_stock_context_menu",
+            target_type="STOCK_SELECTION",
+            target_id=",".join(codes) or None,
+            target_name=",".join(names) or "선택 종목",
+            details={
+                "interaction_type": "SELECTION",
+                "prompt_key": "MONITOR_STOCK_CONTEXT_MENU",
+                "prompt_title": "종목 운영 메뉴",
+                "prompt_summary": "선택 종목에 적용할 context action",
+                "offered_options": [
+                    "OPERATION_START",
+                    "EMERGENCY_STOP",
+                    "EMERGENCY_RELEASE",
+                    "OPERATION_EXCLUDE",
+                    "OPERATION_EXCLUSION_RELEASE",
+                    "EARLY_CLOSE_ROUTINE",
+                    "EARLY_CLOSE_MARKET",
+                    "EARLY_CLOSE_CURRENT",
+                    "EARLY_CLOSE_PROFIT_LOSS",
+                    "EARLY_CLOSE_CARRY",
+                    "EARLY_CLOSE_CANCEL",
+                    "LIQUIDATION_MARKET",
+                    "LIQUIDATION_CURRENT",
+                    "LIQUIDATION_CARRY",
+                    "ATS_LIQUIDATION_MARKET",
+                    "ATS_LIQUIDATION_CURRENT",
+                ],
+                "selected_option": selected_option,
+                "target_count": len(targets),
+            },
+            **correlation,
+        )
     if action_start is not None and chosen == action_start:
         callbacks.start()
     elif action_emergency_stop is not None and chosen == action_emergency_stop:
@@ -798,4 +877,5 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
             "clear" if excluded_view else "set" if running_view else "none"
         ),
         stock_register_enabled=stock_register_target is not None,
+        selected_targets=selected,
     )
