@@ -15,6 +15,7 @@ gui_auto_trade_policy.py
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Iterable
 
 from state_policy import (
     normalize_operation_mode,
@@ -31,8 +32,6 @@ from gui_auto_trade_display import auto_trade_setting_display_status, display_st
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import manual_ats_enabled_labels
 from operation_command_service import (
-    IMMEDIATE_LIQUIDATION_REQUEST_KEY,
-    IMMEDIATE_LIQUIDATION_STATUS_REQUESTED,
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
 )
@@ -103,11 +102,104 @@ def auto_trade_setting_trade_started(state: dict[str, object]) -> bool:
     return raw_status not in ("STOPPED", "STOP", "MANUAL_STOPPED")
 
 
+_CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR = (
+    "_current_session_operation_participant_stock_codes"
+)
+
+
+def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
+    """Return process-local owners that can carry explicit start participation."""
+
+    contexts: list[object] = []
+    pending = [window]
+    seen: set[int] = set()
+    while pending and len(contexts) < 8:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        contexts.append(current)
+
+        owner = getattr(current, "_owner", None)
+        if owner is not None:
+            pending.append(owner)
+        parent_getter = getattr(current, "parent", None)
+        if callable(parent_getter):
+            try:
+                parent = parent_getter()
+            except Exception:
+                parent = None
+            if parent is not None:
+                pending.append(parent)
+    return tuple(contexts)
+
+
+def auto_trade_register_current_session_operation_participants(
+    window,
+    stock_codes: Iterable[object],
+) -> tuple[str, ...]:
+    """Project successful explicit operation-start results for this process only.
+
+    This is deliberately not persisted. Recovery evidence and historical
+    ``trade_enabled`` values must never create current-session participation.
+    """
+
+    normalized = {
+        str(code or "").strip()
+        for code in stock_codes
+        if str(code or "").strip()
+    }
+    if not normalized:
+        return ()
+    for context in _auto_trade_operation_session_contexts(window):
+        existing = getattr(
+            context,
+            _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
+            None,
+        )
+        participants = set(existing) if isinstance(existing, (set, frozenset)) else set()
+        participants.update(normalized)
+        try:
+            setattr(
+                context,
+                _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
+                participants,
+            )
+        except Exception:
+            continue
+    return tuple(sorted(normalized))
+
+
+def auto_trade_current_session_operation_participant_codes(window) -> tuple[str, ...]:
+    participants: set[str] = set()
+    for context in _auto_trade_operation_session_contexts(window):
+        values = getattr(
+            context,
+            _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
+            None,
+        )
+        if not isinstance(values, (set, frozenset, tuple, list)):
+            continue
+        participants.update(
+            str(code or "").strip()
+            for code in values
+            if str(code or "").strip()
+        )
+    return tuple(sorted(participants))
+
+
 def auto_trade_setting_current_session_trade_started(
     window,
     persisted_trade_started: bool,
+    stock_code: object = "",
 ) -> bool:
     if not persisted_trade_started:
+        return False
+
+    clean_stock_code = str(stock_code or "").strip()
+    if not clean_stock_code:
+        return False
+    if clean_stock_code not in auto_trade_current_session_operation_participant_codes(window):
         return False
 
     checker = getattr(window, "startup_recovery_session_ready", None)
@@ -173,18 +265,7 @@ def auto_trade_setting_display_status_for_current_session(
         else:
             raw_display_status = display_status_text_for_gui(policy_status)
 
-    display_status = auto_trade_setting_display_status(raw_display_status)
-    if (
-        auto_trade_setting_immediate_liquidation_requested(state, holding_qty)
-        and display_status != "자동마감"
-        and not auto_trade_setting_liquidation_phase_active(
-            config,
-            holding_qty,
-            state=state,
-        )
-    ):
-        return "즉시청산"
-    return display_status
+    return auto_trade_setting_display_status(raw_display_status)
 
 
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:
@@ -590,12 +671,6 @@ def auto_trade_setting_method_text(
 ) -> str:
     """상태의 보조표시로 사용할 현재 방식 텍스트."""
     status = auto_trade_setting_display_status(display_status)
-    holding_qty = _safe_nonnegative_int((state or {}).get("holding_qty"))
-    if (
-        status != "자동마감"
-        and auto_trade_setting_immediate_liquidation_requested(state, holding_qty)
-    ):
-        return "시장가"
     if auto_trade_setting_early_close_requested(state):
         method = close_method_from_state_or_policy(
             state,
@@ -697,24 +772,6 @@ def _safe_nonnegative_int(value: object) -> int:
     return max(0, result)
 
 
-def auto_trade_setting_immediate_liquidation_requested(
-    state: dict[str, object] | None,
-    holding_qty: int,
-) -> bool:
-    """Return whether the current Runtime has an executable immediate request."""
-    if not isinstance(state, dict) or holding_qty <= 0:
-        return False
-    raw = state.get(IMMEDIATE_LIQUIDATION_REQUEST_KEY)
-    if not isinstance(raw, dict):
-        return False
-    if str(raw.get("status", "")).strip().upper() != IMMEDIATE_LIQUIDATION_STATUS_REQUESTED:
-        return False
-    requested_at = str(raw.get("requested_at", "") or "").strip()
-    if requested_at and not requested_at.startswith(auto_trade_setting_today_date_text()):
-        return False
-    return not auto_trade_setting_liquidation_completed_today(state)
-
-
 def effective_liquidation_policy_for_config(
     config: dict[str, object] | None,
     state: dict[str, object] | None = None,
@@ -771,32 +828,6 @@ def auto_trade_setting_liquidation_text(
     early_close_forced = auto_trade_setting_early_close_requested(state)
     individual_policy = individual_liquidation_policy_from_state(state)
     has_individual = bool(individual_policy)
-    effective_holding_qty = _safe_nonnegative_int(
-        (state or {}).get("holding_qty")
-        if holding_qty is None
-        else holding_qty
-    )
-    immediate_requested = auto_trade_setting_immediate_liquidation_requested(
-        state,
-        effective_holding_qty,
-    )
-
-    if immediate_requested and status_text != "자동마감":
-        if auto_trade_setting_liquidation_phase_active(
-            config,
-            effective_holding_qty,
-            state=state,
-        ):
-            liquidation, _is_individual = effective_liquidation_policy_for_config(
-                config,
-                state,
-            )
-            minutes = str(
-                liquidation.get("minutes_before_regular_close", "5")
-            ).strip() or "5"
-            return f"{minutes}분/시장가"
-        return "시장가"
-
     manual = policy.get("manual_operation", {}) if isinstance(policy.get("manual_operation"), dict) else {}
     if (
         not has_individual

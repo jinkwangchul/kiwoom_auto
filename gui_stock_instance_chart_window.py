@@ -694,6 +694,7 @@ def project_stock_operation_header_display(
         current_session_trade_started = auto_trade_setting_current_session_trade_started(
             session_owner,
             trade_started,
+            code,
         )
         display_status = auto_trade_setting_display_status_for_current_session(
             state,

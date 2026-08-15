@@ -20,16 +20,40 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 from PyQt5 import sip
-from PyQt5.QtCore import QEvent, QItemSelectionModel, QObject, QRect, Qt, QTimer
-from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPalette, QPen
+from PyQt5.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QObject,
+    QRegularExpression,
+    QRect,
+    QSettings,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIntValidator,
+    QPainter,
+    QPalette,
+    QPen,
+    QRegularExpressionValidator,
+)
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGroupBox,
     QGridLayout,
@@ -37,16 +61,16 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
     QComboBox,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QStyle,
-    QStyleOptionButton,
-    QStylePainter,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QVBoxLayout,
@@ -54,6 +78,710 @@ from PyQt5.QtWidgets import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+ACCOUNT_MEMOS_SETTINGS_KEY = "ui/account_memos"
+ACCOUNT_HISTORY_SETTINGS_KEY = "ui/known_accounts"
+TOTAL_BUDGET_ROUNDING_SETTINGS_KEY = "ui/total_budget_digit_alignment"
+BUDGET_WARNING_SETTINGS_KEY = "ui/budget_warning_enabled"
+BUFFER_RESPONSE_EVALUATION_FACTORS = ("손익비율", "손익금액", "투입금액")
+BUFFER_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
+BUFFER_RESPONSE_ACTION_MODES = ("조기마감", "즉시청산", "구간마감")
+BUFFER_RESPONSE_RATIO_OPTIONS = tuple(f"{percent}%" for percent in range(10, 100, 10))
+ACCOUNT_NO_ROLE = Qt.UserRole
+ACCOUNT_POPUP_MEMO_ROLE = Qt.UserRole + 1
+ACCOUNT_ACTIVE_ROLE = Qt.UserRole + 2
+
+
+def masked_account_no(account_no: object) -> str:
+    clean = str(account_no or "").strip()
+    if not clean:
+        return ""
+    return f"{clean[:4]}****"
+
+
+def account_combo_display_text(account_no: object, _memo: object = "") -> str:
+    return masked_account_no(account_no)
+
+
+def account_popup_display_text(account_no: object, memo: object = "") -> str:
+    account_text = masked_account_no(account_no)
+    clean_memo = str(memo or "").strip()[:8]
+    return f"{account_text}   {clean_memo}" if clean_memo else account_text
+
+
+class _DoubleClickActionButton(QPushButton):
+    """Expose one action signal without giving ordinary clicks side effects."""
+
+    doubleClicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class _TextOnlyPopupComboBox(QComboBox):
+    """Open from the text hit area while the native arrow remains hidden."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._popup_minimum_width = 0
+
+    def setPopupMinimumWidth(self, width: int) -> None:
+        self._popup_minimum_width = max(0, int(width))
+        self.view().setMinimumWidth(self._popup_minimum_width)
+
+    def showPopup(self) -> None:
+        if self._popup_minimum_width > 0:
+            self.view().setMinimumWidth(self._popup_minimum_width)
+        super().showPopup()
+        if self._popup_minimum_width > 0:
+            popup = self.view().window()
+            popup.setMinimumWidth(self._popup_minimum_width)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            QTimer.singleShot(0, self.showPopup)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _BudgetPercentEdit(QLineEdit):
+    """Compact integer editor that also permits the projected '-' display."""
+
+    commitRequested = pyqtSignal()
+    cancelRequested = pyqtSignal()
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        selection_epoch = getattr(self, "_selection_epoch", 0) + 1
+        self._selection_epoch = selection_epoch
+        QTimer.singleShot(
+            0,
+            lambda epoch=selection_epoch: self._select_all_for_edit(epoch),
+        )
+
+    def _select_all_for_edit(self, selection_epoch: int) -> None:
+        if (
+            self.hasFocus()
+            and selection_epoch == getattr(self, "_selection_epoch", 0)
+        ):
+            self.selectAll()
+
+    def finish_display(self) -> None:
+        """Return to a plain-text projection without re-emitting a commit."""
+        self._selection_epoch = getattr(self, "_selection_epoch", 0) + 1
+        signals_were_blocked = self.blockSignals(True)
+        try:
+            self.deselect()
+            self.clearFocus()
+            self.setSelection(0, 0)
+        finally:
+            self.blockSignals(signals_were_blocked)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.commitRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.cancelRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.commitRequested.emit()
+        self.deselect()
+
+
+class _DoubleClickValueLabel(QLabel):
+    """A display label whose only action gesture is a left-button double click."""
+
+    doubleClicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class _MainTotalBudgetPopup(QFrame):
+    """Compact, non-modal editor anchored below the total-budget value label."""
+
+    def __init__(self, owner: "MainWindow") -> None:
+        super().__init__(owner, Qt.Popup | Qt.FramelessWindowHint)
+        self._owner = owner
+        self._application_filter_installed = False
+        self.setObjectName("mainTotalBudgetPopup")
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "QFrame#mainTotalBudgetPopup { background: palette(window); "
+            "border: 1px solid #CBD5E1; border-radius: 4px; }"
+            "QPushButton { min-width: 48px; min-height: 24px; padding: 1px 5px; }"
+            "QLineEdit { min-height: 24px; padding: 1px 5px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        percent_layout = QGridLayout()
+        percent_layout.setContentsMargins(0, 0, 0, 0)
+        percent_layout.setHorizontalSpacing(4)
+        percent_layout.setVerticalSpacing(4)
+        self.percent_layout = percent_layout
+        self.percent_buttons: dict[int, QPushButton] = {}
+        for index, percent in enumerate(MAIN_TOTAL_BUDGET_PERCENT_OPTIONS):
+            button = QPushButton(f"{percent}%")
+            button.setObjectName(f"mainTotalBudgetPercent{percent}")
+            button.setToolTip("주문 가능금액 확인 후 사용 가능")
+            button.clicked.connect(
+                lambda _checked=False, value=percent: self._apply_percent(value)
+            )
+            self.percent_buttons[percent] = button
+            percent_layout.addWidget(button, index // 5, index % 5)
+        layout.addLayout(percent_layout)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+
+        direct_layout = QHBoxLayout()
+        direct_layout.setContentsMargins(0, 0, 0, 0)
+        direct_layout.setSpacing(6)
+        self.rounding_toggle = QPushButton()
+        self.rounding_toggle.setObjectName("mainTotalBudgetRoundingToggle")
+        self.rounding_toggle.setCheckable(True)
+        self.rounding_toggle.setToolTip("비율 계산 금액의 상위 두 자릿수를 맞춥니다")
+        self.rounding_toggle.toggled.connect(self._rounding_toggled)
+        direct_layout.addWidget(self.rounding_toggle)
+        direct_layout.addWidget(QLabel("직접입력"))
+        self.direct_input = QLineEdit()
+        self.direct_input.setObjectName("mainTotalBudgetDirectInput")
+        self.direct_input.setMaxLength(len("9,999,999,999"))
+        self.direct_input.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(r"[0-9,]{0,13}"),
+                self.direct_input,
+            )
+        )
+        self.direct_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.direct_input.setFixedWidth(
+            self.direct_input.fontMetrics().horizontalAdvance("9,999,999,999") + 14
+        )
+        self.direct_input.returnPressed.connect(self._apply_direct_input)
+        direct_layout.addWidget(self.direct_input)
+        layout.addLayout(direct_layout)
+        self._stable_popup_size = self._calculate_stable_popup_size()
+        self.setFixedSize(self._stable_popup_size)
+
+    def _calculate_stable_popup_size(self):
+        """Reserve the final content geometry before the popup is ever shown."""
+        self.ensurePolished()
+        current_text = self.rounding_toggle.text()
+        toggle_width = 0
+        for state in ("ON", "OFF"):
+            self.rounding_toggle.setText(f"자릿수맞춤 {state}")
+            self.rounding_toggle.ensurePolished()
+            toggle_width = max(toggle_width, self.rounding_toggle.sizeHint().width())
+        self.rounding_toggle.setMinimumWidth(toggle_width)
+        self.rounding_toggle.setText(current_text or "자릿수맞춤 OFF")
+
+        popup_layout = self.layout()
+        popup_layout.invalidate()
+        popup_layout.activate()
+        return self.sizeHint()
+
+    def refresh_projection(self) -> None:
+        summary = collect_main_budget_summary()
+        self.direct_input.setText(f"{int(summary.get('total_budget', 0)):,}")
+        self.rounding_toggle.blockSignals(True)
+        self.rounding_toggle.setChecked(
+            self._owner.main_total_budget_rounding_enabled()
+        )
+        self.rounding_toggle.blockSignals(False)
+        self._update_rounding_toggle_text()
+        orderable = self._owner.current_orderable_cash_for_budget()
+        enabled = orderable is not None
+        for button in self.percent_buttons.values():
+            button.setEnabled(enabled)
+
+    def show_below(self, anchor: QWidget) -> None:
+        self.refresh_projection()
+        popup_layout = self.layout()
+        popup_layout.invalidate()
+        popup_layout.activate()
+        self.resize(self._stable_popup_size)
+        position = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        screen = QApplication.screenAt(position)
+        if screen is not None:
+            available = screen.availableGeometry()
+            x = min(position.x(), available.right() - self.width() + 1)
+            y = min(position.y() + 2, available.bottom() - self.height() + 1)
+            position.setX(max(available.left(), x))
+            position.setY(max(available.top(), y))
+        self.move(position)
+        self.show()
+        self.raise_()
+
+    def _apply_percent(self, percent: int) -> None:
+        if self._owner.apply_main_total_budget_percentage(percent):
+            self.hide()
+
+    def _apply_direct_input(self) -> None:
+        if self._owner.apply_main_total_budget_direct(self.direct_input.text()):
+            self.hide()
+
+    def _rounding_toggled(self, checked: bool) -> None:
+        self._update_rounding_toggle_text()
+        self._owner.set_main_total_budget_rounding_enabled(checked)
+
+    def _update_rounding_toggle_text(self) -> None:
+        state = "ON" if self.rounding_toggle.isChecked() else "OFF"
+        self.rounding_toggle.setText(f"자릿수맞춤 {state}")
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def showEvent(self, event) -> None:
+        application = QApplication.instance()
+        if application is not None and not self._application_filter_installed:
+            application.installEventFilter(self)
+            self._application_filter_installed = True
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        application = QApplication.instance()
+        if application is not None and self._application_filter_installed:
+            application.removeEventFilter(self)
+            self._application_filter_installed = False
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.MouseButtonPress and self.isVisible():
+            clicked_widget = watched if isinstance(watched, QWidget) else None
+            if clicked_widget is None or (
+                clicked_widget is not self
+                and not self.isAncestorOf(clicked_widget)
+            ):
+                self.hide()
+        return False
+
+
+class _BufferResponseSettingsSurface(QDialog):
+    """Wide, non-modal UI prototype matching the environment-settings layout."""
+
+    MODE_NONE = "NONE"
+    MODE_UNIFIED = "UNIFIED"
+    MODE_SEGMENTED = "SEGMENTED"
+
+    def __init__(self, owner: "MainWindow") -> None:
+        super().__init__(owner)
+        self.setObjectName("mainBufferResponseSettingsSurface")
+        self.setWindowTitle("완충대응 설정")
+        self.setModal(False)
+        self.setMinimumSize(560, 360)
+        self.resize(560, 360)
+        self.setStyleSheet(
+            "QDialog#mainBufferResponseSettingsSurface,"
+            "QDialog#mainBufferResponseSettingsSurface QWidget,"
+            "QDialog#mainBufferResponseSettingsSurface QLabel,"
+            "QDialog#mainBufferResponseSettingsSurface QCheckBox,"
+            "QDialog#mainBufferResponseSettingsSurface QComboBox,"
+            "QDialog#mainBufferResponseSettingsSurface QPushButton {"
+            " font-family: 'Malgun Gothic'; font-size: 9pt;"
+            " }"
+            "QDialog#mainBufferResponseSettingsSurface QComboBox {"
+            " min-height: 30px;"
+            " }"
+            "QDialog#mainBufferResponseSettingsSurface QPushButton {"
+            " min-height: 28px; min-width: 82px;"
+            " }"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(34, 14, 34, 12)
+        root.setSpacing(10)
+
+        self.unified_checkbox = QCheckBox("일괄적용")
+        self.segmented_checkbox = QCheckBox("손익별 적용")
+        root.addWidget(self.unified_checkbox)
+
+        self.strategy_rows: dict[str, list[tuple[QComboBox, QComboBox]]] = {}
+        self.strategy_action_badges: dict[str, QPushButton] = {}
+        strategy_title_width = QFontMetrics(self.font()).horizontalAdvance(
+            "▪ 손실구간"
+        )
+        self.unified_strategy_row, self.unified_strategy_title_label = (
+            self._make_strategy_row(
+                "",
+                "unified",
+                strategy_title_width,
+                ("손익금액", "낮은순"),
+                "조기마감",
+            )
+        )
+        self.profit_strategy_row, self.profit_strategy_title_label = (
+            self._make_strategy_row(
+                "▪ 수익",
+                "profit",
+                strategy_title_width,
+                ("손익금액", "높은순"),
+                "조기마감",
+            )
+        )
+        self.loss_strategy_row, self.loss_strategy_title_label = (
+            self._make_strategy_row(
+                "▪ 손실",
+                "loss",
+                strategy_title_width,
+                ("손익금액", "낮은순"),
+                "즉시청산",
+            )
+        )
+        root.addWidget(self.unified_strategy_row)
+        root.addWidget(self.segmented_checkbox)
+        root.addWidget(self.profit_strategy_row)
+        root.addWidget(self.loss_strategy_row)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        root.addWidget(separator)
+
+        close_settings = QWidget()
+        close_layout = QHBoxLayout(close_settings)
+        close_layout.setContentsMargins(12, 0, 0, 0)
+        close_layout.setSpacing(6)
+        self.buffer_close_title_label = QLabel("※ 구간마감설정 :")
+        close_layout.addWidget(self.buffer_close_title_label)
+
+        badge_metrics = QFontMetrics(self.font())
+        fixed_badge_width = max(
+            badge_metrics.horizontalAdvance(text)
+            for text in ("조기마감", "즉시청산")
+        ) + 20
+        self.buffer_close_early_badge = self._make_fixed_action_badge(
+            "조기마감",
+            fixed_badge_width,
+        )
+        self.buffer_close_immediate_badge = self._make_fixed_action_badge(
+            "즉시청산",
+            fixed_badge_width,
+        )
+        close_layout.addWidget(self.buffer_close_early_badge)
+        close_layout.addWidget(QLabel("◁"))
+        self.buffer_close_ratio_combo = _TextOnlyPopupComboBox()
+        self.buffer_close_ratio_combo.setObjectName("bufferResponseRatioCombo")
+        self.buffer_close_ratio_combo.addItems(BUFFER_RESPONSE_RATIO_OPTIONS)
+        self.buffer_close_ratio_combo.setCurrentText("80%")
+        ratio_width = badge_metrics.horizontalAdvance("90%") + 8
+        self.buffer_close_ratio_combo.setFixedSize(ratio_width, 26)
+        self.buffer_close_ratio_combo.setPopupMinimumWidth(
+            max(64, badge_metrics.horizontalAdvance("90%") + 28)
+        )
+        self.buffer_close_ratio_combo.view().setTextElideMode(Qt.ElideNone)
+        self.buffer_close_ratio_combo.setCursor(Qt.PointingHandCursor)
+        self.buffer_close_ratio_combo.setStyleSheet(
+            "QComboBox { border: none; outline: none; background: transparent;"
+            " padding: 0px; }"
+            "QComboBox:hover, QComboBox:focus { border: none;"
+            " background: transparent; outline: none; }"
+            "QComboBox::drop-down { border: none; width: 0px; }"
+            "QComboBox::down-arrow { image: none; width: 0px; height: 0px; }"
+        )
+        close_layout.addWidget(self.buffer_close_ratio_combo)
+        close_layout.addWidget(QLabel("▷"))
+        close_layout.addWidget(self.buffer_close_immediate_badge)
+        close_layout.addStretch(1)
+        root.addWidget(close_settings)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        self.save_button = self.button_box.button(QDialogButtonBox.Save)
+        self.cancel_button = self.button_box.button(QDialogButtonBox.Cancel)
+        self.save_button.setText("저장")
+        self.cancel_button.setText("취소")
+        self.save_button.setMinimumWidth(110)
+        self.cancel_button.setMinimumWidth(110)
+        self.save_button.setEnabled(False)
+        self.button_box.rejected.connect(self.reject)
+        root.addWidget(self.button_box)
+
+        self._mode_syncing = False
+        self.unified_checkbox.toggled.connect(self._on_unified_toggled)
+        self.segmented_checkbox.toggled.connect(self._on_segmented_toggled)
+        self.set_application_mode(self.MODE_UNIFIED)
+
+    def _make_strategy_row(
+        self,
+        title: str,
+        key: str,
+        title_width: int,
+        default: tuple[str, str],
+        action_default: str,
+    ) -> tuple[QWidget, QLabel]:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(8)
+        title_label = QLabel(title)
+        title_label.setFixedWidth(title_width)
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        if title:
+            title_label.setContentsMargins(12, 0, 0, 0)
+        layout.addWidget(title_label)
+        factor, direction = default
+        factor_combo = QComboBox()
+        factor_combo.addItems(BUFFER_RESPONSE_EVALUATION_FACTORS)
+        factor_combo.setCurrentText(factor)
+        factor_combo.setFixedWidth(126)
+        direction_combo = QComboBox()
+        direction_combo.addItems(BUFFER_RESPONSE_SORT_DIRECTIONS)
+        direction_combo.setCurrentText(direction)
+        direction_combo.setFixedWidth(106)
+        layout.addWidget(factor_combo)
+        layout.addWidget(direction_combo)
+        layout.addSpacing(8)
+        action_badge = _DoubleClickActionButton(action_default)
+        action_badge.setCursor(Qt.PointingHandCursor)
+        action_badge_width = max(
+            QFontMetrics(action_badge.font()).horizontalAdvance(text)
+            for text in BUFFER_RESPONSE_ACTION_MODES
+        ) + 20
+        action_badge.setFixedSize(action_badge_width, 30)
+        action_badge.doubleClicked.connect(
+            lambda strategy_key=key: (
+                self._cycle_strategy_action_badge(strategy_key)
+            )
+        )
+        layout.addWidget(action_badge)
+        layout.addStretch(1)
+        self.strategy_rows[key] = [(factor_combo, direction_combo)]
+        self.strategy_action_badges[key] = action_badge
+        return widget, title_label
+
+    @staticmethod
+    def _make_fixed_action_badge(text: str, width: int) -> QLabel:
+        badge = QLabel(text)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setFixedSize(width, 30)
+        badge.setStyleSheet(
+            "QLabel { border: 1px solid #b7bcc5; border-radius: 3px;"
+            " background: palette(base); padding: 0px; }"
+        )
+        return badge
+
+    def _cycle_strategy_action_badge(self, key: str) -> None:
+        badge = self.strategy_action_badges.get(key)
+        if badge is None or not badge.isEnabled():
+            return
+        current = badge.text()
+        try:
+            index = BUFFER_RESPONSE_ACTION_MODES.index(current)
+        except ValueError:
+            index = -1
+        badge.setText(
+            BUFFER_RESPONSE_ACTION_MODES[
+                (index + 1) % len(BUFFER_RESPONSE_ACTION_MODES)
+            ]
+        )
+
+    def _on_unified_toggled(self, checked: bool) -> None:
+        if self._mode_syncing:
+            return
+        self.set_application_mode(
+            self.MODE_UNIFIED if checked else self.MODE_NONE
+        )
+
+    def _on_segmented_toggled(self, checked: bool) -> None:
+        if self._mode_syncing:
+            return
+        self.set_application_mode(
+            self.MODE_SEGMENTED if checked else self.MODE_NONE
+        )
+
+    def set_application_mode(self, mode: str) -> None:
+        self._mode_syncing = True
+        try:
+            self.unified_checkbox.setChecked(mode == self.MODE_UNIFIED)
+            self.segmented_checkbox.setChecked(mode == self.MODE_SEGMENTED)
+        finally:
+            self._mode_syncing = False
+        self.unified_checkbox.setEnabled(True)
+        self.segmented_checkbox.setEnabled(True)
+        self.unified_strategy_row.setEnabled(mode == self.MODE_UNIFIED)
+        segmented = mode == self.MODE_SEGMENTED
+        self.profit_strategy_row.setEnabled(segmented)
+        self.loss_strategy_row.setEnabled(segmented)
+
+    def application_mode(self) -> str:
+        if self.unified_checkbox.isChecked():
+            return self.MODE_UNIFIED
+        if self.segmented_checkbox.isChecked():
+            return self.MODE_SEGMENTED
+        return self.MODE_NONE
+
+
+class _AccountPopupDisplayDelegate(QStyledItemDelegate):
+    """Project memo text only in the popup without changing account identity."""
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        option.text = account_popup_display_text(
+            index.data(ACCOUNT_NO_ROLE),
+            index.data(ACCOUNT_POPUP_MEMO_ROLE),
+        )
+
+
+class _AccountPopupView(QListView):
+    """Provide the keyboard dismissal expected from a combo popup."""
+
+    def __init__(self, combo: QComboBox) -> None:
+        super().__init__(combo)
+        self._combo = combo
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self._combo.hidePopup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _AccountInfoComboBox(QComboBox):
+    """Use one explicit popup view so account selection/context menus are reliable."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._account_popup_view = _AccountPopupView(self)
+        self._account_popup_view.setWindowFlags(Qt.Popup)
+        self._account_popup_view.setModel(self.model())
+        self._account_popup_view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._account_popup_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    def view(self):
+        return self._account_popup_view
+
+    def showPopup(self) -> None:
+        view = self._account_popup_view
+        view.setModel(self.model())
+        row_height = max(view.sizeHintForRow(0), self.sizeHint().height())
+        visible_rows = max(1, min(self.count(), 10))
+        metrics = view.fontMetrics()
+        projected_widths = [
+            metrics.horizontalAdvance(
+                account_popup_display_text(
+                    self.itemData(row, ACCOUNT_NO_ROLE),
+                    self.itemData(row, ACCOUNT_POPUP_MEMO_ROLE),
+                )
+            )
+            for row in range(self.count())
+        ]
+        canonical_width = metrics.horizontalAdvance(
+            account_popup_display_text("8129000000", "가나다라마바사아")
+        )
+        width = max(
+            self.width(),
+            canonical_width + 24,
+            (max(projected_widths) + 24) if projected_widths else 0,
+        )
+        height = row_height * visible_rows + 2 * view.frameWidth()
+        top_left = self.mapToGlobal(self.rect().bottomLeft())
+        view.setGeometry(top_left.x(), top_left.y(), width, height)
+        if 0 <= self.currentIndex() < self.count():
+            view.setCurrentIndex(self.model().index(self.currentIndex(), 0))
+        view.show()
+        view.raise_()
+        view.setFocus(Qt.PopupFocusReason)
+        controller = getattr(self, "_popup_interaction_controller", None)
+        if controller is None:
+            return
+        view.removeEventFilter(controller)
+        view.installEventFilter(controller)
+        viewport = self.view().viewport()
+        viewport.removeEventFilter(controller)
+        viewport.installEventFilter(controller)
+
+    def hidePopup(self) -> None:
+        self._account_popup_view.hide()
+
+    def hideEvent(self, event) -> None:
+        self.hidePopup()
+        super().hideEvent(event)
+
+
+class _AccountComboPopupInteractionController(QObject):
+    """Provide reliable selection and context actions on the popup view."""
+
+    def __init__(self, owner, combo: QComboBox) -> None:
+        super().__init__(combo.view().viewport())
+        self._owner = owner
+        self._combo = combo
+
+    def eventFilter(self, watched, event) -> bool:
+        view = self._combo.view()
+        viewport = view.viewport()
+        if watched not in (view, viewport):
+            return False
+        event_type = event.type()
+        if event_type == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            global_position = event.globalPos()
+            if not view.rect().contains(view.mapFromGlobal(global_position)):
+                combo_clicked = self._combo.rect().contains(
+                    self._combo.mapFromGlobal(global_position)
+                )
+                self._combo.hidePopup()
+                return combo_clicked
+            if watched is view:
+                return False
+            return True
+        if watched is not viewport:
+            return False
+        if event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            index = view.indexAt(event.pos())
+            if index.isValid():
+                self._combo.setCurrentIndex(index.row())
+                self._combo.hidePopup()
+            return True
+        if event_type == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            index = view.indexAt(event.pos())
+            if index.isValid():
+                self._owner.open_kiwoom_account_context_menu_for_index(
+                    index,
+                    event.globalPos(),
+                )
+            return True
+        if event_type == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
+            return True
+        if event_type == QEvent.ContextMenu:
+            index = view.indexAt(event.pos())
+            if index.isValid():
+                self._owner.open_kiwoom_account_context_menu_for_index(
+                    index,
+                    event.globalPos(),
+                )
+            return True
+        return False
+
 
 from gui_stock_register_window import StockRegisterWindow
 from gui_review_required_window import (
@@ -127,8 +855,18 @@ from gui_main_table_loader import (
     main_monitoring_cell_font,
 )
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
-from gui_main_budget_panel import update_main_budget_panel
+from gui_main_budget_panel import (
+    MAIN_TOTAL_BUDGET_PERCENT_OPTIONS,
+    collect_main_budget_summary,
+    persist_main_total_budget,
+    persist_main_budget_percent,
+    project_main_budget_warning_transition,
+    set_metric_value_text,
+    total_budget_from_orderable_cash,
+    update_main_budget_panel,
+)
 from account_funds_foundation import (
+    ACCOUNT_AUTHENTICATION_REQUIRED,
     DISCONNECTED as ACCOUNT_FUNDS_DISCONNECTED,
     FAILED as ACCOUNT_FUNDS_FAILED,
     LOADING as ACCOUNT_FUNDS_LOADING,
@@ -148,10 +886,29 @@ from gui_auto_trade_display import (
     draw_limit_metric,
     draw_stock_position_metric,
     draw_stock_position_metric_display,
+    profit_loss_value_color,
 )
 from gui_auto_trade_run_control import (
     auto_trade_running_registered_operation_targets,
     show_auto_trade_operation_failure_dialog,
+)
+from gui_auto_trade_policy import (
+    auto_trade_current_session_operation_participant_codes,
+)
+from buffer_response_coordinator import (
+    coordinate_main_window_buffer_response,
+    main_window_buffer_response_integration_ready,
+    reconcile_main_window_buffer_response_cycle,
+    register_main_window_buffer_response_integration,
+)
+from buffer_response_early_close_dispatcher import (
+    resume_main_window_buffer_early_close,
+)
+from buffer_response_immediate_liquidation_preparer import (
+    resume_main_window_buffer_immediate_liquidation_preparation,
+)
+from buffer_response_immediate_liquidation_dispatcher import (
+    dispatch_ready_main_window_buffer_immediate_preparations,
 )
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
@@ -162,8 +919,9 @@ from gui_stock_instance_chart_window import (
     stock_instance_chart_is_open,
 )
 from gui_window_policy import close_persistent_feature_windows
-from event_journal_production import append_owner_event_once
+from event_journal_production import append_owner_event_once, append_production_event
 from runtime_io import read_json_dict
+from routine_order_permission import canonical_stock_trading_time_status
 from gui_review_utils import current_price_from_state
 from gui_operation_environment import (
     effective_amount_starting_budget,
@@ -197,6 +955,7 @@ from kiwoom_api import KiwoomApi
 from operator_reconciliation_service import assess_startup_recovery
 from broker_holding_recorder import write_production_recovery_review
 from production_recovery_contract import (
+    ACCOUNT_FAILED,
     ACCOUNT_COMPLETED,
     ACCOUNT_REVIEW_REQUIRED,
     BrokerSnapshotPart,
@@ -222,7 +981,6 @@ from production_recovery_state_registry import (
 )
 from startup_runtime_initializer import initialize_pristine_startup_runtime
 from operation_command_service import (
-    COMMAND_IMMEDIATE_LIQUIDATION,
     MODE_EARLY_CLOSE,
     OperationCommandService,
     RESULT_FAILED,
@@ -230,6 +988,7 @@ from operation_command_service import (
     SCOPE_ROUTINE_INSTANCE,
 )
 from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from close_liquidation_transition_service import POLICY_MARKET
 from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
 
 
@@ -381,6 +1140,9 @@ def _routine_stock_metric_display_text(metric: object) -> str:
 INITIAL_BUY_BADGE_WIDTH = 64
 INITIAL_BUY_BADGE_HEIGHT = AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT
 INITIAL_BUY_BADGE_GAP = 4
+MAIN_ROUTINE_FILTER_BADGE_WIDTH = 64
+MAIN_ROUTINE_FILTER_BADGE_AREA_WIDTH = 68
+MAIN_ROUTINE_SUMMARY_VALID_BADGE_WIDTH = 68
 INITIAL_BUY_AMOUNT_COLOR = "#B98200"
 INITIAL_BUY_QUANTITY_COLOR = "#6F52B5"
 ROUTINE_STOCK_OPERATION_TOKEN_INDEX = 2
@@ -771,13 +1533,15 @@ def _apply_routine_inline_edit_style(editor: QLineEdit, table) -> None:
 
 def _create_routine_operation_confirmation(
     parent: QWidget | None,
-    command: str,
+    display_status: str,
     icon: QMessageBox.Icon = QMessageBox.Question,
 ) -> QMessageBox:
+    if display_status == MODE_EARLY_CLOSE:
+        display_status = ROUTINE_STATUS_EARLY_CLOSE
     title, message = {
-        MODE_EARLY_CLOSE: ("조기마감", "조기마감을 적용합니다."),
-        COMMAND_IMMEDIATE_LIQUIDATION: ("즉시청산", "즉시청산을 적용합니다."),
-    }[command]
+        ROUTINE_STATUS_EARLY_CLOSE: ("조기마감", "조기마감을 적용합니다."),
+        ROUTINE_STATUS_IMMEDIATE_LIQUIDATION: ("즉시청산", "즉시청산을 적용합니다."),
+    }[display_status]
     dialog = QMessageBox(
         icon,
         title,
@@ -1643,80 +2407,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class _MainRoutineExcludedBadge(QPushButton):
-    LABEL = "제외종목"
-
-    def __init__(self) -> None:
-        super().__init__(f"{self.LABEL}(0)")
-        self._excluded_count = 0
-
-    def set_excluded_count(self, count: int) -> None:
-        self._excluded_count = max(0, int(count))
-        self.setText(f"{self.LABEL}({self._excluded_count})")
-        self.update()
-
-    def count_font(self) -> QFont:
-        font = QFont(self.font())
-        if font.pointSizeF() > 0:
-            font.setPointSizeF(max(1.0, font.pointSizeF() - 1.0))
-        elif font.pixelSize() > 0:
-            font.setPixelSize(max(1, font.pixelSize() - 1))
-        return font
-
-    def content_rects(self) -> tuple[QRect, QRect, QRect, QRect]:
-        label_metrics = self.fontMetrics()
-        count_font = self.count_font()
-        count_metrics = QFontMetrics(count_font)
-        label_width = label_metrics.horizontalAdvance(self.LABEL)
-        left_paren_width = count_metrics.horizontalAdvance("(")
-        number_width = routine_aggregate_number_slot_width(count_font)
-        right_paren_width = count_metrics.horizontalAdvance(")")
-        content_width = (
-            label_width + left_paren_width + number_width + right_paren_width
-        )
-        left = max(0, (self.width() - content_width) // 2)
-        top = 0
-        height = self.height()
-        label_rect = QRect(left, top, label_width, height)
-        left_paren_rect = QRect(label_rect.right() + 1, top, left_paren_width, height)
-        number_rect = QRect(left_paren_rect.right() + 1, top, number_width, height)
-        right_paren_rect = QRect(number_rect.right() + 1, top, right_paren_width, height)
-        return label_rect, left_paren_rect, number_rect, right_paren_rect
-
-    def paintEvent(self, event) -> None:
-        option = QStyleOptionButton()
-        self.initStyleOption(option)
-        option.text = ""
-        painter = QStylePainter(self)
-        painter.drawControl(QStyle.CE_PushButton, option)
-        painter.setPen(option.palette.buttonText().color())
-        label_rect, left_paren_rect, number_rect, right_paren_rect = (
-            self.content_rects()
-        )
-        painter.setFont(self.font())
-        painter.drawText(
-            label_rect,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            self.LABEL,
-        )
-        painter.setFont(self.count_font())
-        painter.drawText(
-            left_paren_rect,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            "(",
-        )
-        painter.drawText(
-            number_rect,
-            Qt.AlignCenter,
-            str(self._excluded_count),
-        )
-        painter.drawText(
-            right_paren_rect,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            ")",
-        )
-
-
 def append_base_stock(code: str, name: str) -> None:
     """
     기초종목.txt 에 종목 1개를 추가한다.
@@ -1759,13 +2449,106 @@ class MainWindow(QMainWindow):
             raw_chejan_received = getattr(self.kiwoom_api, "raw_chejan_received", None)
             if raw_chejan_received is not None:
                 raw_chejan_received.connect(self.on_kiwoom_raw_chejan_received)
+            authentication_required = getattr(
+                self.kiwoom_api,
+                "account_authentication_required",
+                None,
+            )
+            if authentication_required is not None:
+                authentication_required.connect(
+                    self.on_kiwoom_account_authentication_required
+                )
 
         self.login_status_label = QLabel("로그인 상태: 미연결")
         self.btn_kiwoom_login = QPushButton("키움 로그인")
-        self.account_label = QLabel("계좌번호: -")
-        self.account_combo = QComboBox()
+        self.account_label = QLabel("계좌정보 :")
+        self.account_combo = _AccountInfoComboBox()
+        self.account_combo.setObjectName("kiwoomAccountCombo")
         self.account_combo.setEnabled(False)
         self.account_type_label = QLabel("계좌 구분: -")
+        self.account_type_label.hide()
+        self._account_memo_settings = QSettings(
+            QSettings.IniFormat,
+            QSettings.UserScope,
+            "jinkwangchul",
+            "kiwoom_auto",
+        )
+        self._selected_kiwoom_account_no = ""
+        self._account_memo_edit_account_no = ""
+        self._account_memo_loading = False
+        self.account_memo_edit = QLineEdit()
+        self.account_memo_edit.setObjectName("kiwoomAccountMemoEdit")
+        self.account_memo_edit.setMaxLength(8)
+        self.account_memo_edit.setEnabled(False)
+        self.account_memo_edit.setFrame(False)
+        self.account_memo_edit.setStyleSheet(ROUTINE_INLINE_EDIT_STYLE)
+        self._account_authentication_states: dict[str, str] = {}
+        self._account_query_states: dict[str, str] = {}
+        self.account_auth_separator = QLabel("|")
+        self.account_auth_label = QLabel("계좌인증 :")
+        self.account_auth_neutral_label = QLabel("-")
+        self.account_auth_done_label = QLabel("완료")
+        self.btn_account_authentication = QPushButton("미인증")
+        self.btn_account_authentication.setObjectName("accountAuthenticationAction")
+        self.btn_account_authentication.setFixedHeight(24)
+        self.btn_account_authentication.setStyleSheet(
+            "QPushButton {"
+            " color: #DC2626; background: transparent;"
+            " border: 1px solid #DC2626; border-radius: 3px;"
+            " padding: 1px 6px; min-height: 18px;"
+            "}"
+            "QPushButton:hover { background: #FEF2F2; }"
+            "QPushButton:pressed { background: #FEE2E2; }"
+        )
+        for widget in (
+            self.account_auth_separator,
+            self.account_auth_label,
+            self.account_auth_neutral_label,
+            self.account_auth_done_label,
+            self.btn_account_authentication,
+        ):
+            widget.hide()
+        self.account_query_status_label = QLabel("계좌상태 :")
+        self.account_query_normal_label = QLabel("정상")
+        self.account_query_neutral_label = QLabel("-")
+        self.btn_account_requery = QPushButton("재조회")
+        self.btn_account_requery.setObjectName("accountRequeryAction")
+        self.btn_account_requery.setFixedHeight(24)
+        self.btn_account_requery.setStyleSheet(
+            "QPushButton {"
+            " color: #B45309; background: transparent;"
+            " border: 1px solid #D97706; border-radius: 3px;"
+            " padding: 1px 6px; min-height: 18px;"
+            "}"
+            "QPushButton:hover { background: #FFFBEB; }"
+            "QPushButton:pressed { background: #FEF3C7; }"
+        )
+        for widget in (
+            self.account_query_status_label,
+            self.account_query_normal_label,
+            self.account_query_neutral_label,
+            self.btn_account_requery,
+        ):
+            widget.hide()
+        self.account_combo.view().setContextMenuPolicy(Qt.CustomContextMenu)
+        self._account_popup_display_delegate = _AccountPopupDisplayDelegate(
+            self.account_combo.view()
+        )
+        self.account_combo.view().setItemDelegate(
+            self._account_popup_display_delegate
+        )
+        self._account_combo_popup_controller = (
+            _AccountComboPopupInteractionController(self, self.account_combo)
+        )
+        self.account_combo._popup_interaction_controller = (
+            self._account_combo_popup_controller
+        )
+        self.account_combo.view().viewport().installEventFilter(
+            self._account_combo_popup_controller
+        )
+        self.account_combo.view().installEventFilter(
+            self._account_combo_popup_controller
+        )
         self.auto_status_label = QLabel("전체 자동매매 상태: 정지")
         self.buy_time_status_label = QLabel("매수 가능 상태: 확인 전")
         self.account_total_deposit_label = QLabel("-")
@@ -1779,13 +2562,16 @@ class MainWindow(QMainWindow):
 
         # 관제창 예산 현황 표시 전용 QLabel
         # 실제 예산 저장/주문수량 계산/매수 제한 로직은 아직 연결하지 않는다.
-        self.budget_total_label = QLabel("0")
+        self.budget_total_label = _DoubleClickValueLabel("0")
         self.budget_used_label = QLabel("0")
         self.budget_available_label = QLabel("0")
+        self.budget_reserve_label = QLabel("0")
         self.budget_usage_rate_label = QLabel("-")
         self.budget_routine_count_label = QLabel("0")
         self.budget_stock_count_label = QLabel("0")
         self.budget_status_label = QLabel("확인 전")
+        self._main_budget_warning_previous_available_ratio = None
+        self._main_budget_warning_previous_buffer_entered = None
 
         self.routine_table = QTableWidget()
         self.running_stock_table = QTableWidget()
@@ -1813,8 +2599,8 @@ class MainWindow(QMainWindow):
         self._main_routine_initial_buy_sort_next_mode = "AMOUNT"
         self._main_routine_column_sort_key = ""
         self._main_routine_excluded_only = False
+        self._main_routine_stock_scope = "normal"
         self._main_routine_valid_button = None
-        self._main_routine_excluded_button = None
         self._main_routine_level_buttons: dict[str, QPushButton] = {}
         self._main_routine_metric_buttons: dict[str, QPushButton] = {}
         self._main_routine_initial_buy_sort_button = None
@@ -1855,7 +2641,7 @@ class MainWindow(QMainWindow):
         self.btn_log_view = QPushButton("이벤트기록")
         self.btn_review_required = QPushButton("검토관리(0)")
         self.btn_exit = QPushButton("종료")
-        self.btn_emergency_stop = QPushButton("긴급정지")
+        self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
 
         self._setup_ui()
         self._connect_events()
@@ -1879,6 +2665,7 @@ class MainWindow(QMainWindow):
             target_type="APPLICATION",
             target_id="kiwoom_auto",
         )
+        register_main_window_buffer_response_integration(self)
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -1887,14 +2674,27 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
 
-        top_box = self._create_top_status_box()
-        account_funds_box = self._create_account_funds_box()
-        budget_box = self._create_budget_status_box()
+        server_connection_box = self._create_top_status_box()
+        server_basic_info_box = self._create_account_funds_box()
+        budget_setting_box = self._create_budget_status_box()
+        self._main_top_part_boxes = (
+            server_connection_box,
+            server_basic_info_box,
+            budget_setting_box,
+        )
         top_layout = QHBoxLayout()
         top_layout.setSpacing(6)
-        top_layout.addWidget(top_box, 4)
-        top_layout.addWidget(account_funds_box, 2)
-        top_layout.addWidget(budget_box, 4)
+        server_connection_box.setSizePolicy(
+            QSizePolicy.Maximum,
+            QSizePolicy.Preferred,
+        )
+        server_basic_info_box.setSizePolicy(
+            QSizePolicy.Maximum,
+            QSizePolicy.Preferred,
+        )
+        top_layout.addWidget(server_connection_box, 0)
+        top_layout.addWidget(server_basic_info_box, 0)
+        top_layout.addWidget(budget_setting_box, 1)
 
         table_layout = self._create_table_area()
         button_layout = self._create_button_area()
@@ -1910,97 +2710,576 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("준비 완료")
 
     def _create_top_status_box(self) -> QGroupBox:
-        box = QGroupBox("시스템 상태")
+        box = QGroupBox("시스템")
+        box.setObjectName("mainServerConnectionStatusPart")
         layout = QGridLayout()
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
 
-        layout.addWidget(self.login_status_label, 0, 0)
-        layout.addWidget(self.btn_kiwoom_login, 0, 1)
-        layout.addWidget(self.account_label, 0, 2)
-        layout.addWidget(self.account_combo, 0, 3)
-        layout.addWidget(self.account_type_label, 0, 4)
+        self.login_status_label.setParent(box)
+        self.login_status_label.hide()
+        self.auto_status_label.hide()
+        self.buy_time_status_label.hide()
+        self.btn_kiwoom_login.setObjectName("kiwoomLoginStateButton")
+        self.btn_kiwoom_login.setFixedSize(92, 92)
+        self._apply_kiwoom_login_button_state("DISCONNECTED")
+        layout.addWidget(
+            self.btn_kiwoom_login,
+            0,
+            0,
+            3,
+            1,
+            Qt.AlignTop | Qt.AlignHCenter,
+        )
+        self.account_info_widget = QWidget(box)
+        account_info_layout = QHBoxLayout(self.account_info_widget)
+        account_info_layout.setContentsMargins(0, 0, 0, 0)
+        account_info_layout.setSpacing(0)
+        account_info_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        account_title_width = max(
+            self.account_label.fontMetrics().horizontalAdvance(text)
+            for text in ("계좌정보 :", "계좌인증 :", "계좌상태 :")
+        ) + 2
+        for title_label in (
+            self.account_label,
+            self.account_auth_label,
+            self.account_query_status_label,
+        ):
+            title_label.setFixedWidth(account_title_width)
+            title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        account_info_layout.addWidget(self.account_label)
+        account_info_layout.addSpacing(8)
+        account_info_layout.addWidget(self.account_combo)
+        account_info_layout.addSpacing(4)
+        account_info_layout.addWidget(self.account_memo_edit)
+        account_display_width = self.account_combo.fontMetrics().horizontalAdvance(
+            "8129****"
+        )
+        self.account_combo.setFixedWidth(account_display_width + 20)
+        memo_display_width = self.account_memo_edit.fontMetrics().horizontalAdvance(
+            "가나다라마바사아"
+        )
+        self.account_memo_edit.setFixedWidth(memo_display_width + 12)
+        layout.addWidget(self.account_info_widget, 0, 1)
 
-        layout.addWidget(self.auto_status_label, 1, 0, 1, 2)
-        layout.addWidget(self.buy_time_status_label, 1, 2, 1, 2)
-        layout.addWidget(self.btn_emergency_stop, 1, 4)
+        self.account_auth_widget = QWidget(box)
+        account_auth_layout = QHBoxLayout(self.account_auth_widget)
+        account_auth_layout.setContentsMargins(0, 0, 0, 0)
+        account_auth_layout.setSpacing(0)
+        account_auth_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        account_auth_layout.addWidget(self.account_auth_label)
+        # The borderless account combo keeps a 10px text inset.  Start the
+        # other row values at that same visual text column, not merely at the
+        # combo widget's outer geometry.
+        account_auth_layout.addSpacing(18)
+        account_auth_layout.addWidget(self.account_auth_neutral_label)
+        account_auth_layout.addWidget(self.account_auth_done_label)
+        account_auth_layout.addWidget(self.btn_account_authentication)
+        layout.addWidget(self.account_auth_widget, 1, 1)
 
-        self.btn_emergency_stop.setMinimumHeight(32)
-        self.btn_emergency_stop.setObjectName("dangerButton")
+        self.account_query_status_widget = QWidget(box)
+        account_query_status_layout = QHBoxLayout(self.account_query_status_widget)
+        account_query_status_layout.setContentsMargins(0, 0, 0, 0)
+        account_query_status_layout.setSpacing(0)
+        account_query_status_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        account_query_status_layout.addWidget(self.account_query_status_label)
+        account_query_status_layout.addSpacing(18)
+        account_query_status_layout.addWidget(self.account_query_normal_label)
+        account_query_status_layout.addWidget(self.account_query_neutral_label)
+        account_query_status_layout.addWidget(self.btn_account_requery)
+        layout.addWidget(self.account_query_status_widget, 2, 1)
 
-        box.setMaximumHeight(108)
+        auth_value_width = max(
+            self.account_auth_done_label.fontMetrics().horizontalAdvance(value)
+            for value in ("-", "완료", "미인증")
+        ) + 14
+        for widget in (
+            self.account_auth_neutral_label,
+            self.account_auth_done_label,
+            self.btn_account_authentication,
+        ):
+            widget.setFixedWidth(auth_value_width)
+        query_value_width = max(
+            self.account_query_normal_label.fontMetrics().horizontalAdvance(value)
+            for value in ("-", "정상", "재조회")
+        ) + 14
+        for widget in (
+            self.account_query_neutral_label,
+            self.account_query_normal_label,
+            self.btn_account_requery,
+        ):
+            widget.setFixedWidth(query_value_width)
+
+        layout.setColumnStretch(1, 1)
+
         box.setLayout(layout)
+        self.refresh_account_authentication_ui()
         return box
 
+    def _apply_kiwoom_login_button_state(self, state: str) -> None:
+        clean_state = str(state or "").strip().upper()
+        contracts = {
+            "LOGIN_IN_PROGRESS": (
+                "로그인\n중...",
+                "#E2E8F0",
+                "#94A3B8",
+                "#334155",
+            ),
+            "REAL_CONNECTED": (
+                "실전\n연결됨",
+                "#F97316",
+                "#F97316",
+                "#FFFFFF",
+            ),
+            "SIMULATION_CONNECTED": (
+                "모의\n연결됨",
+                "#FACC15",
+                "#FACC15",
+                "#1E3A8A",
+            ),
+        }
+        text, background, border, color = contracts.get(
+            clean_state,
+            ("키움\n로그인", "#F8FAFC", "#CBD5E1", "#334155"),
+        )
+        self.btn_kiwoom_login.setProperty("kiwoomLoginState", clean_state or "DISCONNECTED")
+        self.btn_kiwoom_login.setText(text)
+        login_action_available = clean_state not in contracts
+        self.btn_kiwoom_login.setEnabled(login_action_available)
+        self.btn_kiwoom_login.setCursor(
+            Qt.PointingHandCursor if login_action_available else Qt.ArrowCursor
+        )
+        self.btn_kiwoom_login.setStyleSheet(
+            "QPushButton#kiwoomLoginStateButton {"
+            f" background-color: {background};"
+            f" border: 1px solid {border};"
+            f" color: {color};"
+            " border-radius: 6px;"
+            " padding: 8px;"
+            " min-width: 74px;"
+            " max-width: 74px;"
+            " min-height: 74px;"
+            " max-height: 74px;"
+            " font-weight: 600;"
+            "}"
+            "QPushButton#kiwoomLoginStateButton:hover {"
+            f" border-color: {border};"
+            f" background-color: {background};"
+            "}"
+            "QPushButton#kiwoomLoginStateButton:disabled {"
+            f" background-color: {background};"
+            f" border-color: {border};"
+            f" color: {color};"
+            "}"
+        )
+
+    def _apply_connected_kiwoom_login_button_state(self) -> None:
+        api = getattr(self, "kiwoom_api", None)
+        server_type_getter = getattr(api, "account_server_type", None)
+        server_type = ""
+        if callable(server_type_getter):
+            try:
+                server_type = str(server_type_getter() or "").strip().upper()
+            except Exception:
+                LOGGER.exception("Kiwoom server type projection failed")
+        self._apply_kiwoom_login_button_state(
+            "SIMULATION_CONNECTED" if server_type == "SIMULATION" else "REAL_CONNECTED"
+        )
+
     def _create_account_funds_box(self) -> QGroupBox:
-        box = QGroupBox("계좌 자금")
+        box = QGroupBox("현황정보")
+        box.setObjectName("mainServerBasicInfoPart")
         layout = QGridLayout()
         layout.setContentsMargins(8, 6, 8, 6)
-        layout.setHorizontalSpacing(8)
+        layout.setHorizontalSpacing(0)
         layout.setVerticalSpacing(6)
 
-        layout.addWidget(QLabel("총 예수금"), 0, 0)
-        layout.addWidget(self.account_total_deposit_label, 0, 1)
-        layout.addWidget(QLabel("주문 가능금액"), 1, 0)
-        layout.addWidget(self.account_order_available_label, 1, 1)
+        self.btn_emergency_stop.setObjectName("dangerButton")
+        self.btn_emergency_stop.setFixedSize(self.btn_kiwoom_login.size())
+        self.btn_emergency_stop.setToolTip("더블클릭하여 긴급정지")
+        self.btn_emergency_stop.setStyleSheet(
+            "QPushButton#dangerButton {"
+            " background: #DC2626; border: 1px solid #B91C1C;"
+            " color: #FFFFFF; border-radius: 6px; padding: 8px;"
+            " min-width: 74px; max-width: 74px;"
+            " min-height: 74px; max-height: 74px; font-weight: 700;"
+            "}"
+            "QPushButton#dangerButton:hover { background: #B91C1C; }"
+            "QPushButton#dangerButton:pressed { background: #991B1B; }"
+        )
+        layout.addWidget(
+            self.btn_emergency_stop,
+            0,
+            0,
+            2,
+            1,
+            Qt.AlignTop | Qt.AlignLeft,
+        )
+        self.account_total_deposit_title_label = QLabel("총 예수금")
+        self.account_order_available_title_label = QLabel("주문 가능금액")
+        fund_title_width = max(
+            self.account_total_deposit_title_label.fontMetrics().horizontalAdvance(
+                title
+            )
+            for title in ("총 예수금", "주문 가능금액")
+        ) + 2
+        for title_label in (
+            self.account_total_deposit_title_label,
+            self.account_order_available_title_label,
+        ):
+            title_label.setFixedWidth(fund_title_width)
+            title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+        # Match the System box's 8px gap between its state button and the
+        # first account-information text.
+        layout.setColumnMinimumWidth(1, 8)
+        layout.addWidget(self.account_total_deposit_title_label, 0, 2)
+        layout.addWidget(self.account_order_available_title_label, 1, 2)
+        layout.addWidget(self.account_total_deposit_label, 0, 4)
+        layout.addWidget(self.account_order_available_label, 1, 4)
+        layout.setColumnMinimumWidth(5, 1)
+
+        fund_value_font = QFont("Malgun Gothic", 12, QFont.Bold)
+        fund_value_metrics = QFontMetrics(fund_value_font)
+        fund_value_sample = "500,000,000"
+        removed_currency_width = (
+            fund_value_metrics.horizontalAdvance(f"{fund_value_sample}원")
+            - fund_value_metrics.horizontalAdvance(fund_value_sample)
+        )
+        # Keep the 현황정보 box footprint unchanged: transfer the removed
+        # currency-suffix width to the title/value gap so the numeric right
+        # edge advances to the old full-text right edge.
+        layout.setColumnMinimumWidth(3, 20 + removed_currency_width)
+        fund_value_width = fund_value_metrics.horizontalAdvance(fund_value_sample) + 8
         for label in (
             self.account_total_deposit_label,
             self.account_order_available_label,
         ):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            label.setMinimumWidth(110)
+            label.setFixedWidth(fund_value_width)
             label.setObjectName("fundValue")
+            set_metric_value_text(label, label.text())
 
-        box.setMaximumHeight(108)
         box.setLayout(layout)
         return box
 
     def _create_budget_status_box(self) -> QGroupBox:
         """관제창 예산 현황 UI.
 
-        현재는 표시 전용이다.
-        예산 저장, 주문수량 산출, 매수 제한, 루틴/종목 배분은 이후 단계에서 검토한다.
+        시스템 전체예산과 가용비율만 전역 정책에서 읽고 쓴다.
+        주문수량 산출, 매수 제한, 루틴/종목 배분에는 연결하지 않는다.
         """
-        box = QGroupBox("예산 현황")
+        box = QGroupBox("예산설정")
+        box.setObjectName("mainBudgetSettingPart")
+        box_layout = QVBoxLayout()
+        box_layout.setContentsMargins(8, 6, 8, 6)
+        box_layout.setSpacing(4)
+        total_row_layout = QHBoxLayout()
+        total_row_layout.setContentsMargins(0, 0, 0, 0)
+        total_row_layout.setSpacing(0)
         layout = QGridLayout()
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(0)
+        layout.setVerticalSpacing(4)
+        box_layout.addLayout(total_row_layout)
+        box_layout.addLayout(layout)
 
-        layout.addWidget(QLabel("전체예산"), 0, 0)
-        layout.addWidget(self.budget_total_label, 0, 1)
-        layout.addWidget(QLabel("사용예산"), 0, 2)
-        layout.addWidget(self.budget_used_label, 0, 3)
-        layout.addWidget(QLabel("가용예산"), 0, 4)
-        layout.addWidget(self.budget_available_label, 0, 5)
+        self.budget_total_title_label = QLabel("전체예산 :")
+        title_metrics = self.budget_total_title_label.fontMetrics()
+        percent_edit_width = title_metrics.horizontalAdvance("100") + 10
+        percent_edit_height = max(20, title_metrics.height() + 4)
+        percent_prefix_width = max(
+            title_metrics.horizontalAdvance("▪ 가용 "),
+            title_metrics.horizontalAdvance("▪ 완충 "),
+        )
+        percent_suffix_width = title_metrics.horizontalAdvance("% :")
+        budget_title_width = max(
+            title_metrics.horizontalAdvance("전체예산 :"),
+            percent_prefix_width + percent_edit_width + percent_suffix_width,
+        ) + 2
 
-        layout.addWidget(QLabel("사용률"), 1, 0)
-        layout.addWidget(self.budget_usage_rate_label, 1, 1)
-        layout.addWidget(QLabel("루틴수"), 1, 2)
-        layout.addWidget(self.budget_routine_count_label, 1, 3)
-        layout.addWidget(QLabel("연결종목"), 1, 4)
-        layout.addWidget(self.budget_stock_count_label, 1, 5)
-        layout.addWidget(QLabel("예산상태"), 1, 6)
-        layout.addWidget(self.budget_status_label, 1, 7)
+        self.budget_total_title_label.setFixedWidth(budget_title_width)
+        self.budget_total_title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        total_row_layout.addWidget(self.budget_total_title_label)
 
-        value_labels = [
+        def make_percent_title(prefix: str, object_name: str):
+            widget = QWidget()
+            row_layout = QHBoxLayout(widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(0)
+            prefix_label = QLabel(prefix)
+            prefix_label.setFixedWidth(percent_prefix_width)
+            editor = _BudgetPercentEdit()
+            editor.setObjectName(object_name)
+            editor.setMaxLength(3)
+            editor.setValidator(QIntValidator(0, 999, editor))
+            editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            editor.setFixedSize(percent_edit_width, percent_edit_height)
+            editor.setStyleSheet(
+                "QLineEdit { border: none; outline: none; "
+                "background: transparent; padding: 0; }"
+                "QLineEdit:focus { border: none; outline: none; "
+                "background: transparent; }"
+            )
+            suffix_label = QLabel("% :")
+            suffix_label.setFixedWidth(percent_suffix_width)
+            row_layout.addWidget(prefix_label)
+            row_layout.addWidget(editor)
+            row_layout.addWidget(suffix_label)
+            widget.setFixedWidth(budget_title_width)
+            return widget, editor, suffix_label
+
+        (
+            self.budget_available_title_label,
+            self.budget_available_percent_edit,
+            self.budget_available_percent_suffix_label,
+        ) = make_percent_title("▪ 가용 ", "mainAvailableBudgetPercent")
+        (
+            self.budget_reserve_title_label,
+            self.budget_buffer_percent_edit,
+            self.budget_buffer_percent_suffix_label,
+        ) = make_percent_title("▪ 완충 ", "mainBufferBudgetPercent")
+        layout.addWidget(self.budget_available_title_label, 0, 0)
+        layout.addWidget(self.budget_reserve_title_label, 1, 0)
+
+        self.budget_available_percent_edit.commitRequested.connect(
+            lambda: self._commit_main_budget_percent("available")
+        )
+        self.budget_buffer_percent_edit.commitRequested.connect(
+            lambda: self._commit_main_budget_percent("buffer")
+        )
+        self.budget_available_percent_edit.cancelRequested.connect(
+            self.update_budget_panel
+        )
+        self.budget_buffer_percent_edit.cancelRequested.connect(
+            self.update_budget_panel
+        )
+
+        layout.setColumnMinimumWidth(1, 10)
+        budget_value_width = QFontMetrics(self.budget_total_label.font()).horizontalAdvance(
+            "9,999,999,999"
+        ) + 8
+        value_labels = (
             self.budget_total_label,
-            self.budget_used_label,
             self.budget_available_label,
+            self.budget_reserve_label,
+        )
+        for label in value_labels:
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            label.setFixedWidth(budget_value_width)
+            label.setObjectName("metricValue")
+        total_row_layout.addSpacing(10)
+        total_row_layout.addWidget(self.budget_total_label)
+        for row, label in enumerate(
+            (self.budget_available_label, self.budget_reserve_label)
+        ):
+            layout.addWidget(label, row, 2)
+        layout.setColumnMinimumWidth(3, 8)
+        separator_width = title_metrics.horizontalAdvance("|") + 4
+        activity_title_width = max(
+            title_metrics.horizontalAdvance("잔여"),
+            title_metrics.horizontalAdvance("진입"),
+        ) + 2
+        activity_ratio_width = title_metrics.horizontalAdvance("100.0%") + 6
+        parenthesis_width = max(
+            title_metrics.horizontalAdvance("("),
+            title_metrics.horizontalAdvance(")"),
+        ) + 2
+
+        self.budget_warning_separator_label = QLabel("|")
+        self.budget_warning_toggle_button = _DoubleClickActionButton()
+        self.budget_warning_toggle_button.setObjectName("mainBudgetWarningToggle")
+        self.budget_warning_toggle_button.setCursor(Qt.PointingHandCursor)
+        self.budget_warning_toggle_button.setToolTip("더블클릭하여 경고 ON/OFF 전환")
+        self.budget_buffer_response_button = QPushButton("완충대응")
+        self.budget_buffer_response_button.setObjectName(
+            "mainBudgetBufferResponseEntry"
+        )
+        self.budget_buffer_response_button.setCursor(Qt.PointingHandCursor)
+        self.budget_buffer_response_button.setToolTip("완충대응 설정 준비 중")
+        self.budget_warning_row_widget = QWidget()
+        self.budget_warning_row_widget.setSizePolicy(
+            QSizePolicy.Fixed,
+            QSizePolicy.Fixed,
+        )
+        warning_row_layout = QHBoxLayout(self.budget_warning_row_widget)
+        warning_row_layout.setContentsMargins(0, 0, 0, 0)
+        warning_row_layout.setSpacing(8)
+        self.budget_warning_separator_label.setFixedWidth(separator_width)
+        self.budget_warning_separator_label.setAlignment(Qt.AlignCenter)
+        warning_row_layout.addWidget(self.budget_warning_separator_label)
+        warning_row_layout.addWidget(self.budget_warning_toggle_button)
+        warning_row_layout.addWidget(self.budget_buffer_response_button)
+        total_row_layout.addSpacing(8)
+        total_row_layout.addWidget(self.budget_warning_row_widget)
+        total_row_layout.addStretch(1)
+
+        warning_enabled_getter = getattr(self, "main_budget_warning_enabled", None)
+        warning_enabled = (
+            bool(warning_enabled_getter())
+            if callable(warning_enabled_getter)
+            else True
+        )
+        MainWindow._apply_main_budget_warning_badge_style(
+            self,
+            warning_enabled,
+        )
+        self.budget_warning_toggle_button.ensurePolished()
+        warning_metrics = QFontMetrics(self.budget_warning_toggle_button.font())
+        warning_badge_width = max(
+            warning_metrics.horizontalAdvance("경고 ON"),
+            warning_metrics.horizontalAdvance("경고 OFF"),
+        ) + 16
+        warning_badge_height = max(
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+            warning_metrics.height() + 2,
+        )
+        self.budget_warning_toggle_button.setFixedSize(
+            warning_badge_width,
+            warning_badge_height,
+        )
+        response_metrics = QFontMetrics(self.budget_buffer_response_button.font())
+        response_content_height = max(
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT - 2,
+            response_metrics.height(),
+        )
+        MainWindow._apply_main_budget_buffer_response_badge_style(
+            self,
+            False,
+            content_height=response_content_height,
+        )
+        self.budget_buffer_response_button.setFixedSize(
+            response_metrics.horizontalAdvance("완충대응") + 16,
+            warning_badge_height,
+        )
+        warning_toggle_handler = getattr(
+            self,
+            "set_main_budget_warning_enabled",
+            None,
+        )
+        if callable(warning_toggle_handler) and callable(warning_enabled_getter):
+            self.budget_warning_toggle_button.doubleClicked.connect(
+                lambda: warning_toggle_handler(
+                    not bool(warning_enabled_getter())
+                )
+            )
+        response_entry_handler = getattr(
+            self,
+            "on_main_budget_buffer_response_entry_clicked",
+            None,
+        )
+        if callable(response_entry_handler):
+            self.budget_buffer_response_button.clicked.connect(
+                response_entry_handler
+            )
+
+        self.budget_available_activity_separator_label = QLabel("|")
+        self.budget_buffer_activity_separator_label = QLabel("|")
+        self.budget_available_activity_title_label = QLabel("잔여")
+        self.budget_buffer_activity_title_label = QLabel("진입")
+        self.budget_available_remaining_label = QLabel("-")
+        self.budget_buffer_entry_label = QLabel("-")
+        self.budget_available_ratio_open_label = QLabel("(")
+        self.budget_buffer_ratio_open_label = QLabel("(")
+        self.budget_available_remaining_ratio_label = QLabel("-")
+        self.budget_buffer_entry_ratio_label = QLabel("-")
+        self.budget_available_ratio_close_label = QLabel(")")
+        self.budget_buffer_ratio_close_label = QLabel(")")
+
+        for row, separator_label in enumerate(
+            (
+                self.budget_available_activity_separator_label,
+                self.budget_buffer_activity_separator_label,
+            ),
+            start=0,
+        ):
+            separator_label.setFixedWidth(separator_width)
+            separator_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(separator_label, row, 4)
+
+        layout.setColumnMinimumWidth(5, 8)
+        for row, activity_label in enumerate(
+            (
+                self.budget_available_activity_title_label,
+                self.budget_buffer_activity_title_label,
+            ),
+            start=0,
+        ):
+            activity_label.setFixedWidth(activity_title_width)
+            activity_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            activity_label.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(
+                activity_label,
+                row,
+                6,
+                Qt.AlignLeft | Qt.AlignVCenter,
+            )
+
+        layout.setColumnMinimumWidth(7, 6)
+        for row, amount_label in enumerate(
+            (
+                self.budget_available_remaining_label,
+                self.budget_buffer_entry_label,
+            ),
+            start=0,
+        ):
+            amount_label.setFixedWidth(budget_value_width)
+            amount_label.setObjectName("metricValue")
+            set_metric_value_text(amount_label, "-")
+            layout.addWidget(amount_label, row, 8)
+
+        layout.setColumnMinimumWidth(9, 4)
+        for row, open_label in enumerate(
+            (
+                self.budget_available_ratio_open_label,
+                self.budget_buffer_ratio_open_label,
+            ),
+            start=0,
+        ):
+            open_label.setFixedWidth(parenthesis_width)
+            open_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(open_label, row, 10)
+        for row, ratio_label in enumerate(
+            (
+                self.budget_available_remaining_ratio_label,
+                self.budget_buffer_entry_ratio_label,
+            ),
+            start=0,
+        ):
+            ratio_label.setFixedWidth(activity_ratio_width)
+            ratio_label.setObjectName("metricRatio")
+            set_metric_value_text(ratio_label, "-")
+            layout.addWidget(ratio_label, row, 11)
+        for row, close_label in enumerate(
+            (
+                self.budget_available_ratio_close_label,
+                self.budget_buffer_ratio_close_label,
+            ),
+            start=0,
+        ):
+            close_label.setFixedWidth(parenthesis_width)
+            close_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(close_label, row, 12)
+        layout.setColumnStretch(13, 1)
+
+        for legacy_label in (
+            self.budget_used_label,
             self.budget_usage_rate_label,
             self.budget_routine_count_label,
             self.budget_stock_count_label,
             self.budget_status_label,
-        ]
-        for label in value_labels:
-            label.setAlignment(Qt.AlignCenter)
-            label.setMinimumWidth(90)
-            label.setObjectName("metricValue")
+        ):
+            legacy_label.hide()
 
-        box.setMaximumHeight(108)
-        box.setLayout(layout)
+        if isinstance(self, QWidget):
+            self._main_total_budget_popup = _MainTotalBudgetPopup(self)
+            self.budget_total_label.setToolTip("더블클릭하여 전체예산 설정")
+            self.budget_total_label.doubleClicked.connect(
+                self.show_main_total_budget_popup
+            )
+
+        box.setLayout(box_layout)
         return box
 
     def _create_table_area(self) -> QHBoxLayout:
@@ -2012,15 +3291,17 @@ class MainWindow(QMainWindow):
         routine_layout = QVBoxLayout()
         routine_layout.setContentsMargins(8, 6, 8, 8)
         self._setup_routine_table()
-        routine_header_layout = QHBoxLayout()
-        routine_header_layout.setContentsMargins(0, 0, 0, 0)
-        routine_header_layout.addStretch(1)
-        routine_header_layout.addWidget(self._create_main_routine_excluded_badge())
-        routine_layout.addLayout(routine_header_layout)
         routine_content_layout = QHBoxLayout()
         routine_content_layout.setContentsMargins(0, 0, 0, 0)
         routine_content_layout.setSpacing(6)
-        routine_content_layout.addWidget(self._create_routine_filter_badge_area())
+        routine_header_layout = QHBoxLayout()
+        routine_header_layout.setContentsMargins(0, 0, 0, 0)
+        routine_header_layout.setSpacing(routine_content_layout.spacing())
+        routine_header_layout.addWidget(self._create_main_routine_summary())
+        routine_header_layout.addStretch(1)
+        routine_filter_badge_area = self._create_routine_filter_badge_area()
+        routine_layout.addLayout(routine_header_layout)
+        routine_content_layout.addWidget(routine_filter_badge_area)
         routine_content_layout.addWidget(self.routine_table, 1)
         routine_layout.addLayout(routine_content_layout)
         routine_box.setLayout(routine_layout)
@@ -2032,80 +3313,298 @@ class MainWindow(QMainWindow):
 
         return layout
 
-    def _create_main_routine_excluded_badge(self) -> QPushButton:
-        button = _MainRoutineExcludedBadge()
-        button.setObjectName("mainRoutineExcludedStockBadge")
-        button.setFocusPolicy(Qt.NoFocus)
-        button.setCursor(Qt.PointingHandCursor)
-        button.setCheckable(True)
-        font = button.font()
-        point_size = font.pointSizeF()
-        if point_size > 0:
-            font.setPointSizeF(point_size * 1.1)
-        elif font.pixelSize() > 0:
-            font.setPixelSize(max(1, round(font.pixelSize() * 1.1)))
-        button.setFont(font)
-        button.setFixedHeight(round(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT * 1.1))
-        metrics = button.fontMetrics()
-        content_width = (
-            metrics.horizontalAdvance(f"{button.LABEL}(")
-            + routine_aggregate_number_slot_width(button.font())
-            + metrics.horizontalAdvance(")")
-        )
-        button.setFixedWidth(content_width + 28)
-        button.clicked.connect(self._set_main_routine_excluded_only)
-        self._main_routine_excluded_button = button
-        return button
+    def _create_main_routine_summary(self) -> QWidget:
+        summary = QWidget()
+        summary.setObjectName("mainRoutineSummary")
+        layout = QHBoxLayout(summary)
+        routine_table = getattr(self, "routine_table", None)
+        text_left_margin = 0
+        if isinstance(routine_table, QTableWidget):
+            text_left_margin = (
+                routine_table.viewport().geometry().x()
+                +
+                routine_table.style().pixelMetric(
+                    QStyle.PM_FocusFrameHMargin,
+                    None,
+                    routine_table,
+                )
+                + 1
+            )
+        layout.setSpacing(4)
 
-    def _update_main_routine_excluded_count(self, count: int) -> None:
-        button = getattr(self, "_main_routine_excluded_button", None)
-        if isinstance(button, _MainRoutineExcludedBadge):
-            button.set_excluded_count(count)
+        summary_font = summary.font()
+        point_size = summary_font.pointSizeF()
+        if point_size > 0:
+            summary_font.setPointSizeF(point_size * 1.3)
+        elif summary_font.pixelSize() > 0:
+            summary_font.setPixelSize(max(1, round(summary_font.pixelSize() * 1.3)))
+        summary_font.setBold(True)
+
+        metrics = QFontMetrics(summary_font)
+        badge_border_width = 1
+        badge_vertical_padding = 3
+        badge_row_vertical_margin = 2
+        badge_left_inset = (
+            MAIN_ROUTINE_FILTER_BADGE_AREA_WIDTH - MAIN_ROUTINE_FILTER_BADGE_WIDTH
+        ) // 2
+        label_slot_width = max(
+            metrics.horizontalAdvance(text)
+            for text in ("그룹", "루틴", "종목", "정지", "운영", "제외", "검토")
+        )
+        number_slot_width = routine_aggregate_number_slot_width(summary_font)
+        badge_height = max(
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+            metrics.height()
+            + badge_vertical_padding * 2
+            + badge_border_width * 2,
+        )
+        layout.setContentsMargins(
+            badge_left_inset,
+            badge_row_vertical_margin,
+            0,
+            badge_row_vertical_margin,
+        )
+        summary.setFixedHeight(badge_height + badge_row_vertical_margin * 2)
+        badge_horizontal_padding = text_left_margin
+        badge_body_spacing = 4
+        count_badge_width = (
+            badge_horizontal_padding * 2
+            + label_slot_width
+            + badge_body_spacing
+            + number_slot_width
+        )
+        count_labels: dict[str, tuple[QLabel, QLabel]] = {}
+        count_buttons: dict[str, QPushButton] = {}
+
+        def create_summary_separator(object_name: str) -> QLabel:
+            separator_font = QFont(summary_font)
+            separator_font.setBold(False)
+            separator = QLabel("|")
+            separator.setObjectName(object_name)
+            separator.setFont(separator_font)
+            separator.setAlignment(Qt.AlignCenter)
+            separator.setFixedSize(
+                QFontMetrics(separator_font).horizontalAdvance("|") + 8,
+                badge_height,
+            )
+            separator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            return separator
+
+        valid_button = QPushButton("유효")
+        valid_button.setObjectName("mainRoutineValidBadge")
+        valid_button.setFont(summary_font)
+        valid_button.setFixedSize(MAIN_ROUTINE_SUMMARY_VALID_BADGE_WIDTH, badge_height)
+        valid_button.setFocusPolicy(Qt.NoFocus)
+        valid_button.setCursor(Qt.PointingHandCursor)
+        valid_button.setCheckable(True)
+        valid_button.clicked.connect(self._set_main_routine_valid_only)
+        self._main_routine_valid_button = valid_button
+        layout.addWidget(valid_button)
+        valid_separator = create_summary_separator(
+            "mainRoutineSummaryValidSeparator"
+        )
+        layout.addWidget(valid_separator)
+        self._main_routine_summary_valid_separator = valid_separator
+        for key, label_text in (
+            ("group", "그룹"),
+            ("routine", "루틴"),
+            ("stock", "종목"),
+            ("operation", "정지"),
+            ("excluded", "제외"),
+            ("review", "검토"),
+        ):
+            badge = QPushButton()
+            badge.setObjectName("mainRoutineSummaryCountBadge")
+            badge.setFixedSize(count_badge_width, badge_height)
+            badge.setFocusPolicy(Qt.NoFocus)
+            badge.setCursor(Qt.PointingHandCursor)
+            badge.setCheckable(True)
+            badge_layout = QHBoxLayout(badge)
+            badge_layout.setContentsMargins(
+                badge_horizontal_padding,
+                0,
+                badge_horizontal_padding,
+                0,
+            )
+            badge_layout.setSpacing(badge_body_spacing)
+            label = QLabel(label_text)
+            label.setObjectName(f"mainRoutineSummary{key.title()}Label")
+            label.setFixedWidth(label_slot_width)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setFont(summary_font)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            value = QLabel("0")
+            value.setObjectName(f"mainRoutineSummary{key.title()}Value")
+            value.setFixedWidth(number_slot_width)
+            value.setAlignment(Qt.AlignCenter)
+            value.setFont(summary_font)
+            value.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            badge_layout.addWidget(label)
+            badge_layout.addWidget(value)
+            layout.addWidget(badge)
+            count_labels[key] = (label, value)
+            count_buttons[key] = badge
+            badge.clicked.connect(
+                lambda checked=False, target_key=key:
+                self._activate_main_routine_summary_badge(target_key, bool(checked))
+            )
+
+        profit_separator = create_summary_separator(
+            "mainRoutineSummaryProfitSeparator"
+        )
+        layout.addWidget(profit_separator)
+        profit_label = QPushButton("수익 0 / 0.00%")
+        profit_label.setObjectName("mainRoutineSummaryProfit")
+        profit_label.setFont(summary_font)
+        profit_label.setFocusPolicy(Qt.NoFocus)
+        profit_label.setCursor(Qt.PointingHandCursor)
+        profit_label.setCheckable(True)
+        profit_width = max(
+            metrics.horizontalAdvance("수익 +99,999,999 / +99.99%"),
+            metrics.horizontalAdvance("수익 -99,999,999 / -99.99%"),
+        ) + badge_horizontal_padding * 2
+        profit_label.setFixedSize(profit_width, badge_height)
+        profit_label.clicked.connect(
+            lambda _checked=False: self._activate_main_routine_summary_badge(
+                "profit",
+                bool(_checked),
+            )
+        )
+        layout.addWidget(profit_label)
+        self._main_routine_summary_count_labels = count_labels
+        self._main_routine_summary_count_buttons = count_buttons
+        self._main_routine_level_buttons = {
+            level: count_buttons[level]
+            for level in ("group", "routine", "stock")
+        }
+        self._main_routine_summary_count_badge_width = count_badge_width
+        self._main_routine_summary_number_slot_width = number_slot_width
+        self._main_routine_summary_profit_separator = profit_separator
+        self._main_routine_summary_profit_label = profit_label
+        self._main_routine_summary_profit_color = profit_loss_value_color(0)
+        self._main_routine_summary_widget = summary
+        MainWindow._update_main_routine_summary_badge_styles(self)
+        return summary
+
+    def _update_main_routine_summary(self, projection: dict[str, object]) -> None:
+        count_labels = getattr(self, "_main_routine_summary_count_labels", {})
+        profit_label = getattr(self, "_main_routine_summary_profit_label", None)
+        badges = projection.get("count_badges")
+        if isinstance(count_labels, dict) and isinstance(badges, tuple):
+            for key, label_text, value in badges:
+                labels = count_labels.get(str(key))
+                if not isinstance(labels, tuple) or len(labels) != 2:
+                    continue
+                label, value_label = labels
+                label.setText(str(label_text))
+                value_label.setText(str(max(0, int(value or 0))))
+        if isinstance(profit_label, QPushButton):
+            profit_label.setText(
+                f"수익 {str(projection.get('profit_value_text') or '0 / 0.00%')}"
+            )
+            self._main_routine_summary_profit_color = str(
+                projection.get("profit_color") or profit_loss_value_color(0)
+            )
+        MainWindow._update_main_routine_summary_badge_styles(self)
+
+    def _activate_main_routine_summary_badge(
+        self,
+        key: str,
+        checked: bool,
+    ) -> None:
+        clean_key = str(key or "").strip().lower()
+        if clean_key in {"group", "routine"}:
+            self._set_main_routine_display_level(clean_key)
+            return
+        if clean_key == "stock":
+            self._assign_main_routine_stock_scope("all", checked)
+            self._set_main_routine_display_level("stock")
+            return
+        if clean_key in {"operation", "excluded", "review"}:
+            self._set_main_routine_stock_scope(clean_key, checked)
+            return
+        if clean_key == "profit":
+            self._set_main_routine_metric_sort("profit")
+
+    def _update_main_routine_summary_badge_styles(self) -> None:
+        buttons = getattr(self, "_main_routine_summary_count_buttons", {})
+        if not isinstance(buttons, dict):
+            return
+        scope = MainWindow._current_main_routine_stock_scope(self)
+        level = str(getattr(self, "_main_routine_display_level", "") or "")
+        active_by_key = {
+            "group": level == "group",
+            "routine": level == "routine",
+            "stock": level == "stock" and scope == "all",
+            "operation": scope == "operation",
+            "excluded": scope == "excluded",
+            "review": scope == "review",
+        }
+        for key, button in buttons.items():
+            active = bool(active_by_key.get(key, False))
+            button.setChecked(active)
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            border_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if active
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                "QPushButton#mainRoutineSummaryCountBadge {"
+                " background-color: transparent;"
+                f" border: 1px solid {border_color};"
+                " border-radius: 4px; padding: 0;"
+                "}"
+                "QPushButton#mainRoutineSummaryCountBadge QLabel {"
+                f" color: {color}; border: none; background: transparent; padding: 0;"
+                "}"
+            )
+
+        profit_button = getattr(self, "_main_routine_summary_profit_label", None)
+        if not isinstance(profit_button, QPushButton):
+            return
+        profit_enabled = "profit" in MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL.get(
+            level,
+            frozenset(),
+        )
+        profit_active = bool(
+            profit_enabled
+            and getattr(self, "_main_routine_metric_sort_active", False)
+            and str(getattr(self, "_main_routine_metric_sort_key", "") or "")
+            == "profit"
+        )
+        profit_button.setEnabled(profit_enabled)
+        profit_button.setCursor(Qt.PointingHandCursor if profit_enabled else Qt.ArrowCursor)
+        profit_button.setChecked(profit_active)
+        profit_border = (
+            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+            if profit_active
+            else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+        )
+        profit_button.setStyleSheet(
+            "QPushButton#mainRoutineSummaryProfit {"
+            " background-color: transparent;"
+            f" color: {str(getattr(self, '_main_routine_summary_profit_color', '') or profit_loss_value_color(0))};"
+            f" border: 1px solid {profit_border};"
+            " border-radius: 4px; padding: 0;"
+            "}"
+            "QPushButton#mainRoutineSummaryProfit:disabled { color: #9CA3AF; }"
+        )
 
     def _create_routine_filter_badge_area(self) -> QWidget:
         badge_area = QWidget()
         badge_area.setObjectName("mainRoutineFilterBadgeArea")
-        badge_area.setFixedWidth(68)
+        badge_area.setFixedWidth(MAIN_ROUTINE_FILTER_BADGE_AREA_WIDTH)
         layout = QVBoxLayout(badge_area)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        valid_button = self._create_main_routine_filter_badge(
-            "유효",
-            "mainRoutineValidBadge",
-        )
-        valid_button.setCheckable(True)
-        valid_button.clicked.connect(self._set_main_routine_valid_only)
-        self._main_routine_valid_button = valid_button
-        layout.addWidget(valid_button, 0, Qt.AlignHCenter)
-        layout.addSpacing(8)
         layout.addWidget(
             self._create_main_routine_filter_separator("mainRoutineValidSeparator"),
-            0,
-            Qt.AlignHCenter,
-        )
-        layout.addSpacing(8)
-
-        self._main_routine_level_buttons = {}
-        for level, title in (
-            ("group", "그룹"),
-            ("routine", "루틴"),
-            ("stock", "종목"),
-        ):
-            button = self._create_main_routine_filter_badge(
-                title,
-                f"mainRoutine{level.title()}LevelBadge",
-            )
-            button.clicked.connect(
-                lambda _checked=False, target_level=level:
-                self._set_main_routine_display_level(target_level)
-            )
-            self._main_routine_level_buttons[level] = button
-            layout.addWidget(button, 0, Qt.AlignHCenter)
-
-        layout.addSpacing(8)
-        layout.addWidget(
-            self._create_main_routine_filter_separator("mainRoutineMetricSeparator"),
             0,
             Qt.AlignHCenter,
         )
@@ -2192,7 +3691,10 @@ class MainWindow(QMainWindow):
         button.setObjectName(object_name)
         button.setFocusPolicy(Qt.NoFocus)
         button.setCursor(Qt.PointingHandCursor)
-        button.setFixedSize(64, AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT)
+        button.setFixedSize(
+            MAIN_ROUTINE_FILTER_BADGE_WIDTH,
+            AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
+        )
         return button
 
     def _create_main_routine_filter_separator(self, object_name: str) -> QFrame:
@@ -2244,29 +3746,6 @@ class MainWindow(QMainWindow):
             "}"
         )
         valid_only = bool(self._main_routine_valid_only)
-        excluded_only = bool(getattr(self, "_main_routine_excluded_only", False))
-        excluded_button = getattr(self, "_main_routine_excluded_button", None)
-        if excluded_button is not None:
-            excluded_button.setChecked(excluded_only)
-            excluded_text_color = (
-                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                if excluded_only
-                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
-            )
-            excluded_button.setStyleSheet(
-                self._main_routine_filter_badge_style(
-                    excluded_text_color,
-                    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                    if excluded_only
-                    else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
-                )
-                + (
-                    "QPushButton {"
-                    f" min-height: {excluded_button.height() - 2}px;"
-                    f" max-height: {excluded_button.height() - 2}px;"
-                    "}"
-                )
-            )
         if self._main_routine_valid_button is not None:
             self._main_routine_valid_button.setChecked(valid_only)
             valid_text_color = (
@@ -2280,6 +3759,12 @@ class MainWindow(QMainWindow):
                     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                     if valid_only
                     else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                )
+                + (
+                    "QPushButton {"
+                    f" min-height: {self._main_routine_valid_button.height() - 2}px;"
+                    f" max-height: {self._main_routine_valid_button.height() - 2}px;"
+                    "}"
                 )
             )
 
@@ -2376,6 +3861,7 @@ class MainWindow(QMainWindow):
                 )
                 + disabled_style
             )
+        MainWindow._update_main_routine_summary_badge_styles(self)
 
     def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str], ...]:
         selected_keys: list[tuple[str, str, str, str]] = []
@@ -2422,10 +3908,40 @@ class MainWindow(QMainWindow):
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
 
-    def _set_main_routine_excluded_only(self, enabled: bool) -> None:
-        self._main_routine_excluded_only = bool(enabled)
+    def _current_main_routine_stock_scope(self) -> str:
+        if bool(getattr(self, "_main_routine_excluded_only", False)):
+            return "excluded"
+        scope = str(
+            getattr(self, "_main_routine_stock_scope", "normal") or "normal"
+        ).strip().lower()
+        return scope if scope in {"normal", "all", "operation", "review"} else "normal"
+
+    def _assign_main_routine_stock_scope(
+        self,
+        scope: str,
+        enabled: bool,
+    ) -> None:
+        clean_scope = str(scope or "").strip().lower()
+        if clean_scope not in {"all", "operation", "excluded", "review"}:
+            clean_scope = "normal"
+        current_scope = MainWindow._current_main_routine_stock_scope(self)
+        target_scope = clean_scope if bool(enabled) else "normal"
+        if bool(enabled) and current_scope == clean_scope:
+            target_scope = clean_scope
+        self._main_routine_stock_scope = target_scope
+        self._main_routine_excluded_only = target_scope == "excluded"
+
+    def _set_main_routine_stock_scope(
+        self,
+        scope: str,
+        enabled: bool,
+    ) -> None:
+        MainWindow._assign_main_routine_stock_scope(self, scope, enabled)
         self._update_main_routine_filter_badges()
         self._reload_main_routine_table_preserving_view()
+
+    def _set_main_routine_excluded_only(self, enabled: bool) -> None:
+        MainWindow._set_main_routine_stock_scope(self, "excluded", enabled)
 
     def _set_main_routine_display_level(self, level: str) -> None:
         clean_level = str(level or "").strip()
@@ -2649,6 +4165,25 @@ class MainWindow(QMainWindow):
                 border: 1px solid #cfd6df;
                 border-radius: 4px;
             }
+            QWidget#mainDashboardRoot QComboBox#kiwoomAccountCombo {
+                min-height: 24px;
+                padding-left: 10px;
+                padding-right: 10px;
+                background: transparent;
+                border: none;
+                border-radius: 0;
+                outline: none;
+            }
+            QWidget#mainDashboardRoot QComboBox#kiwoomAccountCombo::drop-down {
+                width: 0;
+                border: none;
+                background: transparent;
+            }
+            QWidget#mainDashboardRoot QComboBox#kiwoomAccountCombo::down-arrow {
+                width: 0;
+                height: 0;
+                image: none;
+            }
             QWidget#mainDashboardRoot QPushButton {
                 min-height: 28px;
                 padding: 4px 10px;
@@ -2709,10 +4244,27 @@ class MainWindow(QMainWindow):
     def _connect_events(self) -> None:
         self.btn_exit.clicked.connect(self.close)
         self.btn_kiwoom_login.clicked.connect(self.login_kiwoom_manually)
-        account_changed = getattr(self.account_combo, "currentTextChanged", None)
+        account_changed = getattr(self.account_combo, "currentIndexChanged", None)
         if account_changed is not None:
             account_changed.connect(self.on_kiwoom_account_changed)
-        self.btn_emergency_stop.clicked.connect(self.on_emergency_stop_clicked)
+        self.account_memo_edit.returnPressed.connect(
+            self.save_current_account_memo_input
+        )
+        self.account_memo_edit.editingFinished.connect(
+            self.save_current_account_memo_input
+        )
+        self.btn_account_authentication.clicked.connect(
+            self.open_current_account_authentication
+        )
+        self.btn_account_requery.clicked.connect(self.requery_current_account_funds)
+        account_context_menu = getattr(
+            self.account_combo.view(),
+            "customContextMenuRequested",
+            None,
+        )
+        if account_context_menu is not None:
+            account_context_menu.connect(self.open_kiwoom_account_context_menu)
+        self.btn_emergency_stop.doubleClicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
         self.btn_close_all_windows.clicked.connect(
@@ -2794,6 +4346,9 @@ class MainWindow(QMainWindow):
         """Refresh monitoring from canonical readers after an operation cycle."""
         if getattr(self, "_main_window_closing", False):
             return
+        self.last_buffer_response_cycle_reconciliation_result = (
+            reconcile_main_window_buffer_response_cycle(self)
+        )
         self.refresh_auto_trade_assignment_views()
 
     def _production_recovery_status_result(self) -> dict[str, object]:
@@ -3008,7 +4563,13 @@ class MainWindow(QMainWindow):
                 )
 
         context = production_recovery_registry.snapshot()
-        if recovery_account_allows_isolated_stock_operation(context):
+        current_session_participants = (
+            auto_trade_current_session_operation_participant_codes(self)
+        )
+        if (
+            recovery_account_allows_isolated_stock_operation(context)
+            and current_session_participants
+        ):
             host = self.main_monitoring_auto_trade_operation_host()
             starter = getattr(host, "start_after_recovery", None)
             if callable(starter):
@@ -3034,6 +4595,15 @@ class MainWindow(QMainWindow):
                     return
         else:
             self._stop_production_recovery_timers()
+            self._production_recovery_timer_start_result = {
+                "started": False,
+                "started_count": 0,
+                "reason_code": (
+                    "NO_CURRENT_SESSION_OPERATION_PARTICIPATION"
+                    if recovery_account_allows_isolated_stock_operation(context)
+                    else "RECOVERY_NOT_OPERATION_READY"
+                ),
+            }
         self._production_recovery_status_result()
         context = production_recovery_registry.snapshot()
         if context is not None and context.identity == identity:
@@ -3050,6 +4620,27 @@ class MainWindow(QMainWindow):
                 reason_code=str(context.account_status or ""),
             )
             self._request_account_funds_after_recovery(identity)
+            self.update_budget_panel()
+            self.last_buffer_response_early_close_resume_result = (
+                resume_main_window_buffer_early_close(
+                    self,
+                    recovery_identity=identity,
+                )
+            )
+            self.last_buffer_response_immediate_preparation_resume_result = (
+                resume_main_window_buffer_immediate_liquidation_preparation(
+                    self,
+                    recovery_identity=identity,
+                )
+            )
+            self.last_buffer_response_immediate_dispatch_resume_result = (
+                dispatch_ready_main_window_buffer_immediate_preparations(
+                    self,
+                    preparation_resume_result=(
+                        self.last_buffer_response_immediate_preparation_resume_result
+                    ),
+                )
+            )
         window = getattr(self, "auto_trade_setting_window", None)
         updater = getattr(window, "update_startup_recovery_controls", None)
         if callable(updater):
@@ -3061,6 +4652,27 @@ class MainWindow(QMainWindow):
         recovered_account = str(getattr(identity, "account_no", "") or "").strip()
         if not recovered_account or recovered_account != self.selected_account_no():
             return {"ok": False, "status": "STALE_RECOVERY_ACCOUNT"}
+        try:
+            projection = object.__getattribute__(self, "_account_funds_projection")
+        except (AttributeError, RuntimeError):
+            projection = None
+        snapshot = getattr(projection, "snapshot", None)
+        if (
+            snapshot is not None
+            and snapshot.account_id == recovered_account
+            and (
+                snapshot.status in (ACCOUNT_FUNDS_LOADING, ACCOUNT_FUNDS_READY)
+                or (
+                    snapshot.status == ACCOUNT_FUNDS_FAILED
+                    and snapshot.error_kind == ACCOUNT_AUTHENTICATION_REQUIRED
+                )
+            )
+        ):
+            return {
+                "ok": snapshot.status == ACCOUNT_FUNDS_READY,
+                "status": snapshot.status,
+                "account_id": recovered_account,
+            }
         return self.request_account_funds()
 
     def _on_production_recovery_snapshot(
@@ -3150,6 +4762,69 @@ class MainWindow(QMainWindow):
         production_recovery_registry.mark_collecting(identity)
         self._production_recovery_status_result()
         return self._request_production_recovery_snapshot(identity, "HOLDINGS")
+
+    def _restart_failed_production_recovery_after_account_funds_success(
+        self,
+        account_no: object,
+    ) -> bool:
+        """Retry the existing Recovery entrypoint after verified account funds."""
+        account = str(account_no or "").strip()
+        if not account or not self._kiwoom_connected_for_budget():
+            return False
+        if account != str(self.selected_account_no() or "").strip():
+            return False
+        try:
+            authentication_states = object.__getattribute__(
+                self,
+                "_account_authentication_states",
+            )
+            query_states = object.__getattribute__(self, "_account_query_states")
+            projection = object.__getattribute__(self, "_account_funds_projection")
+            window_identity = object.__getattribute__(
+                self,
+                "_production_recovery_identity",
+            )
+        except (AttributeError, RuntimeError):
+            return False
+        if authentication_states.get(account) != ACCOUNT_FUNDS_READY:
+            return False
+        if query_states.get(account) != ACCOUNT_FUNDS_READY:
+            return False
+
+        snapshot = projection.snapshot
+        if snapshot.status != ACCOUNT_FUNDS_READY or snapshot.account_id != account:
+            return False
+        for amount in (snapshot.deposit, snapshot.orderable_cash):
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                return False
+
+        context = production_recovery_registry.snapshot()
+        if (
+            context is None
+            or context.account_status != ACCOUNT_FAILED
+            or window_identity is None
+            or context.identity != window_identity
+        ):
+            return False
+
+        identity = context.identity
+        api = getattr(self, "kiwoom_api", None)
+        login_session_reader = getattr(api, "login_session_id", None)
+        try:
+            login_session_id = (
+                str(login_session_reader() or "").strip()
+                if callable(login_session_reader)
+                else ""
+            )
+        except Exception:
+            return False
+        if (
+            identity.account_no != account
+            or identity.login_session_id != login_session_id
+            or identity.trading_day != datetime.now().date().isoformat()
+        ):
+            return False
+        return self.start_production_recovery() is True
 
     def production_recovery_gate_for_stock(
         self,
@@ -3531,6 +5206,7 @@ class MainWindow(QMainWindow):
                 "설치 상태와 32비트 실행 환경을 확인하십시오."
             )
             self.login_status_label.setText(message)
+            self._apply_kiwoom_login_button_state("DISCONNECTED")
             self.statusBar().showMessage(message)
             return
 
@@ -3543,16 +5219,20 @@ class MainWindow(QMainWindow):
                     "설치 상태와 32비트 실행 환경을 확인하십시오."
                 )
                 self.login_status_label.setText(message)
+                self._apply_kiwoom_login_button_state("DISCONNECTED")
                 self.statusBar().showMessage(message)
                 return
             if api.is_connected():
                 message = "로그인 상태: 연결됨"
                 self.login_status_label.setText(message)
+                self._apply_connected_kiwoom_login_button_state()
                 self.refresh_kiwoom_accounts()
                 self.sync_account_funds_selection(connected=True)
+                self.request_account_funds()
                 self.statusBar().showMessage(message)
                 return
 
+            self._apply_kiwoom_login_button_state("LOGIN_IN_PROGRESS")
             result = api.login()
         except Exception:
             LOGGER.exception("Kiwoom login request failed")
@@ -3561,14 +5241,17 @@ class MainWindow(QMainWindow):
                 "키움 OpenAPI 상태를 확인한 뒤 다시 시도하십시오."
             )
             self.login_status_label.setText(message)
+            self._apply_kiwoom_login_button_state("DISCONNECTED")
             self.statusBar().showMessage(message)
             return
 
         status = str(result.get("status", ""))
         if status == "login_requested":
             message = "로그인 요청됨"
+            self._apply_kiwoom_login_button_state("LOGIN_IN_PROGRESS")
         elif result.get("connected"):
             message = "로그인 상태: 연결됨"
+            self._apply_connected_kiwoom_login_button_state()
         else:
             reason = result.get("error") or result.get("message") or status or "unknown error"
             LOGGER.error("Kiwoom login request failed: %s", reason)
@@ -3576,6 +5259,7 @@ class MainWindow(QMainWindow):
                 "키움 로그인 요청을 완료하지 못했습니다. "
                 "키움 OpenAPI 상태를 확인한 뒤 다시 시도하십시오."
             )
+            self._apply_kiwoom_login_button_state("DISCONNECTED")
 
         self.login_status_label.setText(message)
         self.refresh_kiwoom_accounts()
@@ -3588,16 +5272,21 @@ class MainWindow(QMainWindow):
         if connected:
             label_text = "로그인 상태: 연결됨"
             status_message = message or label_text
+            self._apply_connected_kiwoom_login_button_state()
         else:
             label_text = "로그인 상태: 실패"
             status_message = message or label_text
+            self._apply_kiwoom_login_button_state("DISCONNECTED")
 
         self.login_status_label.setText(label_text)
         self.refresh_kiwoom_accounts()
         self.sync_account_funds_selection(connected=connected)
         if connected:
+            self.request_account_funds()
             self.start_production_recovery()
         else:
+            self._account_authentication_states.clear()
+            self._account_query_states.clear()
             self._stop_production_recovery_timers()
             production_recovery_registry.invalidate("login disconnected")
             self._production_recovery_identity = None
@@ -3606,7 +5295,23 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message)
 
     def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
+        self.save_current_account_memo_input()
+        combo = getattr(self, "account_combo", None)
+        current_data = getattr(combo, "currentData", None)
+        self.load_current_account_memo_input()
+        if callable(current_data):
+            active = bool(current_data(ACCOUNT_ACTIVE_ROLE))
+            account = str(current_data(ACCOUNT_NO_ROLE) or "").strip()
+            if combo.currentIndex() >= 0 and not active:
+                self.refresh_account_authentication_ui()
+                self.refresh_account_query_status_ui()
+                return
+            if active and account:
+                self._selected_kiwoom_account_no = account
         self.sync_account_funds_selection()
+        self.refresh_account_authentication_ui()
+        self.refresh_account_query_status_ui()
+        self.request_account_funds()
         if self._production_recovery_required():
             self.start_production_recovery()
             return
@@ -3614,6 +5319,89 @@ class MainWindow(QMainWindow):
         production_recovery_registry.invalidate("account changed")
         self._production_recovery_identity = None
         self._production_recovery_parts = {}
+
+    def _displayed_active_account_no(self) -> str:
+        combo = getattr(self, "account_combo", None)
+        if combo is None or not combo.isEnabled() or combo.currentIndex() < 0:
+            return ""
+        if not bool(combo.currentData(ACCOUNT_ACTIVE_ROLE)):
+            return ""
+        account = str(combo.currentData(ACCOUNT_NO_ROLE) or "").strip()
+        return account if account in self.kiwoom_account_numbers() else ""
+
+    def refresh_account_authentication_ui(self) -> None:
+        account = self._displayed_active_account_no()
+        state = str(self._account_authentication_states.get(account, "") or "")
+        visible = bool(account)
+        completed = visible and state == ACCOUNT_FUNDS_READY
+        self.account_auth_separator.hide()
+        self.account_auth_label.show()
+        self.account_auth_neutral_label.setVisible(not visible)
+        self.account_auth_done_label.setVisible(completed)
+        self.btn_account_authentication.setVisible(visible and not completed)
+        self.btn_account_authentication.setEnabled(visible and not completed)
+        self.refresh_account_query_status_ui()
+
+    def refresh_account_query_status_ui(self) -> None:
+        account = self._displayed_active_account_no()
+        visible = bool(account)
+        authenticated = (
+            visible
+            and self._account_authentication_states.get(account)
+            == ACCOUNT_FUNDS_READY
+        )
+        query_state = str(self._account_query_states.get(account, "") or "")
+        normal = authenticated and query_state == ACCOUNT_FUNDS_READY
+        retryable = authenticated and query_state == ACCOUNT_FUNDS_FAILED
+        neutral = not normal and not retryable
+        self.account_query_status_label.show()
+        self.account_query_normal_label.setVisible(normal)
+        self.account_query_neutral_label.setVisible(neutral)
+        self.btn_account_requery.setVisible(retryable)
+        self.btn_account_requery.setEnabled(retryable)
+
+    def on_kiwoom_account_authentication_required(self, payload) -> None:
+        evidence = payload if isinstance(payload, dict) else {}
+        account = str(evidence.get("account_id") or "").strip()
+        if account and account in self.kiwoom_account_numbers():
+            self._account_authentication_states[account] = (
+                ACCOUNT_AUTHENTICATION_REQUIRED
+            )
+            self._account_query_states[account] = ACCOUNT_FUNDS_FAILED
+        self.refresh_account_authentication_ui()
+
+    def open_current_account_authentication(self) -> None:
+        account = self._displayed_active_account_no()
+        if (
+            not account
+            or self._account_authentication_states.get(account)
+            == ACCOUNT_FUNDS_READY
+        ):
+            return
+        api = getattr(self, "kiwoom_api", None)
+        opener = getattr(api, "show_account_password_window", None)
+        if not callable(opener):
+            self.statusBar().showMessage("계좌비밀번호 입력 기능을 사용할 수 없습니다.")
+            return
+        result = opener()
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            self.statusBar().showMessage("계좌비밀번호 입력창을 열지 못했습니다.")
+            self.refresh_account_authentication_ui()
+            return
+        if self._displayed_active_account_no() == account:
+            self.request_account_funds()
+
+    def requery_current_account_funds(self) -> None:
+        account = self._displayed_active_account_no()
+        if (
+            not account
+            or self._account_authentication_states.get(account)
+            != ACCOUNT_FUNDS_READY
+            or self._account_query_states.get(account) != ACCOUNT_FUNDS_FAILED
+        ):
+            self.refresh_account_query_status_ui()
+            return
+        self.request_account_funds(query_reason="MANUAL_REQUERY")
 
     def kiwoom_account_numbers(self) -> list[str]:
         api = getattr(self, "kiwoom_api", None)
@@ -3635,34 +5423,341 @@ class MainWindow(QMainWindow):
             seen.add(account)
         return accounts
 
+    def account_memos(self) -> dict[str, str]:
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return {}
+        try:
+            raw_value = settings.value(ACCOUNT_MEMOS_SETTINGS_KEY, "")
+            raw = json.loads(str(raw_value or "{}"))
+        except Exception:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, str] = {}
+        for raw_account, raw_memo in raw.items():
+            account = str(raw_account or "").strip()
+            memo = str(raw_memo or "").strip()[:8]
+            if account and memo:
+                result[account] = memo
+        return result
+
+    def set_account_memo(self, account_no: str, memo: str) -> None:
+        account = str(account_no or "").strip()
+        if not account:
+            return
+        memos = self.account_memos()
+        clean_memo = str(memo or "").strip()[:8]
+        if clean_memo:
+            memos[account] = clean_memo
+        else:
+            memos.pop(account, None)
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return
+        settings.setValue(
+            ACCOUNT_MEMOS_SETTINGS_KEY,
+            json.dumps(memos, ensure_ascii=False, sort_keys=True),
+        )
+        settings.sync()
+        combo = getattr(self, "account_combo", None)
+        if combo is not None:
+            for row in range(combo.count()):
+                if str(combo.itemData(row, ACCOUNT_NO_ROLE) or "").strip() == account:
+                    combo.setItemData(row, clean_memo, ACCOUNT_POPUP_MEMO_ROLE)
+                    break
+            combo.view().viewport().update()
+
+    def save_current_account_memo_input(self) -> None:
+        if bool(getattr(self, "_account_memo_loading", False)):
+            return
+        editor = getattr(self, "account_memo_edit", None)
+        account = str(
+            getattr(self, "_account_memo_edit_account_no", "") or ""
+        ).strip()
+        if editor is None or not account:
+            return
+        memo = str(editor.text() or "").strip()[:8]
+        self.set_account_memo(account, memo)
+        if editor.text() != memo:
+            self._account_memo_loading = True
+            try:
+                editor.setText(memo)
+            finally:
+                self._account_memo_loading = False
+
+    def load_current_account_memo_input(self) -> None:
+        editor = getattr(self, "account_memo_edit", None)
+        combo = getattr(self, "account_combo", None)
+        if editor is None or combo is None:
+            return
+        current_data = getattr(combo, "currentData", None)
+        account = (
+            str(current_data(ACCOUNT_NO_ROLE) or "").strip()
+            if callable(current_data) and combo.currentIndex() >= 0
+            else ""
+        )
+        self._account_memo_loading = True
+        try:
+            self._account_memo_edit_account_no = account
+            editor.setEnabled(bool(account))
+            editor.setText(self.account_memos().get(account, "") if account else "")
+        finally:
+            self._account_memo_loading = False
+
+    def remembered_account_numbers(self) -> list[str]:
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return []
+        try:
+            raw = json.loads(
+                str(settings.value(ACCOUNT_HISTORY_SETTINGS_KEY, "[]") or "[]")
+            )
+        except Exception:
+            raw = []
+        values = list(raw) if isinstance(raw, list) else []
+        values.extend(self.account_memos().keys())
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            account = str(value or "").strip()
+            if account and account not in seen:
+                result.append(account)
+                seen.add(account)
+        return result
+
+    def remember_account_numbers(self, accounts: list[str]) -> list[str]:
+        remembered = self.remembered_account_numbers()
+        merged = list(remembered)
+        for value in accounts:
+            account = str(value or "").strip()
+            if account and account not in merged:
+                merged.append(account)
+        if merged == remembered:
+            return merged
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is not None:
+            settings.setValue(
+                ACCOUNT_HISTORY_SETTINGS_KEY,
+                json.dumps(merged, ensure_ascii=False),
+            )
+            settings.sync()
+        return merged
+
+    def _create_account_info_context_menu(self, account_no: str):
+        account = str(account_no or "").strip()
+        menu = QMenu(self)
+        action = menu.addAction("정보삭제")
+        action.setEnabled(
+            bool(account) and account not in set(self.kiwoom_account_numbers())
+        )
+        return menu, action
+
+    def _confirm_delete_saved_account_info(self) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setWindowTitle("계좌정보 삭제")
+        dialog.setText("저장된 계좌정보를 삭제하시겠습니까?")
+        delete_button = dialog.addButton("삭제", QMessageBox.DestructiveRole)
+        cancel_button = dialog.addButton("취소", QMessageBox.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec_()
+        return dialog.clickedButton() is delete_button
+
+    def delete_saved_account_info(self, account_no: str) -> bool:
+        account = str(account_no or "").strip()
+        if not account or account in set(self.kiwoom_account_numbers()):
+            return False
+        remembered = [
+            value for value in self.remembered_account_numbers() if value != account
+        ]
+        memos = self.account_memos()
+        memos.pop(account, None)
+        try:
+            settings = object.__getattribute__(self, "_account_memo_settings")
+        except (AttributeError, RuntimeError):
+            settings = None
+        if settings is None:
+            return False
+        settings.setValue(
+            ACCOUNT_HISTORY_SETTINGS_KEY,
+            json.dumps(remembered, ensure_ascii=False),
+        )
+        settings.setValue(
+            ACCOUNT_MEMOS_SETTINGS_KEY,
+            json.dumps(memos, ensure_ascii=False, sort_keys=True),
+        )
+        settings.sync()
+        if str(getattr(self, "_account_memo_edit_account_no", "") or "") == account:
+            self._account_memo_loading = True
+            try:
+                self._account_memo_edit_account_no = ""
+                self.account_memo_edit.clear()
+                self.account_memo_edit.setEnabled(False)
+            finally:
+                self._account_memo_loading = False
+        self.refresh_kiwoom_accounts()
+        return True
+
+    def open_kiwoom_account_context_menu(self, position) -> None:
+        combo = getattr(self, "account_combo", None)
+        if combo is None:
+            return
+        view = combo.view()
+        index = view.indexAt(position)
+        if not index.isValid():
+            return
+        self.open_kiwoom_account_context_menu_for_index(
+            index,
+            view.viewport().mapToGlobal(position),
+        )
+
+    def open_kiwoom_account_context_menu_for_index(
+        self,
+        index,
+        global_position,
+    ) -> None:
+        account = str(index.data(ACCOUNT_NO_ROLE) or "").strip()
+        if not account:
+            return
+        menu, delete_action = self._create_account_info_context_menu(account)
+        selected = menu.exec_(global_position)
+        if selected is not delete_action or not delete_action.isEnabled():
+            return
+        if self._confirm_delete_saved_account_info():
+            self.delete_saved_account_info(account)
+
     def refresh_kiwoom_accounts(self) -> list[str]:
         combo = getattr(self, "account_combo", None)
         if combo is None:
             return []
 
+        self.save_current_account_memo_input()
+        api = getattr(self, "kiwoom_api", None)
+        is_connected = getattr(api, "is_connected", None)
+        try:
+            connected = bool(is_connected()) if callable(is_connected) else False
+        except Exception:
+            connected = False
+        accounts = self.kiwoom_account_numbers() if connected else []
+        if not accounts:
+            combo.hidePopup()
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.setCurrentIndex(-1)
+                combo.setEnabled(False)
+                self._selected_kiwoom_account_no = ""
+            finally:
+                combo.blockSignals(False)
+            self.load_current_account_memo_input()
+            self.refresh_account_authentication_ui()
+            return []
+
+        current_data = getattr(combo, "currentData", None)
+        viewed_account = (
+            str(current_data(ACCOUNT_NO_ROLE) or "").strip()
+            if callable(current_data) and combo.currentIndex() >= 0
+            else ""
+        )
         current = self.selected_account_no()
-        accounts = self.kiwoom_account_numbers()
+        active_accounts = set(accounts)
+        remembered = self.remember_account_numbers(accounts)
+        memos = self.account_memos()
+        inactive_accounts = [
+            account for account in remembered if account not in active_accounts
+        ]
+        displayed_accounts = list(accounts) + inactive_accounts
         combo.blockSignals(True)
         try:
             combo.clear()
-            combo.addItems(accounts)
-            combo.setEnabled(bool(accounts))
-            if len(accounts) == 1:
-                combo.setCurrentIndex(0)
-            elif current and current in accounts:
-                combo.setCurrentIndex(accounts.index(current))
+            add_item = getattr(combo, "addItem", None)
+            if callable(add_item):
+                for account in displayed_accounts:
+                    active = account in active_accounts
+                    add_item(account_combo_display_text(account), account)
+                    row = combo.count() - 1
+                    combo.setItemData(
+                        row,
+                        memos.get(account, ""),
+                        ACCOUNT_POPUP_MEMO_ROLE,
+                    )
+                    combo.setItemData(row, active, ACCOUNT_ACTIVE_ROLE)
+                    if not active:
+                        combo.setItemData(
+                            row,
+                            QBrush(QColor("#9CA3AF")),
+                            Qt.ForegroundRole,
+                        )
+                    item_reader = getattr(combo.model(), "item", None)
+                    item = item_reader(row) if callable(item_reader) else None
+                    if item is not None:
+                        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             else:
-                combo.setCurrentIndex(-1)
+                combo.addItems(accounts)
+            combo.setEnabled(bool(displayed_accounts))
+            selected_account = ""
+            if len(accounts) == 1:
+                selected_account = accounts[0]
+            elif current and current in accounts:
+                selected_account = current
+            display_account = (
+                viewed_account
+                if viewed_account in displayed_accounts
+                else selected_account
+            )
+            if not display_account and not accounts and displayed_accounts:
+                display_account = displayed_accounts[0]
+            combo.setCurrentIndex(
+                displayed_accounts.index(display_account)
+                if display_account in displayed_accounts
+                else -1
+            )
+            try:
+                self._selected_kiwoom_account_no = selected_account
+            except RuntimeError:
+                pass
         finally:
             combo.blockSignals(False)
+        self.load_current_account_memo_input()
+        self.refresh_account_authentication_ui()
         return accounts
 
     def selected_account_no(self) -> str:
         combo = getattr(self, "account_combo", None)
         if combo is None or not combo.isEnabled():
             return ""
+        accounts = self.kiwoom_account_numbers()
+        current_data = getattr(combo, "currentData", None)
+        if callable(current_data):
+            active = bool(current_data(ACCOUNT_ACTIVE_ROLE))
+            account = str(current_data(ACCOUNT_NO_ROLE) or "").strip()
+            if active and account in accounts:
+                self._selected_kiwoom_account_no = account
+                return account
+            try:
+                selected = str(
+                    object.__getattribute__(self, "_selected_kiwoom_account_no")
+                    or ""
+                ).strip()
+            except (AttributeError, RuntimeError):
+                selected = ""
+            return selected if selected in accounts else ""
         account = str(combo.currentText() or "").strip()
-        return account if account in self.kiwoom_account_numbers() else ""
+        return account if account in accounts else ""
 
     def sync_account_funds_selection(self, *, connected: bool | None = None):
         """Project the selected login account into the memory-only funds view."""
@@ -3685,7 +5780,55 @@ class MainWindow(QMainWindow):
         self.render_account_funds_snapshot(snapshot)
         return snapshot
 
-    def request_account_funds(self) -> dict[str, object]:
+    def _append_account_query_journal_event(
+        self,
+        event_type: str,
+        *,
+        account_id: str,
+        request_id: int,
+        query_reason: str,
+        result: str,
+        payload: object = None,
+    ) -> dict[str, object]:
+        evidence = payload if isinstance(payload, dict) else {}
+        account_display = masked_account_no(account_id)
+        error_code = evidence.get("error_code", evidence.get("result"))
+        reason = str(evidence.get("error") or "").strip()
+        error_kind = str(evidence.get("error_kind") or "").strip()
+        if error_code in (None, "") and reason:
+            code_match = re.search(r"\((\d+)\)\s*$", reason)
+            if code_match:
+                error_code = code_match.group(1)
+        details = {
+            "query_scope": "ACCOUNT_FUNDS",
+            "query_reason": str(query_reason or "INITIAL_QUERY"),
+            "request_id": int(request_id),
+            "retryable": error_kind != ACCOUNT_AUTHENTICATION_REQUIRED,
+        }
+        if error_code not in (None, ""):
+            details["error_code"] = str(error_code)
+        if error_kind:
+            details["error_kind"] = error_kind
+        if reason:
+            details["reason"] = reason[:500]
+        return append_production_event(
+            event_type,
+            severity="WARNING" if result == "FAILED" else "INFO",
+            result=result,
+            source="MainWindow.request_account_funds",
+            template_args={"account_display": account_display},
+            target_type="ACCOUNT",
+            target_id=account_display,
+            target_name=account_display,
+            reason_code=error_kind or (str(error_code) if error_code not in (None, "") else ""),
+            details=details,
+        )
+
+    def request_account_funds(
+        self,
+        *,
+        query_reason: str = "INITIAL_QUERY",
+    ) -> dict[str, object]:
         """Run an injected adapter; the Production Kiwoom adapter is intentionally absent."""
         adapter = getattr(self, "account_funds_adapter", None)
         requester = getattr(adapter, "request_account_funds", None)
@@ -3696,11 +5839,68 @@ class MainWindow(QMainWindow):
         if request is None:
             self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
             return {"ok": False, "status": "ACCOUNT_UNAVAILABLE"}
+        manual_requery = str(query_reason or "").strip() == "MANUAL_REQUERY"
+        requested_event = (
+            "ACCOUNT_REQUERY_REQUESTED"
+            if manual_requery
+            else "ACCOUNT_QUERY_REQUESTED"
+        )
+        try:
+            query_states = object.__getattribute__(self, "_account_query_states")
+        except (AttributeError, RuntimeError):
+            query_states = {}
+            try:
+                object.__setattr__(self, "_account_query_states", query_states)
+            except RuntimeError:
+                pass
+        query_states[request.account_id] = ACCOUNT_FUNDS_LOADING
+        self._append_account_query_journal_event(
+            requested_event,
+            account_id=request.account_id,
+            request_id=request.request_id,
+            query_reason=query_reason,
+            result="REQUESTED",
+        )
         self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
 
+        result_recorded = False
+
         def on_result(payload) -> None:
+            nonlocal result_recorded
             if self._account_funds_projection.apply_result(request, payload):
                 self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+                evidence = payload if isinstance(payload, dict) else {}
+                succeeded = evidence.get("ok") is True
+                error_kind = str(evidence.get("error_kind") or "").strip()
+                if succeeded:
+                    event_type = (
+                        "ACCOUNT_REQUERY_SUCCEEDED"
+                        if manual_requery
+                        else "ACCOUNT_QUERY_SUCCEEDED"
+                    )
+                    journal_result = "SUCCESS"
+                elif manual_requery:
+                    event_type = "ACCOUNT_REQUERY_FAILED"
+                    journal_result = "FAILED"
+                elif error_kind == ACCOUNT_AUTHENTICATION_REQUIRED:
+                    event_type = "ACCOUNT_AUTH_REQUIRED"
+                    journal_result = "FAILED"
+                else:
+                    event_type = "ACCOUNT_QUERY_FAILED"
+                    journal_result = "FAILED"
+                self._append_account_query_journal_event(
+                    event_type,
+                    account_id=request.account_id,
+                    request_id=request.request_id,
+                    query_reason=query_reason,
+                    result=journal_result,
+                    payload=evidence,
+                )
+                result_recorded = True
+                if succeeded:
+                    self._restart_failed_production_recovery_after_account_funds_success(
+                        request.account_id
+                    )
 
         try:
             adapter_result = requester(
@@ -3711,8 +5911,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             if self._account_funds_projection.fail_request(request, exc):
                 self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
+                self._append_account_query_journal_event(
+                    "ACCOUNT_REQUERY_FAILED" if manual_requery else "ACCOUNT_QUERY_FAILED",
+                    account_id=request.account_id,
+                    request_id=request.request_id,
+                    query_reason=query_reason,
+                    result="FAILED",
+                    payload={"error": str(exc)},
+                )
             return {"ok": False, "status": ACCOUNT_FUNDS_FAILED}
         if isinstance(adapter_result, dict) and adapter_result.get("ok") is False:
+            if not result_recorded:
+                on_result(adapter_result)
             self.render_account_funds_snapshot(self._account_funds_projection.snapshot)
             return {"ok": False, "status": ACCOUNT_FUNDS_FAILED}
         return {
@@ -3725,8 +5935,38 @@ class MainWindow(QMainWindow):
     def render_account_funds_snapshot(self, snapshot=None) -> None:
         """Bind one memory snapshot to the existing account/funds labels."""
         snapshot = snapshot or self._account_funds_projection.snapshot
-        account_text = snapshot.account_display or "-"
-        self.account_label.setText(f"계좌번호: {account_text}")
+        self.account_label.setText("계좌정보 :")
+        account_id = str(getattr(snapshot, "account_id", "") or "").strip()
+        try:
+            authentication_states = object.__getattribute__(
+                self,
+                "_account_authentication_states",
+            )
+        except (AttributeError, RuntimeError):
+            authentication_states = None
+        if isinstance(authentication_states, dict):
+            if snapshot.status == ACCOUNT_FUNDS_READY and account_id:
+                authentication_states[account_id] = ACCOUNT_FUNDS_READY
+            elif (
+                snapshot.status == ACCOUNT_FUNDS_FAILED
+                and str(getattr(snapshot, "error_kind", "") or "")
+                == ACCOUNT_AUTHENTICATION_REQUIRED
+                and account_id
+            ):
+                authentication_states[account_id] = (
+                    ACCOUNT_AUTHENTICATION_REQUIRED
+                )
+        try:
+            query_states = object.__getattribute__(self, "_account_query_states")
+        except (AttributeError, RuntimeError):
+            query_states = None
+        if (
+            isinstance(query_states, dict)
+            and account_id
+            and snapshot.status
+            in (ACCOUNT_FUNDS_LOADING, ACCOUNT_FUNDS_READY, ACCOUNT_FUNDS_FAILED)
+        ):
+            query_states[account_id] = snapshot.status
 
         if snapshot.status == ACCOUNT_FUNDS_DISCONNECTED:
             account_type = "-"
@@ -3745,8 +5985,8 @@ class MainWindow(QMainWindow):
             buy_status = "확인 필요"
         elif snapshot.status == ACCOUNT_FUNDS_READY:
             account_type = snapshot.account_type or "확인 필요"
-            deposit = format_account_funds_money(snapshot.deposit)
-            orderable = format_account_funds_money(snapshot.orderable_cash)
+            deposit = format_account_funds_money(snapshot.deposit).removesuffix("원")
+            orderable = format_account_funds_money(snapshot.orderable_cash).removesuffix("원")
             buy_status = "확인 필요"
         else:
             account_type = "-"
@@ -3755,9 +5995,18 @@ class MainWindow(QMainWindow):
             buy_status = "확인 전"
 
         self.account_type_label.setText(f"계좌 구분: {account_type}")
-        self.account_total_deposit_label.setText(deposit)
-        self.account_order_available_label.setText(orderable)
+        set_metric_value_text(self.account_total_deposit_label, deposit)
+        set_metric_value_text(self.account_order_available_label, orderable)
         self.buy_time_status_label.setText(f"매수 가능 상태: {buy_status}")
+        if isinstance(authentication_states, dict):
+            self.refresh_account_authentication_ui()
+        try:
+            budget_total_label = object.__getattribute__(self, "budget_total_label")
+        except (AttributeError, RuntimeError):
+            budget_total_label = None
+        if budget_total_label is not None:
+            self.refresh_main_budget_orderable_validation()
+            update_main_budget_panel(self)
 
     def refresh_all(self) -> None:
         self.load_routine_table()
@@ -3793,7 +6042,322 @@ class MainWindow(QMainWindow):
         window.refresh_all()
 
     def update_budget_panel(self) -> None:
+        self.refresh_main_budget_orderable_validation()
         update_main_budget_panel(self)
+
+    def _kiwoom_connected_for_budget(self) -> bool:
+        api = getattr(self, "kiwoom_api", None)
+        is_connected = getattr(api, "is_connected", None)
+        try:
+            return bool(is_connected()) if callable(is_connected) else False
+        except Exception:
+            return False
+
+    def current_orderable_cash_for_budget(self) -> int | None:
+        """Return one READY snapshot for the currently selected active account."""
+        if not self._kiwoom_connected_for_budget():
+            return None
+        account_no = str(self.selected_account_no() or "").strip()
+        if not account_no:
+            return None
+        snapshot = self._account_funds_projection.snapshot
+        if (
+            snapshot.status != ACCOUNT_FUNDS_READY
+            or str(snapshot.account_id or "").strip() != account_no
+            or snapshot.orderable_cash is None
+        ):
+            return None
+        try:
+            amount = int(snapshot.orderable_cash)
+        except (TypeError, ValueError):
+            return None
+        return amount if amount >= 0 else None
+
+    def refresh_main_budget_orderable_validation(self) -> bool | None:
+        """Project account-fit without mutating the saved total-budget amount."""
+        if not self._kiwoom_connected_for_budget():
+            self._main_budget_orderable_valid = None
+            self.budget_total_label.setToolTip("더블클릭하여 전체예산 설정")
+            return None
+        orderable = self.current_orderable_cash_for_budget()
+        if orderable is None:
+            self._main_budget_orderable_valid = False
+            self.budget_total_label.setToolTip("주문 가능금액 확인 후 사용 가능")
+            return False
+        total_budget = int(collect_main_budget_summary().get("total_budget", 0))
+        valid = total_budget <= orderable
+        self._main_budget_orderable_valid = valid
+        self.budget_total_label.setToolTip(
+            "더블클릭하여 전체예산 설정"
+            if valid
+            else "전체예산이 주문 가능금액을 초과합니다."
+        )
+        return valid
+
+    def show_main_total_budget_popup(self) -> None:
+        popup = getattr(self, "_main_total_budget_popup", None)
+        if popup is not None:
+            popup.show_below(self.budget_total_label)
+
+    def _show_main_budget_setting_notice(self, message: str) -> None:
+        show_toast(
+            parent=self,
+            message=message,
+            duration_ms=1800,
+            position="center",
+        )
+
+    def _save_main_total_budget(
+        self,
+        value: object,
+        *,
+        orderable_cash: int | None,
+    ) -> bool:
+        try:
+            persist_main_total_budget(value, orderable_cash=orderable_cash)
+        except (TypeError, ValueError):
+            self._show_main_budget_setting_notice("전체예산을 확인하세요.")
+            return False
+        self.update_budget_panel()
+        return True
+
+    def main_total_budget_rounding_enabled(self) -> bool:
+        settings = self._account_memo_settings
+        raw_value = settings.value(TOTAL_BUDGET_ROUNDING_SETTINGS_KEY, True)
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return bool(raw_value)
+        return str(raw_value).strip().lower() not in {"0", "false", "no", "off"}
+
+    def set_main_total_budget_rounding_enabled(self, enabled: bool) -> None:
+        self._account_memo_settings.setValue(
+            TOTAL_BUDGET_ROUNDING_SETTINGS_KEY,
+            bool(enabled),
+        )
+
+    def main_budget_warning_enabled(self) -> bool:
+        raw_value = self._account_memo_settings.value(
+            BUDGET_WARNING_SETTINGS_KEY,
+            True,
+        )
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return bool(raw_value)
+        return str(raw_value).strip().lower() not in {"0", "false", "no", "off"}
+
+    def set_main_budget_warning_enabled(self, enabled: bool) -> None:
+        clean_enabled = bool(enabled)
+        self._account_memo_settings.setValue(
+            BUDGET_WARNING_SETTINGS_KEY,
+            clean_enabled,
+        )
+        MainWindow._apply_main_budget_warning_badge_style(self, clean_enabled)
+
+    def _apply_main_budget_warning_badge_style(self, enabled: bool) -> None:
+        button = getattr(self, "budget_warning_toggle_button", None)
+        if button is not None:
+            button.setText("경고 ON" if enabled else "경고 OFF")
+            badge_content_height = max(
+                AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT - 2,
+                QFontMetrics(button.font()).height(),
+            )
+            text_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if enabled
+                else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+            )
+            border_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if enabled
+                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton#mainBudgetWarningToggle",
+                    text_color=text_color,
+                    border_color=border_color,
+                )
+                + "QPushButton#mainBudgetWarningToggle {"
+                f" min-height: {badge_content_height}px;"
+                f" max-height: {badge_content_height}px;"
+                " }"
+                + "QPushButton#mainBudgetWarningToggle:focus { outline: none; }"
+            )
+
+    def on_main_budget_buffer_response_entry_clicked(self) -> None:
+        """Open the memory-only prototype without executing or saving a strategy."""
+        surface = getattr(self, "_main_buffer_response_settings_surface", None)
+        if surface is None or sip.isdeleted(surface):
+            surface = _BufferResponseSettingsSurface(self)
+            self._main_buffer_response_settings_surface = surface
+        surface.show()
+        surface.raise_()
+        surface.activateWindow()
+
+    def _apply_main_budget_buffer_response_badge_style(
+        self,
+        active: bool,
+        *,
+        content_height: int | None = None,
+    ) -> None:
+        button = getattr(self, "budget_buffer_response_button", None)
+        if button is None:
+            return
+        if content_height is None:
+            content_height = max(
+                AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT - 2,
+                QFontMetrics(button.font()).height(),
+            )
+        color = "#ea580c" if active else MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR
+        border_color = (
+            "#ea580c" if active else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+        )
+        button.setStyleSheet(
+            auto_trade_setting_badge_stylesheet(
+                "QPushButton#mainBudgetBufferResponseEntry",
+                text_color=color,
+                border_color=border_color,
+            )
+            + "QPushButton#mainBudgetBufferResponseEntry {"
+            f" min-height: {content_height}px;"
+            f" max-height: {content_height}px;"
+            " }"
+            + "QPushButton#mainBudgetBufferResponseEntry:focus { outline: none; }"
+        )
+
+    def handle_main_budget_warning_projection(
+        self,
+        *,
+        activity: dict[str, object],
+        buffer_enabled: bool,
+    ) -> None:
+        transition = project_main_budget_warning_transition(
+            previous_available_remaining_ratio=getattr(
+                self,
+                "_main_budget_warning_previous_available_ratio",
+                None,
+            ),
+            previous_buffer_entered=getattr(
+                self,
+                "_main_budget_warning_previous_buffer_entered",
+                None,
+            ),
+            activity=activity,
+            buffer_enabled=buffer_enabled,
+        )
+        self._main_budget_warning_previous_available_ratio = transition.get(
+            "available_remaining_ratio"
+        )
+        self._main_budget_warning_previous_buffer_entered = transition.get(
+            "buffer_entered"
+        )
+
+        if not self.main_budget_warning_enabled():
+            return
+        crossed_threshold = transition.get("available_threshold_crossed")
+        if crossed_threshold is not None:
+            show_toast(
+                parent=self,
+                message=f"가용금액이 {int(crossed_threshold)}% 남았습니다.",
+                duration_ms=2200,
+                position="bottom_right",
+            )
+        if transition.get("buffer_entry_started") is True:
+            show_toast(
+                parent=self,
+                message=(
+                    "경고 완충금액에 진입했습니다.\n"
+                    "종목 강제마감 주의하세요"
+                ),
+                duration_ms=2600,
+                position="bottom_right",
+            )
+
+    def apply_main_total_budget_percentage(self, percent: int) -> bool:
+        orderable = self.current_orderable_cash_for_budget()
+        if orderable is None:
+            self._show_main_budget_setting_notice(
+                "주문 가능금액 확인 후 사용 가능합니다."
+            )
+            return False
+        try:
+            total_budget = total_budget_from_orderable_cash(
+                orderable,
+                percent,
+                align_digits=self.main_total_budget_rounding_enabled(),
+            )
+        except (TypeError, ValueError):
+            self._show_main_budget_setting_notice("전체예산을 확인하세요.")
+            return False
+        return self._save_main_total_budget(
+            total_budget,
+            orderable_cash=orderable,
+        )
+
+    def apply_main_total_budget_direct(self, value: object) -> bool:
+        orderable = None
+        if self._kiwoom_connected_for_budget():
+            orderable = self.current_orderable_cash_for_budget()
+            if orderable is None:
+                self._show_main_budget_setting_notice(
+                    "주문 가능금액 확인 후 사용 가능합니다."
+                )
+                return False
+        return self._save_main_total_budget(value, orderable_cash=orderable)
+
+    def _finish_main_budget_percent_editing(self) -> None:
+        for editor in (
+            self.budget_available_percent_edit,
+            self.budget_buffer_percent_edit,
+        ):
+            editor.finish_display()
+
+    def _commit_main_budget_percent(self, source: str) -> None:
+        summary = collect_main_budget_summary()
+        current_available = int(summary.get("available_budget_percent", 100))
+        current_buffer = int(summary.get("buffer_budget_percent", 0))
+        editor = (
+            self.budget_available_percent_edit
+            if source == "available"
+            else self.budget_buffer_percent_edit
+        )
+        raw_value = editor.text().strip()
+
+        if source == "available" and (
+            raw_value == str(current_available)
+            or (current_buffer == 0 and raw_value == "-")
+        ):
+            self.update_budget_panel()
+            self._finish_main_budget_percent_editing()
+            return
+        if source == "buffer" and (
+            raw_value == str(current_buffer)
+            or (current_buffer == 0 and raw_value == "-")
+        ):
+            self.update_budget_panel()
+            self._finish_main_budget_percent_editing()
+            return
+
+        try:
+            persist_main_budget_percent(source, raw_value)
+        except (TypeError, ValueError):
+            self.update_budget_panel()
+            self._finish_main_budget_percent_editing()
+            show_toast(
+                parent=self,
+                message=(
+                    "가용 비율을 확인하세요."
+                    if source == "available"
+                    else "완충 비율을 확인하세요."
+                ),
+                duration_ms=1800,
+                position="center",
+            )
+            return
+        self.update_budget_panel()
+        self._finish_main_budget_percent_editing()
 
     def review_required_stock_count(self) -> int:
         """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
@@ -4943,7 +7507,7 @@ class MainWindow(QMainWindow):
                 lambda _checked=False: self.request_routine_definition_operation(
                     definition_id,
                     definition.display_name,
-                    MODE_EARLY_CLOSE,
+                    "루틴",
                     ROUTINE_STATUS_EARLY_CLOSE,
                 )
             )
@@ -4951,7 +7515,7 @@ class MainWindow(QMainWindow):
                 lambda _checked=False: self.request_routine_definition_operation(
                     definition_id,
                     definition.display_name,
-                    COMMAND_IMMEDIATE_LIQUIDATION,
+                    POLICY_MARKET,
                     ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
                 )
             )
@@ -4998,7 +7562,7 @@ class MainWindow(QMainWindow):
             lambda _checked=False: self.request_routine_operation(
                 instance_id,
                 instance.display_name,
-                MODE_EARLY_CLOSE,
+                "루틴",
                 ROUTINE_STATUS_EARLY_CLOSE,
             )
         )
@@ -5006,7 +7570,7 @@ class MainWindow(QMainWindow):
             lambda _checked=False: self.request_routine_operation(
                 instance_id,
                 instance.display_name,
-                COMMAND_IMMEDIATE_LIQUIDATION,
+                POLICY_MARKET,
                 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
             )
         )
@@ -5045,7 +7609,7 @@ class MainWindow(QMainWindow):
         self,
         definition_id: str,
         display_name: str,
-        command: str,
+        requested_policy: str,
         display_status: str,
     ) -> None:
         instance_ids = tuple(
@@ -5056,11 +7620,8 @@ class MainWindow(QMainWindow):
             if routine_instance_checked(self, instance_id)
             and self._routine_instance_has_assigned_stocks(instance_id)
         )
-        command_label = (
-            ROUTINE_STATUS_EARLY_CLOSE
-            if command == MODE_EARLY_CLOSE
-            else ROUTINE_STATUS_IMMEDIATE_LIQUIDATION
-        )
+        command_label = display_status
+        market_requested = requested_policy == POLICY_MARKET
         if not instance_ids:
             QMessageBox.warning(
                 self,
@@ -5069,14 +7630,14 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if command == COMMAND_IMMEDIATE_LIQUIDATION:
+        if market_requested:
             answer = _create_routine_operation_confirmation(
                 self,
-                command,
+                display_status,
                 QMessageBox.Warning,
             ).exec_()
         else:
-            answer = _create_routine_operation_confirmation(self, command).exec_()
+            answer = _create_routine_operation_confirmation(self, display_status).exec_()
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(
                 f"카테고리 {command_label} 취소: {display_name}"
@@ -5093,9 +7654,9 @@ class MainWindow(QMainWindow):
                 instance_id,
                 command=MODE_EARLY_CLOSE,
                 caller_name=(
-                    "EARLY_CLOSE_ROUTINE_DEFINITION"
-                    if command == MODE_EARLY_CLOSE
-                    else "IMMEDIATE_LIQUIDATION_ROUTINE_DEFINITION"
+                    "MARKET_EARLY_CLOSE_ROUTINE_DEFINITION"
+                    if market_requested
+                    else "EARLY_CLOSE_ROUTINE_DEFINITION"
                 ),
             ):
                 failed_count += 1
@@ -5106,11 +7667,7 @@ class MainWindow(QMainWindow):
                 target_scope=SCOPE_ROUTINE_INSTANCE,
                 target_id=instance_id,
                 source="main_routine_parent_context_menu",
-                requested_policy=(
-                    "시장가"
-                    if command == COMMAND_IMMEDIATE_LIQUIDATION
-                    else "루틴"
-                ),
+                requested_policy=requested_policy,
                 project_root=PROJECT_ROOT,
                 operation_command_service_factory=OperationCommandService,
             )
@@ -5127,7 +7684,7 @@ class MainWindow(QMainWindow):
                 partial_count += 1
             else:
                 applied_count += 1
-            if command == COMMAND_IMMEDIATE_LIQUIDATION:
+            if market_requested:
                 auto_trade_continue_pending_close_liquidations(
                     self,
                     limit=None,
@@ -5158,18 +7715,12 @@ class MainWindow(QMainWindow):
         self,
         instance_id: str,
         display_name: str,
-        command: str,
+        requested_policy: str,
         display_status: str,
     ) -> None:
-        command_label = (
-            ROUTINE_STATUS_EARLY_CLOSE
-            if command == MODE_EARLY_CLOSE
-            else ROUTINE_STATUS_IMMEDIATE_LIQUIDATION
-        )
-        if command == COMMAND_IMMEDIATE_LIQUIDATION:
-            answer = _create_routine_operation_confirmation(self, command).exec_()
-        else:
-            answer = _create_routine_operation_confirmation(self, command).exec_()
+        command_label = display_status
+        market_requested = requested_policy == POLICY_MARKET
+        answer = _create_routine_operation_confirmation(self, display_status).exec_()
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
             return
@@ -5178,9 +7729,9 @@ class MainWindow(QMainWindow):
             instance_id,
             command=MODE_EARLY_CLOSE,
             caller_name=(
-                "EARLY_CLOSE_ROUTINE_INSTANCE"
-                if command == MODE_EARLY_CLOSE
-                else "IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE"
+                "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
+                if market_requested
+                else "EARLY_CLOSE_ROUTINE_INSTANCE"
             ),
         ):
             self.load_routine_table()
@@ -5195,11 +7746,7 @@ class MainWindow(QMainWindow):
             target_scope=SCOPE_ROUTINE_INSTANCE,
             target_id=instance_id,
             source="main_routine_context_menu",
-            requested_policy=(
-                "시장가"
-                if command == COMMAND_IMMEDIATE_LIQUIDATION
-                else "루틴"
-            ),
+            requested_policy=requested_policy,
             project_root=PROJECT_ROOT,
             operation_command_service_factory=OperationCommandService,
         )
@@ -5221,7 +7768,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if command == COMMAND_IMMEDIATE_LIQUIDATION:
+        if market_requested:
             auto_trade_continue_pending_close_liquidations(
                 self,
                 limit=None,
@@ -5329,12 +7876,78 @@ class MainWindow(QMainWindow):
                 "live_event_source": "KiwoomApi.raw_chejan_received",
             },
         )
-        window = getattr(self, "auto_trade_setting_window", None)
+        if (
+            self.last_chejan_record_result.get("recorded") is True
+            and self.last_chejan_record_result.get("manual_reconciliation_required")
+            is not True
+            and main_window_buffer_response_integration_ready(self)
+        ):
+            self.last_buffer_response_coordination_result = (
+                coordinate_main_window_buffer_response(
+                    self,
+                    chejan_result=self.last_chejan_record_result,
+                )
+            )
+        try:
+            window = getattr(self, "auto_trade_setting_window", None)
+        except RuntimeError:
+            window = None
         if window is not None:
             setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
 
+    def _main_exit_warning_required(self, now_dt: datetime | None = None) -> bool:
+        """Fail closed when a current-running stock can trade at the current time."""
+
+        try:
+            running_targets = list(
+                auto_trade_running_registered_operation_targets(self)
+            )
+        except Exception:
+            LOGGER.exception("Main exit current-running projection failed")
+            return True
+        if not running_targets:
+            return False
+
+        current = now_dt or datetime.now()
+        for stock_dir, _code, _name in running_targets:
+            stock_path = Path(stock_dir)
+            config = read_json_dict(stock_path / "config.json")
+            state = read_json_dict(stock_path / "state.json")
+            if not config or not state:
+                return True
+            time_status = canonical_stock_trading_time_status(
+                config=config,
+                state=state,
+                now_dt=current,
+            )
+            if time_status.get("evaluable") is not True:
+                return True
+            if time_status.get("active") is True:
+                return True
+        return False
+
+    def _confirm_main_window_exit_if_required(self) -> bool:
+        if not self._main_exit_warning_required():
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("프로그램 종료")
+        dialog.setText(
+            "운영 중입니다. 지금 종료하면 심각한 손실이 발생할 수 있습니다."
+        )
+        exit_button = dialog.addButton("종료", QMessageBox.AcceptRole)
+        cancel_button = dialog.addButton("취소", QMessageBox.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec_()
+        return dialog.clickedButton() is exit_button
+
     def closeEvent(self, event) -> None:
         """Stop the single operation host only when the main program closes."""
+        if not self._confirm_main_window_exit_if_required():
+            event.ignore()
+            return
         self._main_window_closing = True
         close_persistent_feature_windows(self)
         timer = getattr(self, "_pnl_refresh_timer", None)

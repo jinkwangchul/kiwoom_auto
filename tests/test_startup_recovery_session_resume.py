@@ -127,6 +127,7 @@ _install_pyqt5_import_stubs()
 import gui_main_table_loader
 import gui_auto_trade_timer
 from gui_auto_trade_policy import (
+    auto_trade_register_current_session_operation_participants,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
 )
@@ -568,20 +569,47 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             before = state_path.read_bytes()
 
             self.assertFalse(
-                auto_trade_setting_current_session_trade_started(Window(), True)
+                auto_trade_setting_current_session_trade_started(
+                    Window(),
+                    True,
+                    "003550",
+                )
             )
 
             self.assertEqual(before, state_path.read_bytes())
 
-    def test_persisted_trade_enabled_becomes_current_session_started_after_recovery(self) -> None:
+    def test_recovery_ready_does_not_promote_persisted_trade_without_participation(self) -> None:
         class Window:
             def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
                 return True
 
-        self.assertTrue(auto_trade_setting_current_session_trade_started(Window(), True))
-        self.assertFalse(auto_trade_setting_current_session_trade_started(Window(), False))
+        window = Window()
+        self.assertFalse(
+            auto_trade_setting_current_session_trade_started(window, True, "003550")
+        )
+        self.assertFalse(
+            auto_trade_setting_current_session_trade_started(window, False, "003550")
+        )
 
-    def test_main_running_table_uses_same_current_session_recovery_gate(self) -> None:
+    def test_explicit_start_participation_enables_current_session_after_recovery(self) -> None:
+        class Window:
+            def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
+                return True
+
+        window = Window()
+        auto_trade_register_current_session_operation_participants(
+            window,
+            ("003550",),
+        )
+
+        self.assertTrue(
+            auto_trade_setting_current_session_trade_started(window, True, "003550")
+        )
+        self.assertFalse(
+            auto_trade_setting_current_session_trade_started(window, True, "005930")
+        )
+
+    def test_main_running_table_requires_recovery_and_session_participation(self) -> None:
         class Header:
             def setSortIndicator(self, *_args) -> None:
                 return None
@@ -691,6 +719,10 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             )
 
             approved = Window(ready=True)
+            auto_trade_register_current_session_operation_participants(
+                approved,
+                ("003550",),
+            )
             gui_main_table_loader.main_load_running_stock_table(approved)
             self.assertEqual(1, approved.running_stock_table.row_count)
             self.assertEqual(
@@ -859,6 +891,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 persisted_trade_started=auto_trade_setting_current_session_trade_started(
                     window,
                     False,
+                    code,
                 ),
             )
             self.assertEqual(

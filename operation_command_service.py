@@ -26,9 +26,6 @@ MODE_NORMAL = "NORMAL"
 MODE_EARLY_CLOSE = "EARLY_CLOSE"
 MODE_CARRY_OVER = "CARRY_OVER"
 PERSISTENT_MODES = frozenset({MODE_NORMAL, MODE_EARLY_CLOSE, MODE_CARRY_OVER})
-COMMAND_IMMEDIATE_LIQUIDATION = "IMMEDIATE_LIQUIDATION"
-IMMEDIATE_LIQUIDATION_REQUEST_KEY = "immediate_liquidation_request"
-IMMEDIATE_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
 COMMAND_INDIVIDUAL_LIQUIDATION = "INDIVIDUAL_LIQUIDATION"
 INDIVIDUAL_LIQUIDATION_REQUEST_KEY = "individual_liquidation_request"
 INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED = "REQUESTED"
@@ -372,14 +369,12 @@ class OperationCommandService:
             return "target_id is required"
         if str(request.command or "").strip().upper() not in {
             *PERSISTENT_MODES,
-            COMMAND_IMMEDIATE_LIQUIDATION,
             COMMAND_INDIVIDUAL_LIQUIDATION,
             COMMAND_MANUAL_ATS_LIQUIDATION,
         }:
             return (
                 "command must be NORMAL, EARLY_CLOSE, CARRY_OVER, "
-                "IMMEDIATE_LIQUIDATION, INDIVIDUAL_LIQUIDATION, or "
-                "MANUAL_ATS_LIQUIDATION"
+                "INDIVIDUAL_LIQUIDATION, or MANUAL_ATS_LIQUIDATION"
             )
         if not str(request.source or "").strip():
             return "source is required"
@@ -432,13 +427,10 @@ class OperationCommandService:
                 return self._stock_failure(stock_dir, "state.json is missing or invalid")
 
             command = str(request.command).strip().upper()
-            is_immediate_liquidation = command == COMMAND_IMMEDIATE_LIQUIDATION
             is_individual_liquidation = command == COMMAND_INDIVIDUAL_LIQUIDATION
             is_manual_ats_liquidation = command == COMMAND_MANUAL_ATS_LIQUIDATION
             one_shot_request_key = (
-                IMMEDIATE_LIQUIDATION_REQUEST_KEY
-                if is_immediate_liquidation
-                else INDIVIDUAL_LIQUIDATION_REQUEST_KEY
+                INDIVIDUAL_LIQUIDATION_REQUEST_KEY
                 if is_individual_liquidation
                 else MANUAL_ATS_LIQUIDATION_REQUEST_KEY
                 if is_manual_ats_liquidation
@@ -460,28 +452,6 @@ class OperationCommandService:
                     STOCK_IGNORED_DUPLICATE,
                     current_sequence,
                 )
-            if is_immediate_liquidation:
-                holding_qty = self._nonnegative_int(state.get("holding_qty"))
-                if holding_qty is None or holding_qty <= 0:
-                    return self._stock_failure(
-                        stock_dir,
-                        "immediate liquidation requires a positive holding quantity",
-                        sequence=current_sequence,
-                    )
-                status = str(state.get("status", "") or "").strip().upper()
-                if status in {
-                    "EMERGENCY_STOPPED",
-                    "EMERGENCY_STOP",
-                    "EMERGENCY",
-                    "REVIEW_REQUIRED",
-                    "REVIEW",
-                }:
-                    return self._stock_failure(
-                        stock_dir,
-                        "immediate liquidation is blocked by the current runtime status",
-                        sequence=current_sequence,
-                    )
-
             next_sequence = current_sequence + 1
             applied_at = self._now_factory().isoformat(timespec="seconds")
             next_state = dict(state)
@@ -498,9 +468,7 @@ class OperationCommandService:
                         "id": str(request.target_id).strip(),
                     },
                     "status": (
-                        IMMEDIATE_LIQUIDATION_STATUS_REQUESTED
-                        if is_immediate_liquidation
-                        else INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED
+                        INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED
                         if is_individual_liquidation
                         else MANUAL_ATS_LIQUIDATION_STATUS_REQUESTED
                     ),

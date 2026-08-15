@@ -8,11 +8,17 @@ import unittest
 
 
 class _Signal:
+    def __init__(self) -> None:
+        self.callbacks: list[object] = []
+        self.values: list[object] = []
+
     def connect(self, _callback) -> None:
-        return None
+        self.callbacks.append(_callback)
 
     def emit(self, _value) -> None:
-        return None
+        self.values.append(_value)
+        for callback in tuple(self.callbacks):
+            callback(_value)
 
 
 class _Timer:
@@ -50,6 +56,8 @@ class _Control:
             return None
         if signature.startswith("CommRqData"):
             return self.comm_rq_result
+        if signature.startswith("KOA_Functions"):
+            return ""
         if signature.startswith("GetRepeatCnt"):
             return len(self.rows)
         if signature.startswith("GetCommData"):
@@ -112,6 +120,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._login_session_id = "KIWOOM_LOGIN_SESSION_TEST"
         self.api._unavailable_reason = ""
         self.api._pending_tr = {}
+        self.api._account_funds_request_accounts = {}
         self.identity = self.module.RecoverySessionIdentity(
             recovery_session_id="RECOVERY_SESSION_TEST",
             login_session_id="KIWOOM_LOGIN_SESSION_TEST",
@@ -326,6 +335,82 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.assertFalse(requested["ok"])
         self.assertEqual(1, len(results))
         self.assertEqual({}, self.api._pending_tr)
+
+    def test_account_password_window_uses_installed_official_koa_function(self) -> None:
+        result = self.api.show_account_password_window()
+
+        self.assertTrue(result["ok"])
+        self.assertIn(
+            (
+                "KOA_Functions(QString, QString)",
+                ("ShowAccountWindow", ""),
+            ),
+            self.control.calls,
+        )
+
+    def test_account_password_message_fails_request_and_emits_account_evidence(self) -> None:
+        results: list[dict[str, object]] = []
+        self.api.account_authentication_required = _Signal()
+        requested = self.api.request_account_funds_snapshot(
+            self.account_no,
+            request_id=10,
+            callback=results.append,
+        )
+
+        self.api._on_receive_msg(
+            "9103",
+            requested["rqname"],
+            "opw00001",
+            "(55) 계좌비밀번호 입력을 확인해주시기 바랍니다.",
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(
+            self.module.ACCOUNT_AUTHENTICATION_REQUIRED,
+            results[0]["error_kind"],
+        )
+        self.assertEqual(
+            self.account_no,
+            self.api.account_authentication_required.values[0]["account_id"],
+        )
+        self.assertNotIn(requested["rqname"], self.api._pending_tr)
+
+    def test_verified_numeric_account_errors_are_auth_evidence(self) -> None:
+        self.assertTrue(self.module.account_authentication_required_message("(5)"))
+        self.assertTrue(self.module.account_authentication_required_message("(55)"))
+        self.assertFalse(self.module.account_authentication_required_message("(56)"))
+        self.assertTrue(
+            self.module.account_authentication_required_message(
+                "비밀번호 입력을 확인해주시기 바랍니다."
+            )
+        )
+
+    def test_verified_numeric_funds_field_is_projected_as_auth_required(self) -> None:
+        results: list[dict[str, object]] = []
+        self.api.account_authentication_required = _Signal()
+        requested = self.api.request_account_funds_snapshot(
+            self.account_no,
+            request_id=11,
+            callback=results.append,
+        )
+        self.control.summary = {"예수금": "(5)", "주문가능금액": "(55)"}
+
+        self.api._on_receive_tr_data(
+            "9103",
+            requested["rqname"],
+            "opw00001",
+            "",
+            "0",
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(
+            self.module.ACCOUNT_AUTHENTICATION_REQUIRED,
+            results[0]["error_kind"],
+        )
+        self.assertEqual(1, len(self.api.account_authentication_required.values))
 
 
 if __name__ == "__main__":

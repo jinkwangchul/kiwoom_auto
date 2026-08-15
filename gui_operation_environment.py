@@ -58,6 +58,11 @@ STARTING_BUDGET_DEFAULTS = {
     "limit_recommended_multiplier": 100.0,
     "limit_minimum_multiplier": 25.0,
 }
+SYSTEM_BUDGET_MAX_AMOUNT = 9_999_999_999
+SYSTEM_BUDGET_DEFAULTS = {
+    "total_budget": 2_000_000,
+    "available_budget_percent": 100,
+}
 
 
 def now_text() -> str:
@@ -122,17 +127,19 @@ def default_operation_policy() -> dict[str, object]:
             "minutes_before_regular_close": "5",
             "method": "시장가",
         },
+        "system_budget": dict(SYSTEM_BUDGET_DEFAULTS),
         "starting_budget_defaults": dict(STARTING_BUDGET_DEFAULTS),
         "updated_at": "",
     }
 
 
-def read_operation_policy() -> dict[str, object]:
+def read_operation_policy(*, path: Path | None = None) -> dict[str, object]:
     default = default_operation_policy()
-    if not OPERATION_POLICY_PATH.exists():
+    target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
+    if not target_path.exists():
         return default
     try:
-        data = json.loads(OPERATION_POLICY_PATH.read_text(encoding="utf-8"))
+        data = json.loads(target_path.read_text(encoding="utf-8"))
     except Exception:
         return default
     if not isinstance(data, dict):
@@ -157,6 +164,12 @@ def write_operation_policy(
     path: Path | None = None,
 ) -> None:
     policy = dict(policy)
+    target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
+    if "system_budget" not in policy:
+        existing = read_operation_policy(path=target_path)
+        policy["system_budget"] = system_budget_policy(existing)
+    else:
+        policy["system_budget"] = system_budget_policy(policy)
     scheduled = policy.get("scheduled_operation")
     if isinstance(scheduled, dict):
         policy["scheduled_operation"] = {
@@ -165,11 +178,98 @@ def write_operation_policy(
             if key != "after_buy_end_status"
         }
     policy["updated_at"] = now_text()
-    target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
     target_path.write_text(
         json.dumps(policy, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _strict_integer(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not an integer setting")
+    if isinstance(value, int):
+        return value
+    text = str(value).replace(",", "").strip()
+    if not text or not text.isdigit():
+        raise ValueError("integer setting required")
+    return int(text)
+
+
+def validate_system_total_budget(value: object) -> int:
+    amount = _strict_integer(value)
+    if amount < 0 or amount > SYSTEM_BUDGET_MAX_AMOUNT:
+        raise ValueError("total_budget is outside the supported range")
+    return amount
+
+
+def validate_available_budget_percent(value: object) -> int:
+    percent = _strict_integer(value)
+    if percent < 1 or percent > 100:
+        raise ValueError("available_budget_percent must be between 1 and 100")
+    return percent
+
+
+def system_budget_policy(policy: dict[str, object] | None = None) -> dict[str, int]:
+    """Return the normalized system-wide budget policy.
+
+    A missing field receives the confirmed initial default. An explicitly
+    malformed amount fails closed to zero; an invalid ratio disables the
+    buffer by falling back to 100 percent available.
+    """
+    source = policy if isinstance(policy, dict) else {}
+    raw = source.get("system_budget")
+    section_present = "system_budget" in source
+    section = raw if isinstance(raw, dict) else {}
+
+    if "total_budget" not in section:
+        total_budget = (
+            int(SYSTEM_BUDGET_DEFAULTS["total_budget"])
+            if not section_present
+            else 0
+        )
+    else:
+        try:
+            total_budget = validate_system_total_budget(section.get("total_budget"))
+        except ValueError:
+            total_budget = 0
+
+    if "available_budget_percent" not in section:
+        available_percent = int(SYSTEM_BUDGET_DEFAULTS["available_budget_percent"])
+    else:
+        try:
+            available_percent = validate_available_budget_percent(
+                section.get("available_budget_percent")
+            )
+        except ValueError:
+            available_percent = 100
+
+    return {
+        "total_budget": total_budget,
+        "available_budget_percent": available_percent,
+    }
+
+
+def read_system_budget_policy(*, path: Path | None = None) -> dict[str, int]:
+    return system_budget_policy(read_operation_policy(path=path))
+
+
+def write_system_budget_policy(
+    *,
+    total_budget: object,
+    available_budget_percent: object,
+    path: Path | None = None,
+) -> dict[str, int]:
+    """Persist the two canonical system-budget values through the policy writer."""
+    normalized = {
+        "total_budget": validate_system_total_budget(total_budget),
+        "available_budget_percent": validate_available_budget_percent(
+            available_budget_percent
+        ),
+    }
+    policy = read_operation_policy(path=path)
+    policy["system_budget"] = dict(normalized)
+    write_operation_policy(policy, path=path)
+    return normalized
 
 
 def _positive_decimal(value: object, fallback: float) -> float:
@@ -1211,6 +1311,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 "minutes_before_regular_close": self.liquidation_minutes.currentText(),
                 "method": self._current_liquidation_method(),
             },
+            "system_budget": system_budget_policy(self.policy),
             "starting_budget_defaults": (
                 dict(budget_defaults)
                 if budget_defaults is not None

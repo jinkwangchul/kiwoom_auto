@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from gui_auto_trade_integrity import is_emergency_stopped_state
@@ -59,6 +59,233 @@ ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 ROUTINE_INSTANCE_REQUIRED_MESSAGE = "이 작업을 수행할 대상 루틴을 선택하세요."
+CANCEL_SIDE_SCOPE_ALL = "ALL"
+CANCEL_SIDE_SCOPE_BUY_ONLY = "BUY_ONLY"
+
+_CANCELABLE_BROKER_OPEN_STATUSES = {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}
+_BUY_CANCEL_TERMINAL_STATUSES = {
+    "FILLED",
+    "CANCELLED",
+    "CANCELED",
+    "PARTIAL_CANCELLED",
+    "BROKER_REJECTED",
+    "SEND_CALL_REJECTED",
+    "REJECTED",
+}
+_BUY_CANCEL_UNCERTAIN_STATUSES = {
+    "ORDER_QUEUED",
+    "DISPATCH_CLAIMED",
+    "SEND_ATTEMPTED",
+    "SEND_CALL_IN_PROGRESS",
+    "SEND_CALL_ACCEPTED",
+    "SEND_UNCERTAIN",
+}
+_ACTIVE_CANCEL_REQUEST_STATUSES = {
+    "ORDER_QUEUED",
+    "DISPATCH_CLAIMED",
+    "SEND_ATTEMPTED",
+    "SEND_CALL_IN_PROGRESS",
+    "SEND_CALL_ACCEPTED",
+    "SEND_UNCERTAIN",
+    "BROKER_ACCEPTED",
+}
+
+
+def _queue_text(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _queue_request_parts(record: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    execution_request = record.get("execution_request")
+    execution = execution_request if isinstance(execution_request, Mapping) else {}
+    request_preview = execution.get("request_preview")
+    preview = request_preview if isinstance(request_preview, Mapping) else {}
+    return execution, preview
+
+
+def _queue_order_account(record: Mapping[str, object]) -> tuple[str, str]:
+    execution, preview = _queue_request_parts(record)
+    guard_snapshot = execution.get("guard_snapshot")
+    guard = guard_snapshot if isinstance(guard_snapshot, Mapping) else {}
+    identities = {
+        _queue_text(value)
+        for value in (
+            record.get("account_no"),
+            preview.get("account_no"),
+            guard.get("account_no"),
+        )
+        if _queue_text(value)
+    }
+    if len(identities) > 1:
+        return "", "order account identity is inconsistent"
+    if not identities:
+        return "", "order account identity is unavailable"
+    return next(iter(identities)), ""
+
+
+def _queue_order_code(record: Mapping[str, object]) -> str:
+    _execution, preview = _queue_request_parts(record)
+    return _queue_text(
+        record.get("code") or record.get("stock_code") or preview.get("code")
+    ).lstrip("A")
+
+
+def _queue_order_side(record: Mapping[str, object]) -> str:
+    _execution, preview = _queue_request_parts(record)
+    return _queue_text(record.get("side") or preview.get("side")).upper()
+
+
+def _queue_order_action(record: Mapping[str, object]) -> str:
+    _execution, preview = _queue_request_parts(record)
+    return _queue_text(
+        record.get("order_action") or preview.get("order_action") or "NEW"
+    ).upper()
+
+
+def _queue_remaining_quantity(record: Mapping[str, object]) -> tuple[int | None, str]:
+    value = record.get("remaining_quantity")
+    if value is None or not _queue_text(value):
+        return None, "remaining_quantity is required"
+    if isinstance(value, bool):
+        return None, "remaining_quantity must be a non-negative integer"
+    try:
+        text = _queue_text(value).replace(",", "")
+        quantity = int(text) if text else 0
+    except (TypeError, ValueError):
+        return None, "remaining_quantity must be a non-negative integer"
+    if quantity < 0:
+        return None, "remaining_quantity must be a non-negative integer"
+    return quantity, ""
+
+
+def project_buy_only_cancel_readiness(
+    order_queue_snapshot: Mapping[str, object] | object,
+    *,
+    account_no: object,
+    stock_code: object,
+) -> dict[str, object]:
+    """Project whether target BUY pending quantity is durably zero."""
+
+    account = _queue_text(account_no)
+    code = _queue_text(stock_code).lstrip("A")
+    result: dict[str, object] = {
+        "available": False,
+        "ready": False,
+        "state": "BLOCKED_UNCERTAIN",
+        "account_no": account,
+        "stock_code": code,
+        "pending_buy_order_count": 0,
+        "pending_buy_quantity": None,
+        "cancel_request_in_progress_count": 0,
+        "sell_untouched": True,
+        "reason": "",
+    }
+    if not account or not code:
+        result["reason"] = "account_no and stock_code are required"
+        return result
+    if not isinstance(order_queue_snapshot, Mapping):
+        result["reason"] = "order_queue root must be an object"
+        return result
+    orders = order_queue_snapshot.get("orders")
+    if not isinstance(orders, list) or any(not isinstance(item, Mapping) for item in orders):
+        result["reason"] = "order_queue orders must be a list of objects"
+        return result
+
+    pending_count = 0
+    pending_quantity = 0
+    active_cancel_count = 0
+    source_broker_order_nos: set[str] = set()
+    cancel_original_order_nos: list[str] = []
+    uncertain: list[str] = []
+    for item in orders:
+        record = item if isinstance(item, Mapping) else {}
+        if _queue_order_code(record) != code:
+            continue
+        side = _queue_order_side(record)
+        action = _queue_order_action(record)
+        if side == "SELL":
+            continue
+        if side != "BUY":
+            uncertain.append("target stock order side is unavailable")
+            continue
+        record_account, account_reason = _queue_order_account(record)
+        if account_reason:
+            uncertain.append(account_reason)
+            continue
+        if record_account != account:
+            continue
+        status = _queue_text(record.get("status")).upper()
+        if action == "CANCEL":
+            _execution, preview = _queue_request_parts(record)
+            original_order_no = _queue_text(
+                preview.get("original_order_no")
+                or record.get("original_order_no")
+            )
+            if original_order_no:
+                cancel_original_order_nos.append(original_order_no)
+            else:
+                uncertain.append("cancel request original_order_no is unavailable")
+            if (
+                status in _ACTIVE_CANCEL_REQUEST_STATUSES
+                and record.get("original_order_effect_confirmed") is not True
+            ):
+                active_cancel_count += 1
+            continue
+        if action not in {"NEW", "MODIFY"}:
+            uncertain.append("target BUY order action is unsupported")
+            continue
+        broker_order_no = _queue_text(record.get("broker_order_no"))
+        if broker_order_no:
+            source_broker_order_nos.add(broker_order_no)
+        else:
+            uncertain.append("target BUY broker_order_no is unavailable")
+        remaining, quantity_reason = _queue_remaining_quantity(record)
+        if remaining is None:
+            uncertain.append(quantity_reason)
+            continue
+        if status in _CANCELABLE_BROKER_OPEN_STATUSES:
+            if remaining > 0:
+                pending_count += 1
+                pending_quantity += remaining
+            continue
+        if status in _BUY_CANCEL_TERMINAL_STATUSES:
+            if remaining > 0:
+                uncertain.append("terminal BUY order has positive remaining_quantity")
+            continue
+        if status in _BUY_CANCEL_UNCERTAIN_STATUSES or not status:
+            uncertain.append("BUY order lifecycle is not broker-confirmed")
+            continue
+        uncertain.append(f"BUY order status is unsupported: {status}")
+
+    if any(
+        original_order_no not in source_broker_order_nos
+        for original_order_no in cancel_original_order_nos
+    ):
+        uncertain.append("cancel request lacks linked original BUY order evidence")
+
+    result["pending_buy_order_count"] = pending_count
+    result["pending_buy_quantity"] = pending_quantity if not uncertain else None
+    result["cancel_request_in_progress_count"] = active_cancel_count
+    if uncertain:
+        result["reason"] = "; ".join(dict.fromkeys(uncertain))
+        return result
+    result["available"] = True
+    if pending_quantity > 0:
+        result.update(
+            {
+                "state": "WAITING_BUY_CANCEL",
+                "reason": "target BUY pending quantity remains",
+            }
+        )
+        return result
+    result.update(
+        {
+            "ready": True,
+            "state": "READY_FOR_LIQUIDATION",
+            "reason": "",
+        }
+    )
+    return result
 
 
 @dataclass(frozen=True)
@@ -1032,6 +1259,8 @@ class AutoTradeOrderExecutionBoundary:
         *,
         trading_day: str,
         started_at: str,
+        side_scope: str | None = None,
+        account_no: str | None = None,
     ) -> dict[str, object]:
         """Queue and dispatch cancel requests through the existing final gate."""
 
@@ -1039,14 +1268,22 @@ class AutoTradeOrderExecutionBoundary:
         clean_routine_id = str(routine_instance_id or "").strip()
         clean_trading_day = str(trading_day or "").strip()
         clean_started_at = str(started_at or "").strip()
+        clean_side_scope = str(side_scope or CANCEL_SIDE_SCOPE_ALL).strip().upper()
+        clean_account_no = str(account_no or "").strip()
         result: dict[str, object] = {
             "ok": False,
             "code": clean_code,
             "routine_instance_id": clean_routine_id,
             "trading_day": clean_trading_day,
             "started_at": clean_started_at,
+            "side_scope": clean_side_scope,
+            "account_no": clean_account_no,
+            "target_buy_order_count": 0,
             "cancel_requested": 0,
             "cancel_pending": 0,
+            "remaining_buy_pending_quantity": 0,
+            "has_remaining_buy_pending": False,
+            "sell_untouched": True,
             "cancel_order_identities": [],
             "blocked_reasons": [],
             "results": [],
@@ -1056,6 +1293,13 @@ class AutoTradeOrderExecutionBoundary:
             blocked.append("stock code is required")
         if not clean_routine_id:
             blocked.append("routine instance id is required")
+        if clean_side_scope not in {
+            CANCEL_SIDE_SCOPE_ALL,
+            CANCEL_SIDE_SCOPE_BUY_ONLY,
+        }:
+            blocked.append("side scope must be ALL or BUY_ONLY")
+        if clean_side_scope == CANCEL_SIDE_SCOPE_BUY_ONLY and not clean_account_no:
+            blocked.append("BUY_ONLY cancellation requires account_no")
         if blocked:
             return result
 
@@ -1067,15 +1311,48 @@ class AutoTradeOrderExecutionBoundary:
             blocked.extend(issues)
             return result
 
-        pending_statuses = {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}
         matching_code_orders = [
             item
             for item in orders
             if isinstance(item, dict)
             and str(item.get("code") or "").strip() == clean_code
             and str(item.get("status") or "").strip().upper()
-            in pending_statuses
+            in _CANCELABLE_BROKER_OPEN_STATUSES
         ]
+        if clean_side_scope == CANCEL_SIDE_SCOPE_BUY_ONLY:
+            buy_only_orders: list[dict[str, object]] = []
+            for record in matching_code_orders:
+                side = _queue_order_side(record)
+                if side == "SELL":
+                    continue
+                if side != "BUY":
+                    blocked.append(
+                        "matching stock pending order lacks a valid order side"
+                    )
+                    continue
+                record_account, account_reason = _queue_order_account(record)
+                if account_reason:
+                    blocked.append(account_reason)
+                    continue
+                if record_account != clean_account_no:
+                    continue
+                remaining_quantity, quantity_reason = _queue_remaining_quantity(
+                    record
+                )
+                if remaining_quantity is None:
+                    blocked.append(quantity_reason)
+                    continue
+                if remaining_quantity <= 0:
+                    continue
+                buy_only_orders.append(record)
+                result["remaining_buy_pending_quantity"] = int(
+                    result["remaining_buy_pending_quantity"]
+                ) + remaining_quantity
+            if blocked:
+                return result
+            matching_code_orders = buy_only_orders
+            result["target_buy_order_count"] = len(matching_code_orders)
+            result["has_remaining_buy_pending"] = bool(matching_code_orders)
         if not matching_code_orders:
             result["ok"] = True
             return result
@@ -1134,6 +1411,11 @@ class AutoTradeOrderExecutionBoundary:
         if not sources:
             result["ok"] = True
             return result
+
+        if clean_side_scope == CANCEL_SIDE_SCOPE_ALL:
+            result["sell_untouched"] = not any(
+                _queue_order_side(record) == "SELL" for record in sources
+            )
 
         for source_order in sources:
             broker_order_no = str(

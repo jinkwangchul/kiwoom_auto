@@ -339,6 +339,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             current_session_trade_started = auto_trade_setting_current_session_trade_started(
                 window,
                 trade_started,
+                code,
             )
             display_status = auto_trade_setting_display_status_for_current_session(
                 state,
@@ -398,6 +399,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             current_session_trade_started = auto_trade_setting_current_session_trade_started(
                 window,
                 trade_started,
+                code,
             )
             method_text = auto_trade_setting_method_text(display_status, config, state)
             liquidation_text = auto_trade_setting_liquidation_text(config, display_status, state)

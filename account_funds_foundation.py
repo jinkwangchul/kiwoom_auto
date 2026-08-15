@@ -15,6 +15,7 @@ READY = "READY"
 FAILED = "FAILED"
 DISCONNECTED = "DISCONNECTED"
 STALE = "STALE"
+ACCOUNT_AUTHENTICATION_REQUIRED = "ACCOUNT_AUTHENTICATION_REQUIRED"
 
 ACCOUNT_FUNDS_STATUSES = frozenset(
     {UNREQUESTED, LOADING, READY, FAILED, DISCONNECTED, STALE}
@@ -66,6 +67,7 @@ class AccountFundsSnapshot:
     orderable_cash: int | None = None
     account_type: str = ""
     error: str = ""
+    error_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -167,6 +169,7 @@ class AccountFundsProjection:
                 status=FAILED,
                 fetched_at=_now_text(),
                 error=str(result.get("error") or "account funds request failed"),
+                error_kind=str(result.get("error_kind") or "").strip(),
             )
             return True
 

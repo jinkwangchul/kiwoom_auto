@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import unittest
+from types import MethodType
 
 from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
@@ -48,6 +49,9 @@ def _window(account_ref: list[str], *, connected: bool = True):
     window.buy_time_status_label = _Label()
     window.selected_account_no = lambda: account_ref[0]
     window.kiwoom_api = type("Api", (), {"is_connected": lambda self: connected})()
+    window._append_account_query_journal_event = lambda *args, **kwargs: {
+        "appended": True
+    }
     return window
 
 
@@ -171,6 +175,17 @@ class AccountFundsProjectionTests(unittest.TestCase):
 
 
 class AccountFundsMainWindowBindingTests(unittest.TestCase):
+    @staticmethod
+    def _capture_account_events(window):
+        events: list[tuple[str, dict[str, object]]] = []
+
+        def capture(_self, event_type, **kwargs):
+            events.append((event_type, kwargs))
+            return {"appended": True}
+
+        window._append_account_query_journal_event = MethodType(capture, window)
+        return events
+
     def test_selected_account_updates_masked_label_and_unrequested_ui(self) -> None:
         account = ["12345678"]
         window = _window(account)
@@ -178,7 +193,7 @@ class AccountFundsMainWindowBindingTests(unittest.TestCase):
         snapshot = gui_windows.MainWindow.sync_account_funds_selection(window)
 
         self.assertEqual(funds.UNREQUESTED, snapshot.status)
-        self.assertEqual("계좌번호: 1234-****", window.account_label.value)
+        self.assertEqual("계좌정보 :", window.account_label.value)
         self.assertEqual("계좌 구분: -", window.account_type_label.value)
         self.assertEqual("-", window.account_total_deposit_label.value)
         self.assertEqual("매수 가능 상태: 확인 전", window.buy_time_status_label.value)
@@ -198,10 +213,72 @@ class AccountFundsMainWindowBindingTests(unittest.TestCase):
             {"ok": True, "deposit": "1,250,000", "orderable_cash": "800000"}
         )
 
-        self.assertEqual("1,250,000원", window.account_total_deposit_label.value)
-        self.assertEqual("800,000원", window.account_order_available_label.value)
+        self.assertEqual("1,250,000", window.account_total_deposit_label.value)
+        self.assertEqual("800,000", window.account_order_available_label.value)
         self.assertEqual("계좌 구분: 확인 필요", window.account_type_label.value)
         self.assertEqual("매수 가능 상태: 확인 필요", window.buy_time_status_label.value)
+
+    def test_query_request_and_success_are_recorded_once(self) -> None:
+        account = ["12345678"]
+        window = _window(account)
+        adapter = _DeferredAdapter()
+        window.account_funds_adapter = adapter
+        events = self._capture_account_events(window)
+        gui_windows.MainWindow.sync_account_funds_selection(window)
+
+        gui_windows.MainWindow.request_account_funds(window)
+        adapter.callback({"ok": True, "deposit": 1000, "orderable_cash": 900})
+
+        self.assertEqual(
+            ["ACCOUNT_QUERY_REQUESTED", "ACCOUNT_QUERY_SUCCEEDED"],
+            [event_type for event_type, _kwargs in events],
+        )
+
+    def test_authentication_failure_records_auth_required_once(self) -> None:
+        account = ["12345678"]
+        window = _window(account)
+        events = self._capture_account_events(window)
+        gui_windows.MainWindow.sync_account_funds_selection(window)
+
+        class ImmediateFailureAdapter:
+            def request_account_funds(self, account_id, *, request_id, callback):
+                result = {
+                    "ok": False,
+                    "account_id": account_id,
+                    "request_id": request_id,
+                    "error": "account authentication required",
+                    "error_kind": gui_windows.ACCOUNT_AUTHENTICATION_REQUIRED,
+                    "error_code": "55",
+                }
+                callback(result)
+                return result
+
+        window.account_funds_adapter = ImmediateFailureAdapter()
+        gui_windows.MainWindow.request_account_funds(window)
+
+        self.assertEqual(
+            ["ACCOUNT_QUERY_REQUESTED", "ACCOUNT_AUTH_REQUIRED"],
+            [event_type for event_type, _kwargs in events],
+        )
+
+    def test_manual_requery_failure_records_one_result(self) -> None:
+        account = ["12345678"]
+        window = _window(account)
+        adapter = _DeferredAdapter()
+        window.account_funds_adapter = adapter
+        events = self._capture_account_events(window)
+        gui_windows.MainWindow.sync_account_funds_selection(window)
+
+        gui_windows.MainWindow.request_account_funds(
+            window,
+            query_reason="MANUAL_REQUERY",
+        )
+        adapter.callback({"ok": False, "error": "server unavailable"})
+
+        self.assertEqual(
+            ["ACCOUNT_REQUERY_REQUESTED", "ACCOUNT_REQUERY_FAILED"],
+            [event_type for event_type, _kwargs in events],
+        )
 
     def test_failed_and_disconnected_ui_are_not_zero(self) -> None:
         account = ["12345678"]
@@ -236,7 +313,7 @@ class AccountFundsMainWindowBindingTests(unittest.TestCase):
         gui_windows.MainWindow.sync_account_funds_selection(window)
         old_callback({"ok": True, "deposit": 1000, "orderable_cash": 900})
 
-        self.assertEqual("계좌번호: 2222-****", window.account_label.value)
+        self.assertEqual("계좌정보 :", window.account_label.value)
         self.assertEqual("-", window.account_total_deposit_label.value)
         self.assertEqual(funds.STALE, window._account_funds_projection.snapshot.status)
 
@@ -322,9 +399,9 @@ class AccountFundsMainWindowBindingTests(unittest.TestCase):
             )
             app.processEvents()
 
-        self.assertIn(("계좌 구분: 실계좌", "1,250,000원", "920,000원"), rendered_texts)
-        self.assertIn(("계좌 구분: 모의투자", "1,250,000원", "920,000원"), rendered_texts)
-        self.assertIn(("계좌 구분: 실계좌", "0원", "0원"), rendered_texts)
+        self.assertIn(("계좌 구분: 실계좌", "1,250,000", "920,000"), rendered_texts)
+        self.assertIn(("계좌 구분: 모의투자", "1,250,000", "920,000"), rendered_texts)
+        self.assertIn(("계좌 구분: 실계좌", "0", "0"), rendered_texts)
         self.assertIn(("계좌 구분: 확인 필요", "조회 실패", "조회 실패"), rendered_texts)
         self.assertIn(("계좌 구분: -", "-", "-"), rendered_texts)
 

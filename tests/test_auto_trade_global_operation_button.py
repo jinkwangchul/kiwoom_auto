@@ -425,6 +425,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
     def test_bottom_button_keeps_existing_running_contract_when_global_latch_false(self) -> None:
         self._write_state(self.targets[0][0], status="RUNNING", trade_enabled=True)
+        run_control.auto_trade_register_current_session_operation_participants(
+            self.window,
+            (self.targets[0][1],),
+        )
 
         with patch.object(
             run_control,
@@ -447,6 +451,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         owner.routine_table = QTableWidget(0, 1, owner)
         owner.btn_start = QPushButton("▶ 운영시작", owner)
         owner.startup_recovery_session_ready = Mock(return_value=False)
+        owner._current_session_operation_participant_stock_codes = {
+            self.targets[0][1]
+        }
         adapter = monitoring_context_menu.MainMonitoringStockOperationAdapter(owner, [])
         setting_button = QPushButton("▶ 운영시작", owner)
         setting_host = Mock()
@@ -456,6 +463,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             run_control.auto_trade_running_registered_operation_targets(setting_host)
         )
         setting_host.startup_recovery_session_ready.return_value = False
+        setting_host._current_session_operation_participant_stock_codes = {
+            self.targets[0][1]
+        }
 
         with patch.object(run_control, "read_operation_state", return_value={}):
             adapter.update_global_operation_button_state()
@@ -961,6 +971,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         def start_side_effect(*_args, **kwargs):
             for stock_dir, _code, _name in kwargs["selected_targets"]:
                 self._write_state(stock_dir, status="RUNNING", trade_enabled=True)
+            run_control.auto_trade_register_current_session_operation_participants(
+                self.window,
+                (code for _stock_dir, code, _name in kwargs["selected_targets"]),
+            )
             return {"ok": True}
 
         with patch.object(
@@ -1145,6 +1159,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             trade_enabled=True,
         )
         self._write_operation_excluded(running_target[0], False)
+        run_control.auto_trade_register_current_session_operation_participants(
+            self.window,
+            (running_target[1],),
+        )
         self._write_operation_excluded(untouched_target[0], True)
         before_untouched = read_json_dict(untouched_target[0] / "config.json")
         self.window._selected_stock_infos = [running_target]
@@ -1177,6 +1195,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             trade_enabled=True,
         )
         self._write_operation_excluded(running_target[0], False)
+        run_control.auto_trade_register_current_session_operation_participants(
+            self.window,
+            (running_target[1],),
+        )
         self._write_operation_excluded(add_target[0], True)
         before_running = read_json_dict(running_target[0] / "config.json")
         before_add = read_json_dict(add_target[0] / "config.json")
@@ -1228,6 +1250,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 status="RUNNING",
                 trade_enabled=True,
             )
+        run_control.auto_trade_register_current_session_operation_participants(
+            self.window,
+            (target[1] for target in self.targets[:3]),
+        )
         self.window.update_global_operation_button_state()
         self.assertEqual("\uc6b4\uc601\uc911", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())

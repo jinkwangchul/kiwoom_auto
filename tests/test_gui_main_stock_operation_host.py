@@ -16,6 +16,7 @@ from PyQt5.QtCore import QObject, QPoint
 from PyQt5.QtWidgets import QApplication, QWidget
 
 import gui_auto_trade_context_menu as context_menu
+import gui_auto_trade_run_control as run_control
 import gui_auto_trade_timer
 import gui_windows
 from auto_trade_order_execution_boundary import AutoTradeOrderExecutionBoundary
@@ -259,14 +260,40 @@ class MainStockOperationHostTest(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertFalse(timer.isActive())
 
-    def test_main_source_starts_host_after_recovery_not_settings_window(self) -> None:
+    def test_recovery_starts_host_only_with_current_session_participation(self) -> None:
         source = Path(gui_windows.__file__).read_text(encoding="utf-8")
-        recovery_at = source.index("if recovery_account_allows_isolated_stock_operation(context):")
+        recovery_at = source.index("current_session_participants = (")
         status_at = source.index("self._production_recovery_status_result()", recovery_at)
         recovery_block = source[recovery_at:status_at]
+        self.assertIn("and current_session_participants", recovery_block)
+        self.assertIn("NO_CURRENT_SESSION_OPERATION_PARTICIPATION", recovery_block)
         self.assertIn("main_monitoring_auto_trade_operation_host", recovery_block)
         self.assertIn("start_after_recovery", recovery_block)
         self.assertNotIn("start_periodic_timers_after_recovery", recovery_block)
+
+    def test_explicit_operation_start_activates_existing_host_once(self) -> None:
+        identity = object()
+        host = SimpleNamespace(
+            start_after_recovery=Mock(
+                return_value={
+                    "started": True,
+                    "started_count": 1,
+                    "reason_code": "RECOVERY_TIMER_STARTED",
+                }
+            )
+        )
+        owner = SimpleNamespace(
+            _production_recovery_identity=identity,
+            startup_recovery_session_ready=Mock(return_value=True),
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+        )
+
+        result = run_control._start_operation_host_after_explicit_operation_start(owner)
+
+        self.assertTrue(result["started"])
+        owner.startup_recovery_session_ready.assert_called_once_with(refresh=False)
+        owner.main_monitoring_auto_trade_operation_host.assert_called_once_with()
+        host.start_after_recovery.assert_called_once_with(identity)
 
     def test_settings_close_cannot_stop_main_operation_host(self) -> None:
         from gui_auto_trade_setting_window import AutoTradeSettingWindow

@@ -74,6 +74,34 @@ class EventJournalProductionConnectionTest(unittest.TestCase):
             self.assertEqual("SYSTEM", result["event"]["category"])
             self.assertEqual(severity, result["event"]["severity"])
 
+    def test_account_query_events_use_existing_writer_and_masked_identity(self) -> None:
+        event_types = (
+            "ACCOUNT_QUERY_REQUESTED",
+            "ACCOUNT_QUERY_SUCCEEDED",
+            "ACCOUNT_QUERY_FAILED",
+            "ACCOUNT_AUTH_REQUIRED",
+            "ACCOUNT_REQUERY_REQUESTED",
+            "ACCOUNT_REQUERY_SUCCEEDED",
+            "ACCOUNT_REQUERY_FAILED",
+        )
+        for index, event_type in enumerate(event_types):
+            failed = event_type.endswith("FAILED") or event_type == "ACCOUNT_AUTH_REQUIRED"
+            result = production.append_production_event(
+                event_type,
+                severity="WARNING" if failed else "INFO",
+                result="FAILED" if failed else "SUCCESS",
+                source="MainWindow.request_account_funds",
+                template_args={"account_display": "8129****"},
+                occurred_at=f"2026-08-13T09:00:0{index}+09:00",
+                target_type="ACCOUNT",
+                target_id="8129****",
+                target_name="8129****",
+                details={"query_scope": "ACCOUNT_FUNDS"},
+            )
+            self.assertTrue(result["appended"], result)
+            self.assertEqual("SYSTEM", result["event"]["category"])
+            self.assertNotIn("8129123456", str(result["event"]))
+
     def test_writer_failure_is_fail_open(self) -> None:
         class BrokenWriter:
             def append_event(self, **_kwargs):

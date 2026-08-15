@@ -30,6 +30,7 @@ from gui_auto_trade_integrity import (
     restart_initial_review_reason_for_stock,
 )
 from gui_auto_trade_policy import (
+    auto_trade_register_current_session_operation_participants,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
 )
@@ -79,7 +80,6 @@ _ACTIVE_CLOSE_STATUSES = {
     "LIQUIDATING",
 }
 _LIQUIDATION_REQUEST_KEYS = (
-    "immediate_liquidation_request",
     "individual_liquidation_request",
     "manual_ats_liquidation_request",
 )
@@ -106,6 +106,64 @@ def auto_trade_registered_operation_targets() -> list[tuple[Path, str, str]]:
         if code:
             targets.append((stock_dir, code, name))
     return targets
+
+
+def _start_operation_host_after_explicit_operation_start(window) -> dict[str, object]:
+    """Start the existing Recovery-bound host only after an explicit start succeeds."""
+
+    pending = [window]
+    seen: set[int] = set()
+    while pending and len(seen) < 8:
+        owner = pending.pop(0)
+        if owner is None or id(owner) in seen:
+            continue
+        seen.add(id(owner))
+
+        readiness = getattr(owner, "startup_recovery_session_ready", None)
+        host_getter = getattr(owner, "main_monitoring_auto_trade_operation_host", None)
+        identity = getattr(owner, "_production_recovery_identity", None)
+        if callable(readiness) and callable(host_getter) and identity is not None:
+            try:
+                if not bool(readiness(refresh=False)):
+                    return {
+                        "started": False,
+                        "reason_code": "RECOVERY_NOT_READY",
+                    }
+                host = host_getter()
+                starter = getattr(host, "start_after_recovery", None)
+                if not callable(starter):
+                    return {
+                        "started": False,
+                        "reason_code": "OPERATION_HOST_START_UNAVAILABLE",
+                    }
+                result = starter(identity)
+                setattr(owner, "_production_recovery_timer_start_result", result)
+                return result if isinstance(result, dict) else {
+                    "started": False,
+                    "reason_code": "INVALID_OPERATION_HOST_START_RESULT",
+                }
+            except Exception:
+                LOGGER.exception("Explicit operation-start host activation failed")
+                return {
+                    "started": False,
+                    "reason_code": "OPERATION_HOST_START_FAILED",
+                }
+
+        nested_owner = getattr(owner, "_owner", None)
+        if nested_owner is not None:
+            pending.append(nested_owner)
+        parent_getter = getattr(owner, "parent", None)
+        if callable(parent_getter):
+            try:
+                parent = parent_getter()
+            except Exception:
+                parent = None
+            if parent is not None:
+                pending.append(parent)
+    return {
+        "started": False,
+        "reason_code": "OPERATION_HOST_OWNER_UNAVAILABLE",
+    }
 
 
 def auto_trade_registered_operation_start_targets(window=None) -> list[tuple[Path, str, str]]:
@@ -137,6 +195,7 @@ def auto_trade_running_registered_operation_targets(window) -> list[tuple[Path, 
         if auto_trade_setting_current_session_trade_started(
             window,
             auto_trade_setting_trade_started(state),
+            target[1],
         ):
             running.append(target)
     return running
@@ -1641,6 +1700,10 @@ def auto_trade_start_selected_auto_trades(
         "internal_reason": tuple(dict.fromkeys(failure_reasons)),
     }
     if completed:
+        auto_trade_register_current_session_operation_participants(
+            window,
+            completed_codes,
+        )
         try:
             operation_state_write = write_global_operation_running_state(
                 participant_stock_codes=completed_codes,
@@ -1654,6 +1717,9 @@ def auto_trade_start_selected_auto_trades(
         result["operation_state_write"] = operation_state_write
         result["operation_state_write_failed"] = (
             operation_state_write.get("ok") is not True
+        )
+        result["operation_host_start_result"] = (
+            _start_operation_host_after_explicit_operation_start(window)
         )
     _apply_start_request_context(
         result,

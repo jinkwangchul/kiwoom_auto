@@ -37,7 +37,7 @@ from gui_order_utils import (
 )
 from gui_review_utils import average_price_from_state, current_price_from_state, safe_float_value
 from confirmable_pnl_cycle_service import project_confirmable_cumulative_pnl
-from pnl_ui_refresh import project_current_stock_pnl
+from pnl_ui_refresh import project_current_stock_pnl_snapshot
 from gui_operation_environment import (
     effective_amount_starting_budget,
     starting_budget_defaults,
@@ -49,6 +49,7 @@ from gui_auto_trade_display import (
     apply_auto_trade_plain_metric_item_style,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
+    apply_auto_trade_setting_protection_row_style,
     auto_trade_setting_status_sort_rank,
     create_auto_trade_operation_item,
     create_routine_profit_signal_widget,
@@ -1266,6 +1267,7 @@ def _instance_stock_counts(
     operation_excluded_only: bool | None = None,
     *,
     window=None,
+    stock_scope: str | None = None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
     current_running_stock_dirs = {
@@ -1276,6 +1278,22 @@ def _instance_stock_counts(
             else []
         )
     }
+    clean_scope = str(stock_scope or "").strip().lower()
+    if clean_scope not in {
+        "normal",
+        "all",
+        "operation",
+        "excluded",
+        "review",
+        "all_non_review",
+    }:
+        if operation_excluded_only is True:
+            clean_scope = "excluded"
+        elif operation_excluded_only is False:
+            clean_scope = "normal"
+        else:
+            clean_scope = "all_non_review"
+    operation_scope_running = bool(current_running_stock_dirs)
     valid_instance_ids = {
         instance.instance_id for instance in load_persisted_routine_instances()
     }
@@ -1305,6 +1323,7 @@ def _instance_stock_counts(
                 "profit_amount": 0,
                 "profit_cost_basis": 0,
                 "profit_unknown": False,
+                "pnl_stock_codes": [],
                 "stocks": [],
             },
         )
@@ -1318,14 +1337,25 @@ def _instance_stock_counts(
             item["operation_or_stopped"] += 1
             if str(stock_dir.resolve()) in current_running_stock_dirs:
                 item["operation_running"] += 1
-        if review_required:
-            continue
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
-        include_stock_row = not review_required and (
-            operation_excluded_only is None
-            or operation_excluded == bool(operation_excluded_only)
-        )
+        current_running = str(stock_dir.resolve()) in current_running_stock_dirs
+        if clean_scope == "all":
+            include_stock_row = True
+        elif clean_scope == "review":
+            include_stock_row = review_required
+        elif clean_scope == "excluded":
+            include_stock_row = operation_excluded and not review_required
+        elif clean_scope == "operation":
+            include_stock_row = (
+                not review_required
+                and not operation_excluded
+                and current_running == operation_scope_running
+            )
+        elif clean_scope == "normal":
+            include_stock_row = not review_required and not operation_excluded
+        else:
+            include_stock_row = not review_required
         if include_stock_row and (code or name):
             item["stocks"].append(
                 {
@@ -1336,19 +1366,12 @@ def _instance_stock_counts(
                     "enabled": bool(stock.get("enabled", True)),
                 }
             )
+        if review_required:
+            continue
         holding_qty = safe_int_value(state.get("holding_qty"), 0)
         avg_price = average_price_from_state(state)
-        current_price = current_price_from_state(state)
-        cycle_pnl = project_confirmable_cumulative_pnl(
-            code,
-            current_price,
-            project_root=Path(__file__).resolve().parent,
-        )
-        if cycle_pnl.get("available") is True:
-            item["profit_amount"] = float(item["profit_amount"]) + float(cycle_pnl.get("cumulative_profit") or 0)
-            item["profit_cost_basis"] = float(item["profit_cost_basis"]) + float(cycle_pnl.get("completed_buy_cost") or 0) + float(cycle_pnl.get("open_cost") or 0)
-        else:
-            item["profit_unknown"] = True
+        if code:
+            item["pnl_stock_codes"].append(code)
         if holding_qty > 0 and avg_price > 0:
             cost_basis = holding_qty * avg_price
             item["consumed_amount"] = float(item["consumed_amount"]) + cost_basis
@@ -1372,9 +1395,129 @@ def _instance_stock_counts(
     return counts
 
 
+def _refresh_instance_pnl_from_batch(
+    instance_counts: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Apply one confirmable-PnL Runtime snapshot to all registered stocks."""
+    stock_codes = [
+        str(code or "").strip().lstrip("A")
+        for count in instance_counts.values()
+        for code in count.get("pnl_stock_codes", [])
+        if str(code or "").strip().lstrip("A")
+    ]
+    pnl_by_code = project_current_stock_pnl_snapshot(
+        stock_codes,
+        project_root=Path(__file__).resolve().parent,
+    )
+    for count in instance_counts.values():
+        if "pnl_stock_codes" not in count:
+            continue
+        count["profit_amount"] = 0
+        count["profit_cost_basis"] = 0
+        count["profit_unknown"] = False
+        for raw_code in count.get("pnl_stock_codes", []):
+            code = str(raw_code or "").strip().lstrip("A")
+            result = pnl_by_code.get(code, {})
+            if result.get("available") is not True:
+                count["profit_unknown"] = True
+                continue
+            count["profit_amount"] = float(count["profit_amount"]) + float(
+                result.get("cumulative_profit") or 0
+            )
+            count["profit_cost_basis"] = float(
+                count["profit_cost_basis"]
+            ) + float(result.get("completed_buy_cost") or 0) + float(
+                result.get("open_cost") or 0
+            )
+    return pnl_by_code
+
+
+def _main_routine_summary_projection(
+    definitions: list[object],
+    instances: list[object],
+    instance_counts: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Project the unfiltered registered-routine summary from existing counts."""
+    registered = sum(
+        int(count.get("registered", 0) or 0)
+        for count in instance_counts.values()
+    )
+    excluded = sum(
+        int(count.get("excluded", 0) or 0)
+        for count in instance_counts.values()
+    )
+    review = sum(
+        int(count.get("review", 0) or 0)
+        for count in instance_counts.values()
+    )
+    running = sum(
+        int(count.get("operation_running", count.get("running", 0)) or 0)
+        for count in instance_counts.values()
+    )
+    stopped = sum(
+        int(count.get("operation_or_stopped", count.get("stopped", 0)) or 0)
+        for count in instance_counts.values()
+    )
+    profit_amount = sum(
+        float(count.get("profit_amount", 0) or 0)
+        for count in instance_counts.values()
+    )
+    profit_cost_basis = sum(
+        float(count.get("profit_cost_basis", 0) or 0)
+        for count in instance_counts.values()
+    )
+    operation_label = "운영" if running > 0 else "정지"
+    operation_count = running if running > 0 else stopped
+    profit_rate = (
+        profit_amount / profit_cost_basis * 100
+        if profit_cost_basis > 0
+        else 0
+    )
+    return {
+        "count_badges": (
+            ("group", "그룹", len(definitions)),
+            ("routine", "루틴", len(instances)),
+            ("stock", "종목", registered),
+            ("operation", operation_label, operation_count),
+            ("excluded", "제외", excluded),
+            ("review", "검토", review),
+        ),
+        "counts_text": (
+            f"그룹({len(definitions)})  루틴({len(instances)})  종목({registered})  "
+            f"{operation_label}({operation_count})  제외({excluded})  검토({review})"
+        ),
+        "profit_value_text": (
+            f"{format_signed_money(profit_amount)} / "
+            f"{format_signed_percent(profit_rate, digits=2)}"
+        ),
+        "profit_text": (
+            f"수익({format_signed_money(profit_amount)} / "
+            f"{format_signed_percent(profit_rate, digits=2)})"
+        ),
+        "profit_amount": profit_amount,
+        "profit_rate": profit_rate,
+        "profit_color": profit_loss_value_color(profit_amount),
+    }
+
+
+def _update_main_routine_summary(
+    window,
+    definitions: list[object],
+    instances: list[object],
+    instance_counts: dict[str, dict[str, object]],
+) -> None:
+    update = getattr(window, "_update_main_routine_summary", None)
+    if callable(update):
+        update(_main_routine_summary_projection(definitions, instances, instance_counts))
+
+
 def main_refresh_pnl_only(window) -> None:
     """Refresh monitoring stock/instance PnL without rebuilding either table."""
-    instance_counts = _instance_stock_counts()
+    instance_counts = _instance_stock_counts(window=window)
+    pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
+    definitions = load_routine_definitions()
+    instances = load_persisted_routine_instances()
+    _update_main_routine_summary(window, definitions, instances, instance_counts)
     changed = False
     for row in range(window.routine_table.rowCount()):
         item = window.routine_table.item(row, 0)
@@ -1386,7 +1529,7 @@ def main_refresh_pnl_only(window) -> None:
             metrics = item.data(ROUTINE_STOCK_METRICS_ROLE)
             if not code or not isinstance(metrics, tuple) or len(metrics) < 3:
                 continue
-            result = project_current_stock_pnl(code, project_root=Path(__file__).resolve().parent)
+            result = pnl_by_code.get(code.lstrip("A"), {})
             if result.get("available") is not True:
                 continue
             amount = float(result.get("cumulative_profit") or 0)
@@ -1452,6 +1595,7 @@ def _routine_tree_stock_display_values(
     current_session_trade_started = auto_trade_setting_current_session_trade_started(
         window,
         trade_started,
+        code,
     )
     display_status = auto_trade_setting_display_status_for_current_session(
         state,
@@ -1616,6 +1760,7 @@ def _routine_tree_stock_display_snapshots(
     current_session_trade_started = auto_trade_setting_current_session_trade_started(
         window,
         trade_started,
+        code,
     )
     display_status = auto_trade_setting_display_status_for_current_session(
         state,
@@ -1718,6 +1863,23 @@ def _routine_tree_stock_display_snapshots(
                     alignment=int(Qt.AlignCenter),
                 )
             )
+    review_required = is_review_required_state(state)
+    operation_excluded = is_operation_excluded(config)
+    if review_required or operation_excluded:
+        for token in tokens:
+            if not isinstance(token, dict):
+                continue
+            style_item = SortableTableWidgetItem(str(token.get("text", "") or ""))
+            style_item.setToolTip(str(token.get("tooltip", "") or ""))
+            apply_auto_trade_setting_protection_row_style(
+                style_item,
+                review_required=review_required,
+                operation_excluded=operation_excluded,
+            )
+            protected = _item_style_snapshot(style_item)
+            token["foreground"] = protected.get("foreground", token.get("foreground"))
+            token["background"] = protected.get("background", token.get("background"))
+            token["tooltip"] = protected.get("tooltip", token.get("tooltip", ""))
     return tokens
 
 
@@ -2056,24 +2218,21 @@ def main_load_routine_table(window) -> None:
     operation_excluded_only = bool(
         getattr(window, "_main_routine_excluded_only", False)
     )
+    stock_scope = str(
+        getattr(window, "_main_routine_stock_scope", "") or ""
+    ).strip().lower()
+    if operation_excluded_only:
+        stock_scope = "excluded"
+    if stock_scope not in {"normal", "all", "operation", "excluded", "review"}:
+        stock_scope = "normal"
     instance_counts = _instance_stock_counts(
-        operation_excluded_only,
         window=window,
+        stock_scope=stock_scope,
     )
-    update_excluded_count = getattr(
-        window,
-        "_update_main_routine_excluded_count",
-        None,
-    )
-    if callable(update_excluded_count):
-        update_excluded_count(
-            sum(
-                int(values.get("excluded", 0) or 0)
-                for values in instance_counts.values()
-            )
-        )
+    _refresh_instance_pnl_from_batch(instance_counts)
     definitions = load_routine_definitions()
     instances = load_persisted_routine_instances()
+    _update_main_routine_summary(window, definitions, instances, instance_counts)
     trade_counts_by_code = current_stock_trade_counts_by_code()
     window._routine_assigned_stock_count_by_instance = {
         instance.instance_id: int(
@@ -2229,21 +2388,9 @@ def main_load_routine_table(window) -> None:
 
         all_children = tuple(children)
         if bool(getattr(window, "_main_routine_valid_only", False)):
-            if display_level == "group" and operation_excluded_only:
-                children = [
-                    child for child in children if child.get("stocks")
-                ]
-                if not children:
-                    continue
-            elif display_level == "group":
-                if not children:
-                    continue
-            else:
-                children = [
-                    child for child in children if child.get("stocks")
-                ]
-                if not children:
-                    continue
+            children = [child for child in children if child.get("stocks")]
+            if not children:
+                continue
 
         parent_registered = sum(int(item["registered"]) for item in all_children)
         parent_operation_running = sum(
@@ -2648,6 +2795,7 @@ def main_load_running_stock_table(window) -> None:
         current_session_trade_started = auto_trade_setting_current_session_trade_started(
             window,
             trade_started,
+            code,
         )
 
         holding_qty = safe_int_value(state.get("holding_qty"), 0)

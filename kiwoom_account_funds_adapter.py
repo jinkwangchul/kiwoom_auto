@@ -113,6 +113,8 @@ class KiwoomAccountFundsAdapter:
                 "account_id": request.account_id,
                 "request_id": request.request_id,
                 "error": str(result.get("error") or "account funds request failed"),
+                "error_kind": str(result.get("error_kind") or "").strip(),
+                "error_code": result.get("error_code", result.get("result")),
             }
         if str(result.get("account_id") or "").strip() != request.account_id:
             return {

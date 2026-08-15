@@ -119,17 +119,21 @@ class FakeCellWidget:
     "requires real PyQt widgets; the legacy GUI test module installed global stubs",
 )
 class MainRoutineMonitoringDisplayTest(unittest.TestCase):
-    def test_immediate_liquidation_runtime_drives_stock_status_method_and_liquidation(self) -> None:
+    def test_market_early_close_runtime_drives_stock_status_method_and_liquidation(self) -> None:
         requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
         state = {
-            "status": "RUNNING",
+            "status": "EARLY_CLOSE",
             "holding_qty": 4,
             "trade_enabled": True,
             "trade_started_at": requested_at,
-            "immediate_liquidation_request": {
-                "status": "REQUESTED",
-                "requested_at": requested_at,
-            },
+            "operation_command_mode": "EARLY_CLOSE",
+            "operation_command_source": "main_routine_context_menu",
+            "early_close_requested_at": requested_at,
+            "early_close_source": "main_routine_context_menu",
+            "early_close_method": "시장가",
+            "early_close_policy": {"method": "시장가"},
+            "liquidation_policy_forced": True,
+            "liquidation_policy_reason": "EARLY_CLOSE",
         }
         config = {"operation_mode": "CONTINUOUS"}
 
@@ -156,6 +160,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "gui_auto_trade_policy.auto_trade_setting_liquidation_phase_active",
                 return_value=False,
             ),
+            patch(
+                "gui_auto_trade_policy.auto_trade_setting_is_after_regular_end",
+                return_value=False,
+            ),
         ):
             values = gui_main_table_loader._routine_tree_stock_display_values(
                 SimpleNamespace(),
@@ -166,9 +174,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 },
             )
 
-        self.assertEqual("\uC989\uC2DC\uCCAD\uC0B0", values[4])
+        self.assertEqual("\uC870\uAE30\uB9C8\uAC10", values[4])
         self.assertEqual("\uC2DC\uC7A5\uAC00", values[5])
-        self.assertEqual("\uC2DC\uC7A5\uAC00", values[6])
+        self.assertEqual("5\uBD84/\uC2DC\uC7A5\uAC00", values[6])
 
     def test_instance_operation_status_uses_runtime_running_count_only(self) -> None:
         self.assertEqual(
@@ -260,13 +268,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
     def test_routine_operation_confirmations_use_project_copy(self) -> None:
         import gui_windows
 
-        for command in (
-            "EARLY_CLOSE",
-            "IMMEDIATE_LIQUIDATION",
+        for display_status in (
+            gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
+            gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
         ):
             dialog = gui_windows._create_routine_operation_confirmation(
                 None,
-                command,
+                display_status,
             )
             try:
                 self.assertTrue(dialog.windowTitle())
@@ -1032,8 +1040,21 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 ],
             ),
             patch.object(gui_main_table_loader, "read_json_dict", side_effect=read_json),
+            patch.object(
+                gui_main_table_loader,
+                "project_current_stock_pnl_snapshot",
+                return_value={
+                    "111111": {
+                        "available": True,
+                        "cumulative_profit": 352,
+                        "completed_buy_cost": 10_000,
+                        "open_cost": 0,
+                    }
+                },
+            ),
         ):
             counts = gui_main_table_loader._instance_stock_counts()
+            gui_main_table_loader._refresh_instance_pnl_from_batch(counts)
 
         self.assertEqual(2, counts[instance.instance_id]["registered"])
         self.assertEqual(1, counts[instance.instance_id]["operation_or_stopped"])
@@ -2690,7 +2711,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             _main_routine_sort_column=-1,
             _main_routine_sort_order=0,
             _collapsed_routine_definition_ids=set(),
-            _update_main_routine_excluded_count=MagicMock(),
         )
 
         definition = RoutineDefinitionRecord(
@@ -2730,7 +2750,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_main_table_loader.main_load_routine_table(window)
 
         self.assertEqual(table.row_count, 1)
-        window._update_main_routine_excluded_count.assert_called_once_with(2)
         self.assertEqual(table.columnCount(), 10)
         row_texts = [table.item(0, col).text() for col in range(10)]
         self.assertTrue(row_texts[0])
@@ -3996,7 +4015,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_operation(
                         instance.instance_id,
                         instance.display_name,
-                        "EARLY_CLOSE",
+                        "루틴",
                         "조기마감",
                     )
                 request = command_service.apply.call_args.args[0]
@@ -4025,11 +4044,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_operation(
                         instance.instance_id,
                         instance.display_name,
-                        "IMMEDIATE_LIQUIDATION",
+                        gui_windows.POLICY_MARKET,
                         "즉시�?��",
                     )
                 request = command_service.apply.call_args.args[0]
-                self.assertEqual("IMMEDIATE_LIQUIDATION", request.command)
+                self.assertEqual("EARLY_CLOSE", request.command)
                 self.assertEqual(gui_main_table_loader.ROUTINE_STATUS_STOPPED, window.routine_table.cellWidget(1, 1).findChild(QLabel, "routineInstanceStatusText").text())
 
 
@@ -4066,7 +4085,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_definition_operation(
                         definition.definition_id,
                         definition.display_name,
-                        "EARLY_CLOSE",
+                        "루틴",
                         "조기마감",
                     )
                 service_factory.assert_not_called()
@@ -4098,7 +4117,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_definition_operation(
                         definition.definition_id,
                         definition.display_name,
-                        "EARLY_CLOSE",
+                        "루틴",
                         "조기마감",
                     )
                 category_requests = [
@@ -4153,11 +4172,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_definition_operation(
                         definition.definition_id,
                         definition.display_name,
-                        "IMMEDIATE_LIQUIDATION",
+                        gui_windows.POLICY_MARKET,
                         "즉시�?��",
                     )
                 self.assertEqual(
-                    ["IMMEDIATE_LIQUIDATION", "IMMEDIATE_LIQUIDATION"],
+                    ["EARLY_CLOSE", "EARLY_CLOSE"],
                     [
                         call_item.args[0].command
                         for call_item in category_service.apply.call_args_list
@@ -4177,7 +4196,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.request_routine_definition_operation(
                         definition.definition_id,
                         definition.display_name,
-                        "IMMEDIATE_LIQUIDATION",
+                        gui_windows.POLICY_MARKET,
                         "즉시�?��",
                     )
                 service_factory.assert_not_called()
@@ -4259,8 +4278,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.findChild(QWidget, "routineDummyTabArea")
                 )
                 all_badges = [
-                    window._main_routine_valid_button,
-                    *window._main_routine_level_buttons.values(),
                     *window._main_routine_metric_buttons.values(),
                     window._main_routine_initial_buy_sort_button,
                 ]
@@ -4270,11 +4287,28 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         gui_windows.AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
                         button.height(),
                     )
+                self.assertEqual(
+                    gui_windows.MAIN_ROUTINE_SUMMARY_VALID_BADGE_WIDTH,
+                    window._main_routine_valid_button.width(),
+                )
+                self.assertEqual(
+                    window._main_routine_summary_count_buttons["group"].height(),
+                    window._main_routine_valid_button.height(),
+                )
+                self.assertIs(
+                    window.findChild(QWidget, "mainRoutineSummary"),
+                    window._main_routine_valid_button.parentWidget(),
+                )
+                self.assertIsNotNone(
+                    window.findChild(QFrame, "mainRoutineValidSeparator")
+                )
                 separators = [
                     window.findChild(QFrame, "mainRoutineValidSeparator"),
-                    window.findChild(QFrame, "mainRoutineMetricSeparator"),
                     window.findChild(QFrame, "mainRoutineInitialBuySeparator"),
                 ]
+                self.assertIsNone(
+                    window.findChild(QFrame, "mainRoutineMetricSeparator")
+                )
                 self.assertTrue(all(separator is not None for separator in separators))
                 self.assertTrue(
                     all(
@@ -4288,24 +4322,17 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         separator.testAttribute(Qt.WA_StyledBackground)
                     )
                     self.assertIn("#64748B", separator.styleSheet())
-                separator_neighbors = (
-                    (
-                        window._main_routine_valid_button,
-                        separators[0],
-                        window._main_routine_level_buttons["group"],
-                    ),
-                    (
-                        window._main_routine_level_buttons["stock"],
-                        separators[1],
-                        window._main_routine_metric_buttons["holding"],
-                    ),
+                self.assertLess(
+                    separators[0].geometry().bottom(),
+                    window._main_routine_metric_buttons["holding"].geometry().top(),
+                )
+                for upper, separator, lower in (
                     (
                         window._main_routine_metric_buttons["limit"],
-                        separators[2],
+                        separators[1],
                         window._main_routine_initial_buy_sort_button,
                     ),
-                )
-                for upper, separator, lower in separator_neighbors:
+                ):
                     upper_gap = (
                         separator.geometry().top()
                         - upper.geometry().bottom()

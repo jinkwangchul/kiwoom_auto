@@ -141,7 +141,7 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
             now=datetime(2026, 8, 10, 14, 6, 0),
         )
 
-    def test_market_current_and_immediate_liquidation_block_routine_orders(self) -> None:
+    def test_market_and_current_early_close_block_routine_orders(self) -> None:
         for method in ("시장가", "현재가"):
             state = dict(
                 self.running_state,
@@ -153,18 +153,6 @@ class OrderManagerCanonicalPermissionTest(unittest.TestCase):
                 sell_enabled=True,
             )
             self.assert_sides(state, False)
-
-        immediate = dict(
-            self.running_state,
-            immediate_liquidation_request={
-                "status": "REQUESTED",
-                "requested_at": "2026-08-10 10:00:00",
-                "sell_method": "MARKET",
-            },
-            buy_enabled=True,
-            sell_enabled=True,
-        )
-        self.assert_sides(immediate, False)
 
         forced = dict(
             self.running_state,

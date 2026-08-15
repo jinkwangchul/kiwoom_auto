@@ -680,6 +680,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             window = SimpleNamespace(
                 update_global_operation_button_state=Mock(),
+                startup_recovery_session_ready=Mock(return_value=True),
+                _current_session_operation_participant_stock_codes={"005930"},
             )
             window.registered_operation_targets = lambda: (
                 gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
@@ -751,6 +753,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window = SimpleNamespace(
                 btn_start=MagicMock(),
                 startup_recovery_session_ready=Mock(return_value=True),
+                _current_session_operation_participant_stock_codes={"005930"},
             )
             window.registered_operation_targets = lambda: (
                 gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
@@ -1489,12 +1492,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
     def test_routine_recovery_block_uses_toast_without_command(self) -> None:
         cases = (
             (
-                gui_windows.MODE_EARLY_CLOSE,
+                "루틴",
                 gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
                 "루틴 조기마감",
             ),
             (
-                gui_windows.COMMAND_IMMEDIATE_LIQUIDATION,
+                gui_windows.POLICY_MARKET,
                 gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
                 "루틴 즉시청산",
             ),
@@ -1534,9 +1537,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "instance-a",
                     command=gui_windows.MODE_EARLY_CLOSE,
                     caller_name=(
-                        "EARLY_CLOSE_ROUTINE_INSTANCE"
-                        if command == gui_windows.MODE_EARLY_CLOSE
-                        else "IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE"
+                        "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
+                        if command == gui_windows.POLICY_MARKET
+                        else "EARLY_CLOSE_ROUTINE_INSTANCE"
                     ),
                 )
                 window.show_routine_recovery_block_toast.assert_called_once_with(
@@ -1547,8 +1550,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_instance_close_actions_share_early_close_intent_with_explicit_method(self) -> None:
         cases = (
-            (gui_windows.MODE_EARLY_CLOSE, "루틴"),
-            (gui_windows.COMMAND_IMMEDIATE_LIQUIDATION, "시장가"),
+            ("루틴", "루틴"),
+            (gui_windows.POLICY_MARKET, "시장가"),
         )
         for command, expected_method in cases:
             with self.subTest(command=command):
@@ -1596,9 +1599,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "instance-a",
                     command=gui_windows.MODE_EARLY_CLOSE,
                     caller_name=(
-                        "EARLY_CLOSE_ROUTINE_INSTANCE"
-                        if expected_method == "루틴"
-                        else "IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE"
+                        "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
+                        if expected_method == "시장가"
+                        else "EARLY_CLOSE_ROUTINE_INSTANCE"
                     ),
                 )
                 close_intent.assert_called_once_with(
@@ -1621,8 +1624,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_category_close_actions_apply_explicit_method_to_each_instance(self) -> None:
         cases = (
-            (gui_windows.MODE_EARLY_CLOSE, "루틴"),
-            (gui_windows.COMMAND_IMMEDIATE_LIQUIDATION, "시장가"),
+            ("루틴", "루틴"),
+            (gui_windows.POLICY_MARKET, "시장가"),
         )
         for command, expected_method in cases:
             with self.subTest(command=command):
@@ -1808,30 +1811,26 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 selected_account_no=Mock(return_value=""),
                 update_runtime_stock_status=Mock(),
             )
-            commands = (
-                gui_windows.MODE_EARLY_CLOSE,
-                gui_windows.COMMAND_IMMEDIATE_LIQUIDATION,
-                gui_windows.MODE_EARLY_CLOSE,
+            caller_names = (
+                "EARLY_CLOSE_ROUTINE_INSTANCE",
+                "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE",
+                "EARLY_CLOSE_ROUTINE_INSTANCE",
             )
 
             with patch.object(gui_windows.LOGGER, "warning") as warning:
-                for command in commands:
+                for caller_name in caller_names:
                     self.assertFalse(
                         gui_windows.MainWindow._production_recovery_allows_routine_operation(
                             window,
                             "instance-a",
-                            command=command,
-                            caller_name=(
-                                "EARLY_CLOSE_ROUTINE_INSTANCE"
-                                if command == gui_windows.MODE_EARLY_CLOSE
-                                else "IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE"
-                            ),
+                            command=gui_windows.MODE_EARLY_CLOSE,
+                            caller_name=caller_name,
                         )
                     )
 
             warning.assert_not_called()
             self.assertEqual(
-                len(commands),
+                len(caller_names),
                 window.production_recovery_gate_for_stock.call_count,
             )
             window.update_runtime_stock_status.assert_not_called()
@@ -1891,8 +1890,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 gui_windows.MainWindow._production_recovery_allows_routine_operation(
                     window,
                     "instance-a",
-                    command=gui_windows.COMMAND_IMMEDIATE_LIQUIDATION,
-                    caller_name="IMMEDIATE_LIQUIDATION_ROUTINE_INSTANCE",
+                    command=gui_windows.MODE_EARLY_CLOSE,
+                    caller_name="MARKET_EARLY_CLOSE_ROUTINE_INSTANCE",
                 )
             )
 
@@ -1967,7 +1966,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 window,
                 "indicator-follow",
                 "지표추종매매",
-                gui_windows.MODE_EARLY_CLOSE,
+                "루틴",
                 gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
             )
 

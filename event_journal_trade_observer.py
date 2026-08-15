@@ -458,7 +458,7 @@ def observe_liquidation_requested(request: Any, command_result: Any) -> list[dic
     """Record only newly persisted one-shot liquidation REQUESTED commands."""
 
     command = _text(getattr(request, "command", "")).upper()
-    if command not in {"IMMEDIATE_LIQUIDATION", "INDIVIDUAL_LIQUIDATION", "MANUAL_ATS_LIQUIDATION"}:
+    if command not in {"INDIVIDUAL_LIQUIDATION", "MANUAL_ATS_LIQUIDATION"}:
         return []
     command_id = _text(getattr(command_result, "command_id", ""))
     outputs = []

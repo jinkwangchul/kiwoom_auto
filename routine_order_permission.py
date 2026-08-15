@@ -32,7 +32,6 @@ _LIQUIDATION_STATUSES = {
     "LIQUIDATED",
 }
 _LIQUIDATION_REQUEST_KEYS = (
-    "immediate_liquidation_request",
     "individual_liquidation_request",
     "manual_ats_liquidation_request",
 )
@@ -108,6 +107,66 @@ def _today_normal_ended(
         and _text(operation_state.get("operation_status")).upper()
         == "NORMAL_ENDED"
     )
+
+
+def canonical_stock_trading_time_status(
+    *,
+    config: dict[str, Any] | None,
+    state: dict[str, Any] | None,
+    now_dt: datetime | None = None,
+) -> dict[str, Any]:
+    """Project the existing per-stock regular/ATS trading-time contract."""
+
+    if not isinstance(config, dict):
+        return {
+            "evaluable": False,
+            "active": False,
+            "mode": "",
+            "reason": "CONFIG_UNAVAILABLE",
+        }
+
+    current = now_dt or datetime.now()
+    try:
+        mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+        if mode == "CONTINUOUS":
+            runtime_state = state if isinstance(state, dict) else {}
+            regular_active = in_manual_trading_session(
+                now_dt=current,
+                config=config,
+            )
+            ats_active = manual_ats_active_now(
+                config,
+                runtime_state,
+                current,
+            )
+            return {
+                "evaluable": True,
+                "active": bool(regular_active or ats_active),
+                "mode": mode,
+                "reason": (
+                    "ACTIVE_REGULAR"
+                    if regular_active
+                    else "ACTIVE_ATS"
+                    if ats_active
+                    else "OUTSIDE_OPERATION_TIME"
+                ),
+            }
+
+        active = scheduled_status_for_now(config, current) == "RUNNING"
+        return {
+            "evaluable": True,
+            "active": active,
+            "mode": mode,
+            "reason": "ACTIVE_SCHEDULED" if active else "OUTSIDE_OPERATION_TIME",
+        }
+    except Exception as exc:
+        return {
+            "evaluable": False,
+            "active": False,
+            "mode": "",
+            "reason": "TIME_POLICY_ERROR",
+            "error": str(exc),
+        }
 
 
 def canonical_routine_order_permission(
@@ -202,22 +261,12 @@ def canonical_routine_order_permission(
         return blocked("운영 상태가 RUNNING이 아님")
 
     if isinstance(config, dict):
-        mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-        if mode == "CONTINUOUS":
-            in_operation_time = (
-                in_manual_trading_session(
-                    now_dt=current,
-                    config=config,
-                )
-                or manual_ats_active_now(
-                    config,
-                    runtime_state,
-                    current,
-                )
-            )
-        else:
-            in_operation_time = scheduled_status_for_now(config, current) == "RUNNING"
-        if not in_operation_time:
+        time_status = canonical_stock_trading_time_status(
+            config=config,
+            state=runtime_state,
+            now_dt=current,
+        )
+        if time_status.get("active") is not True:
             return blocked("운영시간 밖")
 
     return {
