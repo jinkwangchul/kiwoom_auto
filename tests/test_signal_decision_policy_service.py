@@ -377,8 +377,8 @@ class SignalDecisionPolicyServiceTest(unittest.TestCase):
         self.assertFalse(result["send_order_connected"])
         self.assertEqual(policy_preview, before)
 
-    def test_operation_state_policy_rejects_stopped_paused_and_emergency_stop_statuses(self):
-        for status in ("STOPPED", "PAUSED", "EMERGENCY_STOP"):
+    def test_operation_state_policy_rejects_stopped_and_emergency_stop_statuses(self):
+        for status in ("STOPPED", "EMERGENCY_STOP"):
             with self.subTest(status=status):
                 result = signal_decision_policy_service.apply_operation_state_policy(
                     _time_policy("BUY"),
@@ -471,8 +471,8 @@ class SignalDecisionPolicyServiceTest(unittest.TestCase):
         self.assertFalse(result["send_order_connected"])
         self.assertEqual(policy_preview, before)
 
-    def test_routine_active_policy_rejects_inactive_paused_stopped(self):
-        for status in ("INACTIVE", "PAUSED", "STOPPED"):
+    def test_routine_active_policy_rejects_inactive_and_stopped(self):
+        for status in ("INACTIVE", "STOPPED"):
             with self.subTest(status=status):
                 result = signal_decision_policy_service.apply_routine_active_policy(
                     _time_policy("BUY"),
@@ -536,8 +536,8 @@ class SignalDecisionPolicyServiceTest(unittest.TestCase):
         self.assertEqual(review["stock_policy_reason"], "stock_state.status is REVIEW")
         self.assertEqual(disabled["blocked_reasons"], ["stock_state.enabled is not true"])
 
-    def test_stock_active_policy_rejects_inactive_paused_stopped_missing_state_and_invalid_preview(self):
-        for status in ("INACTIVE", "PAUSED", "STOPPED"):
+    def test_stock_active_policy_rejects_inactive_stopped_missing_state_and_invalid_preview(self):
+        for status in ("INACTIVE", "STOPPED"):
             with self.subTest(status=status):
                 result = signal_decision_policy_service.apply_stock_active_policy(
                     _time_policy("BUY"),

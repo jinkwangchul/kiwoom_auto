@@ -20,6 +20,8 @@ from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     is_review_required_stock_dir,
     unique_review_reasons,
+    operator_review_location,
+    operator_review_reason,
 )
 from gui_auto_trade_runtime import now_text
 from gui_auto_trade_runtime import get_stock_dirs_in_routine
@@ -28,7 +30,6 @@ from gui_routine_registry import get_routine_dirs
 from gui_auto_trade_status_ops import (
     auto_trade_recalculate_all_status_by_operation_policy,
     auto_trade_recalculate_stock_status_by_operation_policy,
-    auto_trade_resume_status_after_pause,
     auto_trade_update_stock_operation_mode,
     auto_trade_update_stock_status,
 )
@@ -294,9 +295,6 @@ class AutoTradeOperationHost(QObject):
     def update_stock_operation_mode(self, *args, **kwargs):
         return auto_trade_update_stock_operation_mode(self, *args, **kwargs)
 
-    def resume_status_after_pause(self, state: dict[str, object]):
-        return auto_trade_resume_status_after_pause(self, state)
-
     @staticmethod
     def int_state_value(state: dict[str, object], key: str) -> int:
         try:
@@ -410,20 +408,6 @@ class AutoTradeOperationHost(QObject):
                 name,
                 reasons,
             )
-        before_status = (
-            str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        )
-        if before_status == "PAUSED":
-            new_status, metadata, reason = self.resume_status_after_pause(state)
-            if new_status == "REVIEW_REQUIRED":
-                item = build_review_required_item(
-                    routine_name,
-                    stock_dir,
-                    code,
-                    name,
-                    [reason],
-                )
-                item["resume_metadata"] = metadata
         return item
 
     def mark_review_required(
@@ -435,34 +419,32 @@ class AutoTradeOperationHost(QObject):
         source: str = "",
     ) -> bool:
         reasons = unique_review_reasons(list(item.get("review_reasons", [])))
-        reason_text = " / ".join(reasons) if reasons else "수동 검토 필요"
+        operator_reasons = unique_review_reasons(
+            [operator_review_reason(reason) for reason in reasons]
+        )
+        reason_text = " / ".join(operator_reasons) or "수동 검토 필요"
         metadata = {
             "review_required": True,
             "review_status": "PENDING",
-            "review_location": str(
+            "review_location": operator_review_location(str(
                 source
                 or item.get("review_location", "")
                 or item.get("review_source", "")
                 or item.get("detected_by", "")
                 or "-"
             ).strip()
-            or "-",
+            or "-"),
             "review_reason": reason_text,
             "review_checked_at": now_text(),
-            "missed_buy_signal_count": safe_int_value(
-                item.get("missed_buy_signal_count"),
-                0,
-            ),
-            "missed_sell_signal_count": safe_int_value(
-                item.get("missed_sell_signal_count"),
-                0,
-            ),
             "last_checked_price": safe_float_value(
                 item.get("current_price"),
                 0.0,
             ),
             "last_checked_pnl_rate": str(item.get("pnl_rate_text", "-")),
         }
+        raw_reason_text = " / ".join(reasons)
+        if raw_reason_text and raw_reason_text != reason_text:
+            metadata["review_detail"] = raw_reason_text
         resume_metadata = item.get("resume_metadata")
         if isinstance(resume_metadata, dict):
             metadata.update(resume_metadata)

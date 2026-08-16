@@ -401,7 +401,8 @@ def _persist_early_close_execution_result(
         metadata.update(
             {
                 "review_required": True,
-                "review_reason": "EARLY_CLOSE_EXECUTION_FAILED",
+                "review_reason": "청산 처리 오류",
+                "review_location": "운영 중",
             }
         )
     return bool(

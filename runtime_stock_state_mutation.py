@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gui_auto_trade_runtime import now_text, write_state_json
+from gui_review_utils import merge_existing_review_metadata
 from runtime_io import read_json_dict
 
 
@@ -35,10 +36,17 @@ def mutate_runtime_stock_state(
     before_status = str(state.get("status", "STOPPED") or "STOPPED").strip().upper()
     timestamp = str(updated_at or "").strip() or now_text()
 
+    mutation_metadata = dict(metadata or {})
+    target_status = str(new_status or "").strip().upper()
+    if target_status in {"REVIEW", "REVIEW_REQUIRED"} or (
+        mutation_metadata.get("review_required") is True
+    ):
+        mutation_metadata = merge_existing_review_metadata(state, mutation_metadata)
+
     state["status"] = new_status
     state["updated_at"] = timestamp
-    if metadata:
-        state.update(metadata)
+    if mutation_metadata:
+        state.update(mutation_metadata)
 
     after_status = str(state.get("status", "") or "").strip().upper()
     if not write_state_json(
@@ -57,8 +65,8 @@ def mutate_runtime_stock_state(
     if verify_readback:
         saved_state = read_json_dict(path / "state.json")
         expected_values: dict[str, object] = {"status": new_status}
-        if metadata:
-            expected_values.update(metadata)
+        if mutation_metadata:
+            expected_values.update(mutation_metadata)
         if any(saved_state.get(key) != value for key, value in expected_values.items()):
             return RuntimeStockStateMutationResult(
                 ok=False,

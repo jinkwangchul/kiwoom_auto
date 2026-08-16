@@ -159,13 +159,15 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
         self.assertEqual(
             "미해결",
             review_window._review_display_status_for_collected_row(
-                {"status": "REVIEW_REQUIRED", "review_required": True, "review_status": "PENDING"}
+                {"status": "REVIEW_REQUIRED", "review_required": True, "review_status": "PENDING"},
+                return_availability="BLOCKED",
             ),
         )
         self.assertEqual(
             "해결",
             review_window._review_display_status_for_collected_row(
-                {"status": "REVIEW_REQUIRED", "review_required": True, "review_status": "RESOLVED"}
+                {"status": "REVIEW_REQUIRED", "review_required": True, "review_status": "RESOLVED"},
+                return_availability="ALLOWED",
             ),
         )
 
@@ -360,18 +362,19 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
 
         by_code = {str(row["code"]): row for row in rows}
         self.assertEqual("운영 데이터 없음", by_code["100001"]["review_reason"])
-        self.assertEqual("미기록", by_code["100001"]["review_location"])
+        self.assertEqual("종목관리", by_code["100001"]["review_location"])
         self.assertEqual("미해결", by_code["100001"]["display_status"])
-        self.assertEqual("미해결", by_code["100001"]["return_availability"])
+        self.assertEqual("BLOCKED", by_code["100001"]["return_availability"])
         self.assertEqual("운영 데이터 읽기 오류", by_code["100002"]["review_reason"])
-        self.assertEqual("미기록", by_code["100002"]["review_location"])
+        self.assertEqual("종목관리", by_code["100002"]["review_location"])
         self.assertEqual("미해결", by_code["100002"]["display_status"])
         self.assertEqual("운영 데이터 읽기 오류", by_code["100003"]["review_reason"])
-        self.assertEqual("미기록", by_code["100003"]["review_location"])
+        self.assertEqual("종목관리", by_code["100003"]["review_location"])
         self.assertEqual("미해결", by_code["100003"]["display_status"])
         self.assertEqual("기존 사유", by_code["100004"]["review_reason"])
         self.assertEqual("미기록", by_code["100004"]["review_location"])
-        self.assertEqual("해결", by_code["100004"]["display_status"])
+        self.assertEqual("미해결", by_code["100004"]["display_status"])
+        self.assertEqual("BLOCKED", by_code["100004"]["return_availability"])
         self.assertNotIn("100005", by_code)
         self.assertNotIn("100006", by_code)
 
@@ -412,7 +415,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
 
         self.assertEqual(1, len(rows))
         self.assertEqual("긴급정지", rows[0]["display_status"])
-        self.assertEqual("긴급정지", rows[0]["return_availability"])
+        self.assertEqual("BLOCKED", rows[0]["return_availability"])
         self.assertEqual("운영 데이터 불일치", rows[0]["review_reason"])
         self.assertEqual("운영 시작", rows[0]["review_location"])
         self.assertEqual("2026-08-02 12:34:56", rows[0]["review_entered_at"])
@@ -454,12 +457,12 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
 
         self.assertEqual(1, len(rows))
         self.assertEqual("긴급정지", rows[0]["display_status"])
-        self.assertEqual("긴급정지", rows[0]["return_availability"])
+        self.assertEqual("BLOCKED", rows[0]["return_availability"])
         self.assertEqual("운영 데이터 불일치", rows[0]["review_reason"])
         self.assertEqual("운영 중", rows[0]["review_location"])
         self.assertEqual("2026-08-02 12:44:56", rows[0]["review_entered_at"])
 
-    def test_state_issue_rows_without_detection_event_use_unrecorded(self) -> None:
+    def test_state_issue_rows_without_detection_event_use_stock_management(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             records = [SimpleNamespace(code="100001", name="상태없음", routine="A루틴")]
@@ -476,7 +479,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
                 rows = review_window.collect_global_review_required_rows()
 
         self.assertEqual("운영 데이터 없음", rows[0]["review_reason"])
-        self.assertEqual("미기록", rows[0]["review_location"])
+        self.assertEqual("종목관리", rows[0]["review_location"])
 
     def test_state_issue_rows_use_manifest_record(self) -> None:
         with TemporaryDirectory() as temp:
@@ -559,7 +562,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
     def test_review_window_load_and_refresh_do_not_pass_caller_event(self) -> None:
         calls = 0
 
-        def fake_rows():
+        def fake_rows(_availability_window=None):
             nonlocal calls
             calls += 1
             return []
@@ -725,6 +728,10 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
                 patch.object(review_window, "collect_global_review_required_rows", return_value=[row]),
                 patch.object(review_window.QMessageBox, "information"),
                 patch.object(review_window, "append_production_event"),
+                patch(
+                    "gui_main_emergency_ops.review_return_availability",
+                    return_value={"availability": "ALLOWED", "reason": ""},
+                ),
             ):
                 window = review_window.GlobalReviewRequiredWindow()
                 window.table.selectRow(0)

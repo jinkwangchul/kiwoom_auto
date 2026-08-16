@@ -101,6 +101,71 @@ def unique_review_reasons(values: list[object]) -> list[str]:
     return unique
 
 
+def normalized_review_reasons(values: list[object]) -> list[str]:
+    """Normalize persisted legacy/internal causes to the operator vocabulary."""
+    from gui_auto_trade_integrity import operator_review_reason
+
+    return unique_review_reasons(
+        [operator_review_reason(reason) for reason in unique_review_reasons(values)]
+    )
+
+
+def merge_review_reason_text(existing: object, incoming: object) -> str:
+    """Merge operator-facing Review causes without losing their first-seen order."""
+    return " / ".join(normalized_review_reasons([existing, incoming]))
+
+
+def merge_review_detail_text(existing: object, incoming: object) -> str:
+    """Preserve distinct internal evidence lines without creating a new history SoT."""
+    lines: list[str] = []
+    for value in (existing, incoming):
+        for raw_line in str(value or "").splitlines():
+            line = raw_line.strip()
+            if line and line not in lines:
+                lines.append(line)
+    return "\n".join(lines)
+
+
+def merge_existing_review_metadata(
+    state: dict[str, object] | None,
+    metadata: dict[str, object] | None,
+) -> dict[str, object]:
+    """Merge a follow-up Review cause while preserving first-entry identity/lifecycle.
+
+    This is a projection over the existing ``state.json`` payload.  It does not
+    write, create a separate history, or infer Review for missing/corrupt rows.
+    """
+    merged = dict(metadata or {})
+    current = state if isinstance(state, dict) else {}
+    current_status = str(current.get("status", "") or "").strip().upper()
+    already_review = current_status in {"REVIEW", "REVIEW_REQUIRED"} or (
+        current.get("review_required") is True
+    )
+    incoming_reason = str(merged.get("review_reason", "") or "").strip()
+    if not already_review or not incoming_reason:
+        return merged
+
+    merged_reason = merge_review_reason_text(
+        current.get("review_reason", ""),
+        incoming_reason,
+    )
+    if merged_reason:
+        merged["review_reason"] = merged_reason
+
+    merged_detail = merge_review_detail_text(
+        current.get("review_detail", ""),
+        merged.get("review_detail", ""),
+    )
+    if merged_detail:
+        merged["review_detail"] = merged_detail
+
+    for key in ("review_entered_at", "review_location", "review_status"):
+        existing_value = current.get(key)
+        if str(existing_value or "").strip():
+            merged[key] = existing_value
+    return merged
+
+
 def build_review_required_item(
     routine_name: str,
     stock_dir: Path,
@@ -121,9 +186,6 @@ def build_review_required_item(
     holding_qty = safe_int_value(state.get("holding_qty"), 0)
     avg_price = average_price_from_state(state)
     buy_count = safe_int_value(state.get("buy_count"), 0)
-    missed_buy = safe_int_value(state.get("missed_buy_signal_count"), 0)
-    missed_sell = safe_int_value(state.get("missed_sell_signal_count"), 0)
-    check_status = str(state.get("pause_signal_check_status", "UNCHECKED")).strip().upper()
     pending_exists, pending_qty = pending_order_summary(stock_dir, state)
     current_price = current_price_from_state(state)
 
@@ -134,11 +196,6 @@ def build_review_required_item(
     review_reason = str(state.get("review_reason", "")).strip()
     if status == "REVIEW_REQUIRED" and review_reason:
         reasons.extend(split_review_reason_text(review_reason))
-
-    if missed_buy > 0 or missed_sell > 0:
-        reasons.append("일시중지 기간 중 매수/매도 신호 발생")
-    elif status == "PAUSED" and check_status != "CHECKED":
-        reasons.append("일시중지 신호 확인 필요")
 
     if pending_exists:
         reasons.append("미체결 주문 있음")
@@ -172,7 +229,6 @@ def build_review_required_item(
         "display_status": auto_trade_status_display(status),
         "review_reasons": unique_reasons,
         "review_reason_text": " / ".join(unique_reasons) if unique_reasons else "-",
-        "pause_signal_check_status": check_status,
         "holding_qty": holding_qty,
         "avg_price": avg_price,
         "current_price": current_price,
@@ -182,9 +238,6 @@ def build_review_required_item(
         "buy_count": buy_count,
         "pending_exists": pending_exists,
         "pending_qty": pending_qty,
-        "missed_buy_signal_count": missed_buy,
-        "missed_sell_signal_count": missed_sell,
-        "paused_at": str(state.get("paused_at", "")),
         "review_checked_at": str(state.get("review_checked_at", "")),
         "review_status": str(state.get("review_status", "PENDING") or "PENDING"),
         "orders_count": len(orders),
@@ -201,18 +254,7 @@ def review_reason_summary(item: dict[str, object]) -> str:
     pending_text = "미체결O" if bool(item.get("pending_exists")) else "미체결X"
     current_text = "현재가O" if item.get("current_price") is not None else "현재가X"
 
-    missed_buy = safe_int_value(item.get("missed_buy_signal_count"), 0)
-    missed_sell = safe_int_value(item.get("missed_sell_signal_count"), 0)
-    check_status = str(item.get("pause_signal_check_status", "CHECKED")).strip().upper()
-
-    if missed_buy > 0 or missed_sell > 0:
-        signal_text = "매매신호O"
-    elif check_status != "CHECKED" and str(item.get("status", "")).strip().upper() in ("PAUSED", "REVIEW_REQUIRED"):
-        signal_text = "매매신호확인X"
-    else:
-        signal_text = "매매신호X"
-
-    tokens = [pending_text, current_text, signal_text]
+    tokens = [pending_text, current_text]
 
     holding_qty = safe_int_value(item.get("holding_qty"), 0)
     avg_price = safe_float_value(
@@ -226,7 +268,7 @@ def review_reason_summary(item: dict[str, object]) -> str:
 
 
 def compact_time_text(value: object) -> str:
-    """검토관리창 표에서 일시중지 시각을 HH:MM:SS 중심으로 짧게 표시한다."""
+    """검토관리창 표에서 시각 값을 HH:MM:SS 중심으로 짧게 표시한다."""
     text = str(value or "").strip()
     if not text:
         return "-"

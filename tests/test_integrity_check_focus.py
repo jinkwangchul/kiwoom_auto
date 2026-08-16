@@ -375,7 +375,8 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
         self.assertEqual(self.root / "stocks" / "000000_Bad", stock_dir)
         self.assertEqual("000000", code)
         self.assertEqual("Bad", name)
-        self.assertIn("[STOCK_CODE_FORMAT]", " ".join(item["review_reasons"]))
+        self.assertEqual(["운영 데이터 불일치"], item["review_reasons"])
+        self.assertEqual("안정성 검사", item["review_location"])
 
     def test_check_error_issue_is_not_registered(self) -> None:
         stock_dir = self._stock()
@@ -440,7 +441,7 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
 
         writer.assert_called_once()
         reasons = writer.call_args.args[3]["review_reasons"]
-        self.assertEqual(1, sum("[STOCK_CODE_FORMAT]" in reason for reason in reasons))
+        self.assertEqual(["운영 데이터 불일치"], reasons)
 
     def test_existing_review_reason_is_preserved(self) -> None:
         self._stock(
@@ -457,7 +458,7 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
 
         reasons = writer.call_args.args[3]["review_reasons"]
         self.assertIn("기존 사유", reasons)
-        self.assertTrue(any("[STOCK_CODE_FORMAT]" in reason for reason in reasons))
+        self.assertIn("운영 데이터 불일치", reasons)
 
     def test_writer_failure_adds_check_error(self) -> None:
         self._stock("000000_Bad")
@@ -501,10 +502,12 @@ class LocalStockIntegrityCheckTest(unittest.TestCase):
         )
 
         writer.assert_called_once()
-        reasons_text = " ".join(writer.call_args.args[3]["review_reasons"])
-        self.assertIn("[STOCK_CODE_FORMAT]", reasons_text)
-        self.assertIn("[REQUIRED_PATH_MISSING]", reasons_text)
-        self.assertIn("[ORDERS_REQUIRED_KEY_MISSING]", reasons_text)
+        reasons = writer.call_args.args[3]["review_reasons"]
+        self.assertEqual(["운영 데이터 불일치"], reasons)
+        issue_codes = self._issue_codes(self._result())
+        self.assertIn("STOCK_CODE_FORMAT", issue_codes)
+        self.assertIn("REQUIRED_PATH_MISSING", issue_codes)
+        self.assertIn("ORDERS_REQUIRED_KEY_MISSING", issue_codes)
 
     def test_read_only_check_does_not_call_writer(self) -> None:
         self._stock("000000_Bad")

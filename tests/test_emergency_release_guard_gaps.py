@@ -151,9 +151,15 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
         self.assertEqual("2026-08-11 09:00:00", state.get("emergency_stopped_at"), detail)
         self.assertNotEqual("PASSED", state.get("emergency_release_check"), detail)
         if expected_reason is not None:
-            self.assertEqual(expected_reason, state.get("review_reason"), detail)
+            self.assertEqual(
+                "사용자 긴급정지 / "
+                + emergency_ops.operator_review_reason(expected_reason),
+                state.get("review_reason"),
+                detail,
+            )
+            self.assertIn(f"evidence={expected_reason}", state.get("review_detail", ""))
 
-    def test_recovery_completed_control_allows_release_to_stopped(self) -> None:
+    def test_recovery_completed_control_releases_emergency_but_preserves_review(self) -> None:
         stock_dir = self._stock()
 
         result, state = self._release(
@@ -161,8 +167,10 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
             window=_ReleaseWindow(recovery_ready=True),
         )
 
-        self.assertEqual("normal", result)
-        self.assertEqual("STOPPED", state["status"])
+        self.assertEqual("review_existing", result)
+        self.assertEqual("REVIEW_REQUIRED", state["status"])
+        self.assertTrue(state["review_required"])
+        self.assertEqual("RESOLVED", state["review_status"])
         self.assertFalse(state["trade_enabled"])
         self.assertEqual("PASSED", state["emergency_release_check"])
 

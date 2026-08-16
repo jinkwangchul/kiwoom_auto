@@ -50,10 +50,8 @@ class PendingOrderIntegrityReviewWriterTest(unittest.TestCase):
         self.assertTrue(saved["review_required"])
         self.assertEqual("PENDING", saved["review_status"])
         self.assertEqual("focused-test", saved["review_location"])
-        self.assertEqual(
-            "PENDING_ORDER_DATA_INTEGRITY: PENDING_ORDER_QTY_MISSING",
-            saved["review_reason"],
-        )
+        self.assertEqual("미체결 데이터 오류", saved["review_reason"])
+        self.assertIn("PENDING_ORDER_QTY_MISSING", saved["review_detail"])
         self.assertEqual("2026-08-06 12:34:56", saved["review_entered_at"])
         self.assertFalse(saved["trade_enabled"])
         self.assertNotIn("buy_enabled", saved)
@@ -95,8 +93,35 @@ class PendingOrderIntegrityReviewWriterTest(unittest.TestCase):
         self.assertEqual("REVIEW_REQUIRED", saved["status"])
         self.assertIs(saved["trade_enabled"], False)
 
+    def test_production_sources_share_reason_and_use_actual_detection_location(self) -> None:
+        cases = {
+            "종목등록 창 미체결 데이터 무결성 오류": "종목 등록",
+            "등록해제 미체결 데이터 무결성 오류": "종목 해제",
+            "루틴 이동 미체결 데이터 무결성 오류": "루틴 등록",
+            "루틴 해제 미체결 데이터 무결성 오류": "루틴 해제",
+        }
+        for index, (source, expected_location) in enumerate(cases.items(), start=1):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as root:
+                stock_dir = self._stock_dir(root, {"status": "STOPPED"})
+                with patch("gui_auto_trade_utils.append_stock_log"):
+                    ok = mark_pending_order_integrity_review_required(
+                        "루틴A",
+                        stock_dir,
+                        f"{index:06d}",
+                        "테스트",
+                        ["PENDING_ORDER_QTY_MISSING"],
+                        source=source,
+                    )
+                saved = json.loads(
+                    (stock_dir / "state.json").read_text(encoding="utf-8")
+                )
+            self.assertTrue(ok)
+            self.assertEqual("미체결 데이터 오류", saved["review_reason"])
+            self.assertEqual(expected_location, saved["review_location"])
+            self.assertIn("PENDING_ORDER_QTY_MISSING", saved["review_detail"])
+
     def test_same_review_reason_is_idempotent(self) -> None:
-        reason = "PENDING_ORDER_DATA_INTEGRITY: LEGACY_PENDING_SUMMARY_ONLY"
+        reason = "미체결 데이터 오류"
         with tempfile.TemporaryDirectory() as root:
             stock_dir = self._stock_dir(
                 root,
@@ -122,6 +147,45 @@ class PendingOrderIntegrityReviewWriterTest(unittest.TestCase):
         self.assertTrue(ok)
         writer.assert_not_called()
         stock_log.assert_not_called()
+
+    def test_different_existing_review_reason_is_merged_without_reentry(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir = self._stock_dir(
+                root,
+                {
+                    "status": "REVIEW_REQUIRED",
+                    "review_required": True,
+                    "review_status": "RESOLVED",
+                    "review_reason": "운영 데이터 불일치",
+                    "review_detail": "기존 내부 evidence",
+                    "review_location": "운영 시작",
+                    "review_entered_at": "2026-08-01 09:00:00",
+                },
+            )
+            with (
+                patch("gui_auto_trade_utils.now_text", return_value="2026-08-16 12:34:56"),
+                patch("gui_auto_trade_utils.append_stock_log"),
+            ):
+                ok = mark_pending_order_integrity_review_required(
+                    "루틴A",
+                    stock_dir,
+                    "000001",
+                    "테스트",
+                    ["PENDING_ORDER_QTY_MISSING"],
+                    source="종목등록 창 미체결 데이터 무결성 오류",
+                )
+            saved = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            "운영 데이터 불일치 / 미체결 데이터 오류",
+            saved["review_reason"],
+        )
+        self.assertEqual("2026-08-01 09:00:00", saved["review_entered_at"])
+        self.assertEqual("운영 시작", saved["review_location"])
+        self.assertEqual("RESOLVED", saved["review_status"])
+        self.assertIn("기존 내부 evidence", saved["review_detail"])
+        self.assertIn("PENDING_ORDER_QTY_MISSING", saved["review_detail"])
 
     def test_write_failure_returns_false_and_records_critical_log(self) -> None:
         with tempfile.TemporaryDirectory() as root:

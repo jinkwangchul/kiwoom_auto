@@ -39,7 +39,6 @@ def default_config() -> dict[str, object]:
         "end_buy_time": "13:30",
         "auto_start_enabled": False,
         "auto_start_time": "09:00",
-        "pause_resume_policy": "SIGNAL_REVIEW",
         "operation_mode": "SCHEDULED",
         "real_trade_enabled": True,
     }
@@ -66,13 +65,9 @@ def default_state() -> dict[str, object]:
         "ignore_sell_until_next_buy": True,
         "updated_at": "",
         "scheduler_enabled": False,
-        "paused_at": "",
         "resumed_at": "",
         "review_required": False,
         "review_reason": "",
-        "missed_buy_signal_count": 0,
-        "missed_sell_signal_count": 0,
-        "pause_signal_check_status": "UNCHECKED",
         "ignore_signals_before": "",
     }
 

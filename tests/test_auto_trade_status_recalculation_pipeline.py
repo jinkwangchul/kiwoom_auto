@@ -240,7 +240,8 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         )
         self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
         self.assertTrue(saved_state["review_required"])
-        self.assertIn("LEGACY_PENDING_SUMMARY_ONLY", saved_state["review_reason"])
+        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
+        self.assertIn("LEGACY_PENDING_SUMMARY_ONLY", saved_state["review_detail"])
 
     def test_unregister_policy_moves_unknown_pending_side_to_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -280,7 +281,8 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             unregister["reasons"],
         )
         self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
-        self.assertIn("PENDING_ORDER_SIDE_UNKNOWN", saved_state["review_reason"])
+        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
+        self.assertIn("PENDING_ORDER_SIDE_UNKNOWN", saved_state["review_detail"])
 
     def test_unregister_policy_keeps_normal_buy_pending_as_policy_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

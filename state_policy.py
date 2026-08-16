@@ -44,7 +44,7 @@ def auto_trade_status_display(raw_status: object) -> str:
     - 과거 표시명 "감시/매도"는 내부 호환용으로만 인정하고 "자동마감"으로 변환한다.
     - "자동마감"이 raw status로 들어와도 검토종목으로 떨어지면 안 된다.
 
-    STOPPED/PAUSED/REVIEW_REQUIRED 같은 내부·구버전 코드는 화면에 직접 노출하지 않는다.
+    STOPPED/REVIEW_REQUIRED 같은 내부 코드는 화면에 직접 노출하지 않는다.
     """
     raw_text = str(raw_status or "STOPPED").strip()
     if not raw_text:
@@ -109,6 +109,7 @@ def auto_trade_status_display(raw_status: object) -> str:
         "EMERGENCY": "긴급정지",
         "REVIEW_REQUIRED": "검토종목",
         "REVIEW": "검토종목",
+        # 폐기된 persisted 입력은 현재 기능으로 해석하지 않고 fail-closed 표시한다.
         "PAUSED": "검토종목",
         "ERROR": "검토종목",
     }
@@ -131,7 +132,6 @@ def auto_trade_status_color(display_status: str) -> str:
         "정지": "#dc2626",
         "감시중": "#2563eb",
         "매수중지": "#7c3aed",
-        "일시중지": "#ca8a04",
         "검토필요": "#ca8a04",
         "비상정지": "#7f1d1d",
         "등록대기": "#9ca3af",

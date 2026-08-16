@@ -16,8 +16,11 @@ from gui_auto_trade_status_ops import append_stock_log
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_review_required_state,
+    operator_review_location,
+    REVIEW_REASON_PENDING_ORDER_DATA_ERROR,
 )
 from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
+from gui_review_utils import merge_existing_review_metadata, normalized_review_reasons
 from runtime_io import read_json_dict
 
 LOGGER = logging.getLogger(__name__)
@@ -39,41 +42,31 @@ def mark_pending_order_integrity_review_required(
         state = {}
     before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
     unique_issues = list(dict.fromkeys(str(issue).strip() for issue in issue_codes if str(issue).strip()))
-    reason = "PENDING_ORDER_DATA_INTEGRITY"
+    evidence_reason = "PENDING_ORDER_DATA_INTEGRITY"
     if unique_issues:
-        reason += ": " + " / ".join(unique_issues)
+        evidence_reason += ": " + " / ".join(unique_issues)
+    reason = REVIEW_REASON_PENDING_ORDER_DATA_ERROR
+    review_location = operator_review_location(source)
 
-    if before_status in {"REVIEW_REQUIRED", "REVIEW"}:
-        existing_reason = str(state.get("review_reason", "") or "").strip()
-        if existing_reason == reason:
-            return True
-        LOGGER.warning(
-            "pending integrity review-required write skipped: already in review with different reason "
-            "code=%s name=%s routine=%s stock_dir=%s existing_reason=%s new_reason=%s",
-            code,
-            name,
-            routine_name,
-            stock_dir,
-            existing_reason,
-            reason,
-        )
+    if before_status in {"REVIEW_REQUIRED", "REVIEW"} and reason in normalized_review_reasons(
+        [state.get("review_reason", "")]
+    ):
         return True
 
     timestamp = now_text()
-
-    state.update(
-        {
+    metadata = {
             "status": "REVIEW_REQUIRED",
             "review_required": True,
             "review_status": "PENDING",
-            "review_location": source,
+            "review_location": review_location,
             "review_reason": reason,
-            "review_detail": f"{code} {name} / {reason}",
+            "review_detail": f"{code} {name} / {reason} / evidence={evidence_reason}",
             "review_checked_at": timestamp,
             "updated_at": timestamp,
             "trade_enabled": False,
         }
-    )
+    metadata = merge_existing_review_metadata(state, metadata)
+    state.update(metadata)
     if before_status not in {"REVIEW_REQUIRED", "REVIEW"}:
         state["review_entered_at"] = timestamp
 
@@ -99,7 +92,8 @@ def mark_pending_order_integrity_review_required(
         isinstance(saved_state, dict)
         and str(saved_state.get("status", "") or "").strip().upper() == "REVIEW_REQUIRED"
         and saved_state.get("review_required") is True
-        and str(saved_state.get("review_reason", "") or "").strip() == reason
+        and str(saved_state.get("review_reason", "") or "").strip()
+        == str(state.get("review_reason", "") or "").strip()
     )
     if not saved_ok:
         append_stock_log(

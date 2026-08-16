@@ -127,14 +127,6 @@ from gui_auto_trade_utils import (
     mark_pending_order_integrity_review_required,
 )
 from gui_auto_trade_run_control import auto_trade_running_registered_operation_targets
-from gui_review_utils import (
-    build_review_required_item,
-    compact_time_text,
-    pending_order_summary,
-    review_required_for_start,
-    review_reason_summary,
-    safe_float_value,
-)
 from gui_routine_assign_utils import (
     build_routine_assign_result_lines,
     build_routine_assign_status_text,

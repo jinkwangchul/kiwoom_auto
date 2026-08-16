@@ -111,7 +111,6 @@ def default_config() -> dict[str, object]:
         "end_buy_time": "13:30",
         "auto_start_enabled": False,
         "auto_start_time": "09:00",
-        "pause_resume_policy": "SIGNAL_REVIEW",
         "operation_mode": "SCHEDULED",
         "real_trade_enabled": True,
     }

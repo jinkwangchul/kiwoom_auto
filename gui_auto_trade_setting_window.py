@@ -150,9 +150,6 @@ from gui_search_stock_register_dialog import SearchStockRegisterDialog
 from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_review_utils import (
     build_review_required_item,
-    compact_time_text,
-    review_required_for_start,
-    review_reason_summary,
     safe_float_value,
 )
 from gui_routine_assign_utils import (
@@ -1168,6 +1165,8 @@ from gui_auto_trade_integrity import (
     is_review_required_stock_dir,
     auto_trade_setting_data_inconsistency_reasons,
     restart_initial_review_reason_for_stock,
+    operator_review_location,
+    operator_review_reason,
     auto_trade_setting_server_mismatch_detected,
 )
 from gui_stock_performance_window import open_stock_performance_prototype
@@ -1223,7 +1222,6 @@ from gui_auto_trade_status_ops import (
     auto_trade_recalculate_all_status_by_operation_policy,
     auto_trade_recalculate_stock_status_by_operation_policy,
     auto_trade_reset_schedule_times_for_targets,
-    auto_trade_resume_status_after_pause,
     auto_trade_set_selected_stock_operation_exclusions,
     auto_trade_set_stock_operation_exclusion,
     auto_trade_stock_operation_excluded,
@@ -9171,9 +9169,6 @@ class AutoTradeSettingWindow(QDialog):
         except Exception:
             return 0
 
-    def resume_status_after_pause(self, state: dict[str, object]) -> tuple[str, dict[str, object], str]:
-        return auto_trade_resume_status_after_pause(self, state)
-
     def pre_start_review_check(self, routine_name: str, stock_dir: Path, code: str, name: str) -> dict[str, object]:
         """
         자동매매 시작 전 사전점검.
@@ -9183,20 +9178,9 @@ class AutoTradeSettingWindow(QDialog):
         """
         item = build_review_required_item(routine_name, stock_dir, code, name)
         state = read_json_dict(stock_dir / "state.json")
-        before_status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-
         data_reasons = auto_trade_setting_data_inconsistency_reasons(state)
         if data_reasons:
             return build_review_required_item(routine_name, stock_dir, code, name, data_reasons)
-
-        # PAUSED 상태는 일시중지 기간 중 신호 검토 정책을 추가 반영한다.
-        if before_status == "PAUSED":
-            new_status, metadata, reason = self.resume_status_after_pause(state)
-            if new_status == "REVIEW_REQUIRED":
-                forced = [reason]
-                item = build_review_required_item(routine_name, stock_dir, code, name, forced)
-                item["resume_metadata"] = metadata
-                return item
 
         return item
 
@@ -9216,10 +9200,13 @@ class AutoTradeSettingWindow(QDialog):
         data_reasons = auto_trade_setting_data_inconsistency_reasons(state_before)
         operation_active_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
         operation_data_issue = bool(data_reasons) and before_status in operation_active_statuses
+        operator_reasons = unique_review_reasons(
+            [operator_review_reason(reason) for reason in reasons]
+        )
         reason_text = (
             "운영 데이터 불일치"
             if operation_data_issue
-            else (" / ".join(reasons) if reasons else "수동 검토 필요")
+            else (" / ".join(operator_reasons) or "수동 검토 필요")
         )
         review_location = str(
             source
@@ -9228,6 +9215,7 @@ class AutoTradeSettingWindow(QDialog):
             or item.get("detected_by", "")
             or "-"
         ).strip() or "-"
+        review_location = operator_review_location(review_location)
 
         metadata = {
             "review_required": True,
@@ -9235,11 +9223,12 @@ class AutoTradeSettingWindow(QDialog):
             "review_location": review_location,
             "review_reason": reason_text,
             "review_checked_at": now_text(),
-            "missed_buy_signal_count": safe_int_value(item.get("missed_buy_signal_count"), 0),
-            "missed_sell_signal_count": safe_int_value(item.get("missed_sell_signal_count"), 0),
             "last_checked_price": safe_float_value(item.get("current_price"), 0.0),
             "last_checked_pnl_rate": str(item.get("pnl_rate_text", "-")),
         }
+        raw_reason_text = " / ".join(reasons)
+        if raw_reason_text and raw_reason_text != reason_text:
+            metadata["review_detail"] = raw_reason_text
         if operation_data_issue:
             stopped_at = now_text()
             emergency_metadata = {

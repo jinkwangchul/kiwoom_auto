@@ -18,7 +18,6 @@ from gui_toast import show_toast
 from event_journal_production import append_production_event
 
 from gui_config_utils import default_config, default_state
-from gui_review_utils import review_reason_summary
 from gui_schedule_utils import (
     schedule_change_log_text,
     schedule_config_updates,
@@ -300,61 +299,6 @@ def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
     return text.strip(), ""
-
-
-
-def auto_trade_resume_status_after_pause(window, state: dict[str, object]) -> tuple[str, dict[str, object], str]:
-    """
-    일시중지 후 재시작 정책.
-
-    확정 정책:
-    - 일시중지 기간 동안 매수/매도 신호가 1건이라도 확인되면 REVIEW_REQUIRED.
-    - 매수/매도 신호가 모두 0건으로 확인된 경우에만 RUNNING 재시작 허용.
-    - 신호 발생 여부를 아직 확인할 수 없는 경우도 안전하게 REVIEW_REQUIRED.
-
-    현재 단계에서는 실제 루틴 신호 재계산 루프가 아직 연결되지 않았으므로,
-    향후 신호 검증 모듈이 state.json에 기록할 아래 필드를 기준으로 판정한다.
-    - pause_signal_check_status: CHECKED / UNCHECKED / FAILED
-    - missed_buy_signal_count
-    - missed_sell_signal_count
-    """
-    missed_buy = window.int_state_value(state, "missed_buy_signal_count")
-    missed_sell = window.int_state_value(state, "missed_sell_signal_count")
-    check_status = str(state.get("pause_signal_check_status", "UNCHECKED")).strip().upper()
-
-    metadata: dict[str, object] = {
-        "review_checked_at": now_text(),
-        "missed_buy_signal_count": missed_buy,
-        "missed_sell_signal_count": missed_sell,
-    }
-
-    if missed_buy > 0 or missed_sell > 0:
-        metadata.update(
-            {
-                "review_required": True,
-                "review_reason": "SIGNAL_OCCURRED_DURING_PAUSE",
-            }
-        )
-        return "REVIEW_REQUIRED", metadata, "일시중지 중 매수/매도 신호 발생"
-
-    if check_status == "CHECKED":
-        metadata.update(
-            {
-                "review_required": False,
-                "review_reason": "",
-                "resumed_at": now_text(),
-                "ignore_signals_before": now_text(),
-            }
-        )
-        return "RUNNING", metadata, "일시중지 중 매수/매도 신호 없음"
-
-    metadata.update(
-        {
-            "review_required": True,
-            "review_reason": "PAUSE_SIGNAL_CHECK_UNAVAILABLE",
-        }
-    )
-    return "REVIEW_REQUIRED", metadata, "일시중지 중 신호 발생 여부 확인 필요"
 
 
 

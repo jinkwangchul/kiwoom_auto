@@ -27,6 +27,80 @@ from state_policy import auto_trade_status_display
 PENDING_INTEGRITY_USER_REASON = "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."
 REVIEW_REASON_OPERATION_DATA_MISSING = "운영 데이터 없음"
 REVIEW_REASON_OPERATION_DATA_READ_ERROR = "운영 데이터 읽기 오류"
+REVIEW_REASON_OPERATION_DATA_MISMATCH = "운영 데이터 불일치"
+REVIEW_REASON_PENDING_ORDER_DATA_ERROR = "미체결 데이터 오류"
+REVIEW_REASON_LIQUIDATION_REMAINS = "청산 후 보유잔량"
+REVIEW_REASON_LIQUIDATION_PROCESSING_ERROR = "청산 처리 오류"
+REVIEW_REASON_RECOVERY_STATE_ERROR = "복구 상태 오류"
+
+_REVIEW_LOCATION_DISPLAY_BY_SOURCE = {
+    "운영시작": "운영 시작",
+    "운영 시작": "운영 시작",
+    "운영중": "운영 중",
+    "운영 중": "운영 중",
+    "안정성검사": "안정성 검사",
+    "무결성검사": "안정성 검사",
+    "안정성 검사": "안정성 검사",
+    "긴급정지해제": "긴급정지 해제",
+    "긴급정지 해제": "긴급정지 해제",
+    "사용자 긴급정지": "전체 긴급정지",
+    "종목 우클릭 긴급정지": "종목 긴급정지",
+    "강제종료": "운영 종료",
+    "종목등록 창 미체결 데이터 무결성 오류": "종목 등록",
+    "등록해제 미체결 데이터 무결성 오류": "종목 해제",
+    "루틴 이동 미체결 데이터 무결성 오류": "루틴 등록",
+    "루틴 해제 미체결 데이터 무결성 오류": "루틴 해제",
+    "PRODUCTION_RECOVERY": "프로그램 시작",
+    "종목관리": "종목관리",
+}
+
+_OPERATION_DATA_MISMATCH_TEXTS = {
+    "state.json 형식 이상",
+    "state.json 이상",
+    "config.json 이상",
+    "orders.json 누락",
+    "보유수량 필드 불일치",
+    "보유 0인데 평단 존재",
+    "보유 0인데 보유금액 존재",
+    "보유 존재인데 평단 없음",
+    "SERVER_MISMATCH",
+}
+
+
+def operator_review_location(source: object, *, default: str = "미기록") -> str:
+    """Map a producer source to the stable operator-facing detection point."""
+    raw = str(source or "").strip()
+    if not raw or raw == "-":
+        return default
+    return _REVIEW_LOCATION_DISPLAY_BY_SOURCE.get(raw, raw)
+
+
+def operator_review_reason(reason: object, *, default: str = "-") -> str:
+    """Return a short operator cause tag while retaining evidence at its source."""
+    raw = str(reason or "").strip()
+    if not raw or raw == "-":
+        return default
+    if "PENDING_ORDER_DATA_INTEGRITY" in raw:
+        return REVIEW_REASON_PENDING_ORDER_DATA_ERROR
+    if raw in _OPERATION_DATA_MISMATCH_TEXTS or any(
+        text in raw for text in _OPERATION_DATA_MISMATCH_TEXTS
+    ):
+        return REVIEW_REASON_OPERATION_DATA_MISMATCH
+    if raw.startswith("[") and "]" in raw:
+        return REVIEW_REASON_OPERATION_DATA_MISMATCH
+    if " 숫자 형식 오류" in raw or raw.endswith(" 음수"):
+        return REVIEW_REASON_OPERATION_DATA_MISMATCH
+    if raw in {"EARLY_CLOSE_EXECUTION_FAILED", "EVIDENCE_CONFLICT"}:
+        return REVIEW_REASON_LIQUIDATION_PROCESSING_ERROR
+    if raw in {"HOLDING_REMAINS", "LIQUIDATION_HOLDING_REMAINS"}:
+        return REVIEW_REASON_LIQUIDATION_REMAINS
+    if raw == "USER_EMERGENCY_STOP":
+        return "사용자 긴급정지"
+    if raw.startswith("RECOVERY_"):
+        return REVIEW_REASON_RECOVERY_STATE_ERROR
+    if raw == "ACTIVE_CLOSE_OR_LIQUIDATION":
+        return "청산 처리 중"
+    return raw
 _TRUE_TEXT_VALUES = {"TRUE", "1", "YES", "Y", "ON", "검토", "검토필요"}
 _REVIEW_STATUS_VALUES = {
     "PENDING",

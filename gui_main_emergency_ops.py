@@ -5,7 +5,8 @@ gui_main_emergency_ops.py
 MainWindow 긴급정지/정지해제 처리 전용 모듈.
 
 정책:
-- 긴급정지: 즉시 전체 종목 상태를 EMERGENCY_STOPPED로 전환
+- 전체 긴급정지: 전체 종목을 EMERGENCY_STOPPED로 전환하되 새 Review 분류는 만들지 않음
+- 선택 긴급정지: 선택 종목을 EMERGENCY_STOPPED 및 Review 대상으로 전환
 - 정지해제: 무결성 확인 후 정상은 STOPPED, 문제 종목은 REVIEW_REQUIRED
 - 자동복귀 금지: 정지해제 후에도 매매시작 상태로 자동 복귀하지 않음
 """
@@ -21,11 +22,14 @@ from PyQt5.QtWidgets import QMessageBox
 from gui_toast import show_toast
 from gui_operation_ui_context import refresh_auto_trade_views
 from gui_operation_ui_context import operation_dialog_parent
+from gui_window_policy import persistent_feature_owner
 from gui_common_utils import safe_int_value
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     is_emergency_stopped_state,
     is_review_required_state,
+    operator_review_location,
+    operator_review_reason,
 )
 from gui_auto_trade_run_control import (
     ORDER_QUEUE_PATH,
@@ -49,6 +53,11 @@ from production_recovery_state_registry import (
     check_production_recovery_gate,
     production_recovery_registry,
 )
+
+REVIEW_RETURN_ALLOWED = "ALLOWED"
+REVIEW_RETURN_BLOCKED = "BLOCKED"
+
+
 def has_emergency_stopped_stock(window) -> bool:
     """MainWindow 전체 종목 중 긴급정지 상태가 하나라도 있는지 확인한다."""
     for stock_dir in window.all_runtime_stock_dirs():
@@ -112,13 +121,16 @@ def emergency_review_reason_for_stock(stock_dir: Path) -> tuple[bool, str]:
 def _recovery_gate_for_emergency_release(window, stock_code: str):
     """Return the existing Production Recovery gate decision for either GUI path."""
     owners = [window]
+    logical_owner = persistent_feature_owner(window)
+    if logical_owner is not None and logical_owner is not window:
+        owners.append(logical_owner)
     parent_getter = getattr(window, "parent", None)
     if callable(parent_getter):
         try:
             parent = parent_getter()
         except Exception:
             parent = None
-        if parent is not None and parent is not window:
+        if parent is not None and parent is not window and parent not in owners:
             owners.append(parent)
 
     for owner in owners:
@@ -210,6 +222,61 @@ def emergency_release_common_guard(
     return True, ""
 
 
+def review_return_availability(
+    window,
+    stock_dir: Path,
+    stock_code: str,
+    *,
+    state: dict[str, object] | None = None,
+    state_issue_reason: str = "",
+    order_queue_path: str | Path | None = None,
+    now_dt: datetime | None = None,
+) -> dict[str, object]:
+    """Project whether a Review row may leave Review using current evidence."""
+
+    stock_dir = Path(stock_dir)
+    if str(state_issue_reason or "").strip():
+        return {
+            "availability": REVIEW_RETURN_BLOCKED,
+            "reason": str(state_issue_reason).strip(),
+        }
+
+    state_path = stock_dir / "state.json"
+    current_state = state if isinstance(state, dict) else read_json_dict(state_path)
+    if not state_path.exists() or not isinstance(current_state, dict) or not current_state:
+        return {
+            "availability": REVIEW_RETURN_BLOCKED,
+            "reason": "state.json 이상",
+        }
+    review_location = str(current_state.get("review_location", "") or "").strip()
+    emergency_marker_active = bool(
+        str(current_state.get("emergency_reason", "") or "").strip()
+        or str(current_state.get("emergency_stopped_at", "") or "").strip()
+    ) and review_location not in {"긴급정지해제", "긴급정지 해제"}
+    if is_emergency_stopped_state(current_state) or emergency_marker_active:
+        return {
+            "availability": REVIEW_RETURN_BLOCKED,
+            "reason": "EMERGENCY_STOP_ACTIVE",
+        }
+    if not is_review_required_state(current_state):
+        return {
+            "availability": REVIEW_RETURN_BLOCKED,
+            "reason": "정상화 대상 상태가 아닙니다.",
+        }
+
+    allowed, reason = emergency_release_common_guard(
+        window,
+        stock_dir,
+        str(stock_code or "").strip(),
+        order_queue_path=order_queue_path,
+        now_dt=now_dt,
+    )
+    return {
+        "availability": REVIEW_RETURN_ALLOWED if allowed else REVIEW_RETURN_BLOCKED,
+        "reason": "" if allowed else str(reason or "복귀 안전조건 미충족"),
+    }
+
+
 def _record_emergency_release_guard_failure(
     window,
     stock_dir: Path,
@@ -218,6 +285,9 @@ def _record_emergency_release_guard_failure(
     reason: str,
 ) -> bool:
     """Persist the existing fail-closed emergency Review contract."""
+    operator_reason = operator_review_reason(reason)
+    state_before = read_json_dict(Path(stock_dir) / "state.json")
+    entered_at = str(state_before.get("review_entered_at", "") or "").strip() or now_text()
     return update_runtime_stock_status(
         window,
         Path(stock_dir),
@@ -227,17 +297,80 @@ def _record_emergency_release_guard_failure(
         {
             "review_required": True,
             "review_status": "PENDING",
-            "review_location": "긴급정지해제",
-            "review_reason": reason,
-            "review_entered_at": now_text(),
+            "review_location": operator_review_location("긴급정지해제"),
+            "review_reason": operator_reason,
+            "review_entered_at": entered_at,
             "review_checked_at": now_text(),
             "review_routine": _routine_name_for_emergency_release(Path(stock_dir)),
-            "review_detail": f"{code} {name} / {reason}",
+            "review_detail": f"{code} {name} / {operator_reason} / evidence={reason}",
             "trade_enabled": False,
         },
         reason,
         verify_readback=True,
         allow_review_state_transition=True,
+    )
+
+
+def _complete_emergency_release(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    *,
+    preserve_review: bool,
+) -> bool:
+    """Clear emergency evidence without treating release as an automatic Review exit."""
+
+    state_before = read_json_dict(Path(stock_dir) / "state.json")
+    routine_name = _routine_name_for_emergency_release(Path(stock_dir))
+    metadata: dict[str, object] = {
+        "emergency_released_at": now_text(),
+        "emergency_release_check": "PASSED",
+        "emergency_stopped_at": "",
+        "emergency_reason": "",
+        "trade_enabled": False,
+        "operation_notice": "",
+        "operation_notice_reason": "",
+        "operation_notice_at": "",
+        "review_checked_at": now_text(),
+    }
+    target_status = "STOPPED"
+    allow_review_transition = False
+    if preserve_review:
+        target_status = "REVIEW_REQUIRED"
+        allow_review_transition = True
+        metadata.update(
+            {
+                "review_required": True,
+                "review_status": "RESOLVED",
+                "review_routine": str(
+                    state_before.get("review_routine", "") or routine_name
+                ).strip(),
+            }
+        )
+    else:
+        metadata.update(
+            {
+                "review_required": False,
+                "review_status": "",
+                "review_location": "",
+                "review_reason": "",
+                "review_detail": "",
+                "review_entered_at": "",
+                "review_routine": routine_name,
+            }
+        )
+
+    return update_runtime_stock_status(
+        window,
+        Path(stock_dir),
+        code,
+        name,
+        target_status,
+        metadata,
+        "긴급정지 해제",
+        verify_readback=True,
+        allow_review_state_transition=allow_review_transition,
     )
 
 
@@ -370,35 +503,17 @@ def normalize_review_emergency_target(
     ):
         return {"status": "SKIPPED", "reason": "정상화 대상 상태가 아닙니다."}
 
-    has_problem, reason = emergency_review_reason_for_stock(stock_dir)
-    if has_problem:
-        if not is_review_required_state(state_before):
-            current_status = str(
-                state_before.get("status", "EMERGENCY_STOPPED")
-                or "EMERGENCY_STOPPED"
-            ).strip()
-            if not update_runtime_stock_status(
-                window,
-                stock_dir,
-                code,
-                name,
-                current_status,
-                {
-                    "review_required": True,
-                    "review_status": "PENDING",
-                    "review_location": "긴급정지해제",
-                    "review_reason": reason,
-                    "review_entered_at": now_text(),
-                    "review_checked_at": now_text(),
-                    "review_routine": _routine_name_for_emergency_release(stock_dir),
-                    "review_detail": f"{code} {name} / {reason}",
-                    "trade_enabled": False,
-                },
-                reason,
-                verify_readback=True,
-            ):
-                return {"status": "FAILED", "reason": "검토관리 상태 저장 실패"}
-        return {"status": "BLOCKED", "reason": reason}
+    availability = review_return_availability(
+        window,
+        stock_dir,
+        code,
+        state=state_before,
+    )
+    if availability.get("availability") != REVIEW_RETURN_ALLOWED:
+        return {
+            "status": "BLOCKED",
+            "reason": str(availability.get("reason") or "복귀 안전조건 미충족"),
+        }
 
     routine_name = _routine_name_for_emergency_release(stock_dir)
     metadata = {
@@ -460,7 +575,7 @@ def normalize_review_emergency_target(
 
     return {
         "status": "NORMALIZED",
-        "reason": reason,
+        "reason": "",
         "destination": normalized_destination,
         "routine_name": routine_name,
     }
@@ -533,12 +648,9 @@ def execute_emergency_stop(window) -> None:
             {
                 "emergency_stopped_at": now_text(),
                 "emergency_reason": "USER_EMERGENCY_STOP",
-                "review_required": True,
-                "review_status": "PENDING",
-                "review_location": "사용자 긴급정지",
-                "review_reason": "사용자 긴급정지",
-                "review_checked_at": now_text(),
-                "review_routine": _routine_name_for_emergency_release(stock_dir),
+                # 전역 긴급정지는 공통 운영 보호 동작이다. 기존 Review
+                # metadata는 병합 writer가 보존하지만 새 Review 진입 증거는
+                # 만들지 않는다. 문제 종목은 정지해제 guard에서만 분류한다.
                 # 긴급정지는 즉시 매매 시작 플래그를 끈다.
                 # 정지해제 후 자동복귀 금지 정책과 현황색 판정이 어긋나지 않도록
                 # canonical trade_enabled를 False로 고정한다.
@@ -620,8 +732,12 @@ def execute_selected_emergency_stop(
                 "emergency_reason": "USER_EMERGENCY_STOP",
                 "review_required": True,
                 "review_status": "PENDING",
-                "review_location": "종목 우클릭 긴급정지",
+                "review_location": operator_review_location("종목 우클릭 긴급정지"),
                 "review_reason": "사용자 긴급정지",
+                "review_entered_at": str(
+                    state.get("review_entered_at", "") or ""
+                ).strip()
+                or now_text(),
                 "review_checked_at": now_text(),
                 "review_routine": _routine_name_for_emergency_release(stock_dir),
                 "trade_enabled": False,
@@ -639,6 +755,7 @@ def execute_selected_emergency_stop(
             },
             "종목 우클릭 긴급정지",
             verify_readback=True,
+            allow_review_state_transition=True,
         )
         if ok:
             changed.append(label)
@@ -735,19 +852,15 @@ def release_emergency_stop_target(
         active=False,
     )
 
-    result = normalize_review_emergency_target(
+    if not _complete_emergency_release(
         window,
         stock_dir,
         code,
         name,
-        destination="RESTORE",
-    )
-    status = str(result.get("status", "") or "")
-    if status == "NORMALIZED":
-        return "normal"
-    if status == "BLOCKED":
-        return "review_existing" if already_in_review else "review"
-    return "failed"
+        preserve_review=already_in_review,
+    ):
+        return "failed"
+    return "review_existing" if already_in_review else "normal"
 
 
 def execute_selected_emergency_release(

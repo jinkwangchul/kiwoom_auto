@@ -425,7 +425,10 @@ def apply_integrity_review_required_issues(
             if f"[{issue_code}]" in existing_reason:
                 continue
             if isinstance(issue, dict):
-                reasons.append(_integrity_review_reason(issue))
+                # Issue code/message remains in the integrity result as diagnostic
+                # evidence.  Review metadata uses the stable operator cause tag.
+                if "운영 데이터 불일치" not in reasons:
+                    reasons.append("운영 데이터 불일치")
 
         if len(reasons) == (1 if existing_reason else 0):
             continue
@@ -444,7 +447,7 @@ def apply_integrity_review_required_issues(
             "code": code,
             "name": name,
             "review_reasons": reasons,
-            "review_location": source,
+            "review_location": "안정성 검사",
         }
 
         try:

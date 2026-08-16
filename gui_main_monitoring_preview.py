@@ -62,7 +62,7 @@ PREVIEW_STOCKS = (
     PreviewStock(
         "005930",
         "삼성전자",
-        "일시정지",
+        "감시/대기",
         "94,200",
         "-1.12%",
         "20주",
@@ -74,7 +74,7 @@ PREVIEW_STOCKS = (
         "188만",
         "112만",
         "동일 금액",
-        "paused",
+        "waiting",
     ),
     PreviewStock(
         "005380",
@@ -490,7 +490,6 @@ class MainMonitoringPreview(QMainWindow):
             QWidget#monitorPreviewRoot QLabel#statusDot[tone="normal"] {
                 color: #16824a;
             }
-            QWidget#monitorPreviewRoot QLabel#statusDot[tone="paused"],
             QWidget#monitorPreviewRoot QLabel#statusDot[tone="waiting"] {
                 color: #8b98a8;
             }

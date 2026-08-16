@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import gettempdir
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QItemSelectionModel, Qt
 from PyQt5.QtGui import QBrush, QColor, QFontMetrics
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -46,7 +46,7 @@ from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
     auto_trade_setting_badge_stylesheet,
 )
-from gui_review_utils import safe_float_value
+from gui_review_utils import normalized_review_reasons, safe_float_value
 from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
 from gui_table_utils import next_sort_order
 from gui_toast import show_toast
@@ -64,8 +64,11 @@ from stock_repository import repository as stock_repository_factory
 from stock_long_hold_policy import long_hold_excludes_holding_review
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_integrity import (
+    is_emergency_stopped_state as _common_is_emergency_stopped_state,
     is_review_required_state as _common_is_review_required_state,
     read_review_state_with_issue,
+    operator_review_location,
+    operator_review_reason,
 )
 from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -75,26 +78,131 @@ REVIEW_UNKNOWN_TEXT = "-"
 REVIEW_TIME_UNRECORDED = "\ubbf8\uae30\ub85d"
 REVIEW_DISPLAY_STATUS_UNRESOLVED = "\ubbf8\ud574\uacb0"
 REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED = "\uae34\uae09\uc815\uc9c0"
+REVIEW_RETURN_ALLOWED = "ALLOWED"
+REVIEW_RETURN_BLOCKED = "BLOCKED"
 REVIEW_REASON_OPERATION_DATA_MISSING = "\uc6b4\uc601 \ub370\uc774\ud130 \uc5c6\uc74c"
 REVIEW_REASON_OPERATION_DATA_READ_ERROR = "\uc6b4\uc601 \ub370\uc774\ud130 \uc77d\uae30 \uc624\ub958"
 REVIEW_DETECTION_EVENT_UNRECORDED = "\ubbf8\uae30\ub85d"
 REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT = "\uc885\ubaa9\uad00\ub9ac"
 REVIEW_SOURCE_EMERGENCY_RELEASE = "\uae34\uae09\uc815\uc9c0\ud574\uc81c"
 REVIEW_REPRODUCTION_MANIFEST_PREFIX = "review_required_library_cases_"
-REVIEW_DETECTION_EVENT_DISPLAY_BY_SOURCE = {
-    "\uc6b4\uc601\uc2dc\uc791": "\uc6b4\uc601 \uc2dc\uc791",
-    "\uc6b4\uc601\uc911": "\uc6b4\uc601 \uc911",
-    "\uc548\uc815\uc131\uac80\uc0ac": "\uc548\uc815\uc131 \uac80\uc0ac",
-    "\uae34\uae09\uc815\uc9c0\ud574\uc81c": "\uae34\uae09\uc815\uc9c0 \ud574\uc81c",
-    "\uac15\uc81c\uc885\ub8cc": "\uc6b4\uc601 \uc885\ub8cc",
-    "\uc885\ubaa9\ub4f1\ub85d \ucc3d \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\uc885\ubaa9 \ub4f1\ub85d",
-    "\ub4f1\ub85d\ud574\uc81c \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\uc885\ubaa9 \ud574\uc81c",
-    "\ub8e8\ud2f4 \uc774\ub3d9 \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\ub8e8\ud2f4 \ub4f1\ub85d",
-    "\ub8e8\ud2f4 \ud574\uc81c \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\ub8e8\ud2f4 \ud574\uc81c",
-    "PRODUCTION_RECOVERY": "\ud504\ub85c\uadf8\ub7a8 \uc2dc\uc791",
-}
 LONG_HOLD_BADGE_ACTIVE_COLOR = DIRECTIONAL_POSITIVE_COLOR
 LONG_HOLD_BADGE_IDLE_COLOR = DIRECTIONAL_NEUTRAL_COLOR
+
+
+def build_review_operator_guidance(
+    row: dict[str, object] | None,
+    availability_result: dict[str, object] | None = None,
+) -> dict[str, str]:
+    """Build read-only operator guidance from already collected Review evidence."""
+    current = row if isinstance(row, dict) else {}
+    availability = (
+        availability_result if isinstance(availability_result, dict) else {}
+    )
+    availability_value = str(
+        availability.get("availability", current.get("return_availability", ""))
+        or ""
+    ).strip().upper()
+    raw_block_reason = str(
+        availability.get("reason", current.get("return_block_reason", "")) or ""
+    ).strip()
+    reason_values = normalized_review_reasons([current.get("review_reason", "")])
+    operator_reason_by_internal = {
+        "EMERGENCY_STOP_ACTIVE": "긴급정지 활성",
+        "ACTIVE_CLOSE_OR_LIQUIDATION": "청산 처리 중",
+        "SERVER_MISMATCH": "운영 데이터 불일치",
+        "RECOVERY_NOT_READY": "복구 상태 오류",
+    }
+    reason_values = [
+        operator_reason_by_internal.get(reason.upper(), reason)
+        if not (reason.isupper() and "_" in reason)
+        else operator_reason_by_internal.get(reason.upper(), "운영 상태 확인 필요")
+        for reason in reason_values
+    ]
+    reason_text = " / ".join(reason_values) or REVIEW_UNKNOWN_TEXT
+    location = str(current.get("review_location", "") or "").strip()
+    location_text = location or REVIEW_DETECTION_EVENT_UNRECORDED
+    evidence_text = raw_block_reason or " ".join(
+        [
+            reason_text,
+            str(current.get("review_detail", "") or ""),
+            str(current.get("display_status", "") or ""),
+        ]
+    )
+    evidence_upper = evidence_text.upper()
+
+    if availability_value == REVIEW_RETURN_ALLOWED:
+        return {
+            "summary": "복귀 가능",
+            "reason": reason_text,
+            "review_location": location_text,
+            "block_reason": REVIEW_UNKNOWN_TEXT,
+            "operator_action": "복귀하면 STOPPED 상태가 되며 자동 운영은 시작되지 않습니다.",
+            "resolution_condition": "현재 복귀 안전조건을 충족했습니다.",
+        }
+
+    if "EMERGENCY_STOP_ACTIVE" in evidence_upper or "긴급정지" in evidence_text:
+        block_reason = "긴급정지가 활성 상태입니다."
+        action = "먼저 긴급정지를 해제한 뒤 새로고침하세요."
+        condition = "긴급정지가 해제되고 복귀 가능으로 확인되어야 합니다."
+    elif (
+        REVIEW_REASON_OPERATION_DATA_MISSING in evidence_text
+        or "STATE.JSON 누락" in evidence_upper
+    ):
+        block_reason = "운영 데이터가 없습니다."
+        action = "종목 운영 데이터 확인이 필요합니다."
+        condition = "운영 데이터가 정상적으로 확인되고 복귀 안전조건을 충족해야 합니다."
+    elif (
+        REVIEW_REASON_OPERATION_DATA_READ_ERROR in evidence_text
+        or "STATE.JSON 이상" in evidence_upper
+        or "읽기 오류" in evidence_text
+    ):
+        block_reason = "운영 데이터를 읽을 수 없습니다."
+        action = "state 데이터를 정상화한 뒤 새로고침하세요."
+        condition = "운영 데이터가 정상적으로 읽히고 복귀 안전조건을 충족해야 합니다."
+    elif (
+        "PENDING_ORDER_DATA_INTEGRITY" in evidence_upper
+        or "미체결 데이터 오류" in evidence_text
+        or "미체결 존재" in evidence_text
+        or "처리할 수 없는 종목" in evidence_text
+    ):
+        block_reason = "미체결 상태를 확인할 수 없거나 주문이 진행 중입니다."
+        action = "주문·체결 상태를 확인하고 데이터가 정상화된 뒤 새로고침하세요."
+        condition = "미체결 무결성이 정상이고 복귀 가능으로 확인되어야 합니다."
+    elif "ACTIVE_CLOSE_OR_LIQUIDATION" in evidence_upper or "청산 처리 중" in evidence_text:
+        block_reason = "청산 처리가 진행 중입니다."
+        action = "청산 진행 및 주문 상태를 확인한 뒤 새로고침하세요."
+        condition = "청산 처리가 끝나고 복귀 가능으로 확인되어야 합니다."
+    elif "RECOVERY" in evidence_upper or "복구 상태 오류" in evidence_text:
+        block_reason = "복구 상태가 완료되지 않았습니다."
+        action = "Recovery 상태를 확인한 뒤 새로고침하세요."
+        condition = "Recovery가 완료되고 복귀 가능으로 확인되어야 합니다."
+    elif "SERVER_MISMATCH" in evidence_upper or "서버" in evidence_text:
+        block_reason = "서버와 Runtime 정보가 일치하지 않습니다."
+        action = "서버와 Runtime 상태의 일치를 확인한 뒤 새로고침하세요."
+        condition = "서버와 Runtime이 일치하고 복귀 가능으로 확인되어야 합니다."
+    elif (
+        "HOLDING" in evidence_upper
+        or "보유수량" in evidence_text
+        or "보유잔량" in evidence_text
+        or "평단" in evidence_text
+    ):
+        block_reason = "보유잔량 또는 보유정보 확인이 필요합니다."
+        action = "잔여 보유 및 청산 상태를 확인한 뒤 새로고침하세요."
+        condition = "보유정보가 정상화되고 복귀 가능으로 확인되어야 합니다."
+    else:
+        block_reason = "현재 복귀 안전조건을 충족하지 못했습니다."
+        action = "표시된 검토 사유와 관련 운영 상태를 확인한 뒤 새로고침하세요."
+        condition = "복귀 가능으로 확인되어야 합니다."
+
+    return {
+        "summary": "정상화 확인 필요",
+        "reason": reason_text,
+        "review_location": location_text,
+        "block_reason": block_reason,
+        "operator_action": action,
+        "resolution_condition": condition,
+    }
 
 
 def review_entered_at_display(state: dict[str, object]) -> str:
@@ -105,10 +213,7 @@ def review_entered_at_display(state: dict[str, object]) -> str:
 
 def review_detection_event_display(source: object) -> str:
     """Return the operator-facing production event for the stored review source."""
-    raw = str(source or "").strip()
-    if not raw or raw == REVIEW_UNKNOWN_TEXT:
-        return REVIEW_DETECTION_EVENT_UNRECORDED
-    return REVIEW_DETECTION_EVENT_DISPLAY_BY_SOURCE.get(raw, raw)
+    return operator_review_location(source, default=REVIEW_DETECTION_EVENT_UNRECORDED)
 
 
 def _review_manifest_entered_at_display(raw: object) -> str:
@@ -156,21 +261,17 @@ def _state_issue_review_record_from_manifest(
                 stock_dir_text = str(case.get("stock_dir", "") or "")
                 if f"{code}_" not in stock_dir_text:
                     continue
-            location = (
-                case.get("review_location")
-                or REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT
-            )
             entered_at = (
                 case.get("review_entered_at")
                 or case.get("created_at")
                 or manifest.get("created_at")
             )
             return {
-                "review_location": review_detection_event_display(location),
+                "review_location": REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT,
                 "review_entered_at": _review_manifest_entered_at_display(entered_at),
             }
     return {
-        "review_location": REVIEW_DETECTION_EVENT_UNRECORDED,
+        "review_location": REVIEW_DETECTION_EVENT_STOCK_MANAGEMENT,
         "review_entered_at": REVIEW_TIME_UNRECORDED,
     }
 
@@ -250,6 +351,7 @@ def _review_display_status_for_collected_row(
     avg_price: float = 0.0,
     buy_pending_qty: object = 0,
     sell_pending_qty: object = 0,
+    return_availability: object = "",
 ) -> str:
     """Return the review-management status display for a collected row."""
     if state_issue_reason:
@@ -257,38 +359,20 @@ def _review_display_status_for_collected_row(
     if not isinstance(state, dict) or not state:
         return REVIEW_DISPLAY_STATUS_UNRESOLVED
 
-    review_status = str(state.get("review_status", "") or "").strip().upper()
-    if review_status == "RESOLVED":
-        return "\ud574\uacb0"
-
     emergency_reason = str(state.get("emergency_reason", "") or "").strip()
     emergency_stopped_at = str(state.get("emergency_stopped_at", "") or "").strip()
     source = str(review_location_source or state.get("review_location", "") or "").strip()
     if (
-        (emergency_reason or emergency_stopped_at)
-        and source != REVIEW_SOURCE_EMERGENCY_RELEASE
+        _common_is_emergency_stopped_state(state)
+        or (
+            (emergency_reason or emergency_stopped_at)
+            and source != REVIEW_SOURCE_EMERGENCY_RELEASE
+        )
     ):
         return REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED
 
-    if review_status in {"PENDING", "REVIEW_REQUIRED", "NEEDS_REVIEW"}:
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-
-    if buy_pending_qty == "?" or sell_pending_qty == "?":
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-    if holding_qty > 0:
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-    if safe_int_value(buy_pending_qty, 0) > 0:
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-    if safe_int_value(sell_pending_qty, 0) > 0:
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-    if avg_price > 0 and holding_qty <= 0:
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-    if auto_trade_setting_server_mismatch_detected(state):
-        return REVIEW_DISPLAY_STATUS_UNRESOLVED
-
-    if is_review_required_state(state):
-        return "\ud574\uacb0"
-    return REVIEW_DISPLAY_STATUS_UNRESOLVED
+    availability = str(return_availability or "").strip().upper()
+    return "\ud574\uacb0" if availability == REVIEW_RETURN_ALLOWED else REVIEW_DISPLAY_STATUS_UNRESOLVED
 
 
 def append_changelog(change_type: str, filename: str, message: str) -> None:
@@ -643,7 +727,7 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     return False
 
 
-def collect_global_review_required_rows() -> list[dict[str, object]]:
+def collect_global_review_required_rows(availability_window=None) -> list[dict[str, object]]:
     """
     프로그램 전체 단위 검토관리 대상 목록을 중앙 stocks/ 기준으로 수집한다.
 
@@ -681,9 +765,12 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             sell_pending_qty = 0
             review_location = state_issue_record["review_location"]
             review_entered_at = state_issue_record["review_entered_at"]
+            return_availability = REVIEW_RETURN_BLOCKED
+            availability_reason = state_issue_reason
             display_status = _review_display_status_for_collected_row(
                 None,
                 state_issue_reason=state_issue_reason,
+                return_availability=return_availability,
             )
         elif not is_review_required_state(state):
             continue
@@ -708,6 +795,19 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             review_location = review_detection_event_display(review_location_source)
             review_entered_at = review_entered_at_display(state)
 
+            from gui_main_emergency_ops import review_return_availability
+
+            availability = review_return_availability(
+                availability_window,
+                stock_dir,
+                code,
+                state=state,
+            )
+            return_availability = str(
+                availability.get("availability", REVIEW_RETURN_BLOCKED)
+                or REVIEW_RETURN_BLOCKED
+            )
+            availability_reason = str(availability.get("reason", "") or "")
             display_status = _review_display_status_for_collected_row(
                 state,
                 review_location_source=review_location_source,
@@ -715,6 +815,7 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
                 avg_price=avg_price,
                 buy_pending_qty=buy_pending_qty,
                 sell_pending_qty=sell_pending_qty,
+                return_availability=return_availability,
             )
 
         key = (routine_name, code, name)
@@ -722,13 +823,19 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             continue
         seen_keys.add(key)
 
+        review_reasons = normalized_review_reasons(
+            [
+                state_issue_reason,
+                state.get("review_reason", ""),
+            ]
+        )
         rows.append({
             "routine_name": routine_name,
             "stock_dir": stock_dir,
             "code": code,
             "name": name,
             "review_location": review_location,
-            "review_reason": state_issue_reason or str(state.get("review_reason", "") or state.get("review_detail", "") or REVIEW_UNKNOWN_TEXT).strip() or REVIEW_UNKNOWN_TEXT,
+            "review_reason": " / ".join(review_reasons) or REVIEW_UNKNOWN_TEXT,
             "review_entered_at": review_entered_at,
             "last_checked_at": str(state.get("review_checked_at", "") or state.get("updated_at", "") or "-").strip() or "-",
             "holding_qty": holding_qty,
@@ -736,7 +843,8 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             "buy_pending_qty": buy_pending_qty,
             "sell_pending_qty": sell_pending_qty,
             "display_status": display_status,
-            "return_availability": display_status,
+            "return_availability": return_availability,
+            "return_block_reason": availability_reason,
         })
 
     rows.sort(key=lambda row: (str(row.get("review_entered_at", "")), str(row.get("routine_name", "")), str(row.get("code", ""))))
@@ -765,6 +873,12 @@ class GlobalReviewRequiredWindow(QDialog):
         self.long_hold_toggle_button.setObjectName("reviewLongHoldToggle")
         self.long_hold_toggle_button.setCursor(Qt.PointingHandCursor)
         self.long_hold_toggle_button.setToolTip("전체 검토 판정의 장기보유 ON/OFF 전환")
+        self.operator_guidance_label = QLabel("종목을 선택하세요.")
+        self.operator_guidance_label.setObjectName("reviewOperatorGuidance")
+        self.operator_guidance_label.setWordWrap(True)
+        self.operator_guidance_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.operator_guidance_label.setMinimumHeight(82)
+        self._review_rows_by_stock_dir: dict[str, dict[str, object]] = {}
         self._review_sort_column = -1
         self._review_sort_order = Qt.AscendingOrder
 
@@ -812,6 +926,14 @@ class GlobalReviewRequiredWindow(QDialog):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.setStyleSheet(TABLE_LIGHT_SELECTION_STYLE)
         layout.addWidget(self.table)
+        self.operator_guidance_label.setStyleSheet(
+            "QLabel#reviewOperatorGuidance {"
+            " border: 1px solid #d6dbe3;"
+            " padding: 5px 7px;"
+            " background: #ffffff;"
+            " }"
+        )
+        layout.addWidget(self.operator_guidance_label)
 
         buttons = QHBoxLayout()
         badge_metrics = QFontMetrics(self.long_hold_toggle_button.font())
@@ -849,6 +971,7 @@ class GlobalReviewRequiredWindow(QDialog):
         )
         self.table.horizontalHeader().sectionClicked.connect(self.sort_review_table_by_column)
         self.table.customContextMenuRequested.connect(self.show_review_table_context_menu)
+        self.table.itemSelectionChanged.connect(self.refresh_operator_guidance)
 
     def sort_review_table_by_column(self, column: int) -> None:
         """검토관리 표 헤더 클릭 정렬."""
@@ -919,10 +1042,58 @@ class GlobalReviewRequiredWindow(QDialog):
 
 
     def _central_review_rows(self) -> list[dict[str, object]]:
-        return collect_global_review_required_rows()
+        return collect_global_review_required_rows(self)
+
+    def refresh_operator_guidance(self) -> None:
+        """Refresh the read-only guidance for the first selected Review row."""
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
+            self.btn_return.setEnabled(False)
+            self.operator_guidance_label.setText("종목을 선택하세요.")
+            return
+        selected_projection_rows: list[dict[str, object]] = []
+        for selected_index in selected_rows:
+            selected_item = self.table.item(selected_index.row(), 0)
+            selected_path = (
+                str(selected_item.data(Qt.UserRole) or "") if selected_item else ""
+            )
+            selected_row = self._review_rows_by_stock_dir.get(selected_path)
+            if isinstance(selected_row, dict):
+                selected_projection_rows.append(selected_row)
+        self.btn_return.setEnabled(
+            any(
+                str(row.get("return_availability", "") or "").strip().upper()
+                == REVIEW_RETURN_ALLOWED
+                for row in selected_projection_rows
+            )
+        )
+        first_item = self.table.item(selected_rows[0].row(), 0)
+        stock_dir_text = str(first_item.data(Qt.UserRole) or "") if first_item else ""
+        row = self._review_rows_by_stock_dir.get(stock_dir_text)
+        if not isinstance(row, dict):
+            self.operator_guidance_label.setText("선택한 종목의 안내 정보를 확인할 수 없습니다.")
+            return
+        guidance = build_review_operator_guidance(row)
+        self.operator_guidance_label.setText(
+            f"{guidance['summary']} | 사유: {guidance['reason']} | "
+            f"검출: {guidance['review_location']}\n"
+            f"복귀 차단: {guidance['block_reason']}\n"
+            f"운영자 조치: {guidance['operator_action']} | "
+            f"해결 조건: {guidance['resolution_condition']}"
+        )
 
     def load_review_items(self) -> None:
+        selected_stock_dirs = {
+            str(item.data(Qt.UserRole) or "")
+            for index in self.table.selectionModel().selectedRows()
+            for item in [self.table.item(index.row(), 0)]
+            if item is not None and str(item.data(Qt.UserRole) or "")
+        }
+        scroll_value = self.table.verticalScrollBar().value()
         rows = self._central_review_rows()
+        self._review_rows_by_stock_dir = {
+            str(row.get("stock_dir", "") or ""): row for row in rows
+        }
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             tooltip = self._review_row_tooltip(row)
@@ -946,8 +1117,20 @@ class GlobalReviewRequiredWindow(QDialog):
                 first_item.setData(Qt.UserRole + 2, str(row.get("name", "")))
 
         self._apply_saved_review_sort()
+        if selected_stock_dirs:
+            selection_model = self.table.selectionModel()
+            for row_index in range(self.table.rowCount()):
+                item = self.table.item(row_index, 0)
+                if item is None or str(item.data(Qt.UserRole) or "") not in selected_stock_dirs:
+                    continue
+                selection_model.select(
+                    self.table.model().index(row_index, 0),
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+        self.table.verticalScrollBar().setValue(scroll_value)
         self.summary_label.setText(f"검토종목: {len(rows)}개")
         self.refresh_long_hold_policy_badge()
+        self.refresh_operator_guidance()
 
     def refresh_long_hold_policy_badge(self) -> None:
         enabled = bool(
