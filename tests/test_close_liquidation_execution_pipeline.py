@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -892,6 +893,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             target_state["individual_liquidation_request"] = {
                 "status": "REQUESTED",
                 "method": "시장가",
+                "minutes_before_regular_close": "5",
                 "command_id": "command-1",
                 "requested_at": "2026-07-27 13:30:00",
             }
@@ -912,6 +914,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
             ):
                 result = close.auto_trade_continue_pending_close_liquidations(
                     Mock(),
+                    now_dt=datetime(2026, 7, 27, 15, 15),
                 )
         self.assertEqual(result["processed"], 1)
         start.assert_called_once()

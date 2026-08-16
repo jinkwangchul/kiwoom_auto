@@ -20,7 +20,7 @@ from pathlib import Path
 from tempfile import gettempdir
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QBrush, QColor
+from PyQt5.QtGui import QBrush, QColor, QFontMetrics
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -37,7 +37,15 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_common_utils import safe_int_value
-from gui_order_utils import pending_order_side_quantities
+from gui_order_utils import (
+    DIRECTIONAL_NEUTRAL_COLOR,
+    DIRECTIONAL_POSITIVE_COLOR,
+    pending_order_side_quantities,
+)
+from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_BADGE_HEIGHT,
+    auto_trade_setting_badge_stylesheet,
+)
 from gui_review_utils import safe_float_value
 from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
 from gui_table_utils import next_sort_order
@@ -46,9 +54,14 @@ from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
 )
+from gui_operation_environment import (
+    read_review_policy,
+    write_long_term_holding_policy,
+)
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
+from stock_long_hold_policy import long_hold_excludes_holding_review
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_integrity import (
     is_review_required_state as _common_is_review_required_state,
@@ -80,6 +93,8 @@ REVIEW_DETECTION_EVENT_DISPLAY_BY_SOURCE = {
     "\ub8e8\ud2f4 \ud574\uc81c \ubbf8\uccb4\uacb0 \ub370\uc774\ud130 \ubb34\uacb0\uc131 \uc624\ub958": "\ub8e8\ud2f4 \ud574\uc81c",
     "PRODUCTION_RECOVERY": "\ud504\ub85c\uadf8\ub7a8 \uc2dc\uc791",
 }
+LONG_HOLD_BADGE_ACTIVE_COLOR = DIRECTIONAL_POSITIVE_COLOR
+LONG_HOLD_BADGE_IDLE_COLOR = DIRECTIONAL_NEUTRAL_COLOR
 
 
 def review_entered_at_display(state: dict[str, object]) -> str:
@@ -639,6 +654,9 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
     """
     rows: list[dict[str, object]] = []
     seen_keys: set[tuple[str, str, str]] = set()
+    global_long_hold_enabled = bool(
+        read_review_policy().get("long_term_holding_enabled", False)
+    )
 
     try:
         repo = stock_repository_factory()
@@ -673,6 +691,19 @@ def collect_global_review_required_rows() -> list[dict[str, object]]:
             holding_qty = safe_int_value(state.get("holding_qty"), 0)
             avg_price = safe_float_value(state.get("avg_price"), 0.0)
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
+            safety_issue = bool(
+                auto_trade_setting_data_inconsistency_reasons(state)
+                or auto_trade_setting_server_mismatch_detected(state)
+            )
+            if long_hold_excludes_holding_review(
+                global_long_hold_enabled,
+                state,
+                holding_qty=holding_qty,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+                safety_issue=safety_issue,
+            ):
+                continue
             review_location_source = state.get("review_location", "") or REVIEW_UNKNOWN_TEXT
             review_location = review_detection_event_display(review_location_source)
             review_entered_at = review_entered_at_display(state)
@@ -730,6 +761,10 @@ class GlobalReviewRequiredWindow(QDialog):
         self.btn_delete = QPushButton("강제초기화")
         self.btn_refresh = QPushButton("새로고침")
         self.btn_close = QPushButton("닫기")
+        self.long_hold_toggle_button = QPushButton("장기보유 OFF")
+        self.long_hold_toggle_button.setObjectName("reviewLongHoldToggle")
+        self.long_hold_toggle_button.setCursor(Qt.PointingHandCursor)
+        self.long_hold_toggle_button.setToolTip("전체 검토 판정의 장기보유 ON/OFF 전환")
         self._review_sort_column = -1
         self._review_sort_order = Qt.AscendingOrder
 
@@ -779,6 +814,16 @@ class GlobalReviewRequiredWindow(QDialog):
         layout.addWidget(self.table)
 
         buttons = QHBoxLayout()
+        badge_metrics = QFontMetrics(self.long_hold_toggle_button.font())
+        badge_width = max(
+            badge_metrics.horizontalAdvance("장기보유 ON"),
+            badge_metrics.horizontalAdvance("장기보유 OFF"),
+        ) + 16
+        self.long_hold_toggle_button.setFixedSize(
+            badge_width,
+            AUTO_TRADE_SETTING_BADGE_HEIGHT,
+        )
+        buttons.addWidget(self.long_hold_toggle_button)
         buttons.addStretch(1)
         self.btn_return.setMinimumWidth(90)
         self.btn_unassign.setMinimumWidth(90)
@@ -799,6 +844,9 @@ class GlobalReviewRequiredWindow(QDialog):
         self.btn_delete.clicked.connect(self.delete_selected_review_items)
         self.btn_refresh.clicked.connect(self.load_review_items)
         self.btn_close.clicked.connect(self.close)
+        self.long_hold_toggle_button.clicked.connect(
+            self.toggle_long_term_holding_policy
+        )
         self.table.horizontalHeader().sectionClicked.connect(self.sort_review_table_by_column)
         self.table.customContextMenuRequested.connect(self.show_review_table_context_menu)
 
@@ -899,6 +947,59 @@ class GlobalReviewRequiredWindow(QDialog):
 
         self._apply_saved_review_sort()
         self.summary_label.setText(f"검토종목: {len(rows)}개")
+        self.refresh_long_hold_policy_badge()
+
+    def refresh_long_hold_policy_badge(self) -> None:
+        enabled = bool(
+            read_review_policy().get("long_term_holding_enabled", False)
+        )
+        self._apply_long_hold_badge_state(enabled)
+
+    def _apply_long_hold_badge_state(self, enabled: bool) -> None:
+        self.long_hold_toggle_button.setText(
+            "장기보유 ON" if enabled else "장기보유 OFF"
+        )
+        color = (
+            LONG_HOLD_BADGE_ACTIVE_COLOR
+            if enabled
+            else LONG_HOLD_BADGE_IDLE_COLOR
+        )
+        self.long_hold_toggle_button.setEnabled(True)
+        badge_content_height = max(
+            AUTO_TRADE_SETTING_BADGE_HEIGHT - 2,
+            QFontMetrics(self.long_hold_toggle_button.font()).height(),
+        )
+        self.long_hold_toggle_button.setStyleSheet(
+            auto_trade_setting_badge_stylesheet(
+                "QPushButton#reviewLongHoldToggle",
+                text_color=color,
+                border_color=color,
+            )
+            + "QPushButton#reviewLongHoldToggle {"
+            f" min-height: {badge_content_height}px;"
+            f" max-height: {badge_content_height}px;"
+            " }"
+            + "QPushButton#reviewLongHoldToggle:focus { outline: none; }"
+        )
+
+    def toggle_long_term_holding_policy(self) -> None:
+        before = bool(
+            read_review_policy().get("long_term_holding_enabled", False)
+        )
+        try:
+            saved = write_long_term_holding_policy(not before)
+        except Exception:
+            self.refresh_long_hold_policy_badge()
+            show_toast(self, "장기보유 설정 저장에 실패했습니다.")
+            return
+        self._apply_long_hold_badge_state(
+            bool(saved.get("long_term_holding_enabled", False))
+        )
+        self._refresh_after_review_action()
+        show_toast(
+            self,
+            "장기보유 ON" if saved["long_term_holding_enabled"] else "장기보유 OFF",
+        )
 
     def selected_stock_dirs(self) -> list[tuple[Path, str, str]]:
         """검토관리창에서 선택된 종목의 runtime 폴더를 반환한다."""

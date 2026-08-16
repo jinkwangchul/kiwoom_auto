@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from close_liquidation_transition_service import (
@@ -41,6 +41,7 @@ def evaluate_production_transition(
     runtime_state: dict[str, object] | None,
     runtime_routine_instance_id: object,
     scope: TransitionEvidenceScope,
+    liquidation_time_window_entered: bool = False,
 ) -> ProductionTransitionGuardResult:
     """Read evidence and decide without mutating Runtime, Queue, or Commands."""
 
@@ -59,6 +60,8 @@ def evaluate_production_transition(
             evidence_status=EVIDENCE_UNKNOWN,
             evidence=evidence,
         )
+    if liquidation_time_window_entered:
+        snapshot = replace(snapshot, liquidation_time_window_entered=True)
 
     decision = decide_close_liquidation_transition(
         policy_domain=policy_domain,

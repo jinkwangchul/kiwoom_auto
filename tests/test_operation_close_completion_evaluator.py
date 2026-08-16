@@ -31,11 +31,13 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
         self.order_queue_path = self.runtime / "order_queue.json"
         self.positions_path = self.runtime / "positions.json"
         self.broker_holdings_path = self.runtime / "broker_holdings.json"
+        self.operation_policy_path = self.root / "operation_policy.json"
         self.runtime.mkdir(parents=True)
         self.stocks.mkdir(parents=True)
         self._write_json(self.order_queue_path, {"version": 1, "orders": []})
         self._write_json(self.positions_path, {"positions": []})
         self._write_json(self.broker_holdings_path, {"broker_holdings": []})
+        self._set_long_hold_policy(False)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -53,9 +55,26 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
         data.update(extra)
         self._write_json(self.operation_state_path, data)
 
-    def _stock(self, code: str, state: dict[str, object], *, orders: list[dict[str, object]] | None = None) -> Path:
+    def _set_long_hold_policy(self, enabled: bool) -> None:
+        self._write_json(
+            self.operation_policy_path,
+            {"review_policy": {"long_term_holding_enabled": enabled}},
+        )
+
+    def _stock(
+        self,
+        code: str,
+        state: dict[str, object],
+        *,
+        orders: list[dict[str, object]] | None = None,
+        legacy_long_term_holding_enabled: bool = False,
+    ) -> Path:
         stock_dir = self.stocks / f"{code}_Test"
         stock_dir.mkdir(parents=True)
+        self._write_json(
+            stock_dir / "config.json",
+            {"long_term_holding_enabled": legacy_long_term_holding_enabled},
+        )
         self._write_json(stock_dir / "state.json", state)
         self._write_json(stock_dir / "orders.json", {"orders": orders or []})
         return stock_dir
@@ -68,6 +87,7 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
             order_queue_path=self.order_queue_path,
             positions_path=self.positions_path,
             broker_holdings_path=self.broker_holdings_path,
+            operation_policy_path=self.operation_policy_path,
         )
 
     def _statuses(self, result: dict[str, object]) -> dict[str, str]:
@@ -82,6 +102,7 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
             self.order_queue_path,
             self.positions_path,
             self.broker_holdings_path,
+            self.operation_policy_path,
             *self.stocks.glob("*/*.json"),
         ]
         return {
@@ -102,6 +123,7 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
         self.assertEqual({"111111": STATUS_DONE, "222222": STATUS_DONE}, self._statuses(result))
 
     def test_done_and_carryover_done_returns_global_complete(self) -> None:
+        self._set_long_hold_policy(True)
         self._operation_state(["111111", "222222"])
         self._stock("111111", {"status": "AUTO_CLOSED", "holding_qty": 0})
         self._stock(
@@ -109,7 +131,7 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
             {
                 "status": "AUTO_CLOSING",
                 "holding_qty": 7,
-                "operation_notice": "LIQUIDATION_CURRENT_PRICE_CARRYOVER",
+                "operation_notice": "CARRYOVER_DONE",
             },
         )
 
@@ -176,6 +198,106 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
         self._stock("111111", {"status": "AUTO_CLOSING", "holding_qty": 3})
 
         self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_carryover_with_long_term_holding_disabled_blocks_completion(self) -> None:
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {"status": "EARLY_CLOSING", "holding_qty": 3, "early_close_method": "이월"},
+        )
+
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_manual_holding_with_long_term_holding_enabled_is_carryover_done(self) -> None:
+        self._set_long_hold_policy(True)
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {"status": "STOPPED", "holding_qty": 3},
+        )
+
+        self.assertEqual({"111111": STATUS_CARRYOVER_DONE}, self._statuses(self._evaluate()))
+
+    def test_manual_holding_with_long_term_holding_disabled_requires_review(self) -> None:
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {"status": "STOPPED", "holding_qty": 3},
+            legacy_long_term_holding_enabled=True,
+        )
+
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_manual_holding_with_active_market_override_is_never_long_hold(self) -> None:
+        self._set_long_hold_policy(True)
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {
+                "status": "STOPPED",
+                "holding_qty": 3,
+                "individual_liquidation_request": {
+                    "status": "REQUESTED",
+                    "method": "시장가",
+                },
+            },
+        )
+
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_individual_market_request_overrides_earlier_close_carryover(self) -> None:
+        self._set_long_hold_policy(True)
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {
+                "status": "EARLY_CLOSING",
+                "holding_qty": 3,
+                "early_close_method": "이월",
+                "individual_liquidation_request": {
+                    "status": "REQUESTED",
+                    "method": "시장가",
+                },
+            },
+        )
+
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_individual_current_request_overrides_earlier_auto_close_carryover(self) -> None:
+        self._set_long_hold_policy(True)
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {
+                "status": "AUTO_CLOSING",
+                "holding_qty": 3,
+                "auto_close_method": "이월",
+                "individual_liquidation_request": {
+                    "status": "REQUESTED",
+                    "method": "현재가",
+                },
+            },
+        )
+
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
+
+    def test_individual_carryover_request_keeps_latest_carryover_intent(self) -> None:
+        self._set_long_hold_policy(True)
+        self._operation_state(["111111"])
+        self._stock(
+            "111111",
+            {
+                "status": "EARLY_CLOSING",
+                "holding_qty": 3,
+                "early_close_method": "이월",
+                "individual_liquidation_request": {
+                    "status": "REQUESTED",
+                    "method": "이월",
+                },
+            },
+        )
+
+        self.assertEqual({"111111": STATUS_CARRYOVER_DONE}, self._statuses(self._evaluate()))
 
     def test_review_required_blocks_completion(self) -> None:
         self._operation_state(["111111"])

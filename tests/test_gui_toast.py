@@ -126,12 +126,21 @@ class ToastMessageTest(unittest.TestCase):
         button_box = dialog.findChild(QDialogButtonBox)
         self.assertIsNotNone(button_box)
         save_button = button_box.button(QDialogButtonBox.Save)
+        expected_policy = dialog.build_policy_from_widgets(
+            dialog._validated_starting_budget_defaults()
+        )
 
         with (
+            patch.object(
+                environment_dialog,
+                "read_operation_policy",
+                side_effect=[dict(expected_policy), dict(expected_policy)],
+            ),
             patch.object(environment_dialog, "write_operation_policy") as writer,
             patch.object(environment_dialog, "append_changelog"),
             patch.object(environment_dialog, "show_toast") as toast,
             patch.object(QMessageBox, "information") as information,
+            patch.object(QMessageBox, "critical") as critical,
             patch.object(QMessageBox, "exec_") as exec_dialog,
         ):
             QTest.mouseClick(save_button, Qt.LeftButton)
@@ -144,6 +153,7 @@ class ToastMessageTest(unittest.TestCase):
             position="center",
         )
         information.assert_not_called()
+        critical.assert_not_called()
         exec_dialog.assert_not_called()
         self.assertFalse(dialog.isVisible())
         self.assertEqual(QDialog.Accepted, dialog.result())

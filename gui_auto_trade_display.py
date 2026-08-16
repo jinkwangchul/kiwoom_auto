@@ -36,6 +36,29 @@ AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR = "#AFB2B9"
 AUTO_TRADE_SETTING_AMBER_TEXT_COLOR = "#D97706"
 
 
+def auto_trade_setting_badge_stylesheet(
+    selector: str,
+    text_color: str = AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
+    border_color: str = AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
+) -> str:
+    """Return the shared compact badge style used by auto-trade controls."""
+    return (
+        f"{selector} {{"
+        " background-color: transparent;"
+        f" border: 1px solid {border_color};"
+        " border-radius: 4px;"
+        f" color: {text_color};"
+        " font-weight: 600;"
+        " padding: 0 6px;"
+        "}"
+        f"{selector}:hover {{"
+        " background-color: transparent;"
+        f" color: {text_color};"
+        f" border-color: {border_color};"
+        "}"
+    )
+
+
 class SortableTableWidgetItem(QTableWidgetItem):
     """화면 표시값과 정렬 기준값을 분리하는 표 아이템."""
 

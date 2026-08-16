@@ -1112,6 +1112,7 @@ from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
+    auto_trade_setting_badge_stylesheet,
     auto_trade_setting_display_status,
     auto_trade_setting_status_color,
     create_auto_trade_setting_status_item,
@@ -1549,28 +1550,6 @@ def normalize_profit_factor(value: object) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return 0.0
-
-
-def auto_trade_setting_badge_stylesheet(
-    selector: str,
-    text_color: str = AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
-    border_color: str = AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
-) -> str:
-    return (
-        f"{selector} {{"
-        " background-color: transparent;"
-        f" border: 1px solid {border_color};"
-        " border-radius: 4px;"
-        f" color: {text_color};"
-        " font-weight: 600;"
-        " padding: 0 6px;"
-        "}"
-        f"{selector}:hover {{"
-        " background-color: transparent;"
-        f" color: {text_color};"
-        f" border-color: {border_color};"
-        "}"
-    )
 
 
 class StockPositionMetricDelegate(QStyledItemDelegate):

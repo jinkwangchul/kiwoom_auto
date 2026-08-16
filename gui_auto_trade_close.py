@@ -49,6 +49,8 @@ from gui_auto_trade_policy import (
     auto_trade_setting_early_close_requested,
     auto_trade_setting_has_buy_pending_problem,
     auto_trade_setting_has_close_progress_quantity,
+    auto_trade_setting_individual_liquidation_window_entered,
+    auto_trade_setting_liquidation_active,
     auto_trade_setting_liquidation_phase_active,
     auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
@@ -580,6 +582,7 @@ def auto_trade_continue_pending_close_liquidations(
     *,
     limit: int | None = 5,
     target_routine_instance_ids: set[str] | tuple[str, ...] | None = None,
+    now_dt: datetime | None = None,
 ) -> dict[str, object]:
     """Resume Command requests after cancel confirmation without new identity."""
 
@@ -627,6 +630,15 @@ def auto_trade_continue_pending_close_liquidations(
             command_id = str(request.get("command_id") or "").strip()
             requested_at = str(request.get("requested_at") or "").strip()
             reason = "INDIVIDUAL_LIQUIDATION"
+            if short_close_method_text(method) == "이월":
+                continue
+            if not auto_trade_setting_liquidation_active(
+                config,
+                safe_int_value(state.get("holding_qty"), 0),
+                now_dt=now_dt,
+                state=state,
+            ):
+                continue
         elif str(state.get("early_close_requested_at") or "").strip():
             if str(state.get("status") or "").strip().upper() in {
                 "EARLY_CLOSED",
@@ -842,6 +854,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     minutes_before_regular_close: str = "5",
     *,
     show_error_dialog: bool = True,
+    now_dt: datetime | None = None,
 ) -> dict[str, object]:
     dialog_parent = operation_dialog_parent(window)
     normalized_method = short_close_method_text(method)
@@ -915,6 +928,13 @@ def auto_trade_apply_selected_individual_liquidation_method(
                 requested_at=requested_at,
                 operation_command_id=current_command_id,
             ),
+            liquidation_time_window_entered=(
+                auto_trade_setting_individual_liquidation_window_entered(
+                    state,
+                    now_dt=now_dt,
+                    candidate_minutes_before_regular_close=minutes,
+                )
+            ),
         )
         if not transition.allowed:
             reason = f"정책 전환 차단:{transition.reason_code}"
@@ -938,36 +958,11 @@ def auto_trade_apply_selected_individual_liquidation_method(
             and result.stock_results
             and result.stock_results[0].status == STOCK_APPLIED
         ):
-            saved_state = read_json_dict(stock_dir / "state.json")
-            saved_request = saved_state.get("individual_liquidation_request")
-            saved_request = (
-                saved_request if isinstance(saved_request, dict) else {}
-            )
-            execution = _start_close_liquidation_execution(
-                window,
-                stock_dir=stock_dir,
-                code=code,
-                name=name,
-                method=normalized_method,
-                command_id=result.command_id,
-                requested_at=str(
-                    saved_request.get("requested_at") or requested_at
-                ).strip(),
-                routine_instance_id=routine_instance_id,
-                reason="INDIVIDUAL_LIQUIDATION",
-            )
-            if execution.get("ok") is not True:
-                reason = str(execution.get("stage") or "실행 연결 실패")
-                failed.append(f"{code} {name}({reason})")
-                failure_messages.append(reason)
-                continue
             completed.append(f"{code} {name}")
             append_stock_log(
                 stock_dir,
                 "GUI",
-                "개별청산 요청: "
-                f"{minutes}분/{normalized_method} / "
-                f"{execution.get('stage')}",
+                f"개별청산 정책 설정: {minutes}분/{normalized_method}",
             )
         else:
             reason = result.error
@@ -998,7 +993,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
     window._runtime_file_snapshot = window.current_runtime_file_signature()
     window.update_action_buttons()
     window.statusBarMessage(
-        f"개별청산 요청 완료: {minutes}분/{normalized_method} / 대상 {len(completed)}개"
+        f"개별청산 설정 완료: {minutes}분/{normalized_method} / 대상 {len(completed)}개"
     )
     if failed and show_error_dialog:
         QMessageBox.warning(

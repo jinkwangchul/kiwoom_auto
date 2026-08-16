@@ -194,7 +194,15 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
                 "holding_qty": 5,
                 "operation_notice": "CARRYOVER_DONE",
             })
+            self._write_json(
+                stock_dir / "config.json",
+                {"long_term_holding_enabled": True},
+            )
             self._write_json(stock_dir / "orders.json", {"orders": []})
+            self._write_json(
+                root / "operation_policy.json",
+                {"review_policy": {"long_term_holding_enabled": True}},
+            )
 
             result = check_global_close_completion_after_durable_update(
                 source=SOURCE_STARTUP_RECOVERY,
@@ -205,6 +213,7 @@ class OperationCloseCompletionCheckServiceTests(unittest.TestCase):
                 order_queue_path=runtime / "order_queue.json",
                 positions_path=runtime / "positions.json",
                 broker_holdings_path=runtime / "broker_holdings.json",
+                operation_policy_path=root / "operation_policy.json",
             )
 
         self.assertTrue(result["normal_ended_applied"])

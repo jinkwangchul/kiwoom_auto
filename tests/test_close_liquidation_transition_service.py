@@ -18,6 +18,7 @@ from close_liquidation_transition_service import (
     REASON_CARRY_OVER_TO_ROUTINE_CLOSE_ACTIVITY_EXISTS,
     REASON_EXECUTION_PROGRESS_BLOCKED,
     REASON_INVALID_POLICY_DOMAIN,
+    REASON_LIQUIDATION_TIME_WINDOW_ENTERED,
     REASON_MARKET_DOWNGRADE_NOT_ALLOWED,
     REASON_RETURN_TO_CARRY_OVER_NOT_ALLOWED,
     REASON_RETURN_TO_ROUTINE_CLOSE_NOT_ALLOWED,
@@ -187,23 +188,37 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
             domain=DOMAIN_LIQUIDATION,
         )
 
-    def test_liquidation_market_cannot_downgrade(self) -> None:
+    def test_liquidation_market_can_change_before_time_window(self) -> None:
         for requested in (POLICY_CURRENT_PRICE, POLICY_CARRY_OVER):
             with self.subTest(requested=requested):
-                self.assert_blocked(
+                self.assert_allowed(
                     POLICY_MARKET,
                     requested,
-                    REASON_MARKET_DOWNGRADE_NOT_ALLOWED,
                     domain=DOMAIN_LIQUIDATION,
                 )
 
-    def test_liquidation_current_price_cannot_return_to_carry_over(self) -> None:
-        self.assert_blocked(
+    def test_liquidation_current_price_can_return_to_carry_over_before_time_window(self) -> None:
+        self.assert_allowed(
             POLICY_CURRENT_PRICE,
             POLICY_CARRY_OVER,
-            REASON_RETURN_TO_CARRY_OVER_NOT_ALLOWED,
             domain=DOMAIN_LIQUIDATION,
         )
+
+    def test_liquidation_policy_change_is_blocked_after_time_window_entry(self) -> None:
+        evidence = TransitionEvidence(liquidation_time_window_entered=True)
+        for current, requested in (
+            (POLICY_MARKET, POLICY_CARRY_OVER),
+            (POLICY_CURRENT_PRICE, POLICY_CARRY_OVER),
+            (POLICY_CARRY_OVER, POLICY_MARKET),
+        ):
+            with self.subTest(current=current, requested=requested):
+                self.assert_blocked(
+                    current,
+                    requested,
+                    REASON_LIQUIDATION_TIME_WINDOW_ENTERED,
+                    domain=DOMAIN_LIQUIDATION,
+                    evidence=evidence,
+                )
 
     def test_liquidation_same_policy_is_allowed_noop(self) -> None:
         for policy in (POLICY_CARRY_OVER, POLICY_MARKET, POLICY_CURRENT_PRICE):

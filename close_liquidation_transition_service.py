@@ -32,6 +32,7 @@ REASON_INVALID_POLICY_DOMAIN: Final = "INVALID_POLICY_DOMAIN"
 REASON_UNKNOWN_CURRENT_POLICY: Final = "UNKNOWN_CURRENT_POLICY"
 REASON_UNKNOWN_REQUESTED_POLICY: Final = "UNKNOWN_REQUESTED_POLICY"
 REASON_EXECUTION_PROGRESS_BLOCKED: Final = "EXECUTION_PROGRESS_BLOCKED"
+REASON_LIQUIDATION_TIME_WINDOW_ENTERED: Final = "LIQUIDATION_TIME_WINDOW_ENTERED"
 
 _CLOSE_POLICIES: Final = frozenset(
     {
@@ -84,6 +85,7 @@ class TransitionEvidence:
     buy_occurred: bool = False
     sell_occurred: bool = False
     pending_order_cancellation_started: bool = False
+    liquidation_time_window_entered: bool = False
 
     @property
     def activity_exists(self) -> bool:
@@ -192,6 +194,28 @@ def decide_close_liquidation_transition(
         return _decision(
             allowed=True,
             reason_code=REASON_SAME_POLICY_NOOP,
+            current_policy=current,
+            requested_policy=requested,
+            policy_domain=domain,
+            evidence=snapshot,
+        )
+
+    # Individual liquidation is a scheduled stock-policy override. Before its
+    # time gate all three policies are freely replaceable; after the gate the
+    # policy observed at entry is final for that execution cycle.
+    if domain == DOMAIN_LIQUIDATION:
+        if snapshot.liquidation_time_window_entered:
+            return _decision(
+                allowed=False,
+                reason_code=REASON_LIQUIDATION_TIME_WINDOW_ENTERED,
+                current_policy=current,
+                requested_policy=requested,
+                policy_domain=domain,
+                evidence=snapshot,
+            )
+        return _decision(
+            allowed=True,
+            reason_code=REASON_ALLOWED,
             current_policy=current,
             requested_policy=requested,
             policy_domain=domain,

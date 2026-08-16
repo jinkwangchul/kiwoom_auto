@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from close_liquidation_transition_service import DOMAIN_CLOSE
+from close_liquidation_transition_service import (
+    DOMAIN_CLOSE,
+    DOMAIN_LIQUIDATION,
+    REASON_LIQUIDATION_TIME_WINDOW_ENTERED,
+)
 from transition_evidence_reader import (
     COMMAND_REQUEST_SCOPE,
     TIME_POLICY_SCOPE,
@@ -110,6 +114,27 @@ class TransitionProductionGuardTest(unittest.TestCase):
         self.assertFalse(result.allowed)
         self.assertEqual(result.evidence_status, EVIDENCE_COMPLETE)
         self.assertIsNotNone(result.decision)
+
+    def test_liquidation_time_window_evidence_blocks_policy_change(self):
+        result = evaluate_production_transition(
+            policy_domain=DOMAIN_LIQUIDATION,
+            current_policy="시장가",
+            requested_policy="이월",
+            queue_path=self.queue_path,
+            fills_path=self.fills_path,
+            runtime_state=self.state,
+            runtime_routine_instance_id="routine-instance-1",
+            scope=TransitionEvidenceScope(
+                scope_type=COMMAND_REQUEST_SCOPE,
+                stock_code="005930",
+                trade_date="2026-07-27",
+                routine_instance_id="routine-instance-1",
+                transition_requested_at="2026-07-27 13:30:00",
+            ),
+            liquidation_time_window_entered=True,
+        )
+        self.assertFalse(result.allowed)
+        self.assertEqual(REASON_LIQUIDATION_TIME_WINDOW_ENTERED, result.reason_code)
 
 
 if __name__ == "__main__":

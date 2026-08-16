@@ -838,9 +838,9 @@ def auto_trade_setting_liquidation_text(
     ):
         return "-"
 
-    # 조기마감/자동마감 중에는 state에 저장된 마감 옵션이 환경설정 청산정책보다 우선한다.
-    # 특히 마감 옵션이 이월이면 청산 컬럼도 이월로 표시하고, 시장가/현재가 청산으로 보이면 안 된다.
-    if early_close_forced:
+    # 개별청산 정책이 없을 때 마감 이월은 청산 미진입("-")이다.
+    # 이후 명시된 종목별 개별청산 정책은 과거 마감 이월보다 우선 표시한다.
+    if not has_individual and early_close_forced:
         method = short_close_method_text(
             close_method_from_state_or_policy(
                 state,
@@ -851,9 +851,9 @@ def auto_trade_setting_liquidation_text(
             )
         )
         if method == "이월":
-            return "이월"
+            return "-"
 
-    if status_text == "자동마감":
+    if not has_individual and status_text == "자동마감":
         method = short_close_method_text(
             close_method_from_state_or_policy(
                 state,
@@ -864,7 +864,7 @@ def auto_trade_setting_liquidation_text(
             )
         )
         if method == "이월":
-            return "이월"
+            return "-"
 
     liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
     method = short_close_method_text(liquidation.get("method", "이월"))
@@ -882,6 +882,51 @@ def auto_trade_setting_regular_end_seconds() -> int:
     regular = policy.get("regular_market", {}) if isinstance(policy.get("regular_market"), dict) else {}
     end_time = normalized_hhmmss_or_empty(regular.get("end_time", "15:20:00")) or "15:20:00"
     return seconds_from_hhmmss(end_time, "15:20:00")
+
+
+def auto_trade_setting_individual_liquidation_window_entered(
+    state: dict[str, object] | None,
+    now_dt: datetime | None = None,
+    candidate_minutes_before_regular_close: object | None = None,
+) -> bool:
+    """Return whether the persisted individual policy has reached its time gate.
+
+    The request's ``minutes_before_regular_close`` and the existing regular-market
+    end time are the only time sources. Missing/invalid request time evidence is
+    treated as already entered so a risky rollback cannot be enabled by damage.
+    """
+    policy = individual_liquidation_policy_from_state(state)
+    if not policy and candidate_minutes_before_regular_close is None:
+        return False
+
+    current = now_dt or datetime.now()
+    minute_values: list[object] = []
+    if policy:
+        raw_request = state.get("individual_liquidation_request") if isinstance(state, dict) else None
+        raw_request = raw_request if isinstance(raw_request, dict) else {}
+        requested_at_text = str(raw_request.get("requested_at") or "").strip()
+        try:
+            requested_at = datetime.fromisoformat(requested_at_text)
+        except (TypeError, ValueError):
+            return True
+        if requested_at.date() != current.date():
+            return True
+        minute_values.append(policy.get("minutes_before_regular_close", "5"))
+    if candidate_minutes_before_regular_close is not None:
+        minute_values.append(candidate_minutes_before_regular_close)
+
+    current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+    end_seconds = auto_trade_setting_regular_end_seconds()
+    for value in minute_values:
+        try:
+            minutes = int(str(value).strip() or "5")
+        except (TypeError, ValueError):
+            return True
+        minutes = max(1, min(100, minutes))
+        start_seconds = max(0, end_seconds - minutes * 60)
+        if current_seconds >= start_seconds:
+            return True
+    return False
 
 
 def auto_trade_setting_is_after_regular_end(now_dt: datetime | None = None) -> bool:
@@ -1042,8 +1087,8 @@ def auto_trade_setting_liquidation_result_policy(
     반환값:
     - "NONE": 청산 완료 판정 대상 아님
     - "SUCCESS": 보유/미수/미도 없음 → 감시/대기 + ATS 재진입 금지
-    - "CURRENT_CARRYOVER": 현재가 청산 후 보유/미도 잔존 → 이월과 동일 취급
-    - "RED_STOP": 미수 존재 또는 시장가 청산 후 잔여 존재 → 서버/통신 불안정 적색
+    - "CURRENT_CARRYOVER": 최종 청산정책 이월 → 정상 보유 지속
+    - "RED_STOP": 미수 또는 시장가/현재가 적극적 청산 후 잔여 존재
     """
     if not auto_trade_setting_liquidation_completed_today(state):
         return "NONE"
@@ -1067,16 +1112,14 @@ def auto_trade_setting_liquidation_result_policy(
     if not has_sell_residue:
         return "SUCCESS"
 
-    if method == "현재가":
-        return "CURRENT_CARRYOVER"
-
-    # 시장가 청산인데 보유/미도 잔존이면 정상 시장상황보다
-    # 서버/통신/체결정보 불일치 가능성을 우선 표시한다.
-    if method == "시장가":
+    if method in {"시장가", "현재가"}:
         return "RED_STOP"
 
-    # 기타 방식은 보수적으로 이월성 잔여로 둔다.
-    return "CURRENT_CARRYOVER"
+    if method == "이월":
+        return "CURRENT_CARRYOVER"
+
+    # 확정할 수 없는 정책에서 잔량을 정상 이월로 오판하지 않는다.
+    return "RED_STOP"
 
 
 def auto_trade_setting_mark_liquidation_result_for_display(
@@ -1127,7 +1170,7 @@ def auto_trade_setting_mark_liquidation_result_for_display(
         state["server_mismatch"] = True
         state["kiwoom_sync_status"] = "MISMATCH"
         state["operation_notice"] = "LIQUIDATION_RESULT_UNRELIABLE"
-        state["operation_notice_reason"] = "청산 완료 후 미수 또는 시장가 잔여 발생"
+        state["operation_notice_reason"] = "청산 완료 후 미수 또는 적극적 청산 잔여 발생"
         state["operation_notice_at"] = now_text()
 
     return state, result
@@ -1150,10 +1193,12 @@ def auto_trade_setting_liquidation_active(
     if holding_qty <= 0:
         return False
 
-    # 조기마감/자동마감 옵션의 이월은 실제 청산 실행보다 우선한다.
-    # 보유가 있어도 이월이면 시장가/현재가 청산 절차를 시작하지 않는다.
+    liquidation, is_individual = effective_liquidation_policy_for_config(config, state)
+
+    # 명시적인 종목별 개별청산 정책이 없을 때만 과거 마감 이월이
+    # 환경 청산정책 자동 진입을 차단한다. 이후 개별청산은 더 최신 의사다.
     status_text = auto_trade_setting_display_status(display_status)
-    if auto_trade_setting_early_close_requested(state):
+    if not is_individual and auto_trade_setting_early_close_requested(state):
         close_method = short_close_method_text(
             close_method_from_state_or_policy(
                 state,
@@ -1166,7 +1211,7 @@ def auto_trade_setting_liquidation_active(
         if close_method == "이월":
             return False
 
-    if status_text == "자동마감":
+    if not is_individual and status_text == "자동마감":
         close_method = short_close_method_text(
             close_method_from_state_or_policy(
                 state,
@@ -1179,7 +1224,6 @@ def auto_trade_setting_liquidation_active(
         if close_method == "이월":
             return False
 
-    liquidation, _is_individual = effective_liquidation_policy_for_config(config, state)
     method = short_close_method_text(liquidation.get("method", "이월"))
     if method == "이월":
         return False

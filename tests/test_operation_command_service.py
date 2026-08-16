@@ -2665,7 +2665,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                     close,
                     "_start_close_liquidation_execution",
                     return_value={"ok": True, "stage": "send_order"},
-                ),
+                ) as start,
             ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
                     window,
@@ -2680,9 +2680,10 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         request = state[INDIVIDUAL_LIQUIDATION_REQUEST_KEY]
         self.assertEqual("현재가", request["method"])
         self.assertEqual("7", request["minutes_before_regular_close"])
+        start.assert_not_called()
         window.refresh_all.assert_called_once_with()
         window.statusBarMessage.assert_called_once_with(
-            "개별청산 요청 완료: 7분/현재가 / 대상 1개"
+            "개별청산 설정 완료: 7분/현재가 / 대상 1개"
         )
 
     def test_individual_liquidation_time_keeps_current_method(self) -> None:

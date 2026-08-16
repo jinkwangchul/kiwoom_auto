@@ -64,6 +64,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                 {
                     "status": "RUNNING",
                     "holding_qty": 1,
+                    "avg_price": 1000,
                     "trade_enabled": True,
                     "trade_started_at": "2026-07-27 09:00:00",
                 }

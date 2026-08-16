@@ -100,8 +100,16 @@ class AtsSessionVisibilityTest(unittest.TestCase):
             dialog.extra_name[0].setText("장전프리장")
             dialog.extra_start[0].set_time("07:30:00")
             dialog.extra_end[0].set_time("08:40:00")
+            expected_policy = dialog.build_policy_from_widgets(
+                dialog._validated_starting_budget_defaults()
+            )
 
             with (
+                patch.object(
+                    environment,
+                    "read_operation_policy",
+                    side_effect=[dict(expected_policy), dict(expected_policy)],
+                ),
                 patch.object(environment, "write_operation_policy") as writer,
                 patch.object(environment, "append_changelog"),
                 patch.object(environment, "show_toast") as toast,

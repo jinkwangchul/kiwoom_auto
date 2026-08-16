@@ -65,6 +65,9 @@ SYSTEM_BUDGET_DEFAULTS = {
     "total_budget": 2_000_000,
     "available_budget_percent": 100,
 }
+REVIEW_POLICY_DEFAULTS = {
+    "long_term_holding_enabled": False,
+}
 BUFFER_RESPONSE_APPLICATION_MODES = ("UNIFIED", "SEGMENTED")
 BUFFER_RESPONSE_EVALUATION_FACTORS = ("손익비율", "손익금액", "투입금액")
 BUFFER_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
@@ -188,6 +191,7 @@ def default_operation_policy() -> dict[str, object]:
             "minutes_before_regular_close": "5",
             "method": "시장가",
         },
+        "review_policy": dict(REVIEW_POLICY_DEFAULTS),
         "system_budget": dict(SYSTEM_BUDGET_DEFAULTS),
         "starting_budget_defaults": dict(STARTING_BUDGET_DEFAULTS),
         "updated_at": "",
@@ -230,6 +234,7 @@ def write_operation_policy(
     existing: dict[str, object] | None = None
     if (
         "system_budget" not in policy
+        or "review_policy" not in policy
         or (preserve_buffer_response and "buffer_response" not in policy)
     ):
         existing = read_operation_policy(path=target_path)
@@ -238,6 +243,11 @@ def write_operation_policy(
         policy["system_budget"] = system_budget_policy(existing)
     else:
         policy["system_budget"] = system_budget_policy(policy)
+    if "review_policy" not in policy:
+        assert existing is not None
+        policy["review_policy"] = review_policy(existing)
+    else:
+        policy["review_policy"] = review_policy(policy)
     if (
         preserve_buffer_response
         and "buffer_response" not in policy
@@ -282,6 +292,58 @@ def validate_available_budget_percent(value: object) -> int:
     if percent < 1 or percent > 100:
         raise ValueError("available_budget_percent must be between 1 and 100")
     return percent
+
+
+def review_policy(policy: dict[str, object] | None = None) -> dict[str, bool]:
+    """Return the normalized global Review-classification policy."""
+    source = policy if isinstance(policy, dict) else {}
+    raw_section = source.get("review_policy")
+    section = raw_section if isinstance(raw_section, dict) else {}
+    raw_enabled = section.get(
+        "long_term_holding_enabled",
+        REVIEW_POLICY_DEFAULTS["long_term_holding_enabled"],
+    )
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    elif isinstance(raw_enabled, str):
+        normalized = raw_enabled.strip().upper()
+        enabled = normalized in {"TRUE", "1", "YES", "Y", "ON"}
+    else:
+        enabled = False
+    return {"long_term_holding_enabled": enabled}
+
+
+def read_review_policy(*, path: Path | None = None) -> dict[str, bool]:
+    return review_policy(read_operation_policy(path=path))
+
+
+def write_long_term_holding_policy(
+    enabled: bool,
+    *,
+    path: Path | None = None,
+) -> dict[str, bool]:
+    """Persist the single global long-hold Review policy with read-back."""
+    if not isinstance(enabled, bool):
+        raise ValueError("long_term_holding_enabled must be boolean")
+    before = read_review_policy(path=path)
+    normalized = {"long_term_holding_enabled": enabled}
+    policy = read_operation_policy(path=path)
+    policy["review_policy"] = dict(normalized)
+    write_operation_policy(policy, path=path)
+    saved = read_review_policy(path=path)
+    if saved != normalized:
+        raise RuntimeError("review_policy read-back verification failed")
+    try:
+        _append_setting_change(
+            "SETTING_CHANGED",
+            source="LONG_TERM_HOLDING_POLICY_WRITER",
+            target="장기보유",
+            target_id="GLOBAL_REVIEW_POLICY",
+            changes=_journal_changes(before, saved),
+        )
+    except Exception:
+        pass
+    return saved
 
 
 def system_budget_policy(policy: dict[str, object] | None = None) -> dict[str, int]:
@@ -1556,6 +1618,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 "minutes_before_regular_close": self.liquidation_minutes.currentText(),
                 "method": self._current_liquidation_method(),
             },
+            "review_policy": review_policy(self.policy),
             "system_budget": system_budget_policy(self.policy),
             "starting_budget_defaults": (
                 dict(budget_defaults)

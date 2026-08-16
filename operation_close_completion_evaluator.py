@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from gui_auto_trade_integrity import is_review_required_state
+from gui_operation_environment import read_review_policy
 from gui_order_utils import order_current_pending_qty, pending_order_side_quantities
+from stock_long_hold_policy import (
+    final_close_liquidation_method,
+    has_active_individual_liquidation_request,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,6 +30,7 @@ OPERATION_STATE_PATH = RUNTIME_DIR / "operation_state.json"
 ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
 POSITIONS_PATH = RUNTIME_DIR / "positions.json"
 BROKER_HOLDINGS_PATH = RUNTIME_DIR / "broker_holdings.json"
+OPERATION_POLICY_PATH = PROJECT_ROOT / "operation_policy.json"
 
 STATUS_DONE = "DONE"
 STATUS_CARRYOVER_DONE = "CARRYOVER_DONE"
@@ -97,11 +103,18 @@ def evaluate_operation_close_completion(
     order_queue_path: str | Path = ORDER_QUEUE_PATH,
     positions_path: str | Path = POSITIONS_PATH,
     broker_holdings_path: str | Path = BROKER_HOLDINGS_PATH,
+    operation_policy_path: str | Path = OPERATION_POLICY_PATH,
 ) -> dict[str, Any]:
     """Classify all operation participants using durable files only."""
 
     effective_today = str(today or today_text()).strip()
     operation_state, operation_error = _read_json_object(Path(operation_state_path))
+    global_long_hold_enabled = bool(
+        read_review_policy(path=Path(operation_policy_path)).get(
+            "long_term_holding_enabled",
+            False,
+        )
+    )
     base = {
         "evaluated": True,
         "blocked": False,
@@ -114,6 +127,7 @@ def evaluate_operation_close_completion(
         "blocking_stock_codes": [],
         "reasons": [],
         "evidence_errors": [],
+        "long_term_holding_enabled": global_long_hold_enabled,
     }
 
     if operation_error:
@@ -170,6 +184,7 @@ def evaluate_operation_close_completion(
             positions_data=positions_data if not positions_error else None,
             broker_data=broker_data if not broker_error else None,
             evidence_errors=evidence_errors,
+            global_long_hold_enabled=global_long_hold_enabled,
         )
         for code in participants
     ]
@@ -298,6 +313,7 @@ def _evaluate_stock(
     positions_data: dict[str, Any] | None,
     broker_data: dict[str, Any] | None,
     evidence_errors: list[str],
+    global_long_hold_enabled: bool,
 ) -> dict[str, Any]:
     stock_dir = _find_stock_dir(stocks_dir, stock_code)
     evidence: dict[str, Any] = {"stock_dir": str(stock_dir) if stock_dir else ""}
@@ -401,6 +417,40 @@ def _evaluate_stock(
         )
 
     if not _close_started(state):
+        # A positive holding with no close/liquidation entry is a normal
+        # holding-continuation route.  The global Review policy decides whether
+        # it can finish as intentional carry-over; without that explicit policy
+        # the residual remains a Review-blocking result.
+        if holding_qty is not None and holding_qty > 0:
+            if (
+                global_long_hold_enabled
+                and not has_active_individual_liquidation_request(state)
+                and not final_close_liquidation_method(state)
+            ):
+                return _stock_result(
+                    stock_code,
+                    STATUS_CARRYOVER_DONE,
+                    close_mode=close_mode,
+                    state=status_text,
+                    holding_qty=holding_qty,
+                    pending_buy_qty=buy_pending_qty,
+                    pending_sell_qty=sell_pending_qty,
+                    active_order_ids=active_order_ids,
+                    evidence=evidence,
+                    reasons=[],
+                )
+            return _stock_result(
+                stock_code,
+                STATUS_HOLDING_REMAINS,
+                close_mode=close_mode,
+                state=status_text,
+                holding_qty=holding_qty,
+                pending_buy_qty=buy_pending_qty,
+                pending_sell_qty=sell_pending_qty,
+                active_order_ids=active_order_ids,
+                evidence=evidence,
+                reasons=["positive durable holding quantity remains"],
+            )
         return _stock_result(
             stock_code,
             STATUS_CLOSE_NOT_STARTED,
@@ -415,6 +465,23 @@ def _evaluate_stock(
         )
 
     if _explicit_carryover_done(state):
+        if (
+            holding_qty is not None
+            and holding_qty > 0
+            and not global_long_hold_enabled
+        ):
+            return _stock_result(
+                stock_code,
+                STATUS_HOLDING_REMAINS,
+                close_mode=close_mode,
+                state=status_text,
+                holding_qty=holding_qty,
+                pending_buy_qty=buy_pending_qty,
+                pending_sell_qty=sell_pending_qty,
+                active_order_ids=active_order_ids,
+                evidence=evidence,
+                reasons=["positive durable holding quantity remains and long-term holding is disabled"],
+            )
         return _stock_result(
             stock_code,
             STATUS_CARRYOVER_DONE,
@@ -581,6 +648,11 @@ def _close_mode(state: dict[str, Any]) -> str:
 
 
 def _explicit_carryover_done(state: dict[str, Any]) -> bool:
+    final_method = final_close_liquidation_method(state)
+    if has_active_individual_liquidation_request(state):
+        return final_method == "CARRYOVER"
+    if final_method:
+        return final_method == "CARRYOVER"
     values = [
         state.get("operation_notice"),
         state.get("liquidation_result"),
@@ -589,14 +661,9 @@ def _explicit_carryover_done(state: dict[str, Any]) -> bool:
         state.get("early_close_result"),
         state.get("close_result"),
     ]
-    if any(_norm(value) in {"CURRENT_CARRYOVER", "CARRYOVER_DONE", "LIQUIDATION_CURRENT_PRICE_CARRYOVER"} for value in values):
+    if any(_norm(value) in {"CURRENT_CARRYOVER", "CARRYOVER_DONE"} for value in values):
         return True
-    methods = [
-        state.get("auto_close_method"),
-        state.get("early_close_method"),
-        state.get("liquidation_method"),
-    ]
-    return any(_norm(value) in {"CARRYOVER", "ROLLOVER", "\uc774\uc6d4"} for value in methods)
+    return False
 
 
 def _stock_side_pending(stock_dir: Path, state: dict[str, Any]) -> tuple[object, object, str]:
