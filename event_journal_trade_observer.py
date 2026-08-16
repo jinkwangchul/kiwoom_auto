@@ -92,6 +92,16 @@ def _identity(order: Any, result: Any) -> dict[str, str]:
     }
 
 
+def _trade_correlation(identity: dict[str, str]) -> str:
+    """Return the strongest existing identity without minting a new one."""
+
+    return _first(
+        identity.get("execution_id"),
+        identity.get("order_id"),
+        identity.get("signal_id"),
+    )
+
+
 def _remember(key: tuple[str, ...]) -> bool:
     if key in _SEEN_EVENT_KEYS:
         _SEEN_EVENT_KEYS.move_to_end(key)
@@ -121,6 +131,7 @@ def _target_fields(identity: dict[str, str]) -> dict[str, Any]:
         "signal_id": identity["signal_id"] or None,
         "order_id": identity["order_id"] or None,
         "execution_id": identity["execution_id"] or None,
+        "correlation_id": _trade_correlation(identity) or None,
     }
 
 
@@ -163,6 +174,7 @@ def observe_signal_created(
         stock_name=_text(stock_name) or _text(stock_code),
         routine=_text(routine_name) or None,
         signal_id=signal_id,
+        correlation_id=signal_id,
         details=details,
     )
 
@@ -438,6 +450,7 @@ def observe_close_started(
         stock_code=code or None,
         stock_name=_text(stock_name) or None,
         command_id=_first(command_id, command_result) or None,
+        correlation_id=_first(command_id, command_result) or None,
     )
 
 
@@ -501,6 +514,7 @@ def observe_liquidation_requested(
                 stock_name=name or None,
                 routine=routine or None,
                 command_id=command_id or None,
+                correlation_id=command_id or None,
                 details={
                     "command": command,
                     "method": direct_method or None,
@@ -548,6 +562,7 @@ def observe_manual_ats_liquidation_outcome(
         stock_code=clean_code,
         stock_name=clean_name,
         command_id=clean_command_id,
+        correlation_id=clean_command_id,
         reason_code=_text(reason_code) or None,
         details=dict(details),
     )

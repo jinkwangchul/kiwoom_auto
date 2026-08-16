@@ -40,7 +40,11 @@ from gui_review_utils import (
 )
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
-from event_journal_production import append_production_event
+from event_journal_production import (
+    append_production_event,
+    observe_owner_failure_transition,
+    observe_production_exception,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +111,9 @@ class AutoTradeOperationHost(QObject):
             timers=(self._operation_timer,),
         )
         if result.get("started") is True and int(result.get("started_count") or 0) > 0:
+            recovery_session_id = str(
+                getattr(identity, "recovery_session_id", "") or ""
+            ).strip()
             append_production_event(
                 "OPERATION_HOST_STARTED",
                 result="SUCCESS",
@@ -114,6 +121,11 @@ class AutoTradeOperationHost(QObject):
                 target_type="OPERATION_HOST",
                 target_id="main_operation_host",
                 reason_code=str(result.get("reason_code") or ""),
+                **(
+                    {"correlation_id": recovery_session_id}
+                    if recovery_session_id
+                    else {}
+                ),
             )
         return result
 
@@ -149,10 +161,26 @@ class AutoTradeOperationHost(QObject):
         from gui_auto_trade_timer import auto_trade_run_operation_cycle
 
         self._operation_cycle_running = True
+        cycle_exception = None
         try:
             try:
                 result = auto_trade_run_operation_cycle(self)
             except Exception as exc:
+                cycle_exception = exc
+                observe_production_exception(
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                    component="operation_host",
+                    operation="run_operation_cycle",
+                    source="gui_auto_trade_operation_host.AutoTradeOperationHost.run_operation_cycle",
+                    target_type="OPERATION_HOST",
+                    target_id="main_operation_host",
+                    target_name="자동매매 운영 주기",
+                    reason_code="OPERATION_CYCLE_FAILED",
+                    owner=self,
+                    failure_scope="operation_cycle",
+                )
                 LOGGER.exception("Main operation host cycle failed")
                 self.statusBarMessage(
                     "자동매매 운영 주기를 처리하지 못했습니다. 로그를 확인하십시오."
@@ -165,6 +193,17 @@ class AutoTradeOperationHost(QObject):
         finally:
             self._operation_cycle_running = False
         if isinstance(result, dict):
+            if cycle_exception is None:
+                observe_owner_failure_transition(
+                    self,
+                    "operation_cycle",
+                    active=False,
+                )
+            observe_owner_failure_transition(
+                self,
+                "operation_cycle_result",
+                active=False,
+            )
             signal_result = result.get("signal_result", {})
             deferred = (
                 isinstance(signal_result, dict)
@@ -173,6 +212,24 @@ class AutoTradeOperationHost(QObject):
             if not deferred:
                 self.operation_cycle_completed.emit(result)
             return result
+        observe_owner_failure_transition(
+            self,
+            "operation_cycle_result",
+            active=True,
+            signature=type(result).__name__,
+            event_type="INTEGRITY_WARNING",
+            severity="ERROR",
+            result="FAILED",
+            source="gui_auto_trade_operation_host.AutoTradeOperationHost.run_operation_cycle",
+            template_args={"target": "자동매매 운영 주기"},
+            target_type="OPERATION_HOST",
+            target_id="main_operation_host",
+            target_name="자동매매 운영 주기",
+            reason_code="INVALID_OPERATION_CYCLE_RESULT",
+            component="operation_host",
+            operation="run_operation_cycle",
+            details={"result_type": type(result).__name__},
+        )
         return {"processed": False, "reason_code": "INVALID_OPERATION_CYCLE_RESULT"}
 
     def complete_deferred_operation_cycle(self, result: dict[str, object]) -> None:

@@ -1026,7 +1026,11 @@ from gui_stock_instance_chart_window import (
     stock_instance_chart_is_open,
 )
 from gui_window_policy import close_persistent_feature_windows
-from event_journal_production import append_owner_event_once, append_production_event
+from event_journal_production import (
+    append_owner_event_once,
+    append_production_event,
+    observe_owner_failure_transition,
+)
 from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
 from gui_review_utils import current_price_from_state
@@ -2753,7 +2757,7 @@ class MainWindow(QMainWindow):
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
         self.btn_close_all_windows = QPushButton("모든창닫기")
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
-        self.btn_log_view = QPushButton("이벤트기록")
+        self.btn_log_view = QPushButton("이벤트")
         self.btn_review_required = QPushButton("검토관리(0)")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
@@ -4657,6 +4661,7 @@ class MainWindow(QMainWindow):
             source="MainWindow._fail_production_recovery",
             target_type="RECOVERY_SESSION",
             target_id=identity.recovery_session_id,
+            correlation_id=identity.recovery_session_id,
             reason_code=str(reason_code or "RECOVERY_FAILED"),
         )
 
@@ -4785,6 +4790,7 @@ class MainWindow(QMainWindow):
                 source="MainWindow._finish_production_recovery",
                 target_type="RECOVERY_SESSION",
                 target_id=identity.recovery_session_id,
+                correlation_id=identity.recovery_session_id,
                 reason_code=str(context.account_status or ""),
             )
             self._request_account_funds_after_recovery(identity)
@@ -5453,6 +5459,9 @@ class MainWindow(QMainWindow):
     def on_kiwoom_login_state_changed(self, state) -> None:
         state = state if isinstance(state, dict) else {}
         connected = bool(state.get("connected", False))
+        previously_connected = bool(
+            getattr(self, "_event_journal_kiwoom_connected", False)
+        )
         message = str(state.get("message", "") or "")
         if connected:
             label_text = "로그인 상태: 연결됨"
@@ -5477,9 +5486,34 @@ class MainWindow(QMainWindow):
             self._production_recovery_identity = None
             self._production_recovery_parts = {}
             self._production_recovery_status_result()
+        if connected and not previously_connected:
+            append_production_event(
+                "LOGIN_SUCCEEDED",
+                result="SUCCESS",
+                source="gui_windows.MainWindow.on_kiwoom_login_state_changed",
+                target_type="BROKER_CONNECTION",
+                target_id="kiwoom_openapi",
+                target_name="키움 OpenAPI",
+                reason_code="ON_EVENT_CONNECT_SUCCESS",
+            )
+        elif not connected and previously_connected:
+            append_production_event(
+                "CONNECTION_LOST",
+                severity="WARNING",
+                result="FAILED",
+                source="gui_windows.MainWindow.on_kiwoom_login_state_changed",
+                target_type="BROKER_CONNECTION",
+                target_id="kiwoom_openapi",
+                target_name="키움 OpenAPI",
+                reason_code="LOGIN_STATE_DISCONNECTED",
+            )
+        self._event_journal_kiwoom_connected = connected
         self.statusBar().showMessage(status_message)
 
     def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
+        previous_account = str(
+            getattr(self, "_selected_kiwoom_account_no", "") or ""
+        ).strip()
         self.save_current_account_memo_input()
         combo = getattr(self, "account_combo", None)
         current_data = getattr(combo, "currentData", None)
@@ -5493,6 +5527,18 @@ class MainWindow(QMainWindow):
                 return
             if active and account:
                 self._selected_kiwoom_account_no = account
+                if account != previous_account:
+                    account_display = masked_account_no(account)
+                    append_production_event(
+                        "ACCOUNT_CHANGED",
+                        result="SUCCESS",
+                        source="gui_windows.MainWindow.on_kiwoom_account_changed",
+                        template_args={"account_display": account_display},
+                        target_type="ACCOUNT",
+                        target_id=account_display,
+                        target_name=account_display,
+                        reason_code="ACTIVE_ACCOUNT_SELECTED",
+                    )
         self.sync_account_funds_selection()
         self.refresh_account_authentication_ui()
         self.refresh_account_query_status_ui()
@@ -8168,6 +8214,48 @@ class MainWindow(QMainWindow):
                 "kiwoom_api_live_event": True,
                 "live_event_source": "KiwoomApi.raw_chejan_received",
             },
+        )
+        chejan_result = (
+            self.last_chejan_record_result
+            if isinstance(self.last_chejan_record_result, dict)
+            else {}
+        )
+        chejan_stage = str(
+            chejan_result.get("stage")
+            or chejan_result.get("record_stage")
+            or ""
+        ).strip().upper()
+        chejan_failed = chejan_result.get("recorded") is not True
+        chejan_execution_id = str(chejan_result.get("execution_id") or "").strip()
+        chejan_order_id = str(chejan_result.get("order_id") or "").strip()
+        observe_owner_failure_transition(
+            self,
+            "kiwoom_chejan_normalization",
+            active=chejan_failed,
+            signature=f"CHEJAN_EVIDENCE_FAILED:{chejan_stage}",
+            event_type=(
+                "PROCESSING_ERROR"
+                if chejan_stage in {"QUEUE_READ", "QUEUE_STRUCTURE"}
+                else "INTEGRITY_WARNING"
+            ),
+            severity="ERROR",
+            result="FAILED",
+            source="gui_windows.MainWindow.on_kiwoom_raw_chejan_received",
+            template_args={"target": "키움 체결 증거"},
+            target_type="BROKER_EVIDENCE",
+            target_id="kiwoom_chejan",
+            target_name="키움 체결 증거",
+            reason_code=(
+                f"CHEJAN_{chejan_stage}_FAILED"
+                if chejan_stage
+                else "CHEJAN_EVIDENCE_FAILED"
+            ),
+            component="kiwoom_chejan",
+            operation="normalize_and_record",
+            execution_id=chejan_execution_id or None,
+            order_id=chejan_order_id or None,
+            correlation_id=chejan_execution_id or chejan_order_id or None,
+            details={"stage": chejan_stage},
         )
         if (
             self.last_chejan_record_result.get("recorded") is True

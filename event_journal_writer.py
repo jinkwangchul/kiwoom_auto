@@ -15,6 +15,7 @@ from event_journal_contract import (
     new_event_id,
     parse_aware_timestamp,
     render_summary,
+    sanitize_event_record,
     validate_event_record,
 )
 
@@ -116,6 +117,9 @@ class EventJournalWriter:
         template_account_issues = account_safety_issues(template_args or {})
         if template_account_issues:
             return _result(invalid=True, issues=template_account_issues)
+        optional_account_issues = account_safety_issues(optional_fields)
+        if optional_account_issues:
+            return _result(invalid=True, issues=optional_account_issues)
 
         rendered = render_summary(event_type_text, template_args)
         if not rendered.get("rendered"):
@@ -133,6 +137,11 @@ class EventJournalWriter:
         for key, value in optional_fields.items():
             if value is not None and value != "":
                 record[key] = value
+
+        try:
+            record = sanitize_event_record(record)
+        except Exception as exc:
+            return _result(write_failed=True, error=f"event sanitization failed: {exc}")
 
         issues = validate_event_record(record)
         if issues:

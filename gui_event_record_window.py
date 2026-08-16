@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from typing import Callable
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -29,7 +30,12 @@ from PyQt5.QtWidgets import (
 )
 from gui_window_policy import configure_persistent_feature_window
 
-from event_journal_contract import EVENT_TYPE_LABELS, event_target_display, parse_aware_timestamp
+from event_journal_contract import (
+    EVENT_TYPE_LABELS,
+    event_target_display,
+    parse_aware_timestamp,
+    sanitize_diagnostic_text,
+)
 from event_journal_reader import EventJournalReader
 
 
@@ -64,14 +70,27 @@ RESULT_COLORS = {
 }
 CORRELATION_LABELS = (
     ("app_session_id", "프로그램 세션 ID"),
-    ("stock_code", "종목코드"),
-    ("routine", "적용 루틴"),
+    ("correlation_id", "상관관계 ID"),
+    ("parent_event_id", "직전 원인 이벤트 ID"),
     ("event_id", "이벤트 ID"),
     ("signal_id", "신호 ID"),
     ("order_id", "주문 ID"),
     ("execution_id", "체결 ID"),
     ("broker_order_no", "Broker 주문번호"),
     ("command_id", "명령 ID"),
+)
+TARGET_LABELS = (
+    ("target", "대상"),
+    ("stock_code", "종목"),
+    ("routine", "루틴"),
+)
+DEVELOPER_DIAGNOSTIC_LABELS = (
+    ("component", "구성요소"),
+    ("operation", "작업"),
+    ("exception_type", "예외 유형"),
+    ("exception_message", "예외 메시지"),
+    ("stack_fingerprint", "스택 지문"),
+    ("build_version", "빌드 버전"),
 )
 DEFAULT_HIDDEN_EVENT_TYPES = frozenset({
     "ORDER_QUEUED",
@@ -81,6 +100,7 @@ DEFAULT_HIDDEN_EVENT_TYPES = frozenset({
 })
 EVENT_LIST_PANEL_FIXED_WIDTH = 1170
 EVENT_DETAIL_PANEL_MINIMUM_WIDTH = 380
+EVENT_AUTO_REFRESH_INTERVAL_MS = 3_000
 OPERATOR_EVENT_TYPES = frozenset({
     "OPERATOR_SYSTEM_DECISION",
     "OPERATOR_OPERATION_DECISION",
@@ -126,11 +146,19 @@ _SENSITIVE_DETAIL_KEYS = frozenset({
     "api_key",
     "auth",
     "broker_response",
+    "broker_payload",
+    "broker_raw",
+    "chejan_fid_map",
+    "chejan_raw",
     "directory",
+    "fid",
     "file_path",
     "password",
     "path",
+    "payload",
     "raw",
+    "raw_json",
+    "raw_payload",
     "raw_response",
     "secret",
     "stack",
@@ -162,7 +190,7 @@ class EventRecordPrototypeWindow(QDialog):
         configure_persistent_feature_window(self, parent)
         self.reader = reader or EventJournalReader()
         self._now_provider = now_provider or (lambda: datetime.now().astimezone())
-        self.setWindowTitle("이벤트기록")
+        self.setWindowTitle("이벤트")
         self.resize(1580, 800)
         self.setMinimumSize(1400, 700)
         self.current_period = "1주"
@@ -171,6 +199,9 @@ class EventRecordPrototypeWindow(QDialog):
         self._period_button_group.setExclusive(True)
         self._setup_ui()
         self.select_period(self.current_period)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(EVENT_AUTO_REFRESH_INTERVAL_MS)
+        self._refresh_timer.timeout.connect(self._auto_refresh)
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -289,8 +320,11 @@ class EventRecordPrototypeWindow(QDialog):
         return group
 
     def _create_detail_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+        panel = QScrollArea()
+        panel.setWidgetResizable(True)
+        panel.setFrameShape(QScrollArea.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         detail_group = QGroupBox("이벤트 상세")
@@ -300,11 +334,12 @@ class EventRecordPrototypeWindow(QDialog):
         detail_layout.setVerticalSpacing(8)
         self.detail_labels: dict[str, QLabel] = {}
         for key, title in (("occurred_at", "발생시각"), ("category", "구분"),
-                           ("severity", "중요도"), ("source", "발생 위치"),
-                           ("target", "대상"), ("event", "이벤트"),
-                           ("result", "결과"), ("reason_code", "사유 코드")):
+                           ("severity", "중요도"), ("event", "이벤트"),
+                           ("result", "결과"), ("reason_code", "사유"),
+                           ("source", "발생 위치"), ("summary", "요약")):
             label = QLabel("-")
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setWordWrap(key == "summary")
             detail_layout.addRow(title, label)
             self.detail_labels[key] = label
         self.detail_text = QTextEdit()
@@ -312,6 +347,22 @@ class EventRecordPrototypeWindow(QDialog):
         self.detail_text.setMinimumHeight(150)
         detail_layout.addRow("상세 내용", self.detail_text)
         layout.addWidget(detail_group, 2)
+
+        self.target_group = QGroupBox("대상")
+        target_layout = QFormLayout(self.target_group)
+        target_layout.setContentsMargins(12, 16, 12, 12)
+        target_layout.setHorizontalSpacing(14)
+        target_layout.setVerticalSpacing(7)
+        self.target_rows: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, title in TARGET_LABELS:
+            title_label = QLabel(title)
+            value_label = QLabel()
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value_label.setWordWrap(True)
+            target_layout.addRow(title_label, value_label)
+            self.target_rows[key] = (title_label, value_label)
+        layout.addWidget(self.target_group)
+
         correlation_group = QGroupBox("연결 정보")
         correlation_layout = QFormLayout(correlation_group)
         correlation_layout.setContentsMargins(12, 16, 12, 12)
@@ -326,7 +377,41 @@ class EventRecordPrototypeWindow(QDialog):
             correlation_layout.addRow(title_label, value_label)
             self.correlation_rows[key] = (title_label, value_label)
         layout.addWidget(correlation_group, 1)
+        self.correlation_group = correlation_group
+        # Preserve the existing public lookup used by focused GUI tests while
+        # presenting stock/routine under the normalized target group.
+        self.correlation_rows["stock_code"] = self.target_rows["stock_code"]
+        self.correlation_rows["routine"] = self.target_rows["routine"]
+
+        diagnostic_toggle_layout = QHBoxLayout()
+        self.developer_diagnostic_button = QPushButton("개발 진단 펼치기")
+        self.developer_diagnostic_button.setCheckable(True)
+        self.developer_diagnostic_button.setChecked(False)
+        self.developer_diagnostic_button.clicked.connect(
+            self._sync_developer_diagnostic_visibility
+        )
+        diagnostic_toggle_layout.addWidget(self.developer_diagnostic_button)
+        diagnostic_toggle_layout.addStretch(1)
+        layout.addLayout(diagnostic_toggle_layout)
+
+        self.developer_diagnostic_group = QGroupBox("개발 진단")
+        diagnostic_layout = QFormLayout(self.developer_diagnostic_group)
+        diagnostic_layout.setContentsMargins(12, 16, 12, 12)
+        diagnostic_layout.setHorizontalSpacing(14)
+        diagnostic_layout.setVerticalSpacing(7)
+        self.developer_diagnostic_rows: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, title in DEVELOPER_DIAGNOSTIC_LABELS:
+            title_label = QLabel(title)
+            value_label = QLabel()
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value_label.setWordWrap(True)
+            diagnostic_layout.addRow(title_label, value_label)
+            self.developer_diagnostic_rows[key] = (title_label, value_label)
+        self.developer_diagnostic_group.hide()
+        self.developer_diagnostic_button.hide()
+        layout.addWidget(self.developer_diagnostic_group)
         layout.addStretch(1)
+        panel.setWidget(content)
         return panel
 
     def select_period(self, period: str) -> None:
@@ -506,7 +591,16 @@ class EventRecordPrototypeWindow(QDialog):
             "summary": EventRecordPrototypeWindow._summary_text(event),
         }
 
+    def _selected_event_id(self) -> str:
+        row = self.event_table.currentRow()
+        item = self.event_table.item(row, 0) if row >= 0 else None
+        event = item.data(Qt.UserRole) if item is not None else None
+        return str(event.get("event_id") or "") if isinstance(event, dict) else ""
+
     def apply_filters(self, *_args) -> None:
+        selected_event_id = self._selected_event_id()
+        vertical_scroll = self.event_table.verticalScrollBar().value()
+        horizontal_scroll = self.event_table.horizontalScrollBar().value()
         events = self._filtered_events()
         self.event_table.setSortingEnabled(False)
         self.event_table.setRowCount(len(events))
@@ -538,7 +632,21 @@ class EventRecordPrototypeWindow(QDialog):
         self.event_table.horizontalHeader().setSortIndicatorShown(False)
         self.result_count_label.setText(f"표시 {len(events)}건")
         if events:
-            self.event_table.selectRow(0)
+            selected_row = 0
+            if selected_event_id:
+                for row in range(self.event_table.rowCount()):
+                    item = self.event_table.item(row, 0)
+                    event = item.data(Qt.UserRole) if item is not None else None
+                    if (
+                        isinstance(event, dict)
+                        and str(event.get("event_id") or "") == selected_event_id
+                    ):
+                        selected_row = row
+                        break
+            self.event_table.selectRow(selected_row)
+            if selected_event_id:
+                self.event_table.verticalScrollBar().setValue(vertical_scroll)
+                self.event_table.horizontalScrollBar().setValue(horizontal_scroll)
             self._show_selected_event()
         else:
             self.event_table.clearSelection()
@@ -555,19 +663,96 @@ class EventRecordPrototypeWindow(QDialog):
         for key, label in self.detail_labels.items():
             label.setText(str(display.get(key, "-") or "-"))
         self.detail_text.setPlainText(self._detail_text_for_event(event))
-        for key, (title_label, value_label) in self.correlation_rows.items():
-            value = str(event.get(key, "") or "").strip()
-            title_label.setVisible(bool(value))
-            value_label.setVisible(bool(value))
+        stock_code = str(event.get("stock_code") or "").strip()
+        stock_name = str(event.get("stock_name") or "").strip()
+        target_values = {
+            "target": event_target_display(event),
+            "stock_code": " ".join(part for part in (stock_code, stock_name) if part),
+            "routine": str(event.get("routine") or "").strip(),
+        }
+        self.target_group.setVisible(
+            self._set_optional_rows(self.target_rows, target_values)
+        )
+        connection_rows = {
+            key: row
+            for key, row in self.correlation_rows.items()
+            if key not in {"stock_code", "routine"}
+        }
+        self.correlation_group.setVisible(
+            self._set_optional_rows(connection_rows, event)
+        )
+        has_diagnostics = self._set_optional_rows(
+            self.developer_diagnostic_rows,
+            {
+                key: self._diagnostic_value(key, event.get(key))
+                if event.get(key) not in (None, "")
+                else ""
+                for key, _title in DEVELOPER_DIAGNOSTIC_LABELS
+            },
+        )
+        self.developer_diagnostic_button.setVisible(has_diagnostics)
+        self._sync_developer_diagnostic_visibility()
+
+    @staticmethod
+    def _set_optional_rows(
+        rows: dict[str, tuple[QLabel, QLabel]],
+        values: dict[str, object],
+    ) -> bool:
+        has_value = False
+        for key, (title_label, value_label) in rows.items():
+            value = str(values.get(key, "") or "").strip()
+            visible = bool(value)
+            title_label.setVisible(visible)
+            value_label.setVisible(visible)
             value_label.setText(value)
+            has_value = has_value or visible
+        return has_value
+
+    @classmethod
+    def _diagnostic_value(cls, key: str, value: object) -> str:
+        if key == "exception_message":
+            return sanitize_diagnostic_text(value)
+        return cls._safe_value(value)
+
+    def _sync_developer_diagnostic_visibility(self, *_args) -> None:
+        available = not self.developer_diagnostic_button.isHidden()
+        expanded = available and self.developer_diagnostic_button.isChecked()
+        self.developer_diagnostic_group.setVisible(expanded)
+        self.developer_diagnostic_button.setText(
+            "개발 진단 접기" if expanded else "개발 진단 펼치기"
+        )
+
+    def _auto_refresh(self) -> None:
+        if self.isVisible():
+            self.apply_filters()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._refresh_timer.start()
+
+    def hideEvent(self, event) -> None:
+        self._refresh_timer.stop()
+        super().hideEvent(event)
 
     def _clear_detail(self) -> None:
         for label in self.detail_labels.values():
             label.setText("-")
         self.detail_text.clear()
-        for title_label, value_label in self.correlation_rows.values():
+        self.target_group.hide()
+        self.correlation_group.hide()
+        for title_label, value_label in self.target_rows.values():
             title_label.hide()
             value_label.hide()
+        for key, (title_label, value_label) in self.correlation_rows.items():
+            if key in {"stock_code", "routine"}:
+                continue
+            title_label.hide()
+            value_label.hide()
+        for title_label, value_label in self.developer_diagnostic_rows.values():
+            title_label.hide()
+            value_label.hide()
+        self.developer_diagnostic_button.hide()
+        self.developer_diagnostic_group.hide()
 
 
 def _clear_event_record_window_reference(parent: QWidget, target: EventRecordPrototypeWindow) -> None:

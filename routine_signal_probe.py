@@ -32,6 +32,10 @@ from candle_timeframe_aggregation import (
     parse_market_datetime,
 )
 from gui_auto_trade_runtime import all_registered_stock_dirs
+from event_journal_production import (
+    observe_owner_failure_transition,
+    observe_production_exception,
+)
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
 from order_candidate_engine import read_latest_price
 
@@ -43,6 +47,43 @@ FILLS_PATH = RUNTIME_DIR / "fills.json"
 POSITIONS_PATH = RUNTIME_DIR / "positions.json"
 _DEFAULT_OBSERVER_SENTINEL = object()
 _DEFAULT_DECISION_TRACE_OBSERVER: Any = None
+
+
+def _routine_observer_owner() -> Any:
+    return sys.modules[__name__]
+
+
+def _observe_routine_contract_failure(
+    *,
+    scope: str,
+    reason_code: str,
+    routine_name: str,
+    stock_code: str = "",
+    stock_name: str = "",
+    result_type: str = "",
+) -> dict[str, Any]:
+    target_name = stock_name or stock_code or routine_name or "루틴 평가"
+    return observe_owner_failure_transition(
+        _routine_observer_owner(),
+        scope,
+        active=True,
+        signature=f"{reason_code}:{result_type}",
+        event_type="INTEGRITY_WARNING",
+        severity="ERROR",
+        result="FAILED",
+        source="routine_signal_probe",
+        template_args={"target": target_name},
+        target_type="STOCK" if stock_code else "ROUTINE",
+        target_id=stock_code or routine_name,
+        target_name=target_name,
+        stock_code=stock_code or None,
+        stock_name=stock_name or None,
+        routine=routine_name or None,
+        reason_code=reason_code,
+        component="routine_signal_probe",
+        operation="evaluate",
+        details={"result_type": result_type} if result_type else {},
+    )
 
 
 try:
@@ -289,6 +330,14 @@ def probe_routine_for_stock(
             candle_projection_error = str(exc)
         evaluate = getattr(routine_module, "evaluate", None)
         if candle_projection_error:
+            _observe_routine_contract_failure(
+                scope=f"routine_candle_projection:{routine_name}:{code}",
+                reason_code="ROUTINE_CANDLE_PROJECTION_FAILED",
+                routine_name=routine_name,
+                stock_code=code,
+                stock_name=name,
+                result_type="ValueError",
+            )
             result = {
                 "signal": "ERROR",
                 "reason": f"거래기준봉 변환 실패: {candle_projection_error}",
@@ -297,6 +346,13 @@ def probe_routine_for_stock(
                 "name": name,
             }
         elif not callable(evaluate):
+            _observe_routine_contract_failure(
+                scope=f"routine_evaluate_contract:{routine_name}:{code}",
+                reason_code="ROUTINE_EVALUATE_MISSING",
+                routine_name=routine_name,
+                stock_code=code,
+                stock_name=name,
+            )
             result = {
                 "signal": "ERROR",
                 "reason": "evaluate 함수 없음",
@@ -363,10 +419,47 @@ def probe_routine_for_stock(
                     }
             try:
                 raw_result = evaluate(context)
-                result = raw_result if isinstance(raw_result, dict) else {
-                    "signal": "ERROR",
-                    "reason": f"evaluate 반환 형식 오류: {type(raw_result).__name__}",
-                }
+                if isinstance(raw_result, dict):
+                    signal_kind = str(raw_result.get("signal") or "").strip().upper()
+                    if signal_kind not in {"BUY", "SELL", "NONE", "SKIP", "ERROR"}:
+                        _observe_routine_contract_failure(
+                            scope=f"routine_evaluate_contract:{routine_name}:{code}",
+                            reason_code="ROUTINE_EVALUATE_SIGNAL_MALFORMED",
+                            routine_name=routine_name,
+                            stock_code=code,
+                            stock_name=name,
+                            result_type=signal_kind or "MISSING",
+                        )
+                    else:
+                        observe_owner_failure_transition(
+                            _routine_observer_owner(),
+                            f"routine_evaluate_contract:{routine_name}:{code}",
+                            active=False,
+                        )
+                    observe_owner_failure_transition(
+                        _routine_observer_owner(),
+                        f"routine_candle_projection:{routine_name}:{code}",
+                        active=False,
+                    )
+                    observe_owner_failure_transition(
+                        _routine_observer_owner(),
+                        f"routine_evaluate_exception:{routine_name}:{code}",
+                        active=False,
+                    )
+                    result = raw_result
+                else:
+                    _observe_routine_contract_failure(
+                        scope=f"routine_evaluate_contract:{routine_name}:{code}",
+                        reason_code="ROUTINE_EVALUATE_RESULT_MALFORMED",
+                        routine_name=routine_name,
+                        stock_code=code,
+                        stock_name=name,
+                        result_type=type(raw_result).__name__,
+                    )
+                    result = {
+                        "signal": "ERROR",
+                        "reason": f"evaluate 반환 형식 오류: {type(raw_result).__name__}",
+                    }
                 result["code"] = code
                 result["name"] = name
                 result["routine"] = result.get("routine", routine_name)
@@ -422,6 +515,21 @@ def probe_routine_for_stock(
                         pass
 
             except Exception as exc:
+                observe_production_exception(
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                    component="routine_signal_probe",
+                    operation="evaluate",
+                    source="routine_signal_probe.probe_routine_for_stock",
+                    target_type="STOCK",
+                    target_id=code,
+                    target_name=name or code,
+                    reason_code="ROUTINE_EVALUATE_EXCEPTION",
+                    owner=_routine_observer_owner(),
+                    failure_scope=f"routine_evaluate_exception:{routine_name}:{code}",
+                    details={"routine": routine_name},
+                )
                 result = {
                     "signal": "ERROR",
                     "reason": f"evaluate 예외: {exc}",
@@ -477,8 +585,26 @@ def probe_selected_routine_once(window: Any, tick_key: str = "") -> dict[str, in
     try:
         routine_module = _load_routine_module(Path(routine_dir))
     except Exception as exc:
-        _append_log(f"[{now_text()}] tick={tick_key} routine={routine_name} ERROR routine load: {exc}")
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="routine_signal_probe",
+            operation="load_routine_module",
+            source="routine_signal_probe.probe_selected_routine_once",
+            target_type="ROUTINE",
+            target_id=routine_name,
+            target_name=routine_name,
+            reason_code="ROUTINE_IMPORT_FAILED",
+            owner=_routine_observer_owner(),
+            failure_scope=f"routine_import:{routine_name}",
+        )
         return {"checked": 0, "logged": 0, "error": 1, "skip": 0, "queued": 0}
+    observe_owner_failure_transition(
+        _routine_observer_owner(),
+        f"routine_import:{routine_name}",
+        active=False,
+    )
 
     checked = 0
     logged = 0
@@ -544,9 +670,12 @@ def probe_all_enabled_routine_stocks_once(
 
         if not instance_id or definition is None:
             code, name = _parse_stock_folder_name(stock_dir)
-            _append_log(
-                f"[{now_text()}] tick={tick_key} routine={routine_name or definition_id} "
-                f"stock={code} {name} ERROR routine assignment unresolved"
+            _observe_routine_contract_failure(
+                scope=f"routine_assignment:{code}",
+                reason_code="ROUTINE_ASSIGNMENT_UNRESOLVED",
+                routine_name=routine_name or definition_id,
+                stock_code=code,
+                stock_name=name,
             )
             error += 1
             logged += 1
@@ -562,13 +691,36 @@ def probe_all_enabled_routine_stocks_once(
                 module_cache[definition_id] = routine_module
         except Exception as exc:
             code, name = _parse_stock_folder_name(stock_dir)
-            _append_log(
-                f"[{now_text()}] tick={tick_key} routine={routine_name} "
-                f"stock={code} {name} ERROR routine load: {exc}"
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="routine_signal_probe",
+                operation="load_routine_module",
+                source="routine_signal_probe.probe_all_enabled_routine_stocks_once",
+                target_type="ROUTINE",
+                target_id=definition_id,
+                target_name=routine_name,
+                reason_code="ROUTINE_IMPORT_FAILED",
+                owner=_routine_observer_owner(),
+                failure_scope=f"routine_import:{definition_id}",
+                details={"stock_code": code},
             )
             error += 1
             logged += 1
             continue
+
+        observe_owner_failure_transition(
+            _routine_observer_owner(),
+            f"routine_import:{definition_id}",
+            active=False,
+        )
+        code, _name = _parse_stock_folder_name(stock_dir)
+        observe_owner_failure_transition(
+            _routine_observer_owner(),
+            f"routine_assignment:{code}",
+            active=False,
+        )
 
         result = probe_routine_for_stock(
             routine_module,

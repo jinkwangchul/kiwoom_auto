@@ -4,12 +4,23 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
+import re
 from string import Formatter
 from typing import Any
 from uuid import uuid4
 
 
 SCHEMA_VERSION = "event_journal_v1"
+
+DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_LENGTH = 512
+DIAGNOSTIC_TEXT_MAX_LENGTH = 2048
+DIAGNOSTIC_IDENTITY_MAX_LENGTH = 256
+DIAGNOSTIC_REDACTED = "[REDACTED]"
+DIAGNOSTIC_TRACEBACK_REDACTED = "[TRACEBACK REDACTED]"
+DIAGNOSTIC_RAW_JSON_REDACTED = "[RAW JSON REDACTED]"
+DIAGNOSTIC_UNAVAILABLE = "[UNAVAILABLE]"
 
 CATEGORIES = frozenset({"SYSTEM", "OPERATION", "SETTING", "SIGNAL", "ORDER", "FILL"})
 LEGACY_CATEGORIES = frozenset({"WARNING", "ERROR"})
@@ -245,9 +256,204 @@ OPTIONAL_FIELDS = frozenset(
         "reason_args",
         "details",
         "changes",
+        "component",
+        "operation",
+        "exception_type",
+        "exception_message",
+        "correlation_id",
+        "parent_event_id",
+        "stack_fingerprint",
+        "build_version",
     }
 )
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
+
+DIAGNOSTIC_IDENTITY_FIELDS = frozenset(
+    {
+        "component",
+        "operation",
+        "exception_type",
+        "correlation_id",
+        "parent_event_id",
+        "stack_fingerprint",
+        "build_version",
+    }
+)
+
+_CREDENTIAL_KEY_PATTERN = re.compile(
+    r"(?:^|_)(?:password|passwd|pwd|token|api_?key|secret|credential|credentials|authorization|authentication|auth)(?:$|_)",
+    re.IGNORECASE,
+)
+_INLINE_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|api[_-]?key|secret|credential|authorization|authentication|auth)\b\s*[:=]\s*([^\s,;]+)"
+)
+_WINDOWS_USER_PATH_PATTERN = re.compile(
+    r"(?i)\b[A-Z]:[\\/]+Users[\\/]+[^\\/\r\n]+"
+)
+_POSIX_USER_PATH_PATTERN = re.compile(r"(?i)(?<![\w])/(?:home|Users)/[^/\s]+")
+_RAW_TRACEBACK_PATTERN = re.compile(
+    r"(?is)Traceback\s+\(most recent call last\):.*"
+)
+_ACCOUNT_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){8,12}(?!\d)")
+
+
+def _safe_text(value: Any) -> str:
+    try:
+        return str(value or "")
+    except Exception:
+        return DIAGNOSTIC_UNAVAILABLE
+
+
+def _looks_like_raw_json(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return False
+    return (stripped.startswith("{") and stripped.endswith("}")) or (
+        stripped.startswith("[") and stripped.endswith("]")
+    )
+
+
+def sanitize_diagnostic_text(
+    value: Any,
+    *,
+    max_length: int = DIAGNOSTIC_TEXT_MAX_LENGTH,
+    mask_account_numbers: bool = False,
+) -> str:
+    """Return bounded diagnostic text without credentials, paths, or raw dumps.
+
+    This helper is deliberately fail-open for Production: malformed objects or
+    sanitizer failures return a non-sensitive placeholder and never raise.
+    """
+
+    try:
+        text = _safe_text(value).replace("\x00", "")
+        text = _RAW_TRACEBACK_PATTERN.sub(DIAGNOSTIC_TRACEBACK_REDACTED, text)
+        if _looks_like_raw_json(text):
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (dict, list)):
+                text = DIAGNOSTIC_RAW_JSON_REDACTED
+        text = _INLINE_CREDENTIAL_PATTERN.sub(
+            lambda match: f"{match.group(1)}={DIAGNOSTIC_REDACTED}",
+            text,
+        )
+        text = _WINDOWS_USER_PATH_PATTERN.sub("<USER_HOME>", text)
+        text = _POSIX_USER_PATH_PATTERN.sub("<USER_HOME>", text)
+        if mask_account_numbers:
+            text = _ACCOUNT_NUMBER_PATTERN.sub("[ACCOUNT REDACTED]", text)
+        text = " ".join(text.split())
+        limit = max(1, int(max_length))
+        if len(text) > limit:
+            suffix = "...[TRUNCATED]"
+            text = text[: max(1, limit - len(suffix))] + suffix
+        return text
+    except Exception:
+        return DIAGNOSTIC_UNAVAILABLE
+
+
+def _is_sensitive_diagnostic_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key or "").strip().lower()).strip("_")
+    if _CREDENTIAL_KEY_PATTERN.search(normalized):
+        return True
+    return normalized in {
+        "raw_payload",
+        "raw_response",
+        "raw_json",
+        "broker_payload",
+        "broker_response",
+        "broker_raw",
+        "chejan_raw",
+    }
+
+
+def _sanitize_diagnostic_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    if depth > 12:
+        return DIAGNOSTIC_UNAVAILABLE
+    if _is_sensitive_diagnostic_key(key):
+        return DIAGNOSTIC_REDACTED
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        field_name = _safe_text(
+            value.get("field_key")
+            or value.get("field")
+            or value.get("setting_key")
+            or ""
+        )
+        sensitive_change = _is_sensitive_diagnostic_key(field_name)
+        for child_key, child_value in value.items():
+            safe_key = sanitize_diagnostic_text(child_key, max_length=128)
+            if sensitive_change and safe_key in {"before", "after", "value"}:
+                sanitized[safe_key] = DIAGNOSTIC_REDACTED
+            else:
+                sanitized[safe_key] = _sanitize_diagnostic_value(
+                    child_value,
+                    key=safe_key,
+                    depth=depth + 1,
+                )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitize_diagnostic_value(child, key=key, depth=depth + 1)
+            for child in value
+        ]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    mask_account = "account" in str(key or "").lower() or "계좌" in str(key or "")
+    return sanitize_diagnostic_text(value, mask_account_numbers=mask_account)
+
+
+def sanitize_event_record(record: Any) -> dict[str, Any]:
+    """Return a recursively sanitized Event Journal record without raising."""
+
+    try:
+        if not isinstance(record, dict):
+            return {}
+        sanitized = {
+            str(key): _sanitize_diagnostic_value(value, key=str(key))
+            for key, value in record.items()
+        }
+        if "exception_message" in sanitized:
+            sanitized["exception_message"] = sanitize_diagnostic_text(
+                sanitized.get("exception_message"),
+                max_length=DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_LENGTH,
+                mask_account_numbers=True,
+            )
+        for key in DIAGNOSTIC_IDENTITY_FIELDS:
+            if key in sanitized:
+                sanitized[key] = sanitize_diagnostic_text(
+                    sanitized.get(key),
+                    max_length=DIAGNOSTIC_IDENTITY_MAX_LENGTH,
+                )
+        return sanitized
+    except Exception:
+        return {}
+
+
+def make_stack_fingerprint(
+    *,
+    exception_type: Any,
+    module: Any,
+    function: Any,
+    line: Any,
+) -> str:
+    """Build a stable, path-free diagnostic fingerprint without raising."""
+
+    try:
+        module_text = sanitize_diagnostic_text(module, max_length=256)
+        module_text = module_text.replace("\\", "/")
+        if "/" in module_text:
+            module_text = module_text.rsplit("/", 1)[-1]
+        parts = (
+            sanitize_diagnostic_text(exception_type, max_length=128),
+            module_text,
+            sanitize_diagnostic_text(function, max_length=128),
+            sanitize_diagnostic_text(line, max_length=32),
+        )
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
+    except Exception:
+        return ""
 
 
 def new_event_id() -> str:
@@ -378,6 +584,17 @@ def validate_event_record(record: Any, *, allow_legacy_categories: bool = False)
             issues.append("changes must be an array of objects")
     if record.get("reason_args") is not None and not isinstance(record.get("reason_args"), dict):
         issues.append("reason_args must be an object")
+    for field in DIAGNOSTIC_IDENTITY_FIELDS:
+        value = record.get(field)
+        if value is not None and not isinstance(value, str):
+            issues.append(f"{field} must be a string")
+    exception_message = record.get("exception_message")
+    if exception_message is not None and not isinstance(exception_message, str):
+        issues.append("exception_message must be a string")
+    elif isinstance(exception_message, str) and len(exception_message) > DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_LENGTH:
+        issues.append(
+            f"exception_message exceeds {DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_LENGTH} characters"
+        )
     if str(record.get("target_type") or "").upper() == "ACCOUNT":
         for field in ("target_id", "target_name"):
             if _contains_unmasked_account(record.get(field)):

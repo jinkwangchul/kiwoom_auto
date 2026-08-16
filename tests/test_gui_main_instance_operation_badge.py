@@ -2136,12 +2136,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_time_policy_timer_exception_hides_internal_exception(self) -> None:
         window = SimpleNamespace(
-            _last_time_policy_minute_key="10:00",
+            _last_time_policy_gui_minute_key="10:00",
             statusBarMessage=Mock(),
         )
         with (
             patch(
-                "gui_auto_trade_setting_window.auto_trade_on_time_policy_timer_tick",
+                "gui_auto_trade_setting_window.auto_trade_on_time_policy_gui_timer_tick",
                 side_effect=RuntimeError("secret timer error"),
             ),
             patch("gui_auto_trade_setting_window.LOGGER.exception"),

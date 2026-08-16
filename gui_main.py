@@ -13,10 +13,15 @@ import traceback
 
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from event_journal_production import (
+    install_global_exception_observers,
+    observe_production_exception,
+)
 from gui_windows import MainWindow
 
 
 def main() -> int:
+    install_global_exception_observers()
     app = QApplication(sys.argv)
 
     try:
@@ -25,6 +30,18 @@ def main() -> int:
         return app.exec_()
 
     except Exception as exc:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        observe_production_exception(
+            exc_type,
+            exc_value,
+            exc_traceback,
+            component="main_gui",
+            operation="main",
+            source="gui_main.main",
+            target_id="main_window",
+            target_name="메인 GUI",
+            reason_code="GUI_MAIN_FAILED",
+        )
         error_text = traceback.format_exc()
         print(error_text)
 

@@ -14,16 +14,24 @@ from pathlib import Path
 
 from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
 from gui_auto_trade_ats_ops import auto_trade_continue_pending_manual_ats_liquidations
+from event_journal_production import (
+    observe_owner_failure_transition,
+    observe_production_exception,
+)
 
 try:
     from auto_candle_refresh import refresh_operation_candles
-except Exception:
+    _CANDLE_REFRESH_IMPORT_ERROR = None
+except Exception as exc:
     refresh_operation_candles = None
+    _CANDLE_REFRESH_IMPORT_ERROR = exc
 
 try:
     from routine_signal_probe import probe_all_enabled_routine_stocks_once
-except Exception:
+    _ROUTINE_PROBE_IMPORT_ERROR = None
+except Exception as exc:
     probe_all_enabled_routine_stocks_once = None
+    _ROUTINE_PROBE_IMPORT_ERROR = exc
 
 try:
     from routine_signal_consumer import consume_pending_routine_signals_dry_run
@@ -160,6 +168,21 @@ def auto_trade_on_time_policy_gui_timer_tick(window) -> None:
 def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
     signal_result: dict[str, object] = {}
     if not callable(probe_all_enabled_routine_stocks_once):
+        if _ROUTINE_PROBE_IMPORT_ERROR is not None:
+            observe_production_exception(
+                type(_ROUTINE_PROBE_IMPORT_ERROR),
+                _ROUTINE_PROBE_IMPORT_ERROR,
+                _ROUTINE_PROBE_IMPORT_ERROR.__traceback__,
+                component="routine_signal_cycle",
+                operation="import_routine_signal_probe",
+                source="gui_auto_trade_timer._auto_trade_run_signal_cycle",
+                target_type="ROUTINE",
+                target_id="routine_signal_probe",
+                target_name="루틴 신호 프로브",
+                reason_code="ROUTINE_PROBE_IMPORT_FAILED",
+                owner=window,
+                failure_scope="routine_probe_import",
+            )
         return signal_result
     try:
         probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
@@ -201,6 +224,29 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
                     f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
                 )
             signal_result = dict(summary)
+            observe_owner_failure_transition(
+                window,
+                "routine_signal_consumer_result",
+                active=errors > 0,
+                signature=f"ROUTINE_SIGNAL_CONSUMER_FAILED:{errors}",
+                event_type="PROCESSING_ERROR",
+                severity="ERROR",
+                result="FAILED",
+                source="gui_auto_trade_timer._auto_trade_run_signal_cycle",
+                template_args={"target": "루틴 신호 후보 처리"},
+                target_type="ROUTINE",
+                target_id="routine_signal_consumer",
+                target_name="루틴 신호 후보 처리",
+                reason_code="ROUTINE_SIGNAL_CONSUMER_FAILED",
+                component="routine_signal_cycle",
+                operation="consume_pending_routine_signals",
+                details={
+                    "checked": checked,
+                    "blocked": blocked,
+                    "allowed": allowed,
+                    "error_count": errors,
+                },
+            )
             if auto_trade_real_execution_active(window):
                 auto_executor = getattr(
                     window,
@@ -217,7 +263,31 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
                         window.statusBarMessage(
                             f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
                         )
-    except Exception:
+        observe_owner_failure_transition(
+            window,
+            "routine_signal_cycle",
+            active=False,
+        )
+        observe_owner_failure_transition(
+            window,
+            "routine_probe_import",
+            active=False,
+        )
+    except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="routine_signal_cycle",
+            operation="run_signal_cycle",
+            source="gui_auto_trade_timer._auto_trade_run_signal_cycle",
+            target_type="ROUTINE",
+            target_id="routine_signal_cycle",
+            target_name="루틴 신호 주기",
+            reason_code="ROUTINE_SIGNAL_CYCLE_FAILED",
+            owner=window,
+            failure_scope="routine_signal_cycle",
+        )
         LOGGER.exception("Routine signal operation cycle failed")
         window.statusBarMessage(
             "주문 후보를 검증하는 중 오류가 발생했습니다. 로그를 확인하십시오."
@@ -247,6 +317,24 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
     )
     changed_count = int(result.get("changed", 0) or 0)
     failed_count = int(result.get("failed", 0) or 0)
+    observe_owner_failure_transition(
+        window,
+        "operation_policy_recalculation",
+        active=failed_count > 0,
+        signature=f"OPERATION_POLICY_RECALCULATION_FAILED:{failed_count}",
+        event_type="PROCESSING_ERROR",
+        severity="ERROR",
+        result="FAILED",
+        source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+        template_args={"target": "운영 정책 재판정"},
+        target_type="OPERATION",
+        target_id="operation_policy_recalculation",
+        target_name="운영 정책 재판정",
+        reason_code="OPERATION_POLICY_RECALCULATION_FAILED",
+        component="operation_cycle",
+        operation="recalculate_all_status_by_operation_policy",
+        details={"failed_count": failed_count},
+    )
 
     rebind_recovery = getattr(
         window,
@@ -301,6 +389,51 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
         nonlocal candle_refresh_result, signal_result, signal_cycle_completed
         if isinstance(_refresh_result, dict):
             candle_refresh_result = dict(_refresh_result)
+            try:
+                failed_refreshes = int(candle_refresh_result.get("failed", 0) or 0)
+            except (TypeError, ValueError):
+                failed_refreshes = 0
+                observe_owner_failure_transition(
+                    window,
+                    "candle_refresh_result_contract",
+                    active=True,
+                    signature="CANDLE_REFRESH_FAILED_COUNT_MALFORMED",
+                    event_type="INTEGRITY_WARNING",
+                    severity="ERROR",
+                    result="FAILED",
+                    source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                    template_args={"target": "분봉 갱신 결과"},
+                    target_type="MARKET_DATA",
+                    target_id="operation_candle_refresh",
+                    target_name="분봉 갱신 결과",
+                    reason_code="CANDLE_REFRESH_RESULT_MALFORMED",
+                    component="candle_refresh",
+                    operation="continue_after_candle_refresh",
+                )
+            else:
+                observe_owner_failure_transition(
+                    window,
+                    "candle_refresh_result_contract",
+                    active=False,
+                )
+            observe_owner_failure_transition(
+                window,
+                "candle_refresh_result",
+                active=failed_refreshes > 0,
+                signature=f"CANDLE_REFRESH_RESULT_FAILED:{failed_refreshes}",
+                event_type="PROCESSING_ERROR",
+                severity="ERROR",
+                result="FAILED",
+                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                template_args={"target": "분봉 갱신"},
+                target_type="MARKET_DATA",
+                target_id="operation_candle_refresh",
+                target_name="분봉 갱신",
+                reason_code="CANDLE_REFRESH_RESULT_FAILED",
+                component="candle_refresh",
+                operation="continue_after_candle_refresh",
+                details={"failed_count": failed_refreshes},
+            )
         signal_result = _auto_trade_run_signal_cycle(window, minute_key)
         signal_cycle_completed = True
         if callable(rebind_recovery):
@@ -310,7 +443,26 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
         ):
             try:
                 deferred_cycle_completion(operation_cycle_result())
-            except Exception:
+                observe_owner_failure_transition(
+                    window,
+                    "deferred_operation_cycle_completion",
+                    active=False,
+                )
+            except Exception as exc:
+                observe_production_exception(
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                    component="operation_cycle_callback",
+                    operation="complete_deferred_operation_cycle",
+                    source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                    target_type="OPERATION_HOST",
+                    target_id="deferred_operation_cycle",
+                    target_name="지연 운영 주기 완료 callback",
+                    reason_code="DEFERRED_OPERATION_CALLBACK_FAILED",
+                    owner=window,
+                    failure_scope="deferred_operation_cycle_completion",
+                )
                 LOGGER.exception("Deferred operation cycle completion notify failed")
 
     if callable(refresh_operation_candles):
@@ -320,7 +472,21 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 minute_key,
                 on_complete=continue_after_candle_refresh,
             )
-        except Exception:
+        except Exception as exc:
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="candle_refresh",
+                operation="refresh_operation_candles",
+                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                target_type="MARKET_DATA",
+                target_id="operation_candle_refresh",
+                target_name="분봉 갱신",
+                reason_code="CANDLE_REFRESH_FAILED",
+                owner=window,
+                failure_scope="candle_refresh_request",
+            )
             LOGGER.exception("Automatic minute candle refresh failed")
             candle_refresh_result = {
                 "accepted": False,
@@ -329,6 +495,11 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             }
             signal_result = _auto_trade_run_signal_cycle(window, minute_key)
         else:
+            observe_owner_failure_transition(
+                window,
+                "candle_refresh_request",
+                active=False,
+            )
             if (
                 candle_refresh_result.get("accepted") is False
                 and candle_refresh_result.get("completed") is False
@@ -338,6 +509,21 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 signal_result = {"deferred_for_candle_refresh": True}
                 deferred_cycle_completion_pending = True
     else:
+        if _CANDLE_REFRESH_IMPORT_ERROR is not None:
+            observe_production_exception(
+                type(_CANDLE_REFRESH_IMPORT_ERROR),
+                _CANDLE_REFRESH_IMPORT_ERROR,
+                _CANDLE_REFRESH_IMPORT_ERROR.__traceback__,
+                component="candle_refresh",
+                operation="import_auto_candle_refresh",
+                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                target_type="MARKET_DATA",
+                target_id="operation_candle_refresh",
+                target_name="분봉 갱신",
+                reason_code="CANDLE_REFRESH_IMPORT_FAILED",
+                owner=window,
+                failure_scope="candle_refresh_import",
+            )
         signal_result = _auto_trade_run_signal_cycle(window, minute_key)
 
     if callable(rebind_recovery) and not signal_cycle_completed:

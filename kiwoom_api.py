@@ -31,6 +31,7 @@ from account_funds_foundation import ACCOUNT_AUTHENTICATION_REQUIRED
 from kiwoom_candle_adapter import save_minute_candles_for_stock
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
+from event_journal_production import observe_production_exception
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
@@ -1500,6 +1501,26 @@ class KiwoomApi(QObject):
             try:
                 callback(result)
             except Exception as exc:
+                execution_id = str(result.get("execution_id") or "").strip()
+                order_id = str(result.get("order_id") or "").strip()
+                observe_production_exception(
+                    type(exc),
+                    exc,
+                    exc.__traceback__,
+                    component="kiwoom_api",
+                    operation="finish_callback",
+                    source="kiwoom_api.KiwoomApi._finish_callback",
+                    target_type="BROKER_CALLBACK",
+                    target_id="kiwoom_callback",
+                    target_name="키움 OpenAPI callback",
+                    reason_code="KIWOOM_CALLBACK_FAILED",
+                    execution_id=execution_id,
+                    order_id=order_id,
+                    correlation_id=execution_id or order_id,
+                    details={
+                        "callback": str(getattr(callback, "__name__", "") or type(callback).__name__)
+                    },
+                )
                 result = dict(result)
                 result["callback_error"] = str(exc)
         return result

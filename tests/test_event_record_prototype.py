@@ -122,7 +122,7 @@ class EventRecordProductionReaderTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_window_is_read_only_and_uses_production_columns(self) -> None:
-        self.assertEqual("이벤트기록", self.window.windowTitle())
+        self.assertEqual("이벤트", self.window.windowTitle())
         headers = [
             self.window.event_table.horizontalHeaderItem(column).text()
             for column in range(self.window.event_table.columnCount())

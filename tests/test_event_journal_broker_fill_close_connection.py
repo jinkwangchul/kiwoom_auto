@@ -322,7 +322,10 @@ class EventJournalBrokerFillCloseConnectionTest(unittest.TestCase):
         )
 
         self.assertTrue(result["normal_ended_applied"])
-        self.assertEqual(["LIQUIDATION_COMPLETED"], [item["event_type"] for item in self.events()])
+        self.assertEqual(
+            ["OPERATION_STOPPED", "LIQUIDATION_COMPLETED"],
+            [item["event_type"] for item in self.events()],
+        )
 
 
 if __name__ == "__main__":

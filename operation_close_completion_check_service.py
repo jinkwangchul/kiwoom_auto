@@ -18,6 +18,11 @@ from operation_close_completion_evaluator import (
 )
 from operation_policy_gate import write_global_operation_normal_ended_state
 from event_journal_trade_observer import observe_liquidation_completed, observe_pnl_cycle_boundaries
+from event_journal_production import (
+    append_production_event,
+    observe_owner_failure_transition,
+    observe_production_exception,
+)
 from confirmable_pnl_cycle_service import record_completion_boundaries
 
 
@@ -49,6 +54,20 @@ def check_global_close_completion_after_durable_update(
     try:
         evaluator_result = evaluator(**evaluator_kwargs)
     except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="operation_close_completion",
+            operation="evaluate_operation_close_completion",
+            source="operation_close_completion_check_service.check_global_close_completion_after_durable_update",
+            target_type="OPERATION",
+            target_id="global_operation",
+            target_name="전체 운영 종료 검증",
+            reason_code="OPERATION_CLOSE_COMPLETION_EVALUATION_FAILED",
+            owner=check_global_close_completion_after_durable_update,
+            failure_scope=f"completion_evaluation:{clean_source}",
+        )
         return {
             "checked": False,
             "source": clean_source,
@@ -61,6 +80,11 @@ def check_global_close_completion_after_durable_update(
             "normal_ended_applied": False,
             "operation_status_after": "",
         }
+    observe_owner_failure_transition(
+        check_global_close_completion_after_durable_update,
+        f"completion_evaluation:{clean_source}",
+        active=False,
+    )
 
     reasons = list(evaluator_result.get("reasons") or [])
     operation_status_after = str(evaluator_result.get("operation_status") or "").strip().upper()
@@ -87,6 +111,20 @@ def check_global_close_completion_after_durable_update(
             operation_state_path=operation_state_path,
         )
     except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="operation_close_completion",
+            operation="write_global_operation_normal_ended_state",
+            source="operation_close_completion_check_service.check_global_close_completion_after_durable_update",
+            target_type="OPERATION",
+            target_id="global_operation",
+            target_name="전체 운영 종료 상태",
+            reason_code="OPERATION_NORMAL_END_WRITE_FAILED",
+            owner=check_global_close_completion_after_durable_update,
+            failure_scope=f"normal_end_write:{clean_source}",
+        )
         return {
             **result,
             "normal_end_write": {"ok": False, "error": str(exc)},
@@ -104,6 +142,25 @@ def check_global_close_completion_after_durable_update(
             write_result.get("operation_status") or operation_status_after
         ).strip().upper(),
     }
+    if write_ok:
+        observe_owner_failure_transition(
+            check_global_close_completion_after_durable_update,
+            f"normal_end_write:{clean_source}",
+            active=False,
+        )
+        operation_date = str(evaluator_result.get("operation_date") or "").strip()
+        append_production_event(
+            "OPERATION_STOPPED",
+            event_id=f"operation-stopped:{operation_date or clean_source.lower()}",
+            result="COMPLETED",
+            source="operation_close_completion_check_service.check_global_close_completion_after_durable_update",
+            template_args={"target": "전체"},
+            target_type="OPERATION",
+            target_id="global_operation",
+            target_name="전체",
+            reason_code="ALL_PARTICIPANTS_COMPLETE",
+            details={"operation_date": operation_date},
+        )
     observe_liquidation_completed(final_result)
     final_result["pnl_cycle_boundary_results"] = record_completion_boundaries(
         final_result,
