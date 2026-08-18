@@ -40,27 +40,56 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
     def _window() -> SimpleNamespace:
         return SimpleNamespace(startup_recovery_session_ready=lambda refresh=False: True)
 
-    def test_emergency_active_is_emergency_and_blocked(self) -> None:
+    def test_selected_emergency_provenance_uses_normal_return_gate(self) -> None:
         with TemporaryDirectory() as root:
             stock_dir = self._stock(root, status="EMERGENCY_STOPPED")
+            state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+            state["emergency_scope"] = "SELECTED"
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
             state = read_json_dict(stock_dir / "state.json")
             state["emergency_reason"] = "USER_EMERGENCY_STOP"
             (stock_dir / "state.json").write_text(
                 json.dumps(state, ensure_ascii=False), encoding="utf-8"
             )
-            with patch.object(emergency_ops, "emergency_release_common_guard") as guard:
+            with (
+                patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": False}),
+                patch.object(
+                    emergency_ops,
+                    "emergency_release_common_guard",
+                    return_value=(True, ""),
+                ) as guard,
+            ):
+                result = emergency_ops.review_return_availability(
+                    self._window(), stock_dir, "000001", state=state
+                )
+
+        self.assertEqual("ALLOWED", result["availability"])
+        self.assertEqual("", result["reason"])
+        self.assertEqual(
+            "해결",
+            review_window._review_display_status_for_collected_row(
+                state, return_availability=result["availability"]
+            ),
+        )
+        guard.assert_called_once()
+
+    def test_global_latch_blocks_selected_emergency_provenance(self) -> None:
+        with TemporaryDirectory() as root:
+            stock_dir = self._stock(root, status="REVIEW_REQUIRED")
+            state = read_json_dict(stock_dir / "state.json")
+            state["emergency_scope"] = "SELECTED"
+            with (
+                patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": True}),
+                patch.object(emergency_ops, "emergency_release_common_guard") as guard,
+            ):
                 result = emergency_ops.review_return_availability(
                     self._window(), stock_dir, "000001", state=state
                 )
 
         self.assertEqual("BLOCKED", result["availability"])
         self.assertEqual("EMERGENCY_STOP_ACTIVE", result["reason"])
-        self.assertEqual(
-            "긴급정지",
-            review_window._review_display_status_for_collected_row(
-                state, return_availability=result["availability"]
-            ),
-        )
         guard.assert_not_called()
 
     def test_resolved_metadata_does_not_override_recovery_or_mismatch_block(self) -> None:
@@ -104,6 +133,35 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
                 state, return_availability=result["availability"]
             ),
         )
+
+    def test_active_early_close_remains_blocked_from_review_return(self) -> None:
+        with TemporaryDirectory() as root:
+            stock_dir = self._stock(root)
+            state = read_json_dict(stock_dir / "state.json")
+            state["operation_command_mode"] = "EARLY_CLOSE"
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+            queue_path = Path(root) / "order_queue.json"
+            queue_path.write_text(
+                json.dumps({"version": 1, "orders": []}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with patch.object(
+                emergency_ops,
+                "emergency_review_reason_for_stock",
+                return_value=(False, ""),
+            ):
+                result = emergency_ops.review_return_availability(
+                    self._window(),
+                    stock_dir,
+                    "000001",
+                    state=state,
+                    order_queue_path=queue_path,
+                )
+
+        self.assertEqual("BLOCKED", result["availability"])
+        self.assertEqual("ACTIVE_CLOSE_OR_LIQUIDATION", result["reason"])
 
     def test_execution_rechecks_after_allowed_preview_and_does_not_mutate(self) -> None:
         with TemporaryDirectory() as root:
@@ -181,6 +239,7 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
             state.update(
                 {
                     "emergency_reason": "USER_EMERGENCY_STOP",
+                    "emergency_scope": "SELECTED",
                     "emergency_stopped_at": "2026-08-16 10:00:00",
                     "review_status": "PENDING",
                 }
@@ -190,6 +249,11 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
             )
             window = self._window()
             with (
+                patch.object(
+                    emergency_ops,
+                    "read_operation_state",
+                    return_value={"emergency_stop": False},
+                ),
                 patch.object(emergency_ops, "emergency_release_common_guard", return_value=(True, "")),
                 patch.object(emergency_ops, "append_stock_log"),
             ):
@@ -197,7 +261,7 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
                     window, stock_dir, "000001", "TEST"
                 )
             released = read_json_dict(stock_dir / "state.json")
-            self.assertEqual("review_existing", release)
+            self.assertEqual(emergency_ops.RELEASED_TO_REVIEW, release)
             self.assertEqual("REVIEW_REQUIRED", released["status"])
             self.assertEqual("RESOLVED", released["review_status"])
             self.assertTrue(released["review_required"])

@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import QLabel, QHeaderView, QTableWidget
 
 PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY = "plain_header_use_table_body_background"
 PLAIN_HEADER_GRID_COLOR_PROPERTY = "plain_header_grid_color"
+REGISTERED_STOCK_STATUS_GRID_COLOR = "#D1D5DB"
 TABLE_LIGHT_SELECTION_STYLE = """
 QTableWidget {
     selection-background-color: #dbeafe;
@@ -30,6 +31,43 @@ QTableWidget::item:selected:!active {
 QTableWidget::item:focus {
     outline: 0;
 }
+"""
+
+
+def registered_stock_status_table_stylesheet(
+    object_name: str,
+    body_background: str,
+) -> str:
+    """Return the canonical 등록종목상태 table visual style."""
+    return f"""
+QTableWidget {{
+    background: #ffffff;
+    gridline-color: {REGISTERED_STOCK_STATUS_GRID_COLOR};
+    selection-background-color: #dbeafe;
+    selection-color: #111827;
+}}
+QTableWidget::item:selected,
+QTableWidget::item:selected:active,
+QTableWidget::item:selected:!active {{
+    background: #dbeafe;
+    color: #111827;
+}}
+QTableWidget::item:focus {{
+    outline: 0;
+}}
+QTableWidget#{object_name} QHeaderView::section:vertical {{
+    background-color: {body_background};
+    border: none;
+    border-right: 1px solid {REGISTERED_STOCK_STATUS_GRID_COLOR};
+    border-bottom: 1px solid {REGISTERED_STOCK_STATUS_GRID_COLOR};
+    padding: 0;
+}}
+QTableWidget#{object_name} QTableCornerButton::section {{
+    background-color: {body_background};
+    border: none;
+    border-right: 1px solid {REGISTERED_STOCK_STATUS_GRID_COLOR};
+    border-bottom: 1px solid {REGISTERED_STOCK_STATUS_GRID_COLOR};
+}}
 """
 
 

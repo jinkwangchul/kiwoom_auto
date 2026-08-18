@@ -107,7 +107,9 @@ def _setting_leaf_changes(
 from gui_styles import (
     PLAIN_HEADER_GRID_COLOR_PROPERTY,
     PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY,
+    REGISTERED_STOCK_STATUS_GRID_COLOR,
     apply_plain_table_header,
+    registered_stock_status_table_stylesheet,
 )
 from gui_toast import show_toast
 from gui_common_utils import safe_int_value, sanitize_path_part
@@ -1112,12 +1114,14 @@ from gui_auto_trade_display import (
     auto_trade_setting_badge_stylesheet,
     auto_trade_setting_display_status,
     auto_trade_setting_status_color,
+    confirmable_stock_profit_metric,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
     draw_stock_position_metric,
     yes_no_display,
     display_status_text_for_gui,
     profit_loss_value_color,
+    ratio_metric_text,
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
@@ -1469,7 +1473,7 @@ AUTO_TRADE_SETTING_STOCK_TABLE_COLUMN_WIDTHS = {
     7: 204,   # 보유: 수량 / 총매수금액
     8: 194,   # 가격: 평단가 / 현재가
     9: 199,   # 손익: 손익금 / 수익률
-    10: 78,   # 미체결: 미수 / 미도
+    10: 78,   # 매매: 매수회차 / 매도회차
 }
 AUTO_TRADE_SETTING_INITIAL_STOCK_LAST_COLUMN = 6
 AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP = 6
@@ -1551,13 +1555,13 @@ def normalize_profit_factor(value: object) -> float:
 
 
 class StockPositionMetricDelegate(QStyledItemDelegate):
-    """보유/가격/손익/미체결 셀의 숫자 슬롯을 우측 정렬해 그린다."""
+    """보유/가격/손익/매매 셀의 숫자 슬롯을 우측 정렬해 그린다."""
 
     LABEL_BY_COLUMN = {
         7: "보유",
         8: "가격",
-        9: "손익",
-        10: "미체결",
+        9: "수익",
+        10: "매매",
     }
 
     def paint(self, painter, option, index) -> None:
@@ -3069,7 +3073,7 @@ class AutoTradeSettingWindow(QDialog):
             "보유",
             "가격",
             "손익",
-            "미체결",
+            "매매",
         ]
 
         self.stock_table.setColumnCount(len(headers))
@@ -3079,7 +3083,7 @@ class AutoTradeSettingWindow(QDialog):
         header.setObjectName("autoTradeSettingStockHeader")
         header.setProperty(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY, True)
         vertical_header = self.stock_table.verticalHeader()
-        stock_table_grid_color = "#D1D5DB"
+        stock_table_grid_color = REGISTERED_STOCK_STATUS_GRID_COLOR
         header.setProperty(PLAIN_HEADER_GRID_COLOR_PROPERTY, stock_table_grid_color)
         header_font = QFont(self.stock_table.font())
         header.setFont(header_font)
@@ -3121,43 +3125,17 @@ class AutoTradeSettingWindow(QDialog):
             )
 
         # 자동매매설정창 하단 종목표 고정폭 배분.
-        # 보유/가격/손익/미체결은 관제 트리와 같은 묶음 단위로 표시한다.
+        # 보유/가격/손익/매매는 관제 트리와 같은 묶음 단위로 표시한다.
         self._apply_stock_table_column_widths()
         self.stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.stock_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stock_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         body_background = self.stock_table.viewport().palette().color(QPalette.Base).name()
         self.stock_table.setStyleSheet(
-            """
-            QTableWidget {
-                background: #ffffff;
-                gridline-color: __GRID_COLOR__;
-                selection-background-color: #dbeafe;
-                selection-color: #111827;
-            }
-            QTableWidget::item:selected,
-            QTableWidget::item:selected:active,
-            QTableWidget::item:selected:!active {
-                background: #dbeafe;
-                color: #111827;
-            }
-            QTableWidget::item:focus {
-                outline: 0;
-            }
-            QTableWidget#autoTradeSettingStockTable QHeaderView::section:vertical {
-                background-color: __BODY_BACKGROUND__;
-                border: none;
-                border-right: 1px solid __GRID_COLOR__;
-                border-bottom: 1px solid __GRID_COLOR__;
-                padding: 0;
-            }
-            QTableWidget#autoTradeSettingStockTable QTableCornerButton::section {
-                background-color: __BODY_BACKGROUND__;
-                border: none;
-                border-right: 1px solid __GRID_COLOR__;
-                border-bottom: 1px solid __GRID_COLOR__;
-            }
-            """.replace("__BODY_BACKGROUND__", body_background).replace("__GRID_COLOR__", stock_table_grid_color)
+            registered_stock_status_table_stylesheet(
+                self.stock_table.objectName(),
+                body_background,
+            )
         )
         self._sync_stock_table_header_background_to_body()
         self.stock_table.setWordWrap(True)
@@ -3181,7 +3159,10 @@ class AutoTradeSettingWindow(QDialog):
 
         header = self.stock_table.horizontalHeader()
         header.setProperty(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY, True)
-        header.setProperty(PLAIN_HEADER_GRID_COLOR_PROPERTY, "#D1D5DB")
+        header.setProperty(
+            PLAIN_HEADER_GRID_COLOR_PROPERTY,
+            REGISTERED_STOCK_STATUS_GRID_COLOR,
+        )
         header.viewport().update()
 
         vertical_header = self.stock_table.verticalHeader()
@@ -3549,16 +3530,15 @@ class AutoTradeSettingWindow(QDialog):
             if code_item is None or pnl_item is None:
                 continue
             result = project_current_stock_pnl(code_item.text(), project_root=PROJECT_ROOT)
-            if result.get("available") is True:
-                amount = float(result.get("cumulative_profit") or 0)
-                rate = result.get("cumulative_rate")
-                text = f"손익 {format_signed_money(amount)} / {format_signed_percent(rate, digits=2) if rate is not None else '-'}"
-            elif result.get("reason") == "EVALUATION_PRICE_UNAVAILABLE":
+            if result.get("available") is not True:
                 continue
-            else:
-                text = "손익 확인 필요 / -"
+            profit_metric, amount, _rate = confirmable_stock_profit_metric(result)
+            text = ratio_metric_text(profit_metric)
             if pnl_item.text() != text:
                 pnl_item.setText(text)
+            color = QColor(profit_loss_value_color(amount))
+            if pnl_item.foreground().color() != color:
+                pnl_item.setForeground(color)
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
         """하단 종목표의 선택 종목 경로와 세로 스크롤 위치를 저장한다."""
@@ -9571,24 +9551,6 @@ class AutoTradeSettingWindow(QDialog):
         from gui_main_emergency_ops import execute_selected_emergency_stop
 
         return execute_selected_emergency_stop(self, selected_targets)
-
-    def release_selected_emergency_stopped_auto_trade_stocks(self) -> dict[str, object]:
-        selected_targets = self.selected_stock_infos()
-        if not selected_targets:
-            return {
-                "normal": (),
-                "review": (),
-                "skipped": (),
-                "failed": (),
-                "normal_count": 0,
-                "review_count": 0,
-                "skipped_count": 0,
-                "failed_count": 0,
-            }
-        from gui_main_emergency_ops import execute_selected_emergency_release
-
-        return execute_selected_emergency_release(self, selected_targets)
-
 
     def apply_selected_early_close_default(self, checked: bool = False) -> None:
         # QPushButton.clicked may pass a checked(bool) argument.

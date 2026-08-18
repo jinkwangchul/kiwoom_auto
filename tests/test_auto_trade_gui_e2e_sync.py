@@ -34,6 +34,17 @@ class _RegistrationTable:
 
 
 class AutoTradeGuiE2ESyncTest(unittest.TestCase):
+    def setUp(self) -> None:
+        import gui_main_emergency_ops as emergency
+
+        preflight = patch.object(
+            emergency,
+            "global_emergency_release_preflight",
+            return_value=(True, ""),
+        )
+        preflight.start()
+        self.addCleanup(preflight.stop)
+
     def _registration_dialog(self, parent):
         return SimpleNamespace(
             result_table=_RegistrationTable(),
@@ -597,7 +608,6 @@ class AutoTradeGuiE2ESyncTest(unittest.TestCase):
 
             with (
                 patch.object(operation_policy_gate, "OPERATION_STATE_PATH", operation_state_path),
-                patch.object(emergency, "release_emergency_stop_target", return_value="normal"),
                 patch.object(emergency, "append_changelog"),
                 patch.object(emergency, "show_toast"),
             ):
@@ -630,6 +640,18 @@ class AutoTradeGuiE2ESyncTest(unittest.TestCase):
             second = root / "stocks" / "222222_두번째"
             first.mkdir(parents=True)
             second.mkdir(parents=True)
+            for stock_dir in (first, second):
+                (stock_dir / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "EMERGENCY_STOPPED",
+                            "review_required": False,
+                            "emergency_scope": "GLOBAL",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
             status_bar = SimpleNamespace(showMessage=Mock())
             button = SimpleNamespace(setText=Mock())
             main = SimpleNamespace(
@@ -642,7 +664,11 @@ class AutoTradeGuiE2ESyncTest(unittest.TestCase):
 
             with (
                 patch.object(operation_policy_gate, "OPERATION_STATE_PATH", operation_state_path),
-                patch.object(emergency, "release_emergency_stop_target", side_effect=["review", "failed"]),
+                patch.object(
+                    emergency,
+                    "_release_global_emergency_stop_target",
+                    side_effect=[emergency.RELEASED_TO_REVIEW, emergency.RELEASE_FAILED],
+                ),
                 patch.object(emergency, "append_changelog"),
                 patch.object(emergency, "show_toast") as toast,
             ):

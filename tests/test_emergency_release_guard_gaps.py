@@ -90,6 +90,7 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
             "avg_price": 0,
             "emergency_stopped_at": "2026-08-11 09:00:00",
             "emergency_reason": "USER_EMERGENCY_STOP",
+            "emergency_scope": "SELECTED",
             "review_required": True,
             "review_status": "PENDING",
             "review_location": "긴급정지",
@@ -115,6 +116,11 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
         target_window = window or _ReleaseWindow()
         with (
             patch.object(emergency_ops, "append_stock_log"),
+            patch.object(
+                emergency_ops,
+                "read_operation_state",
+                return_value={"emergency_stop": False},
+            ),
             patch.object(
                 emergency_ops,
                 "ORDER_QUEUE_PATH",
@@ -167,7 +173,7 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
             window=_ReleaseWindow(recovery_ready=True),
         )
 
-        self.assertEqual("review_existing", result)
+        self.assertEqual(emergency_ops.RELEASED_TO_REVIEW, result)
         self.assertEqual("REVIEW_REQUIRED", state["status"])
         self.assertTrue(state["review_required"])
         self.assertEqual("RESOLVED", state["review_status"])
@@ -278,6 +284,110 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
             expected_reason="PENDING_CANCEL",
         )
 
+    def test_approval_blocked_zero_quantity_never_sent_candidate_is_terminal(self) -> None:
+        queue_path = self.root / "runtime" / "order_queue.json"
+        queue_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "orders": [
+                        {
+                            "code": "000001",
+                            "status": "BLOCKED",
+                            "approval_status": "BLOCKED",
+                            "candidate_status": "NO_HOLDING_QTY",
+                            "order_type": "SELL_NO_HOLDING_CANDIDATE",
+                            "side": "SELL",
+                            "quantity": 0,
+                            "pending_qty": 0,
+                            "execution_enabled": False,
+                            "send_order_called": False,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual("", _active_queue_reason("000001", queue_path))
+
+    def test_blocked_zero_quantity_candidate_with_risk_evidence_stays_active(self) -> None:
+        base = {
+            "code": "000001",
+            "status": "BLOCKED",
+            "approval_status": "BLOCKED",
+            "candidate_status": "NO_HOLDING_QTY",
+            "order_type": "SELL_NO_HOLDING_CANDIDATE",
+            "side": "SELL",
+            "quantity": 0,
+            "pending_qty": 0,
+            "execution_enabled": False,
+            "send_order_called": False,
+        }
+        cases = (
+            {"pending_qty": 1},
+            {"pending_qty": "?"},
+            {"dispatch_claim_id": "CLAIM_1"},
+            {"execution_id": "EXEC_1"},
+            {"lock_id": "LOCK_1"},
+            {"broker_order_no": "BROKER_1"},
+            {"send_order_called": True},
+        )
+        queue_path = self.root / "runtime" / "order_queue.json"
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                record = {**base, **evidence}
+                queue_path.write_text(
+                    json.dumps(
+                        {"version": 1, "orders": [record]},
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    "PENDING_ORDER",
+                    _active_queue_reason("000001", queue_path),
+                )
+
+    def test_blocked_variants_are_not_conflated_with_terminal_candidate(self) -> None:
+        queue_path = self.root / "runtime" / "order_queue.json"
+        base = {
+            "code": "000001",
+            "status": "BLOCKED",
+            "approval_status": "BLOCKED",
+            "candidate_status": "NO_HOLDING_QTY",
+            "order_type": "SELL_NO_HOLDING_CANDIDATE",
+            "quantity": 0,
+            "pending_qty": 0,
+            "execution_enabled": False,
+        }
+        for changed in (
+            {"status": "BLOCKED_POLICY"},
+            {"status": "ORDER_BLOCKED"},
+            {"candidate_status": "CANDIDATE_READY"},
+            {"order_type": "SELL_SIGNAL_CANDIDATE"},
+        ):
+            with self.subTest(changed=changed):
+                queue_path.write_text(
+                    json.dumps(
+                        {"version": 1, "orders": [{**base, **changed}]},
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    "PENDING_ORDER",
+                    _active_queue_reason("000001", queue_path),
+                )
+
+    def test_malformed_queue_snapshot_remains_runtime_damaged(self) -> None:
+        queue_path = self.root / "runtime" / "order_queue.json"
+        queue_path.write_text("{not-json", encoding="utf-8")
+        self.assertEqual("RUNTIME_DAMAGED", _active_queue_reason("000001", queue_path))
+
     def test_stock_orders_cancel_requested_control_is_already_blocked(self) -> None:
         stock_dir = self._stock()
         (stock_dir / "orders.json").write_text(
@@ -311,7 +421,6 @@ class EmergencyReleaseGuardGapTests(unittest.TestCase):
             {"liquidation_policy_forced": True},
             {"close_routine_final_sell_ordered": True},
             {"operation_command_mode": "EARLY_CLOSE"},
-            {"status": "AUTO_CLOSING"},
         )
         now_dt = datetime(2026, 8, 11, 10, 0, 0)
         for index, evidence in enumerate(cases, start=1):

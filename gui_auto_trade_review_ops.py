@@ -23,6 +23,9 @@ def auto_trade_open_review_required_window(window) -> None:
     if existing is not None:
         try:
             if existing.isVisible():
+                refresh = getattr(existing, "refresh_review_items", None)
+                if callable(refresh):
+                    refresh()
                 existing.show()
                 existing.raise_()
                 existing.activateWindow()

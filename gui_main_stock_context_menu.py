@@ -44,7 +44,6 @@ from gui_auto_trade_status_ops import (
 )
 from gui_auto_trade_unregister import unregister_selected_auto_trade_stocks
 from gui_main_emergency_ops import (
-    execute_selected_emergency_release,
     execute_selected_emergency_stop,
 )
 from gui_auto_trade_ats_ops import (
@@ -57,12 +56,12 @@ from gui_auto_trade_ats_ops import (
 from gui_auto_trade_context_menu import (
     StockContextMenuCallbacks,
     open_selected_stock_instance_charts,
+    selected_emergency_context_state,
     show_monitor_stock_context_menu,
 )
 from gui_config_utils import default_config
 from gui_schedule_window import ScheduleOperationDialog
 from gui_auto_trade_integrity import (
-    is_emergency_stopped_state,
     is_operation_excluded,
     is_review_required_stock_dir,
 )
@@ -412,11 +411,6 @@ class MainMonitoringStockOperationAdapter:
 
     def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
         return execute_selected_emergency_stop(self, self.selected_stock_infos())
-
-    def release_selected_emergency_stopped_auto_trade_stocks(
-        self,
-    ) -> dict[str, object]:
-        return execute_selected_emergency_release(self, self.selected_stock_infos())
 
     def unregister_selected_auto_trade_stocks(self) -> None:
         unregister_selected_auto_trade_stocks(self)
@@ -780,11 +774,8 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
 
     adapter = MainMonitoringStockOperationAdapter(window, targets)
     window._main_monitoring_stock_operation_adapter = adapter
-    emergency_states = tuple(
-        is_emergency_stopped_state(
-            read_json_dict(target.stock_dir / "state.json")
-        )
-        for target in targets
+    _has_selected_provenance, has_non_emergency = selected_emergency_context_state(
+        (target.stock_dir, target.code, target.name) for target in targets
     )
     callbacks = StockContextMenuCallbacks(
         select_all=lambda: select_all_visible_main_monitoring_stocks(window),
@@ -792,12 +783,7 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         start=adapter.start_selected_auto_trades,
         emergency_stop=(
             adapter.emergency_stop_selected_auto_trade_stocks
-            if any(not state for state in emergency_states)
-            else None
-        ),
-        emergency_release=(
-            adapter.release_selected_emergency_stopped_auto_trade_stocks
-            if any(emergency_states)
+            if has_non_emergency
             else None
         ),
         stock_register=lambda target_instance_id=context_target.routine_instance_id: (

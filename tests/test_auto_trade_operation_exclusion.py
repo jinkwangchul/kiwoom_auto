@@ -6,10 +6,11 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 import gui_auto_trade_table_loader as table_loader
 import gui_auto_trade_context_menu
+from gui_operation_ui_context import refresh_auto_trade_views
 from gui_auto_trade_setting_window import (
     OPERATION_EXCLUDED_CONFIG_KEY,
     AutoTradeSettingWindow,
@@ -34,6 +35,20 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             statusBarMessage=Mock(),
             refresh_all=Mock(),
         )
+
+    def test_refresh_after_exclusion_uses_persistent_main_owner(self) -> None:
+        main = QWidget()
+        main.refresh_auto_trade_assignment_views = Mock()
+        window = SimpleNamespace(
+            _persistent_feature_owner_ref=lambda: main,
+            parent=lambda: None,
+            refresh_all=Mock(),
+        )
+
+        refresh_auto_trade_views(window)
+
+        main.refresh_auto_trade_assignment_views.assert_called_once_with()
+        window.refresh_all.assert_not_called()
 
     def test_name_double_click_toggles_operation_exclusion_not_start(self) -> None:
         target = (Path("stocks/111111_Test"), "111111", "Test")
@@ -230,7 +245,9 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             first_dir = self._stock_dir(temp)
             second_dir = Path(temp) / "222222_Other"
             second_dir.mkdir()
-            for stock_dir in (first_dir, second_dir):
+            third_dir = Path(temp) / "333333_Third"
+            third_dir.mkdir()
+            for stock_dir in (first_dir, second_dir, third_dir):
                 (stock_dir / "config.json").write_text(
                     json.dumps(
                         {
@@ -250,10 +267,15 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 )
 
             window = self._window()
+            main = QWidget()
+            main.refresh_auto_trade_assignment_views = Mock()
+            window._persistent_feature_owner_ref = lambda: main
+            window.parent = lambda: None
             window.selected_stock_infos = Mock(
                 return_value=[
                     (first_dir, "111111", "Test"),
                     (second_dir, "222222", "Other"),
+                    (third_dir, "333333", "Third"),
                 ]
             )
             window.set_stock_operation_exclusion = MethodType(
@@ -269,13 +291,15 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             ):
                 AutoTradeSettingWindow.set_selected_stock_operation_exclusions(window)
 
-            for stock_dir in (first_dir, second_dir):
+            for stock_dir in (first_dir, second_dir, third_dir):
                 saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
                 self.assertTrue(saved[OPERATION_EXCLUDED_CONFIG_KEY])
                 self.assertEqual("CONTINUOUS", saved["operation_mode"])
                 self.assertEqual("inst-a", saved["assigned_routine_instance_id"])
-            window.refresh_all.assert_called_once_with()
-            toast.assert_called_once_with(window, "2개 종목을 운영제외했습니다.")
+            main.refresh_auto_trade_assignment_views.assert_called_once_with()
+            window.refresh_all.assert_not_called()
+            toast.assert_called_once_with(window, "3개 종목을 운영제외했습니다.")
+            main.close()
 
     def test_set_selected_operation_exclusions_does_not_bypass_review_required(self) -> None:
         with TemporaryDirectory() as temp:
@@ -478,7 +502,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             def addAction(self, text: str) -> _Action:
                 action = _Action(text)
                 self.actions.append(action)
-                if text == "긴급정지":
+                if text == "검토정지":
                     _Menu.chosen_action = action
                 return action
 
@@ -516,7 +540,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         window.emergency_stop_selected_auto_trade_stocks.assert_called_once_with()
         window.release_selected_emergency_stopped_auto_trade_stocks.assert_not_called()
 
-    def test_stock_context_menu_dispatches_emergency_release_action(self) -> None:
+    def test_stock_context_menu_has_no_emergency_release_action(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "111111_Test"
             stock_dir.mkdir()
@@ -589,7 +613,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 )
 
         window.emergency_stop_selected_auto_trade_stocks.assert_not_called()
-        window.release_selected_emergency_stopped_auto_trade_stocks.assert_called_once_with()
+        window.release_selected_emergency_stopped_auto_trade_stocks.assert_not_called()
 
     def test_stock_context_menu_emergency_actions_follow_selection_state(self) -> None:
         class _Action:
@@ -650,8 +674,8 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
             cases = (
                 ([(normal_dir, "111111", "Normal")], True, False),
-                ([(emergency_dir, "222222", "Emergency")], False, True),
-                ([(normal_dir, "111111", "Normal"), (emergency_dir, "222222", "Emergency")], True, True),
+                ([(emergency_dir, "222222", "Emergency")], False, False),
+                ([(normal_dir, "111111", "Normal"), (emergency_dir, "222222", "Emergency")], True, False),
             )
             for selected, expect_stop, expect_release in cases:
                 with self.subTest(selected=len(selected), stop=expect_stop, release=expect_release):
@@ -674,7 +698,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                             object(),
                         )
 
-                    self.assertEqual(expect_stop, "긴급정지" in _Menu.action_texts)
+                    self.assertEqual(expect_stop, "검토정지" in _Menu.action_texts)
                     self.assertEqual(expect_release, "정지해제" in _Menu.action_texts)
 
     def test_stock_context_menu_stock_register_visibility_follows_routine_scope(self) -> None:

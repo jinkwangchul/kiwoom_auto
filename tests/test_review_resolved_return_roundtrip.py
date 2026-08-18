@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -16,6 +17,7 @@ from PyQt5.QtWidgets import QApplication, QPushButton, QWidget
 
 import gui_main_emergency_ops as emergency_ops
 import gui_review_required_window as review_window
+from gui_auto_trade_run_control import _active_close_or_liquidation
 from runtime_io import read_json_dict
 
 
@@ -39,7 +41,11 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     @staticmethod
-    def _stock(root: str, code: str) -> Path:
+    def _stock(
+        root: str,
+        code: str,
+        state_overrides: dict[str, object] | None = None,
+    ) -> Path:
         stock_dir = Path(root) / f"{code}_TEST"
         stock_dir.mkdir(parents=True)
         (stock_dir / "config.json").write_text(
@@ -49,23 +55,22 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
         (stock_dir / "orders.json").write_text(
             '{"orders": []}\n', encoding="utf-8"
         )
+        state = {
+            "status": "REVIEW_REQUIRED",
+            "review_required": True,
+            "review_status": "RESOLVED",
+            "review_location": "안정성 검사",
+            "review_reason": "운영 데이터 불일치",
+            "review_detail": "SERVER_MISMATCH",
+            "review_entered_at": "2026-08-16 10:00:00",
+            "review_routine": "루틴A",
+            "holding_qty": 0,
+            "avg_price": 0,
+            "trade_enabled": False,
+        }
+        state.update(state_overrides or {})
         (stock_dir / "state.json").write_text(
-            json.dumps(
-                {
-                    "status": "REVIEW_REQUIRED",
-                    "review_required": True,
-                    "review_status": "RESOLVED",
-                    "review_location": "안정성 검사",
-                    "review_reason": "운영 데이터 불일치",
-                    "review_detail": "SERVER_MISMATCH",
-                    "review_entered_at": "2026-08-16 10:00:00",
-                    "review_routine": "루틴A",
-                    "holding_qty": 0,
-                    "avg_price": 0,
-                    "trade_enabled": False,
-                },
-                ensure_ascii=False,
-            ),
+            json.dumps(state, ensure_ascii=False),
             encoding="utf-8",
         )
         return stock_dir
@@ -171,6 +176,136 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
                 self.assertEqual("검토관리(0)", owner.btn_review_required.text())
                 self.assertGreaterEqual(owner.refresh_calls, 2)
                 self.assertFalse((Path(root) / "order_queue.json").exists())
+
+    def test_restore_preserves_terminal_early_close_evidence(self):
+        with TemporaryDirectory() as root:
+            terminal = {
+                "operation_command_mode": "EARLY_CLOSE",
+                "operation_notice": "EARLY_CLOSE_NO_TARGET",
+                "operation_notice_reason": "조기마감 대상 없음",
+                "operation_notice_at": "2026-08-17 10:15:20",
+            }
+            position = {"holding_qty": 0, "avg_price": 0, "holding_amount": 0}
+            stock_dir = self._stock(
+                root,
+                "323410",
+                {**terminal, **position, "review_status": "PENDING"},
+            )
+
+            def rows():
+                row = self._row(stock_dir, "ALLOWED")
+                return [row] if row else []
+
+            gate = Mock(return_value={"availability": "ALLOWED", "reason": ""})
+            stack, _owner, window = self._window_context(rows, gate)
+            with stack:
+                before = read_json_dict(stock_dir / "state.json")
+                self.assertFalse(_active_close_or_liquidation(before, datetime.now()))
+                window.table.selectRow(0)
+                self.app.processEvents()
+                window.btn_return.click()
+                self.app.processEvents()
+
+                saved = read_json_dict(stock_dir / "state.json")
+                self.assertEqual("STOPPED", saved["status"])
+                self.assertFalse(saved["trade_enabled"])
+                self.assertFalse(saved["review_required"])
+                self.assertEqual("", saved["review_status"])
+                for key, value in terminal.items():
+                    self.assertEqual(value, saved[key])
+                for key, value in position.items():
+                    self.assertEqual(value, saved[key])
+                self.assertFalse(_active_close_or_liquidation(saved, datetime.now()))
+
+    def test_unassigned_preserves_terminal_early_close_evidence(self):
+        with TemporaryDirectory() as root:
+            terminal = {
+                "operation_command_mode": "EARLY_CLOSE",
+                "operation_notice": "EARLY_CLOSE_NO_TARGET",
+                "operation_notice_reason": "조기마감 대상 없음",
+                "operation_notice_at": "2026-08-17 10:15:20",
+            }
+            stock_dir = self._stock(
+                root,
+                "323410",
+                {
+                    **terminal,
+                    "review_status": "PENDING",
+                    "active_routine": "루틴A",
+                    "routine_name": "루틴A",
+                },
+            )
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        emergency_ops,
+                        "review_return_availability",
+                        return_value={"availability": "ALLOWED", "reason": ""},
+                    )
+                )
+                stack.enter_context(patch.object(emergency_ops, "append_stock_log"))
+                stack.enter_context(
+                    patch.object(emergency_ops, "observe_owner_failure_transition")
+                )
+                update_routines = stack.enter_context(
+                    patch.object(
+                        emergency_ops, "update_base_stock_routines", return_value=True
+                    )
+                )
+                result = emergency_ops.normalize_review_emergency_target(
+                    None,
+                    stock_dir,
+                    "323410",
+                    "TEST",
+                    destination="UNASSIGNED",
+                )
+                saved = read_json_dict(stock_dir / "state.json")
+                self.assertEqual("NORMALIZED", result["status"])
+                self.assertEqual("STOPPED", saved["status"])
+                self.assertFalse(saved["trade_enabled"])
+                self.assertFalse(saved["review_required"])
+                self.assertEqual("", saved["review_status"])
+                for key, value in terminal.items():
+                    self.assertEqual(value, saved[key])
+                self.assertEqual("", saved["active_routine"])
+                self.assertEqual("", saved["routine_name"])
+                self.assertFalse(_active_close_or_liquidation(saved, datetime.now()))
+                update_routines.assert_called_once_with("323410", "TEST", [])
+
+    def test_restore_keeps_nonterminal_notice_clear_behavior(self):
+        with TemporaryDirectory() as root:
+            stock_dir = self._stock(
+                root,
+                "000001",
+                {
+                    "operation_command_mode": "NORMAL",
+                    "operation_notice": "일반 안내",
+                    "operation_notice_reason": "일반 사유",
+                    "operation_notice_at": "2026-08-16 11:22:33",
+                },
+            )
+
+            def rows():
+                row = self._row(stock_dir, "ALLOWED")
+                return [row] if row else []
+
+            gate = Mock(return_value={"availability": "ALLOWED", "reason": ""})
+            stack, _owner, window = self._window_context(rows, gate)
+            with stack:
+                window.table.selectRow(0)
+                self.app.processEvents()
+                window.btn_return.click()
+                self.app.processEvents()
+
+                saved = read_json_dict(stock_dir / "state.json")
+                self.assertEqual("NORMAL", saved["operation_command_mode"])
+                for key in (
+                    "operation_notice",
+                    "operation_notice_reason",
+                    "operation_notice_at",
+                ):
+                    self.assertEqual("", saved[key])
 
     def test_blocked_and_emergency_rows_disable_restore(self):
         for reason, status in (

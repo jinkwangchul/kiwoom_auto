@@ -20,7 +20,7 @@ from pathlib import Path
 from tempfile import gettempdir
 
 from PyQt5.QtCore import QItemSelectionModel, Qt
-from PyQt5.QtGui import QBrush, QColor, QFontMetrics
+from PyQt5.QtGui import QBrush, QColor, QFontMetrics, QPalette
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -42,12 +42,15 @@ from gui_order_utils import (
     DIRECTIONAL_POSITIVE_COLOR,
     pending_order_side_quantities,
 )
-from gui_auto_trade_display import (
-    AUTO_TRADE_SETTING_BADGE_HEIGHT,
-    auto_trade_setting_badge_stylesheet,
-)
+from gui_auto_trade_display import auto_trade_setting_badge_stylesheet
 from gui_review_utils import normalized_review_reasons, safe_float_value
-from gui_styles import TABLE_LIGHT_SELECTION_STYLE, apply_plain_table_header
+from gui_styles import (
+    PLAIN_HEADER_GRID_COLOR_PROPERTY,
+    PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY,
+    REGISTERED_STOCK_STATUS_GRID_COLOR,
+    apply_plain_table_header,
+    registered_stock_status_table_stylesheet,
+)
 from gui_table_utils import next_sort_order
 from gui_toast import show_toast
 from gui_window_policy import (
@@ -71,9 +74,30 @@ from gui_auto_trade_integrity import (
     operator_review_reason,
 )
 from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
+from stock_position_reconciliation_service import (
+    STATUS_APPLIED as POSITION_STATUS_APPLIED,
+    STATUS_BLOCKED_EVIDENCE as POSITION_STATUS_BLOCKED_EVIDENCE,
+    STATUS_FAILED as POSITION_STATUS_FAILED,
+    STATUS_NO_CHANGE as POSITION_STATUS_NO_CHANGE,
+    reconcile_review_stock_position,
+    state_file_sha256,
+)
+from legacy_close_reconciliation_service import (
+    STATUS_BLOCKED_EVIDENCE as LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE,
+    STATUS_COMPLETED as LEGACY_CLOSE_STATUS_COMPLETED,
+    STATUS_FAILED as LEGACY_CLOSE_STATUS_FAILED,
+    STATUS_NO_CHANGE as LEGACY_CLOSE_STATUS_NO_CHANGE,
+    _active_close_evidence,
+    reconcile_legacy_early_close_no_target,
+)
+from production_recovery_contract import (
+    ACCOUNT_COMPLETED,
+    BrokerAccountSnapshot,
+    RecoverySessionIdentity,
+)
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
-
+ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 REVIEW_UNKNOWN_TEXT = "-"
 REVIEW_TIME_UNRECORDED = "\ubbf8\uae30\ub85d"
 REVIEW_DISPLAY_STATUS_UNRESOLVED = "\ubbf8\ud574\uacb0"
@@ -122,14 +146,32 @@ def build_review_operator_guidance(
     reason_text = " / ".join(reason_values) or REVIEW_UNKNOWN_TEXT
     location = str(current.get("review_location", "") or "").strip()
     location_text = location or REVIEW_DETECTION_EVENT_UNRECORDED
-    evidence_text = raw_block_reason or " ".join(
-        [
-            reason_text,
-            str(current.get("review_detail", "") or ""),
-            str(current.get("display_status", "") or ""),
-        ]
+    display_status = str(current.get("display_status", "") or "").strip()
+    detail_text = str(current.get("review_detail", "") or "").strip()
+    evidence_text = " ".join(
+        value
+        for value in (raw_block_reason, detail_text, reason_text)
+        if value
     )
-    evidence_upper = evidence_text.upper()
+    explicit_block_reason_codes = {
+        "EMERGENCY_STOP_ACTIVE",
+        "PENDING_ORDER_DATA_INTEGRITY",
+        "ACTIVE_CLOSE_OR_LIQUIDATION",
+        "RECOVERY_NOT_READY",
+        "SERVER_MISMATCH",
+    }
+    classification_text = (
+        raw_block_reason
+        if raw_block_reason.upper() in explicit_block_reason_codes
+        else evidence_text
+    )
+    classification_upper = classification_text.upper()
+    explicit_emergency_active = (
+        display_status == REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED
+        or raw_block_reason.upper() == "EMERGENCY_STOP_ACTIVE"
+    )
+    holding_qty = safe_int_value(current.get("holding_qty"), 0)
+    avg_price = safe_float_value(current.get("avg_price"), 0.0)
 
     if availability_value == REVIEW_RETURN_ALLOWED:
         return {
@@ -141,58 +183,60 @@ def build_review_operator_guidance(
             "resolution_condition": "현재 복귀 안전조건을 충족했습니다.",
         }
 
-    if "EMERGENCY_STOP_ACTIVE" in evidence_upper or "긴급정지" in evidence_text:
+    if explicit_emergency_active:
         block_reason = "긴급정지가 활성 상태입니다."
-        action = "먼저 긴급정지를 해제한 뒤 새로고침하세요."
+        action = "먼저 긴급정지를 해제한 뒤 상태재판정하세요."
         condition = "긴급정지가 해제되고 복귀 가능으로 확인되어야 합니다."
     elif (
-        REVIEW_REASON_OPERATION_DATA_MISSING in evidence_text
-        or "STATE.JSON 누락" in evidence_upper
+        REVIEW_REASON_OPERATION_DATA_MISSING in classification_text
+        or "STATE.JSON 누락" in classification_upper
     ):
         block_reason = "운영 데이터가 없습니다."
         action = "종목 운영 데이터 확인이 필요합니다."
         condition = "운영 데이터가 정상적으로 확인되고 복귀 안전조건을 충족해야 합니다."
     elif (
-        REVIEW_REASON_OPERATION_DATA_READ_ERROR in evidence_text
-        or "STATE.JSON 이상" in evidence_upper
-        or "읽기 오류" in evidence_text
+        REVIEW_REASON_OPERATION_DATA_READ_ERROR in classification_text
+        or "STATE.JSON 이상" in classification_upper
+        or "읽기 오류" in classification_text
     ):
         block_reason = "운영 데이터를 읽을 수 없습니다."
-        action = "state 데이터를 정상화한 뒤 새로고침하세요."
+        action = "state 데이터를 정상화한 뒤 상태재판정하세요."
         condition = "운영 데이터가 정상적으로 읽히고 복귀 안전조건을 충족해야 합니다."
     elif (
-        "PENDING_ORDER_DATA_INTEGRITY" in evidence_upper
-        or "미체결 데이터 오류" in evidence_text
-        or "미체결 존재" in evidence_text
-        or "처리할 수 없는 종목" in evidence_text
+        "PENDING_ORDER_DATA_INTEGRITY" in classification_upper
+        or "미체결 데이터 오류" in classification_text
+        or "미체결 존재" in classification_text
+        or "처리할 수 없는 종목" in classification_text
     ):
         block_reason = "미체결 상태를 확인할 수 없거나 주문이 진행 중입니다."
-        action = "주문·체결 상태를 확인하고 데이터가 정상화된 뒤 새로고침하세요."
+        action = "주문·체결 상태를 확인하고 데이터가 정상화된 뒤 상태재판정하세요."
         condition = "미체결 무결성이 정상이고 복귀 가능으로 확인되어야 합니다."
-    elif "ACTIVE_CLOSE_OR_LIQUIDATION" in evidence_upper or "청산 처리 중" in evidence_text:
+    elif "ACTIVE_CLOSE_OR_LIQUIDATION" in classification_upper or "청산 처리 중" in classification_text:
         block_reason = "청산 처리가 진행 중입니다."
-        action = "청산 진행 및 주문 상태를 확인한 뒤 새로고침하세요."
+        action = "청산 진행 및 주문 상태를 확인한 뒤 상태재판정하세요."
         condition = "청산 처리가 끝나고 복귀 가능으로 확인되어야 합니다."
-    elif "RECOVERY" in evidence_upper or "복구 상태 오류" in evidence_text:
+    elif "RECOVERY" in classification_upper or "복구 상태 오류" in classification_text:
         block_reason = "복구 상태가 완료되지 않았습니다."
-        action = "Recovery 상태를 확인한 뒤 새로고침하세요."
+        action = "Recovery 상태를 확인한 뒤 상태재판정하세요."
         condition = "Recovery가 완료되고 복귀 가능으로 확인되어야 합니다."
-    elif "SERVER_MISMATCH" in evidence_upper or "서버" in evidence_text:
+    elif "SERVER_MISMATCH" in classification_upper or "서버" in classification_text:
         block_reason = "서버와 Runtime 정보가 일치하지 않습니다."
-        action = "서버와 Runtime 상태의 일치를 확인한 뒤 새로고침하세요."
+        action = "서버와 Runtime 상태의 일치를 확인한 뒤 상태재판정하세요."
         condition = "서버와 Runtime이 일치하고 복귀 가능으로 확인되어야 합니다."
     elif (
-        "HOLDING" in evidence_upper
-        or "보유수량" in evidence_text
-        or "보유잔량" in evidence_text
-        or "평단" in evidence_text
+        holding_qty > 0
+        or avg_price > 0
+        or "HOLDING" in classification_upper
+        or "보유수량" in classification_text
+        or "보유잔량" in classification_text
+        or "평단" in classification_text
     ):
         block_reason = "보유잔량 또는 보유정보 확인이 필요합니다."
-        action = "잔여 보유 및 청산 상태를 확인한 뒤 새로고침하세요."
-        condition = "보유정보가 정상화되고 복귀 가능으로 확인되어야 합니다."
+        action = "현재 보유 상태와 이후 처리 방침을 확인한 뒤 상태재판정하세요."
+        condition = "보유 관련 복귀 안전조건을 충족해야 합니다."
     else:
         block_reason = "현재 복귀 안전조건을 충족하지 못했습니다."
-        action = "표시된 검토 사유와 관련 운영 상태를 확인한 뒤 새로고침하세요."
+        action = "표시된 검토 사유와 관련 운영 상태를 확인한 뒤 상태재판정하세요."
         condition = "복귀 가능으로 확인되어야 합니다."
 
     return {
@@ -362,12 +406,14 @@ def _review_display_status_for_collected_row(
     emergency_reason = str(state.get("emergency_reason", "") or "").strip()
     emergency_stopped_at = str(state.get("emergency_stopped_at", "") or "").strip()
     source = str(review_location_source or state.get("review_location", "") or "").strip()
+    emergency_scope = str(state.get("emergency_scope", "") or "").strip().upper()
+    if _common_is_emergency_stopped_state(state):
+        if emergency_scope != "SELECTED":
+            return REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED
     if (
-        _common_is_emergency_stopped_state(state)
-        or (
-            (emergency_reason or emergency_stopped_at)
-            and source != REVIEW_SOURCE_EMERGENCY_RELEASE
-        )
+        (emergency_reason or emergency_stopped_at)
+        and emergency_scope != "SELECTED"
+        and source != REVIEW_SOURCE_EMERGENCY_RELEASE
     ):
         return REVIEW_DISPLAY_STATUS_EMERGENCY_STOPPED
 
@@ -845,6 +891,7 @@ def collect_global_review_required_rows(availability_window=None) -> list[dict[s
             "display_status": display_status,
             "return_availability": return_availability,
             "return_block_reason": availability_reason,
+            "emergency_scope": str(state.get("emergency_scope", "") or "").strip().upper(),
         })
 
     rows.sort(key=lambda row: (str(row.get("review_entered_at", "")), str(row.get("routine_name", "")), str(row.get("code", ""))))
@@ -860,14 +907,14 @@ class GlobalReviewRequiredWindow(QDialog):
         super().__init__(None)
         configure_persistent_feature_window(self, parent)
         self.setWindowTitle("검토종목 관리")
-        self.resize(1100, 620)
+        self.resize(1320, 620)
 
         self.summary_label = QLabel("검토종목: 0개")
         self.table = QTableWidget()
         self.btn_return = QPushButton("복귀")
         self.btn_unassign = QPushButton("미지정")
         self.btn_delete = QPushButton("강제초기화")
-        self.btn_refresh = QPushButton("새로고침")
+        self.btn_refresh = QPushButton("상태재판정")
         self.btn_close = QPushButton("닫기")
         self.long_hold_toggle_button = QPushButton("장기보유 OFF")
         self.long_hold_toggle_button.setObjectName("reviewLongHoldToggle")
@@ -879,23 +926,30 @@ class GlobalReviewRequiredWindow(QDialog):
         self.operator_guidance_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.operator_guidance_label.setMinimumHeight(82)
         self._review_rows_by_stock_dir: dict[str, dict[str, object]] = {}
+        self.last_position_reconciliation_result: dict[str, object] = {}
+        self.last_legacy_close_reconciliation_result: dict[str, object] = {}
         self._review_sort_column = -1
         self._review_sort_order = Qt.AscendingOrder
 
         self._setup_ui()
         self._connect_events()
-        self.load_review_items()
+        self.refresh_review_items()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout()
-        layout.addWidget(self.summary_label)
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(self.summary_label)
+        top_layout.addStretch(1)
+        self.btn_refresh.setMinimumWidth(100)
+        top_layout.addWidget(self.btn_refresh)
+        layout.addLayout(top_layout)
 
         headers = [
             "코드",
             "종목",
             "위치",
             "상태",
-            "검토 전환 시각",
+            "시간",
             "사유",
             "검출",
         ]
@@ -906,31 +960,50 @@ class GlobalReviewRequiredWindow(QDialog):
             detection_header_item.setTextAlignment(Qt.AlignCenter)
         apply_plain_table_header(self.table)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.setObjectName("reviewRequiredTable")
+        header.setProperty(PLAIN_HEADER_USE_TABLE_BODY_BACKGROUND_PROPERTY, True)
+        header.setProperty(
+            PLAIN_HEADER_GRID_COLOR_PROPERTY,
+            REGISTERED_STOCK_STATUS_GRID_COLOR,
+        )
+        # Keep the six predictable fields stable and let the variable-length
+        # reason consume only the remaining viewport.  Row reloads must not
+        # recalculate geometry or push the final detection column off-screen.
+        for column in (0, 1, 2, 3, 4, 6):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
         header.setSectionResizeMode(5, QHeaderView.Stretch)
         header.setStretchLastSection(False)
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         self.table.setColumnWidth(0, 75)    # 코드
-        self.table.setColumnWidth(1, 180)   # 종목
+        self.table.setColumnWidth(1, 160)   # 종목
         self.table.setColumnWidth(2, 140)   # 위치
-        self.table.setColumnWidth(3, 75)    # 상태
-        self.table.setColumnWidth(4, 180)   # 검토 전환 시각
-        self.table.setColumnWidth(5, 350)   # 사유
-        self.table.setColumnWidth(6, 130)   # 검출
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setColumnWidth(3, 90)    # 상태
+        self.table.setColumnWidth(4, 360)   # 시간
+        self.table.setColumnWidth(6, 140)   # 검출
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table.setStyleSheet(TABLE_LIGHT_SELECTION_STYLE)
+        self.table.verticalHeader().hide()
+        self.table.setShowGrid(True)
+        self.table.setGridStyle(Qt.SolidLine)
+        self.table.setAlternatingRowColors(False)
+        body_background = self.table.viewport().palette().color(QPalette.Base).name()
+        self.table.setStyleSheet(
+            registered_stock_status_table_stylesheet(
+                self.table.objectName(),
+                body_background,
+            )
+        )
         layout.addWidget(self.table)
         self.operator_guidance_label.setStyleSheet(
             "QLabel#reviewOperatorGuidance {"
             " border: 1px solid #d6dbe3;"
             " padding: 5px 7px;"
             " background: #ffffff;"
+            " color: #000000;"
             " }"
         )
         layout.addWidget(self.operator_guidance_label)
@@ -941,21 +1014,19 @@ class GlobalReviewRequiredWindow(QDialog):
             badge_metrics.horizontalAdvance("장기보유 ON"),
             badge_metrics.horizontalAdvance("장기보유 OFF"),
         ) + 16
-        self.long_hold_toggle_button.setFixedSize(
-            badge_width,
-            AUTO_TRADE_SETTING_BADGE_HEIGHT,
+        self.long_hold_toggle_button.setFixedWidth(badge_width)
+        self.long_hold_toggle_button.setFixedHeight(
+            self.btn_return.sizeHint().height()
         )
         buttons.addWidget(self.long_hold_toggle_button)
         buttons.addStretch(1)
         self.btn_return.setMinimumWidth(90)
         self.btn_unassign.setMinimumWidth(90)
         self.btn_delete.setMinimumWidth(90)
-        self.btn_refresh.setMinimumWidth(100)
         self.btn_close.setMinimumWidth(100)
         buttons.addWidget(self.btn_return)
         buttons.addWidget(self.btn_unassign)
         buttons.addWidget(self.btn_delete)
-        buttons.addWidget(self.btn_refresh)
         buttons.addWidget(self.btn_close)
         layout.addLayout(buttons)
         self.setLayout(layout)
@@ -964,7 +1035,7 @@ class GlobalReviewRequiredWindow(QDialog):
         self.btn_return.clicked.connect(self.return_selected_items_to_auto_list)
         self.btn_unassign.clicked.connect(self.unassign_selected_review_items)
         self.btn_delete.clicked.connect(self.delete_selected_review_items)
-        self.btn_refresh.clicked.connect(self.load_review_items)
+        self.btn_refresh.clicked.connect(self.refresh_review_items)
         self.btn_close.clicked.connect(self.close)
         self.long_hold_toggle_button.clicked.connect(
             self.toggle_long_term_holding_policy
@@ -1016,6 +1087,7 @@ class GlobalReviewRequiredWindow(QDialog):
         item.setTextAlignment(align)
         if tooltip:
             item.setToolTip(tooltip)
+        item.setBackground(QBrush(QColor("#ffffff")))
         item.setForeground(QBrush(QColor("#000000")))
         self.table.setItem(row, col, item)
 
@@ -1049,6 +1121,7 @@ class GlobalReviewRequiredWindow(QDialog):
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             self.btn_return.setEnabled(False)
+            self.btn_unassign.setEnabled(False)
             self.operator_guidance_label.setText("종목을 선택하세요.")
             return
         selected_projection_rows: list[dict[str, object]] = []
@@ -1060,13 +1133,13 @@ class GlobalReviewRequiredWindow(QDialog):
             selected_row = self._review_rows_by_stock_dir.get(selected_path)
             if isinstance(selected_row, dict):
                 selected_projection_rows.append(selected_row)
-        self.btn_return.setEnabled(
-            any(
-                str(row.get("return_availability", "") or "").strip().upper()
-                == REVIEW_RETURN_ALLOWED
-                for row in selected_projection_rows
-            )
+        has_allowed_selection = any(
+            str(row.get("return_availability", "") or "").strip().upper()
+            == REVIEW_RETURN_ALLOWED
+            for row in selected_projection_rows
         )
+        self.btn_return.setEnabled(has_allowed_selection)
+        self.btn_unassign.setEnabled(has_allowed_selection)
         first_item = self.table.item(selected_rows[0].row(), 0)
         stock_dir_text = str(first_item.data(Qt.UserRole) or "") if first_item else ""
         row = self._review_rows_by_stock_dir.get(stock_dir_text)
@@ -1074,13 +1147,181 @@ class GlobalReviewRequiredWindow(QDialog):
             self.operator_guidance_label.setText("선택한 종목의 안내 정보를 확인할 수 없습니다.")
             return
         guidance = build_review_operator_guidance(row)
-        self.operator_guidance_label.setText(
-            f"{guidance['summary']} | 사유: {guidance['reason']} | "
-            f"검출: {guidance['review_location']}\n"
-            f"복귀 차단: {guidance['block_reason']}\n"
-            f"운영자 조치: {guidance['operator_action']} | "
-            f"해결 조건: {guidance['resolution_condition']}"
+        guidance_lines = [guidance["summary"]]
+        if guidance["block_reason"] != REVIEW_UNKNOWN_TEXT:
+            guidance_lines.append(f"복귀 차단: {guidance['block_reason']}")
+        guidance_lines.extend(
+            [
+                f"운영자 조치: {guidance['operator_action']}",
+                f"해결 조건: {guidance['resolution_condition']}",
+            ]
         )
+        self.operator_guidance_label.setText("\n".join(guidance_lines))
+
+    def _auto_reconciliation_targets(
+        self,
+        rows: list[dict[str, object]],
+    ) -> list[tuple[Path, str]]:
+        """Return persisted Review rows eligible for proven-safe preparation.
+
+        This preparation boundary is deliberately separate from the Collector:
+        the Collector stays a read-only projection. GLOBAL/unknown emergency
+        ownership remains excluded. SELECTED is only Review provenance and is
+        therefore eligible for the same safe preparation as other Review rows.
+        """
+        stocks_root = (PROJECT_ROOT / "stocks").resolve()
+        targets: list[tuple[Path, str]] = []
+        for row in rows:
+            stock_dir_value = row.get("stock_dir")
+            code = str(row.get("code", "") or "").strip()
+            if not code or not stock_dir_value:
+                continue
+            try:
+                stock_dir = Path(stock_dir_value).resolve(strict=True)
+                stock_dir.relative_to(stocks_root)
+                state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict) or not _common_is_review_required_state(state):
+                continue
+            scope = str(state.get("emergency_scope", "") or "").strip().upper()
+            selected_provenance = scope == "SELECTED"
+            if (
+                (_common_is_emergency_stopped_state(state) and not selected_provenance)
+                or (scope and not selected_provenance)
+                or (
+                    (
+                        str(state.get("emergency_reason", "") or "").strip()
+                        or str(state.get("emergency_stopped_at", "") or "").strip()
+                    )
+                    and not selected_provenance
+                )
+                or _active_close_evidence(state)
+            ):
+                continue
+            targets.append((stock_dir, code))
+        return targets
+
+    def _prepare_safe_review_reconciliation(self) -> None:
+        """Use already-completed evidence only; never return a Review row.
+
+        LOCAL_SAFE currently has no writer-backed inference path: a terminal
+        ``EARLY_CLOSE_NO_TARGET`` residue is already canonical and is therefore
+        intentionally a no-write outcome even when offline.  BROKER_SAFE uses
+        the existing completed Recovery handoff and canonical services only.
+        """
+        rows = self._central_review_rows()
+        targets = self._auto_reconciliation_targets(rows)
+        self.last_position_reconciliation_result = {
+            "status": POSITION_STATUS_NO_CHANGE,
+            "reason": "LOCAL_SAFE_NO_WRITER_REQUIRED",
+            "service_calls": 0,
+        }
+        self.last_legacy_close_reconciliation_result = {
+            "status": LEGACY_CLOSE_STATUS_NO_CHANGE,
+            "reason": "LOCAL_SAFE_NO_WRITER_REQUIRED",
+            "service_calls": 0,
+        }
+        handoff = self._completed_recovery_handoff()
+        if handoff is None or not targets:
+            return
+
+        identity = handoff.get("identity")
+        snapshot = handoff.get("snapshot")
+        if not isinstance(identity, RecoverySessionIdentity) or not isinstance(
+            snapshot, BrokerAccountSnapshot
+        ):
+            return
+
+        position_results: list[dict[str, object]] = []
+        for stock_dir, code in targets:
+            try:
+                state_sha = state_file_sha256(stock_dir / "state.json")
+                result = reconcile_review_stock_position(
+                    stock_dir=stock_dir,
+                    stock_code=code,
+                    recovery_identity=identity,
+                    completed_recovery_identity=identity,
+                    broker_snapshot=snapshot,
+                    expected_account_no=identity.account_no,
+                    expected_trading_day=identity.trading_day,
+                    expected_login_session_id=identity.login_session_id,
+                    expected_recovery_session_id=identity.recovery_session_id,
+                    completed_recovery_status=str(handoff.get("recovery_status", "") or ""),
+                    holdings_complete=handoff.get("holdings_complete") is True,
+                    open_orders_complete=handoff.get("open_orders_complete") is True,
+                    expected_state_sha256=state_sha,
+                    order_queue_path=ORDER_QUEUE_PATH,
+                )
+            except Exception as exc:
+                result = {
+                    "status": POSITION_STATUS_FAILED,
+                    "reason": f"SERVICE_CALL_FAILED:{type(exc).__name__}",
+                    "stock_code": code,
+                }
+            position_results.append(dict(result))
+        self.last_position_reconciliation_result = {
+            "status": "COMPLETED",
+            "service_calls": len(position_results),
+            "results": position_results,
+        }
+
+        legacy_handoff = self._legacy_close_recovery_handoff()
+        if legacy_handoff is None:
+            return
+        legacy_identity = legacy_handoff.get("identity")
+        legacy_snapshot = legacy_handoff.get("snapshot")
+        if not isinstance(legacy_identity, RecoverySessionIdentity) or not isinstance(
+            legacy_snapshot, BrokerAccountSnapshot
+        ):
+            return
+        legacy_results: list[dict[str, object]] = []
+        for stock_dir, code in targets:
+            try:
+                state = json.loads((stock_dir / "state.json").read_text(encoding="utf-8"))
+                if (
+                    not isinstance(state, dict)
+                    or str(state.get("operation_command_mode", "") or "").strip().upper()
+                    != "EARLY_CLOSE"
+                    or str(state.get("operation_notice", "") or "").strip().upper()
+                    == "EARLY_CLOSE_NO_TARGET"
+                ):
+                    continue
+                result = reconcile_legacy_early_close_no_target(
+                    stock_dir=stock_dir,
+                    stock_code=code,
+                    recovery_identity=legacy_identity,
+                    completed_recovery_identity=legacy_identity,
+                    broker_snapshot=legacy_snapshot,
+                    expected_account_no=legacy_identity.account_no,
+                    expected_trading_day=legacy_identity.trading_day,
+                    expected_login_session_id=legacy_identity.login_session_id,
+                    expected_recovery_session_id=legacy_identity.recovery_session_id,
+                    completed_recovery_status=str(
+                        legacy_handoff.get("recovery_status", "") or ""
+                    ),
+                    holdings_complete=legacy_handoff.get("holdings_complete") is True,
+                    open_orders_complete=legacy_handoff.get("open_orders_complete") is True,
+                    expected_state_sha256=state_file_sha256(stock_dir / "state.json"),
+                    order_queue_path=ORDER_QUEUE_PATH,
+                )
+            except Exception as exc:
+                result = {
+                    "status": LEGACY_CLOSE_STATUS_FAILED,
+                    "reason": f"SERVICE_CALL_FAILED:{type(exc).__name__}",
+                    "stock_code": code,
+                }
+            legacy_results.append(dict(result))
+        self.last_legacy_close_reconciliation_result = {
+            "status": "COMPLETED",
+            "service_calls": len(legacy_results),
+            "results": legacy_results,
+        }
+
+    def refresh_review_items(self) -> None:
+        """Prepare only proven-safe evidence, then render the read-only view."""
+        self._prepare_safe_review_reconciliation()
+        self.load_review_items()
 
     def load_review_items(self) -> None:
         selected_stock_dirs = {
@@ -1106,8 +1347,20 @@ class GlobalReviewRequiredWindow(QDialog):
                 row.get("display_status", row.get("return_availability", "-")),
                 tooltip=tooltip,
             )
-            self._set_item(row_index, 4, row.get("review_entered_at", "미기록"), tooltip=tooltip)
-            self._set_item(row_index, 5, row.get("review_reason", "-"), Qt.AlignLeft | Qt.AlignVCenter, tooltip)
+            self._set_item(
+                row_index,
+                4,
+                row.get("review_entered_at", "미기록"),
+                Qt.AlignCenter,
+                tooltip,
+            )
+            self._set_item(
+                row_index,
+                5,
+                row.get("review_reason", "-"),
+                Qt.AlignCenter,
+                tooltip,
+            )
             self._set_item(row_index, 6, row.get("review_location", "-"), tooltip=tooltip)
 
             first_item = self.table.item(row_index, 0)
@@ -1148,20 +1401,13 @@ class GlobalReviewRequiredWindow(QDialog):
             else LONG_HOLD_BADGE_IDLE_COLOR
         )
         self.long_hold_toggle_button.setEnabled(True)
-        badge_content_height = max(
-            AUTO_TRADE_SETTING_BADGE_HEIGHT - 2,
-            QFontMetrics(self.long_hold_toggle_button.font()).height(),
-        )
         self.long_hold_toggle_button.setStyleSheet(
             auto_trade_setting_badge_stylesheet(
                 "QPushButton#reviewLongHoldToggle",
                 text_color=color,
                 border_color=color,
             )
-            + "QPushButton#reviewLongHoldToggle {"
-            f" min-height: {badge_content_height}px;"
-            f" max-height: {badge_content_height}px;"
-            " }"
+            + "QPushButton#reviewLongHoldToggle { margin: 1px 0; }"
             + "QPushButton#reviewLongHoldToggle:focus { outline: none; }"
         )
 
@@ -1208,6 +1454,380 @@ class GlobalReviewRequiredWindow(QDialog):
             result.append((stock_dir, code, name))
 
         return result
+
+    def _completed_recovery_handoff(self) -> dict[str, object] | None:
+        owner = persistent_feature_owner(self)
+        getter = getattr(owner, "latest_completed_recovery_handoff", None)
+        if not callable(getter):
+            return None
+        try:
+            handoff = getter()
+        except Exception:
+            return None
+        if not isinstance(handoff, dict):
+            return None
+        identity = handoff.get("identity")
+        snapshot = handoff.get("snapshot")
+        if (
+            not isinstance(identity, RecoverySessionIdentity)
+            or not isinstance(snapshot, BrokerAccountSnapshot)
+            or handoff.get("recovery_status") != ACCOUNT_COMPLETED
+            or handoff.get("holdings_complete") is not True
+            or handoff.get("open_orders_complete") is not True
+            or not snapshot.is_complete
+            or bool(snapshot.errors)
+            or snapshot.account_no != identity.account_no
+            or snapshot.trading_day != identity.trading_day
+            or snapshot.recovery_session_id != identity.recovery_session_id
+            or snapshot.requested_at != identity.requested_at
+        ):
+            return None
+        return handoff
+
+    def _position_reconciliation_targets(self) -> list[tuple[Path, str, str]]:
+        """Return only persisted, readable Review targets from the selection."""
+        stocks_root = (PROJECT_ROOT / "stocks").resolve()
+        targets: list[tuple[Path, str, str]] = []
+        for stock_dir, code, name in self.selected_stock_dirs():
+            try:
+                resolved_dir = stock_dir.resolve(strict=True)
+                resolved_dir.relative_to(stocks_root)
+                state_path = resolved_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict) or not _common_is_review_required_state(state):
+                continue
+            targets.append((resolved_dir, code, name))
+        return targets
+
+    def _legacy_close_recovery_handoff(self) -> dict[str, object] | None:
+        """Return the existing handoff only while current GUI identities match."""
+        handoff = self._completed_recovery_handoff()
+        if handoff is None:
+            return None
+        identity = handoff.get("identity")
+        if not isinstance(identity, RecoverySessionIdentity):
+            return None
+        owner = persistent_feature_owner(self)
+        account_getter = getattr(owner, "selected_account_no", None)
+        api = getattr(owner, "kiwoom_api", None)
+        login_getter = getattr(api, "login_session_id", None)
+        if not callable(account_getter) or not callable(login_getter):
+            return None
+        try:
+            account_no = str(account_getter() or "").strip()
+            login_session_id = str(login_getter() or "").strip()
+        except Exception:
+            return None
+        if (
+            not account_no
+            or not login_session_id
+            or identity.account_no != account_no
+            or identity.login_session_id != login_session_id
+            or identity.trading_day != datetime.now().date().isoformat()
+        ):
+            return None
+        return handoff
+
+    def _legacy_close_reconciliation_targets(self) -> list[tuple[Path, str, str]]:
+        """Return selected persisted Review rows eligible for the explicit action."""
+        stocks_root = (PROJECT_ROOT / "stocks").resolve()
+        targets: list[tuple[Path, str, str]] = []
+        for stock_dir, code, name in self.selected_stock_dirs():
+            try:
+                resolved_dir = stock_dir.resolve(strict=True)
+                resolved_dir.relative_to(stocks_root)
+                state = json.loads((resolved_dir / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict) or not _common_is_review_required_state(state):
+                continue
+            if str(state.get("operation_command_mode", "") or "").strip().upper() != "EARLY_CLOSE":
+                continue
+            if str(state.get("operation_notice", "") or "").strip().upper() == "EARLY_CLOSE_NO_TARGET":
+                continue
+            targets.append((resolved_dir, code, name))
+        return targets
+
+    def reconcile_selected_legacy_early_close(self) -> None:
+        """Explicitly reconcile selected legacy EARLY_CLOSE Review residues."""
+        handoff = self._legacy_close_recovery_handoff()
+        selected_count = len(self.selected_stock_dirs())
+        targets = self._legacy_close_reconciliation_targets()
+        skipped = max(selected_count - len(targets), 0)
+        if handoff is None:
+            self.last_legacy_close_reconciliation_result = {
+                "status": LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE,
+                "reason": "COMPLETED_RECOVERY_HANDOFF_UNAVAILABLE_OR_MISMATCH",
+                "service_calls": 0,
+                "skipped": skipped,
+            }
+            show_toast(self, "현재 계좌와 일치하는 완료 Recovery가 없어 정합할 수 없습니다.")
+            return
+        if not targets:
+            self.last_legacy_close_reconciliation_result = {
+                "status": LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE,
+                "reason": "ELIGIBLE_LEGACY_EARLY_CLOSE_REVIEW_REQUIRED",
+                "service_calls": 0,
+                "skipped": skipped,
+            }
+            show_toast(self, "조기마감 상태를 정합할 검토종목을 선택하세요.")
+            return
+
+        prepared: list[tuple[Path, str, str, str]] = []
+        preflight_failed = 0
+        for stock_dir, code, name in targets:
+            try:
+                state_sha = state_file_sha256(stock_dir / "state.json")
+            except Exception:
+                preflight_failed += 1
+                continue
+            prepared.append((stock_dir, code, name, state_sha))
+        if not prepared:
+            self.last_legacy_close_reconciliation_result = {
+                "status": LEGACY_CLOSE_STATUS_FAILED,
+                "reason": "STATE_EVIDENCE_CAPTURE_FAILED",
+                "service_calls": 0,
+                "failed": preflight_failed,
+                "skipped": skipped,
+            }
+            show_toast(self, f"조기마감정합 실패 | 실패 {preflight_failed}개")
+            return
+
+        identity = handoff.get("identity")
+        snapshot = handoff.get("snapshot")
+        target_lines = "\n".join(
+            f"- {code} {name}".rstrip() for _stock_dir, code, name, _sha in prepared
+        )
+        confirmation = QMessageBox.question(
+            self,
+            "조기마감정합",
+            "현재 완료된 Recovery의 보유·미체결 정보를 기준으로 선택 종목의 "
+            "과거 조기마감 상태를 '조기마감 대상 없음'으로 정합합니다.\n\n"
+            "검토상태, 긴급정지, 보유정보, 루틴, 운영상태는 변경하지 않습니다.\n\n"
+            f"대상: {len(prepared)}개\n{target_lines}\n\n"
+            f"Recovery session: {getattr(identity, 'recovery_session_id', '')}\n"
+            f"계좌: {str(handoff.get('account_display', '') or '')}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirmation != QMessageBox.Yes:
+            self.last_legacy_close_reconciliation_result = {
+                "status": "CANCELED",
+                "reason": "OPERATOR_CANCELED",
+                "service_calls": 0,
+                "skipped": skipped,
+            }
+            return
+
+        current_handoff = self._legacy_close_recovery_handoff()
+        if (
+            current_handoff is None
+            or current_handoff.get("identity") != identity
+            or current_handoff.get("snapshot") is not snapshot
+        ):
+            self.last_legacy_close_reconciliation_result = {
+                "status": LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE,
+                "reason": "RECOVERY_HANDOFF_CHANGED_DURING_CONFIRMATION",
+                "service_calls": 0,
+                "skipped": skipped,
+            }
+            show_toast(self, "확인 중 Recovery 정보가 변경되어 조기마감정합을 차단했습니다.")
+            return
+
+        counts = {
+            LEGACY_CLOSE_STATUS_COMPLETED: 0,
+            LEGACY_CLOSE_STATUS_NO_CHANGE: 0,
+            LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE: 0,
+            LEGACY_CLOSE_STATUS_FAILED: preflight_failed,
+        }
+        results: list[dict[str, object]] = []
+        for stock_dir, code, _name, state_sha in prepared:
+            try:
+                result = reconcile_legacy_early_close_no_target(
+                    stock_dir=stock_dir,
+                    stock_code=code,
+                    recovery_identity=identity,
+                    completed_recovery_identity=identity,
+                    broker_snapshot=snapshot,
+                    expected_account_no=getattr(identity, "account_no", ""),
+                    expected_trading_day=getattr(identity, "trading_day", ""),
+                    expected_login_session_id=getattr(identity, "login_session_id", ""),
+                    expected_recovery_session_id=getattr(identity, "recovery_session_id", ""),
+                    completed_recovery_status=str(handoff.get("recovery_status", "") or ""),
+                    holdings_complete=handoff.get("holdings_complete") is True,
+                    open_orders_complete=handoff.get("open_orders_complete") is True,
+                    expected_state_sha256=state_sha,
+                    order_queue_path=ORDER_QUEUE_PATH,
+                )
+            except Exception as exc:
+                result = {
+                    "status": LEGACY_CLOSE_STATUS_FAILED,
+                    "reason": f"SERVICE_CALL_FAILED:{type(exc).__name__}",
+                    "stock_code": code,
+                }
+            status = str(result.get("status", "") or "")
+            counts[status if status in counts else LEGACY_CLOSE_STATUS_FAILED] += 1
+            results.append(dict(result))
+
+        self.last_legacy_close_reconciliation_result = {
+            "status": "COMPLETED",
+            "service_calls": len(prepared),
+            "completed": counts[LEGACY_CLOSE_STATUS_COMPLETED],
+            "no_change": counts[LEGACY_CLOSE_STATUS_NO_CHANGE],
+            "blocked": counts[LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE],
+            "failed": counts[LEGACY_CLOSE_STATUS_FAILED],
+            "skipped": skipped,
+            "results": results,
+        }
+        self.load_review_items()
+        show_toast(
+            self,
+            "조기마감정합 완료 | "
+            f"변경 {counts[LEGACY_CLOSE_STATUS_COMPLETED]} | "
+            f"변경없음 {counts[LEGACY_CLOSE_STATUS_NO_CHANGE]} | "
+            f"차단 {counts[LEGACY_CLOSE_STATUS_BLOCKED_EVIDENCE]} | "
+            f"대상아님 {skipped} | "
+            f"실패 {counts[LEGACY_CLOSE_STATUS_FAILED]}",
+        )
+
+    def reconcile_selected_position_information(self) -> None:
+        """Explicitly apply one completed Recovery snapshot through Phase A."""
+        handoff = self._completed_recovery_handoff()
+        targets = self._position_reconciliation_targets()
+        if handoff is None:
+            self.last_position_reconciliation_result = {
+                "status": POSITION_STATUS_BLOCKED_EVIDENCE,
+                "reason": "COMPLETED_RECOVERY_HANDOFF_UNAVAILABLE",
+                "service_calls": 0,
+            }
+            show_toast(self, "완료된 Recovery 보유정보가 없어 정합할 수 없습니다.")
+            return
+        if not targets:
+            self.last_position_reconciliation_result = {
+                "status": POSITION_STATUS_BLOCKED_EVIDENCE,
+                "reason": "VALID_REVIEW_SELECTION_REQUIRED",
+                "service_calls": 0,
+            }
+            show_toast(self, "보유정보를 정합할 검토종목을 선택하세요.")
+            return
+
+        prepared: list[tuple[Path, str, str, str]] = []
+        preflight_failed = 0
+        for stock_dir, code, name in targets:
+            try:
+                state_sha = state_file_sha256(stock_dir / "state.json")
+            except Exception:
+                preflight_failed += 1
+                continue
+            prepared.append((stock_dir, code, name, state_sha))
+        if not prepared:
+            self.last_position_reconciliation_result = {
+                "status": POSITION_STATUS_FAILED,
+                "reason": "STATE_EVIDENCE_CAPTURE_FAILED",
+                "service_calls": 0,
+                "failed": preflight_failed,
+            }
+            show_toast(self, f"보유정보정합 실패 | 실패 {preflight_failed}개")
+            return
+
+        identity = handoff.get("identity")
+        snapshot = handoff.get("snapshot")
+        target_lines = "\n".join(
+            f"- {code} {name}".rstrip() for _stock_dir, code, name, _sha in prepared
+        )
+        confirmation = QMessageBox.question(
+            self,
+            "보유정보정합",
+            "Broker Recovery 완료 보유정보를 기준으로 선택 종목의 "
+            "보유수량/평단만 정합합니다.\n"
+            "검토상태, 긴급정지, 마감 상태는 변경하지 않습니다.\n\n"
+            f"대상: {len(prepared)}개\n{target_lines}\n\n"
+            f"Recovery session: {getattr(identity, 'recovery_session_id', '')}\n"
+            f"계좌: {str(handoff.get('account_display', '') or '')}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirmation != QMessageBox.Yes:
+            self.last_position_reconciliation_result = {
+                "status": "CANCELED",
+                "reason": "OPERATOR_CANCELED",
+                "service_calls": 0,
+            }
+            return
+
+        current_handoff = self._completed_recovery_handoff()
+        if (
+            current_handoff is None
+            or current_handoff.get("identity") != identity
+            or current_handoff.get("snapshot") is not snapshot
+        ):
+            self.last_position_reconciliation_result = {
+                "status": POSITION_STATUS_BLOCKED_EVIDENCE,
+                "reason": "RECOVERY_HANDOFF_CHANGED_DURING_CONFIRMATION",
+                "service_calls": 0,
+            }
+            show_toast(self, "확인 중 Recovery 보유정보가 변경되어 정합을 차단했습니다.")
+            return
+
+        counts = {
+            POSITION_STATUS_APPLIED: 0,
+            POSITION_STATUS_NO_CHANGE: 0,
+            POSITION_STATUS_BLOCKED_EVIDENCE: 0,
+            POSITION_STATUS_FAILED: preflight_failed,
+        }
+        results: list[dict[str, object]] = []
+        for stock_dir, code, _name, state_sha in prepared:
+            try:
+                result = reconcile_review_stock_position(
+                    stock_dir=stock_dir,
+                    stock_code=code,
+                    recovery_identity=identity,
+                    completed_recovery_identity=identity,
+                    broker_snapshot=snapshot,
+                    expected_account_no=getattr(identity, "account_no", ""),
+                    expected_trading_day=getattr(identity, "trading_day", ""),
+                    expected_login_session_id=getattr(identity, "login_session_id", ""),
+                    expected_recovery_session_id=getattr(
+                        identity, "recovery_session_id", ""
+                    ),
+                    completed_recovery_status=str(
+                        handoff.get("recovery_status", "") or ""
+                    ),
+                    holdings_complete=handoff.get("holdings_complete") is True,
+                    open_orders_complete=handoff.get("open_orders_complete") is True,
+                    expected_state_sha256=state_sha,
+                    order_queue_path=ORDER_QUEUE_PATH,
+                )
+            except Exception as exc:
+                result = {
+                    "status": POSITION_STATUS_FAILED,
+                    "reason": f"SERVICE_CALL_FAILED:{type(exc).__name__}",
+                    "stock_code": code,
+                }
+            status = str(result.get("status", "") or "")
+            counts[status if status in counts else POSITION_STATUS_FAILED] += 1
+            results.append(dict(result))
+
+        self.last_position_reconciliation_result = {
+            "status": "COMPLETED",
+            "service_calls": len(prepared),
+            "applied": counts[POSITION_STATUS_APPLIED],
+            "no_change": counts[POSITION_STATUS_NO_CHANGE],
+            "blocked": counts[POSITION_STATUS_BLOCKED_EVIDENCE],
+            "failed": counts[POSITION_STATUS_FAILED],
+            "results": results,
+        }
+        self.load_review_items()
+        show_toast(
+            self,
+            "보유정보정합 완료 | "
+            f"변경 {counts[POSITION_STATUS_APPLIED]} | "
+            f"변경없음 {counts[POSITION_STATUS_NO_CHANGE]} | "
+            f"차단 {counts[POSITION_STATUS_BLOCKED_EVIDENCE]} | "
+            f"실패 {counts[POSITION_STATUS_FAILED]}",
+        )
 
     def _review_exit_block_reason(self, stock_dir: Path, state: dict[str, object]) -> str:
         """복귀/미지정 전 필요한 최소 무결성 조건을 확인한다."""
@@ -1366,11 +1986,7 @@ class GlobalReviewRequiredWindow(QDialog):
         """정상화할 수 없는 검토종목의 로컬 프로젝트 데이터를 폐기한다."""
         targets = self.selected_stock_dirs()
         if not targets:
-            QMessageBox.information(
-                self,
-                "강제초기화",
-                "강제초기화할 검토종목을 선택하세요.",
-            )
+            show_toast(self, "강제초기화할 검토종목을 선택하세요.")
             return
 
         from gui_stock_register_window import (

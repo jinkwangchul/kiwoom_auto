@@ -36,7 +36,7 @@ def persistent_feature_owner(window: QWidget | None) -> QWidget | None:
             try:
                 if not sip.isdeleted(owner):
                     return owner
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass
     parent_getter = getattr(window, "parent", None)
     if callable(parent_getter):

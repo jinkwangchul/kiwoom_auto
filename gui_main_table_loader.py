@@ -18,7 +18,7 @@ from dataclasses import replace
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QFontMetrics
@@ -51,6 +51,7 @@ from gui_auto_trade_display import (
     apply_auto_trade_setting_liquidation_style,
     apply_auto_trade_setting_protection_row_style,
     auto_trade_setting_status_sort_rank,
+    confirmable_stock_profit_metric,
     create_auto_trade_operation_item,
     create_routine_profit_signal_widget,
     create_auto_trade_setting_activity_status_item,
@@ -59,6 +60,7 @@ from gui_auto_trade_display import (
     format_routine_buy_limit_usage,
     format_routine_used_amount,
     profit_loss_value_color,
+    ratio_metric_text,
     ratio_metric_width,
     routine_profit_signal,
     split_ratio_metric_text,
@@ -168,6 +170,8 @@ ROUTINE_STOCK_PROFIT_LED_ROLE = Qt.UserRole + 218
 ROUTINE_STOCK_INITIAL_BUY_ROLE = Qt.UserRole + 219
 ROUTINE_STOCK_DISPLAY_ROLE = Qt.UserRole + 220
 ROUTINE_PARENT_AGGREGATE_VALUES_ROLE = Qt.UserRole + 221
+ROUTINE_PARENT_PROFIT_ROLE = Qt.UserRole + 222
+_MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
 ROUTINE_ROW_PARENT = "definition"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
@@ -185,7 +189,7 @@ ROUTINE_INSTANCE_NAME_WIDTH = 180
 ROUTINE_INSTANCE_ROW_HEIGHT = 28
 ROUTINE_STOCK_ROW_HEIGHT = 24
 ROUTINE_STATUS_STAMP_WIDTH = 82
-ROUTINE_STATUS_STAMP_HEIGHT = 22
+ROUTINE_STATUS_STAMP_HEIGHT = 26
 ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES = {
     "status": "[기본운영]",
     "registered": "등록(99)",
@@ -916,6 +920,26 @@ def routine_instance_profit_text(
     return f"수익({amount_text} / {rate_text})", color
 
 
+def routine_group_profit_projection(
+    instance_ids: Iterable[object],
+    instance_counts: dict[str, dict[str, object]],
+) -> tuple[str, str, float]:
+    """Aggregate definition/group profit with the same contract as a routine row."""
+
+    counts = [
+        instance_counts.get(str(instance_id or "").strip(), {})
+        for instance_id in instance_ids
+    ]
+    amount = sum(float(count.get("profit_amount") or 0) for count in counts)
+    cost_basis = sum(float(count.get("profit_cost_basis") or 0) for count in counts)
+    text, color = routine_instance_profit_text(
+        profit_amount=amount,
+        cost_basis=cost_basis,
+        unknown=any(bool(count.get("profit_unknown")) for count in counts),
+    )
+    return text, color, amount
+
+
 class RoutineInstanceStatusStamp(QWidget):
     def __init__(
         self,
@@ -990,7 +1014,7 @@ def create_routine_instance_status_widget(
     )
 
     stamp_layout = QHBoxLayout(stamp)
-    stamp_layout.setContentsMargins(4, 0, 4, 0)
+    stamp_layout.setContentsMargins(4, 2, 4, 2)
     stamp_layout.setSpacing(0)
     stamp_layout.setAlignment(Qt.AlignCenter)
     stamp_color = color or "#9CA3AF"
@@ -1270,14 +1294,6 @@ def _instance_stock_counts(
     stock_scope: str | None = None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
-    current_running_stock_dirs = {
-        str(Path(stock_dir).resolve())
-        for stock_dir, _code, _name in (
-            auto_trade_running_registered_operation_targets(window)
-            if window is not None
-            else []
-        )
-    }
     clean_scope = str(stock_scope or "").strip().lower()
     if clean_scope not in {
         "normal",
@@ -1293,21 +1309,43 @@ def _instance_stock_counts(
             clean_scope = "normal"
         else:
             clean_scope = "all_non_review"
-    operation_scope_running = bool(current_running_stock_dirs)
-    valid_instance_ids = {
-        instance.instance_id for instance in load_persisted_routine_instances()
-    }
-    for stock in read_base_stocks():
-        stock_path = str(stock.get("stock_path", "") or "").strip()
-        if not stock_path:
-            continue
-        stock_dir = Path(__file__).resolve().parent / stock_path
-        config = read_json_dict(stock_dir / "config.json")
+    static_cache = _main_pnl_refresh_static_cache(window)
+    dynamic_stocks: list[tuple[dict[str, object], dict[str, object]]] = []
+    registered_targets: list[tuple[Path, str, str]] = []
+    operation_excluded_by_stock_dir: dict[str, bool] = {}
+    state_by_stock_dir: dict[str, dict[str, object]] = {}
+    for stock in static_cache["stocks"]:
+        stock_dir = Path(stock["stock_dir"])
         state = read_json_dict(stock_dir / "state.json")
-        instance_id = str(config.get("assigned_routine_instance_id", "") or "").strip()
-        if not instance_id or instance_id not in valid_instance_ids:
-            continue
-        operation_excluded = is_operation_excluded(config)
+        operation_excluded = bool(stock.get("operation_excluded", False))
+        code = str(stock.get("code", "") or "").strip()
+        name = str(stock.get("name", "") or "").strip()
+        stock_dir_key = str(stock.get("stock_dir_key", "") or stock_dir)
+        registered_targets.append((stock_dir, code, name))
+        operation_excluded_by_stock_dir[stock_dir_key] = operation_excluded
+        state_by_stock_dir[stock_dir_key] = state
+        dynamic_stocks.append((stock, state))
+    current_running_stock_dirs = {
+        str(Path(stock_dir))
+        for stock_dir, _code, _name in (
+            auto_trade_running_registered_operation_targets(
+                window,
+                registered_targets=registered_targets,
+                operation_excluded_by_stock_dir=operation_excluded_by_stock_dir,
+                state_by_stock_dir=state_by_stock_dir,
+            )
+            if window is not None
+            else []
+        )
+    }
+    operation_scope_running = bool(current_running_stock_dirs)
+    for stock, state in dynamic_stocks:
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        stock_dir = Path(stock["stock_dir"])
+        stock_dir_key = str(stock.get("stock_dir_key", "") or stock_dir)
+        current_running = stock_dir_key in current_running_stock_dirs
+        instance_id = str(stock.get("instance_id", "") or "").strip()
+        operation_excluded = bool(stock.get("operation_excluded", False))
         review_required = is_review_required_state(state)
         item = counts.setdefault(
             instance_id,
@@ -1324,6 +1362,7 @@ def _instance_stock_counts(
                 "profit_cost_basis": 0,
                 "profit_unknown": False,
                 "pnl_stock_codes": [],
+                "pnl_flat_stock_codes": [],
                 "stocks": [],
             },
         )
@@ -1335,11 +1374,10 @@ def _instance_stock_counts(
         else:
             item["normal"] += 1
             item["operation_or_stopped"] += 1
-            if str(stock_dir.resolve()) in current_running_stock_dirs:
+            if current_running:
                 item["operation_running"] += 1
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
-        current_running = str(stock_dir.resolve()) in current_running_stock_dirs
         if clean_scope == "all":
             include_stock_row = True
         elif clean_scope == "review":
@@ -1372,6 +1410,8 @@ def _instance_stock_counts(
         avg_price = average_price_from_state(state)
         if code:
             item["pnl_stock_codes"].append(code)
+            if holding_qty == 0:
+                item["pnl_flat_stock_codes"].append(code)
         if holding_qty > 0 and avg_price > 0:
             cost_basis = holding_qty * avg_price
             item["consumed_amount"] = float(item["consumed_amount"]) + cost_basis
@@ -1395,6 +1435,68 @@ def _instance_stock_counts(
     return counts
 
 
+def _invalidate_main_pnl_refresh_cache(window) -> None:
+    """Invalidate process-local metadata before the canonical table reload."""
+    if window is not None:
+        setattr(window, _MAIN_PNL_STATIC_CACHE_ATTR, None)
+
+
+def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
+    """Return slow-changing routine/assignment metadata for the 1-second tick."""
+    cached = (
+        getattr(window, _MAIN_PNL_STATIC_CACHE_ATTR, None)
+        if window is not None
+        else None
+    )
+    if isinstance(cached, dict):
+        return cached
+
+    definitions = tuple(load_routine_definitions())
+    instances = tuple(load_persisted_routine_instances())
+    valid_instance_ids = {
+        str(instance_id)
+        for instance in instances
+        if (instance_id := getattr(instance, "instance_id", ""))
+    }
+    stocks: list[dict[str, object]] = []
+    for stock in read_base_stocks():
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        if not stock_path:
+            continue
+        stock_dir = Path(__file__).resolve().parent / stock_path
+        config = read_json_dict(stock_dir / "config.json")
+        instance_id = str(
+            config.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        if not instance_id or instance_id not in valid_instance_ids:
+            continue
+        stocks.append(
+            {
+                "stock_path": stock_path,
+                "stock_dir": stock_dir,
+                "stock_dir_key": str(stock_dir),
+                "instance_id": instance_id,
+                "operation_excluded": is_operation_excluded(config),
+                "code": str(stock.get("code", "") or "").strip(),
+                "name": str(stock.get("name", "") or "").strip(),
+                "enabled": bool(stock.get("enabled", True)),
+            }
+        )
+    result: dict[str, object] = {
+        "definitions": definitions,
+        "instances": instances,
+        "stocks": tuple(stocks),
+    }
+    if window is not None:
+        setattr(window, _MAIN_PNL_STATIC_CACHE_ATTR, result)
+    return result
+
+
+def _main_pnl_refresh_routine_metadata(window) -> tuple[list[object], list[object]]:
+    cache = _main_pnl_refresh_static_cache(window)
+    return list(cache["definitions"]), list(cache["instances"])
+
+
 def _refresh_instance_pnl_from_batch(
     instance_counts: dict[str, dict[str, object]],
 ) -> dict[str, dict[str, object]]:
@@ -1415,10 +1517,20 @@ def _refresh_instance_pnl_from_batch(
         count["profit_amount"] = 0
         count["profit_cost_basis"] = 0
         count["profit_unknown"] = False
+        flat_codes = {
+            str(code or "").strip().lstrip("A")
+            for code in count.get("pnl_flat_stock_codes", [])
+        }
         for raw_code in count.get("pnl_stock_codes", []):
             code = str(raw_code or "").strip().lstrip("A")
             result = pnl_by_code.get(code, {})
             if result.get("available") is not True:
+                if (
+                    code in flat_codes
+                    and str(result.get("reason") or "").strip()
+                    == "PNL_CYCLE_BOOTSTRAP_REQUIRED"
+                ):
+                    continue
                 count["profit_unknown"] = True
                 continue
             count["profit_amount"] = float(count["profit_amount"]) + float(
@@ -1515,8 +1627,7 @@ def main_refresh_pnl_only(window) -> None:
     """Refresh monitoring stock/instance PnL without rebuilding either table."""
     instance_counts = _instance_stock_counts(window=window)
     pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
-    definitions = load_routine_definitions()
-    instances = load_persisted_routine_instances()
+    definitions, instances = _main_pnl_refresh_routine_metadata(window)
     _update_main_routine_summary(window, definitions, instances, instance_counts)
     changed = False
     for row in range(window.routine_table.rowCount()):
@@ -1532,10 +1643,8 @@ def main_refresh_pnl_only(window) -> None:
             result = pnl_by_code.get(code.lstrip("A"), {})
             if result.get("available") is not True:
                 continue
-            amount = float(result.get("cumulative_profit") or 0)
-            rate = result.get("cumulative_rate")
             updated = list(metrics)
-            updated[2] = replace(updated[2], value1=format_signed_money(amount), value2=format_signed_percent(rate, digits=2) if rate is not None else "-")
+            updated[2], _amount, _rate = confirmable_stock_profit_metric(result)
             if tuple(updated) != metrics:
                 item.setData(ROUTINE_STOCK_METRICS_ROLE, tuple(updated))
                 changed = True
@@ -1550,6 +1659,21 @@ def main_refresh_pnl_only(window) -> None:
             if label.text() != text:
                 label.setText(text)
                 label.setStyleSheet(f"color: {color}; border: none; background: transparent;")
+                changed = True
+        elif kind == ROUTINE_ROW_PARENT:
+            definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
+            definition_instance_ids = (
+                instance.instance_id
+                for instance in instances
+                if str(instance.definition_id) == definition_id
+            )
+            text, color, _amount = routine_group_profit_projection(
+                definition_instance_ids,
+                instance_counts,
+            )
+            profit_data = (text, color)
+            if item.data(ROUTINE_PARENT_PROFIT_ROLE) != profit_data:
+                item.setData(ROUTINE_PARENT_PROFIT_ROLE, profit_data)
                 changed = True
     if changed:
         window.routine_table.viewport().update()
@@ -1917,7 +2041,7 @@ def _routine_tree_stock_metric_values(
         stock,
         current_price,
     )
-    holding_metric, price_metric, profit_metric, _pending_metric, profit_amount, profit_rate = (
+    holding_metric, price_metric, _base_profit_metric, _pending_metric, _profit_amount, _profit_rate = (
         stock_position_metric_values(
             holding_qty=holding_qty,
             avg_price=avg_price,
@@ -1926,31 +2050,14 @@ def _routine_tree_stock_metric_values(
             sell_pending_qty=sell_pending_qty,
         )
     )
-    profit_metric = replace(profit_metric, label="수익")
     cycle_pnl = project_confirmable_cumulative_pnl(
         str(stock.get("code") or ""),
         current_price,
         project_root=Path(__file__).resolve().parent,
     )
-    if cycle_pnl.get("available") is True:
-        profit_amount = float(cycle_pnl.get("cumulative_profit") or 0)
-        profit_rate = cycle_pnl.get("cumulative_rate")
-        profit_metric = replace(
-            profit_metric,
-            value1=format_signed_money(profit_amount),
-            value2=format_signed_percent(
-                profit_rate if profit_rate is not None else 0.0,
-                digits=2,
-            ),
-        )
-    else:
-        profit_amount = 0.0
-        profit_rate = 0.0
-        profit_metric = replace(
-            profit_metric,
-            value1=format_signed_money(profit_amount),
-            value2=format_signed_percent(profit_rate, digits=2),
-        )
+    profit_metric, profit_amount, profit_rate = confirmable_stock_profit_metric(
+        cycle_pnl
+    )
     buy_trade_count, sell_trade_count = trade_counts
     trade_metric = RatioMetricDisplay(
         label="매매",
@@ -2061,9 +2168,7 @@ def _routine_tree_stock_row(
     )
     profit_metric = stock_metrics[2] if len(stock_metrics) > 2 else None
     if isinstance(profit_metric, RatioMetricDisplay) and len(stock_values) > 9:
-        stock_values[9] = (
-            f"{profit_metric.label}({profit_metric.value1} / {profit_metric.value2})"
-        )
+        stock_values[9] = ratio_metric_text(profit_metric)
     stock_values = [
         *stock_values,
         limit_text,
@@ -2215,6 +2320,7 @@ def main_load_routine_table(window) -> None:
     인스턴스 한도는 routine_instances 메타데이터, 소모/손익은 배정 종목
     state.json의 보유수량/평단/현재가 후보 필드만 사용한다.
     """
+    _invalidate_main_pnl_refresh_cache(window)
     operation_excluded_only = bool(
         getattr(window, "_main_routine_excluded_only", False)
     )
@@ -2230,8 +2336,7 @@ def main_load_routine_table(window) -> None:
         stock_scope=stock_scope,
     )
     _refresh_instance_pnl_from_batch(instance_counts)
-    definitions = load_routine_definitions()
-    instances = load_persisted_routine_instances()
+    definitions, instances = _main_pnl_refresh_routine_metadata(window)
     _update_main_routine_summary(window, definitions, instances, instance_counts)
     trade_counts_by_code = current_stock_trade_counts_by_code()
     window._routine_assigned_stock_count_by_instance = {
@@ -2240,6 +2345,19 @@ def main_load_routine_table(window) -> None:
         )
         for instance in instances
     }
+    total_groups = len(definitions)
+    total_instances = len(instances)
+    total_stocks = sum(
+        int(
+            window._routine_assigned_stock_count_by_instance.get(
+                instance.instance_id, 0
+            )
+        )
+        for instance in instances
+    )
+    apply_routine_height = getattr(window, "_apply_main_routine_table_height", None)
+    if callable(apply_routine_height):
+        apply_routine_height(total_groups, total_instances, total_stocks)
     sync_routine_selection_state(window, definitions, instances)
     display_level = str(
         getattr(window, "_main_routine_display_level", "") or ""
@@ -2278,7 +2396,8 @@ def main_load_routine_table(window) -> None:
     collapsed = getattr(window, "_collapsed_routine_definition_ids", set())
     for definition in definitions:
         children: list[dict[str, object]] = []
-        for instance in by_definition.get(definition.definition_id, []):
+        definition_instances = by_definition.get(definition.definition_id, [])
+        for instance in definition_instances:
             count = instance_counts.get(
                 instance.instance_id,
                 {
@@ -2408,6 +2527,12 @@ def main_load_routine_table(window) -> None:
             int(item.get("excluded", 0) or 0) for item in all_children
         )
         parent_review = sum(int(item["review"]) for item in all_children)
+        parent_profit_text, parent_profit_color, parent_profit_amount = (
+            routine_group_profit_projection(
+                (instance.instance_id for instance in definition_instances),
+                instance_counts,
+            )
+        )
         groups.append(
             {
                 "kind": ROUTINE_ROW_PARENT,
@@ -2427,8 +2552,9 @@ def main_load_routine_table(window) -> None:
                 "buy_limit_configured": False,
                 "buy_limit_display": "",
                 "consumed_display": "",
-                "profit_display": "",
-                "profit_color": "",
+                "profit_display": parent_profit_text,
+                "profit_amount": parent_profit_amount,
+                "profit_color": parent_profit_color,
                 "collapsed": definition.definition_id in collapsed,
                 "children": children,
             }
@@ -2649,6 +2775,13 @@ def main_load_routine_table(window) -> None:
                     item.setData(
                         ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
                         aggregate_values,
+                    )
+                    item.setData(
+                        ROUTINE_PARENT_PROFIT_ROLE,
+                        (
+                            str(row_data.get("profit_display", "")),
+                            str(row_data.get("profit_color", "")),
+                        ),
                     )
                     item.setData(
                         ROUTINE_PARENT_COLLAPSED_ROLE,

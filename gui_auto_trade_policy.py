@@ -265,7 +265,11 @@ def auto_trade_setting_display_status_for_current_session(
         else:
             raw_display_status = display_status_text_for_gui(policy_status)
 
-    return auto_trade_setting_display_status(raw_display_status)
+    emergency_scope = str(state.get("emergency_scope", "") or "").strip()
+    return auto_trade_setting_display_status(
+        raw_display_status,
+        emergency_scope=emergency_scope,
+    )
 
 
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:

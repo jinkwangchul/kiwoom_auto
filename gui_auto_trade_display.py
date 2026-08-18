@@ -116,7 +116,9 @@ STOCK_POSITION_METRIC_SAMPLES = {
     "보유": ("99999주", "999,999,999"),
     "가격": ("9,999,999", "9,999,999"),
     "손익": ("-99,999,999", "-00.00%"),
+    "수익": ("-99,999,999", "-00.00%"),
     "미체결": ("99", "99"),
+    "매매": ("99", "99"),
 }
 
 @dataclass(frozen=True)
@@ -144,6 +146,32 @@ class RatioMetricLayout:
     value2_width: int
     close_width: int
     total_width: int
+
+
+def confirmable_stock_profit_metric(
+    projection: object,
+) -> tuple[RatioMetricDisplay, float, float]:
+    """관제창과 설정창이 공유하는 확정 손익 표시 계약."""
+
+    result = projection if isinstance(projection, dict) else {}
+    if result.get("available") is True:
+        profit_amount = float(result.get("cumulative_profit") or 0)
+        raw_rate = result.get("cumulative_rate")
+        profit_rate = float(raw_rate) if raw_rate is not None else 0.0
+    else:
+        profit_amount = 0.0
+        profit_rate = 0.0
+    return (
+        RatioMetricDisplay(
+            label="수익",
+            value1=format_signed_money(profit_amount),
+            value2=format_signed_percent(profit_rate, digits=2),
+            value1_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][0],
+            value2_sample=STOCK_POSITION_METRIC_SAMPLES["수익"][1],
+        ),
+        profit_amount,
+        profit_rate,
+    )
 
 
 def ratio_metric_text(metric: RatioMetricDisplay, *, prefix: str = "") -> str:
@@ -853,7 +881,11 @@ def create_auto_trade_status_item(display_status: str) -> QTableWidgetItem:
     return item
 
 
-def auto_trade_setting_display_status(display_status: str) -> str:
+def auto_trade_setting_display_status(
+    display_status: str,
+    *,
+    emergency_scope: str | None = None,
+) -> str:
     """자동매매설정창 표시용 상태명.
 
     이 창은 운영 가능 종목의 설정/현황을 보는 곳이므로
@@ -862,6 +894,11 @@ def auto_trade_setting_display_status(display_status: str) -> str:
     normalized = display_status_text_for_gui(display_status)
     if normalized == "감시/매도":
         return "자동마감"
+    if (
+        normalized == "긴급정지"
+        and str(emergency_scope or "").strip().upper() == "SELECTED"
+    ):
+        return "검토종목"
     return normalized
 
 

@@ -50,9 +50,12 @@ class _OperationButtonHarness(QWidget):
     emergency_stop_selected_auto_trade_stocks = (
         setting_window.AutoTradeSettingWindow.emergency_stop_selected_auto_trade_stocks
     )
-    release_selected_emergency_stopped_auto_trade_stocks = (
-        setting_window.AutoTradeSettingWindow.release_selected_emergency_stopped_auto_trade_stocks
-    )
+
+    def release_selected_emergency_stopped_auto_trade_stocks(self):
+        # Backend-only regression harness. Production UI no longer exposes this action.
+        return emergency_ops.execute_selected_emergency_release(
+            self, self.selected_stock_infos()
+        )
 
     def __init__(self) -> None:
         super().__init__()
@@ -282,6 +285,8 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "trade_enabled": trade_enabled,
             "holding_qty": 0,
         }
+        if status == "EMERGENCY_STOPPED" and "emergency_scope" not in extra:
+            state["emergency_scope"] = "SELECTED"
         state.update(extra)
         (stock_dir / "state.json").write_text(
             json.dumps(
@@ -558,7 +563,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertTrue(
             all(
                 read_json_dict(target[0] / "state.json").get("status")
-                == "EMERGENCY_STOPPED"
+                == "REVIEW_REQUIRED"
                 for target in self.targets
             )
         )
@@ -1306,9 +1311,10 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         changed_state = read_json_dict(target[0] / "state.json")
         self.assertEqual(("000001 테스트1",), result["changed"])
-        self.assertEqual("EMERGENCY_STOPPED", changed_state["status"])
-        self.assertEqual("2026-07-29 10:00:00", changed_state["emergency_stopped_at"])
-        self.assertEqual("USER_EMERGENCY_STOP", changed_state["emergency_reason"])
+        self.assertEqual("REVIEW_REQUIRED", changed_state["status"])
+        self.assertEqual("", changed_state["emergency_stopped_at"])
+        self.assertEqual("", changed_state["emergency_reason"])
+        self.assertEqual("SELECTED", changed_state["emergency_scope"])
         self.assertFalse(changed_state["trade_enabled"])
         self.assertNotIn("buy_enabled", changed_state)
         self.assertNotIn("sell_enabled", changed_state)
@@ -1331,7 +1337,8 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertEqual(("000001 테스트1", "000003 테스트3"), result["changed"])
         for target in selected_targets:
             state = read_json_dict(target[0] / "state.json")
-            self.assertEqual("EMERGENCY_STOPPED", state["status"])
+            self.assertEqual("REVIEW_REQUIRED", state["status"])
+            self.assertEqual("SELECTED", state["emergency_scope"])
             self.assertFalse(state["trade_enabled"])
             self.assertNotIn("buy_enabled", state)
             self.assertNotIn("sell_enabled", state)
@@ -1422,7 +1429,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             result = self.window.release_selected_emergency_stopped_auto_trade_stocks()
 
         state = read_json_dict(target[0] / "state.json")
-        self.assertEqual(("000001 테스트1",), result["review"])
+        self.assertEqual(("000001 테스트1",), result["blocked"])
         self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertFalse(state["trade_enabled"])
         self.assertTrue(state["review_required"])
@@ -1495,7 +1502,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             )
 
         state = read_json_dict(target[0] / "state.json")
-        self.assertEqual("normal", result)
+        self.assertEqual(emergency_ops.RELEASED_NORMAL, result)
         self.assertEqual("STOPPED", state["status"])
         self.assertFalse(state["trade_enabled"])
         self.assertEqual("PASSED", state["emergency_release_check"])
@@ -1554,7 +1561,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             )
 
         state = read_json_dict(target[0] / "state.json")
-        self.assertEqual("review", result)
+        self.assertEqual(emergency_ops.BLOCKED_IN_EMERGENCY, result)
         self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertEqual("", state["review_routine"])
         self.assertFalse(state["trade_enabled"])
@@ -1616,7 +1623,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             )
 
         state = read_json_dict(target[0] / "state.json")
-        self.assertEqual("review", result)
+        self.assertEqual(emergency_ops.BLOCKED_IN_EMERGENCY, result)
         self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertTrue(state["review_required"])
         self.assertEqual("PENDING", state["review_status"])
@@ -1667,7 +1674,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             )
 
         state = read_json_dict(target[0] / "state.json")
-        self.assertEqual("review", result)
+        self.assertEqual(emergency_ops.BLOCKED_IN_EMERGENCY, result)
         self.assertEqual("EMERGENCY_STOPPED", state["status"])
         self.assertTrue(state["review_required"])
         self.assertEqual("PENDING", state["review_status"])

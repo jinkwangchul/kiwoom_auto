@@ -16,14 +16,16 @@ from PyQt5.QtGui import (
     QColor,
     QIcon,
     QIconEngine,
+    QPalette,
     QPainter,
     QPixmap,
 )
-from PyQt5.QtWidgets import QMenu
+from PyQt5.QtWidgets import QMenu, QProxyStyle, QStyle, QStyleOptionMenuItem
 
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_operation_excluded,
+    is_review_required_state,
 )
 from gui_ats_utils import (
     manual_ats_session_labels,
@@ -59,6 +61,65 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
     "20",
     "30",
 )
+
+CONTEXT_MENU_DANGER_TEXT_COLOR = "#DC2626"
+CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR = "#15803D"
+_MENU_TEXT_COLOR_PROPERTY = "menuTextColor"
+
+
+class _MenuActionColorProxyStyle(QProxyStyle):
+    """Apply an opt-in foreground color to individual QMenu actions."""
+
+    def drawControl(self, element, option, painter, widget=None) -> None:
+        if (
+            element == QStyle.CE_MenuItem
+            and isinstance(option, QStyleOptionMenuItem)
+            and isinstance(widget, QMenu)
+        ):
+            colors = getattr(widget, "_menu_action_text_colors", {})
+            color_text = colors.get(str(option.text or "")) if isinstance(colors, dict) else None
+            color = QColor(str(color_text or ""))
+            if color.isValid():
+                colored_option = QStyleOptionMenuItem(option)
+                palette = QPalette(colored_option.palette)
+                for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+                    for role in (
+                        QPalette.Text,
+                        QPalette.ButtonText,
+                        QPalette.WindowText,
+                        QPalette.HighlightedText,
+                    ):
+                        palette.setColor(group, role, color)
+                colored_option.palette = palette
+                super().drawControl(element, colored_option, painter, widget)
+                return
+        super().drawControl(element, option, painter, widget)
+
+
+def set_menu_action_text_color(menu, action, color: str) -> None:
+    """Color one QAction label without changing its behavior or enabled state."""
+
+    if action is None:
+        return
+    setter = getattr(action, "setProperty", None)
+    if callable(setter):
+        setter(_MENU_TEXT_COLOR_PROPERTY, color)
+    if not isinstance(menu, QObject) or not callable(getattr(menu, "setStyle", None)):
+        return
+    colors = getattr(menu, "_menu_action_text_colors", None)
+    if not isinstance(colors, dict):
+        colors = {}
+        menu._menu_action_text_colors = colors
+    text_getter = getattr(action, "text", None)
+    text = str(text_getter() if callable(text_getter) else "")
+    if text:
+        colors[text] = color
+    if getattr(menu, "_menu_action_color_style", None) is None:
+        style = _MenuActionColorProxyStyle()
+        style.setParent(menu)
+        menu._menu_action_color_style = style
+        menu.setStyle(style)
+    menu.update()
 
 def tile_new_stock_instance_charts(
     parent,
@@ -234,16 +295,21 @@ def _new_stock_context_menu(parent) -> QMenu:
     return menu
 
 
-def _selected_emergency_state(selected: list[tuple[object, str, str]]) -> tuple[bool, bool]:
-    has_emergency = False
+def selected_emergency_context_state(
+    selected: Iterable[tuple[object, str, str]],
+) -> tuple[bool, bool]:
+    """Return SELECTED-release and ordinary-stop eligibility for one selection."""
+    has_selected_emergency = False
     has_non_emergency = False
     for stock_dir, _code, _name in selected:
         state = read_json_dict(stock_dir / "state.json")
-        if is_emergency_stopped_state(state):
-            has_emergency = True
+        if is_emergency_stopped_state(state) or is_review_required_state(state):
+            scope = str(state.get("emergency_scope", "") or "").strip().upper()
+            if scope == "SELECTED":
+                has_selected_emergency = True
         else:
             has_non_emergency = True
-    return has_emergency, has_non_emergency
+    return has_selected_emergency, has_non_emergency
 
 
 def _stock_register_context_instance_metadata(window) -> dict[str, object] | None:
@@ -308,6 +374,25 @@ def _add_early_close_menu(
         ),
         "earlyCloseCurrent",
     )
+    menu_action_getter = getattr(early_close_menu, "menuAction", None)
+    if callable(menu_action_getter):
+        set_menu_action_text_color(
+            menu,
+            menu_action_getter(),
+            CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+        )
+    for action in (
+        action_early_routine,
+        action_early_market,
+        action_early_current,
+        action_early_profit_loss,
+        action_early_carry,
+    ):
+        set_menu_action_text_color(
+            early_close_menu,
+            action,
+            CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+        )
     return {
         "routine": action_early_routine,
         "market": action_early_market,
@@ -549,6 +634,7 @@ def show_monitor_stock_context_menu(
     operation_exclusion_action: str | None = None,
     stock_register_enabled: bool | None = None,
     selected_targets: Iterable[tuple[object, str, str]] | None = None,
+    selected_scope_emergency: bool | None = None,
 ) -> None:
     """Show the monitoring stock-row profile with the shared menu form."""
 
@@ -561,12 +647,8 @@ def show_monitor_stock_context_menu(
         action_start.setEnabled(has_selection)
     action_emergency_stop = None
     if callbacks.emergency_stop is not None:
-        action_emergency_stop = menu.addAction("긴급정지")
+        action_emergency_stop = menu.addAction("검토정지")
         action_emergency_stop.setEnabled(has_selection)
-    action_emergency_release = None
-    if callbacks.emergency_release is not None:
-        action_emergency_release = menu.addAction("정지해제")
-        action_emergency_release.setEnabled(has_selection)
     if action_start is not None:
         menu.addSeparator()
     action_select_all = menu.addAction("전체선택")
@@ -646,8 +728,6 @@ def show_monitor_stock_context_menu(
         selected_option = "OPERATION_START"
     elif action_emergency_stop is not None and chosen == action_emergency_stop:
         selected_option = "EMERGENCY_STOP"
-    elif action_emergency_release is not None and chosen == action_emergency_release:
-        selected_option = "EMERGENCY_RELEASE"
     elif action_set_exclusion is not None and chosen == action_set_exclusion:
         selected_option = "OPERATION_EXCLUDE"
         decision_event_type = "OPERATOR_SETTING_DECISION"
@@ -721,8 +801,6 @@ def show_monitor_stock_context_menu(
         callbacks.start()
     elif action_emergency_stop is not None and chosen == action_emergency_stop:
         callbacks.emergency_stop()
-    elif action_emergency_release is not None and chosen == action_emergency_release:
-        callbacks.emergency_release()
     elif action_stock_register is not None and chosen == action_stock_register:
         callbacks.stock_register()
     elif chosen == action_select_all:
@@ -788,7 +866,7 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         for stock_dir, _code, _name in selected
     )
     selected_modes = window.selected_operation_mode_set(selected)
-    has_emergency, has_non_emergency = _selected_emergency_state(selected)
+    _has_selected_provenance, has_non_emergency = selected_emergency_context_state(selected)
     status_filter = str(getattr(window, "_stock_status_filter", "") or "").strip().lower()
     excluded_view = status_filter == "excluded"
     running_view = status_filter in {"running", "stopped"}
@@ -806,11 +884,6 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         emergency_stop=(
             window_callback("emergency_stop_selected_auto_trade_stocks")
             if has_non_emergency
-            else None
-        ),
-        emergency_release=(
-            window_callback("release_selected_emergency_stopped_auto_trade_stocks")
-            if has_emergency
             else None
         ),
         stock_register=(

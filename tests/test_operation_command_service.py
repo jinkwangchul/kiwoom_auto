@@ -1009,6 +1009,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             type(self).instances.append(self)
             self._proceed_button = None
             self._cancel_button = None
+            self.text = ""
 
         def setIcon(self, _icon) -> None:
             pass
@@ -1016,8 +1017,8 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         def setWindowTitle(self, _title) -> None:
             pass
 
-        def setText(self, _text) -> None:
-            pass
+        def setText(self, text) -> None:
+            self.text = str(text)
 
         def addButton(self, _text, role):
             button = object()
@@ -1039,8 +1040,12 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
     @staticmethod
     def _window(selected) -> Mock:
         window = Mock()
+        window._persistent_feature_owner_ref = None
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "indicator_follow"
+        window._current_session_operation_participant_stock_codes = {
+            str(code) for _stock_dir, code, _name in selected
+        }
         parent = Mock()
         parent.kiwoom_api.is_connected.return_value = True
         window.parent.return_value = parent
@@ -1058,7 +1063,15 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         stock_dir = root / "stocks" / folder
         stock_dir.mkdir(parents=True)
         code, name = folder.split("_", 1)
-        state_data = state if state is not None else {"status": "RUNNING", "holding_qty": holding_qty}
+        state_data = (
+            state
+            if state is not None
+            else {
+                "status": "RUNNING",
+                "holding_qty": holding_qty,
+                "trade_enabled": True,
+            }
+        )
         (stock_dir / "state.json").write_text(json.dumps(state_data), encoding="utf-8")
         (stock_dir / "config.json").write_text("{}", encoding="utf-8")
         return stock_dir, code, name
@@ -1387,18 +1400,119 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             ):
                 auto_trade_apply_selected_early_close(window, "루틴")
 
-        service.apply_early_close.assert_called_once()
+        service.apply_early_close.assert_not_called()
         self.assertEqual([], self._MessageBox.instances)
         show_toast.assert_called_once()
         toast_args = show_toast.call_args.args
         self.assertIs(toast_args[0], window)
-        self.assertEqual("조기마감 적용 대상이 없습니다.", toast_args[1])
+        self.assertEqual("조기마감 대상이 없습니다.", toast_args[1])
         self.assertNotIn("111111", toast_args[1])
         self.assertNotIn("222222", toast_args[1])
         self.assertNotIn("\n", toast_args[1])
         self.assertEqual(2500, show_toast.call_args.kwargs["duration_ms"])
         self.assertNotIn("position", show_toast.call_args.kwargs)
-        window.statusBarMessage.assert_called_with("조기마감 적용: 1개 / 제외 1개")
+        window.statusBarMessage.assert_called_with("조기마감 적용: 0개")
+
+    def test_confirmation_count_excludes_non_operating_and_no_target_stocks(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [
+                self._write_stock(root, "111111_A", holding_qty=5),
+                self._write_stock(root, "222222_B", holding_qty=7),
+                self._write_stock(root, "333333_C", holding_qty=0),
+                self._write_stock(
+                    root,
+                    "444444_D",
+                    holding_qty=9,
+                    state={
+                        "status": "STOPPED",
+                        "holding_qty": 9,
+                        "trade_enabled": False,
+                    },
+                ),
+                self._write_stock(
+                    root,
+                    "555555_E",
+                    holding_qty=11,
+                    state={
+                        "status": "EMERGENCY_STOPPED",
+                        "holding_qty": 11,
+                        "trade_enabled": False,
+                        "emergency_scope": "SELECTED",
+                    },
+                ),
+                self._write_stock(
+                    root,
+                    "666666_F",
+                    holding_qty=13,
+                    state={
+                        "status": "REVIEW_REQUIRED",
+                        "holding_qty": 13,
+                        "trade_enabled": False,
+                        "review_required": True,
+                    },
+                ),
+            ]
+            window = self._window(selected)
+            window._all_stocks_scope_active = True
+            self._MessageBox.instances = []
+            self._MessageBox.proceed = False
+            with (
+                patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
+                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+            ):
+                auto_trade_apply_selected_early_close(window, "루틴")
+
+        service_type.assert_not_called()
+        self.assertEqual(1, len(self._MessageBox.instances))
+        self.assertEqual(
+            "전체운영 2종목을 조기마감합니다. 진행하시겠습니까?",
+            self._MessageBox.instances[0].text,
+        )
+
+    def test_non_operating_stock_does_not_receive_no_target_mutation(self) -> None:
+        from gui_auto_trade_close import auto_trade_apply_selected_early_close
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = [
+                self._write_stock(
+                    root,
+                    "444444_D",
+                    holding_qty=0,
+                    state={
+                        "status": "STOPPED",
+                        "holding_qty": 0,
+                        "trade_enabled": False,
+                    },
+                )
+            ]
+            state_path = selected[0][0] / "state.json"
+            before = state_path.read_bytes()
+            window = self._window(selected)
+            self._MessageBox.instances = []
+            with (
+                patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
+                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("gui_auto_trade_close.show_toast") as show_toast,
+            ):
+                result = auto_trade_apply_selected_early_close(window, "루틴")
+
+            after = state_path.read_bytes()
+
+        service_type.assert_not_called()
+        self.assertEqual(before, after)
+        self.assertEqual([], self._MessageBox.instances)
+        show_toast.assert_called_once_with(
+            window,
+            "조기마감 대상이 없습니다.",
+            duration_ms=2500,
+        )
+        self.assertEqual("조기마감 대상이 없습니다.", result["message"])
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):

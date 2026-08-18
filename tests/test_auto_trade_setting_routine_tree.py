@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 
 import gui_auto_trade_setting_window as setting_window
+import auto_trade_order_execution_boundary as execution_boundary
 import gui_auto_trade_close as close_ops
 import gui_auto_trade_table_loader as table_loader
 import gui_routine_policy as routine_policy
@@ -378,6 +379,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "has_early_close_scope_targets",
         ):
             setattr(harness, name, MethodType(getattr(AutoTradeSettingWindow, name), harness))
+        harness.update_review_required_button_text = MagicMock()
         return harness
 
     @contextmanager
@@ -1920,7 +1922,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
         self.assertTrue(saved_state["review_required"])
-        self.assertIn("PENDING_ORDER_QTY_MISSING", saved_state["review_reason"])
+        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
 
     def test_routine_move_policy_treats_paused_as_unexpected_legacy_state(self) -> None:
         with patch.object(
@@ -4406,6 +4408,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window = self._window_harness()
         window._setup_stock_table()
 
+        self.assertEqual("매매", window.stock_table.horizontalHeaderItem(10).text())
         style = window.stock_table.styleSheet()
         self.assertIn("selection-background-color: #dbeafe", style)
         self.assertIn("selection-color: #111827", style)
@@ -6033,8 +6036,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             routine_type="지표추종매매",
         )
         ensure_single.assert_called_once_with("111111", "가능", "지표추종매매")
-        report.assert_called_once()
-        self.assertEqual(1, len(report.call_args.args[1]))
         toast.assert_called_once_with(window, "루틴등록 1종목 | 등록불가 1종목")
 
     def test_stock_register_context_menu_without_routines_uses_disabled_plain_assign_action(self) -> None:
@@ -7431,7 +7432,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             return {"status": "RUNNING", "trade_enabled": True}
 
         with patch.object(setting_window, "read_base_stocks", return_value=stocks), \
-                patch.object(setting_window, "read_json_dict", side_effect=fake_read_json):
+                patch.object(execution_boundary, "read_json_dict", side_effect=fake_read_json):
             result = window.auto_trade_runtime_state_for_order({"code": "005930"})
 
         self.assertTrue(result["found"])

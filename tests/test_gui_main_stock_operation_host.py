@@ -455,7 +455,7 @@ class MainStockOperationHostTest(unittest.TestCase):
                 _Menu,
             ), patch.object(
                 context_menu,
-                "_selected_emergency_state",
+                "selected_emergency_context_state",
                 return_value=(False, False),
             ):
                 context_menu.show_monitor_stock_context_menu(
@@ -505,7 +505,7 @@ class MainStockOperationHostTest(unittest.TestCase):
 
         with patch.object(
             context_menu,
-            "_selected_emergency_state",
+            "selected_emergency_context_state",
             return_value=(False, True),
         ), patch.object(
             context_menu,
@@ -545,7 +545,7 @@ class MainStockOperationHostTest(unittest.TestCase):
         )
         expected = [
             "운영시작",
-            "긴급정지",
+            "검토정지",
             "<separator>",
             "전체선택",
             "선택해제",
@@ -590,7 +590,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             }
             with patch.object(
                 context_menu,
-                "_selected_emergency_state",
+                "selected_emergency_context_state",
                 return_value=(False, True),
             ):
                 context_menu.show_auto_trade_stock_context_menu(

@@ -7,7 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -50,6 +50,23 @@ class FeatureWindowPolicyTests(unittest.TestCase):
         self.assertEqual(Qt.NonModal, chart.windowModality())
         self.assertIs(owner, persistent_feature_owner(settings))
         self.assertIs(owner, persistent_feature_owner(chart))
+
+    def test_reopening_visible_review_window_refreshes_before_raise(self) -> None:
+        import gui_windows
+
+        owner = QMainWindow()
+        existing = QDialog()
+        existing.refresh_review_items = Mock()
+        owner.review_required_window = existing
+        self.addCleanup(owner.close)
+        self.addCleanup(existing.close)
+        existing.show()
+        self.app.processEvents()
+
+        gui_windows.MainWindow.open_review_required_window(owner)
+
+        existing.refresh_review_items.assert_called_once_with()
+        self.assertTrue(existing.isVisible())
 
     def test_transient_dialog_keeps_the_actual_feature_window_parent(self) -> None:
         owner = QMainWindow()
@@ -139,7 +156,7 @@ class FeatureWindowPolicyTests(unittest.TestCase):
             TemporaryDirectory() as temp_dir,
             patch.object(
                 GlobalReviewRequiredWindow,
-                "load_review_items",
+                "refresh_review_items",
                 lambda _self: None,
             ),
             patch.object(StockRegisterWindow, "refresh_stock_table", lambda _self: None),

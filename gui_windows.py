@@ -917,6 +917,7 @@ from gui_main_table_loader import (
     ROUTINE_MONITORING_HEADERS,
     ROUTINE_PARENT_AGGREGATE_ROLE,
     ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
+    ROUTINE_PARENT_PROFIT_ROLE,
     ROUTINE_PARENT_COLLAPSED_ROLE,
     ROUTINE_PARENT_NAME_ROLE,
     ROUTINE_COMPLETION_STATUSES,
@@ -989,6 +990,11 @@ from gui_main_stock_context_menu import (
     clear_main_monitoring_chart_open_selection,
     show_main_monitoring_stock_context_menu,
 )
+from gui_auto_trade_context_menu import (
+    CONTEXT_MENU_DANGER_TEXT_COLOR,
+    set_menu_action_text_color,
+)
+from gui_auto_trade_integrity import is_operation_excluded
 from gui_auto_trade_display import (
     draw_limit_metric,
     draw_stock_position_metric,
@@ -1068,14 +1074,20 @@ from gui_main_routine_selection import (
 )
 from kiwoom_api import KiwoomApi
 from operator_reconciliation_service import assess_startup_recovery
-from broker_holding_recorder import write_production_recovery_review
+from broker_holding_recorder import (
+    resolve_account_holding_snapshot_failures,
+    write_production_recovery_review,
+)
 from production_recovery_contract import (
     ACCOUNT_FAILED,
     ACCOUNT_COMPLETED,
     ACCOUNT_REVIEW_REQUIRED,
+    BrokerAccountSnapshot,
     BrokerSnapshotPart,
+    RecoverySessionIdentity,
     combine_account_snapshot,
     create_recovery_session_identity,
+    recovery_request_id,
 )
 from production_recovery_state_registry import (
     RECOVERY_ACCOUNT_FAILED,
@@ -1895,10 +1907,22 @@ class _RoutineTreeInteractionController(QObject):
                     event.type() == QEvent.MouseButtonDblClick
                     and event.button() == Qt.LeftButton
                 ):
-                    if row_kind == ROUTINE_ROW_PARENT:
-                        self.window.open_routine_settings_from_main_table(
-                            self.table.item(index.row(), 0)
-                        )
+                    if (
+                        row_kind == ROUTINE_ROW_CHILD
+                        and self._child_name_rect(index).contains(event.pos())
+                    ):
+                        if self.window.handle_routine_instance_name_double_click(index.row()):
+                            event.accept()
+                            return True
+                        return super().eventFilter(watched, event)
+                    if (
+                        row_kind == ROUTINE_ROW_PARENT
+                        and self._parent_name_rect(index).contains(event.pos())
+                    ):
+                        if self.window.handle_routine_group_name_double_click(index.row()):
+                            event.accept()
+                            return True
+                        return super().eventFilter(watched, event)
                     event.accept()
                     return True
             elif event.type() == QEvent.MouseButtonDblClick:
@@ -2496,6 +2520,49 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                                 text_rect.height(),
                             )
                             painter.drawText(separator_rect, Qt.AlignCenter, "|")
+                    profit_data = index.data(ROUTINE_PARENT_PROFIT_ROLE)
+                    if (
+                        isinstance(profit_data, (list, tuple))
+                        and len(profit_data) == 2
+                        and slot_lefts
+                    ):
+                        profit_text, profit_color = profit_data
+                        profit_left = (
+                            slot_lefts[-1]
+                            + column_widths["review"]
+                            + separator_width
+                        )
+                        separator_rect = QRect(
+                            profit_left - separator_width,
+                            text_rect.top(),
+                            separator_width,
+                            text_rect.height(),
+                        )
+                        painter.drawText(separator_rect, Qt.AlignCenter, "|")
+                        color = QColor(str(profit_color or ""))
+                        if color.isValid() and visually_enabled:
+                            painter.setPen(color)
+                        number_widths = routine_instance_number_widths(
+                            aggregate_font
+                        )
+                        draw_stock_position_metric(
+                            painter,
+                            QRect(
+                                profit_left,
+                                text_rect.top(),
+                                routine_instance_grid_columns(aggregate_font)["profit"],
+                                text_rect.height(),
+                            ),
+                            str(profit_text or ""),
+                            value_widths={
+                                "수익": (
+                                    number_widths["profit_amount"],
+                                    number_widths["profit_rate"],
+                                )
+                            },
+                            outer_padding=ROUTINE_INSTANCE_MONEY_OUTER_PADDING,
+                            label_hint="수익",
+                        )
                 else:
                     aggregate = display_text[len(parent_text) :].lstrip()
                     aggregate_left = option.rect.left() + ROUTINE_INSTANCE_NAME_WIDTH
@@ -2718,7 +2785,8 @@ class MainWindow(QMainWindow):
         self._main_routine_initial_buy_sort_next_mode = "AMOUNT"
         self._main_routine_column_sort_key = ""
         self._main_routine_excluded_only = False
-        self._main_routine_stock_scope = "normal"
+        self._main_routine_stock_scope = "operation"
+        self._last_main_routine_table_height_signature = (-1, -1, -1)
         self._main_routine_valid_button = None
         self._main_routine_level_buttons: dict[str, QPushButton] = {}
         self._main_routine_metric_buttons: dict[str, QPushButton] = {}
@@ -2752,6 +2820,8 @@ class MainWindow(QMainWindow):
         self._startup_recovery_approved_snapshot = ""
         self._production_recovery_identity = None
         self._production_recovery_parts: dict[str, BrokerSnapshotPart] = {}
+        self._latest_completed_recovery_snapshot: BrokerAccountSnapshot | None = None
+        self._latest_completed_recovery_identity: RecoverySessionIdentity | None = None
 
         self.btn_start = QPushButton("▶ 운영시작")
         self.btn_auto_trade_setting = QPushButton("자동매매설정")
@@ -3688,6 +3758,12 @@ class MainWindow(QMainWindow):
                 self._activate_main_routine_summary_badge(target_key, bool(checked))
             )
 
+            if key == "stock":
+                stock_separator = create_summary_separator(
+                    "mainRoutineSummaryStockSeparator"
+                )
+                layout.addWidget(stock_separator)
+
         self._main_routine_summary_count_labels = count_labels
         self._main_routine_summary_count_buttons = count_buttons
         self._main_routine_level_buttons = {
@@ -3703,14 +3779,31 @@ class MainWindow(QMainWindow):
     def _update_main_routine_summary(self, projection: dict[str, object]) -> None:
         count_labels = getattr(self, "_main_routine_summary_count_labels", {})
         badges = projection.get("count_badges")
+        if not isinstance(badges, tuple):
+            return
+        badge_snapshot = tuple(
+            (str(key), str(label_text), max(0, int(value or 0)))
+            for key, label_text, value in badges
+        )
+        if badge_snapshot == getattr(
+            self,
+            "_main_routine_summary_badge_snapshot",
+            None,
+        ):
+            return
         if isinstance(count_labels, dict) and isinstance(badges, tuple):
             for key, label_text, value in badges:
                 labels = count_labels.get(str(key))
                 if not isinstance(labels, tuple) or len(labels) != 2:
                     continue
                 label, value_label = labels
-                label.setText(str(label_text))
-                value_label.setText(str(max(0, int(value or 0))))
+                clean_label_text = str(label_text)
+                clean_value_text = str(max(0, int(value or 0)))
+                if label.text() != clean_label_text:
+                    label.setText(clean_label_text)
+                if value_label.text() != clean_value_text:
+                    value_label.setText(clean_value_text)
+        self._main_routine_summary_badge_snapshot = badge_snapshot
         MainWindow._update_main_routine_summary_badge_styles(self)
 
     def _activate_main_routine_summary_badge(
@@ -3720,13 +3813,17 @@ class MainWindow(QMainWindow):
     ) -> None:
         clean_key = str(key or "").strip().lower()
         if clean_key in {"group", "routine"}:
+            MainWindow._assign_main_routine_stock_scope(self, "normal", False)
+            self._main_routine_excluded_only = False
+            self._main_routine_stock_scope = "normal"
             self._set_main_routine_display_level(clean_key)
             return
         if clean_key == "stock":
-            self._assign_main_routine_stock_scope("all", checked)
+            self._assign_main_routine_stock_scope("operation", checked)
             self._set_main_routine_display_level("stock")
             return
         if clean_key in {"operation", "excluded", "review"}:
+            self._set_main_routine_display_level("stock")
             self._set_main_routine_stock_scope(clean_key, checked)
 
     def _update_main_routine_summary_badge_styles(self) -> None:
@@ -3738,7 +3835,8 @@ class MainWindow(QMainWindow):
         active_by_key = {
             "group": level == "group",
             "routine": level == "routine",
-            "stock": level == "stock" and scope == "all",
+            "stock": level == "stock"
+            and scope in {"operation", "excluded", "review"},
             "operation": scope == "operation",
             "excluded": scope == "excluded",
             "review": scope == "review",
@@ -4086,7 +4184,7 @@ class MainWindow(QMainWindow):
         scope = str(
             getattr(self, "_main_routine_stock_scope", "normal") or "normal"
         ).strip().lower()
-        return scope if scope in {"normal", "all", "operation", "review"} else "normal"
+        return scope if scope in {"normal", "operation", "excluded", "review"} else "normal"
 
     def _assign_main_routine_stock_scope(
         self,
@@ -4094,10 +4192,17 @@ class MainWindow(QMainWindow):
         enabled: bool,
     ) -> None:
         clean_scope = str(scope or "").strip().lower()
-        if clean_scope not in {"all", "operation", "excluded", "review"}:
+        if clean_scope == "all":
+            clean_scope = "operation"
+        if clean_scope not in {"operation", "excluded", "review"}:
             clean_scope = "normal"
         current_scope = MainWindow._current_main_routine_stock_scope(self)
-        target_scope = clean_scope if bool(enabled) else "normal"
+        if bool(enabled):
+            target_scope = clean_scope
+        elif clean_scope in {"operation", "excluded", "review"}:
+            target_scope = "operation"
+        else:
+            target_scope = clean_scope
         if bool(enabled) and current_scope == clean_scope:
             target_scope = clean_scope
         self._main_routine_stock_scope = target_scope
@@ -4253,6 +4358,57 @@ class MainWindow(QMainWindow):
         self.routine_table._hovered_routine_definition_id = ""
         self._routine_tree_item_delegate = _RoutineTreeItemDelegate(self.routine_table)
         self.routine_table.setItemDelegateForColumn(0, self._routine_tree_item_delegate)
+
+    def _apply_main_routine_table_height(
+        self,
+        total_groups: int,
+        total_instances: int,
+        total_stocks: int,
+    ) -> None:
+        def _to_int(value: object) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return -1
+
+        signature = (
+            _to_int(total_groups),
+            _to_int(total_instances),
+            _to_int(total_stocks),
+        )
+        if getattr(self, "_last_main_routine_table_height_signature", None) == signature:
+            return
+        table = self.routine_table
+        row_height = max(1, int(table.verticalHeader().defaultSectionSize() or 0))
+        total_rows = max(1, signature[0] + signature[1] + signature[2] + 1)
+        desired_height = (
+            total_rows * row_height
+            + table.frameWidth() * 2
+            + table.contentsMargins().top()
+            + table.contentsMargins().bottom()
+        )
+        # The automatic height is a one-shot resize target, not a minimum-size
+        # contract.  Keeping the table minimum at zero preserves manual window
+        # shrinking after the registered group/routine/stock totals are applied.
+        table.setMinimumHeight(0)
+        target_window_height = max(
+            int(self.minimumHeight()),
+            int(self.height()) + desired_height - int(table.height()),
+        )
+        screen = self.screen()
+        if screen is not None:
+            available_height = max(0, int(screen.availableGeometry().height()))
+            if available_height > 0:
+                frame_overhead = max(
+                    0,
+                    int(self.frameGeometry().height()) - int(self.height()),
+                )
+                target_window_height = min(
+                    target_window_height,
+                    max(1, available_height - frame_overhead),
+                )
+        self.resize(int(self.width()), target_window_height)
+        self._last_main_routine_table_height_signature = signature
 
     def _setup_running_stock_table(self) -> None:
         headers = [
@@ -4514,10 +4670,90 @@ class MainWindow(QMainWindow):
         if callable(stopper):
             stopper()
 
+    def _clear_completed_recovery_handoff(self) -> None:
+        """Invalidate the process-local completed Recovery evidence handoff."""
+        self._latest_completed_recovery_snapshot = None
+        self._latest_completed_recovery_identity = None
+
+    def _publish_completed_recovery_handoff(
+        self,
+        identity: RecoverySessionIdentity,
+        snapshot: BrokerAccountSnapshot,
+    ) -> bool:
+        """Publish only an exact, final COMPLETED Recovery snapshot reference."""
+        context = production_recovery_registry.snapshot()
+        if (
+            not isinstance(identity, RecoverySessionIdentity)
+            or not isinstance(snapshot, BrokerAccountSnapshot)
+            or context is None
+            or context.identity != identity
+            or context.account_status != ACCOUNT_COMPLETED
+            or not snapshot.is_complete
+            or bool(snapshot.errors)
+            or snapshot.account_no != identity.account_no
+            or snapshot.trading_day != identity.trading_day
+            or snapshot.recovery_session_id != identity.recovery_session_id
+            or snapshot.requested_at != identity.requested_at
+            or snapshot.request_id != recovery_request_id(identity, "ACCOUNT")
+            or not snapshot.completed_at
+        ):
+            MainWindow._clear_completed_recovery_handoff(self)
+            return False
+        self._latest_completed_recovery_identity = identity
+        self._latest_completed_recovery_snapshot = snapshot
+        return True
+
+    def latest_completed_recovery_handoff(self) -> dict[str, object] | None:
+        """Return current process-local handoff only while all identities match."""
+        identity = getattr(self, "_latest_completed_recovery_identity", None)
+        snapshot = getattr(self, "_latest_completed_recovery_snapshot", None)
+        context = production_recovery_registry.snapshot()
+        api = getattr(self, "kiwoom_api", None)
+        login_session_id = str(
+            getattr(api, "login_session_id", lambda: "")() or ""
+        ).strip()
+        account_no = str(self.selected_account_no() or "").strip()
+        trading_day = datetime.now().date().isoformat()
+        if (
+            not isinstance(identity, RecoverySessionIdentity)
+            or not isinstance(snapshot, BrokerAccountSnapshot)
+            or context is None
+            or context.identity != identity
+            or context.account_status != ACCOUNT_COMPLETED
+            or identity.account_no != account_no
+            or identity.login_session_id != login_session_id
+            or identity.trading_day != trading_day
+            or snapshot.account_no != identity.account_no
+            or snapshot.trading_day != identity.trading_day
+            or snapshot.recovery_session_id != identity.recovery_session_id
+            or snapshot.requested_at != identity.requested_at
+            or snapshot.request_id != recovery_request_id(identity, "ACCOUNT")
+            or not snapshot.is_complete
+            or bool(snapshot.errors)
+        ):
+            return None
+        return {
+            "identity": identity,
+            "snapshot": snapshot,
+            "recovery_status": context.account_status,
+            "holdings_complete": True,
+            "open_orders_complete": True,
+            "account_display": masked_account_no(identity.account_no),
+        }
+
     def _on_main_operation_cycle_completed(self, _result: dict[str, object]) -> None:
         """Refresh monitoring from canonical readers after an operation cycle."""
         if getattr(self, "_main_window_closing", False):
             return
+        completed_identity = getattr(
+            self, "_latest_completed_recovery_identity", None
+        )
+        if (
+            isinstance(completed_identity, RecoverySessionIdentity)
+            and completed_identity.trading_day
+            != datetime.now().date().isoformat()
+        ):
+            MainWindow._clear_completed_recovery_handoff(self)
         self.last_buffer_response_cycle_reconciliation_result = (
             reconcile_main_window_buffer_response_cycle(self)
         )
@@ -4539,6 +4775,7 @@ class MainWindow(QMainWindow):
                 or context.identity.account_no != self.selected_account_no()
                 or context.identity.trading_day != datetime.now().date().isoformat()
             ):
+                MainWindow._clear_completed_recovery_handoff(self)
                 status = "STALE"
                 reasons.append("STALE_RECOVERY_SESSION")
         labels = {
@@ -4642,6 +4879,7 @@ class MainWindow(QMainWindow):
         *,
         broker_evidence: object = None,
     ) -> None:
+        MainWindow._clear_completed_recovery_handoff(self)
         self._production_recovery_failure_reason_code = str(reason_code or "")
         production_recovery_registry.fail_account(identity)
         self._stop_production_recovery_timers()
@@ -4780,6 +5018,7 @@ class MainWindow(QMainWindow):
         self._production_recovery_status_result()
         context = production_recovery_registry.snapshot()
         if context is not None and context.identity == identity:
+            MainWindow._publish_completed_recovery_handoff(self, identity, snapshot)
             warning = context.account_status == ACCOUNT_REVIEW_REQUIRED
             append_owner_event_once(
                 self,
@@ -4874,10 +5113,28 @@ class MainWindow(QMainWindow):
                 broker_evidence={
                     "errors": list(payload.get("errors") or []),
                     "error": str(payload.get("error") or ""),
+                    "result": payload.get("result"),
                 },
             )
             return
         self._production_recovery_parts[kind] = snapshot
+        if kind == "HOLDINGS":
+            try:
+                self._production_recovery_holding_failure_resolution_result = (
+                    resolve_account_holding_snapshot_failures(
+                        account_no=identity.account_no,
+                        trading_day=identity.trading_day,
+                        login_session_id=identity.login_session_id,
+                        successful_recovery_session_id=identity.recovery_session_id,
+                        broker_holdings_path=RECOVERY_BROKER_HOLDINGS_PATH,
+                    )
+                )
+            except Exception as exc:
+                self._production_recovery_holding_failure_resolution_result = {
+                    "status": "RESOLUTION_FAILED",
+                    "resolved_count": 0,
+                    "reason": str(exc),
+                }
         if kind == "HOLDINGS" and "OPEN_ORDERS" not in self._production_recovery_parts:
             self._request_production_recovery_snapshot(identity, "OPEN_ORDERS")
             return
@@ -4910,6 +5167,7 @@ class MainWindow(QMainWindow):
         )
 
     def start_production_recovery(self) -> bool:
+        MainWindow._clear_completed_recovery_handoff(self)
         self._stop_production_recovery_timers()
         production_recovery_registry.invalidate("new login/account recovery")
         self._production_recovery_parts = {}
@@ -5479,6 +5737,7 @@ class MainWindow(QMainWindow):
             self.request_account_funds()
             self.start_production_recovery()
         else:
+            MainWindow._clear_completed_recovery_handoff(self)
             self._account_authentication_states.clear()
             self._account_query_states.clear()
             self._stop_production_recovery_timers()
@@ -5511,6 +5770,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message)
 
     def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
+        MainWindow._clear_completed_recovery_handoff(self)
         previous_account = str(
             getattr(self, "_selected_kiwoom_account_no", "") or ""
         ).strip()
@@ -7035,6 +7295,97 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    def handle_routine_instance_name_double_click(self, row: int) -> bool:
+        item = self.routine_table.item(row, 0)
+        if (
+            item is None
+            or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD
+        ):
+            return False
+
+        instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+        if not instance_id:
+            return False
+
+        stock_dirs = list(self._routine_instance_stock_dirs(instance_id))
+        if not stock_dirs:
+            return False
+
+        should_exclude = False
+        if not all(
+            is_operation_excluded(read_json_dict(stock_dir / "config.json"))
+            for stock_dir in stock_dirs
+        ):
+            should_exclude = True
+
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            [],
+            request_scope="multiple",
+        )
+        changed = False
+        for stock_dir in stock_dirs:
+            code, separator, name = stock_dir.name.partition("_")
+            if not separator or not code or not name:
+                continue
+            if adapter.set_stock_operation_exclusion(
+                (stock_dir, code, name),
+                should_exclude,
+                refresh=False,
+            ):
+                changed = True
+        if changed:
+            self.refresh_auto_trade_assignment_views()
+        return changed
+
+    def handle_routine_group_name_double_click(self, row: int) -> bool:
+        item = self.routine_table.item(row, 0)
+        if (
+            item is None
+            or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT
+        ):
+            return False
+
+        definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
+        if not definition_id:
+            return False
+
+        stock_dirs = []
+        for instance_id in self._routine_instance_ids_by_definition.get(
+            definition_id,
+            (),
+        ):
+            stock_dirs.extend(self._routine_instance_stock_dirs(instance_id))
+        if not stock_dirs:
+            return False
+
+        should_exclude = False
+        if not all(
+            is_operation_excluded(read_json_dict(stock_dir / "config.json"))
+            for stock_dir in stock_dirs
+        ):
+            should_exclude = True
+
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            [],
+            request_scope="multiple",
+        )
+        changed = False
+        for stock_dir in stock_dirs:
+            code, separator, name = stock_dir.name.partition("_")
+            if not separator or not code or not name:
+                continue
+            if adapter.set_stock_operation_exclusion(
+                (stock_dir, code, name),
+                should_exclude,
+                refresh=False,
+            ):
+                changed = True
+        if changed:
+            self.refresh_auto_trade_assignment_views()
+        return changed
+
     def _routine_stock_initial_buy_value_rect(self, row: int) -> QRect:
         index = self.routine_table.model().index(row, 0)
         if not index.isValid():
@@ -7744,8 +8095,15 @@ class MainWindow(QMainWindow):
                 return
             menu = QMenu(self.routine_table)
             menu.setToolTipsVisible(True)
+            new_routine_action = menu.addAction("신규루틴")
+            menu.addSeparator()
             early_close_action = menu.addAction("조기마감")
             immediate_action = menu.addAction("즉시청산")
+            set_menu_action_text_color(
+                menu,
+                early_close_action,
+                CONTEXT_MENU_DANGER_TEXT_COLOR,
+            )
             has_valid_target = any(
                 routine_instance_checked(self, instance_id)
                 and self._routine_instance_has_assigned_stocks(instance_id)
@@ -7757,6 +8115,11 @@ class MainWindow(QMainWindow):
             self._set_routine_operation_actions_enabled(
                 (early_close_action, immediate_action),
                 has_valid_target,
+            )
+            new_routine_action.triggered.connect(
+                lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
+                    item
+                )
             )
             early_close_action.triggered.connect(
                 lambda _checked=False: self.request_routine_definition_operation(
@@ -7816,6 +8179,11 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         early_close_action = menu.addAction("조기마감")
         immediate_action = menu.addAction("즉시청산")
+        set_menu_action_text_color(
+            menu,
+            early_close_action,
+            CONTEXT_MENU_DANGER_TEXT_COLOR,
+        )
         settings_action.triggered.connect(
             lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
                 item
@@ -8346,6 +8714,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._main_window_closing = True
+        MainWindow._clear_completed_recovery_handoff(self)
         close_persistent_feature_windows(self)
         timer = getattr(self, "_pnl_refresh_timer", None)
         if timer is not None:
@@ -8369,6 +8738,9 @@ class MainWindow(QMainWindow):
     def open_review_required_window(self) -> None:
         window = getattr(self, "review_required_window", None)
         if window is not None and not sip.isdeleted(window) and window.isVisible():
+            refresh = getattr(window, "refresh_review_items", None)
+            if callable(refresh):
+                refresh()
             window.show()
             window.raise_()
             window.activateWindow()

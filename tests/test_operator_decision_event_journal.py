@@ -44,6 +44,7 @@ class _ClickedMessageBox:
     AcceptRole = QMessageBox.AcceptRole
     RejectRole = QMessageBox.RejectRole
     accepted = False
+    displayed_text = ""
 
     def __init__(self, _parent=None) -> None:
         self._buttons: list[object] = []
@@ -54,8 +55,8 @@ class _ClickedMessageBox:
     def setWindowTitle(self, _value) -> None:
         pass
 
-    def setText(self, _value) -> None:
-        pass
+    def setText(self, value) -> None:
+        type(self).displayed_text = str(value)
 
     def addButton(self, _text, _role):
         button = object()
@@ -143,7 +144,9 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
             (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
             (stock_dir / "orders.json").write_text(json.dumps({"orders": []}), encoding="utf-8")
             window = MagicMock()
+            window._persistent_feature_owner_ref = None
             window.current_selected_routine_name.return_value = "테스트 루틴"
+            window._current_session_operation_participant_stock_codes = {"005930"}
             window.stock_table.viewport.return_value = MagicMock()
             recovery = MagicMock(allowed=False)
             with (
@@ -172,6 +175,10 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
 
         self.assertEqual(["CANCELLED", "ACCEPTED"], [call.kwargs["result"] for call in journal.call_args_list])
         self.assertEqual("시장가", journal.call_args_list[1].kwargs["details"]["method"])
+        self.assertEqual(
+            "테스트 루틴 1종목을 조기마감합니다. 진행하시겠습니까?",
+            _ClickedMessageBox.displayed_text,
+        )
 
     def test_ats_yes_and_no_are_separate_operator_results(self) -> None:
         selected = [(Path("C:/fixture/stock"), "005930", "삼성전자")]

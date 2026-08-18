@@ -7,6 +7,7 @@ import inspect
 from decimal import Decimal
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -17,6 +18,7 @@ from broker_holding_recorder import (
     PRODUCTION_RECOVERY_REVIEW_READ_BACK_FAILED,
     PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
     PRODUCTION_RECOVERY_REVIEW_WRITTEN,
+    resolve_account_holding_snapshot_failures,
     write_production_recovery_review,
 )
 from operator_reconciliation_service import collect_operator_reconciliation_items
@@ -27,6 +29,7 @@ from production_recovery_contract import (
     ACCOUNT_REVIEW_REQUIRED,
     BrokerAccountSnapshot,
     BrokerHoldingSnapshotItem,
+    BrokerSnapshotPart,
     STOCK_RESTORED,
     STOCK_REVIEW_REQUIRED,
     create_recovery_session_identity,
@@ -169,6 +172,39 @@ class RecoveryReviewWriterTest(unittest.TestCase):
         data = json.loads(self.holdings.read_text(encoding="utf-8"))
         self.assertEqual(2, len(data["production_recovery_reviews"]))
 
+    def test_duplicate_open_merges_new_broker_result_evidence(self) -> None:
+        identity = _identity("A")
+        first_review = _review(
+            identity,
+            stock_code="",
+            reason_code="HOLDING_SNAPSHOT_FAILED",
+        )
+        first_review["broker_evidence"] = {
+            "error": "CommRqData failed",
+            "errors": [],
+        }
+        first = write_production_recovery_review(first_review, self.holdings)
+        self.assertEqual(PRODUCTION_RECOVERY_REVIEW_WRITTEN, first["status"])
+
+        repeated_review = dict(first_review)
+        repeated_review["broker_evidence"] = {
+            "error": "CommRqData failed",
+            "errors": [],
+            "result": -202,
+        }
+        updated = write_production_recovery_review(repeated_review, self.holdings)
+
+        self.assertEqual(PRODUCTION_RECOVERY_REVIEW_WRITTEN, updated["status"])
+        data = json.loads(self.holdings.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(data["production_recovery_reviews"]))
+        saved = data["production_recovery_reviews"][0]
+        self.assertEqual("OPEN", saved["status"])
+        self.assertEqual(-202, saved["broker_evidence"]["result"])
+        self.assertEqual(first_review["detected_at"], saved["detected_at"])
+
+        duplicate = write_production_recovery_review(repeated_review, self.holdings)
+        self.assertEqual(PRODUCTION_RECOVERY_REVIEW_DUPLICATE, duplicate["status"])
+
     def test_rejects_missing_identity_and_missing_storage(self) -> None:
         invalid = _review(_identity())
         invalid["login_session_id"] = ""
@@ -220,6 +256,283 @@ class RecoveryReviewWriterTest(unittest.TestCase):
         data = json.loads(self.holdings.read_text(encoding="utf-8"))
         self.assertEqual(1, len(data["production_recovery_reviews"]))
         self.assertEqual("RESOLVED", data["production_recovery_reviews"][0]["status"])
+
+    def test_valid_holding_snapshot_resolves_same_login_account_failure(self) -> None:
+        failed_identity = _identity("A")
+        successful_identity = create_recovery_session_identity(
+            login_session_id=failed_identity.login_session_id,
+            account_no=failed_identity.account_no,
+            trading_day=failed_identity.trading_day,
+            requested_at="2026-07-27T09:00:02",
+        )
+        failure = _review(
+            failed_identity,
+            stock_code="",
+            reason_code="HOLDING_SNAPSHOT_FAILED",
+        )
+        failure["broker_evidence"] = {
+            "error": "CommRqData failed",
+            "result": -202,
+        }
+        write_production_recovery_review(failure, self.holdings)
+
+        result = resolve_account_holding_snapshot_failures(
+            account_no=successful_identity.account_no,
+            trading_day=successful_identity.trading_day,
+            login_session_id=successful_identity.login_session_id,
+            successful_recovery_session_id=successful_identity.recovery_session_id,
+            broker_holdings_path=self.holdings,
+        )
+
+        self.assertEqual(PRODUCTION_RECOVERY_REVIEW_WRITTEN, result["status"])
+        self.assertEqual(1, result["resolved_count"])
+        data = json.loads(self.holdings.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(data["production_recovery_reviews"]))
+        saved = data["production_recovery_reviews"][0]
+        self.assertEqual("RESOLVED", saved["status"])
+        self.assertEqual(-202, saved["broker_evidence"]["result"])
+        self.assertEqual(failed_identity.recovery_session_id, saved["recovery_session_id"])
+        self.assertEqual(
+            successful_identity.recovery_session_id,
+            saved["runtime_evidence"]["resolution"]["successful_recovery_session_id"],
+        )
+        reread = collect_operator_reconciliation_items(
+            queue_path=self.queue,
+            fills_path=self.fills,
+            positions_path=self.positions,
+            broker_holdings_path=self.holdings,
+        )
+        self.assertEqual(0, reread["summary"]["production_recovery"])
+
+    def test_repeated_holding_snapshot_failure_remains_open(self) -> None:
+        first = _identity("A")
+        second = create_recovery_session_identity(
+            login_session_id=first.login_session_id,
+            account_no=first.account_no,
+            trading_day=first.trading_day,
+            requested_at="2026-07-27T09:00:02",
+        )
+        for identity in (first, second):
+            result = write_production_recovery_review(
+                _review(
+                    identity,
+                    stock_code="",
+                    reason_code="HOLDING_SNAPSHOT_FAILED",
+                ),
+                self.holdings,
+            )
+            self.assertEqual(PRODUCTION_RECOVERY_REVIEW_WRITTEN, result["status"])
+
+        saved = json.loads(self.holdings.read_text(encoding="utf-8"))[
+            "production_recovery_reviews"
+        ]
+        self.assertEqual(2, len(saved))
+        self.assertTrue(all(item["status"] == "OPEN" for item in saved))
+
+    def test_holding_failure_resolution_is_scoped_and_preserves_history(self) -> None:
+        matching = _identity("A")
+        other_login = _identity("B")
+        other_account = create_recovery_session_identity(
+            login_session_id=matching.login_session_id,
+            account_no="9999999999",
+            trading_day=matching.trading_day,
+            requested_at="2026-07-27T09:00:03",
+        )
+        records = (
+            _review(matching, stock_code="", reason_code="HOLDING_SNAPSHOT_FAILED"),
+            _review(other_login, stock_code="", reason_code="HOLDING_SNAPSHOT_FAILED"),
+            _review(other_account, stock_code="", reason_code="HOLDING_SNAPSHOT_FAILED"),
+            _review(matching, stock_code="", reason_code="OPEN_ORDER_SNAPSHOT_FAILED"),
+        )
+        for record in records:
+            write_production_recovery_review(record, self.holdings)
+
+        successful = create_recovery_session_identity(
+            login_session_id=matching.login_session_id,
+            account_no=matching.account_no,
+            trading_day=matching.trading_day,
+            requested_at="2026-07-27T09:00:04",
+        )
+        result = resolve_account_holding_snapshot_failures(
+            account_no=successful.account_no,
+            trading_day=successful.trading_day,
+            login_session_id=successful.login_session_id,
+            successful_recovery_session_id=successful.recovery_session_id,
+            broker_holdings_path=self.holdings,
+        )
+
+        self.assertEqual(1, result["resolved_count"])
+        saved = json.loads(self.holdings.read_text(encoding="utf-8"))[
+            "production_recovery_reviews"
+        ]
+        self.assertEqual(4, len(saved))
+        self.assertEqual(1, sum(item["status"] == "RESOLVED" for item in saved))
+        self.assertEqual(3, sum(item["status"] == "OPEN" for item in saved))
+
+    def test_repeated_resolution_is_idempotent(self) -> None:
+        identity = _identity("A")
+        write_production_recovery_review(
+            _review(identity, stock_code="", reason_code="HOLDING_SNAPSHOT_FAILED"),
+            self.holdings,
+        )
+        kwargs = {
+            "account_no": identity.account_no,
+            "trading_day": identity.trading_day,
+            "login_session_id": identity.login_session_id,
+            "successful_recovery_session_id": "RECOVERY_SUCCESS",
+            "broker_holdings_path": self.holdings,
+        }
+        first = resolve_account_holding_snapshot_failures(**kwargs)
+        second = resolve_account_holding_snapshot_failures(**kwargs)
+        self.assertEqual(1, first["resolved_count"])
+        self.assertEqual(PRODUCTION_RECOVERY_REVIEW_DUPLICATE, second["status"])
+        self.assertEqual(0, second["resolved_count"])
+
+
+class RecoveryMainWindowResolutionConnectionTest(unittest.TestCase):
+    def test_current_failure_path_has_no_stock_state_fanout(self) -> None:
+        import gui_windows
+
+        identity = _identity("A")
+        owner = SimpleNamespace(
+            _stop_production_recovery_timers=mock.Mock(),
+            _record_production_recovery_review=mock.Mock(),
+            _production_recovery_status_result=mock.Mock(),
+        )
+        with (
+            mock.patch.object(
+                gui_windows.production_recovery_registry,
+                "fail_account",
+            ) as fail_account,
+            mock.patch.object(gui_windows, "append_owner_event_once"),
+            mock.patch.object(
+                gui_windows,
+                "emergency_update_runtime_stock_status",
+            ) as stock_writer,
+        ):
+            gui_windows.MainWindow._fail_production_recovery(
+                owner,
+                identity,
+                "HOLDINGS_SNAPSHOT_FAILED",
+                broker_evidence={"result": -202},
+            )
+
+        fail_account.assert_called_once_with(identity)
+        owner._record_production_recovery_review.assert_called_once_with(
+            identity,
+            stock_code="",
+            reason_code="HOLDINGS_SNAPSHOT_FAILED",
+            broker_evidence={"result": -202},
+        )
+        stock_writer.assert_not_called()
+
+    def test_main_window_recovery_writer_persists_minus_202(self) -> None:
+        import gui_windows
+
+        identity = _identity("A")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            holdings = Path(temp_dir) / "broker_holdings.json"
+            _write_runtime(holdings, "holdings")
+            with mock.patch.object(
+                gui_windows,
+                "RECOVERY_BROKER_HOLDINGS_PATH",
+                holdings,
+            ):
+                gui_windows.MainWindow._record_production_recovery_review(
+                    SimpleNamespace(),
+                    identity,
+                    stock_code="",
+                    reason_code="HOLDINGS_SNAPSHOT_FAILED",
+                    broker_evidence={
+                        "error": "CommRqData failed",
+                        "errors": [],
+                        "result": -202,
+                    },
+                )
+
+            saved = json.loads(holdings.read_text(encoding="utf-8"))[
+                "production_recovery_reviews"
+            ]
+            self.assertEqual(1, len(saved))
+            self.assertEqual(-202, saved[0]["broker_evidence"]["result"])
+
+    def test_valid_holding_callback_connects_existing_resolution_writer(self) -> None:
+        import gui_windows
+
+        identity = _identity("A")
+        snapshot = BrokerSnapshotPart(
+            kind="HOLDINGS",
+            account_no=identity.account_no,
+            trading_day=identity.trading_day,
+            requested_at=identity.requested_at,
+            completed_at="2026-07-27T09:01:00",
+            request_id="HOLDINGS",
+            recovery_session_id=identity.recovery_session_id,
+            is_complete=True,
+            items=(),
+            source="TEST",
+        )
+        owner = SimpleNamespace(
+            _production_recovery_identity=identity,
+            _production_recovery_parts={},
+            _request_production_recovery_snapshot=mock.Mock(return_value=True),
+        )
+        resolution = {
+            "status": PRODUCTION_RECOVERY_REVIEW_WRITTEN,
+            "resolved_count": 1,
+        }
+        with mock.patch.object(
+            gui_windows,
+            "resolve_account_holding_snapshot_failures",
+            return_value=resolution,
+        ) as resolver:
+            gui_windows.MainWindow._on_production_recovery_snapshot(
+                owner,
+                identity,
+                "HOLDINGS",
+                {"ok": True, "snapshot": snapshot},
+            )
+
+        resolver.assert_called_once_with(
+            account_no=identity.account_no,
+            trading_day=identity.trading_day,
+            login_session_id=identity.login_session_id,
+            successful_recovery_session_id=identity.recovery_session_id,
+            broker_holdings_path=gui_windows.RECOVERY_BROKER_HOLDINGS_PATH,
+        )
+        self.assertEqual(
+            resolution,
+            owner._production_recovery_holding_failure_resolution_result,
+        )
+        owner._request_production_recovery_snapshot.assert_called_once_with(
+            identity,
+            "OPEN_ORDERS",
+        )
+
+    def test_failed_holding_callback_preserves_commrqdata_result_code(self) -> None:
+        import gui_windows
+
+        identity = _identity("A")
+        owner = SimpleNamespace(
+            _production_recovery_identity=identity,
+            _production_recovery_parts={},
+            _fail_production_recovery=mock.Mock(),
+        )
+        gui_windows.MainWindow._on_production_recovery_snapshot(
+            owner,
+            identity,
+            "HOLDINGS",
+            {"ok": False, "error": "CommRqData failed", "result": -202},
+        )
+        owner._fail_production_recovery.assert_called_once_with(
+            identity,
+            "HOLDINGS_SNAPSHOT_FAILED",
+            broker_evidence={
+                "errors": [],
+                "error": "CommRqData failed",
+                "result": -202,
+            },
+        )
 
 
 class RecoveryRegistryAndGateTest(unittest.TestCase):

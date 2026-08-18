@@ -85,17 +85,35 @@ class TransitionProductionCallerTest(unittest.TestCase):
     @staticmethod
     def _window(selected):
         window = Mock()
+        window._persistent_feature_owner_ref = None
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "routine"
+        window._current_session_operation_participant_stock_codes = {
+            str(code) for _stock_dir, code, _name in selected
+        }
         window.capture_stock_table_view_state.return_value = ([], 0)
         return window
 
     def test_early_close_rejection_does_not_create_command_or_mutate_state(self):
+        class Parent:
+            def production_recovery_gate_for_stock(
+                self,
+                _code,
+                *,
+                caller_name,
+            ):
+                self.caller_name = caller_name
+                return SimpleNamespace(
+                    allowed=True,
+                    reason_code="RECOVERY_COMPLETED",
+                )
+
         with tempfile.TemporaryDirectory() as temp:
             selected = [self._write_stock(Path(temp))]
             state_path = selected[0][0] / "state.json"
             before = state_path.read_bytes()
             window = self._window(selected)
+            parent = Parent()
             service = Mock()
             rejected = SimpleNamespace(
                 allowed=False,
@@ -116,11 +134,12 @@ class TransitionProductionCallerTest(unittest.TestCase):
                     return_value=False,
                 ),
                 patch.object(close, "_kiwoom_server_login_block_message", return_value=""),
+                patch.object(close, "persistent_feature_owner", return_value=parent),
                 patch.object(
                     close,
                     "evaluate_production_transition",
                     return_value=rejected,
-                ),
+                ) as transition,
                 patch.object(close, "show_toast"),
                 patch.object(close, "append_changelog"),
             ):
@@ -130,6 +149,8 @@ class TransitionProductionCallerTest(unittest.TestCase):
                 )
 
             self.assertEqual(state_path.read_bytes(), before)
+            self.assertEqual("EARLY_CLOSE_REQUEST", parent.caller_name)
+            transition.assert_called_once()
             service.apply_early_close.assert_not_called()
             window.statusBarMessage.assert_called_once_with(
                 "\uc870\uae30\ub9c8\uac10 \uc801\uc6a9: 0\uac1c / \uc81c\uc678 1\uac1c"
@@ -153,12 +174,12 @@ class TransitionProductionCallerTest(unittest.TestCase):
             selected = [self._write_stock(Path(temp))]
             window = self._window(selected)
             parent = Parent()
-            window.parent.return_value = parent
             state_path = selected[0][0] / "state.json"
             before = state_path.read_bytes()
             service = Mock()
             with (
                 patch.object(close, "QMessageBox", _ProceedMessageBox),
+                patch.object(close, "persistent_feature_owner", return_value=parent),
                 patch.object(close, "OperationCommandService", return_value=service),
                 patch.object(
                     close,
@@ -204,9 +225,9 @@ class TransitionProductionCallerTest(unittest.TestCase):
             before = state_path.read_bytes()
             window = self._window(selected)
             parent = Parent()
-            window.parent.return_value = parent
             service = Mock()
             with (
+                patch.object(close, "persistent_feature_owner", return_value=parent),
                 patch.object(close, "OperationCommandService", return_value=service),
                 patch.object(close.QMessageBox, "critical"),
             ):
@@ -237,6 +258,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
                 evidence_status="UNKNOWN",
             )
             with (
+                patch.object(close, "persistent_feature_owner", return_value=None),
                 patch.object(close, "OperationCommandService", return_value=service),
                 patch.object(
                     close,

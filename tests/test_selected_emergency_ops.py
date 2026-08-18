@@ -15,24 +15,37 @@ from runtime_io import read_json_dict
 
 
 class SelectedEmergencyOpsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        operation_state = patch.object(
+            emergency_ops,
+            "read_operation_state",
+            return_value={"emergency_stop": False},
+        )
+        operation_state.start()
+        self.addCleanup(operation_state.stop)
+
     def _target(
         self,
         root: str,
         code: str,
         *,
         status: str = "STOPPED",
+        emergency_scope: str | None = None,
     ) -> tuple[Path, str, str]:
         stock_dir = Path(root) / f"{code}_TEST"
         stock_dir.mkdir(parents=True)
         (stock_dir / "config.json").write_text("{}\n", encoding="utf-8")
         (stock_dir / "orders.json").write_text('{"orders": []}\n', encoding="utf-8")
+        state = {
+            "status": status,
+            "holding_qty": 0,
+            "trade_enabled": status == "RUNNING",
+        }
+        if status == "EMERGENCY_STOPPED":
+            state["emergency_scope"] = emergency_scope or "SELECTED"
         (stock_dir / "state.json").write_text(
             json.dumps(
-                {
-                    "status": status,
-                    "holding_qty": 0,
-                    "trade_enabled": status == "RUNNING",
-                },
+                state,
                 ensure_ascii=False,
             )
             + "\n",
@@ -58,6 +71,9 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             refresh_all=Mock(),
             statusBar=lambda: status_bar,
             btn_emergency_stop=SimpleNamespace(setText=Mock()),
+            startup_recovery_session_ready=lambda refresh=False: True,
+            production_recovery_stock_is_review_required=lambda _code: False,
+            start_production_recovery=Mock(),
         )
 
     @staticmethod
@@ -152,9 +168,129 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 emergency_ops.execute_emergency_stop(window)
 
             saved = read_json_dict(target[0] / "state.json")
+            self.assertEqual("REVIEW_REQUIRED", saved["status"])
             self.assertTrue(saved["review_required"])
             self.assertEqual("기존 사유", saved["review_reason"])
             self.assertEqual("2026-08-15 09:00:00", saved["review_entered_at"])
+
+    def test_global_stop_preserves_existing_reviews_and_adds_no_review_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            reviews = [
+                self._target(root, f"00000{index}", status="REVIEW_REQUIRED")
+                for index in range(1, 3)
+            ]
+            normal = [
+                self._target(root, f"0000{index:02d}", status="STOPPED")
+                for index in range(3, 13)
+            ]
+            identities = {}
+            for index, target in enumerate(reviews, start=1):
+                state = read_json_dict(target[0] / "state.json")
+                state.update(
+                    {
+                        "review_required": True,
+                        "review_status": "PENDING",
+                        "review_reason": f"기존 사유 {index}",
+                        "review_location": f"기존 검출 {index}",
+                        "review_entered_at": f"2026-08-1{index} 09:00:00",
+                    }
+                )
+                (target[0] / "state.json").write_text(
+                    json.dumps(state, ensure_ascii=False), encoding="utf-8"
+                )
+                identities[target[1]] = dict(state)
+
+            targets = reviews + normal
+            window = self._global_window(targets)
+            with (
+                patch.object(emergency_ops, "write_global_emergency_stop_state", return_value={"ok": True}),
+                patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": False}),
+                patch.object(emergency_ops, "append_production_event"),
+                patch.object(emergency_ops, "append_changelog"),
+                patch.object(emergency_ops, "append_stock_log"),
+                patch.object(emergency_ops, "show_toast"),
+                patch.object(emergency_ops.QMessageBox, "critical") as critical,
+            ):
+                emergency_ops.execute_emergency_stop(window)
+
+            critical.assert_not_called()
+            window.start_production_recovery.assert_not_called()
+            rows = self._collect_rows_for(targets)
+            self.assertEqual(2, len(rows))
+            self.assertEqual(2, len(self._collect_rows_for(targets)))
+            for target in reviews:
+                self.assertEqual(identities[target[1]], read_json_dict(target[0] / "state.json"))
+            for target in normal:
+                state = read_json_dict(target[0] / "state.json")
+                self.assertEqual("EMERGENCY_STOPPED", state["status"])
+                self.assertEqual("GLOBAL", state["emergency_scope"])
+                self.assertFalse(state.get("review_required", False))
+                self.assertNotIn("review_entered_at", state)
+
+    def test_global_latch_write_failure_starts_no_stock_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            target = self._target(root, "000001", status="RUNNING")
+            before = read_json_dict(target[0] / "state.json")
+            window = self._global_window([target])
+            with (
+                patch.object(emergency_ops, "write_global_emergency_stop_state", return_value={"ok": False}),
+                patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": False}),
+                patch.object(emergency_ops, "update_runtime_stock_status") as stock_writer,
+                patch.object(emergency_ops, "show_toast"),
+                patch.object(emergency_ops.QMessageBox, "critical"),
+            ):
+                emergency_ops.execute_emergency_stop(window)
+
+            stock_writer.assert_not_called()
+            self.assertEqual(before, read_json_dict(target[0] / "state.json"))
+
+    def test_global_release_preserves_old_review_and_reviews_only_failed_target(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            existing_review = self._target(root, "000001", status="REVIEW_REQUIRED")
+            review_state = read_json_dict(existing_review[0] / "state.json")
+            review_state.update(
+                {
+                    "review_required": True,
+                    "review_status": "PENDING",
+                    "review_reason": "기존 사유",
+                    "review_location": "기존 검출",
+                    "review_entered_at": "2026-08-01 09:00:00",
+                }
+            )
+            (existing_review[0] / "state.json").write_text(
+                json.dumps(review_state, ensure_ascii=False), encoding="utf-8"
+            )
+            normal = self._target(
+                root, "000002", status="EMERGENCY_STOPPED", emergency_scope="GLOBAL"
+            )
+            blocked = self._target(
+                root, "000003", status="EMERGENCY_STOPPED", emergency_scope="GLOBAL"
+            )
+            blocked_state = read_json_dict(blocked[0] / "state.json")
+            blocked_state.update({"holding_qty": 1, "avg_price": 1000})
+            (blocked[0] / "state.json").write_text(
+                json.dumps(blocked_state, ensure_ascii=False), encoding="utf-8"
+            )
+            targets = [existing_review, normal, blocked]
+            window = self._global_window(targets)
+            with (
+                patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": True}),
+                patch.object(emergency_ops, "global_emergency_release_preflight", return_value=(True, "")),
+                patch.object(emergency_ops, "write_global_emergency_stop_state", return_value={"ok": True}),
+                patch.object(emergency_ops, "_active_queue_reason", return_value=""),
+                patch.object(emergency_ops, "append_production_event"),
+                patch.object(emergency_ops, "append_changelog"),
+                patch.object(emergency_ops, "append_stock_log"),
+                patch.object(emergency_ops, "show_toast"),
+                patch.object(emergency_ops.QMessageBox, "critical"),
+            ):
+                emergency_ops.release_emergency_stop(window)
+
+            self.assertEqual(review_state, read_json_dict(existing_review[0] / "state.json"))
+            self.assertEqual("STOPPED", read_json_dict(normal[0] / "state.json")["status"])
+            failed_state = read_json_dict(blocked[0] / "state.json")
+            self.assertTrue(failed_state["review_required"])
+            self.assertEqual("긴급정지 해제", failed_state["review_location"])
 
     def test_stop_changes_only_selected_target_and_verifies_saved_state(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -167,17 +303,27 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 patch.object(emergency_ops, "append_stock_log"),
                 patch.object(emergency_ops, "show_toast") as toast,
                 patch.object(emergency_ops, "now_text", return_value="2026-08-06 14:00:00"),
+                patch.object(
+                    emergency_ops,
+                    "review_return_availability",
+                    return_value={"availability": "ALLOWED", "reason": ""},
+                ),
             ):
                 result = emergency_ops.execute_selected_emergency_stop(window, [selected])
 
             saved = read_json_dict(selected[0] / "state.json")
             self.assertEqual(("000001 테스트",), result["changed"])
             self.assertEqual((), result["failed"])
-            self.assertEqual("EMERGENCY_STOPPED", saved["status"])
+            self.assertEqual("REVIEW_REQUIRED", saved["status"])
+            self.assertEqual("SELECTED", saved["emergency_scope"])
             self.assertFalse(saved["trade_enabled"])
             self.assertTrue(saved["review_required"])
             self.assertEqual("PENDING", saved["review_status"])
-            self.assertEqual("종목 긴급정지", saved["review_location"])
+            self.assertEqual("종목 검토정지", saved["review_location"])
+            self.assertEqual("사용자 검토정지", saved["review_reason"])
+            self.assertEqual("", saved["emergency_reason"])
+            self.assertEqual("", saved["emergency_stopped_at"])
+            self.assertEqual("ALLOWED", result["availability_by_stock"]["000001"]["availability"])
             self.assertEqual("2026-08-06 14:00:00", saved["review_entered_at"])
             self.assertNotIn("buy_enabled", saved)
             self.assertNotIn("sell_enabled", saved)
@@ -185,7 +331,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             window.refresh_all.assert_called_once_with()
             toast.assert_called_once()
 
-    def test_selected_stop_merges_existing_review_reason_without_reentry(self) -> None:
+    def test_selected_stop_skips_existing_review_without_reentry(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             target = self._target(root, "000001", status="REVIEW_REQUIRED")
             state = read_json_dict(target[0] / "state.json")
@@ -212,15 +358,13 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 )
             saved = read_json_dict(target[0] / "state.json")
 
-        self.assertEqual(("000001 테스트",), result["changed"])
-        self.assertEqual(
-            "운영 데이터 불일치 / 사용자 긴급정지",
-            saved["review_reason"],
-        )
+        self.assertEqual((), result["changed"])
+        self.assertEqual(("000001 테스트",), result["skipped"])
+        self.assertEqual("운영 데이터 불일치", saved["review_reason"])
         self.assertEqual("2026-08-01 09:00:00", saved["review_entered_at"])
         self.assertEqual("운영 시작", saved["review_location"])
         self.assertEqual("RESOLVED", saved["review_status"])
-        self.assertEqual("EMERGENCY_STOPPED", saved["status"])
+        self.assertEqual("REVIEW_REQUIRED", saved["status"])
 
     def test_stop_write_failure_is_reported_without_success_toast(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -262,6 +406,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             for target in (first, second):
                 saved = read_json_dict(target[0] / "state.json")
                 self.assertTrue(saved["review_required"])
+                self.assertEqual("SELECTED", saved["emergency_scope"])
                 self.assertEqual("2026-08-16 10:30:00", saved["review_entered_at"])
             self.assertEqual(
                 untouched_before, read_json_dict(untouched[0] / "state.json")
@@ -328,7 +473,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 result = emergency_ops.execute_selected_emergency_release(window, [target])
 
             saved = read_json_dict(target[0] / "state.json")
-            self.assertEqual(("000001 테스트",), result["review"])
+            self.assertEqual(("000001 테스트",), result["blocked"])
             self.assertEqual("EMERGENCY_STOPPED", saved["status"])
             self.assertTrue(saved["review_required"])
             self.assertEqual("PENDING", saved["review_status"])
@@ -338,7 +483,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
 
     def test_release_readback_mismatch_is_reported_as_failure(self) -> None:
         target = (Path("stocks/000001_TEST"), "000001", "테스트")
-        initial = {"status": "EMERGENCY_STOPPED"}
+        initial = {"status": "EMERGENCY_STOPPED", "emergency_scope": "SELECTED"}
         window = self._window()
         with (
             patch.object(
@@ -365,7 +510,8 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
 
         self.assertEqual(("000001 테스트",), result["failed"])
         self.assertEqual((), result["normal"])
-        toast.assert_not_called()
+        toast.assert_called_once()
+        self.assertNotIn("완료", toast.call_args.kwargs["message"])
 
     def test_common_restore_releases_review_and_preserves_routine_identity(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -510,10 +656,12 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             patch.object(emergency_ops, "execute_selected_emergency_release", return_value={"ok": True}) as release,
         ):
             AutoTradeSettingWindow.emergency_stop_selected_auto_trade_stocks(window)
-            AutoTradeSettingWindow.release_selected_emergency_stopped_auto_trade_stocks(window)
 
         stop.assert_called_once_with(window, [target])
-        release.assert_called_once_with(window, [target])
+        release.assert_not_called()
+        self.assertFalse(
+            hasattr(AutoTradeSettingWindow, "release_selected_emergency_stopped_auto_trade_stocks")
+        )
 
 
 if __name__ == "__main__":

@@ -184,6 +184,66 @@ class ReviewForceResetTest(unittest.TestCase):
                 readback_failed = stock_window.delete_stock_project_data("111111", "대상", stock_dir)
             self.assertEqual("FAILED", readback_failed["status"])
 
+    def test_review_force_reset_no_selection_with_review_row_uses_toast(self):
+        with TemporaryDirectory() as temp_dir:
+            stock_dir = self._make_review_stock(Path(temp_dir))
+            row = self._row(stock_dir)
+            with (
+                patch.object(
+                    review_window,
+                    "collect_global_review_required_rows",
+                    return_value=[row],
+                ),
+                patch.object(review_window, "show_toast") as toast,
+                patch.object(review_window.QMessageBox, "information") as information,
+                patch.object(stock_window, "force_stock_reset_preflight") as preflight,
+                patch.object(stock_window, "confirm_force_stock_reset") as confirm,
+                patch.object(stock_window, "delete_stock_project_data") as delete_data,
+                patch.object(review_window, "append_production_event") as journal,
+            ):
+                window = review_window.GlobalReviewRequiredWindow()
+                self.addCleanup(window.close)
+                window.table.clearSelection()
+                window.delete_selected_review_items()
+
+            toast.assert_called_once_with(
+                window,
+                "강제초기화할 검토종목을 선택하세요.",
+            )
+            information.assert_not_called()
+            preflight.assert_not_called()
+            confirm.assert_not_called()
+            delete_data.assert_not_called()
+            journal.assert_not_called()
+
+    def test_review_force_reset_empty_table_uses_toast(self):
+        with (
+            patch.object(
+                review_window,
+                "collect_global_review_required_rows",
+                return_value=[],
+            ),
+            patch.object(review_window, "show_toast") as toast,
+            patch.object(review_window.QMessageBox, "information") as information,
+            patch.object(stock_window, "force_stock_reset_preflight") as preflight,
+            patch.object(stock_window, "confirm_force_stock_reset") as confirm,
+            patch.object(stock_window, "delete_stock_project_data") as delete_data,
+            patch.object(review_window, "append_production_event") as journal,
+        ):
+            window = review_window.GlobalReviewRequiredWindow()
+            self.addCleanup(window.close)
+            window.delete_selected_review_items()
+
+        toast.assert_called_once_with(
+            window,
+            "강제초기화할 검토종목을 선택하세요.",
+        )
+        information.assert_not_called()
+        preflight.assert_not_called()
+        confirm.assert_not_called()
+        delete_data.assert_not_called()
+        journal.assert_not_called()
+
     def test_review_force_reset_cancel_changes_nothing(self):
         with TemporaryDirectory() as temp:
             stock_dir = self._make_review_stock(Path(temp))

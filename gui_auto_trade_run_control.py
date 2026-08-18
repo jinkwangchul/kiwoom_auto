@@ -201,18 +201,44 @@ def auto_trade_registered_operation_start_targets(window=None) -> list[tuple[Pat
     ]
 
 
-def auto_trade_running_registered_operation_targets(window) -> list[tuple[Path, str, str]]:
+def auto_trade_running_registered_operation_targets(
+    window,
+    *,
+    registered_targets: list[tuple[Path, str, str]] | None = None,
+    operation_excluded_by_stock_dir: dict[str, bool] | None = None,
+    state_by_stock_dir: dict[str, dict[str, object]] | None = None,
+) -> list[tuple[Path, str, str]]:
     running: list[tuple[Path, str, str]] = []
     target_getter = getattr(window, "registered_operation_targets", None)
     registered = (
-        list(target_getter())
+        list(registered_targets)
+        if registered_targets is not None
+        else list(target_getter())
         if callable(target_getter)
         else auto_trade_registered_operation_targets()
     )
     for target in registered:
-        if auto_trade_stock_operation_excluded(target[0]):
+        preloaded_snapshot = (
+            operation_excluded_by_stock_dir is not None
+            or state_by_stock_dir is not None
+        )
+        stock_dir_key = (
+            str(Path(target[0]))
+            if preloaded_snapshot
+            else str(Path(target[0]).resolve())
+        )
+        operation_excluded = (
+            bool(operation_excluded_by_stock_dir.get(stock_dir_key, False))
+            if operation_excluded_by_stock_dir is not None
+            else auto_trade_stock_operation_excluded(target[0])
+        )
+        if operation_excluded:
             continue
-        state = read_json_dict(target[0] / "state.json")
+        state = (
+            state_by_stock_dir.get(stock_dir_key, {})
+            if state_by_stock_dir is not None
+            else read_json_dict(target[0] / "state.json")
+        )
         if auto_trade_setting_current_session_trade_started(
             window,
             auto_trade_setting_trade_started(state),
@@ -334,6 +360,70 @@ def _queue_record_action(record: dict[str, object]) -> str:
     return next(iter(actions), "")
 
 
+def _terminal_approval_blocked_zero_quantity(
+    record: dict[str, object],
+    *,
+    pending_qty: int,
+    pending_unknown: bool,
+) -> bool:
+    """Identify the narrow approval-blocked SELL candidate terminal contract."""
+
+    if str(record.get("status") or "").strip().upper() != "BLOCKED":
+        return False
+    if str(record.get("approval_status") or "").strip().upper() != "BLOCKED":
+        return False
+    if record.get("execution_enabled") is not False:
+        return False
+    if str(record.get("candidate_status") or "").strip().upper() != "NO_HOLDING_QTY":
+        return False
+    if (
+        str(record.get("order_type") or "").strip().upper()
+        != "SELL_NO_HOLDING_CANDIDATE"
+    ):
+        return False
+    raw_quantity = record.get("quantity")
+    if isinstance(raw_quantity, bool) or raw_quantity is None:
+        return False
+    try:
+        quantity = int(str(raw_quantity).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return False
+    for pending_field in ("pending_qty", "remaining_qty", "unfilled_qty", "미체결수량"):
+        for raw_pending in _queue_named_values(record, pending_field.lower()):
+            if raw_pending in (None, ""):
+                continue
+            if isinstance(raw_pending, bool):
+                return False
+            try:
+                parsed_pending = int(str(raw_pending).replace(",", "").strip())
+            except (TypeError, ValueError):
+                return False
+            if parsed_pending < 0:
+                return False
+    if quantity != 0 or pending_unknown or pending_qty != 0:
+        return False
+    if record.get("send_order_called") not in (None, False):
+        return False
+    if record.get("dispatch_claimed") is True:
+        return False
+    for field in (
+        "execution_id",
+        "order_id",
+        "lock_id",
+        "dispatch_claim_id",
+        "dispatch_status",
+        "send_status",
+        "broker_order_no",
+        "original_order_no",
+    ):
+        if any(
+            str(value or "").strip()
+            for value in _queue_named_values(record, field)
+        ):
+            return False
+    return True
+
+
 def _today_normal_ended(
     operation_state: dict[str, object],
     now_dt: datetime,
@@ -412,6 +502,12 @@ def _active_queue_reason(
             record.get("status") or record.get("order_status") or ""
         ).strip().upper()
         pending_qty, unknown = order_current_pending_qty(record)
+        if _terminal_approval_blocked_zero_quantity(
+            record,
+            pending_qty=pending_qty,
+            pending_unknown=unknown,
+        ):
+            continue
         unresolved = (
             status in ACTIVE_QUEUE_STATUSES
             or unknown

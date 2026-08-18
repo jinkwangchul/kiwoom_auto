@@ -265,6 +265,119 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_parent_new_routine_moves_from_double_click_to_context_menu(self) -> None:
+        definition = RoutineDefinitionRecord(
+            definition_id="indicator_follow",
+            display_name="지표추종매매",
+            package_dir=Path("routine-path"),
+            schema_version="1.0",
+            version="0.1.0",
+            routine_type="auto_trade",
+            entry_file="routine.py",
+            module_name="indicator_follow_routine",
+            settings_ui="indicator_follow",
+            default_rules_file="rules.json",
+            package_enabled=True,
+            source_name="지표추종매매",
+        )
+        table = QTableWidget(1, 1)
+        item = QTableWidgetItem(definition.display_name)
+        item.setData(
+            gui_main_table_loader.ROUTINE_ROW_KIND_ROLE,
+            gui_main_table_loader.ROUTINE_ROW_PARENT,
+        )
+        item.setData(
+            gui_main_table_loader.ROUTINE_DEFINITION_ID_ROLE,
+            definition.definition_id,
+        )
+        item.setData(
+            gui_main_table_loader.ROUTINE_PARENT_NAME_ROLE,
+            definition.display_name,
+        )
+        table.setItem(0, 0, item)
+        table.resize(480, 120)
+        table.show()
+        self.app.processEvents()
+
+        def set_operation_actions_enabled(actions, enabled):
+            gui_windows.MainWindow._set_routine_operation_actions_enabled(
+                actions,
+                enabled,
+            )
+
+        window = SimpleNamespace(
+            routine_table=table,
+            handle_routine_group_name_double_click=MagicMock(return_value=True),
+            open_routine_settings_from_main_table=MagicMock(),
+            request_routine_definition_operation=MagicMock(),
+            _routine_instance_ids_by_definition={},
+            _routine_instance_has_assigned_stocks=MagicMock(return_value=False),
+            _set_routine_operation_actions_enabled=set_operation_actions_enabled,
+        )
+        controller = gui_windows._RoutineTreeInteractionController(window)
+        window._routine_tree_interaction_controller = controller
+        index = table.model().index(0, 0)
+        parent_name_point = controller._parent_name_rect(index).center()
+
+        double_click = QMouseEvent(
+            QEvent.MouseButtonDblClick,
+            QPointF(parent_name_point),
+            Qt.LeftButton,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+        self.assertTrue(controller.eventFilter(table.viewport(), double_click))
+        window.handle_routine_group_name_double_click.assert_called_once_with(0)
+        window.open_routine_settings_from_main_table.assert_not_called()
+
+        menu = MagicMock()
+        actions = [MagicMock(), MagicMock(), MagicMock()]
+        menu.addAction.side_effect = actions
+        menu.exec_.return_value = None
+        with (
+            patch.object(gui_windows, "QMenu", return_value=menu),
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=definition,
+            ),
+        ):
+            gui_windows.MainWindow.open_routine_context_menu(
+                window,
+                parent_name_point,
+            )
+
+        self.assertEqual(
+            ["신규루틴", "조기마감", "즉시청산"],
+            [call_item.args[0] for call_item in menu.addAction.call_args_list],
+        )
+        menu.addSeparator.assert_called_once_with()
+        new_routine_slot = actions[0].triggered.connect.call_args.args[0]
+        new_routine_slot()
+        window.open_routine_settings_from_main_table.assert_called_once_with(item)
+        for action in actions[1:]:
+            action.setEnabled.assert_called_once_with(False)
+        actions[1].triggered.connect.call_args.args[0]()
+        actions[2].triggered.connect.call_args.args[0]()
+        self.assertEqual(
+            [
+                call(
+                    definition.definition_id,
+                    definition.display_name,
+                    "루틴",
+                    gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
+                ),
+                call(
+                    definition.definition_id,
+                    definition.display_name,
+                    gui_windows.POLICY_MARKET,
+                    gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
+                ),
+            ],
+            window.request_routine_definition_operation.call_args_list,
+        )
+        table.close()
+
     def test_routine_operation_confirmations_use_project_copy(self) -> None:
         import gui_windows
 
@@ -960,6 +1073,24 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             ("\uC218\uC775(0 / 0.00%)", DIRECTIONAL_NEUTRAL_COLOR),
         )
         self.assertEqual(
+            gui_main_table_loader.routine_group_profit_projection(
+                ("routine-a", "routine-b"),
+                {
+                    "routine-a": {
+                        "profit_amount": 35_200,
+                        "profit_cost_basis": 1_248_227,
+                        "profit_unknown": False,
+                    },
+                    "routine-b": {
+                        "profit_amount": -12_500,
+                        "profit_cost_basis": 1_250_000,
+                        "profit_unknown": False,
+                    },
+                },
+            ),
+            ("\uC218\uC775(+22,700 / +0.91%)", DIRECTIONAL_NEGATIVE_COLOR, 22_700.0),
+        )
+        self.assertEqual(
             routine_instance_profit_text(
                 profit_amount=0,
                 cost_basis=0,
@@ -1487,7 +1618,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 gui_main_table_loader.ROUTINE_STATUS_STAMP_WIDTH,
                 stamp.width(),
             )
-            self.assertEqual(22, stamp.height())
+            self.assertEqual(
+                gui_main_table_loader.ROUTINE_STATUS_STAMP_HEIGHT,
+                stamp.height(),
+            )
             self.assertIn(f"border: 1px solid {color}", stamp.styleSheet())
             self.assertIn(f"color: {color}", status_text.styleSheet())
             def aggregate_metric_text(metric_widget):
@@ -2930,6 +3064,12 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            ("수익(+35,200 / +2.82%)", DIRECTIONAL_NEGATIVE_COLOR),
+            table.item(0, 0).data(
+                gui_main_table_loader.ROUTINE_PARENT_PROFIT_ROLE
+            ),
+        )
+        self.assertEqual(
             expected_aggregate,
             table.item(1, 0).data(gui_main_table_loader.ROUTINE_CHILD_AGGREGATE_ROLE),
         )
@@ -2968,7 +3108,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_main_table_loader.ROUTINE_STATUS_STAMP_WIDTH,
             stamp.width(),
         )
-        self.assertEqual(22, stamp.height())
+        self.assertEqual(
+            gui_main_table_loader.ROUTINE_STATUS_STAMP_HEIGHT,
+            stamp.height(),
+        )
         self.assertIn("border: 1px solid #16A34A", stamp.styleSheet())
         self.assertIn("color: #16A34A", status_text.styleSheet())
         self.assertEqual(
@@ -3622,8 +3765,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 )
                 self.assertIn(
                     gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
-                    window._main_routine_level_buttons["stock"].styleSheet(),
+                    window._main_routine_summary_count_buttons[
+                        "operation"
+                    ].styleSheet(),
                 )
+                window._set_main_routine_stock_scope("operation", False)
 
                 window._main_routine_valid_button.click()
                 window._main_routine_level_buttons["group"].click()
@@ -3838,18 +3984,24 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
                 parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
                 parent_menu = MagicMock()
-                parent_actions = [MagicMock(), MagicMock()]
+                parent_actions = [MagicMock(), MagicMock(), MagicMock()]
                 parent_menu.addAction.side_effect = parent_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=parent_menu),
                     patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
                 ):
                     window.open_routine_context_menu(parent_name_rect.center())
-                self.assertEqual(2, len(parent_menu.addAction.call_args_list))
+                self.assertEqual(3, len(parent_menu.addAction.call_args_list))
+                self.assertEqual(
+                    ["신규루틴", "조기마감", "즉시청산"],
+                    [call.args[0] for call in parent_menu.addAction.call_args_list],
+                )
+                parent_menu.addSeparator.assert_called_once_with()
+                parent_actions[0].triggered.connect.assert_called_once()
 
 
 
-                for action in parent_actions:
+                for action in parent_actions[1:]:
                     action.setEnabled.assert_called_once_with(False)
                     action.setStatusTip.assert_called_once()
 
@@ -3914,6 +4066,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window,
                     "open_routine_settings_from_main_table",
                 ) as settings_open:
+                    double_click_routine(parent_name_rect.center())
                     with patch.object(
                         window,
                         "start_routine_instance_name_edit",
@@ -3924,6 +4077,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                             double_click_routine(blocked_point)
                         name_edit.assert_not_called()
                     settings_open.assert_not_called()
+
+                with patch.object(
+                    window,
+                    "open_routine_settings_from_main_table",
+                ) as settings_open:
+                    new_routine_slot = parent_actions[0].triggered.connect.call_args.args[0]
+                    new_routine_slot()
+                settings_open.assert_called_once_with(window.routine_table.item(0, 0))
 
                 fake_menu = MagicMock()
                 child_actions = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
@@ -3954,14 +4115,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
                 window._routine_assigned_stock_count_by_instance[instance.instance_id] = 1
                 active_parent_menu = MagicMock()
-                active_parent_actions = [MagicMock(), MagicMock()]
+                active_parent_actions = [MagicMock(), MagicMock(), MagicMock()]
                 active_parent_menu.addAction.side_effect = active_parent_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=active_parent_menu),
                     patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
                 ):
                     window.open_routine_context_menu(parent_name_rect.center())
-                for action in active_parent_actions:
+                for action in active_parent_actions[1:]:
                     action.setEnabled.assert_called_once_with(True)
 
                 active_child_menu = MagicMock()

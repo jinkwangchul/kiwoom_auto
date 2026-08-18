@@ -579,17 +579,40 @@ def write_production_recovery_review(
                     ),
                     -1,
                 )
-                if duplicate_index >= 0 and (
-                    _clean_text(reviews[duplicate_index].get("status")).upper()
-                    == record["status"]
-                    or record["status"] != PRODUCTION_RECOVERY_REVIEW_RESOLVED
-                ):
-                    return _recovery_review_result(
-                        PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
-                        dedup_key=record["dedup_key"],
-                        record=reviews[duplicate_index],
-                        post_write_verified=True,
-                    )
+                if duplicate_index >= 0:
+                    existing = deepcopy(reviews[duplicate_index])
+                    existing_status = _clean_text(existing.get("status")).upper()
+                    if record["status"] == PRODUCTION_RECOVERY_REVIEW_OPEN:
+                        if existing_status != PRODUCTION_RECOVERY_REVIEW_OPEN:
+                            return _recovery_review_result(
+                                PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
+                                dedup_key=record["dedup_key"],
+                                record=existing,
+                                post_write_verified=True,
+                            )
+                        merged = deepcopy(existing)
+                        for evidence_field in ("broker_evidence", "runtime_evidence"):
+                            previous_evidence = _as_dict(existing.get(evidence_field))
+                            incoming_evidence = _as_dict(record.get(evidence_field))
+                            merged[evidence_field] = {
+                                **deepcopy(previous_evidence),
+                                **deepcopy(incoming_evidence),
+                            }
+                        if merged == existing:
+                            return _recovery_review_result(
+                                PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
+                                dedup_key=record["dedup_key"],
+                                record=existing,
+                                post_write_verified=True,
+                            )
+                        record = merged
+                    elif existing_status == PRODUCTION_RECOVERY_REVIEW_RESOLVED:
+                        return _recovery_review_result(
+                            PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
+                            dedup_key=record["dedup_key"],
+                            record=existing,
+                            post_write_verified=True,
+                        )
 
                 updated = deepcopy(data)
                 if duplicate_index >= 0:
@@ -648,6 +671,107 @@ def write_production_recovery_review(
             record=record,
             reason="broker holdings lock timeout",
         )
+
+
+def resolve_account_holding_snapshot_failures(
+    *,
+    account_no: Any,
+    trading_day: Any,
+    login_session_id: Any,
+    successful_recovery_session_id: Any,
+    broker_holdings_path: str | Path,
+) -> dict[str, Any]:
+    """Resolve superseded account-level HOLDING snapshot failures.
+
+    Resolution is deliberately limited to failures owned by the same account,
+    trading day, and login session.  Each historical row keeps its original
+    recovery-session identity and is updated through the existing canonical
+    review writer; no row is removed.
+    """
+
+    account = _clean_text(account_no)
+    day = _clean_text(trading_day)
+    login = _clean_text(login_session_id)
+    successful_session = _clean_text(successful_recovery_session_id)
+    if not all((account, day, login, successful_session)):
+        return {
+            "status": PRODUCTION_RECOVERY_REVIEW_INVALID,
+            "resolved_count": 0,
+            "file_write": False,
+            "post_write_verified": False,
+            "reason": "successful Recovery identity is incomplete",
+        }
+
+    target_path = Path(broker_holdings_path)
+    data, blocked = _read_holdings(target_path)
+    if blocked is not None:
+        return {
+            "status": PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED,
+            "resolved_count": 0,
+            "file_write": False,
+            "post_write_verified": False,
+            "reason": blocked["blocked_reasons"][0],
+        }
+
+    candidates = [
+        deepcopy(item)
+        for item in data.get(PRODUCTION_RECOVERY_REVIEW_FIELD, [])
+        if isinstance(item, dict)
+        and _clean_text(item.get("review_source")).upper()
+        == PRODUCTION_RECOVERY_REVIEW_SOURCE
+        and _clean_text(item.get("status")).upper()
+        == PRODUCTION_RECOVERY_REVIEW_OPEN
+        and _clean_text(item.get("account_no")) == account
+        and _clean_text(item.get("trading_day")) == day
+        and _clean_text(item.get("login_session_id")) == login
+        and not _clean_text(item.get("stock_code"))
+        and _clean_text(item.get("reason_code")) == "HOLDING_SNAPSHOT_FAILED"
+    ]
+    if not candidates:
+        return {
+            "status": PRODUCTION_RECOVERY_REVIEW_DUPLICATE,
+            "resolved_count": 0,
+            "file_write": False,
+            "post_write_verified": True,
+            "reason": "no matching active holding snapshot failure",
+        }
+
+    resolved_count = 0
+    results: list[dict[str, Any]] = []
+    for candidate in candidates:
+        runtime_evidence = _as_dict(candidate.get("runtime_evidence"))
+        candidate["runtime_evidence"] = {
+            **deepcopy(runtime_evidence),
+            "resolution": {
+                "resolved_at": _now_text(),
+                "successful_recovery_session_id": successful_session,
+            },
+        }
+        candidate["status"] = PRODUCTION_RECOVERY_REVIEW_RESOLVED
+        result = write_production_recovery_review(candidate, target_path)
+        results.append(result)
+        if result.get("status") == PRODUCTION_RECOVERY_REVIEW_WRITTEN:
+            resolved_count += 1
+            continue
+        return {
+            "status": str(result.get("status") or PRODUCTION_RECOVERY_REVIEW_STORAGE_FAILED),
+            "resolved_count": resolved_count,
+            "file_write": any(item.get("file_write") is True for item in results),
+            "post_write_verified": False,
+            "reason": str(result.get("reason") or "holding snapshot failure resolution failed"),
+            "results": results,
+        }
+
+    return {
+        "status": PRODUCTION_RECOVERY_REVIEW_WRITTEN,
+        "resolved_count": resolved_count,
+        "file_write": any(item.get("file_write") is True for item in results),
+        "post_write_verified": all(
+            item.get("post_write_verified") is True for item in results
+        ),
+        "reason": "",
+        "results": results,
+    }
 
 
 def _read_positions_for_compare(path: Path) -> tuple[list[dict[str, Any]], str]:

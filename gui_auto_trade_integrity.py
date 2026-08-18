@@ -45,6 +45,7 @@ _REVIEW_LOCATION_DISPLAY_BY_SOURCE = {
     "긴급정지 해제": "긴급정지 해제",
     "사용자 긴급정지": "전체 긴급정지",
     "종목 우클릭 긴급정지": "종목 긴급정지",
+    "종목 우클릭 검토정지": "종목 검토정지",
     "강제종료": "운영 종료",
     "종목등록 창 미체결 데이터 무결성 오류": "종목 등록",
     "등록해제 미체결 데이터 무결성 오류": "종목 해제",
@@ -96,6 +97,12 @@ def operator_review_reason(reason: object, *, default: str = "-") -> str:
         return REVIEW_REASON_LIQUIDATION_REMAINS
     if raw == "USER_EMERGENCY_STOP":
         return "사용자 긴급정지"
+    if raw == "USER_REVIEW_STOP":
+        return "사용자 검토정지"
+    if raw == "PENDING_ORDER":
+        return "미체결 주문 존재"
+    if raw == "PENDING_CANCEL":
+        return "주문 취소 처리 중"
     if raw.startswith("RECOVERY_"):
         return REVIEW_REASON_RECOVERY_STATE_ERROR
     if raw == "ACTIVE_CLOSE_OR_LIQUIDATION":

@@ -492,6 +492,223 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             self.assertEqual(5, rank_by_status["검토종목"])
             self.assertNotEqual(rank_by_status["긴급정지"], rank_by_status["검토종목"])
 
+    def test_setting_trade_column_reuses_main_buy_sell_trade_counts(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        _ = app
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_삼성전자"
+            stock_dir.mkdir()
+            config = {
+                "operation_mode": "CONTINUOUS",
+                "assigned_routine_instance_id": "instance-a",
+            }
+            state = {
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "holding_qty": 0,
+                "pending_buy_qty": 99,
+                "pending_sell_qty": 88,
+            }
+            (stock_dir / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            stock = {
+                "code": "005930",
+                "name": "삼성전자",
+                "stock_path": str(stock_dir),
+                "assigned_routine_instance_id": "instance-a",
+            }
+            window = SimpleNamespace(
+                stock_table=QTableWidget(0, 11),
+                _all_stocks_scope_active=True,
+                _stock_status_filter="all",
+                _stock_visual_order=[],
+                current_selected_routine_dir=lambda: None,
+                current_selected_routine_name=lambda: "",
+                capture_stock_table_view_state=lambda: (set(), 0),
+                restore_stock_table_view_state=lambda *_args: None,
+                update_selected_routine_status_bar=lambda: None,
+                all_registered_instance_ids=lambda: ["instance-a"],
+                update_action_buttons=lambda: None,
+            )
+
+            with (
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "read_base_stocks",
+                    return_value=[stock],
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "current_stock_trade_counts_by_code",
+                    return_value={"005930": (3, 2)},
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "pending_order_side_quantities",
+                    return_value=(99, 88),
+                ),
+            ):
+                gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(window)
+
+            main_values = gui_main_table_loader._routine_tree_stock_display_values(
+                SimpleNamespace(),
+                {
+                    "code": "005930",
+                    "name": "삼성전자",
+                    "stock_path": "",
+                    "state": state,
+                    "config": config,
+                },
+                trade_counts=(3, 2),
+            )
+            setting_trade_item = window.stock_table.item(0, 10)
+
+            self.assertIsNotNone(setting_trade_item)
+            self.assertEqual("매매(3 / 2)", main_values[10])
+            self.assertEqual(main_values[10], setting_trade_item.text())
+            self.assertNotIn("99", setting_trade_item.text())
+            self.assertNotIn("88", setting_trade_item.text())
+            self.assertEqual(
+                int(Qt.AlignCenter),
+                setting_trade_item.textAlignment(),
+            )
+
+    def test_setting_profit_column_matches_main_contract_for_all_placeholders(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        _ = app
+        cases = (
+            ({}, "수익(0 / 0.00%)"),
+            (
+                {
+                    "available": True,
+                    "cumulative_profit": 1_250,
+                    "cumulative_rate": 0.53,
+                },
+                "수익(+1,250 / +0.53%)",
+            ),
+            (
+                {
+                    "available": True,
+                    "cumulative_profit": -2_340,
+                    "cumulative_rate": -0.97,
+                },
+                "수익(-2,340 / -0.97%)",
+            ),
+            (
+                {
+                    "available": True,
+                    "cumulative_profit": 0,
+                    "cumulative_rate": 0,
+                },
+                "수익(0 / 0.00%)",
+            ),
+            (
+                {"available": False, "reason": "BROKER_NOT_CONNECTED"},
+                "수익(0 / 0.00%)",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_삼성전자"
+            stock_dir.mkdir()
+            config = {
+                "operation_mode": "CONTINUOUS",
+                "assigned_routine_instance_id": "instance-a",
+            }
+            state = {
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "holding_qty": 0,
+            }
+            (stock_dir / "config.json").write_text(
+                json.dumps(config, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            setting_stock = {
+                "code": "005930",
+                "name": "삼성전자",
+                "stock_path": str(stock_dir),
+                "assigned_routine_instance_id": "instance-a",
+            }
+            main_stock = {
+                "code": "005930",
+                "name": "삼성전자",
+                "stock_path": "",
+                "state": state,
+                "config": config,
+            }
+
+            for projection, expected_text in cases:
+                with self.subTest(expected_text=expected_text, projection=projection):
+                    window = SimpleNamespace(
+                        stock_table=QTableWidget(0, 11),
+                        _all_stocks_scope_active=True,
+                        _stock_status_filter="all",
+                        _stock_visual_order=[],
+                        current_selected_routine_dir=lambda: None,
+                        current_selected_routine_name=lambda: "",
+                        capture_stock_table_view_state=lambda: (set(), 0),
+                        restore_stock_table_view_state=lambda *_args: None,
+                        update_selected_routine_status_bar=lambda: None,
+                        all_registered_instance_ids=lambda: ["instance-a"],
+                        update_action_buttons=lambda: None,
+                    )
+                    with (
+                        patch.object(
+                            gui_auto_trade_table_loader,
+                            "read_base_stocks",
+                            return_value=[setting_stock],
+                        ),
+                        patch.object(
+                            gui_auto_trade_table_loader,
+                            "current_stock_trade_counts_by_code",
+                            return_value={},
+                        ),
+                        patch.object(
+                            gui_auto_trade_table_loader,
+                            "project_confirmable_cumulative_pnl",
+                            return_value=projection,
+                        ),
+                        patch.object(
+                            gui_main_table_loader,
+                            "project_confirmable_cumulative_pnl",
+                            return_value=projection,
+                        ),
+                    ):
+                        gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(
+                            window
+                        )
+                        main_row = gui_main_table_loader._routine_tree_stock_row(
+                            SimpleNamespace(),
+                            definition_id="indicator_follow",
+                            instance_id="instance-a",
+                            stock=main_stock,
+                        )
+
+                    setting_item = window.stock_table.item(0, 9)
+                    self.assertIsNotNone(setting_item)
+                    self.assertEqual(expected_text, main_row["stock_values"][9])
+                    self.assertEqual(main_row["stock_values"][9], setting_item.text())
+                    self.assertEqual(
+                        main_row["stock_display_tokens"][9]["foreground"],
+                        setting_item.foreground().color().name(),
+                    )
+                    self.assertNotIn("확인 필요", setting_item.text())
+
+        self.assertEqual(
+            "수익",
+            gui_auto_trade_setting_window.StockPositionMetricDelegate.LABEL_BY_COLUMN[9],
+        )
+
     def test_setting_situation_and_status_columns_sort_independently(self) -> None:
         app = QApplication.instance() or QApplication([])
         _ = app

@@ -16,13 +16,11 @@ from PyQt5.QtWidgets import QMessageBox
 
 from gui_common_utils import safe_int_value
 from gui_order_utils import (
-    directional_value_color,
-    format_signed_money,
-    format_signed_percent,
     pending_order_side_quantities,
 )
 from confirmable_pnl_cycle_service import project_confirmable_cumulative_pnl
 from gui_config_utils import default_config
+from gui_main_table_loader import current_stock_trade_counts_by_code
 from gui_review_utils import (
     average_price_from_state,
     build_review_required_item,
@@ -46,11 +44,14 @@ from gui_auto_trade_display import (
     apply_auto_trade_setting_liquidation_style,
     apply_auto_trade_setting_protection_row_style,
     auto_trade_setting_display_status,
+    confirmable_stock_profit_metric,
     auto_trade_setting_status_color,
     auto_trade_setting_status_sort_rank,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
+    profit_loss_value_color,
     routine_status_display_text,
+    ratio_metric_text,
     SORT_ROLE,
     SortableTableWidgetItem,
     stock_position_display_values,
@@ -238,6 +239,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
         if not stock_dirs:
             window.stock_table.setRowCount(0)
             return
+        trade_counts_by_code = current_stock_trade_counts_by_code()
         if previous_stock_order_index:
             matched_previous_paths = {str(path) for path in stock_dirs} & set(previous_stock_order_index)
             if matched_previous_paths:
@@ -255,6 +257,11 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
         for stock_dir in stock_dirs:
             code, name = parse_stock_folder_name(stock_dir.name)
             state = read_json_dict(stock_dir / "state.json")
+            trade_key = str(code or "").strip().lstrip("A")
+            buy_trade_count, sell_trade_count = trade_counts_by_code.get(
+                trade_key,
+                (0, 0),
+            )
 
             # 검토종목은 자동매매설정 창에서 완전 제외한다.
             config = read_json_dict(stock_dir / "config.json")
@@ -469,19 +476,16 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     sell_pending_qty=sell_pending_qty,
                 )
             )
+            trade_text = f"매매({buy_trade_count:,} / {sell_trade_count:,})"
             cycle_pnl = project_confirmable_cumulative_pnl(
                 code,
                 current_price,
                 project_root=Path(__file__).resolve().parent,
             )
-            if cycle_pnl.get("available") is True:
-                profit_amount = float(cycle_pnl.get("cumulative_profit") or 0)
-                cycle_rate = cycle_pnl.get("cumulative_rate")
-                rate_text = format_signed_percent(cycle_rate, digits=2) if cycle_rate is not None else "-"
-                profit_text = f"손익 {format_signed_money(profit_amount)} / {rate_text}"
-            else:
-                profit_amount = 0
-                profit_text = "손익 확인 필요 / -"
+            profit_metric, profit_amount, _profit_rate = (
+                confirmable_stock_profit_metric(cycle_pnl)
+            )
+            profit_text = ratio_metric_text(profit_metric)
 
             values = [
                 code,
@@ -494,7 +498,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 holding_text,
                 price_text,
                 profit_text,
-                pending_text,
+                trade_text,
             ]
             status_rank = auto_trade_setting_status_sort_rank(display_status)
 
@@ -509,7 +513,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 holding_qty,
                 avg_price,
                 profit_amount,
-                safe_int_value(buy_pending_qty, 0) + safe_int_value(sell_pending_qty, 0),
+                safe_int_value(buy_trade_count, 0) + safe_int_value(sell_trade_count, 0),
             ]
 
             for col, value in enumerate(values):
@@ -571,7 +575,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     if display_status in ("긴급정지", "검토종목"):
                         item.setForeground(QColor(auto_trade_setting_status_color(display_status)))
                 if col == 9:
-                    item.setForeground(QColor(directional_value_color(profit_amount)))
+                    item.setForeground(QColor(profit_loss_value_color(profit_amount)))
                 if col != 3:
                     apply_auto_trade_setting_protection_row_style(
                         item,

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFontMetrics, QPalette
 from PyQt5.QtWidgets import QApplication, QHeaderView
 
 import gui_auto_trade_status_ops as status_ops
@@ -16,7 +17,8 @@ import gui_auto_trade_runtime as runtime
 import gui_routine_policy as routine_policy
 import gui_stock_register_window as stock_register_window
 import gui_review_required_window as review_window
-from gui_styles import TABLE_LIGHT_SELECTION_STYLE
+from gui_auto_trade_policy import auto_trade_setting_display_status_for_current_session
+from gui_styles import registered_stock_status_table_stylesheet
 
 
 class ReviewRequiredTransitionTimeTest(unittest.TestCase):
@@ -185,6 +187,67 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             ),
         )
 
+    def test_review_display_status_distinguishes_selected_and_global_emergency(self) -> None:
+        selected_state = {
+            "status": "EMERGENCY_STOPPED",
+            "emergency_scope": "SELECTED",
+            "review_required": True,
+            "review_status": "PENDING",
+        }
+        global_state = {
+            **selected_state,
+            "emergency_scope": "GLOBAL",
+        }
+
+        self.assertEqual(
+            "미해결",
+            review_window._review_display_status_for_collected_row(selected_state),
+        )
+        self.assertEqual(
+            "긴급정지",
+            review_window._review_display_status_for_collected_row(global_state),
+        )
+
+    def test_selected_emergency_uses_review_projection(self) -> None:
+        selected_state = {
+            "status": "EMERGENCY_STOPPED",
+            "emergency_scope": "SELECTED",
+            "review_required": True,
+            "review_status": "PENDING",
+        }
+        shared_display = auto_trade_setting_display_status_for_current_session(
+            selected_state,
+            {},
+            holding_qty=0,
+            buy_pending_qty=0,
+            sell_pending_qty=0,
+            current_session_trade_started=False,
+            persisted_trade_started=False,
+        )
+        review_display = review_window._review_display_status_for_collected_row(
+            selected_state,
+            return_availability="BLOCKED",
+        )
+
+        self.assertEqual("검토종목", shared_display)
+        self.assertEqual("미해결", review_display)
+
+    def test_selected_release_removes_review_emergency_label(self) -> None:
+        released_state = {
+            "status": "REVIEW_REQUIRED",
+            "emergency_scope": "",
+            "review_required": True,
+            "review_status": "RESOLVED",
+        }
+
+        self.assertEqual(
+            "해결",
+            review_window._review_display_status_for_collected_row(
+                released_state,
+                return_availability="ALLOWED",
+            ),
+        )
+
     def test_corrupt_state_is_protected_by_routine_policy_gates(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "stocks" / "051910_LG화학"
@@ -286,7 +349,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             window = review_window.GlobalReviewRequiredWindow()
 
         self.assertEqual(
-            "검토 전환 시각",
+            "시간",
             window.table.horizontalHeaderItem(4).text(),
         )
         self.assertEqual(7, window.table.columnCount())
@@ -295,7 +358,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             for index in range(window.table.columnCount())
         ]
         self.assertEqual(
-            ["코드", "종목", "위치", "상태", "검토 전환 시각", "사유", "검출"],
+            ["코드", "종목", "위치", "상태", "시간", "사유", "검출"],
             headers,
         )
         self.assertNotIn("보유", headers)
@@ -308,10 +371,162 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             window.table.horizontalHeaderItem(6).textAlignment() & Qt.AlignHCenter
         )
         self.assertTrue(window.table.item(0, 6).textAlignment() & Qt.AlignHCenter)
+        self.assertEqual(int(Qt.AlignCenter), window.table.item(0, 4).textAlignment())
+        self.assertGreaterEqual(
+            window.table.columnWidth(4),
+            QFontMetrics(window.table.font()).horizontalAdvance("2026-07-28 11:42:15") + 20,
+        )
         header = window.table.horizontalHeader()
-        self.assertEqual(QHeaderView.Stretch, header.sectionResizeMode(5))
-        self.assertEqual(QHeaderView.ResizeToContents, header.sectionResizeMode(6))
+        self.assertEqual(
+            [75, 160, 140, 90, 360, 140],
+            [window.table.columnWidth(index) for index in (0, 1, 2, 3, 4, 6)],
+        )
+        self.assertEqual(
+            [
+                QHeaderView.Interactive,
+                QHeaderView.Interactive,
+                QHeaderView.Interactive,
+                QHeaderView.Interactive,
+                QHeaderView.Interactive,
+                QHeaderView.Stretch,
+                QHeaderView.Interactive,
+            ],
+            [header.sectionResizeMode(index) for index in range(7)],
+        )
+        self.assertFalse(hasattr(window, "btn_emergency_release"))
+        self.assertFalse(hasattr(window, "btn_position_reconcile"))
+        self.assertFalse(hasattr(window, "btn_legacy_close_reconcile"))
+        self.assertEqual("복귀", window.btn_return.text())
+        self.assertEqual("미지정", window.btn_unassign.text())
+        self.assertEqual("강제초기화", window.btn_delete.text())
+        self.assertEqual("상태재판정", window.btn_refresh.text())
         window.close()
+
+    def test_selected_emergency_remains_visible_across_refresh_and_reopen(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "stocks" / "086520_에코프로"
+            stock_dir.mkdir(parents=True)
+            state = {
+                "status": "EMERGENCY_STOPPED",
+                "trade_enabled": False,
+                "emergency_scope": "SELECTED",
+                "emergency_reason": "USER_EMERGENCY_STOP",
+                "emergency_stopped_at": "2026-08-17 12:00:37",
+                "review_required": True,
+                "review_status": "PENDING",
+                "review_reason": "사용자 긴급정지",
+                "review_location": "종목 긴급정지",
+                "review_entered_at": "2026-08-17 12:00:37",
+                "holding_qty": 0,
+                "avg_price": 0,
+            }
+            state_path = stock_dir / "state.json"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            (stock_dir / "orders.json").write_text('{"orders": []}', encoding="utf-8")
+            (stock_dir / "config.json").write_text(
+                '{"assigned_routine_instance_id": "INSTANCE-1"}', encoding="utf-8"
+            )
+
+            class FakeRepo:
+                def list_stocks(self):
+                    return [SimpleNamespace(code="086520", name="에코프로", routine="루틴")]
+
+                def resolve_stock_dir(self, code, name):
+                    return stock_dir
+
+            before = state_path.read_bytes()
+            fixed_widths = [75, 160, 140, 90, 360, 140]
+            with (
+                patch.object(review_window, "PROJECT_ROOT", root),
+                patch.object(review_window, "stock_repository_factory", return_value=FakeRepo()),
+                patch.object(review_window, "read_review_policy", return_value={}),
+            ):
+                self.assertEqual(1, len(review_window.collect_global_review_required_rows()))
+                first = review_window.GlobalReviewRequiredWindow()
+                first.show()
+                self.app.processEvents()
+                self.assertEqual(1, first.table.rowCount())
+                self.assertEqual(
+                    fixed_widths,
+                    [first.table.columnWidth(i) for i in (0, 1, 2, 3, 4, 6)],
+                )
+                reason_width = first.table.columnWidth(5)
+                self.assertGreater(reason_width, 296)
+                self.assertEqual(
+                    int(Qt.AlignCenter),
+                    first.table.item(0, 5).textAlignment(),
+                )
+                self.assertEqual(0, first.table.horizontalScrollBar().maximum())
+                first.refresh_review_items()
+                self.app.processEvents()
+                self.assertEqual(1, first.table.rowCount())
+                self.assertEqual(
+                    fixed_widths,
+                    [first.table.columnWidth(i) for i in (0, 1, 2, 3, 4, 6)],
+                )
+                self.assertEqual(reason_width, first.table.columnWidth(5))
+                self.assertEqual(0, first.table.horizontalScrollBar().maximum())
+                first.close()
+
+                second = review_window.GlobalReviewRequiredWindow()
+                second.show()
+                self.app.processEvents()
+                self.assertEqual(1, second.table.rowCount())
+                self.assertEqual(
+                    fixed_widths,
+                    [second.table.columnWidth(i) for i in (0, 1, 2, 3, 4, 6)],
+                )
+                self.assertEqual(reason_width, second.table.columnWidth(5))
+                self.assertEqual(
+                    int(Qt.AlignCenter),
+                    second.table.item(0, 5).textAlignment(),
+                )
+                self.assertEqual(0, second.table.horizontalScrollBar().maximum())
+                second.close()
+
+            self.assertEqual(before, state_path.read_bytes())
+
+    def test_review_column_widths_are_stable_for_zero_and_multiple_rows(self) -> None:
+        rows: list[dict[str, object]] = []
+        fixed_widths = [75, 160, 140, 90, 360, 140]
+        with patch.object(
+            review_window.GlobalReviewRequiredWindow,
+            "_central_review_rows",
+            side_effect=lambda: list(rows),
+        ):
+            window = review_window.GlobalReviewRequiredWindow()
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(0, window.table.rowCount())
+            self.assertEqual(
+                fixed_widths,
+                [window.table.columnWidth(i) for i in (0, 1, 2, 3, 4, 6)],
+            )
+            self.assertEqual(0, window.table.horizontalScrollBar().maximum())
+            rows.extend(
+                {
+                    "routine_name": f"루틴{index}",
+                    "stock_dir": Path(f"virtual-{index}"),
+                    "code": f"{index:06d}",
+                    "name": f"종목{index}",
+                    "review_location": "테스트",
+                    "review_reason": "검토 필요",
+                    "review_entered_at": "2026-08-17 12:00:37",
+                    "display_status": "미해결",
+                    "return_availability": "BLOCKED",
+                }
+                for index in range(10)
+            )
+            window.refresh_review_items()
+            self.app.processEvents()
+            self.assertEqual(10, window.table.rowCount())
+            self.assertEqual(
+                fixed_widths,
+                [window.table.columnWidth(i) for i in (0, 1, 2, 3, 4, 6)],
+            )
+            self.assertEqual(0, window.table.horizontalScrollBar().maximum())
+            window.close()
 
     def test_collect_global_review_rows_includes_missing_and_unreadable_state(self) -> None:
         with TemporaryDirectory() as temp:
@@ -571,7 +786,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             window = review_window.GlobalReviewRequiredWindow()
             window.load_review_items()
 
-        self.assertEqual(2, calls)
+        self.assertEqual(3, calls)
         window.close()
 
     def test_review_window_does_not_load_operator_reconciliation_items(self) -> None:
@@ -592,7 +807,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
         self.assertFalse(hasattr(window, "btn_runtime_retry"))
         window.close()
 
-    def test_review_window_uses_project_light_selection_style(self) -> None:
+    def test_review_window_uses_registered_stock_status_table_style(self) -> None:
         row = {
             "routine_name": "지표추종매매",
             "stock_dir": Path("stocks/005930_삼성전자"),
@@ -616,7 +831,18 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
         ):
             window = review_window.GlobalReviewRequiredWindow()
 
-        self.assertEqual(TABLE_LIGHT_SELECTION_STYLE, window.table.styleSheet())
+        self.assertEqual(
+            registered_stock_status_table_stylesheet(
+                window.table.objectName(),
+                window.table.viewport().palette().color(QPalette.Base).name(),
+            ),
+            window.table.styleSheet(),
+        )
+        self.assertEqual(
+            "#ffffff",
+            window.table.palette().color(QPalette.Base).name(),
+        )
+        self.assertTrue(window.table.verticalHeader().isHidden())
         self.assertFalse(hasattr(window, "runtime_summary_label"))
         self.assertFalse(hasattr(window, "runtime_table"))
         self.assertFalse(hasattr(window, "btn_runtime_retry"))
@@ -630,6 +856,7 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
         for col in range(window.table.columnCount()):
             cell = window.table.item(0, col)
             self.assertIsNotNone(cell)
+            self.assertEqual("#ffffff", cell.background().color().name())
             self.assertEqual("#000000", cell.foreground().color().name())
 
         item = window.table.item(0, 0)

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -35,6 +36,7 @@ import gui_main_emergency_ops as emergency_ops
 import gui_main_stock_context_menu as monitoring_menu
 import gui_windows
 from gui_main_table_loader import (
+    ROUTINE_DEFINITION_ID_ROLE,
     ROUTINE_INSTANCE_ID_ROLE,
     ROUTINE_ROW_KIND_ROLE,
     ROUTINE_ROW_PARENT,
@@ -137,6 +139,15 @@ class _Window(QWidget):
         self.routine_table.show()
         self._main_monitoring_stock_operation_adapter = None
 
+    def refresh_auto_trade_assignment_views(self) -> None:
+        return
+
+    def handle_routine_group_name_double_click(self, _row: int) -> bool:
+        return False
+
+    def handle_routine_instance_name_double_click(self, _row: int) -> bool:
+        return False
+
 
 class MainMonitoringStockContextMenuTest(unittest.TestCase):
     @classmethod
@@ -163,6 +174,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         code: str = "",
         name: str = "",
         instance_id: str = "",
+        definition_id: str = "",
         hidden: bool = False,
     ) -> int:
         row = self.window.routine_table.rowCount()
@@ -172,6 +184,8 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         item.setData(ROUTINE_STOCK_CODE_ROLE, code)
         item.setData(ROUTINE_STOCK_NAME_ROLE, name)
         item.setData(ROUTINE_INSTANCE_ID_ROLE, instance_id)
+        if definition_id:
+            item.setData(ROUTINE_DEFINITION_ID_ROLE, definition_id)
         if kind == ROUTINE_ROW_STOCK:
             stock_dir = self.root / f"{code}_{name}"
             stock_dir.mkdir()
@@ -344,6 +358,371 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             (target.stock_dir, "005930", "삼성전자"),
         )
 
+    def test_routine_instance_name_double_click_toggles_set_exclusion_true_if_any_allowed(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=gui_windows.ROUTINE_ROW_CHILD,
+            code="",
+            name="인스턴스명",
+            instance_id="instance-a",
+        )
+        instance_stock_dirs = [
+            self.root / "005380_현대차",
+            self.root / "005930_삼성전자",
+        ]
+        for stock_dir in instance_stock_dirs:
+            stock_dir.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                return_value=instance_stock_dirs
+            )
+            adapter_class.return_value = adapter
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_instance_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            [
+                ((instance_stock_dirs[0], "005380", "현대차"), True, False),
+                ((instance_stock_dirs[1], "005930", "삼성전자"), True, False),
+            ],
+            [
+                ((call.args[0][0], call.args[0][1], call.args[0][2]), call.args[1], call.kwargs["refresh"])
+                for call in adapter.set_stock_operation_exclusion.call_args_list
+            ],
+        )
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_instance_name_double_click_toggles_set_exclusion_false_if_all_excluded(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=gui_windows.ROUTINE_ROW_CHILD,
+            code="",
+            name="인스턴스명",
+            instance_id="instance-a",
+        )
+        instance_stock_dirs = [
+            self.root / "005380_현대차",
+            self.root / "005930_삼성전자",
+        ]
+        for stock_dir in instance_stock_dirs:
+            stock_dir.mkdir(parents=True, exist_ok=True)
+            (stock_dir / "config.json").write_text(
+                json.dumps({"operation_excluded": True}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                return_value=instance_stock_dirs
+            )
+            adapter_class.return_value = adapter
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_instance_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            [
+                ((instance_stock_dirs[0], "005380", "현대차"), False, False),
+                ((instance_stock_dirs[1], "005930", "삼성전자"), False, False),
+            ],
+            [
+                ((call.args[0][0], call.args[0][1], call.args[0][2]), call.args[1], call.kwargs["refresh"])
+                for call in adapter.set_stock_operation_exclusion.call_args_list
+            ],
+        )
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_instance_name_double_click_toggles_set_exclusion_true_if_mixed_states(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=gui_windows.ROUTINE_ROW_CHILD,
+            code="",
+            name="인스턴스명",
+            instance_id="instance-a",
+        )
+        instance_stock_dirs = [
+            self.root / "005380_현대차",
+            self.root / "005930_삼성전자",
+        ]
+        for stock_dir in instance_stock_dirs:
+            stock_dir.mkdir(parents=True, exist_ok=True)
+        (instance_stock_dirs[0] / "config.json").write_text(
+            json.dumps({"operation_excluded": True}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                return_value=instance_stock_dirs
+            )
+            adapter_class.return_value = adapter
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_instance_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            [
+                ((instance_stock_dirs[0], "005380", "현대차"), True, False),
+                ((instance_stock_dirs[1], "005930", "삼성전자"), True, False),
+            ],
+            [
+                ((call.args[0][0], call.args[0][1], call.args[0][2]), call.args[1], call.kwargs["refresh"])
+                for call in adapter.set_stock_operation_exclusion.call_args_list
+            ],
+        )
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_group_name_double_click_toggles_set_exclusion_true_if_any_allowed(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_PARENT,
+            name="그룹명",
+            definition_id="definition-a",
+        )
+        group_stock_dirs = {
+            "instance-a": [
+                self.root / "005380_현대차",
+                self.root / "005930_삼성전자",
+            ],
+            "instance-b": [self.root / "086520_에코프로"],
+        }
+        for stock_dirs in group_stock_dirs.values():
+            for stock_dir in stock_dirs:
+                stock_dir.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                side_effect=lambda instance_id: group_stock_dirs[instance_id]
+            )
+            adapter_class.return_value = adapter
+            self.window._routine_instance_ids_by_definition = {
+                "definition-a": ("instance-a", "instance-b"),
+            }
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_group_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            {
+                (str(self.root / "005380_현대차"), "005380", "현대차"),
+                (str(self.root / "005930_삼성전자"), "005930", "삼성전자"),
+                (str(self.root / "086520_에코프로"), "086520", "에코프로"),
+            },
+            {
+                (str(target.args[0][0]), target.args[0][1], target.args[0][2])
+                for target in adapter.set_stock_operation_exclusion.call_args_list
+            },
+        )
+        self.assertEqual(
+            {call.args[1] for call in adapter.set_stock_operation_exclusion.call_args_list},
+            {True},
+        )
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_group_name_double_click_toggles_set_exclusion_false_if_all_excluded(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_PARENT,
+            name="그룹명",
+            definition_id="definition-a",
+        )
+        group_stock_dirs = {
+            "instance-a": [
+                self.root / "005380_현대차",
+                self.root / "005930_삼성전자",
+            ],
+            "instance-b": [self.root / "086520_에코프로"],
+        }
+        for stock_dirs in group_stock_dirs.values():
+            for stock_dir in stock_dirs:
+                stock_dir.mkdir(parents=True, exist_ok=True)
+                (stock_dir / "config.json").write_text(
+                    json.dumps({"operation_excluded": True}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                side_effect=lambda instance_id: group_stock_dirs[instance_id]
+            )
+            adapter_class.return_value = adapter
+            self.window._routine_instance_ids_by_definition = {
+                "definition-a": ("instance-a", "instance-b"),
+            }
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_group_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            {call.args[1] for call in adapter.set_stock_operation_exclusion.call_args_list},
+            {False},
+        )
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_group_name_double_click_toggles_set_exclusion_true_if_mixed_states(
+        self,
+    ) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_PARENT,
+            name="그룹명",
+            definition_id="definition-a",
+        )
+        group_stock_dirs = {
+            "instance-a": [
+                self.root / "005380_현대차",
+                self.root / "005930_삼성전자",
+            ],
+            "instance-b": [self.root / "086520_에코프로"],
+        }
+        for stock_dirs in group_stock_dirs.values():
+            for idx, stock_dir in enumerate(stock_dirs):
+                stock_dir.mkdir(parents=True, exist_ok=True)
+                if idx == 0:
+                    (stock_dir / "config.json").write_text(
+                        json.dumps({"operation_excluded": True}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+        with (
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+            ) as adapter_class,
+            patch.object(self.window, "refresh_auto_trade_assignment_views") as refresh,
+        ):
+            adapter = Mock()
+            adapter.set_stock_operation_exclusion = Mock(return_value=True)
+            self.window._routine_instance_stock_dirs = Mock(  # type: ignore[assignment]
+                side_effect=lambda instance_id: group_stock_dirs[instance_id]
+            )
+            adapter_class.return_value = adapter
+            self.window._routine_instance_ids_by_definition = {
+                "definition-a": ("instance-a", "instance-b"),
+            }
+            refresh.return_value = None
+            handled = gui_windows.MainWindow.handle_routine_group_name_double_click(
+                self.window,
+                row,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(1, refresh.call_count)
+        self.assertEqual(
+            {
+                (str(self.root / "005380_현대차"), "005380", "현대차"),
+                (str(self.root / "005930_삼성전자"), "005930", "삼성전자"),
+                (str(self.root / "086520_에코프로"), "086520", "에코프로"),
+            },
+            {
+                (str(target.args[0][0]), target.args[0][1], target.args[0][2])
+                for target in adapter.set_stock_operation_exclusion.call_args_list
+            },
+        )
+        self.assertEqual({True}, {call.args[1] for call in adapter.set_stock_operation_exclusion.call_args_list})
+        self.assertEqual(0, len(adapter.start_selected_auto_trades.call_args_list))
+
+    def test_routine_group_name_double_click_routes_to_controller(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_PARENT,
+            name="그룹명",
+            definition_id="definition-a",
+        )
+        controller = gui_windows._RoutineTreeInteractionController(self.window)
+        name_rect = Mock()
+        name_rect.contains.return_value = True
+
+        with (
+            patch.object(self.window, "handle_routine_group_name_double_click") as handler,
+            patch.object(
+                controller,
+                "_parent_name_rect",
+                return_value=name_rect,
+            ),
+        ):
+            handler.return_value = True
+            event = QMouseEvent(
+                QEvent.MouseButtonDblClick,
+                QPointF(0, 0),
+                Qt.LeftButton,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            )
+            handled = controller.eventFilter(
+                self.window.routine_table.viewport(),
+                event,
+            )
+
+        self.assertTrue(handled)
+        handler.assert_called_once_with(row)
+
     def test_visible_code_mouse_double_click_opens_then_clears_selection(self) -> None:
         row = self._add_row(
             kind=ROUTINE_ROW_STOCK,
@@ -462,7 +841,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             instance_id="instance-a",
         )
         stock_dir = self._write_stock_config(row, mode="SCHEDULED")
-        self.window.refresh_all = Mock()
+        self.window.refresh_auto_trade_assignment_views = Mock()
         self.window.statusBar = Mock(return_value=Mock())
 
         import gui_auto_trade_setting_window as setting_window
@@ -499,7 +878,10 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             )
             self.app.processEvents()
 
-        self.assertEqual(2, self.window.refresh_all.call_count)
+        self.assertEqual(
+            2,
+            self.window.refresh_auto_trade_assignment_views.call_count,
+        )
 
     def test_stock_name_double_click_keeps_setting_running_block(self) -> None:
         row = self._add_row(
@@ -510,7 +892,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         )
         stock_dir = self._write_stock_config(row, mode="SCHEDULED")
         before = (stock_dir / "config.json").read_bytes()
-        self.window.refresh_all = Mock()
+        self.window.refresh_auto_trade_assignment_views = Mock()
         status_bar = Mock()
         self.window.statusBar = Mock(return_value=status_bar)
 
@@ -532,7 +914,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             )
 
         self.assertEqual(before, (stock_dir / "config.json").read_bytes())
-        self.window.refresh_all.assert_not_called()
+        self.window.refresh_auto_trade_assignment_views.assert_not_called()
         status_bar.showMessage.assert_called_once()
 
     def test_stock_delegate_paint_smoke_with_token_and_legacy_paths(self) -> None:
@@ -987,6 +1369,115 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         menu.close()
         root.close()
 
+    def test_stock_early_close_menu_uses_deep_green_text_only(self) -> None:
+        root = QMenu()
+        actions = common_menu._add_early_close_menu(
+            root,
+            has_selection=True,
+            operation_policy={"early_close": {"method": "시장가"}},
+        )
+
+        self.assertEqual(
+            common_menu.CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+            actions["menu"].menuAction().property("menuTextColor"),
+        )
+        for key in ("routine", "market", "current", "profit_loss", "carry"):
+            self.assertEqual(
+                common_menu.CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+                actions[key].property("menuTextColor"),
+            )
+        self.assertIsNone(actions["cancel"].property("menuTextColor"))
+        self.assertIsInstance(root.style(), common_menu._MenuActionColorProxyStyle)
+        self.assertIsInstance(
+            actions["menu"].style(),
+            common_menu._MenuActionColorProxyStyle,
+        )
+        root.close()
+
+    def test_group_context_early_close_action_uses_danger_text_only(self) -> None:
+        row_item = Mock(row=Mock(return_value=0))
+        first_item = Mock()
+        first_item.data.side_effect = lambda role: {
+            gui_windows.ROUTINE_ROW_KIND_ROLE: gui_windows.ROUTINE_ROW_PARENT,
+            gui_windows.ROUTINE_DEFINITION_ID_ROLE: "definition-a",
+        }.get(role)
+        table = Mock()
+        table.itemAt.return_value = row_item
+        table.item.return_value = first_item
+        name_rect = Mock()
+        name_rect.contains.return_value = True
+        new_routine_action = Mock()
+        early_action = Mock()
+        immediate_action = Mock()
+        menu = Mock()
+        menu.addAction.side_effect = (
+            new_routine_action,
+            early_action,
+            immediate_action,
+        )
+        menu.exec_.return_value = None
+        window = SimpleNamespace(
+            routine_table=table,
+            _routine_tree_interaction_controller=SimpleNamespace(
+                _parent_name_rect=Mock(return_value=name_rect),
+            ),
+            _routine_instance_ids_by_definition={"definition-a": ()},
+            _routine_instance_has_assigned_stocks=Mock(return_value=False),
+            _set_routine_operation_actions_enabled=lambda actions, enabled: None,
+            open_routine_settings_from_main_table=Mock(),
+            request_routine_definition_operation=Mock(),
+        )
+        definition = SimpleNamespace(display_name="성장주")
+
+        with (
+            patch.object(gui_windows, "QMenu", return_value=menu),
+            patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
+        ):
+            gui_windows.MainWindow.open_routine_context_menu(window, QPoint())
+
+        early_action.setProperty.assert_called_once_with(
+            "menuTextColor",
+            common_menu.CONTEXT_MENU_DANGER_TEXT_COLOR,
+        )
+        immediate_action.setProperty.assert_not_called()
+
+    def test_routine_context_early_close_action_uses_danger_text_only(self) -> None:
+        row_item = Mock(row=Mock(return_value=0))
+        first_item = Mock()
+        first_item.data.side_effect = lambda role: {
+            gui_windows.ROUTINE_ROW_KIND_ROLE: gui_windows.ROUTINE_ROW_CHILD,
+            gui_windows.ROUTINE_INSTANCE_ID_ROLE: "instance-a",
+        }.get(role)
+        table = Mock()
+        table.itemAt.return_value = row_item
+        table.item.return_value = first_item
+        actions = tuple(Mock() for _ in range(5))
+        menu = Mock()
+        menu.addAction.side_effect = actions
+        menu.exec_.return_value = None
+        window = SimpleNamespace(
+            routine_table=table,
+            open_routine_settings_from_main_table=Mock(),
+            start_routine_instance_name_edit=Mock(),
+            open_routine_instance_stock_register_from_main_table=Mock(),
+            _routine_instance_has_assigned_stocks=Mock(return_value=True),
+            _set_routine_operation_actions_enabled=lambda action_set, enabled: None,
+            request_routine_operation=Mock(),
+        )
+        instance = SimpleNamespace(display_name="오전루틴")
+
+        with (
+            patch.object(gui_windows, "QMenu", return_value=menu),
+            patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+        ):
+            gui_windows.MainWindow.open_routine_context_menu(window, QPoint())
+
+        actions[3].setProperty.assert_called_once_with(
+            "menuTextColor",
+            common_menu.CONTEXT_MENU_DANGER_TEXT_COLOR,
+        )
+        actions[4].setProperty.assert_not_called()
+
     def test_monitor_continuous_ats_submenu_uses_shared_adapter_backends(self) -> None:
         row = self._add_row(
             kind=ROUTINE_ROW_STOCK,
@@ -1135,7 +1626,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             json.dumps({"status": "STOPPED"}),
             encoding="utf-8",
         )
-        self.window.refresh_all = Mock()
+        self.window.refresh_auto_trade_assignment_views = Mock()
         self._select_rows(row)
         self.app.processEvents()
         position = self.window.routine_table.visualItemRect(
@@ -1197,7 +1688,10 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         )
         self.assertTrue(stock_dir.exists())
         self.assertTrue((stock_dir / "state.json").exists())
-        self.assertEqual(2, self.window.refresh_all.call_count)
+        self.assertEqual(
+            2,
+            self.window.refresh_auto_trade_assignment_views.call_count,
+        )
 
     def test_monitor_emergency_stop_uses_window_as_toast_parent(self) -> None:
         row = self._add_row(
@@ -1221,6 +1715,11 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         adapter.statusBarMessage = Mock()
 
         with (
+            patch.object(
+                emergency_ops,
+                "_evaluate_emergency_preflight",
+                return_value=(True, ""),
+            ),
             patch.object(emergency_ops, "update_runtime_stock_status", return_value=True) as update,
             patch.object(emergency_ops, "append_changelog"),
             patch.object(emergency_ops, "show_toast") as toast,
@@ -1252,7 +1751,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         )
         adapter.refresh_auto_trade_assignment_views = Mock()
         adapter.statusBar_message = Mock()
-        self.window.refresh_all = Mock()
+        self.window.refresh_auto_trade_assignment_views = Mock()
 
         with (
             patch.object(
@@ -1273,20 +1772,9 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.assertIs(toast.call_args.args[0], self.window)
         self.assertIsInstance(toast.call_args.args[0], QWidget)
 
-    def test_monitor_emergency_release_uses_window_as_toast_parent(self) -> None:
-        row = self._add_row(
-            kind=ROUTINE_ROW_STOCK,
-            code="005930",
-            name="삼성전자",
-            instance_id="instance-a",
-        )
-        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
-        (stock_dir / "state.json").write_text(
-            json.dumps({"status": "EMERGENCY_STOPPED"}),
-            encoding="utf-8",
-        )
+    def test_monitor_has_no_selected_emergency_release_entrypoint(self) -> None:
         target = monitoring_menu.MainMonitoringStockTarget(
-            stock_dir=stock_dir,
+            stock_dir=self.root,
             code="005930",
             name="삼성전자",
             routine_instance_id="instance-a",
@@ -1295,23 +1783,9 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             self.window,
             [target],
         )
-        adapter.refresh_auto_trade_assignment_views = Mock()
-        adapter.statusBarMessage = Mock()
-
-        with (
-            patch.object(
-                emergency_ops,
-                "release_emergency_stop_target",
-                return_value="normal",
-            ),
-            patch.object(emergency_ops, "append_changelog"),
-            patch.object(emergency_ops, "show_toast") as toast,
-        ):
-            result = adapter.release_selected_emergency_stopped_auto_trade_stocks()
-
-        self.assertEqual(1, result["normal_count"])
-        self.assertIs(toast.call_args.kwargs["parent"], self.window)
-        self.assertIsInstance(toast.call_args.kwargs["parent"], QWidget)
+        self.assertFalse(
+            hasattr(adapter, "release_selected_emergency_stopped_auto_trade_stocks")
+        )
 
     def test_monitor_early_close_uses_window_as_toast_parent(self) -> None:
         target = monitoring_menu.MainMonitoringStockTarget(
@@ -1757,7 +2231,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             if not action.separator
         }
         self.assertTrue(actions["운영시작"].enabled)
-        self.assertTrue(actions["긴급정지"].enabled)
+        self.assertTrue(actions["검토정지"].enabled)
         self.assertTrue(actions["제외해제"].enabled)
 
     def test_settings_excluded_selection_uses_config_and_disables_early_close(self) -> None:
@@ -1801,9 +2275,200 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
                 callbacks=callbacks,
                 operation_excluded=False,
             )
-
         menus = {menu.title: menu for menu in _FakeMenu.root.submenus}
         self.assertTrue(menus["조기마감"].enabled)
+
+    def test_settings_hides_selected_release_while_global_latch_is_active(self) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir()
+        (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {"status": "EMERGENCY_STOPPED", "emergency_scope": "SELECTED"},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        window = Mock()
+        window._stock_status_filter = "stopped"
+        window.stock_table.itemAt.return_value = None
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window.selected_stock_infos.return_value = [(stock_dir, "005930", "삼성전자")]
+        window.selected_operation_mode_set.return_value = set()
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_auto_trade_stock_context_menu(window, QPoint())
+
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("정지해제", action_texts)
+
+    def test_settings_selected_review_exposes_release_when_global_latch_is_off(
+        self,
+    ) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir()
+        (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "status": "EMERGENCY_STOPPED",
+                    "emergency_scope": "SELECTED",
+                    "review_required": True,
+                    "review_status": "PENDING",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        window = Mock()
+        window._stock_status_filter = "stopped"
+        window.stock_table.itemAt.return_value = None
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window.selected_stock_infos.return_value = [(stock_dir, "005930", "삼성전자")]
+        window.selected_operation_mode_set.return_value = set()
+        _FakeMenu.chosen_text = "검토정지 해제"
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_auto_trade_stock_context_menu(window, QPoint())
+
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("검토정지 해제", action_texts)
+        self.assertNotIn("정지해제", action_texts)
+        window.release_selected_emergency_stopped_auto_trade_stocks.assert_not_called()
+
+    def test_settings_global_emergency_never_exposes_selected_release(self) -> None:
+        stock_dir = self.root / "005930_삼성전자"
+        stock_dir.mkdir()
+        (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {"status": "EMERGENCY_STOPPED", "emergency_scope": "GLOBAL"},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        window = Mock()
+        window._stock_status_filter = "stopped"
+        window.stock_table.itemAt.return_value = None
+        window.stock_table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window.selected_stock_infos.return_value = [(stock_dir, "005930", "삼성전자")]
+        window.selected_operation_mode_set.return_value = set()
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            common_menu.show_auto_trade_stock_context_menu(window, QPoint())
+
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("정지해제", action_texts)
+
+    def test_main_hides_selected_release_while_global_latch_is_active(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {"status": "EMERGENCY_STOPPED", "emergency_scope": "SELECTED"},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.window.routine_table.selectRow(row)
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(row, 0)
+        ).center()
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            opened = monitoring_menu.show_main_monitoring_stock_context_menu(
+                self.window, position
+            )
+
+        self.assertTrue(opened)
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("정지해제", action_texts)
+
+    def test_main_selected_review_exposes_release_when_global_latch_is_off(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "status": "EMERGENCY_STOPPED",
+                    "emergency_scope": "SELECTED",
+                    "review_required": True,
+                    "review_status": "PENDING",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.window.routine_table.selectRow(row)
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(row, 0)
+        ).center()
+        _FakeMenu.chosen_text = "검토정지 해제"
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            opened = monitoring_menu.show_main_monitoring_stock_context_menu(
+                self.window, position
+            )
+
+        self.assertTrue(opened)
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("검토정지 해제", action_texts)
+        self.assertNotIn("정지해제", action_texts)
+
+    def test_main_review_only_state_does_not_expose_emergency_release(self) -> None:
+        row = self._add_row(
+            kind=ROUTINE_ROW_STOCK,
+            code="005930",
+            name="삼성전자",
+            instance_id="instance-a",
+        )
+        stock_dir = self._write_stock_config(row, mode="SCHEDULED")
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "status": "REVIEW_REQUIRED",
+                    "review_required": True,
+                    "review_status": "PENDING",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.window.routine_table.selectRow(row)
+        position = self.window.routine_table.visualItemRect(
+            self.window.routine_table.item(row, 0)
+        ).center()
+
+        with patch.object(common_menu, "QMenu", _FakeMenu):
+            opened = monitoring_menu.show_main_monitoring_stock_context_menu(
+                self.window, position
+            )
+
+        self.assertTrue(opened)
+        action_texts = {
+            action.text for action in _FakeMenu.root.actions if not action.separator
+        }
+        self.assertNotIn("정지해제", action_texts)
 
     def test_carry_disables_shared_individual_time_menu(self) -> None:
         callbacks = common_menu.StockContextMenuCallbacks(

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import QWidget
 
+from gui_window_policy import persistent_feature_owner
+
 
 def _explicit_callback(owner, name: str):
     class_callback = getattr(type(owner), name, None)
@@ -40,8 +42,7 @@ def refresh_auto_trade_views(operation_context) -> None:
         refresh_views()
         return
 
-    parent_getter = getattr(operation_context, "parent", None)
-    owner = parent_getter() if callable(parent_getter) else None
+    owner = persistent_feature_owner(operation_context)
     refresh_views = _explicit_callback(owner, "refresh_auto_trade_assignment_views")
     if refresh_views is not None:
         refresh_views()

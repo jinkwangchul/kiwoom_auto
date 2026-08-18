@@ -30,6 +30,43 @@ class MainRoutineSummaryTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_auto_height_changes_only_with_registered_total_signature(self) -> None:
+        table = SimpleNamespace(
+            verticalHeader=lambda: SimpleNamespace(defaultSectionSize=lambda: 24),
+            frameWidth=lambda: 1,
+            contentsMargins=lambda: SimpleNamespace(top=lambda: 0, bottom=lambda: 0),
+            height=lambda: 200,
+            setMinimumHeight=MagicMock(),
+        )
+        host = SimpleNamespace(
+            routine_table=table,
+            _last_main_routine_table_height_signature=(-1, -1, -1),
+            minimumHeight=lambda: 0,
+            height=lambda: 720,
+            width=lambda: 1200,
+            frameGeometry=lambda: SimpleNamespace(height=lambda: 720),
+            screen=lambda: SimpleNamespace(
+                availableGeometry=lambda: SimpleNamespace(height=lambda: 1000)
+            ),
+            resize=MagicMock(),
+        )
+
+        MainWindow._apply_main_routine_table_height(host, 2, 3, 10)
+        self.assertEqual((2, 3, 10), host._last_main_routine_table_height_signature)
+        table.setMinimumHeight.assert_called_once_with(0)
+        host.resize.assert_called_once_with(1200, 906)
+
+        # Filter changes and group collapse/expand keep the same registered
+        # totals, so they must not override a user's manual window size.
+        MainWindow._apply_main_routine_table_height(host, 2, 3, 10)
+        table.setMinimumHeight.assert_called_once_with(0)
+        host.resize.assert_called_once_with(1200, 906)
+
+        MainWindow._apply_main_routine_table_height(host, 2, 3, 11)
+        self.assertEqual((2, 3, 11), host._last_main_routine_table_height_signature)
+        self.assertEqual(2, table.setMinimumHeight.call_count)
+        self.assertEqual(2, host.resize.call_count)
+
     def test_summary_uses_unfiltered_registered_counts_and_current_running_mode(self) -> None:
         projection = table_loader._main_routine_summary_projection(
             [SimpleNamespace(), SimpleNamespace()],
@@ -178,6 +215,42 @@ class MainRoutineSummaryTests(unittest.TestCase):
             counts,
         )
         self.assertEqual("수익(+60 / +5.45%)", projection["profit_text"])
+
+    def test_flat_stocks_without_pnl_cycle_aggregate_as_zero(self) -> None:
+        counts = {
+            "instance-a": {
+                "pnl_stock_codes": ["000001", "000002"],
+                "pnl_flat_stock_codes": ["000001", "000002"],
+                "profit_amount": 999,
+                "profit_cost_basis": 999,
+                "profit_unknown": True,
+            }
+        }
+        results = {
+            code: {
+                "available": False,
+                "reason": "PNL_CYCLE_BOOTSTRAP_REQUIRED",
+            }
+            for code in ("000001", "000002")
+        }
+        with patch.object(
+            table_loader,
+            "project_current_stock_pnl_snapshot",
+            return_value=results,
+        ):
+            table_loader._refresh_instance_pnl_from_batch(counts)
+
+        self.assertEqual(0, counts["instance-a"]["profit_amount"])
+        self.assertEqual(0, counts["instance-a"]["profit_cost_basis"])
+        self.assertFalse(counts["instance-a"]["profit_unknown"])
+        self.assertEqual(
+            ("수익(0 / 0.00%)", "#374151"),
+            table_loader.routine_instance_profit_text(
+                profit_amount=counts["instance-a"]["profit_amount"],
+                cost_basis=counts["instance-a"]["profit_cost_basis"],
+                unknown=counts["instance-a"]["profit_unknown"],
+            ),
+        )
 
     def test_one_second_refresh_updates_operation_summary_without_table_rebuild(self) -> None:
         class EmptyTable:
@@ -603,6 +676,39 @@ class MainRoutineSummaryTests(unittest.TestCase):
             )["instance-a"]
         self.assertEqual(["000001", "000002"], codes(stopped))
 
+    def test_main_starts_with_operation_stock_scope_selected(self) -> None:
+        api = SimpleNamespace(
+            unavailable_reason=lambda: "test double",
+            login_state_changed=None,
+            raw_chejan_received=None,
+        )
+        with (
+            patch.object(gui_windows, "KiwoomApi", return_value=api),
+            patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
+            patch.object(
+                gui_windows.MainWindow,
+                "refresh_startup_recovery_status",
+                return_value={},
+            ),
+            patch.object(gui_windows.MainWindow, "refresh_all"),
+        ):
+            window = gui_windows.MainWindow()
+        try:
+            self.assertEqual("operation", window._main_routine_stock_scope)
+            self.assertEqual("operation", window._current_main_routine_stock_scope())
+            self.assertTrue(window._main_routine_summary_count_buttons["stock"].isChecked())
+            self.assertTrue(
+                window._main_routine_summary_count_buttons["operation"].isChecked()
+            )
+            self.assertFalse(
+                window._main_routine_summary_count_buttons["excluded"].isChecked()
+            )
+            self.assertFalse(
+                window._main_routine_summary_count_buttons["review"].isChecked()
+            )
+        finally:
+            window.close()
+
     def test_review_scope_row_reuses_existing_review_protection_style(self) -> None:
         stock = {
             "code": "000004",
@@ -640,6 +746,10 @@ class MainRoutineSummaryTests(unittest.TestCase):
             top["group"].click()
             self.assertEqual("group", window._main_routine_display_level)
             self.assertTrue(top["group"].isChecked())
+            self.assertFalse(top["operation"].isChecked())
+            self.assertFalse(top["excluded"].isChecked())
+            self.assertFalse(top["review"].isChecked())
+            self.assertFalse(top["stock"].isChecked())
             self.assertIn(
                 gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
                 window._main_routine_level_buttons["group"].styleSheet(),
@@ -648,16 +758,20 @@ class MainRoutineSummaryTests(unittest.TestCase):
             window._main_routine_level_buttons["routine"].click()
             self.assertEqual("routine", window._main_routine_display_level)
             self.assertTrue(top["routine"].isChecked())
+            self.assertFalse(top["operation"].isChecked())
+            self.assertFalse(top["excluded"].isChecked())
+            self.assertFalse(top["review"].isChecked())
+            self.assertFalse(top["stock"].isChecked())
 
             top["stock"].click()
             self.assertEqual("stock", window._main_routine_display_level)
-            self.assertEqual("all", window._main_routine_stock_scope)
+            self.assertEqual("operation", window._main_routine_stock_scope)
             self.assertTrue(top["stock"].isChecked())
 
             top["operation"].click()
             self.assertEqual("operation", window._main_routine_stock_scope)
             self.assertTrue(top["operation"].isChecked())
-            self.assertFalse(top["stock"].isChecked())
+            self.assertTrue(top["stock"].isChecked())
             self.assertIn(
                 gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
                 top["operation"].styleSheet(),
@@ -668,8 +782,9 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertTrue(window._main_routine_excluded_only)
             self.assertFalse(hasattr(window, "_main_routine_excluded_button"))
             self.assertTrue(top["excluded"].isChecked())
+            self.assertTrue(top["stock"].isChecked())
             self.assertEqual(
-                ["excluded"],
+                ["stock", "excluded"],
                 [
                     key
                     for key in ("stock", "operation", "excluded", "review")
@@ -678,15 +793,17 @@ class MainRoutineSummaryTests(unittest.TestCase):
             )
 
             top["excluded"].click()
-            self.assertEqual("normal", window._main_routine_stock_scope)
+            self.assertEqual("operation", window._main_routine_stock_scope)
             self.assertFalse(window._main_routine_excluded_only)
             self.assertFalse(top["excluded"].isChecked())
+            self.assertTrue(top["operation"].isChecked())
+            self.assertTrue(top["stock"].isChecked())
 
             top["review"].click()
             self.assertEqual("review", window._main_routine_stock_scope)
             self.assertTrue(top["review"].isChecked())
             top["review"].click()
-            self.assertEqual("normal", window._main_routine_stock_scope)
+            self.assertEqual("operation", window._main_routine_stock_scope)
 
             window._main_routine_level_buttons["routine"].click()
             self.assertFalse(hasattr(window, "_main_routine_summary_profit_label"))

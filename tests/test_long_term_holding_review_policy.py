@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,7 +16,6 @@ from PyQt5.QtWidgets import QApplication
 
 import gui_review_required_window as review_window
 import gui_operation_environment as environment
-from gui_auto_trade_display import AUTO_TRADE_SETTING_BADGE_HEIGHT
 from gui_auto_trade_policy import auto_trade_setting_liquidation_result_policy
 from stock_long_hold_policy import long_hold_excludes_holding_review
 
@@ -113,7 +113,9 @@ class LongTermHoldingReviewPolicyTests(unittest.TestCase):
                 result = auto_trade_setting_liquidation_result_policy(
                     {},
                     {
-                        "liquidation_completed_at": "2026-08-16 15:20:00",
+                        "liquidation_completed_at": datetime.now().astimezone().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
                         "individual_liquidation_request": {
                             "status": "REQUESTED",
                             "method": method,
@@ -250,7 +252,30 @@ class LongTermHoldingReviewPolicyTests(unittest.TestCase):
                 window = review_window.GlobalReviewRequiredWindow()
                 self.assertFalse(hasattr(window, "btn_long_hold_on"))
                 self.assertFalse(hasattr(window, "btn_long_hold_off"))
-                self.assertEqual(AUTO_TRADE_SETTING_BADGE_HEIGHT, window.long_hold_toggle_button.height())
+                window.show()
+                self.app.processEvents()
+                standard_button_height = window.btn_return.height()
+                self.assertEqual(standard_button_height, window.long_hold_toggle_button.height())
+                self.assertEqual(standard_button_height, window.btn_unassign.height())
+                self.assertEqual(standard_button_height, window.btn_delete.height())
+                self.assertEqual(standard_button_height, window.btn_close.height())
+                standard_button_center_y = window.btn_return.geometry().center().y()
+                self.assertEqual(
+                    standard_button_center_y,
+                    window.long_hold_toggle_button.geometry().center().y(),
+                )
+                for row_count in (0, 1, 3):
+                    window.table.setRowCount(row_count)
+                    window.resize(window.width() + 1, window.height())
+                    self.app.processEvents()
+                    self.assertEqual(
+                        window.btn_return.height(),
+                        window.long_hold_toggle_button.height(),
+                    )
+                    self.assertEqual(
+                        window.btn_return.geometry().center().y(),
+                        window.long_hold_toggle_button.geometry().center().y(),
+                    )
                 badge_size = window.long_hold_toggle_button.size()
                 self.assertEqual("장기보유 OFF", window.long_hold_toggle_button.text())
 
@@ -261,16 +286,34 @@ class LongTermHoldingReviewPolicyTests(unittest.TestCase):
                     review_window.LONG_HOLD_BADGE_ACTIVE_COLOR,
                     window.long_hold_toggle_button.styleSheet(),
                 )
+                self.assertIn(
+                    "margin: 1px 0",
+                    window.long_hold_toggle_button.styleSheet(),
+                )
                 self.assertEqual(badge_size, window.long_hold_toggle_button.size())
 
                 window.long_hold_toggle_button.click()
                 self.assertEqual("장기보유 OFF", window.long_hold_toggle_button.text())
                 self.assertFalse(environment.read_review_policy()["long_term_holding_enabled"])
+                self.assertEqual(window.btn_return.height(), window.long_hold_toggle_button.height())
                 self.assertGreaterEqual(collector.call_count, 3)
                 self.assertFalse(
                     any("종목을 선택" in str(call) for call in toast.call_args_list)
                 )
                 window.close()
+
+                reopened_window = review_window.GlobalReviewRequiredWindow()
+                reopened_window.show()
+                self.app.processEvents()
+                self.assertEqual(
+                    reopened_window.btn_return.height(),
+                    reopened_window.long_hold_toggle_button.height(),
+                )
+                self.assertEqual(
+                    reopened_window.btn_return.geometry().center().y(),
+                    reopened_window.long_hold_toggle_button.geometry().center().y(),
+                )
+                reopened_window.close()
 
     def test_global_badge_save_failure_keeps_read_back_state(self) -> None:
         with (
