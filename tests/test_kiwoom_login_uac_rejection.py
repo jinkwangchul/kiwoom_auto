@@ -93,6 +93,7 @@ class KiwoomLoginUacRejectionTests(unittest.TestCase):
         self.addCleanup(qax_patch.stop)
         api = kiwoom_api.KiwoomApi()
         self.addCleanup(api._login_bootstrap_timer.stop)
+        self.addCleanup(api._connection_observation_timer.stop)
         return api, processes, windows
 
     def _create_main_window(self, api: kiwoom_api.KiwoomApi):
@@ -436,6 +437,155 @@ class KiwoomLoginUacRejectionTests(unittest.TestCase):
         result = failed_api.login()
         self.assertFalse(result["ok"])
         self.assertFalse(failed_api._login_requested)
+
+    def test_broker_session_initial_unavailable_disconnected_readiness(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+
+        session = api.broker_session_snapshot()
+        readiness = api.broker_readiness_snapshot()
+
+        self.assertTrue(session.api_available)
+        self.assertFalse(session.connected)
+        self.assertFalse(session.login_requested)
+        self.assertEqual("", session.login_session_id)
+        self.assertEqual(0, session.connection_epoch)
+        self.assertFalse(readiness.broker_request_ready)
+        self.assertIn("DISCONNECTED", readiness.blockers)
+        self.assertIn("LOGIN_SESSION_MISSING", readiness.blockers)
+
+    def test_login_success_creates_session_epoch_and_broker_readiness(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+        events = []
+        api.login_state_changed.connect(events.append)
+
+        control.connect_state = 1
+        api._on_event_connect(0)
+        session = api.broker_session_snapshot()
+        readiness = api.broker_readiness_snapshot()
+
+        self.assertTrue(session.connected)
+        self.assertTrue(session.login_session_id)
+        self.assertEqual(1, session.connection_epoch)
+        self.assertTrue(readiness.api_available)
+        self.assertTrue(readiness.connection_ready)
+        self.assertTrue(readiness.login_session_ready)
+        self.assertTrue(readiness.broker_request_ready)
+        self.assertEqual((), readiness.blockers)
+        self.assertEqual(1, events[-1]["connection_epoch"])
+        self.assertEqual(session.login_session_id, events[-1]["login_session_id"])
+
+    def test_disconnect_observation_invalidates_session_once(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+        events = []
+        api.login_state_changed.connect(events.append)
+
+        control.connect_state = 1
+        api._on_event_connect(0)
+        first_session = api.login_session_id()
+        self.assertEqual(1, api.broker_session_snapshot().connection_epoch)
+
+        control.connect_state = 0
+        self.assertFalse(api.is_connected())
+        disconnected = api.broker_session_snapshot()
+        self.assertEqual("", disconnected.login_session_id)
+        self.assertEqual(2, disconnected.connection_epoch)
+        self.assertFalse(api.broker_readiness_snapshot().broker_request_ready)
+
+        api.is_connected()
+        api._observe_broker_connection()
+        self.assertEqual(2, api.broker_session_snapshot().connection_epoch)
+        disconnect_events = [event for event in events if not event.get("connected")]
+        self.assertEqual(1, len(disconnect_events))
+        self.assertEqual(2, disconnect_events[0]["connection_epoch"])
+        self.assertNotEqual("", first_session)
+
+    def test_reconnect_creates_new_session_and_advances_epoch(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+
+        control.connect_state = 1
+        api._on_event_connect(0)
+        first_session = api.login_session_id()
+        control.connect_state = 0
+        api.is_connected()
+        control.connect_state = 1
+        api._on_event_connect(0)
+
+        session = api.broker_session_snapshot()
+        self.assertEqual(3, session.connection_epoch)
+        self.assertTrue(session.login_session_id)
+        self.assertNotEqual(first_session, session.login_session_id)
+        self.assertTrue(api.broker_readiness_snapshot().broker_request_ready)
+
+    def test_login_failure_without_established_session_does_not_create_epoch(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+        events = []
+        api.login_state_changed.connect(events.append)
+
+        api._on_event_connect(-101)
+        session = api.broker_session_snapshot()
+
+        self.assertFalse(session.connected)
+        self.assertEqual("", session.login_session_id)
+        self.assertEqual(0, session.connection_epoch)
+        self.assertFalse(api.broker_readiness_snapshot().broker_request_ready)
+        self.assertEqual(0, events[-1]["connection_epoch"])
+
+    def test_get_connect_state_exception_does_not_create_disconnect_transition(self) -> None:
+        class RaisingControl(_Control):
+            def dynamicCall(self, *args):
+                if str(args[0]) == "GetConnectState()":
+                    raise RuntimeError("connect state unavailable")
+                return super().dynamicCall(*args)
+
+        control = RaisingControl()
+        api, _processes, _windows = self._create_api(control)
+        events = []
+        api.login_state_changed.connect(events.append)
+        api._connected = True
+        api._login_session_id = "SESSION-A"
+        api._connection_epoch = 7
+
+        self.assertTrue(api.is_connected())
+        session = api.broker_session_snapshot()
+        self.assertTrue(session.connected)
+        self.assertEqual("SESSION-A", session.login_session_id)
+        self.assertEqual(7, session.connection_epoch)
+        self.assertEqual([], events)
+
+    def test_readiness_is_not_trading_or_order_permission(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+        control.connect_state = 1
+        api._on_event_connect(0)
+        readiness = api.broker_readiness_snapshot()
+
+        self.assertTrue(readiness.broker_request_ready)
+        self.assertFalse(hasattr(readiness, "trading_ready"))
+        self.assertFalse(hasattr(readiness, "order_permission"))
+
+    def test_login_state_changed_keeps_compatible_payload_keys(self) -> None:
+        control = _Control()
+        api, _processes, _windows = self._create_api(control)
+        events = []
+        api.login_state_changed.connect(events.append)
+
+        control.connect_state = 1
+        api._on_event_connect(0)
+        control.connect_state = 0
+        api.is_connected()
+
+        for event in events:
+            self.assertIn("connected", event)
+            self.assertIn("err_code", event)
+            self.assertIn("message", event)
+
+        self.assertIn("connection_epoch", events[-1])
+        self.assertIn("login_session_id", events[-1])
 
 
 if __name__ == "__main__":

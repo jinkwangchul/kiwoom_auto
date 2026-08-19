@@ -9,6 +9,7 @@ engine, or write rules.
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import os
@@ -37,6 +38,28 @@ from event_journal_production import observe_production_exception
 Opt10080Callback = Callable[[dict[str, Any]], None]
 RecoverySnapshotCallback = Callable[[dict[str, Any]], None]
 AccountFundsCallback = Callable[[dict[str, Any]], None]
+
+
+@dataclass(frozen=True)
+class BrokerSessionSnapshot:
+    api_available: bool
+    connected: bool
+    login_requested: bool
+    login_session_id: str
+    connection_epoch: int
+    last_login_error: int | None
+    message: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class BrokerReadinessSnapshot:
+    api_available: bool
+    connection_ready: bool
+    login_session_ready: bool
+    broker_request_ready: bool
+    blockers: tuple[str, ...]
+    reason: str
 
 
 def account_authentication_required_message(message: object) -> bool:
@@ -291,6 +314,7 @@ class KiwoomApi(QObject):
     RECOVERY_TR_TIMEOUT_MS = 15_000
     ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
     MINUTE_CANDLE_TR_TIMEOUT_MS = 10_000
+    BROKER_CONNECTION_OBSERVATION_INTERVAL_MS = 5_000
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -300,10 +324,18 @@ class KiwoomApi(QObject):
         self._connected = False
         self._login_requested = False
         self._login_session_id = ""
+        self._connection_epoch = 0
         self._login_bootstrap_timer = QTimer(self)
         self._login_bootstrap_timer.setInterval(200)
         self._login_bootstrap_timer.timeout.connect(
             self._observe_login_bootstrap
+        )
+        self._connection_observation_timer = QTimer(self)
+        self._connection_observation_timer.setInterval(
+            self.BROKER_CONNECTION_OBSERVATION_INTERVAL_MS
+        )
+        self._connection_observation_timer.timeout.connect(
+            self._observe_broker_connection
         )
         self._login_bootstrap_baseline_consent_pids: frozenset[int] = frozenset()
         self._login_bootstrap_baseline_starter_pids: frozenset[int] = frozenset()
@@ -346,6 +378,7 @@ class KiwoomApi(QObject):
                 chejan_signal.connect(self._on_receive_chejan_data)
             self._control = control
             self._available = True
+            self._connection_observation_timer.start()
         except Exception as exc:  # pragma: no cover - depends on Kiwoom OCX.
             self._control = None
             self._available = False
@@ -356,6 +389,95 @@ class KiwoomApi(QObject):
 
     def unavailable_reason(self) -> str:
         return self._unavailable_reason
+
+    def broker_session_snapshot(self) -> BrokerSessionSnapshot:
+        return BrokerSessionSnapshot(
+            api_available=self.is_available(),
+            connected=bool(self._connected),
+            login_requested=bool(self._login_requested),
+            login_session_id=str(self._login_session_id or ""),
+            connection_epoch=int(self._connection_epoch),
+            last_login_error=self.last_login_error,
+            message=str(self.last_login_message or ""),
+            reason=(
+                ""
+                if self.is_available()
+                else self._unavailable_reason or "kiwoom api unavailable"
+            ),
+        )
+
+    def broker_readiness_snapshot(self) -> BrokerReadinessSnapshot:
+        session = self.broker_session_snapshot()
+        blockers: list[str] = []
+        if not session.api_available:
+            blockers.append("API_UNAVAILABLE")
+        if not session.connected:
+            blockers.append("DISCONNECTED")
+        if not session.login_session_id:
+            blockers.append("LOGIN_SESSION_MISSING")
+        ready = not blockers
+        return BrokerReadinessSnapshot(
+            api_available=session.api_available,
+            connection_ready=session.connected,
+            login_session_ready=bool(session.login_session_id),
+            broker_request_ready=ready,
+            blockers=tuple(blockers),
+            reason="READY" if ready else ",".join(blockers),
+        )
+
+    def _observe_connected_state(self, connected: bool, *, reason: str) -> bool:
+        connected = bool(connected)
+        if connected:
+            self._connected = True
+            return False
+        if not self._connected:
+            self._connected = False
+            return False
+        self._invalidate_login_session(reason=reason, emit=True, increment_epoch=True)
+        return True
+
+    def _establish_login_session(self, *, account_payload: str) -> str:
+        connected_at = datetime.now().isoformat(timespec="microseconds")
+        next_epoch = self._connection_epoch + 1
+        digest = hashlib.sha256(
+            f"{next_epoch}|{connected_at}|{account_payload}".encode("utf-8")
+        ).hexdigest().upper()
+        self._connection_epoch = next_epoch
+        self._connected = True
+        self._login_session_id = f"KIWOOM_LOGIN_SESSION_{digest}"
+        return self._login_session_id
+
+    def _invalidate_login_session(
+        self,
+        *,
+        reason: str,
+        emit: bool,
+        increment_epoch: bool,
+        err_code: int | None = None,
+        status: str = "disconnected",
+        message: str = "kiwoom api disconnected",
+    ) -> None:
+        had_session = bool(self._connected or self._login_session_id)
+        self._connected = False
+        self._login_session_id = ""
+        if increment_epoch and had_session:
+            self._connection_epoch += 1
+        self.last_login_message = message
+        if emit:
+            self.login_state_changed.emit(
+                {
+                    "connected": False,
+                    "err_code": err_code,
+                    "status": status,
+                    "message": self.last_login_message,
+                    "connection_epoch": self._connection_epoch,
+                    "login_session_id": "",
+                    "reason": reason,
+                }
+            )
+
+    def _observe_broker_connection(self) -> None:
+        self.is_connected()
 
     def show_account_password_window(self) -> dict[str, Any]:
         """Open the installed OpenAPI account-password dialog without reading it."""
@@ -392,7 +514,6 @@ class KiwoomApi(QObject):
 
     def login(self) -> dict[str, Any]:
         if not self.is_available():
-            self._connected = False
             self._login_requested = False
             self.last_login_error = None
             self.last_login_message = self._unavailable_reason or "kiwoom api unavailable"
@@ -414,7 +535,6 @@ class KiwoomApi(QObject):
             finally:
                 self._stop_login_bootstrap_desktop_probe()
             if int(result or 0) != 0:
-                self._connected = False
                 self._login_requested = False
                 self._stop_login_bootstrap_observation()
                 self.last_login_error = int(result or -1)
@@ -436,7 +556,6 @@ class KiwoomApi(QObject):
                 "message": self.last_login_message,
             }
         except Exception as exc:
-            self._connected = False
             self._login_requested = False
             self._stop_login_bootstrap_observation()
             self.last_login_error = None
@@ -596,26 +715,26 @@ class KiwoomApi(QObject):
             return
 
         self._login_requested = False
-        self._connected = False
-        self._login_session_id = ""
         self.last_login_error = None
-        self.last_login_message = "미연결 상태"
         self._stop_login_bootstrap_observation()
-        self.login_state_changed.emit(
-            {
-                "connected": False,
-                "err_code": None,
-                "status": "login_bootstrap_rejected",
-                "message": self.last_login_message,
-            }
+        self._invalidate_login_session(
+            reason="login bootstrap rejected",
+            emit=True,
+            increment_epoch=False,
+            err_code=None,
+            status="login_bootstrap_rejected",
+            message="미연결 상태",
         )
 
     def is_connected(self) -> bool:
         if not self.is_available():
-            self._connected = False
             return False
         try:
-            self._connected = int(self._control.dynamicCall("GetConnectState()") or 0) == 1
+            connected = int(self._control.dynamicCall("GetConnectState()") or 0) == 1
+            self._observe_connected_state(
+                connected,
+                reason="GetConnectState observed disconnected",
+            )
             return self._connected
         except Exception:
             return bool(self._connected)
@@ -1107,20 +1226,17 @@ class KiwoomApi(QObject):
             code = -9999
 
         self.last_login_error = code
-        self._connected = code == 0
         if code == 0:
-            connected_at = datetime.now().isoformat(timespec="microseconds")
             account_payload = ";".join(self.account_numbers())
-            digest = hashlib.sha256(
-                f"{connected_at}|{account_payload}".encode("utf-8")
-            ).hexdigest().upper()
-            self._login_session_id = f"KIWOOM_LOGIN_SESSION_{digest}"
+            self._establish_login_session(account_payload=account_payload)
             self.last_login_message = "login succeeded"
             self.login_state_changed.emit(
                 {
                     "connected": True,
                     "err_code": code,
                     "message": self.last_login_message,
+                    "connection_epoch": self._connection_epoch,
+                    "login_session_id": self._login_session_id,
                 }
             )
             return
@@ -1130,14 +1246,14 @@ class KiwoomApi(QObject):
             -101: "server connection failed",
             -102: "version processing failed",
         }
-        self._login_session_id = ""
         self.last_login_message = messages.get(code, f"login failed: {code}")
-        self.login_state_changed.emit(
-            {
-                "connected": False,
-                "err_code": code,
-                "message": self.last_login_message,
-            }
+        self._invalidate_login_session(
+            reason="OnEventConnect failed",
+            emit=True,
+            increment_epoch=True,
+            err_code=code,
+            status="login_failed",
+            message=self.last_login_message,
         )
 
     def _on_receive_chejan_data(self, gubun: Any, item_cnt: Any, fid_list: Any) -> None:
