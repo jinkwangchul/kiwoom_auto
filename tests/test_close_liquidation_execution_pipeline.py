@@ -460,6 +460,53 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
         self.assertEqual("005930", execute.call_args.kwargs["code"])
         self.assertEqual("시장가", execute.call_args.kwargs["method"])
 
+    def test_pending_close_execution_exception_becomes_review_failure_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.update(
+                {
+                    "status": "EARLY_CLOSE",
+                    "early_close_requested_at": "2026-07-27 10:00:00",
+                    "early_close_method": "시장가",
+                    "operation_command_id": "command-exception",
+                }
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with (
+                patch(
+                    "gui_auto_trade_runtime.all_registered_stock_dirs",
+                    return_value=[stock],
+                ),
+                patch.object(close, "_production_recovery_gate", return_value=None),
+                patch.object(
+                    close,
+                    "_start_close_liquidation_execution",
+                    side_effect=AttributeError("missing canonical operation boundary"),
+                ),
+                patch.object(
+                    close,
+                    "_persist_early_close_execution_result",
+                    return_value=True,
+                ) as persist,
+                patch.object(
+                    close,
+                    "check_global_close_completion_after_durable_update",
+                    return_value={"ok": True},
+                ),
+            ):
+                result = close.auto_trade_continue_pending_close_liquidations(Mock())
+
+        self.assertEqual(0, result["processed"])
+        self.assertEqual(1, result["blocked"])
+        self.assertEqual("execution_exception", result["results"][0]["stage"])
+        self.assertEqual(
+            "REVIEW_REQUIRED",
+            result["results"][0]["runtime_status"],
+        )
+        persist.assert_called_once()
+
     def test_cancel_confirmation_must_precede_liquidation_queue_entry(self):
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp))

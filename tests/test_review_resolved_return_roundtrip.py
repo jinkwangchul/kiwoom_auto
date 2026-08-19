@@ -357,7 +357,10 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
                 self.assertEqual(before, (stock_dir / "state.json").read_bytes())
                 self.assertEqual(1, window.table.rowCount())
                 self.assertEqual(1, len(window.table.selectionModel().selectedRows()))
-                self.assertIn("복구 상태", window.operator_guidance_label.text())
+                guidance = window.operator_guidance_label.text()
+                self.assertIn("계좌 및 운영 상태", guidance)
+                self.assertNotIn("Recovery", guidance)
+                self.assertNotIn("복구 상태", guidance)
                 gate.assert_called_once()
 
     def test_multi_selection_is_partial_success(self):

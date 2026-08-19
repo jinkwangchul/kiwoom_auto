@@ -75,6 +75,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "instance-a": {
                     "registered": 4,
                     "operation_running": 2,
+                    "waiting": 0,
                     "operation_or_stopped": 2,
                     "excluded": 1,
                     "review": 1,
@@ -84,6 +85,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "instance-b": {
                     "registered": 3,
                     "operation_running": 0,
+                    "waiting": 1,
                     "operation_or_stopped": 1,
                     "excluded": 1,
                     "review": 1,
@@ -94,7 +96,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            "그룹(2)  루틴(3)  종목(7)  운영(2)  제외(2)  검토(2)",
+            "그룹(2)  루틴(3)  종목(7)  운영(2)  대기(1)  제외(2)  검토(2)",
             projection["counts_text"],
         )
         self.assertEqual("수익(+60 / +5.45%)", projection["profit_text"])
@@ -104,6 +106,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 ("routine", "루틴", 3),
                 ("stock", "종목", 7),
                 ("operation", "운영", 2),
+                ("waiting", "대기", 1),
                 ("excluded", "제외", 2),
                 ("review", "검토", 2),
             ),
@@ -120,20 +123,108 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "instance-a": {
                     "registered": 5,
                     "operation_running": 0,
+                    "waiting": 3,
                     "operation_or_stopped": 3,
                     "excluded": 1,
                     "review": 1,
                 }
             },
         )
-        self.assertIn("정지(3)", projection["counts_text"])
+        self.assertIn("대기(3)", projection["counts_text"])
         self.assertEqual("수익(0 / 0.00%)", projection["profit_text"])
+
+    def test_valid_badges_use_operation_plus_waiting_hierarchy_without_changing_registered_totals(self) -> None:
+        updater = MagicMock()
+        window = SimpleNamespace(
+            _main_routine_valid_only=True,
+            _main_routine_display_level="stock",
+            _main_routine_stock_scope="all",
+            _update_main_routine_summary=updater,
+        )
+        definitions = [
+            SimpleNamespace(definition_id="group-a"),
+            SimpleNamespace(definition_id="group-b"),
+            SimpleNamespace(definition_id="group-c"),
+        ]
+        instances = [
+            SimpleNamespace(instance_id="instance-a", definition_id="group-a"),
+            SimpleNamespace(instance_id="instance-b", definition_id="group-a"),
+            SimpleNamespace(instance_id="instance-c", definition_id="group-b"),
+            SimpleNamespace(instance_id="instance-d", definition_id="group-c"),
+        ]
+
+        def badge_values(projection: dict[str, object]) -> dict[str, int]:
+            return {
+                str(key): int(value)
+                for key, _label, value in projection["count_badges"]
+            }
+
+        counts = {
+            "instance-a": {
+                "registered": 4,
+                "operation_running": 1,
+                "waiting": 1,
+                "excluded": 1,
+                "review": 1,
+            },
+            "instance-b": {
+                "registered": 2,
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 2,
+                "review": 0,
+            },
+            "instance-c": {
+                "registered": 5,
+                "operation_running": 0,
+                "waiting": 3,
+                "excluded": 1,
+                "review": 1,
+            },
+            "instance-d": {
+                "registered": 5,
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 1,
+                "review": 4,
+            },
+        }
+        table_loader._update_main_routine_summary(
+            window,
+            definitions,
+            instances,
+            counts,
+        )
+        projection = updater.call_args.args[0]
+        self.assertEqual(
+            {"group": 2, "routine": 2, "stock": 5},
+            {
+                key: badge_values(projection)[key]
+                for key in ("group", "routine", "stock")
+            },
+        )
+        self.assertIn("그룹(2)  루틴(2)  종목(5)", projection["counts_text"])
+
+        window._main_routine_valid_only = False
+        table_loader._update_main_routine_summary(
+            window,
+            definitions,
+            instances,
+            counts,
+        )
+        projection = updater.call_args.args[0]
+        self.assertEqual(
+            {"group": 3, "routine": 4, "stock": 16},
+            {
+                key: badge_values(projection)[key]
+                for key in ("group", "routine", "stock")
+            },
+        )
+        self.assertIn("그룹(3)  루틴(4)  종목(16)", projection["counts_text"])
 
     def test_instance_counts_reuse_common_current_running_targets(self) -> None:
         instance = SimpleNamespace(instance_id="instance-a")
         root = Path(table_loader.__file__).resolve().parent
-        running_dir = root / "stocks" / "000001_Running"
-
         def read_json(path):
             if Path(path).name == "config.json":
                 return {"assigned_routine_instance_id": instance.instance_id}
@@ -158,18 +249,15 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 ],
             ),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
-            patch.object(
-                table_loader,
-                "auto_trade_running_registered_operation_targets",
-                return_value=[(running_dir, "000001", "Running")],
-            ) as current_running,
         ):
             counts = table_loader._instance_stock_counts(
-                window=SimpleNamespace(),
+                window=SimpleNamespace(
+                    _current_session_operation_participant_stock_codes={"000001"},
+                ),
             )
 
-        current_running.assert_called_once()
         self.assertEqual(1, counts[instance.instance_id]["operation_running"])
+        self.assertEqual(1, counts[instance.instance_id]["waiting"])
         self.assertEqual(2, counts[instance.instance_id]["operation_or_stopped"])
 
     def test_batch_snapshot_aggregates_profit_and_cost_once(self) -> None:
@@ -267,6 +355,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             "instance-a": {
                 "registered": 2,
                 "operation_running": 0,
+                "waiting": 2,
                 "operation_or_stopped": 2,
                 "excluded": 0,
                 "review": 0,
@@ -277,6 +366,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             "instance-a": {
                 "registered": 2,
                 "operation_running": 1,
+                "waiting": 1,
                 "operation_or_stopped": 2,
                 "excluded": 0,
                 "review": 0,
@@ -293,7 +383,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             table_loader.main_refresh_pnl_only(window)
 
         first, second = (call.args[0] for call in updater.call_args_list)
-        self.assertIn("정지(2)", first["counts_text"])
+        self.assertIn("대기(2)", first["counts_text"])
         self.assertIn("운영(1)", second["counts_text"])
 
     def test_visible_summary_updates_without_right_excluded_badge(self) -> None:
@@ -313,13 +403,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
         header.addStretch(1)
         try:
             first = {
-                "counts_text": "그룹(1)  루틴(2)  종목(3)  정지(2)  제외(1)  검토(0)",
+                "counts_text": "그룹(1)  루틴(2)  종목(3)  운영(0)  대기(2)  제외(1)  검토(0)",
                 "profit_text": "수익(0 / 0.00%)",
                 "count_badges": (
                     ("group", "그룹", 1),
                     ("routine", "루틴", 2),
                     ("stock", "종목", 16),
-                    ("operation", "정지", 2),
+                    ("operation", "운영", 0),
+                    ("waiting", "대기", 2),
                     ("excluded", "제외", 1),
                     ("review", "검토", 0),
                 ),
@@ -327,13 +418,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "profit_color": profit_loss_value_color(0),
             }
             second = {
-                "counts_text": "그룹(1)  루틴(2)  종목(3)  운영(1)  제외(1)  검토(0)",
+                "counts_text": "그룹(1)  루틴(2)  종목(3)  운영(1)  대기(1)  제외(1)  검토(0)",
                 "profit_text": "수익(+12,500 / +1.25%)",
                 "count_badges": (
                     ("group", "그룹", 125),
                     ("routine", "루틴", 2),
                     ("stock", "종목", 16),
                     ("operation", "운영", 1),
+                    ("waiting", "대기", 1),
                     ("excluded", "제외", 0),
                     ("review", "검토", 4),
                 ),
@@ -448,7 +540,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertTrue(valid_badge.font().bold())
             source = inspect.getsource(MainWindow._create_table_area)
             self.assertLess(
-                source.index("addWidget(self._create_main_routine_summary())"),
+                source.index("routine_summary = self._create_main_routine_summary()"),
                 source.index("addStretch(1)"),
             )
             self.assertNotIn("mainRoutineHeaderAlignment", source)
@@ -607,7 +699,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             },
         }
         states = {
-            "000001_Running": {},
+            "000001_Running": {"trade_enabled": True},
             "000002_Stopped": {},
             "000003_Excluded": {},
             "000004_Review": {"review_required": True, "review_status": "PENDING"},
@@ -617,7 +709,6 @@ class MainRoutineSummaryTests(unittest.TestCase):
             values = configs if Path(path).name == "config.json" else states
             return dict(values.get(Path(path).parent.name, {}))
 
-        running_dir = PROJECT_ROOT / records[0]["stock_path"]
         with (
             patch.object(table_loader, "read_base_stocks", return_value=records),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
@@ -626,18 +717,18 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "load_persisted_routine_instances",
                 return_value=[SimpleNamespace(instance_id="instance-a")],
             ),
-            patch.object(
-                table_loader,
-                "auto_trade_running_registered_operation_targets",
-                return_value=[(running_dir, "000001", "Running")],
-            ) as running_targets,
         ):
+            window = SimpleNamespace(
+                _current_session_operation_participant_stock_codes={"000001"},
+            )
             projected = {
                 scope: table_loader._instance_stock_counts(
-                    window=SimpleNamespace(),
+                    window=window,
                     stock_scope=scope,
                 )["instance-a"]
-                for scope in ("normal", "all", "operation", "excluded", "review")
+                for scope in (
+                    "normal", "all", "operation", "waiting", "excluded", "review"
+                )
             }
 
         def codes(count):
@@ -649,13 +740,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
             codes(projected["all"]),
         )
         self.assertEqual(["000001"], codes(projected["operation"]))
+        self.assertEqual(["000002"], codes(projected["waiting"]))
         self.assertEqual(["000003"], codes(projected["excluded"]))
         self.assertEqual(["000004"], codes(projected["review"]))
         self.assertEqual(4, projected["all"]["registered"])
         self.assertEqual(1, projected["all"]["excluded"])
         self.assertEqual(1, projected["all"]["review"])
-        running_targets.assert_called()
 
+        window._current_session_operation_participant_stock_codes = set()
         with (
             patch.object(table_loader, "read_base_stocks", return_value=records),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
@@ -664,19 +756,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 "load_persisted_routine_instances",
                 return_value=[SimpleNamespace(instance_id="instance-a")],
             ),
-            patch.object(
-                table_loader,
-                "auto_trade_running_registered_operation_targets",
-                return_value=[],
-            ),
         ):
-            stopped = table_loader._instance_stock_counts(
-                window=SimpleNamespace(),
-                stock_scope="operation",
+            ended = table_loader._instance_stock_counts(
+                window=window,
+                stock_scope="waiting",
             )["instance-a"]
-        self.assertEqual(["000001", "000002"], codes(stopped))
+        self.assertEqual(["000001", "000002"], codes(ended))
 
-    def test_main_starts_with_operation_stock_scope_selected(self) -> None:
+    def test_main_starts_with_valid_stock_and_no_status_filter_selected(self) -> None:
         api = SimpleNamespace(
             unavailable_reason=lambda: "test double",
             login_state_changed=None,
@@ -694,11 +781,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
         ):
             window = gui_windows.MainWindow()
         try:
-            self.assertEqual("operation", window._main_routine_stock_scope)
-            self.assertEqual("operation", window._current_main_routine_stock_scope())
+            self.assertEqual("all", window._main_routine_stock_scope)
+            self.assertEqual("all", window._current_main_routine_stock_scope())
             self.assertTrue(window._main_routine_summary_count_buttons["stock"].isChecked())
-            self.assertTrue(
+            self.assertFalse(
                 window._main_routine_summary_count_buttons["operation"].isChecked()
+            )
+            self.assertFalse(
+                window._main_routine_summary_count_buttons["waiting"].isChecked()
             )
             self.assertFalse(
                 window._main_routine_summary_count_buttons["excluded"].isChecked()
@@ -747,6 +837,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertEqual("group", window._main_routine_display_level)
             self.assertTrue(top["group"].isChecked())
             self.assertFalse(top["operation"].isChecked())
+            self.assertFalse(top["waiting"].isChecked())
             self.assertFalse(top["excluded"].isChecked())
             self.assertFalse(top["review"].isChecked())
             self.assertFalse(top["stock"].isChecked())
@@ -759,13 +850,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertEqual("routine", window._main_routine_display_level)
             self.assertTrue(top["routine"].isChecked())
             self.assertFalse(top["operation"].isChecked())
+            self.assertFalse(top["waiting"].isChecked())
             self.assertFalse(top["excluded"].isChecked())
             self.assertFalse(top["review"].isChecked())
             self.assertFalse(top["stock"].isChecked())
 
             top["stock"].click()
             self.assertEqual("stock", window._main_routine_display_level)
-            self.assertEqual("operation", window._main_routine_stock_scope)
+            self.assertEqual("all", window._main_routine_stock_scope)
             self.assertTrue(top["stock"].isChecked())
 
             top["operation"].click()
@@ -777,6 +869,11 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 top["operation"].styleSheet(),
             )
 
+            top["waiting"].click()
+            self.assertEqual("waiting", window._main_routine_stock_scope)
+            self.assertTrue(top["waiting"].isChecked())
+            self.assertFalse(top["operation"].isChecked())
+
             top["excluded"].click()
             self.assertEqual("excluded", window._main_routine_stock_scope)
             self.assertTrue(window._main_routine_excluded_only)
@@ -787,23 +884,29 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 ["stock", "excluded"],
                 [
                     key
-                    for key in ("stock", "operation", "excluded", "review")
+                    for key in ("stock", "operation", "waiting", "excluded", "review")
                     if top[key].isChecked()
                 ],
             )
 
             top["excluded"].click()
-            self.assertEqual("operation", window._main_routine_stock_scope)
+            self.assertEqual("all", window._main_routine_stock_scope)
             self.assertFalse(window._main_routine_excluded_only)
             self.assertFalse(top["excluded"].isChecked())
-            self.assertTrue(top["operation"].isChecked())
             self.assertTrue(top["stock"].isChecked())
 
             top["review"].click()
             self.assertEqual("review", window._main_routine_stock_scope)
             self.assertTrue(top["review"].isChecked())
             top["review"].click()
+            self.assertEqual("all", window._main_routine_stock_scope)
+
+            top["operation"].click()
             self.assertEqual("operation", window._main_routine_stock_scope)
+            top["stock"].click()
+            self.assertEqual("all", window._main_routine_stock_scope)
+            self.assertTrue(top["stock"].isChecked())
+            self.assertFalse(top["operation"].isChecked())
 
             window._main_routine_level_buttons["routine"].click()
             self.assertFalse(hasattr(window, "_main_routine_summary_profit_label"))
@@ -850,7 +953,34 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 patch.object(table_loader, "current_stock_trade_counts_by_code", return_value={}),
             ):
                 table_loader.main_load_routine_table(host)
-            collector.assert_called_once_with(window=host, stock_scope="review")
+                collector.assert_called_once_with(window=host, stock_scope="review")
+
+                host._main_routine_stock_scope = "all"
+                host._main_routine_valid_only = False
+                collector.reset_mock()
+                table_loader.main_load_routine_table(host)
+                collector.assert_called_once_with(window=host, stock_scope="all")
+
+                host._main_routine_valid_only = True
+                collector.reset_mock()
+                table_loader.main_load_routine_table(host)
+                collector.assert_called_once_with(window=host, stock_scope="normal")
+
+                for display_level in ("group", "routine"):
+                    host._main_routine_display_level = display_level
+                    host._main_routine_stock_scope = "all"
+                    host._main_routine_valid_only = True
+                    collector.reset_mock()
+                    table_loader.main_load_routine_table(host)
+                    collector.assert_called_once_with(
+                        window=host,
+                        stock_scope="normal",
+                    )
+
+                    host._main_routine_valid_only = False
+                    collector.reset_mock()
+                    table_loader.main_load_routine_table(host)
+                    collector.assert_called_once_with(window=host, stock_scope="all")
         finally:
             table.close()
 

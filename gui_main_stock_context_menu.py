@@ -733,6 +733,7 @@ class MainMonitoringStockOperationAdapter:
         extra_policy: dict[str, object] | None = None,
         show_error_dialog: bool = True,
         show_result_toast: bool = True,
+        show_confirmation: bool = True,
     ) -> dict[str, object]:
         return auto_trade_apply_selected_early_close(
             self,
@@ -741,6 +742,7 @@ class MainMonitoringStockOperationAdapter:
             extra_policy=extra_policy,
             show_error_dialog=show_error_dialog,
             show_result_toast=show_result_toast,
+            show_confirmation=show_confirmation,
         )
 
     def apply_selected_individual_liquidation_method(

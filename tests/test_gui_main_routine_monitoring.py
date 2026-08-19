@@ -401,6 +401,81 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             finally:
                 dialog.close()
 
+    def test_child_context_menu_close_actions_call_existing_routine_callbacks(self) -> None:
+        instance = SimpleNamespace(
+            instance_id="instance-a",
+            display_name="오전루틴",
+        )
+        table = QTableWidget(1, 1)
+        item = QTableWidgetItem(instance.display_name)
+        item.setData(
+            gui_main_table_loader.ROUTINE_ROW_KIND_ROLE,
+            gui_main_table_loader.ROUTINE_ROW_CHILD,
+        )
+        item.setData(
+            gui_main_table_loader.ROUTINE_INSTANCE_ID_ROLE,
+            instance.instance_id,
+        )
+        table.setItem(0, 0, item)
+        table.resize(480, 120)
+        table.show()
+        self.app.processEvents()
+
+        window = SimpleNamespace(
+            routine_table=table,
+            request_routine_operation=MagicMock(),
+            open_routine_settings_from_main_table=MagicMock(),
+            start_routine_instance_name_edit=MagicMock(),
+            open_routine_instance_stock_register_from_main_table=MagicMock(),
+            _routine_instance_has_assigned_stocks=MagicMock(return_value=True),
+            _set_routine_operation_actions_enabled=lambda actions, enabled: (
+                gui_windows.MainWindow._set_routine_operation_actions_enabled(
+                    actions,
+                    enabled,
+                )
+            ),
+        )
+        window._routine_tree_interaction_controller = (
+            gui_windows._RoutineTreeInteractionController(window)
+        )
+        menu = MagicMock()
+        actions = [MagicMock() for _ in range(5)]
+        menu.addAction.side_effect = actions
+        menu.exec_.return_value = None
+        with (
+            patch.object(gui_windows, "QMenu", return_value=menu),
+            patch.object(
+                gui_windows,
+                "routine_instance_by_id",
+                return_value=instance,
+            ),
+        ):
+            gui_windows.MainWindow.open_routine_context_menu(
+                window,
+                table.visualItemRect(item).center(),
+            )
+
+        actions[3].triggered.connect.call_args.args[0]()
+        actions[4].triggered.connect.call_args.args[0]()
+        self.assertEqual(
+            [
+                call(
+                    instance.instance_id,
+                    instance.display_name,
+                    "루틴",
+                    gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
+                ),
+                call(
+                    instance.instance_id,
+                    instance.display_name,
+                    gui_windows.POLICY_MARKET,
+                    gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
+                ),
+            ],
+            window.request_routine_operation.call_args_list,
+        )
+        table.close()
+
     def test_used_amount_buy_limit_and_usage_rate_are_independent(self) -> None:
         self.assertEqual(format_routine_used_amount(7_843_650), "\u20A97,843,650")
         self.assertEqual(

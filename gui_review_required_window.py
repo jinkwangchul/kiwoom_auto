@@ -61,6 +61,7 @@ from gui_operation_environment import (
     read_review_policy,
     write_long_term_holding_policy,
 )
+from account_funds_foundation import READY as ACCOUNT_FUNDS_READY
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
@@ -91,10 +92,13 @@ from legacy_close_reconciliation_service import (
     reconcile_legacy_early_close_no_target,
 )
 from production_recovery_contract import (
+    ACCOUNT_COLLECTING,
     ACCOUNT_COMPLETED,
+    ACCOUNT_RECONCILING,
     BrokerAccountSnapshot,
     RecoverySessionIdentity,
 )
+from production_recovery_state_registry import production_recovery_registry
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHANGELOG_PATH = PROJECT_ROOT / "PROJECT_CHANGELOG.txt"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
@@ -114,9 +118,109 @@ LONG_HOLD_BADGE_ACTIVE_COLOR = DIRECTIONAL_POSITIVE_COLOR
 LONG_HOLD_BADGE_IDLE_COLOR = DIRECTIONAL_NEUTRAL_COLOR
 
 
+def review_operator_readiness_evidence(owner) -> dict[str, str]:
+    """Classify current account readiness for operator guidance without mutation."""
+    api = getattr(owner, "kiwoom_api", None)
+    connection_reader = getattr(api, "is_connected", None)
+    if callable(connection_reader):
+        try:
+            if connection_reader() is not True:
+                return {"cause": "SERVER_DISCONNECTED"}
+        except Exception:
+            return {"cause": "SERVER_DISCONNECTED"}
+
+    account_reader = getattr(owner, "selected_account_no", None)
+    account_no = ""
+    if callable(account_reader):
+        try:
+            account_no = str(account_reader() or "").strip()
+        except Exception:
+            account_no = ""
+        if not account_no:
+            return {"cause": "ACCOUNT_NOT_SELECTED"}
+
+    authentication_states = getattr(owner, "_account_authentication_states", None)
+    query_states = getattr(owner, "_account_query_states", None)
+    if account_no and isinstance(authentication_states, dict):
+        if str(authentication_states.get(account_no, "") or "") != ACCOUNT_FUNDS_READY:
+            return {"cause": "ACCOUNT_CHECK_INCOMPLETE"}
+    if account_no and isinstance(query_states, dict):
+        if str(query_states.get(account_no, "") or "") != ACCOUNT_FUNDS_READY:
+            return {"cause": "ACCOUNT_CHECK_INCOMPLETE"}
+
+    context = production_recovery_registry.snapshot()
+    if context is None:
+        return {"cause": "ACCOUNT_OPERATION_CHECK_INCOMPLETE"}
+
+    login_reader = getattr(api, "login_session_id", None)
+    login_session_id = ""
+    if callable(login_reader):
+        try:
+            login_session_id = str(login_reader() or "").strip()
+        except Exception:
+            login_session_id = ""
+    identity = getattr(context, "identity", None)
+    if identity is not None and (
+        (account_no and str(getattr(identity, "account_no", "") or "").strip() != account_no)
+        or (
+            login_session_id
+            and str(getattr(identity, "login_session_id", "") or "").strip()
+            != login_session_id
+        )
+        or str(getattr(identity, "trading_day", "") or "").strip()
+        != datetime.now().date().isoformat()
+    ):
+        return {"cause": "RECOVERY_IDENTITY_MISMATCH"}
+
+    status = str(getattr(context, "account_status", "") or "").strip().upper()
+    if status in {ACCOUNT_COLLECTING, ACCOUNT_RECONCILING}:
+        return {"cause": "ACCOUNT_OPERATION_CHECK_IN_PROGRESS"}
+    return {"cause": "ACCOUNT_OPERATION_CHECK_INCOMPLETE"}
+
+
+def _operator_readiness_guidance(evidence: dict[str, str] | None) -> tuple[str, str, str]:
+    cause = str((evidence or {}).get("cause", "") or "").strip().upper()
+    if cause == "SERVER_DISCONNECTED":
+        return (
+            "현재 서버에 연결되어 있지 않습니다.",
+            "서버 연결 및 계좌 확인 후 상태재판정하십시오.",
+            "서버 연결과 현재 계좌 상태 확인이 완료되어야 합니다.",
+        )
+    if cause == "ACCOUNT_NOT_SELECTED":
+        return (
+            "계좌가 선택되지 않았습니다.",
+            "계좌를 선택한 뒤 상태를 다시 확인하십시오.",
+            "현재 계좌가 선택되고 계좌 상태 확인이 완료되어야 합니다.",
+        )
+    if cause == "ACCOUNT_CHECK_INCOMPLETE":
+        return (
+            "계좌 확인이 완료되지 않았습니다.",
+            "계좌 인증과 보유·주문 확인이 완료된 뒤 상태재판정하십시오.",
+            "계좌 인증과 보유·주문 상태 확인이 완료되어야 합니다.",
+        )
+    if cause == "ACCOUNT_OPERATION_CHECK_IN_PROGRESS":
+        return (
+            "계좌 및 보유·주문 상태를 확인 중입니다.",
+            "확인이 완료된 뒤 상태재판정하십시오.",
+            "현재 계좌와 보유·주문 상태 확인이 완료되어야 합니다.",
+        )
+    if cause == "RECOVERY_IDENTITY_MISMATCH":
+        return (
+            "현재 로그인 또는 계좌 정보가 이전 확인 상태와 일치하지 않습니다.",
+            "현재 계좌 상태를 다시 확인하십시오.",
+            "현재 로그인·계좌 정보로 계좌 상태 확인이 완료되어야 합니다.",
+        )
+    return (
+        "현재 계좌 및 운영 상태 확인이 완료되지 않았습니다.",
+        "현재 계좌와 운영 상태를 확인한 뒤 상태재판정하십시오.",
+        "현재 계좌 및 운영 상태 확인이 완료되어야 합니다.",
+    )
+
+
 def build_review_operator_guidance(
     row: dict[str, object] | None,
     availability_result: dict[str, object] | None = None,
+    readiness_evidence: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build read-only operator guidance from already collected Review evidence."""
     current = row if isinstance(row, dict) else {}
@@ -135,10 +239,12 @@ def build_review_operator_guidance(
         "EMERGENCY_STOP_ACTIVE": "긴급정지 활성",
         "ACTIVE_CLOSE_OR_LIQUIDATION": "청산 처리 중",
         "SERVER_MISMATCH": "운영 데이터 불일치",
-        "RECOVERY_NOT_READY": "복구 상태 오류",
+        "RECOVERY_NOT_READY": "계좌 상태 확인 필요",
     }
     reason_values = [
-        operator_reason_by_internal.get(reason.upper(), reason)
+        "계좌 상태 확인 필요"
+        if reason == "복구 상태 오류"
+        else operator_reason_by_internal.get(reason.upper(), reason)
         if not (reason.isupper() and "_" in reason)
         else operator_reason_by_internal.get(reason.upper(), "운영 상태 확인 필요")
         for reason in reason_values
@@ -216,9 +322,9 @@ def build_review_operator_guidance(
         action = "청산 진행 및 주문 상태를 확인한 뒤 상태재판정하세요."
         condition = "청산 처리가 끝나고 복귀 가능으로 확인되어야 합니다."
     elif "RECOVERY" in classification_upper or "복구 상태 오류" in classification_text:
-        block_reason = "복구 상태가 완료되지 않았습니다."
-        action = "Recovery 상태를 확인한 뒤 상태재판정하세요."
-        condition = "Recovery가 완료되고 복귀 가능으로 확인되어야 합니다."
+        block_reason, action, condition = _operator_readiness_guidance(
+            readiness_evidence
+        )
     elif "SERVER_MISMATCH" in classification_upper or "서버" in classification_text:
         block_reason = "서버와 Runtime 정보가 일치하지 않습니다."
         action = "서버와 Runtime 상태의 일치를 확인한 뒤 상태재판정하세요."
@@ -1146,7 +1252,12 @@ class GlobalReviewRequiredWindow(QDialog):
         if not isinstance(row, dict):
             self.operator_guidance_label.setText("선택한 종목의 안내 정보를 확인할 수 없습니다.")
             return
-        guidance = build_review_operator_guidance(row)
+        guidance = build_review_operator_guidance(
+            row,
+            readiness_evidence=review_operator_readiness_evidence(
+                persistent_feature_owner(self)
+            ),
+        )
         guidance_lines = [guidance["summary"]]
         if guidance["block_reason"] != REVIEW_UNKNOWN_TEXT:
             guidance_lines.append(f"복귀 차단: {guidance['block_reason']}")

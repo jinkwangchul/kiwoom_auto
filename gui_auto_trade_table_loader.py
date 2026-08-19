@@ -63,6 +63,7 @@ from gui_stock_instance_chart_window import (
     stock_instance_chart_is_open,
 )
 from gui_auto_trade_policy import (
+    auto_trade_stock_operation_category,
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
     auto_trade_setting_early_close_metadata_is_stale,
@@ -269,6 +270,14 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 config = default_config()
             operation_excluded = is_operation_excluded(config)
             review_required = is_review_required_state(state)
+            trade_started = auto_trade_setting_trade_started(state)
+            operation_category = auto_trade_stock_operation_category(
+                window,
+                stock_code=code,
+                persisted_trade_started=trade_started,
+                operation_excluded=operation_excluded,
+                review_required=review_required,
+            )
 
             buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
             holding_qty = safe_int_value(state.get("holding_qty"), 0)
@@ -359,15 +368,20 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             )
 
             stock_status_filter = str(getattr(window, "_stock_status_filter", "all") or "all").strip().lower()
-            if stock_status_filter == "stopped":
-                stock_status_filter = "running"
-            if stock_status_filter == "running" and (review_required or operation_excluded):
+            stock_status_filter = {
+                "running": "operation",
+                "stopped": "waiting",
+                "error": "review",
+            }.get(stock_status_filter, stock_status_filter)
+            if stock_status_filter == "normal" and operation_category not in {
+                "operation",
+                "waiting",
+            }:
                 continue
-            if stock_status_filter == "excluded" and (
-                review_required or not operation_excluded
+            if (
+                stock_status_filter in {"operation", "waiting", "excluded", "review"}
+                and stock_status_filter != operation_category
             ):
-                continue
-            if stock_status_filter in {"error", "review"} and not review_required:
                 continue
 
             window.stock_table.insertRow(row)
@@ -402,7 +416,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 operation_tooltip = f"{ats_source_text} 적용 | {ats_tooltip_lines}\n\n※주의:정규장외 시장 거래중"
                 operation_display_tooltip = operation_tooltip
 
-            trade_started = auto_trade_setting_trade_started(state)
             current_session_trade_started = auto_trade_setting_current_session_trade_started(
                 window,
                 trade_started,

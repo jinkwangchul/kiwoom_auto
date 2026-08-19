@@ -286,6 +286,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._default_operation_instance_by_definition = {}
         harness._routine_operation_status_by_instance = {}
         harness._stock_status_filter = "running"
+        harness._selected_stock_normal_projection_active = False
+        harness._selected_stock_double_click_release_pending = False
         harness._collapsed_auto_trade_instance_ids = set()
         harness._routine_tree_display_level = "category"
         harness._routine_tree_display_scope = ""
@@ -373,6 +375,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "update_selection_summary_panel",
             "_setup_selected_routine_status_bar",
             "set_stock_status_filter",
+            "_toggle_selected_stock_normal_projection",
             "update_selected_routine_status_bar",
             "_stock_operation_status_label",
             "load_selected_routine_stocks",
@@ -2370,6 +2373,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertIn("padding: 0 6px", badge.styleSheet())
         self.assertIn("color: #16A34A", badges["category"].styleSheet())
         self.assertIn("color: #111827", badges["routine"].styleSheet())
+        QTest.mouseDClick(badges["stock"], Qt.LeftButton)
+        self._app.processEvents()
+        self.assertEqual("종목", badges["stock"].text())
+        self.assertNotIn("color: #15803D", badges["stock"].styleSheet())
+        self.assertFalse(hasattr(window, "_routine_tree_stock_normal_projection"))
         scopes = window._routine_tree_display_scope_buttons
         self.assertEqual(
             ["전체", "현재", "과거"],
@@ -4174,8 +4182,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
             zero_instance_widget = window.routine_table.cellWidget(
                 zero_instance_row,
-                0,
-            )
+            0,
+        )
+
             self.assertEqual(
                 "0",
                 zero_instance_widget.findChild(
@@ -7315,6 +7324,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "stopped": 1,
                 "error": 0,
                 "normal": 1,
+                "operation_running": 1,
+                "waiting": 0,
                 "excluded": 1,
                 "review": 0,
             },
@@ -7324,6 +7335,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "stopped": 0,
                 "error": 1,
                 "normal": 0,
+                "operation_running": 0,
+                "waiting": 0,
                 "excluded": 0,
                 "review": 1,
             },
@@ -7336,12 +7349,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(setting_window, "read_base_stocks", return_value=stocks):
             window.load_routine_table()
 
-        def status_texts() -> tuple[str, str, str, str]:
+        def status_texts() -> tuple[str, str, str, str, str]:
             return (
                 window.selected_routine_status_buttons["all"].text(),
-                window.selected_routine_status_buttons["running"].text(),
+                window.selected_routine_status_buttons["operation"].text(),
+                window.selected_routine_status_buttons["waiting"].text(),
                 window.selected_routine_status_buttons["excluded"].text(),
-                window.selected_routine_status_buttons["error"].text(),
+                window.selected_routine_status_buttons["review"].text(),
             )
 
         window.routine_table.selectRow(1)
@@ -7363,7 +7377,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(instance_target_ids, first_stock_target_ids)
         self.assertEqual(instance_target_ids, second_stock_target_ids)
         self.assertEqual(
-            ("종목(2)", "정지(1)", "제외(1)", "검토(0)"),
+            ("종목(2)", "운영(1)", "대기(0)", "제외(1)", "검토(0)"),
             instance_texts,
         )
         self.assertEqual(instance_texts, first_stock_texts)
@@ -7373,7 +7387,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.update_selected_routine_status_bar()
         self.assertEqual(("inst-b",), window.current_selected_target_instance_ids())
         self.assertEqual(
-            ("종목(1)", "정지(0)", "제외(0)", "검토(1)"),
+            ("종목(1)", "운영(0)", "대기(0)", "제외(0)", "검토(1)"),
             status_texts(),
         )
 
@@ -7767,6 +7781,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "stopped": 4,
                 "error": 1,
                 "normal": 3,
+                "operation_running": 3,
+                "waiting": 0,
+                "operation_running": 3,
+                "waiting": 0,
                 "excluded": 3,
                 "review": 1,
             }
@@ -7784,26 +7802,100 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertEqual("", window.selected_routine_instance_count_badge.text())
             self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
             self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
-            self.assertEqual("정지(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("운영(3)", window.selected_routine_status_buttons["operation"].text())
+            self.assertEqual("대기(0)", window.selected_routine_status_buttons["waiting"].text())
             self.assertEqual("제외(3)", window.selected_routine_status_buttons["excluded"].text())
-            self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
+            self.assertEqual("검토(1)", window.selected_routine_status_buttons["review"].text())
 
             calls = []
             window.load_selected_routine_stocks = lambda: calls.append(window._stock_status_filter)
-            window.selected_routine_status_buttons["running"].click()
-            self.assertEqual("running", window._stock_status_filter)
+            window.selected_routine_status_buttons["operation"].click()
+            self.assertEqual("operation", window._stock_status_filter)
             window.selected_routine_name_button.click()
             self.assertEqual("all", window._stock_status_filter)
-            self.assertEqual(["running", "all"], calls)
+            self.assertEqual(["operation", "all"], calls)
 
             window.routine_table.selectRow(1)
             window.update_selected_routine_status_bar()
             self.assertEqual("A 인스턴스", window.selected_routine_name_button.text())
             self.assertTrue(window.selected_routine_instance_count_badge.isHidden())
             self.assertEqual("종목(7)", window.selected_routine_status_buttons["all"].text())
-            self.assertEqual("정지(3)", window.selected_routine_status_buttons["running"].text())
+            self.assertEqual("운영(3)", window.selected_routine_status_buttons["operation"].text())
+            self.assertEqual("대기(0)", window.selected_routine_status_buttons["waiting"].text())
             self.assertEqual("제외(3)", window.selected_routine_status_buttons["excluded"].text())
-            self.assertEqual("검토(1)", window.selected_routine_status_buttons["error"].text())
+            self.assertEqual("검토(1)", window.selected_routine_status_buttons["review"].text())
+
+    def test_actual_registered_stock_badge_single_and_double_click_projection(self) -> None:
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+            window = AutoTradeSettingWindow()
+        self.addCleanup(window.close)
+        window._all_stocks_scope_active = True
+        window._all_stocks_scope_summary = lambda: {
+            "groups": 1,
+            "routines": 1,
+            "registered": 4,
+            "normal": 2,
+            "operation_running": 1,
+            "waiting": 1,
+            "excluded": 1,
+            "review": 1,
+        }
+        loaded_filters: list[str] = []
+        window.load_selected_routine_stocks = lambda: loaded_filters.append(
+            str(window._stock_status_filter)
+        )
+        window.update_selected_routine_status_bar()
+        window.show()
+        self._app.processEvents()
+        stock_badge = window.selected_routine_status_buttons["all"]
+
+        self.assertEqual("normal", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
+        self.assertEqual("종목(2)", stock_badge.text())
+        self.assertIn("color: #15803D", stock_badge.styleSheet())
+
+        QTest.mouseClick(stock_badge, Qt.LeftButton)
+        self._app.processEvents()
+        self.assertEqual("normal", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
+
+        QTest.mouseDClick(stock_badge, Qt.LeftButton)
+        self._app.processEvents()
+        self.assertEqual("all", window._stock_status_filter)
+        self.assertFalse(window._selected_stock_normal_projection_active)
+        self.assertEqual("종목(4)", stock_badge.text())
+        self.assertNotIn("color: #15803D", stock_badge.styleSheet())
+
+        QTest.mouseDClick(stock_badge, Qt.LeftButton)
+        self._app.processEvents()
+        self.assertEqual("normal", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
+        self.assertEqual("종목(2)", stock_badge.text())
+        self.assertIn("color: #15803D", stock_badge.styleSheet())
+
+        QTest.mouseClick(
+            window.selected_routine_status_buttons["excluded"],
+            Qt.LeftButton,
+        )
+        self._app.processEvents()
+        self.assertEqual("excluded", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
+        self.assertEqual("종목(2)", stock_badge.text())
+        self.assertIn("color: #15803D", stock_badge.styleSheet())
+
+        window.btn_all_stocks.click()
+        self._app.processEvents()
+        self.assertTrue(window._selected_stock_normal_projection_active)
+        self.assertEqual("excluded", window._stock_status_filter)
+        self.assertEqual("종목(2)", stock_badge.text())
+
+        QTest.mouseDClick(stock_badge, Qt.LeftButton)
+        self._app.processEvents()
+        self.assertEqual("all", window._stock_status_filter)
+        self.assertFalse(window._selected_stock_normal_projection_active)
+        self.assertEqual("종목(4)", stock_badge.text())
 
     def test_all_stocks_button_selects_all_view_scope_and_restores_row_scope(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
@@ -7825,6 +7917,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "stopped": 4,
                 "error": 1,
                 "normal": 3,
+                "operation_running": 3,
+                "waiting": 0,
                 "excluded": 3,
                 "review": 1,
             },
@@ -7838,6 +7932,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "stopped": 3,
                 "error": 1,
                 "normal": 2,
+                "operation_running": 2,
+                "waiting": 0,
                 "excluded": 2,
                 "review": 1,
             },
@@ -7848,21 +7944,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.routine_table.setItem(row, 0, item)
 
         window.routine_table.selectRow(0)
-        window._stock_status_filter = "running"
+        window._stock_status_filter = "operation"
         stock_loader.reset_mock()
         window.btn_all_stocks.click()
 
         self.assertTrue(window._all_stocks_scope_active)
         self.assertIsNone(window.current_selected_routine_row_metadata())
-        self.assertEqual("running", window._stock_status_filter)
+        self.assertEqual("operation", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
         self.assertEqual("전체", window.selected_routine_name_button.text())
         self.assertTrue(window.selected_routine_signal_label.isHidden())
         self.assertEqual("그룹(2)", window.selected_routine_group_count_badge.text())
         self.assertEqual("루틴(3)", window.selected_routine_instance_count_badge.text())
-        self.assertEqual("종목(12)", window.selected_routine_status_buttons["all"].text())
-        self.assertEqual("정지(5)", window.selected_routine_status_buttons["running"].text())
+        self.assertEqual("종목(5)", window.selected_routine_status_buttons["all"].text())
+        self.assertEqual("운영(5)", window.selected_routine_status_buttons["operation"].text())
+        self.assertEqual("대기(0)", window.selected_routine_status_buttons["waiting"].text())
         self.assertEqual("제외(5)", window.selected_routine_status_buttons["excluded"].text())
-        self.assertEqual("검토(2)", window.selected_routine_status_buttons["error"].text())
+        self.assertEqual("검토(2)", window.selected_routine_status_buttons["review"].text())
         self.assertEqual(
             setting_window.auto_trade_setting_badge_stylesheet(
                 "QPushButton",
@@ -7873,7 +7971,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         stock_loader.assert_called_once_with()
 
-        for filter_key in ("excluded", "error", "all"):
+        for filter_key in ("excluded", "review", "all"):
             window._all_stocks_scope_active = False
             window._stock_status_filter = filter_key
             window.routine_table.selectRow(0)
@@ -7913,7 +8011,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("all", window._routine_tree_display_scope)
         self.assertEqual("all", window._routine_tree_last_stock_scope)
         self.assertFalse(window._routine_tree_valid_only)
-        self.assertEqual("running", window._stock_status_filter)
+        self.assertEqual("normal", window._stock_status_filter)
+        self.assertTrue(window._selected_stock_normal_projection_active)
         self.assertTrue(window._all_stocks_scope_active)
         self.assertIn(
             "color: #16A34A",
@@ -10876,12 +10975,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.update_selected_routine_status_bar = lambda: None
         window.update_action_buttons = lambda: None
         window._stock_visual_order = []
+        window._current_session_operation_participant_stock_codes = {"111111"}
 
         stocks = [
             {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "정상1"},
             {"stock_path": "stocks/222222_STOP", "assigned_routine_instance_id": "inst-a", "code": "222222", "name": "제외"},
             {"stock_path": "stocks/333333_REVIEW", "assigned_routine_instance_id": "inst-a", "code": "333333", "name": "검토"},
             {"stock_path": "stocks/444444_REVIEW_EXCLUDED", "assigned_routine_instance_id": "inst-a", "code": "444444", "name": "검토제외"},
+            {"stock_path": "stocks/555555_WAIT", "assigned_routine_instance_id": "inst-a", "code": "555555", "name": "대기"},
         ]
 
         def fake_read_json(path: Path):
@@ -10918,20 +11019,29 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
             window._stock_status_filter = "all"
             table_loader.auto_trade_load_selected_routine_stocks(window)
-            self.assertEqual(["111111", "222222", "333333", "444444"], loaded_codes())
+            self.assertEqual(["111111", "222222", "333333", "444444", "555555"], loaded_codes())
             self.assertEqual(["222222"], inactive_codes())
 
-            window._stock_status_filter = "running"
+            window._stock_status_filter = "normal"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(["111111", "555555"], loaded_codes())
+            self.assertEqual([], inactive_codes())
+
+            window._stock_status_filter = "operation"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(["111111"], loaded_codes())
             self.assertEqual([], inactive_codes())
+
+            window._stock_status_filter = "waiting"
+            table_loader.auto_trade_load_selected_routine_stocks(window)
+            self.assertEqual(["555555"], loaded_codes())
 
             window._stock_status_filter = "excluded"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(["222222"], loaded_codes())
             self.assertEqual(["222222"], inactive_codes())
 
-            window._stock_status_filter = "error"
+            window._stock_status_filter = "review"
             table_loader.auto_trade_load_selected_routine_stocks(window)
             self.assertEqual(["333333", "444444"], loaded_codes())
             self.assertEqual([], inactive_codes())

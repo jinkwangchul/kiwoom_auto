@@ -73,8 +73,8 @@ from gui_auto_trade_display import (
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_integrity import is_operation_excluded, is_review_required_state
-from gui_auto_trade_run_control import auto_trade_running_registered_operation_targets
 from gui_auto_trade_policy import (
+    auto_trade_stock_operation_category,
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
@@ -1299,6 +1299,7 @@ def _instance_stock_counts(
         "normal",
         "all",
         "operation",
+        "waiting",
         "excluded",
         "review",
         "all_non_review",
@@ -1311,48 +1312,24 @@ def _instance_stock_counts(
             clean_scope = "all_non_review"
     static_cache = _main_pnl_refresh_static_cache(window)
     dynamic_stocks: list[tuple[dict[str, object], dict[str, object]]] = []
-    registered_targets: list[tuple[Path, str, str]] = []
-    operation_excluded_by_stock_dir: dict[str, bool] = {}
-    state_by_stock_dir: dict[str, dict[str, object]] = {}
     for stock in static_cache["stocks"]:
         stock_dir = Path(stock["stock_dir"])
         state = read_json_dict(stock_dir / "state.json")
-        operation_excluded = bool(stock.get("operation_excluded", False))
-        code = str(stock.get("code", "") or "").strip()
-        name = str(stock.get("name", "") or "").strip()
-        stock_dir_key = str(stock.get("stock_dir_key", "") or stock_dir)
-        registered_targets.append((stock_dir, code, name))
-        operation_excluded_by_stock_dir[stock_dir_key] = operation_excluded
-        state_by_stock_dir[stock_dir_key] = state
         dynamic_stocks.append((stock, state))
-    current_running_stock_dirs = {
-        str(Path(stock_dir))
-        for stock_dir, _code, _name in (
-            auto_trade_running_registered_operation_targets(
-                window,
-                registered_targets=registered_targets,
-                operation_excluded_by_stock_dir=operation_excluded_by_stock_dir,
-                state_by_stock_dir=state_by_stock_dir,
-            )
-            if window is not None
-            else []
-        )
-    }
-    operation_scope_running = bool(current_running_stock_dirs)
     for stock, state in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
-        stock_dir = Path(stock["stock_dir"])
-        stock_dir_key = str(stock.get("stock_dir_key", "") or stock_dir)
-        current_running = stock_dir_key in current_running_stock_dirs
         instance_id = str(stock.get("instance_id", "") or "").strip()
         operation_excluded = bool(stock.get("operation_excluded", False))
         review_required = is_review_required_state(state)
+        code = str(stock.get("code", "") or "").strip()
+        name = str(stock.get("name", "") or "").strip()
         item = counts.setdefault(
             instance_id,
             {
                 "registered": 0,
                 "operation_or_stopped": 0,
                 "operation_running": 0,
+                "waiting": 0,
                 "normal": 0,
                 "excluded": 0,
                 "review": 0,
@@ -1367,17 +1344,24 @@ def _instance_stock_counts(
             },
         )
         item["registered"] += 1
-        if review_required:
+        category = auto_trade_stock_operation_category(
+            window,
+            stock_code=code,
+            persisted_trade_started=auto_trade_setting_trade_started(state),
+            operation_excluded=operation_excluded,
+            review_required=review_required,
+        )
+        if category == "review":
             item["review"] += 1
-        elif operation_excluded:
+        elif category == "excluded":
             item["excluded"] += 1
         else:
             item["normal"] += 1
             item["operation_or_stopped"] += 1
-            if current_running:
+            if category == "operation":
                 item["operation_running"] += 1
-        code = str(stock.get("code", "") or "").strip()
-        name = str(stock.get("name", "") or "").strip()
+            else:
+                item["waiting"] += 1
         if clean_scope == "all":
             include_stock_row = True
         elif clean_scope == "review":
@@ -1385,11 +1369,9 @@ def _instance_stock_counts(
         elif clean_scope == "excluded":
             include_stock_row = operation_excluded and not review_required
         elif clean_scope == "operation":
-            include_stock_row = (
-                not review_required
-                and not operation_excluded
-                and current_running == operation_scope_running
-            )
+            include_stock_row = category == "operation"
+        elif clean_scope == "waiting":
+            include_stock_row = category == "waiting"
         elif clean_scope == "normal":
             include_stock_row = not review_required and not operation_excluded
         else:
@@ -1548,6 +1530,10 @@ def _main_routine_summary_projection(
     definitions: list[object],
     instances: list[object],
     instance_counts: dict[str, dict[str, object]],
+    *,
+    group_badge_count: int | None = None,
+    routine_badge_count: int | None = None,
+    stock_badge_count: int | None = None,
 ) -> dict[str, object]:
     """Project the unfiltered registered-routine summary from existing counts."""
     registered = sum(
@@ -1566,9 +1552,24 @@ def _main_routine_summary_projection(
         int(count.get("operation_running", count.get("running", 0)) or 0)
         for count in instance_counts.values()
     )
-    stopped = sum(
-        int(count.get("operation_or_stopped", count.get("stopped", 0)) or 0)
+    waiting = sum(
+        int(count.get("waiting", 0) or 0)
         for count in instance_counts.values()
+    )
+    displayed_stock_count = (
+        registered
+        if stock_badge_count is None
+        else max(0, int(stock_badge_count))
+    )
+    displayed_group_count = (
+        len(definitions)
+        if group_badge_count is None
+        else max(0, int(group_badge_count))
+    )
+    displayed_routine_count = (
+        len(instances)
+        if routine_badge_count is None
+        else max(0, int(routine_badge_count))
     )
     profit_amount = sum(
         float(count.get("profit_amount", 0) or 0)
@@ -1578,8 +1579,6 @@ def _main_routine_summary_projection(
         float(count.get("profit_cost_basis", 0) or 0)
         for count in instance_counts.values()
     )
-    operation_label = "운영" if running > 0 else "정지"
-    operation_count = running if running > 0 else stopped
     profit_rate = (
         profit_amount / profit_cost_basis * 100
         if profit_cost_basis > 0
@@ -1587,16 +1586,17 @@ def _main_routine_summary_projection(
     )
     return {
         "count_badges": (
-            ("group", "그룹", len(definitions)),
-            ("routine", "루틴", len(instances)),
-            ("stock", "종목", registered),
-            ("operation", operation_label, operation_count),
+            ("group", "그룹", displayed_group_count),
+            ("routine", "루틴", displayed_routine_count),
+            ("stock", "종목", displayed_stock_count),
+            ("operation", "운영", running),
+            ("waiting", "대기", waiting),
             ("excluded", "제외", excluded),
             ("review", "검토", review),
         ),
         "counts_text": (
-            f"그룹({len(definitions)})  루틴({len(instances)})  종목({registered})  "
-            f"{operation_label}({operation_count})  제외({excluded})  검토({review})"
+            f"그룹({displayed_group_count})  루틴({displayed_routine_count})  종목({displayed_stock_count})  "
+            f"운영({running})  대기({waiting})  제외({excluded})  검토({review})"
         ),
         "profit_value_text": (
             f"{format_signed_money(profit_amount)} / "
@@ -1620,7 +1620,65 @@ def _update_main_routine_summary(
 ) -> None:
     update = getattr(window, "_update_main_routine_summary", None)
     if callable(update):
-        update(_main_routine_summary_projection(definitions, instances, instance_counts))
+        valid_projection = bool(getattr(window, "_main_routine_valid_only", False))
+        valid_instance_ids = {
+            str(getattr(instance, "instance_id", "") or "").strip()
+            for instance in instances
+            if (
+                int(
+                    instance_counts.get(
+                        str(getattr(instance, "instance_id", "") or "").strip(),
+                        {},
+                    ).get("operation_running", 0)
+                    or 0
+                )
+                + int(
+                    instance_counts.get(
+                        str(getattr(instance, "instance_id", "") or "").strip(),
+                        {},
+                    ).get("waiting", 0)
+                    or 0
+                )
+                > 0
+            )
+        }
+        valid_definition_ids = {
+            str(getattr(instance, "definition_id", "") or "").strip()
+            for instance in instances
+            if str(getattr(instance, "instance_id", "") or "").strip()
+            in valid_instance_ids
+            and str(getattr(instance, "definition_id", "") or "").strip()
+        }
+        registered_definition_ids = {
+            str(getattr(definition, "definition_id", "") or "").strip()
+            for definition in definitions
+            if str(getattr(definition, "definition_id", "") or "").strip()
+        }
+        valid_stock_count = (
+            sum(
+                int(count.get("operation_running", 0) or 0)
+                + int(count.get("waiting", 0) or 0)
+                for count in instance_counts.values()
+            )
+            if valid_projection
+            else None
+        )
+        update(
+            _main_routine_summary_projection(
+                definitions,
+                instances,
+                instance_counts,
+                group_badge_count=(
+                    len(valid_definition_ids & registered_definition_ids)
+                    if valid_projection
+                    else None
+                ),
+                routine_badge_count=(
+                    len(valid_instance_ids) if valid_projection else None
+                ),
+                stock_badge_count=valid_stock_count,
+            )
+        )
 
 
 def main_refresh_pnl_only(window) -> None:
@@ -2329,7 +2387,11 @@ def main_load_routine_table(window) -> None:
     ).strip().lower()
     if operation_excluded_only:
         stock_scope = "excluded"
-    if stock_scope not in {"normal", "all", "operation", "excluded", "review"}:
+    if stock_scope not in {
+        "normal", "all", "operation", "waiting", "excluded", "review"
+    }:
+        stock_scope = "normal"
+    if bool(getattr(window, "_main_routine_valid_only", False)) and stock_scope == "all":
         stock_scope = "normal"
     instance_counts = _instance_stock_counts(
         window=window,
@@ -2483,6 +2545,7 @@ def main_load_routine_table(window) -> None:
                     ),
                     "registered": int(count["registered"]),
                     "operation_running": operation_running_count,
+                    "waiting": int(count.get("waiting", 0) or 0),
                     "review": int(count.get("review", count.get("error", 0)) or 0),
                     "operation_or_stopped": operation_or_stopped_count,
                     "normal": int(count.get("normal", 0) or 0),
@@ -2515,6 +2578,7 @@ def main_load_routine_table(window) -> None:
         parent_operation_running = sum(
             int(item["operation_running"]) for item in all_children
         )
+        parent_waiting = sum(int(item.get("waiting", 0) or 0) for item in all_children)
         parent_operation_or_stopped = (
             parent_operation_running
             if parent_operation_running > 0
@@ -2543,6 +2607,7 @@ def main_load_routine_table(window) -> None:
                 ),
                 "registered": parent_registered,
                 "operation_running": parent_operation_running,
+                "waiting": parent_waiting,
                 "operation_or_stopped": parent_operation_or_stopped,
                 "normal": parent_normal,
                 "excluded": parent_excluded,

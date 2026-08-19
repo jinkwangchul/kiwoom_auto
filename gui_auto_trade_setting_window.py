@@ -1181,7 +1181,10 @@ from gui_window_policy import (
 from gui_auto_trade_unregister import (
     unregister_selected_auto_trade_stocks,
 )
-from gui_auto_trade_context_menu import show_auto_trade_stock_context_menu
+from gui_auto_trade_context_menu import (
+    CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+    show_auto_trade_stock_context_menu,
+)
 from gui_auto_trade_selection import (
     clear_current_routine_stock_selection,
     ensure_context_row_selected,
@@ -1340,6 +1343,7 @@ AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
 AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = AUTO_TRADE_SETTING_BADGE_HEIGHT
 AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
 AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
+AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE = "color: #2563eb; font-weight: bold;"
 AUTO_TRADE_SETTING_ROUTINE_TREE_DISPLAY_CRITERIA = {
     "category": frozenset({"period", "profit", "average", "efficiency"}),
     "routine": frozenset({"period", "profit", "average", "efficiency"}),
@@ -2424,7 +2428,7 @@ class AutoTradeSettingWindow(QDialog):
 
         self.btn_start = QPushButton("▶ 운영시작")
         self.btn_early_close = QPushButton("조기마감")
-        self.btn_early_close.setStyleSheet("color: #2563eb; font-weight: bold;")
+        self.btn_early_close.setStyleSheet(AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE)
         self.btn_all_stocks = QPushButton("전체")
         self.btn_all_stocks.setFocusPolicy(Qt.NoFocus)
         self.btn_all_stocks.setCursor(Qt.PointingHandCursor)
@@ -2539,7 +2543,9 @@ class AutoTradeSettingWindow(QDialog):
         self._last_execution_enable_queue_snapshot: dict[str, object] | None = None
         self._last_real_preflight_preview_result: dict[str, object] | None = None
         self._last_real_preflight_queue_snapshot: dict[str, object] | None = None
-        self._stock_status_filter = "running"
+        self._stock_status_filter = "normal"
+        self._selected_stock_normal_projection_active = True
+        self._selected_stock_double_click_release_pending = False
         self._last_strategy_workspace_width = 0
         self._collapsed_auto_trade_instance_ids: set[str] = set()
         self._routine_tree_display_level = "stock"
@@ -2790,9 +2796,10 @@ class AutoTradeSettingWindow(QDialog):
         self.selected_routine_status_buttons: dict[str, QPushButton] = {}
         for filter_key, object_name in (
             ("all", "autoTradeSettingSelectedRoutineRegistered"),
-            ("running", "autoTradeSettingSelectedRoutineRunning"),
+            ("operation", "autoTradeSettingSelectedRoutineRunning"),
+            ("waiting", "autoTradeSettingSelectedRoutineWaiting"),
             ("excluded", "autoTradeSettingSelectedRoutineExcluded"),
-            ("error", "autoTradeSettingSelectedRoutineError"),
+            ("review", "autoTradeSettingSelectedRoutineError"),
         ):
             button = QPushButton()
             button.setObjectName(object_name)
@@ -2804,6 +2811,8 @@ class AutoTradeSettingWindow(QDialog):
                 "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
             )
             button.clicked.connect(lambda _checked=False, key=filter_key: self.set_stock_status_filter(key))
+            if filter_key == "all" and isinstance(self, AutoTradeSettingWindow):
+                button.installEventFilter(self)
             self.selected_routine_status_buttons[filter_key] = button
             layout.addWidget(button, 0, Qt.AlignVCenter)
 
@@ -2812,11 +2821,29 @@ class AutoTradeSettingWindow(QDialog):
 
     def set_stock_status_filter(self, filter_key: str) -> None:
         normalized = str(filter_key or "all").strip().lower()
-        if normalized == "stopped":
-            normalized = "running"
-        if normalized not in {"all", "running", "excluded", "error"}:
-            normalized = "running"
-        self._stock_status_filter = normalized
+        normalized = {
+            "running": "operation",
+            "stopped": "waiting",
+            "error": "review",
+        }.get(normalized, normalized)
+        if normalized not in {"all", "operation", "waiting", "excluded", "review"}:
+            normalized = "operation"
+        self._stock_status_filter = (
+            "normal"
+            if normalized == "all"
+            and bool(getattr(self, "_selected_stock_normal_projection_active", False))
+            else normalized
+        )
+        self.update_selected_routine_status_bar()
+        self.load_selected_routine_stocks()
+
+    def _toggle_selected_stock_normal_projection(self) -> None:
+        """Toggle operation/waiting projection in the selected-stock table only."""
+        projection_active = not bool(
+            getattr(self, "_selected_stock_normal_projection_active", False)
+        )
+        self._selected_stock_normal_projection_active = projection_active
+        self._stock_status_filter = "normal" if projection_active else "all"
         self.update_selected_routine_status_bar()
         self.load_selected_routine_stocks()
 
@@ -2864,7 +2891,13 @@ class AutoTradeSettingWindow(QDialog):
                 self.selected_routine_name_button.setText("-")
                 self.selected_routine_instance_count_badge.setText("")
                 self.selected_routine_instance_count_badge.hide()
-                counts = {"registered": 0, "normal": 0, "excluded": 0, "review": 0}
+                counts = {
+                    "registered": 0,
+                    "operation_running": 0,
+                    "waiting": 0,
+                    "excluded": 0,
+                    "review": 0,
+                }
             else:
                 row_kind = str(metadata.get("row_kind", "") or "")
                 self.selected_routine_signal_label.setText("●")
@@ -2878,14 +2911,16 @@ class AutoTradeSettingWindow(QDialog):
                             instance_id,
                             {
                                 "registered": 0,
-                                "normal": 0,
+                                "operation_running": 0,
+                                "waiting": 0,
                                 "excluded": 0,
                                 "review": 0,
                             },
                         )
                         counts = {
                             "registered": int(instance_counts.get("registered", 0) or 0),
-                            "normal": int(instance_counts.get("normal", instance_counts.get("running", 0)) or 0),
+                            "operation_running": int(instance_counts.get("operation_running", 0) or 0),
+                            "waiting": int(instance_counts.get("waiting", 0) or 0),
                             "excluded": int(instance_counts.get("excluded", 0) or 0),
                             "review": int(instance_counts.get("review", instance_counts.get("error", 0)) or 0),
                         }
@@ -2899,26 +2934,55 @@ class AutoTradeSettingWindow(QDialog):
                 if counts is None:
                     counts = {
                         "registered": int(metadata.get("registered", 0) or 0),
-                        "normal": int(metadata.get("normal", metadata.get("running", 0)) or 0),
+                        "operation_running": int(metadata.get("operation_running", 0) or 0),
+                        "waiting": int(metadata.get("waiting", 0) or 0),
                         "excluded": int(metadata.get("excluded", 0) or 0),
                         "review": int(metadata.get("review", metadata.get("error", 0)) or 0),
                     }
-        operation_label = self._stock_operation_status_label()
         button_texts = {
-            "all": f"종목({counts['registered']})",
-            "running": f"{operation_label}({counts['normal']})",
+            "all": (
+                f"종목({counts['operation_running'] + counts['waiting']})"
+                if bool(
+                    getattr(
+                        self,
+                        "_selected_stock_normal_projection_active",
+                        False,
+                    )
+                )
+                else f"종목({counts['registered']})"
+            ),
+            "operation": f"운영({counts['operation_running']})",
+            "waiting": f"대기({counts['waiting']})",
             "excluded": f"제외({counts['excluded']})",
-            "error": f"검토({counts['review']})",
+            "review": f"검토({counts['review']})",
         }
         current_filter = str(getattr(self, "_stock_status_filter", "all") or "all")
-        if current_filter == "stopped":
-            current_filter = "running"
+        current_filter = {
+            "running": "operation",
+            "stopped": "waiting",
+            "error": "review",
+        }.get(current_filter, current_filter)
+        if current_filter == "normal":
+            current_filter = "all"
         for key, button in self.selected_routine_status_buttons.items():
             button.setText(button_texts[key])
             is_active = key == current_filter
+            projection_active = bool(
+                getattr(self, "_selected_stock_normal_projection_active", False)
+            )
+            active_color = (
+                CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR
+                if key == "all" and projection_active
+                else "#1D4ED8"
+            )
+            text_color = (
+                CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR
+                if key == "all" and projection_active
+                else active_color if is_active else "#374151"
+            )
             button.setStyleSheet(
                 "QPushButton { background: transparent; border: none; "
-                f"color: {'#1D4ED8' if is_active else '#374151'}; "
+                f"color: {text_color}; "
                 f"font-weight: {'600' if is_active else '400'}; padding: 0 2px; }}"
                 "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
             )
@@ -2936,6 +3000,8 @@ class AutoTradeSettingWindow(QDialog):
             "routines": 0,
             "registered": 0,
             "normal": 0,
+            "operation_running": 0,
+            "waiting": 0,
             "excluded": 0,
             "review": 0,
         }
@@ -2948,7 +3014,10 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             summary["groups"] += 1
             summary["routines"] += int(metadata.get("instance_count", 0) or 0)
-            for key in ("registered", "normal", "excluded", "review"):
+            for key in (
+                "registered", "normal", "operation_running", "waiting",
+                "excluded", "review",
+            ):
                 summary[key] += int(metadata.get(key, 0) or 0)
         return summary
 
@@ -2978,7 +3047,8 @@ class AutoTradeSettingWindow(QDialog):
         self._set_routine_tree_display_level("stock")
         self._routine_tree_display_scope = "all"
         self._set_routine_tree_display_criterion("profit")
-        self._stock_status_filter = "running"
+        self._selected_stock_normal_projection_active = True
+        self._stock_status_filter = "normal"
         self.show_all_registered_stocks()
 
     def update_selection_summary_panel(self) -> None:
@@ -5279,11 +5349,9 @@ class AutoTradeSettingWindow(QDialog):
 
         selected_level = str(getattr(self, "_routine_tree_display_level", "category") or "category")
         for level, button in getattr(self, "_routine_tree_display_level_buttons", {}).items():
-            color = (
-                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
-                if level == selected_level
-                else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
-            )
+            color = AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            if level == selected_level:
+                color = AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
             button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
@@ -5597,6 +5665,33 @@ class AutoTradeSettingWindow(QDialog):
             self._refresh_routine_tree_display_state()
 
     def eventFilter(self, obj, event) -> bool:
+        selected_stock_button = getattr(
+            self,
+            "selected_routine_status_buttons",
+            {},
+        ).get("all")
+        if (
+            obj is selected_stock_button
+            and event.type() == QEvent.MouseButtonRelease
+            and bool(
+                getattr(
+                    self,
+                    "_selected_stock_double_click_release_pending",
+                    False,
+                )
+            )
+        ):
+            self._selected_stock_double_click_release_pending = False
+            return True
+        if (
+            obj is selected_stock_button
+            and event.type() == QEvent.MouseButtonDblClick
+        ):
+            if hasattr(event, "button") and event.button() != Qt.LeftButton:
+                return False
+            self._selected_stock_double_click_release_pending = True
+            self._toggle_selected_stock_normal_projection()
+            return True
         if obj is getattr(self, "routine_box", None) and event.type() == QEvent.Resize:
             self._position_routine_tree_display_level_badges()
         if (
@@ -6011,6 +6106,14 @@ class AutoTradeSettingWindow(QDialog):
                         int(instance_counts.get(str(instance.instance_id), {}).get("normal", 0) or 0)
                         for instance in child_instances
                     ),
+                    "operation_running": sum(
+                        int(instance_counts.get(str(instance.instance_id), {}).get("operation_running", 0) or 0)
+                        for instance in child_instances
+                    ),
+                    "waiting": sum(
+                        int(instance_counts.get(str(instance.instance_id), {}).get("waiting", 0) or 0)
+                        for instance in child_instances
+                    ),
                     "excluded": sum(
                         int(instance_counts.get(str(instance.instance_id), {}).get("excluded", 0) or 0)
                         for instance in child_instances
@@ -6080,6 +6183,8 @@ class AutoTradeSettingWindow(QDialog):
                         "stopped": int(count.get("stopped", 0) or 0),
                         "error": int(count.get("error", 0) or 0),
                         "normal": int(count.get("normal", 0) or 0),
+                        "operation_running": int(count.get("operation_running", 0) or 0),
+                        "waiting": int(count.get("waiting", 0) or 0),
                         "excluded": int(count.get("excluded", 0) or 0),
                         "review": int(count.get("review", 0) or 0),
                         "display_level": str(

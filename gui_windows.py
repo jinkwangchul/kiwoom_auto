@@ -1007,6 +1007,7 @@ from gui_auto_trade_run_control import (
 )
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
+    operation_policy_section,
 )
 from buffer_response_coordinator import (
     coordinate_main_window_buffer_response,
@@ -1052,6 +1053,7 @@ from gui_operation_environment import (
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+    AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE,
     AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
     InstanceStockSearchRegisterDialog,
@@ -1060,6 +1062,7 @@ from gui_auto_trade_setting_window import (
     get_stock_dirs_in_routine,
     handle_stock_name_operation_exclusion_double_click,
     handle_kiwoom_raw_chejan_event,
+    is_emergency_stopped_state,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
     routine_display_name,
@@ -1107,16 +1110,8 @@ from production_recovery_state_registry import (
     reconcile_production_recovery_snapshot,
 )
 from startup_runtime_initializer import initialize_pristine_startup_runtime
-from operation_command_service import (
-    MODE_EARLY_CLOSE,
-    OperationCommandService,
-    RESULT_FAILED,
-    RESULT_PARTIAL_SUCCESS,
-    SCOPE_ROUTINE_INSTANCE,
-)
-from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from operation_command_service import MODE_EARLY_CLOSE
 from close_liquidation_transition_service import POLICY_MARKET
-from gui_auto_trade_close import auto_trade_continue_pending_close_liquidations
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -2785,7 +2780,7 @@ class MainWindow(QMainWindow):
         self._main_routine_initial_buy_sort_next_mode = "AMOUNT"
         self._main_routine_column_sort_key = ""
         self._main_routine_excluded_only = False
-        self._main_routine_stock_scope = "operation"
+        self._main_routine_stock_scope = "all"
         self._last_main_routine_table_height_signature = (-1, -1, -1)
         self._main_routine_valid_button = None
         self._main_routine_level_buttons: dict[str, QPushButton] = {}
@@ -2829,6 +2824,7 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
         self.btn_review_required = QPushButton("검토관리(0)")
+        self.btn_main_visible_early_close = QPushButton("조기마감")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
 
@@ -3603,12 +3599,21 @@ class MainWindow(QMainWindow):
         routine_content_layout = QHBoxLayout()
         routine_content_layout.setContentsMargins(0, 0, 0, 0)
         routine_content_layout.setSpacing(6)
+        routine_filter_badge_area = self._create_routine_filter_badge_area()
         routine_header_layout = QHBoxLayout()
         routine_header_layout.setContentsMargins(0, 0, 0, 0)
         routine_header_layout.setSpacing(routine_content_layout.spacing())
-        routine_header_layout.addWidget(self._create_main_routine_summary())
+        routine_summary = self._create_main_routine_summary()
+        routine_header_layout.addWidget(routine_summary)
         routine_header_layout.addStretch(1)
-        routine_filter_badge_area = self._create_routine_filter_badge_area()
+        if hasattr(self, "_main_routine_valid_only"):
+            MainWindow._update_main_routine_filter_badges(self)
+        MainWindow._style_main_visible_early_close_button(self)
+        routine_header_layout.addWidget(
+            self.btn_main_visible_early_close,
+            0,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
         routine_layout.addLayout(routine_header_layout)
         routine_content_layout.addWidget(routine_filter_badge_area)
         routine_content_layout.addWidget(self.routine_table, 1)
@@ -3621,6 +3626,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(routine_box, 1)
 
         return layout
+
+    def _style_main_visible_early_close_button(self) -> None:
+        self.btn_main_visible_early_close.setObjectName("mainVisibleEarlyCloseButton")
+        early_close_style = (
+            "QPushButton#mainVisibleEarlyCloseButton {"
+            f" {AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE}"
+        )
+        reference_button = getattr(self, "_main_routine_valid_button", None)
+        if reference_button is not None:
+            reference_font = reference_button.font()
+            self.btn_main_visible_early_close.setFont(reference_font)
+            if reference_font.pixelSize() > 0:
+                early_close_style += f" font-size: {reference_font.pixelSize()}px;"
+            elif reference_font.pointSizeF() > 0:
+                early_close_style += f" font-size: {reference_font.pointSizeF():g}pt;"
+        early_close_style += " }"
+        self.btn_main_visible_early_close.setMinimumHeight(28)
+        self.btn_main_visible_early_close.setStyleSheet(early_close_style)
 
     def _create_main_routine_summary(self) -> QWidget:
         summary = QWidget()
@@ -3658,7 +3681,7 @@ class MainWindow(QMainWindow):
         ) // 2
         label_slot_width = max(
             metrics.horizontalAdvance(text)
-            for text in ("그룹", "루틴", "종목", "정지", "운영", "제외", "검토")
+            for text in ("그룹", "루틴", "종목", "운영", "대기", "제외", "검토")
         )
         number_slot_width = routine_aggregate_number_slot_width(summary_font)
         badge_height = max(
@@ -3718,7 +3741,8 @@ class MainWindow(QMainWindow):
             ("group", "그룹"),
             ("routine", "루틴"),
             ("stock", "종목"),
-            ("operation", "정지"),
+            ("operation", "운영"),
+            ("waiting", "대기"),
             ("excluded", "제외"),
             ("review", "검토"),
         ):
@@ -3813,16 +3837,16 @@ class MainWindow(QMainWindow):
     ) -> None:
         clean_key = str(key or "").strip().lower()
         if clean_key in {"group", "routine"}:
-            MainWindow._assign_main_routine_stock_scope(self, "normal", False)
+            MainWindow._assign_main_routine_stock_scope(self, "all", True)
             self._main_routine_excluded_only = False
-            self._main_routine_stock_scope = "normal"
+            self._main_routine_stock_scope = "all"
             self._set_main_routine_display_level(clean_key)
             return
         if clean_key == "stock":
-            self._assign_main_routine_stock_scope("operation", checked)
+            self._assign_main_routine_stock_scope("all", True)
             self._set_main_routine_display_level("stock")
             return
-        if clean_key in {"operation", "excluded", "review"}:
+        if clean_key in {"operation", "waiting", "excluded", "review"}:
             self._set_main_routine_display_level("stock")
             self._set_main_routine_stock_scope(clean_key, checked)
 
@@ -3835,11 +3859,11 @@ class MainWindow(QMainWindow):
         active_by_key = {
             "group": level == "group",
             "routine": level == "routine",
-            "stock": level == "stock"
-            and scope in {"operation", "excluded", "review"},
-            "operation": scope == "operation",
-            "excluded": scope == "excluded",
-            "review": scope == "review",
+            "stock": level == "stock",
+            "operation": level == "stock" and scope == "operation",
+            "waiting": level == "stock" and scope == "waiting",
+            "excluded": level == "stock" and scope == "excluded",
+            "review": level == "stock" and scope == "review",
         }
         for key, button in buttons.items():
             active = bool(active_by_key.get(key, False))
@@ -4037,6 +4061,15 @@ class MainWindow(QMainWindow):
                     "}"
                 )
             )
+            valid_separator = getattr(
+                self,
+                "_main_routine_summary_valid_separator",
+                None,
+            )
+            if valid_separator is not None:
+                valid_separator.setFixedHeight(
+                    self._main_routine_valid_button.height()
+                )
 
         for level, button in self._main_routine_level_buttons.items():
             active = level == self._main_routine_display_level
@@ -4182,9 +4215,11 @@ class MainWindow(QMainWindow):
         if bool(getattr(self, "_main_routine_excluded_only", False)):
             return "excluded"
         scope = str(
-            getattr(self, "_main_routine_stock_scope", "normal") or "normal"
+            getattr(self, "_main_routine_stock_scope", "all") or "all"
         ).strip().lower()
-        return scope if scope in {"normal", "operation", "excluded", "review"} else "normal"
+        return scope if scope in {
+            "all", "normal", "operation", "waiting", "excluded", "review"
+        } else "all"
 
     def _assign_main_routine_stock_scope(
         self,
@@ -4192,15 +4227,15 @@ class MainWindow(QMainWindow):
         enabled: bool,
     ) -> None:
         clean_scope = str(scope or "").strip().lower()
-        if clean_scope == "all":
-            clean_scope = "operation"
-        if clean_scope not in {"operation", "excluded", "review"}:
-            clean_scope = "normal"
+        if clean_scope not in {
+            "all", "normal", "operation", "waiting", "excluded", "review"
+        }:
+            clean_scope = "all"
         current_scope = MainWindow._current_main_routine_stock_scope(self)
         if bool(enabled):
             target_scope = clean_scope
-        elif clean_scope in {"operation", "excluded", "review"}:
-            target_scope = "operation"
+        elif clean_scope in {"operation", "waiting", "excluded", "review"}:
+            target_scope = "all"
         else:
             target_scope = clean_scope
         if bool(enabled) and current_scope == clean_scope:
@@ -4595,6 +4630,9 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.doubleClicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
+        self.btn_main_visible_early_close.clicked.connect(
+            self.request_visible_monitoring_early_close
+        )
         self.btn_close_all_windows.clicked.connect(
             self.close_all_persistent_feature_windows
         )
@@ -7831,6 +7869,163 @@ class MainWindow(QMainWindow):
                 result.append(stock_dir)
         return result
 
+    def _running_routine_operation_targets(
+        self,
+        instance_ids,
+    ) -> list[MainMonitoringStockTarget]:
+        running_by_path = {
+            str(Path(stock_dir).resolve()): (Path(stock_dir), code, name)
+            for stock_dir, code, name in auto_trade_running_registered_operation_targets(
+                self
+            )
+        }
+        targets: list[MainMonitoringStockTarget] = []
+        seen_paths: set[str] = set()
+        for instance_id in instance_ids:
+            clean_instance_id = str(instance_id or "").strip()
+            if not clean_instance_id:
+                continue
+            for stock_dir in self._routine_instance_stock_dirs(clean_instance_id):
+                stock_path = str(Path(stock_dir).resolve())
+                running = running_by_path.get(stock_path)
+                if running is None or stock_path in seen_paths:
+                    continue
+                seen_paths.add(stock_path)
+                resolved_dir, code, name = running
+                targets.append(
+                    MainMonitoringStockTarget(
+                        stock_dir=resolved_dir,
+                        code=code,
+                        name=name,
+                        routine_instance_id=clean_instance_id,
+                    )
+                )
+        return targets
+
+    def _visible_monitoring_early_close_targets(self) -> list[MainMonitoringStockTarget]:
+        running_by_path = {
+            str(Path(stock_dir).resolve()): (Path(stock_dir), code, name)
+            for stock_dir, code, name in auto_trade_running_registered_operation_targets(
+                self
+            )
+        }
+        targets: list[MainMonitoringStockTarget] = []
+        seen_paths: set[str] = set()
+        for row in range(self.routine_table.rowCount()):
+            target = _stock_target_for_row(self, row)
+            if target is None:
+                continue
+            stock_path = str(Path(target.stock_dir).resolve())
+            running = running_by_path.get(stock_path)
+            if running is None or stock_path in seen_paths:
+                continue
+            state = read_json_dict(Path(target.stock_dir) / "state.json")
+            if is_review_required_state(state) or is_emergency_stopped_state(state):
+                continue
+            seen_paths.add(stock_path)
+            resolved_dir, code, name = running
+            targets.append(
+                MainMonitoringStockTarget(
+                    stock_dir=resolved_dir,
+                    code=code,
+                    name=name,
+                    routine_instance_id=target.routine_instance_id,
+                )
+            )
+        return targets
+
+    def request_visible_monitoring_early_close(self) -> None:
+        targets = self._visible_monitoring_early_close_targets()
+        if not targets:
+            message = "조기마감 대상이 없습니다."
+            show_toast(self, message, duration_ms=2500)
+            self.statusBar().showMessage("관제창 조기마감: 대상 0")
+            return
+
+        answer = _create_routine_operation_confirmation(
+            self,
+            ROUTINE_STATUS_EARLY_CLOSE,
+        ).exec_()
+        accepted = answer == QMessageBox.Yes
+        method = (
+            str(operation_policy_section("early_close").get("method", "루틴")).strip()
+            or "루틴"
+        )
+        append_production_event(
+            "OPERATOR_OPERATION_DECISION",
+            result="ACCEPTED" if accepted else "CANCELLED",
+            source="gui_windows.MainWindow.request_visible_monitoring_early_close",
+            target_type="VISIBLE_MONITORING_STOCKS",
+            target_id="visible",
+            target_name="현재 표시 종목",
+            details={
+                "interaction_type": "CONFIRM",
+                "prompt_key": "VISIBLE_MONITORING_EARLY_CLOSE_CONFIRM",
+                "prompt_title": "조기마감",
+                "prompt_summary": "관제창 현재 표시 종목 조기마감 적용",
+                "offered_options": ["진행", "취소"],
+                "selected_option": "진행" if accepted else "취소",
+                "operation": "EARLY_CLOSE",
+                "method": method,
+                "target_count": len(targets),
+            },
+        )
+        if not accepted:
+            self.statusBar().showMessage("관제창 조기마감 취소")
+            return
+
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            targets,
+            request_scope="multiple",
+        )
+        self._main_monitoring_stock_operation_adapter = adapter
+        result = adapter.apply_selected_early_close(
+            method,
+            source="main_visible_early_close_button",
+            show_error_dialog=False,
+            show_result_toast=False,
+            show_confirmation=False,
+        )
+        applied_count = int(result.get("completed_count", 0) or 0)
+        failed_count = int(result.get("failed_count", 0) or 0)
+        result_message = str(result.get("message") or "").strip()
+        blocked_without_counts = (
+            result.get("ok") is False
+            and not applied_count
+            and not failed_count
+            and bool(result_message)
+            and "대상이 없습니다" not in result_message
+        )
+        self.update_review_required_button_text()
+        if applied_count and failed_count:
+            QMessageBox.warning(
+                self,
+                "관제창 조기마감 일부 적용",
+                f"조기마감 {applied_count}건 접수 / {failed_count}건 차단",
+            )
+        elif failed_count or blocked_without_counts:
+            QMessageBox.warning(
+                self,
+                "관제창 조기마감 실패",
+                result_message or "현재 상태에서는 실행할 수 없습니다.",
+            )
+        elif applied_count:
+            show_toast(
+                self,
+                f"조기마감 {applied_count}종목 적용 합니다.",
+                duration_ms=2500,
+            )
+        else:
+            show_toast(
+                self,
+                "조기마감 대상이 없습니다.",
+                duration_ms=2500,
+            )
+        self.statusBar().showMessage(
+            f"관제창 조기마감: 성공 {applied_count} / 차단 {failed_count}"
+        )
+
     def toggle_routine_instance_operation(self, instance_id: str) -> None:
         instance = routine_instance_by_id(instance_id)
         if instance is None:
@@ -8297,6 +8492,15 @@ class MainWindow(QMainWindow):
             )
             return
 
+        targets = MainWindow._running_routine_operation_targets(self, instance_ids)
+        if not targets:
+            message = f"{command_label} 대상이 없습니다."
+            show_toast(self, message, duration_ms=2500)
+            self.statusBar().showMessage(
+                f"카테고리 {command_label}: {display_name} / 대상 0"
+            )
+            return
+
         if market_requested:
             answer = _create_routine_operation_confirmation(
                 self,
@@ -8331,71 +8535,62 @@ class MainWindow(QMainWindow):
             )
             return
 
-        applied_count = 0
-        partial_count = 0
-        failed_count = 0
-        recovery_blocked_count = 0
-        command_failed_count = 0
-        for instance_id in instance_ids:
-            if not self._production_recovery_allows_routine_operation(
-                instance_id,
-                command=MODE_EARLY_CLOSE,
-                caller_name=(
-                    "MARKET_EARLY_CLOSE_ROUTINE_DEFINITION"
-                    if market_requested
-                    else "EARLY_CLOSE_ROUTINE_DEFINITION"
-                ),
-            ):
-                failed_count += 1
-                recovery_blocked_count += 1
-                continue
-            intent_result = apply_close_intent(
-                intent=CLOSE_INTENT_EARLY_CLOSE,
-                target_scope=SCOPE_ROUTINE_INSTANCE,
-                target_id=instance_id,
-                source="main_routine_parent_context_menu",
-                requested_policy=requested_policy,
-                project_root=PROJECT_ROOT,
-                operation_command_service_factory=OperationCommandService,
-            )
-            result = intent_result.get("command_result")
-            if result is None:
-                failed_count += 1
-                command_failed_count += 1
-                continue
-            if result.status == RESULT_FAILED or not result.stock_results:
-                failed_count += 1
-                command_failed_count += 1
-                continue
-            if result.status == RESULT_PARTIAL_SUCCESS:
-                partial_count += 1
-            else:
-                applied_count += 1
-            if market_requested:
-                auto_trade_continue_pending_close_liquidations(
-                    self,
-                    limit=None,
-                    target_routine_instance_ids={instance_id},
-                )
-
-        self.load_routine_table()
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            targets,
+            request_scope="multiple",
+        )
+        self._main_monitoring_stock_operation_adapter = adapter
+        result = adapter.apply_selected_early_close(
+            requested_policy,
+            source="main_routine_parent_context_menu",
+            show_error_dialog=False,
+            show_result_toast=False,
+            show_confirmation=False,
+        )
+        applied_count = int(result.get("completed_count", 0) or 0)
+        failed_count = int(result.get("failed_count", 0) or 0)
+        result_message = str(result.get("message") or "").strip()
+        blocked_without_counts = (
+            result.get("ok") is False
+            and not applied_count
+            and not failed_count
+            and bool(result_message)
+            and "대상이 없습니다" not in result_message
+        )
         self.update_review_required_button_text()
-        if recovery_blocked_count:
-            self.show_routine_recovery_block_toast(
-                f"카테고리 {command_label}"
-            )
-        if partial_count or command_failed_count:
+        if applied_count and failed_count:
             QMessageBox.warning(
                 self,
-                f"카테고리 {command_label} 일부 적용"
-                if applied_count or partial_count
-                else f"카테고리 {command_label} 실패",
-                f"성공 {applied_count}개 / 일부 적용 {partial_count}개 / "
-                f"실패 {command_failed_count}개입니다.",
+                f"카테고리 {command_label} 일부 적용",
+                f"{command_label} {applied_count}건 접수 / {failed_count}건 차단",
+            )
+        elif failed_count or blocked_without_counts:
+            QMessageBox.warning(
+                self,
+                f"카테고리 {command_label} 실패",
+                result_message or "현재 상태에서는 실행할 수 없습니다.",
+            )
+        elif applied_count:
+            success_message = (
+                f"조기마감 {applied_count}종목 적용 합니다."
+                if command_label == ROUTINE_STATUS_EARLY_CLOSE
+                else f"{display_name} {command_label} 요청이 접수되었습니다."
+            )
+            show_toast(
+                self,
+                success_message,
+                duration_ms=2500,
+            )
+        else:
+            show_toast(
+                self,
+                f"{command_label} 대상이 없습니다.",
+                duration_ms=2500,
             )
         self.statusBar().showMessage(
             f"카테고리 {command_label}: {display_name} / 성공 {applied_count} / "
-            f"일부 적용 {partial_count} / 실패 {failed_count}"
+            f"차단 {failed_count}"
         )
 
     def request_routine_operation(
@@ -8407,6 +8602,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         command_label = display_status
         market_requested = requested_policy == POLICY_MARKET
+        targets = MainWindow._running_routine_operation_targets(self, (instance_id,))
+        if not targets:
+            message = f"{command_label} 대상이 없습니다."
+            show_toast(self, message, duration_ms=2500)
+            self.statusBar().showMessage(
+                f"루틴 {command_label}: {display_name} / 대상 0"
+            )
+            return
         answer = _create_routine_operation_confirmation(self, display_status).exec_()
         accepted = answer == QMessageBox.Yes
         append_production_event(
@@ -8432,65 +8635,63 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"루틴 {command_label} 취소: {display_name}")
             return
 
-        if not self._production_recovery_allows_routine_operation(
-            instance_id,
-            command=MODE_EARLY_CLOSE,
-            caller_name=(
-                "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
-                if market_requested
-                else "EARLY_CLOSE_ROUTINE_INSTANCE"
-            ),
-        ):
-            self.load_routine_table()
-            self.update_review_required_button_text()
-            self.show_routine_recovery_block_toast(
-                f"루틴 {command_label}"
-            )
-            return
-
-        intent_result = apply_close_intent(
-            intent=CLOSE_INTENT_EARLY_CLOSE,
-            target_scope=SCOPE_ROUTINE_INSTANCE,
-            target_id=instance_id,
-            source="main_routine_context_menu",
-            requested_policy=requested_policy,
-            project_root=PROJECT_ROOT,
-            operation_command_service_factory=OperationCommandService,
+        adapter = MainMonitoringStockOperationAdapter(
+            self,
+            targets,
+            request_scope="multiple",
         )
-        result = intent_result.get("command_result")
-        if result is None:
-            self.update_review_required_button_text()
-            QMessageBox.warning(
-                self,
-                f"猷⑦떞 {command_label} ?ㅽ뙣",
-                "紐낅졊???곸슜??????먮뒗 寃곌낵瑜??뺤씤?섏? 紐삵뻽?듬땲??",
-            )
-            return
-        if result.status == RESULT_FAILED or not result.stock_results:
-            self.update_review_required_button_text()
-            QMessageBox.warning(
-                self,
-                f"루틴 {command_label} 실패",
-                result.error or "명령을 적용할 대상 또는 결과를 확인하지 못했습니다.",
-            )
-            return
-
-        if market_requested:
-            auto_trade_continue_pending_close_liquidations(
-                self,
-                limit=None,
-                target_routine_instance_ids={instance_id},
-            )
-
-        self.load_routine_table()
+        self._main_monitoring_stock_operation_adapter = adapter
+        result = adapter.apply_selected_early_close(
+            requested_policy,
+            source="main_routine_context_menu",
+            show_error_dialog=False,
+            show_result_toast=False,
+            show_confirmation=False,
+        )
+        applied_count = int(result.get("completed_count", 0) or 0)
+        failed_count = int(result.get("failed_count", 0) or 0)
+        result_message = str(result.get("message") or "").strip()
+        blocked_without_counts = (
+            result.get("ok") is False
+            and not applied_count
+            and not failed_count
+            and bool(result_message)
+            and "대상이 없습니다" not in result_message
+        )
         self.update_review_required_button_text()
-        if result.status == RESULT_PARTIAL_SUCCESS:
+        if applied_count and failed_count:
             QMessageBox.warning(
                 self,
                 f"루틴 {command_label} 일부 적용",
-                "일부 종목에 명령을 적용하지 못했습니다. 검토관리 상태를 확인하세요.",
+                f"{command_label} {applied_count}건 접수 / {failed_count}건 차단",
             )
-        self.statusBar().showMessage(f"루틴 {command_label}: {display_name}")
+        elif failed_count or blocked_without_counts:
+            QMessageBox.warning(
+                self,
+                f"루틴 {command_label} 실패",
+                result_message or "현재 상태에서는 실행할 수 없습니다.",
+            )
+        elif applied_count:
+            success_message = (
+                f"조기마감 {applied_count}종목 적용 합니다."
+                if command_label == ROUTINE_STATUS_EARLY_CLOSE
+                else f"{display_name} {command_label} 요청이 접수되었습니다."
+            )
+            show_toast(
+                self,
+                success_message,
+                duration_ms=2500,
+            )
+        else:
+            show_toast(
+                self,
+                f"{command_label} 대상이 없습니다.",
+                duration_ms=2500,
+            )
+        self.statusBar().showMessage(
+            f"루틴 {command_label}: {display_name} / 성공 {applied_count} / "
+            f"차단 {failed_count}"
+        )
 
     def reflect_routine_completion_result(
         self,

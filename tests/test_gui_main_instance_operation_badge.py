@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QItemSelectionModel, Qt
+from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -1489,226 +1490,477 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertEqual("키움 서버에 로그인되어 있지 않습니다.", message)
         self.assertNotIn("\n", message)
 
-    def test_routine_recovery_block_uses_toast_without_command(self) -> None:
-        cases = (
-            (
+    def _routine_close_target(self, code="005930", instance_id="instance-a"):
+        return gui_windows.MainMonitoringStockTarget(
+            stock_dir=Path(f"{code}_stock"),
+            code=code,
+            name=f"stock-{code}",
+            routine_instance_id=instance_id,
+        )
+
+    def _append_monitoring_stock_row(
+        self,
+        table: QTableWidget,
+        stock_dir: Path,
+        *,
+        code: str,
+        name: str,
+        instance_id: str = "instance-a",
+    ) -> int:
+        row = table.rowCount()
+        table.insertRow(row)
+        item = QTableWidgetItem(code)
+        item.setData(table_loader.ROUTINE_ROW_KIND_ROLE, table_loader.ROUTINE_ROW_STOCK)
+        item.setData(table_loader.ROUTINE_STOCK_PATH_ROLE, str(stock_dir))
+        item.setData(table_loader.ROUTINE_STOCK_CODE_ROLE, code)
+        item.setData(table_loader.ROUTINE_STOCK_NAME_ROLE, name)
+        item.setData(table_loader.ROUTINE_INSTANCE_ID_ROLE, instance_id)
+        table.setItem(row, 0, item)
+        return row
+
+    def test_visible_early_close_button_reuses_top_summary_badge_font(self) -> None:
+        window = SimpleNamespace()
+        window.btn_main_visible_early_close = QPushButton("조기마감")
+        vertical_badge = QPushButton("보유")
+        top_badge = QPushButton("유효")
+        badge_font = top_badge.font()
+        badge_font.setPointSize(12)
+        top_badge.setFont(badge_font)
+
+        def setup_routine_table():
+            window.routine_table = QTableWidget()
+
+        def setup_running_stock_table():
+            window.running_stock_table = QTableWidget()
+
+        def create_filter_badge_area():
+            window._main_routine_metric_buttons = {"holding": vertical_badge}
+            return QWidget()
+
+        def create_main_routine_summary():
+            window._main_routine_valid_button = top_badge
+            return QWidget()
+
+        window._setup_routine_table = setup_routine_table
+        window._setup_running_stock_table = setup_running_stock_table
+        window._create_routine_filter_badge_area = create_filter_badge_area
+        window._create_main_routine_summary = create_main_routine_summary
+
+        gui_windows.MainWindow._create_table_area(window)
+
+        self.assertEqual(
+            top_badge.font().pointSize(),
+            window.btn_main_visible_early_close.font().pointSize(),
+        )
+        self.assertEqual(
+            top_badge.font().pointSizeF(),
+            window.btn_main_visible_early_close.font().pointSizeF(),
+        )
+        expected_font_size = f"font-size: {top_badge.font().pointSizeF():g}pt"
+        self.assertIn(expected_font_size, window.btn_main_visible_early_close.styleSheet())
+        self.assertIn(
+            "QPushButton#mainVisibleEarlyCloseButton",
+            window.btn_main_visible_early_close.styleSheet(),
+        )
+        left_metrics = QFontMetrics(top_badge.font())
+        early_close_metrics = QFontMetrics(window.btn_main_visible_early_close.font())
+        self.assertEqual(left_metrics.height(), early_close_metrics.height())
+        self.assertEqual(left_metrics.ascent(), early_close_metrics.ascent())
+        self.assertEqual(
+            left_metrics.boundingRect("조기마감").height(),
+            early_close_metrics.boundingRect("조기마감").height(),
+        )
+        self.assertEqual(28, window.btn_main_visible_early_close.minimumHeight())
+        self.assertIn(
+            "color: #2563eb; font-weight: bold;",
+            window.btn_main_visible_early_close.styleSheet(),
+        )
+
+    def test_routine_close_candidates_intersect_current_session_running_targets(self) -> None:
+        running_dir = Path("005930_running")
+        waiting_dir = Path("000660_waiting")
+        other_dir = Path("035720_other")
+        window = SimpleNamespace(
+            _routine_instance_stock_dirs=Mock(
+                return_value=[running_dir, waiting_dir]
+            )
+        )
+        with patch.object(
+            gui_windows,
+            "auto_trade_running_registered_operation_targets",
+            return_value=[
+                (running_dir, "005930", "삼성전자"),
+                (other_dir, "035720", "카카오"),
+            ],
+        ):
+            targets = gui_windows.MainWindow._running_routine_operation_targets(
+                window,
+                ("instance-a",),
+            )
+
+        self.assertEqual(["005930"], [target.code for target in targets])
+        self.assertEqual("instance-a", targets[0].routine_instance_id)
+
+    def test_visible_early_close_targets_use_visible_running_stock_rows_only(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            running_dir = root / "005930_삼성전자"
+            waiting_dir = root / "000660_SK하이닉스"
+            hidden_dir = root / "035720_카카오"
+            review_dir = root / "051910_LG화학"
+            for stock_dir in (running_dir, waiting_dir, hidden_dir, review_dir):
+                stock_dir.mkdir()
+            (running_dir / "state.json").write_text("{}", encoding="utf-8")
+            (waiting_dir / "state.json").write_text("{}", encoding="utf-8")
+            (hidden_dir / "state.json").write_text("{}", encoding="utf-8")
+            (review_dir / "state.json").write_text(
+                json.dumps({"review_required": True}),
+                encoding="utf-8",
+            )
+            table = QTableWidget()
+            table.setColumnCount(1)
+            self._append_monitoring_stock_row(
+                table,
+                running_dir,
+                code="005930",
+                name="삼성전자",
+            )
+            self._append_monitoring_stock_row(
+                table,
+                waiting_dir,
+                code="000660",
+                name="SK하이닉스",
+            )
+            hidden_row = self._append_monitoring_stock_row(
+                table,
+                hidden_dir,
+                code="035720",
+                name="카카오",
+            )
+            self._append_monitoring_stock_row(
+                table,
+                review_dir,
+                code="051910",
+                name="LG화학",
+            )
+            table.hideRow(hidden_row)
+            window = SimpleNamespace(routine_table=table)
+
+            with patch.object(
+                gui_windows,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[
+                    (running_dir, "005930", "삼성전자"),
+                    (hidden_dir, "035720", "카카오"),
+                    (review_dir, "051910", "LG화학"),
+                ],
+            ):
+                targets = gui_windows.MainWindow._visible_monitoring_early_close_targets(
+                    window
+                )
+
+        self.assertEqual(["005930"], [target.code for target in targets])
+
+    def test_visible_early_close_button_uses_policy_method_and_actual_success_count(self) -> None:
+        confirmation = MagicMock()
+        confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
+        target = self._routine_close_target()
+        adapter = MagicMock()
+        adapter.apply_selected_early_close.return_value = {
+            "ok": True,
+            "completed_count": 3,
+            "failed_count": 0,
+            "message": "",
+        }
+        window = SimpleNamespace(
+            _visible_monitoring_early_close_targets=Mock(return_value=[target]),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+            update_review_required_button_text=Mock(),
+        )
+
+        with (
+            patch.object(
+                gui_windows,
+                "_create_routine_operation_confirmation",
+                return_value=confirmation,
+            ),
+            patch.object(
+                gui_windows,
+                "operation_policy_section",
+                return_value={"method": "현재가"},
+            ),
+            patch.object(gui_windows, "append_production_event"),
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+                return_value=adapter,
+            ) as adapter_factory,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow.request_visible_monitoring_early_close(window)
+
+        adapter_factory.assert_called_once_with(
+            window,
+            [target],
+            request_scope="multiple",
+        )
+        adapter.apply_selected_early_close.assert_called_once_with(
+            "현재가",
+            source="main_visible_early_close_button",
+            show_error_dialog=False,
+            show_result_toast=False,
+            show_confirmation=False,
+        )
+        toast.assert_called_once_with(
+            window,
+            "조기마감 3종목 적용 합니다.",
+            duration_ms=2500,
+        )
+
+    def test_visible_early_close_button_zero_targets_does_not_enter_backend(self) -> None:
+        window = SimpleNamespace(
+            _visible_monitoring_early_close_targets=Mock(return_value=[]),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+        )
+
+        with (
+            patch.object(gui_windows, "MainMonitoringStockOperationAdapter") as adapter_factory,
+            patch.object(gui_windows, "_create_routine_operation_confirmation") as confirmation,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow.request_visible_monitoring_early_close(window)
+
+        adapter_factory.assert_not_called()
+        confirmation.assert_not_called()
+        toast.assert_called_once_with(
+            window,
+            "조기마감 대상이 없습니다.",
+            duration_ms=2500,
+        )
+
+    def test_instance_close_actions_use_stock_canonical_boundary(self) -> None:
+        for method, label in (
+            ("루틴", gui_windows.ROUTINE_STATUS_EARLY_CLOSE),
+            (gui_windows.POLICY_MARKET, gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION),
+        ):
+            with self.subTest(method=method):
+                confirmation = MagicMock()
+                confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
+                target = self._routine_close_target()
+                adapter = MagicMock()
+                adapter.apply_selected_early_close.return_value = {
+                    "ok": True,
+                    "completed_count": 1,
+                    "failed_count": 0,
+                    "message": "",
+                }
+                window = SimpleNamespace(
+                    statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+                    update_review_required_button_text=Mock(),
+                )
+                with (
+                    patch.object(
+                        gui_windows.MainWindow,
+                        "_running_routine_operation_targets",
+                        return_value=[target],
+                    ) as collect_targets,
+                    patch.object(
+                        gui_windows,
+                        "_create_routine_operation_confirmation",
+                        return_value=confirmation,
+                    ),
+                    patch.object(
+                        gui_windows,
+                        "MainMonitoringStockOperationAdapter",
+                        return_value=adapter,
+                    ) as adapter_factory,
+                    patch.object(gui_windows, "show_toast") as toast,
+                ):
+                    gui_windows.MainWindow.request_routine_operation(
+                        window,
+                        "instance-a",
+                        "지표추종매매",
+                        method,
+                        label,
+                    )
+
+                collect_targets.assert_called_once_with(window, ("instance-a",))
+                adapter_factory.assert_called_once_with(
+                    window,
+                    [target],
+                    request_scope="multiple",
+                )
+                adapter.apply_selected_early_close.assert_called_once_with(
+                    method,
+                    source="main_routine_context_menu",
+                    show_error_dialog=False,
+                    show_result_toast=False,
+                    show_confirmation=False,
+                )
+                expected_message = (
+                    "조기마감 1종목 적용 합니다."
+                    if label == gui_windows.ROUTINE_STATUS_EARLY_CLOSE
+                    else f"지표추종매매 {label} 요청이 접수되었습니다."
+                )
+                toast.assert_called_once_with(
+                    window,
+                    expected_message,
+                    duration_ms=2500,
+                )
+
+    def test_category_close_actions_use_one_stock_canonical_result(self) -> None:
+        confirmation = MagicMock()
+        confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
+        targets = [
+            self._routine_close_target("005930", "instance-a"),
+            self._routine_close_target("000660", "instance-b"),
+        ]
+        adapter = MagicMock()
+        adapter.apply_selected_early_close.return_value = {
+            "ok": True,
+            "completed_count": 2,
+            "failed_count": 0,
+            "message": "",
+        }
+        window = SimpleNamespace(
+            _routine_instance_ids_by_definition={
+                "definition-a": ("instance-a", "instance-b")
+            },
+            _routine_instance_has_assigned_stocks=Mock(return_value=True),
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+            update_review_required_button_text=Mock(),
+        )
+        with (
+            patch.object(gui_windows, "routine_instance_checked", return_value=True),
+            patch.object(
+                gui_windows.MainWindow,
+                "_running_routine_operation_targets",
+                return_value=targets,
+            ) as collect_targets,
+            patch.object(
+                gui_windows,
+                "_create_routine_operation_confirmation",
+                return_value=confirmation,
+            ),
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+                return_value=adapter,
+            ) as adapter_factory,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow.request_routine_definition_operation(
+                window,
+                "definition-a",
+                "지표추종매매",
                 "루틴",
                 gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
-                "루틴 조기마감",
-            ),
-            (
-                gui_windows.POLICY_MARKET,
-                gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
-                "루틴 즉시청산",
-            ),
+            )
+
+        collect_targets.assert_called_once_with(
+            window,
+            ("instance-a", "instance-b"),
         )
-        for command, display_status, expected_action in cases:
-            with self.subTest(command=command):
-                confirmation = MagicMock()
-                confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
-                window = SimpleNamespace(
-                    statusBar=Mock(),
-                    _production_recovery_allows_routine_operation=Mock(
-                        return_value=False
-                    ),
-                    load_routine_table=Mock(),
-                    update_review_required_button_text=Mock(),
-                    show_routine_recovery_block_toast=Mock(),
-                )
-
-                with (
-                    patch.object(
-                        gui_windows,
-                        "_create_routine_operation_confirmation",
-                        return_value=confirmation,
-                    ),
-                    patch.object(gui_windows.QMessageBox, "warning") as warning,
-                    patch.object(gui_windows, "OperationCommandService") as service,
-                ):
-                    gui_windows.MainWindow.request_routine_operation(
-                        window,
-                        "instance-a",
-                        "지표추종매매",
-                        command,
-                        display_status,
-                    )
-
-                window._production_recovery_allows_routine_operation.assert_called_once_with(
-                    "instance-a",
-                    command=gui_windows.MODE_EARLY_CLOSE,
-                    caller_name=(
-                        "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
-                        if command == gui_windows.POLICY_MARKET
-                        else "EARLY_CLOSE_ROUTINE_INSTANCE"
-                    ),
-                )
-                window.show_routine_recovery_block_toast.assert_called_once_with(
-                    expected_action
-                )
-                warning.assert_not_called()
-                service.assert_not_called()
-
-    def test_instance_close_actions_share_early_close_intent_with_explicit_method(self) -> None:
-        cases = (
-            ("루틴", "루틴"),
-            (gui_windows.POLICY_MARKET, "시장가"),
+        adapter_factory.assert_called_once_with(
+            window,
+            targets,
+            request_scope="multiple",
         )
-        for command, expected_method in cases:
-            with self.subTest(command=command):
-                confirmation = MagicMock()
-                confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
-                command_result = SimpleNamespace(
-                    status="SUCCESS",
-                    stock_results=(SimpleNamespace(status="APPLIED"),),
-                    error="",
-                )
-                window = SimpleNamespace(
-                    statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
-                    _production_recovery_allows_routine_operation=Mock(
-                        return_value=True
-                    ),
-                    load_routine_table=Mock(),
-                    update_review_required_button_text=Mock(),
-                )
-
-                with (
-                    patch.object(
-                        gui_windows,
-                        "_create_routine_operation_confirmation",
-                        return_value=confirmation,
-                    ),
-                    patch.object(
-                        gui_windows,
-                        "apply_close_intent",
-                        return_value={"command_result": command_result},
-                    ) as close_intent,
-                    patch.object(
-                        gui_windows,
-                        "auto_trade_continue_pending_close_liquidations",
-                    ) as continue_close,
-                ):
-                    gui_windows.MainWindow.request_routine_operation(
-                        window,
-                        "instance-a",
-                        "지표추종매매",
-                        command,
-                        "조기마감" if expected_method == "루틴" else "즉시청산",
-                    )
-
-                window._production_recovery_allows_routine_operation.assert_called_once_with(
-                    "instance-a",
-                    command=gui_windows.MODE_EARLY_CLOSE,
-                    caller_name=(
-                        "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE"
-                        if expected_method == "시장가"
-                        else "EARLY_CLOSE_ROUTINE_INSTANCE"
-                    ),
-                )
-                close_intent.assert_called_once_with(
-                    intent=gui_windows.CLOSE_INTENT_EARLY_CLOSE,
-                    target_scope=gui_windows.SCOPE_ROUTINE_INSTANCE,
-                    target_id="instance-a",
-                    source="main_routine_context_menu",
-                    requested_policy=expected_method,
-                    project_root=gui_windows.PROJECT_ROOT,
-                    operation_command_service_factory=gui_windows.OperationCommandService,
-                )
-                if expected_method == "시장가":
-                    continue_close.assert_called_once_with(
-                        window,
-                        limit=None,
-                        target_routine_instance_ids={"instance-a"},
-                    )
-                else:
-                    continue_close.assert_not_called()
-
-    def test_category_close_actions_apply_explicit_method_to_each_instance(self) -> None:
-        cases = (
-            ("루틴", "루틴"),
-            (gui_windows.POLICY_MARKET, "시장가"),
+        adapter.apply_selected_early_close.assert_called_once()
+        toast.assert_called_once_with(
+            window,
+            "조기마감 2종목 적용 합니다.",
+            duration_ms=2500,
         )
-        for command, expected_method in cases:
-            with self.subTest(command=command):
-                confirmation = MagicMock()
-                confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
-                command_result = SimpleNamespace(
-                    status="SUCCESS",
-                    stock_results=(SimpleNamespace(status="APPLIED"),),
-                    error="",
-                )
+
+    def test_group_and_instance_zero_running_targets_do_not_enter_backend(self) -> None:
+        requests = (
+            ("instance", "루틴", gui_windows.ROUTINE_STATUS_EARLY_CLOSE),
+            ("instance", gui_windows.POLICY_MARKET, gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION),
+            ("group", "루틴", gui_windows.ROUTINE_STATUS_EARLY_CLOSE),
+            ("group", gui_windows.POLICY_MARKET, gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION),
+        )
+        for scope, method, label in requests:
+            with self.subTest(scope=scope, method=method):
                 window = SimpleNamespace(
-                    _routine_instance_ids_by_definition={
-                        "definition-a": ("instance-a", "instance-b")
-                    },
+                    _routine_instance_ids_by_definition={"definition-a": ("instance-a",)},
                     _routine_instance_has_assigned_stocks=Mock(return_value=True),
-                    _production_recovery_allows_routine_operation=Mock(
-                        return_value=True
-                    ),
-                    load_routine_table=Mock(),
-                    update_review_required_button_text=Mock(),
                     statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+                    update_review_required_button_text=Mock(),
                 )
-
                 with (
                     patch.object(gui_windows, "routine_instance_checked", return_value=True),
                     patch.object(
-                        gui_windows,
-                        "_create_routine_operation_confirmation",
-                        return_value=confirmation,
+                        gui_windows.MainWindow,
+                        "_running_routine_operation_targets",
+                        return_value=[],
                     ),
                     patch.object(
                         gui_windows,
-                        "apply_close_intent",
-                        side_effect=(
-                            {"command_result": command_result},
-                            {"command_result": command_result},
-                        ),
-                    ) as close_intent,
+                        "_create_routine_operation_confirmation",
+                    ) as confirmation,
                     patch.object(
                         gui_windows,
-                        "auto_trade_continue_pending_close_liquidations",
-                    ) as continue_close,
+                        "MainMonitoringStockOperationAdapter",
+                    ) as adapter_factory,
+                    patch.object(gui_windows, "show_toast") as toast,
                 ):
-                    gui_windows.MainWindow.request_routine_definition_operation(
-                        window,
-                        "definition-a",
-                        "지표추종매매",
-                        command,
-                        "조기마감" if expected_method == "루틴" else "즉시청산",
-                    )
+                    if scope == "group":
+                        gui_windows.MainWindow.request_routine_definition_operation(
+                            window, "definition-a", "그룹", method, label
+                        )
+                    else:
+                        gui_windows.MainWindow.request_routine_operation(
+                            window, "instance-a", "루틴", method, label
+                        )
 
-                self.assertEqual(2, close_intent.call_count)
-                self.assertEqual(
-                    {"instance-a", "instance-b"},
-                    {call.kwargs["target_id"] for call in close_intent.call_args_list},
-                )
-                self.assertTrue(
-                    all(
-                        call.kwargs["intent"] == gui_windows.CLOSE_INTENT_EARLY_CLOSE
-                        and call.kwargs["requested_policy"] == expected_method
-                        for call in close_intent.call_args_list
-                    )
-                )
-                if expected_method == "시장가":
-                    self.assertEqual(2, continue_close.call_count)
-                    self.assertEqual(
-                        {frozenset({"instance-a"}), frozenset({"instance-b"})},
-                        {
-                            frozenset(call.kwargs["target_routine_instance_ids"])
-                            for call in continue_close.call_args_list
-                        },
-                    )
-                    self.assertTrue(
-                        all(call.kwargs["limit"] is None for call in continue_close.call_args_list)
-                    )
-                else:
-                    continue_close.assert_not_called()
-                self.assertTrue(
-                    all(
-                        call.kwargs.get("requested_policy") != ""
-                        for call in close_intent.call_args_list
-                    )
-                )
+                confirmation.assert_not_called()
+                adapter_factory.assert_not_called()
+                self.assertIn("대상이 없습니다", toast.call_args.args[1])
+
+    def test_instance_partial_success_uses_actual_result_counts(self) -> None:
+        confirmation = MagicMock()
+        confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
+        adapter = MagicMock()
+        adapter.apply_selected_early_close.return_value = {
+            "ok": False,
+            "completed_count": 2,
+            "failed_count": 1,
+            "message": "차단 원인",
+        }
+        window = SimpleNamespace(
+            statusBar=Mock(return_value=SimpleNamespace(showMessage=Mock())),
+            update_review_required_button_text=Mock(),
+        )
+        with (
+            patch.object(
+                gui_windows.MainWindow,
+                "_running_routine_operation_targets",
+                return_value=[self._routine_close_target()],
+            ),
+            patch.object(
+                gui_windows,
+                "_create_routine_operation_confirmation",
+                return_value=confirmation,
+            ),
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+                return_value=adapter,
+            ),
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow.request_routine_operation(
+                window,
+                "instance-a",
+                "루틴",
+                "루틴",
+                gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
+            )
+
+        self.assertIn("2건 접수 / 1건 차단", warning.call_args.args[2])
+        toast.assert_not_called()
 
     def test_routine_recovery_global_block_does_not_write_any_stock(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1924,25 +2176,27 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         exception.assert_called_once()
         window.update_runtime_stock_status.assert_not_called()
 
-    def test_routine_definition_recovery_block_shows_one_toast(self) -> None:
+    def test_routine_definition_recovery_block_uses_canonical_failure_result(self) -> None:
         confirmation = MagicMock()
         confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
+        target = self._routine_close_target()
+        adapter = MagicMock()
+        adapter.apply_selected_early_close.return_value = {
+            "ok": False,
+            "completed_count": 0,
+            "failed_count": 1,
+            "message": "서버 연결 및 계좌 상태를 확인하십시오.",
+        }
         window = SimpleNamespace(
             _routine_instance_ids_by_definition={
                 "indicator-follow": ("instance-a", "instance-b")
             },
             _routine_instance_has_assigned_stocks=Mock(return_value=True),
-            _production_recovery_allows_routine_operation=Mock(
-                side_effect=(False, False)
-            ),
-            load_routine_table=Mock(),
             update_review_required_button_text=Mock(),
-            show_routine_recovery_block_toast=Mock(),
             statusBar=Mock(
                 return_value=SimpleNamespace(showMessage=Mock())
             ),
         )
-        service = Mock()
 
         with (
             patch.object(
@@ -1956,11 +2210,17 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 return_value=confirmation,
             ),
             patch.object(
+                gui_windows.MainWindow,
+                "_running_routine_operation_targets",
+                return_value=[target],
+            ),
+            patch.object(
                 gui_windows,
-                "OperationCommandService",
-                return_value=service,
+                "MainMonitoringStockOperationAdapter",
+                return_value=adapter,
             ),
             patch.object(gui_windows.QMessageBox, "warning") as warning,
+            patch.object(gui_windows, "show_toast") as toast,
         ):
             gui_windows.MainWindow.request_routine_definition_operation(
                 window,
@@ -1970,15 +2230,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
             )
 
-        self.assertEqual(
-            2,
-            window._production_recovery_allows_routine_operation.call_count,
-        )
-        service.apply.assert_not_called()
-        window.show_routine_recovery_block_toast.assert_called_once_with(
-            "카테고리 조기마감"
-        )
-        warning.assert_not_called()
+        adapter.apply_selected_early_close.assert_called_once()
+        self.assertIn("계좌 상태", warning.call_args.args[2])
+        toast.assert_not_called()
 
     def test_instance_restart_adapter_uses_shared_routine_block_formatter(self) -> None:
         expected = (

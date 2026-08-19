@@ -212,6 +212,29 @@ def auto_trade_setting_current_session_trade_started(
         return False
 
 
+def auto_trade_stock_operation_category(
+    window,
+    *,
+    stock_code: object,
+    persisted_trade_started: bool,
+    operation_excluded: bool,
+    review_required: bool,
+) -> str:
+    """Project one registered stock into the current operator-facing category."""
+
+    if review_required:
+        return "review"
+    if operation_excluded:
+        return "excluded"
+    if auto_trade_setting_current_session_trade_started(
+        window,
+        bool(persisted_trade_started),
+        stock_code,
+    ):
+        return "operation"
+    return "waiting"
+
+
 def auto_trade_setting_display_status_for_current_session(
     state: dict[str, object],
     config: dict[str, object],

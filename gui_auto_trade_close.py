@@ -677,17 +677,30 @@ def auto_trade_continue_pending_close_liquidations(
             blocked_count += 1
             continue
 
-        result = _start_close_liquidation_execution(
-            window,
-            stock_dir=stock_path,
-            code=code,
-            name=name,
-            method=method,
-            command_id=command_id,
-            requested_at=requested_at,
-            routine_instance_id=routine_instance_id,
-            reason=reason,
-        )
+        try:
+            result = _start_close_liquidation_execution(
+                window,
+                stock_dir=stock_path,
+                code=code,
+                name=name,
+                method=method,
+                command_id=command_id,
+                requested_at=requested_at,
+                routine_instance_id=routine_instance_id,
+                reason=reason,
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "Close/liquidation execution failed: stock=%s command=%s",
+                code,
+                command_id,
+            )
+            result = {
+                "ok": False,
+                "stage": "execution_exception",
+                "runtime_status": "REVIEW_REQUIRED",
+                "blocked_reasons": [f"{type(exc).__name__}: {exc}"],
+            }
         if reason == "EARLY_CLOSE":
             persisted = _persist_early_close_execution_result(
                 window,
@@ -1421,6 +1434,7 @@ def auto_trade_apply_selected_early_close(
     *,
     show_error_dialog: bool = True,
     show_result_toast: bool = True,
+    show_confirmation: bool = True,
 ) -> dict[str, object]:
     """선택 종목에 조기마감 명령을 적용한다.
 
@@ -1511,7 +1525,19 @@ def auto_trade_apply_selected_early_close(
         window.statusBarMessage("조기마감 불가: 청산 진행 중")
         return {"ok": False, "message": "조기마감 불가: 청산 진행 중"}
 
-    if close_targets:
+    if not close_targets:
+        toast_message = "조기마감 대상이 없습니다."
+        window.statusBarMessage("조기마감 적용: 0개")
+        if show_result_toast:
+            show_toast(dialog_parent, toast_message, duration_ms=2500)
+        return {
+            "ok": False,
+            "completed_count": 0,
+            "failed_count": 0,
+            "message": toast_message,
+        }
+
+    if close_targets and show_confirmation:
         box = QMessageBox(dialog_parent)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("조기마감 확인")

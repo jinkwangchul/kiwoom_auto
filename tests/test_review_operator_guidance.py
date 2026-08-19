@@ -2,7 +2,9 @@
 
 import os
 import unittest
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -20,6 +22,7 @@ from gui_styles import (
 from gui_review_required_window import (
     GlobalReviewRequiredWindow,
     build_review_operator_guidance,
+    review_operator_readiness_evidence,
 )
 
 
@@ -63,10 +66,105 @@ class ReviewOperatorGuidanceProjectionTests(unittest.TestCase):
 
     def test_recovery_guidance(self):
         result = build_review_operator_guidance(
-            self._row(return_block_reason="RECOVERY_NOT_READY")
+            self._row(return_block_reason="RECOVERY_NOT_READY"),
+            readiness_evidence={"cause": "SERVER_DISCONNECTED"},
         )
-        self.assertIn("복구 상태", result["block_reason"])
+        self.assertIn("서버에 연결", result["block_reason"])
+        self.assertNotIn("Recovery", str(result))
+        self.assertNotIn("복구 상태", str(result))
         self.assertNotIn("RECOVERY_NOT_READY", str(result))
+
+    def test_recovery_guidance_uses_specific_live_readiness_cause(self):
+        expectations = {
+            "SERVER_DISCONNECTED": "서버에 연결",
+            "ACCOUNT_NOT_SELECTED": "계좌가 선택",
+            "ACCOUNT_CHECK_INCOMPLETE": "계좌 확인이 완료",
+            "ACCOUNT_OPERATION_CHECK_IN_PROGRESS": "확인 중",
+            "RECOVERY_IDENTITY_MISMATCH": "이전 확인 상태와 일치하지",
+            "ACCOUNT_OPERATION_CHECK_INCOMPLETE": "계좌 및 운영 상태 확인",
+        }
+        for cause, expected in expectations.items():
+            with self.subTest(cause=cause):
+                result = build_review_operator_guidance(
+                    self._row(return_block_reason="RECOVERY_NOT_READY"),
+                    readiness_evidence={"cause": cause},
+                )
+                self.assertIn(expected, result["block_reason"])
+                self.assertNotIn("Recovery", str(result))
+
+    def test_live_readiness_evidence_priority(self):
+        connected_api = SimpleNamespace(
+            is_connected=lambda: True,
+            login_session_id=lambda: "LOGIN-1",
+        )
+
+        disconnected = SimpleNamespace(
+            kiwoom_api=SimpleNamespace(is_connected=lambda: False),
+            selected_account_no=lambda: "12345678",
+        )
+        self.assertEqual(
+            "SERVER_DISCONNECTED",
+            review_operator_readiness_evidence(disconnected)["cause"],
+        )
+
+        no_account = SimpleNamespace(
+            kiwoom_api=connected_api,
+            selected_account_no=lambda: "",
+        )
+        self.assertEqual(
+            "ACCOUNT_NOT_SELECTED",
+            review_operator_readiness_evidence(no_account)["cause"],
+        )
+
+        unchecked = SimpleNamespace(
+            kiwoom_api=connected_api,
+            selected_account_no=lambda: "12345678",
+            _account_authentication_states={"12345678": "LOADING"},
+            _account_query_states={"12345678": "READY"},
+        )
+        self.assertEqual(
+            "ACCOUNT_CHECK_INCOMPLETE",
+            review_operator_readiness_evidence(unchecked)["cause"],
+        )
+
+        identity = SimpleNamespace(
+            account_no="12345678",
+            login_session_id="LOGIN-1",
+            trading_day=date.today().isoformat(),
+        )
+        checking = SimpleNamespace(
+            kiwoom_api=connected_api,
+            selected_account_no=lambda: "12345678",
+            _account_authentication_states={"12345678": "READY"},
+            _account_query_states={"12345678": "READY"},
+        )
+        with patch(
+            "gui_review_required_window.production_recovery_registry.snapshot",
+            return_value=SimpleNamespace(
+                identity=identity,
+                account_status="COLLECTING",
+            ),
+        ):
+            self.assertEqual(
+                "ACCOUNT_OPERATION_CHECK_IN_PROGRESS",
+                review_operator_readiness_evidence(checking)["cause"],
+            )
+
+        with patch(
+            "gui_review_required_window.production_recovery_registry.snapshot",
+            return_value=SimpleNamespace(
+                identity=SimpleNamespace(
+                    account_no="87654321",
+                    login_session_id="LOGIN-OLD",
+                    trading_day=identity.trading_day,
+                ),
+                account_status="COMPLETED",
+            ),
+        ):
+            self.assertEqual(
+                "RECOVERY_IDENTITY_MISMATCH",
+                review_operator_readiness_evidence(checking)["cause"],
+            )
 
     def test_holding_residual_guidance(self):
         result = build_review_operator_guidance(
@@ -122,9 +220,10 @@ class ReviewOperatorGuidanceProjectionTests(unittest.TestCase):
             self._row(
                 review_reason="사용자 긴급정지 / 미체결 데이터 오류",
                 return_block_reason="RECOVERY_NOT_READY",
-            )
+            ),
+            readiness_evidence={"cause": "ACCOUNT_NOT_SELECTED"},
         )
-        self.assertIn("복구 상태", result["block_reason"])
+        self.assertIn("계좌가 선택", result["block_reason"])
 
     def test_allowed_guidance_states_stopped_without_auto_start(self):
         result = build_review_operator_guidance(

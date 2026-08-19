@@ -1396,11 +1396,13 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                 ),
                 patch("gui_auto_trade_close.append_changelog"),
                 patch("gui_auto_trade_close.append_stock_log"),
+                patch("gui_auto_trade_close.refresh_auto_trade_views") as refresh_views,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
-                auto_trade_apply_selected_early_close(window, "루틴")
+                result = auto_trade_apply_selected_early_close(window, "루틴")
 
         service.apply_early_close.assert_not_called()
+        refresh_views.assert_not_called()
         self.assertEqual([], self._MessageBox.instances)
         show_toast.assert_called_once()
         toast_args = show_toast.call_args.args
@@ -1412,6 +1414,15 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         self.assertEqual(2500, show_toast.call_args.kwargs["duration_ms"])
         self.assertNotIn("position", show_toast.call_args.kwargs)
         window.statusBarMessage.assert_called_with("조기마감 적용: 0개")
+        self.assertEqual(
+            {
+                "ok": False,
+                "completed_count": 0,
+                "failed_count": 0,
+                "message": "조기마감 대상이 없습니다.",
+            },
+            result,
+        )
 
     def test_confirmation_count_excludes_non_operating_and_no_target_stocks(self) -> None:
         from gui_auto_trade_close import auto_trade_apply_selected_early_close
