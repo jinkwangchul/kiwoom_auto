@@ -117,7 +117,11 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._control = self.control
         self.api._available = True
         self.api._connected = True
+        self.api._login_requested = False
         self.api._login_session_id = "KIWOOM_LOGIN_SESSION_TEST"
+        self.api._connection_epoch = 1
+        self.api.last_login_error = 0
+        self.api.last_login_message = "login succeeded"
         self.api._unavailable_reason = ""
         self.api._pending_tr = {}
         self.api._account_funds_request_accounts = {}
@@ -250,6 +254,8 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
                 "name": "삼성전자",
                 "count": 1,
                 "callback": results.append,
+                "request_connection_epoch": 1,
+                "request_login_session_id": "KIWOOM_LOGIN_SESSION_TEST",
             }
             self.control.rows = [
                 {
@@ -411,6 +417,241 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             results[0]["error_kind"],
         )
         self.assertEqual(1, len(self.api.account_authentication_required.values))
+
+    def test_minute_candle_request_captures_broker_session_provenance(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles(
+            "005930",
+            "삼성전자",
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+
+        self.assertTrue(requested["ok"])
+        pending = self.api._pending_tr[rqname]
+        self.assertEqual(1, pending["request_connection_epoch"])
+        self.assertEqual(
+            "KIWOOM_LOGIN_SESSION_TEST",
+            pending["request_login_session_id"],
+        )
+        self.assertTrue(pending["started_at"])
+
+    def test_minute_candle_stale_after_disconnect_does_not_save(self) -> None:
+        results: list[dict[str, object]] = []
+        saves: list[object] = []
+        requested = self.api.request_minute_candles(
+            "005930",
+            "삼성전자",
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+        saved_function = self.module.save_minute_candles_for_stock
+        self.module.save_minute_candles_for_stock = (
+            lambda *args, **kwargs: saves.append((args, kwargs)) or []
+        )
+        try:
+            self.api._connection_epoch = 2
+            self.api._connected = False
+            self.api._login_session_id = ""
+            self.control.rows = [
+                {
+                    "체결시간": "20260727090000",
+                    "시가": "70000",
+                    "고가": "70100",
+                    "저가": "69900",
+                    "현재가": "70050",
+                    "거래량": "100",
+                }
+            ]
+            self.api._on_receive_tr_data("9001", rqname, "opt10080", "", "0")
+        finally:
+            self.module.save_minute_candles_for_stock = saved_function
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
+        self.assertEqual([], saves)
+        self.assertNotIn(rqname, self.api._pending_tr)
+
+        self.api._expire_minute_candle_request(rqname)
+        self.assertEqual(1, len(results))
+
+    def test_minute_candle_stale_after_reconnect_does_not_save(self) -> None:
+        results: list[dict[str, object]] = []
+        saves: list[object] = []
+        requested = self.api.request_minute_candles(
+            "005930",
+            "삼성전자",
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+        saved_function = self.module.save_minute_candles_for_stock
+        self.module.save_minute_candles_for_stock = (
+            lambda *args, **kwargs: saves.append((args, kwargs)) or []
+        )
+        try:
+            self.api._connection_epoch = 3
+            self.api._connected = True
+            self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+            self.api._on_receive_tr_data("9001", rqname, "opt10080", "", "0")
+        finally:
+            self.module.save_minute_candles_for_stock = saved_function
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
+        self.assertEqual([], saves)
+
+    def test_account_funds_stale_response_cleans_side_map_once(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_account_funds_snapshot(
+            self.account_no,
+            request_id=21,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+        self.control.summary = {"예수금": "100", "주문가능금액": "90"}
+
+        self.api._connection_epoch = 2
+        self.api._connected = False
+        self.api._login_session_id = ""
+        self.api._on_receive_tr_data("9103", rqname, "opw00001", "", "0")
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
+        self.assertNotIn(rqname, self.api._pending_tr)
+        self.assertNotIn(rqname, self.api._account_funds_request_accounts)
+
+        self.api._expire_account_funds_request(rqname)
+        self.assertEqual(1, len(results))
+
+    def test_recovery_holdings_stale_response_is_incomplete(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_account_holdings_snapshot(
+            self.identity,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+
+        self.api._connection_epoch = 2
+        self.api._connected = False
+        self.api._login_session_id = ""
+        self.control.rows = [self.holding_row("005930")]
+        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "0")
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["is_complete"])
+        self.assertEqual("INCOMPLETE", results[0]["status"])
+        self.assertIn("STALE_BROKER_SESSION", results[0]["errors"])
+        self.assertEqual(0, results[0]["rows_count"])
+
+    def test_recovery_open_orders_stale_response_is_incomplete(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_open_orders_snapshot(
+            self.identity,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+
+        self.api._connection_epoch = 3
+        self.api._connected = True
+        self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+        self.control.rows = [self.order_row()]
+        self.api._on_receive_tr_data("9102", rqname, "opt10075", "", "0")
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["is_complete"])
+        self.assertIn("STALE_BROKER_SESSION", results[0]["errors"])
+        self.assertEqual(0, results[0]["rows_count"])
+
+    def test_recovery_continuation_stale_before_next_page_blocks_commrq(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_account_holdings_snapshot(
+            self.identity,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+        before_calls = len(
+            [call for call in self.control.calls if call[0].startswith("CommRqData")]
+        )
+
+        def reconnect_during_first_page(*_args, **_kwargs):
+            self.api._connection_epoch = 3
+            self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+            return [self.holding_row("005930")]
+
+        self.api._read_tr_rows = reconnect_during_first_page
+        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "2")
+        after_calls = len(
+            [call for call in self.control.calls if call[0].startswith("CommRqData")]
+        )
+
+        self.assertEqual(before_calls, after_calls)
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["is_complete"])
+        self.assertIn("STALE_BROKER_SESSION", results[0]["errors"])
+
+    def test_unknown_rqname_is_ignored_without_affecting_pending(self) -> None:
+        requested = self.api.request_minute_candles("005930")
+        self.api._on_receive_tr_data("9001", "UNKNOWN_RQNAME", "opt10080", "", "0")
+        self.assertIn(requested["rqname"], self.api._pending_tr)
+
+    def test_broker_request_not_ready_does_not_call_commrq_or_leak_pending(self) -> None:
+        self.api._login_session_id = ""
+        before_calls = len(
+            [call for call in self.control.calls if call[0].startswith("CommRqData")]
+        )
+
+        result = self.api.request_minute_candles("005930")
+        after_calls = len(
+            [call for call in self.control.calls if call[0].startswith("CommRqData")]
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("BROKER_REQUEST_NOT_READY", result["error_kind"])
+        self.assertEqual(before_calls, after_calls)
+        self.assertEqual({}, self.api._pending_tr)
+
+    def test_reconnect_new_request_captures_new_session_identity(self) -> None:
+        first = self.api.request_minute_candles("005930")
+        first_pending = self.api._pending_tr[str(first["rqname"])]
+
+        self.api._connection_epoch = 3
+        self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+        second = self.api.request_minute_candles("006400")
+        second_pending = self.api._pending_tr[str(second["rqname"])]
+
+        self.assertEqual(1, first_pending["request_connection_epoch"])
+        self.assertEqual(3, second_pending["request_connection_epoch"])
+        self.assertNotEqual(
+            first_pending["request_login_session_id"],
+            second_pending["request_login_session_id"],
+        )
+
+    def test_account_password_message_for_stale_request_does_not_emit_evidence(self) -> None:
+        results: list[dict[str, object]] = []
+        self.api.account_authentication_required = _Signal()
+        requested = self.api.request_account_funds_snapshot(
+            self.account_no,
+            request_id=22,
+            callback=results.append,
+        )
+        rqname = str(requested["rqname"])
+
+        self.api._connection_epoch = 2
+        self.api._connected = False
+        self.api._login_session_id = ""
+        self.api._on_receive_msg(
+            "9103",
+            rqname,
+            "opw00001",
+            "(55) 계좌비밀번호 입력을 확인해주시기 바랍니다.",
+        )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
+        self.assertEqual([], self.api.account_authentication_required.values)
+        self.assertNotIn(rqname, self.api._pending_tr)
 
 
 if __name__ == "__main__":

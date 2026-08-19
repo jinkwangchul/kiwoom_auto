@@ -479,6 +479,98 @@ class KiwoomApi(QObject):
     def _observe_broker_connection(self) -> None:
         self.is_connected()
 
+    def _capture_broker_request_identity(self) -> dict[str, Any] | None:
+        readiness = self.broker_readiness_snapshot()
+        if readiness.broker_request_ready is not True:
+            return None
+        session = self.broker_session_snapshot()
+        if not session.connected or not session.login_session_id:
+            return None
+        return {
+            "request_connection_epoch": session.connection_epoch,
+            "request_login_session_id": session.login_session_id,
+            "started_at": datetime.now().isoformat(timespec="microseconds"),
+        }
+
+    def _broker_request_not_ready_error(self) -> dict[str, Any]:
+        readiness = self.broker_readiness_snapshot()
+        return {
+            "ok": False,
+            "error": "broker request is not ready",
+            "error_kind": "BROKER_REQUEST_NOT_READY",
+            "blockers": list(readiness.blockers),
+        }
+
+    def _pending_tr_matches_current_session(self, pending: dict[str, Any]) -> bool:
+        session = self.broker_session_snapshot()
+        return bool(
+            session.connected
+            and session.login_session_id
+            and pending.get("request_connection_epoch") == session.connection_epoch
+            and pending.get("request_login_session_id") == session.login_session_id
+        )
+
+    def _stale_broker_session_error(
+        self,
+        rqname: str,
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        session = self.broker_session_snapshot()
+        return {
+            "ok": False,
+            "rqname": str(rqname),
+            "error": "stale broker session",
+            "error_kind": "STALE_BROKER_SESSION",
+            "request_connection_epoch": pending.get("request_connection_epoch"),
+            "current_connection_epoch": session.connection_epoch,
+            "request_login_session_id": pending.get("request_login_session_id", ""),
+            "current_login_session_id": session.login_session_id,
+        }
+
+    def _finish_stale_pending_tr(
+        self,
+        rqname: str,
+        pending: dict[str, Any],
+    ) -> None:
+        request_name = str(rqname)
+        current = self._pending_tr.pop(request_name, None)
+        if current is not pending:
+            return
+        pending_type = pending.get("type")
+        if pending_type == "account_funds":
+            self._account_funds_request_accounts.pop(request_name, None)
+            callback = pending.get("callback")
+            payload = self._stale_broker_session_error(request_name, pending)
+            payload.update(
+                {
+                    "account_id": pending.get("account_id", ""),
+                    "request_id": pending.get("request_id"),
+                }
+            )
+            self._finish_callback(callback if callable(callback) else None, payload)
+            return
+        if pending_type == "recovery_snapshot":
+            stale = self._stale_broker_session_error(request_name, pending)
+            pending["rows"] = []
+            self._finish_recovery_snapshot(
+                request_name,
+                pending,
+                collection_complete=False,
+                errors=(str(stale["error_kind"]),),
+            )
+            return
+        if pending_type == "minute_candles":
+            callback = pending.get("callback")
+            payload = self._stale_broker_session_error(request_name, pending)
+            payload.update(
+                {
+                    "type": "minute_candles",
+                    "code": pending.get("code", ""),
+                    "name": pending.get("name", ""),
+                }
+            )
+            self._finish_callback(callback if callable(callback) else None, payload)
+
     def show_account_password_window(self) -> dict[str, Any]:
         """Open the installed OpenAPI account-password dialog without reading it."""
 
@@ -836,6 +928,11 @@ class KiwoomApi(QObject):
                 callback,
                 {"ok": False, "code": clean_code, "error": "kiwoom api is not connected"},
             )
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result["code"] = clean_code
+            return self._finish_callback(callback, result)
 
         try:
             clean_interval = max(int(interval), 1)
@@ -861,6 +958,7 @@ class KiwoomApi(QObject):
             "screen_no": str(screen_no or "9001"),
             "callback": callback,
             "rows": [],
+            **request_identity,
         }
 
         try:
@@ -995,6 +1093,11 @@ class KiwoomApi(QObject):
                 {"ok": False, "account_id": clean_account, "request_id": request_id,
                  "error": "kiwoom api is not connected"},
             )
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result.update({"account_id": clean_account, "request_id": request_id})
+            return self._finish_callback(callback, result)
         if not clean_account or clean_account not in self.account_numbers():
             return self._finish_callback(
                 callback,
@@ -1013,7 +1116,7 @@ class KiwoomApi(QObject):
             "account_id": clean_account,
             "request_id": int(request_id),
             "callback": callback,
-            "started_at": datetime.now().isoformat(timespec="microseconds"),
+            **request_identity,
         }
         self._pending_tr[rqname] = pending
         self._account_funds_request_accounts[rqname] = clean_account
@@ -1131,6 +1234,11 @@ class KiwoomApi(QObject):
                 callback,
                 {"ok": False, "is_complete": False, "error": "recovery login session is stale"},
             )
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result["is_complete"] = False
+            return self._finish_callback(callback, result)
 
         rqname = "{}_RECOVERY_{}".format(
             trcode.upper(),
@@ -1146,7 +1254,7 @@ class KiwoomApi(QObject):
             "inputs": tuple(inputs),
             "rows": [],
             "pages": 0,
-            "started_at": datetime.now().isoformat(timespec="microseconds"),
+            **request_identity,
         }
         self._pending_tr[rqname] = pending
         result = self._submit_recovery_snapshot_page(rqname, pending, prev_next=0)
@@ -1312,6 +1420,12 @@ class KiwoomApi(QObject):
         if not account_id or not account_authentication_required_message(message):
             return
 
+        pending = self._pending_tr.get(request_name)
+        if pending and pending.get("type") == "account_funds":
+            if not self._pending_tr_matches_current_session(pending):
+                self._finish_stale_pending_tr(request_name, pending)
+                return
+
         self._account_funds_request_accounts.pop(request_name, None)
         pending = self._pending_tr.pop(request_name, None)
         payload = {
@@ -1339,6 +1453,9 @@ class KiwoomApi(QObject):
         request_name = str(rqname)
         pending = self._pending_tr.get(request_name)
         if not pending:
+            return
+        if not self._pending_tr_matches_current_session(pending):
+            self._finish_stale_pending_tr(request_name, pending)
             return
         if pending.get("type") == "recovery_snapshot":
             self._on_receive_recovery_snapshot_page(
@@ -1485,6 +1602,9 @@ class KiwoomApi(QObject):
             return
 
         if prev_next == "2":
+            if not self._pending_tr_matches_current_session(pending):
+                self._finish_stale_pending_tr(rqname, pending)
+                return
             result = self._submit_recovery_snapshot_page(
                 rqname,
                 pending,
