@@ -6,6 +6,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -260,16 +261,88 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             )
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("즉시청산", badge.text())
-            self.assertNotIn("#DC2626", badge.styleSheet())
+            self.assertIn("#374151", badge.styleSheet())
+            self.assertNotEqual("", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("구간마감", badge.text())
-            self.assertIn("#DC2626", badge.styleSheet())
+            self.assertIn("#374151", badge.styleSheet())
+            self.assertNotIn("#DC2626", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("조기마감", badge.text())
             self.assertIn("#DC2626", badge.styleSheet())
             for action_badge in surface.strategy_action_badges.values():
                 self.assertNotIn("#2563EB", action_badge.styleSheet())
             owner.deleteLater()
+
+    def test_action_cycle_keeps_one_badge_geometry_and_style_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            self._write_instance(root, INSTANCE_IDS[0])
+            owner, surface = self._surface(repository)
+            badge = surface.strategy_action_badges["unified"]
+            widget_type = type(badge)
+            fixed_size = badge.size()
+            normalized_styles = []
+
+            for expected_text in (
+                "조기마감",
+                "즉시청산",
+                "구간마감",
+                "조기마감",
+            ):
+                self.assertEqual(expected_text, badge.text())
+                self.assertIs(widget_type, type(badge))
+                self.assertEqual(fixed_size, badge.size())
+                style = badge.styleSheet()
+                self.assertNotEqual("", style)
+                for token in (
+                    "border: 1px solid",
+                    "border-radius: 3px",
+                    "padding: 0px",
+                    "font-weight: bold",
+                ):
+                    self.assertIn(token, style)
+                self.assertNotIn("QPushButton:disabled", style)
+                normalized_styles.append(
+                    re.sub(r"#[0-9A-Fa-f]{6}", "#COLOR", style)
+                )
+                surface._cycle_strategy_action_badge("unified")
+
+            self.assertEqual(1, len(set(normalized_styles)))
+            surface.set_application_mode(surface.MODE_SEGMENTED)
+            self.assertFalse(badge.isEnabled())
+            self.assertTrue(surface.strategy_action_badges["profit"].isEnabled())
+            for action_badge in surface.strategy_action_badges.values():
+                self.assertEqual(fixed_size, action_badge.size())
+                self.assertNotIn(
+                    "QPushButton:disabled",
+                    action_badge.styleSheet(),
+                )
+            owner.deleteLater()
+
+    def test_early_close_context_color_constants_remain_separated(self) -> None:
+        import gui_auto_trade_context_menu
+        import gui_auto_trade_setting_window
+
+        self.assertEqual(
+            "#15803D",
+            gui_auto_trade_context_menu.CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR,
+        )
+        environment_color = re.search(
+            r"#[0-9A-Fa-f]{6}",
+            gui_auto_trade_setting_window.AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE,
+        )
+        self.assertIsNotNone(environment_color)
+        self.assertEqual("#2563EB", environment_color.group(0).upper())
+        self.assertEqual(
+            "#DC2626",
+            gui_windows._RoutineLimitResponseSettingsSurface.ROUTINE_CLOSE_COLOR,
+        )
+        self.assertEqual(
+            "#374151",
+            gui_windows._RoutineLimitResponseSettingsSurface.NEUTRAL_ACTION_COLOR,
+        )
 
     def test_threshold_options_preserve_or_raise_immediate_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

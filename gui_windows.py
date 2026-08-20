@@ -764,6 +764,8 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
     MODE_UNIFIED = "UNIFIED"
     MODE_SEGMENTED = "SEGMENTED"
     ROUTINE_CLOSE_COLOR = "#DC2626"
+    NEUTRAL_ACTION_COLOR = "#374151"
+
     def __init__(
         self,
         owner: QWidget,
@@ -995,18 +997,16 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         return combo
 
     def _apply_action_badge_style(self, badge: QPushButton) -> None:
-        if badge.text() not in {"조기마감", "구간마감"}:
-            badge.setStyleSheet("")
-            return
-        color = self.ROUTINE_CLOSE_COLOR
+        color = (
+            self.ROUTINE_CLOSE_COLOR
+            if badge.text() == "조기마감"
+            else self.NEUTRAL_ACTION_COLOR
+        )
         badge.setStyleSheet(
             "QPushButton {"
             f" color: {color}; border: 1px solid {color};"
             " border-radius: 3px; background: transparent; padding: 0px;"
             " font-weight: bold; }"
-            "QPushButton:disabled {"
-            " color: #9CA3AF; border-color: #D1D5DB;"
-            " background: transparent; }"
         )
 
     def _cycle_strategy_action_badge(self, key: str) -> None:
