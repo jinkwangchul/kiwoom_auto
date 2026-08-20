@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -480,7 +480,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         window.refresh_all.assert_not_called()
         window.update_startup_recovery_controls_mock.assert_called_once_with()
 
-    def test_timer_probes_all_enabled_stocks_without_selected_routine(self) -> None:
+    def test_timer_no_target_tail_does_not_fallback_to_batch_probe(self) -> None:
         class RecoveryReadyWindow:
             def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
                 return True
@@ -510,9 +510,11 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                 "queued": 0,
             }
         )
+        pipeline = Mock(return_value={})
 
         with (
             patch.object(auto_trade_timer, "probe_all_enabled_routine_stocks_once", probe),
+            patch.object(auto_trade_timer, "_process_pending_signal_pipeline", pipeline),
             patch.object(auto_trade_timer, "consume_pending_routine_signals_dry_run", None),
             patch.object(
                 auto_trade_timer,
@@ -533,11 +535,8 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         ):
             auto_trade_timer.auto_trade_on_time_policy_timer_tick(window)
 
-        probe.assert_called_once_with(
-            window,
-            "2026-07-25 18:01",
-            execution_universe_snapshot=ANY,
-        )
+        probe.assert_not_called()
+        pipeline.assert_called_once_with(window)
         self.assertEqual("", window.current_selected_routine_name())
 
     def test_runtime_file_signature_tracks_central_stocks_without_routine_scope(self) -> None:

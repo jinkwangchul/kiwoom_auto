@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import Mock, patch
 
 import auto_candle_refresh
 from candle_manager import load_candles, save_candles
@@ -179,13 +179,14 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             self.assertEqual(result["skipped_by_limit"], 5)
             self.assertEqual(result["request_spacing_ms"], 1000)
 
-    def test_operation_cycle_waits_for_refresh_callback_before_signal_probe(self) -> None:
+    def test_operation_cycle_tail_does_not_repeat_batch_probe(self) -> None:
         host = Mock()
         host.startup_recovery_session_ready.return_value = True
         host._last_time_policy_minute_key = ""
         host.recalculate_all_status_by_operation_policy.return_value = {"changed": 0, "failed": 0}
         callbacks: list[object] = []
         probe = Mock(return_value={"logged": 0, "error": 0})
+        pipeline = Mock(return_value={})
 
         def begin_refresh(_window, _minute_key, *, on_complete):
             callbacks.append(on_complete)
@@ -203,16 +204,17 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             gui_auto_trade_timer,
             "probe_all_enabled_routine_stocks_once",
             probe,
+        ), patch.object(
+            gui_auto_trade_timer,
+            "_process_pending_signal_pipeline",
+            pipeline,
         ), patch.object(gui_auto_trade_timer, "consume_pending_routine_signals_dry_run", None):
             result = gui_auto_trade_timer.auto_trade_run_operation_cycle(host)
             probe.assert_not_called()
             callbacks[0]({"completed": True})
 
-        probe.assert_called_once_with(
-            host,
-            "2026-08-10 10:00",
-            execution_universe_snapshot=ANY,
-        )
+        probe.assert_not_called()
+        pipeline.assert_called_once_with(host)
         self.assertTrue(result["signal_result"]["deferred_for_candle_refresh"])
 
 

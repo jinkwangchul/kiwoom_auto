@@ -150,6 +150,80 @@ def auto_trade_on_time_policy_gui_timer_tick(window) -> None:
     window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
 
 
+def _process_pending_signal_pipeline(
+    window,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
+) -> dict[str, object]:
+    """Reuse the existing Consumer and real executor without routine probing."""
+    signal_result: dict[str, object] = {}
+    snapshot = execution_universe_snapshot or project_execution_universe(window)
+    if not (
+        callable(consume_pending_routine_signals_dry_run)
+        and (
+            auto_trade_signal_probe_only_active(window, snapshot)
+            or auto_trade_real_execution_active(window, snapshot)
+        )
+    ):
+        return signal_result
+
+    consumer_result = consume_pending_routine_signals_dry_run(
+        limit=5,
+        mark_previewed=True,
+        write_order_queue=True,
+        apply_approval=True,
+    )
+    summary = consumer_result.get("summary", {}) if isinstance(consumer_result, dict) else {}
+    checked = int(summary.get("signals_checked", 0) or 0)
+    blocked = int(summary.get("blocked", 0) or 0)
+    allowed = int(summary.get("allowed", 0) or 0)
+    errors = int(summary.get("errors", 0) or 0)
+    orders_created = int(summary.get("orders_created", 0) or 0)
+    approval_checked = int(summary.get("approval_checked", 0) or 0)
+    approved = int(summary.get("approved", 0) or 0)
+    if checked > 0 or errors > 0:
+        window.statusBarMessage(
+            f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
+            f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
+        )
+    signal_result = dict(summary)
+    observe_owner_failure_transition(
+        window,
+        "routine_signal_consumer_result",
+        active=errors > 0,
+        signature=f"ROUTINE_SIGNAL_CONSUMER_FAILED:{errors}",
+        event_type="PROCESSING_ERROR",
+        severity="ERROR",
+        result="FAILED",
+        source="gui_auto_trade_timer._process_pending_signal_pipeline",
+        template_args={"target": "루틴 신호 후보 처리"},
+        target_type="ROUTINE",
+        target_id="routine_signal_consumer",
+        target_name="루틴 신호 후보 처리",
+        reason_code="ROUTINE_SIGNAL_CONSUMER_FAILED",
+        component="routine_signal_cycle",
+        operation="consume_pending_routine_signals",
+        details={
+            "checked": checked,
+            "blocked": blocked,
+            "allowed": allowed,
+            "error_count": errors,
+        },
+    )
+    if auto_trade_real_execution_active(window, snapshot):
+        auto_executor = getattr(window, "auto_process_executable_orders_for_real_trade", None)
+        if callable(auto_executor):
+            auto_result = auto_executor(limit=5)
+            processed = int(auto_result.get("processed", 0) or 0)
+            auto_blocked = int(auto_result.get("blocked", 0) or 0)
+            signal_result["orders_processed"] = processed
+            signal_result["orders_blocked"] = auto_blocked
+            if processed > 0 or auto_blocked > 0:
+                window.statusBarMessage(
+                    f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
+                )
+    return signal_result
+
+
 def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
     signal_result: dict[str, object] = {}
     if not callable(probe_all_enabled_routine_stocks_once):
@@ -183,76 +257,10 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
                 f"루틴 신호 로그: 기록 {logged_count}개"
                 + (f" / 오류 {error_count}개" if error_count else "")
             )
-        if (
-            callable(consume_pending_routine_signals_dry_run)
-            and (
-                auto_trade_signal_probe_only_active(window, execution_universe_snapshot)
-                or auto_trade_real_execution_active(window, execution_universe_snapshot)
-            )
-        ):
-            consumer_result = consume_pending_routine_signals_dry_run(
-                limit=5,
-                mark_previewed=True,
-                write_order_queue=True,
-                apply_approval=True,
-            )
-            summary = (
-                consumer_result.get("summary", {})
-                if isinstance(consumer_result, dict)
-                else {}
-            )
-            checked = int(summary.get("signals_checked", 0) or 0)
-            blocked = int(summary.get("blocked", 0) or 0)
-            allowed = int(summary.get("allowed", 0) or 0)
-            errors = int(summary.get("errors", 0) or 0)
-            orders_created = int(summary.get("orders_created", 0) or 0)
-            approval_checked = int(summary.get("approval_checked", 0) or 0)
-            approved = int(summary.get("approved", 0) or 0)
-            if checked > 0 or errors > 0:
-                window.statusBarMessage(
-                    f"주문후보검증: 확인 {checked} / 차단 {blocked} / 허용 {allowed} / 오류 {errors}"
-                    f" / 후보 {orders_created} / 승인검사 {approval_checked} / 승인 {approved}"
-                )
-            signal_result = dict(summary)
-            observe_owner_failure_transition(
-                window,
-                "routine_signal_consumer_result",
-                active=errors > 0,
-                signature=f"ROUTINE_SIGNAL_CONSUMER_FAILED:{errors}",
-                event_type="PROCESSING_ERROR",
-                severity="ERROR",
-                result="FAILED",
-                source="gui_auto_trade_timer._auto_trade_run_signal_cycle",
-                template_args={"target": "루틴 신호 후보 처리"},
-                target_type="ROUTINE",
-                target_id="routine_signal_consumer",
-                target_name="루틴 신호 후보 처리",
-                reason_code="ROUTINE_SIGNAL_CONSUMER_FAILED",
-                component="routine_signal_cycle",
-                operation="consume_pending_routine_signals",
-                details={
-                    "checked": checked,
-                    "blocked": blocked,
-                    "allowed": allowed,
-                    "error_count": errors,
-                },
-            )
-            if auto_trade_real_execution_active(window, execution_universe_snapshot):
-                auto_executor = getattr(
-                    window,
-                    "auto_process_executable_orders_for_real_trade",
-                    None,
-                )
-                if callable(auto_executor):
-                    auto_result = auto_executor(limit=5)
-                    processed = int(auto_result.get("processed", 0) or 0)
-                    auto_blocked = int(auto_result.get("blocked", 0) or 0)
-                    signal_result["orders_processed"] = processed
-                    signal_result["orders_blocked"] = auto_blocked
-                    if processed > 0 or auto_blocked > 0:
-                        window.statusBarMessage(
-                            f"실자동매매 주문처리: 실행 {processed} / 차단 {auto_blocked}"
-                        )
+        signal_result = _process_pending_signal_pipeline(
+            window,
+            execution_universe_snapshot,
+        )
         observe_owner_failure_transition(
             window,
             "routine_signal_cycle",
@@ -424,7 +432,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 operation="continue_after_candle_refresh",
                 details={"failed_count": failed_refreshes},
             )
-        signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+        signal_result = _process_pending_signal_pipeline(window)
         signal_cycle_completed = True
         if callable(rebind_recovery):
             rebind_recovery()
@@ -483,7 +491,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 "completed": False,
                 "reason_code": "CANDLE_REFRESH_FAILED",
             }
-            signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+            signal_result = _process_pending_signal_pipeline(window)
         else:
             observe_owner_failure_transition(
                 window,
@@ -494,7 +502,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 candle_refresh_result.get("accepted") is False
                 and candle_refresh_result.get("completed") is False
             ):
-                signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+                signal_result = _process_pending_signal_pipeline(window)
             elif candle_refresh_result.get("completed") is not True:
                 signal_result = {"deferred_for_candle_refresh": True}
                 deferred_cycle_completion_pending = True
@@ -514,7 +522,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 owner=window,
                 failure_scope="candle_refresh_import",
             )
-        signal_result = _auto_trade_run_signal_cycle(window, minute_key)
+        signal_result = _process_pending_signal_pipeline(window)
 
     if callable(rebind_recovery) and not signal_cycle_completed:
         rebind_recovery()

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 from pathlib import Path
 
@@ -34,6 +35,8 @@ from gui_auto_trade_status_ops import (
     auto_trade_update_stock_status,
 )
 from gui_auto_trade_timer import auto_trade_current_runtime_file_signature
+from candle_manager import canonical_candle_content_hash, load_candles
+from execution_universe import project_execution_universe
 from gui_review_utils import (
     build_review_required_item,
     safe_float_value,
@@ -41,6 +44,7 @@ from gui_review_utils import (
 )
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
+from stock_repository import StockRepository
 from event_journal_production import (
     append_production_event,
     observe_owner_failure_transition,
@@ -84,6 +88,14 @@ class AutoTradeOperationHost(QObject):
                 confirm_runtime_file_init=None,
             )
         )
+        self._operation_candle_requests: dict[str, dict[str, object]] = {}
+        self._bar_commit_trigger_queue: deque[dict[str, object]] = deque()
+        self._bar_commit_drain_scheduled = False
+        self._bar_commit_drain_running = False
+        self._last_bar_commit_identity_by_stock: dict[str, str] = {}
+        self._last_bar_commit_fast_path_result: dict[str, object] = {}
+        self._bar_committed_signal_bound = False
+        self._bind_bar_committed_signal_once()
 
     def parent(self):
         return self._owner
@@ -147,15 +159,239 @@ class AutoTradeOperationHost(QObject):
 
     def shutdown(self) -> dict[str, object]:
         self._shutting_down = True
+        self._operation_candle_requests.clear()
+        self._bar_commit_trigger_queue.clear()
         return self.stop_operation_timers()
 
     def operation_timer(self) -> QTimer:
         return self._operation_timer
 
+    def _bind_bar_committed_signal_once(self) -> bool:
+        if self._bar_committed_signal_bound:
+            return True
+        signal = getattr(self._kiwoom_api(), "bar_committed", None)
+        connect = getattr(signal, "connect", None)
+        if not callable(connect):
+            return False
+        try:
+            connect(self._on_bar_committed)
+        except Exception as exc:
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="bar_commit_fast_path",
+                operation="bind_bar_committed",
+                source="gui_auto_trade_operation_host.AutoTradeOperationHost._bind_bar_committed_signal_once",
+                target_type="OPERATION_HOST",
+                target_id="main_operation_host",
+                target_name="BAR_COMMITTED fast path",
+                reason_code="BAR_COMMITTED_BIND_FAILED",
+                owner=self,
+                failure_scope="bar_committed_signal_binding",
+            )
+            return False
+        self._bar_committed_signal_bound = True
+        return True
+
+    def register_operation_candle_request(
+        self,
+        rqname: str,
+        *,
+        stock_code: str,
+        stock_name: str,
+        stock_dir: Path,
+        operation_cycle_minute_key: str,
+    ) -> bool:
+        clean_rqname = str(rqname or "").strip()
+        clean_code = str(stock_code or "").strip()
+        minute_key = str(operation_cycle_minute_key or "").strip()
+        if self._shutting_down or not clean_rqname or not clean_code or not minute_key:
+            return False
+        self._operation_candle_requests[clean_rqname] = {
+            "stock_code": clean_code,
+            "stock_name": str(stock_name or "").strip(),
+            "stock_dir": Path(stock_dir),
+            "operation_cycle_minute_key": minute_key,
+        }
+        return True
+
+    def complete_operation_candle_request(self, rqname: str) -> bool:
+        return self._operation_candle_requests.pop(str(rqname or "").strip(), None) is not None
+
+    @staticmethod
+    def _valid_bar_committed_payload(payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("event_type") != "BAR_COMMITTED" or payload.get("source") != "opt10080":
+            return False
+        timeframe = payload.get("timeframe_minutes")
+        if isinstance(timeframe, bool) or timeframe != 1:
+            return False
+        return all(
+            str(payload.get(field) or "").strip()
+            for field in (
+                "stock_code",
+                "rqname",
+                "commit_identity",
+                "canonical_content_hash",
+                "canonical_path",
+                "bar_key",
+                "bar_identity",
+                "bar_time",
+            )
+        )
+
+    def _on_bar_committed(self, payload: object) -> None:
+        """Validate and enqueue only; broker callback work ends here."""
+        if self._shutting_down or not self._valid_bar_committed_payload(payload):
+            return
+        event = dict(payload)
+        rqname = str(event.get("rqname") or "").strip()
+        context = self._operation_candle_requests.get(rqname)
+        if not isinstance(context, dict):
+            return
+        stock_code = str(event.get("stock_code") or "").strip()
+        if stock_code != str(context.get("stock_code") or "").strip():
+            return
+        expected_path = (Path(context["stock_dir"]) / "candles.json").resolve()
+        try:
+            event_path = Path(str(event.get("canonical_path") or "")).resolve()
+        except Exception:
+            return
+        if event_path != expected_path:
+            return
+
+        self._operation_candle_requests.pop(rqname, None)
+        commit_identity = str(event.get("commit_identity") or "").strip()
+        if self._last_bar_commit_identity_by_stock.get(stock_code) == commit_identity:
+            return
+        self._last_bar_commit_identity_by_stock[stock_code] = commit_identity
+        self._bar_commit_trigger_queue.append({"event": event, "context": context})
+        if not self._bar_commit_drain_scheduled and not self._bar_commit_drain_running:
+            self._bar_commit_drain_scheduled = True
+            QTimer.singleShot(0, self._drain_bar_commit_triggers)
+
+    def _drain_bar_commit_triggers(self) -> None:
+        self._bar_commit_drain_scheduled = False
+        if self._bar_commit_drain_running or self._shutting_down:
+            return
+        self._bar_commit_drain_running = True
+        try:
+            while self._bar_commit_trigger_queue and not self._shutting_down:
+                trigger = self._bar_commit_trigger_queue.popleft()
+                try:
+                    result = self._process_bar_commit_trigger(trigger)
+                except Exception as exc:
+                    event = trigger.get("event", {}) if isinstance(trigger, dict) else {}
+                    observe_production_exception(
+                        type(exc),
+                        exc,
+                        exc.__traceback__,
+                        component="bar_commit_fast_path",
+                        operation="drain_bar_commit_trigger",
+                        source="gui_auto_trade_operation_host.AutoTradeOperationHost._drain_bar_commit_triggers",
+                        target_type="STOCK",
+                        target_id=str(event.get("stock_code") or ""),
+                        target_name=str(event.get("stock_name") or event.get("stock_code") or ""),
+                        reason_code="BAR_COMMIT_FAST_PATH_FAILED",
+                        owner=self,
+                        failure_scope=f"bar_commit_fast_path:{event.get('stock_code', '')}",
+                    )
+                    result = {
+                        "accepted": True,
+                        "evaluated": False,
+                        "stock_code": str(event.get("stock_code") or ""),
+                        "commit_identity": str(event.get("commit_identity") or ""),
+                        "signal": "ERROR",
+                        "queue_status": "",
+                        "reason_code": "BAR_COMMIT_FAST_PATH_FAILED",
+                    }
+                self._last_bar_commit_fast_path_result = result
+        finally:
+            self._bar_commit_drain_running = False
+            if self._bar_commit_trigger_queue and not self._bar_commit_drain_scheduled:
+                self._bar_commit_drain_scheduled = True
+                QTimer.singleShot(0, self._drain_bar_commit_triggers)
+
+    def _process_bar_commit_trigger(self, trigger: dict[str, object]) -> dict[str, object]:
+        event = trigger.get("event") if isinstance(trigger, dict) else None
+        context = trigger.get("context") if isinstance(trigger, dict) else None
+        if not isinstance(event, dict) or not isinstance(context, dict):
+            return self._bar_commit_result(event, reason_code="MALFORMED_BAR_COMMIT_TRIGGER")
+
+        stock_code = str(event.get("stock_code") or "").strip()
+        stock_name = str(context.get("stock_name") or "").strip()
+        stock_dir = StockRepository().resolve_stock_dir(stock_code, stock_name)
+        expected_path = (stock_dir / "candles.json").resolve()
+        if expected_path != Path(str(event.get("canonical_path") or "")).resolve():
+            return self._bar_commit_result(event, reason_code="CANONICAL_CANDLE_PATH_MISMATCH")
+
+        candles = load_candles(stock_dir)
+        current_hash = canonical_candle_content_hash(candles)
+        if not candles or current_hash != str(event.get("canonical_content_hash") or ""):
+            return self._bar_commit_result(event, reason_code="SUPERSEDED_BAR_COMMIT")
+
+        snapshot = project_execution_universe(self, stock_dirs=[stock_dir])
+        entry = snapshot.entries[0] if snapshot.entries else None
+        if entry is None or entry.execution_ready is not True:
+            return self._bar_commit_result(event, reason_code="EXECUTION_NOT_READY")
+
+        from gui_auto_trade_timer import _process_pending_signal_pipeline
+        from routine_signal_probe import probe_execution_stock_for_committed_bar
+
+        provenance = {
+            "trigger_commit_identity": event["commit_identity"],
+            "trigger_bar_key": event["bar_key"],
+            "trigger_bar_identity": event["bar_identity"],
+            "trigger_canonical_content_hash": event["canonical_content_hash"],
+        }
+        probe_result = probe_execution_stock_for_committed_bar(
+            self,
+            stock_dir,
+            str(context.get("operation_cycle_minute_key") or ""),
+            trigger_provenance=provenance,
+            execution_universe_snapshot=snapshot,
+        )
+        pipeline_result = _process_pending_signal_pipeline(self, snapshot)
+        result = self._bar_commit_result(
+            event,
+            evaluated=True,
+            signal=str(probe_result.get("signal") or ""),
+            queue_status=str(probe_result.get("queue_status") or ""),
+            reason_code="BAR_COMMIT_FAST_PATH_EVALUATED",
+        )
+        result["probe_result"] = probe_result
+        result["pipeline_result"] = pipeline_result
+        return result
+
+    @staticmethod
+    def _bar_commit_result(
+        event: object,
+        *,
+        evaluated: bool = False,
+        signal: str = "",
+        queue_status: str = "",
+        reason_code: str,
+    ) -> dict[str, object]:
+        payload = event if isinstance(event, dict) else {}
+        return {
+            "accepted": True,
+            "evaluated": evaluated,
+            "stock_code": str(payload.get("stock_code") or ""),
+            "commit_identity": str(payload.get("commit_identity") or ""),
+            "signal": signal,
+            "queue_status": queue_status,
+            "reason_code": reason_code,
+        }
+
     def run_operation_cycle(self) -> dict[str, object]:
         """Run one operation cycle without depending on any window visibility."""
         if self._shutting_down:
             return {"processed": False, "reason_code": "OPERATION_HOST_SHUTTING_DOWN"}
+        bind_bar_committed = getattr(self, "_bind_bar_committed_signal_once", None)
+        if callable(bind_bar_committed):
+            bind_bar_committed()
         if self._operation_cycle_running:
             return {"processed": False, "reason_code": "OPERATION_CYCLE_REENTRY"}
 

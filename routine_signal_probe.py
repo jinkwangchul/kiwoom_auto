@@ -50,6 +50,12 @@ ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
 FILLS_PATH = RUNTIME_DIR / "fills.json"
 POSITIONS_PATH = RUNTIME_DIR / "positions.json"
 _DEFAULT_OBSERVER_SENTINEL = object()
+TRIGGER_PROVENANCE_FIELDS = (
+    "trigger_commit_identity",
+    "trigger_bar_key",
+    "trigger_bar_identity",
+    "trigger_canonical_content_hash",
+)
 _DEFAULT_DECISION_TRACE_OBSERVER: Any = None
 
 
@@ -297,6 +303,7 @@ def probe_routine_for_stock(
     tick_key: str,
     *,
     decision_trace_observer: Any = _DEFAULT_OBSERVER_SENTINEL,
+    trigger_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
     state = _read_json_dict(stock_dir / "state.json")
@@ -378,6 +385,13 @@ def probe_routine_for_stock(
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
             }
+            provenance = {
+                field: trigger_provenance.get(field)
+                for field in TRIGGER_PROVENANCE_FIELDS
+                if isinstance(trigger_provenance, dict)
+                and trigger_provenance.get(field) not in (None, "")
+            }
+            context.update(provenance)
             if isinstance(instance_rules, dict):
                 context["rules"] = instance_rules
                 context["rules_source"] = "ROUTINE_INSTANCE_RULES"
@@ -468,6 +482,8 @@ def probe_routine_for_stock(
                 result["name"] = name
                 result["routine"] = result.get("routine", routine_name)
                 result["candles"] = len(candles)
+                for field, value in provenance.items():
+                    result.setdefault(field, value)
 
                 queue_result = _maybe_enqueue_signal(
                     result,
@@ -672,86 +688,14 @@ def probe_all_enabled_routine_stocks_once(
 
     snapshot = execution_universe_snapshot or project_execution_universe(_window)
     for entry in execution_ready_entries(snapshot):
-        stock_dir = entry.stock_dir
-        state = _read_json_dict(stock_dir / "state.json")
-        if not _is_trade_watch_target(state):
-            continue
-
         checked += 1
-        config = _read_json_dict(stock_dir / "config.json")
-        instance_id = str(
-            config.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        definition_id = str(
-            config.get("routine_definition_id", "") or ""
-        ).strip()
-        routine_name = str(
-            config.get("routine_instance_name")
-            or config.get("routine")
-            or config.get("routine_name")
-            or ""
-        ).strip()
-        definition = definitions.get(definition_id)
-
-        if not instance_id or definition is None:
-            code, name = _parse_stock_folder_name(stock_dir)
-            _observe_routine_contract_failure(
-                scope=f"routine_assignment:{code}",
-                reason_code="ROUTINE_ASSIGNMENT_UNRESOLVED",
-                routine_name=routine_name or definition_id,
-                stock_code=code,
-                stock_name=name,
-            )
-            error += 1
-            logged += 1
-            continue
-
-        if not routine_name:
-            routine_name = definition.display_name
-
-        try:
-            routine_module = module_cache.get(definition_id)
-            if routine_module is None:
-                routine_module = _load_routine_module(definition.package_dir)
-                module_cache[definition_id] = routine_module
-        except Exception as exc:
-            code, name = _parse_stock_folder_name(stock_dir)
-            observe_production_exception(
-                type(exc),
-                exc,
-                exc.__traceback__,
-                component="routine_signal_probe",
-                operation="load_routine_module",
-                source="routine_signal_probe.probe_all_enabled_routine_stocks_once",
-                target_type="ROUTINE",
-                target_id=definition_id,
-                target_name=routine_name,
-                reason_code="ROUTINE_IMPORT_FAILED",
-                owner=_routine_observer_owner(),
-                failure_scope=f"routine_import:{definition_id}",
-                details={"stock_code": code},
-            )
-            error += 1
-            logged += 1
-            continue
-
-        observe_owner_failure_transition(
-            _routine_observer_owner(),
-            f"routine_import:{definition_id}",
-            active=False,
-        )
-        code, _name = _parse_stock_folder_name(stock_dir)
-        observe_owner_failure_transition(
-            _routine_observer_owner(),
-            f"routine_assignment:{code}",
-            active=False,
-        )
-
-        result = probe_routine_for_stock(
-            routine_module,
-            routine_name,
-            stock_dir,
+        result = probe_execution_stock_for_committed_bar(
+            _window,
+            entry.stock_dir,
             tick_key,
+            execution_universe_snapshot=snapshot,
+            _definitions=definitions,
+            _module_cache=module_cache,
         )
         signal = str(result.get("signal", "") or "").upper()
         if signal == "SKIP":
@@ -771,3 +715,133 @@ def probe_all_enabled_routine_stocks_once(
         "skip": skip,
         "queued": queued,
     }
+
+
+def probe_execution_stock_for_committed_bar(
+    window: Any,
+    stock_dir: Path,
+    tick_key: str,
+    *,
+    trigger_provenance: dict[str, Any] | None = None,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
+    _definitions: dict[str, Any] | None = None,
+    _module_cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate exactly one currently execution-ready stock."""
+    target_dir = Path(stock_dir)
+    snapshot = execution_universe_snapshot or project_execution_universe(
+        window,
+        stock_dirs=[target_dir],
+    )
+    target_resolved = str(target_dir.resolve())
+    entry = next(
+        (
+            candidate
+            for candidate in execution_ready_entries(snapshot)
+            if str(candidate.stock_dir.resolve()) == target_resolved
+        ),
+        None,
+    )
+    code, name = _parse_stock_folder_name(target_dir)
+    if entry is None:
+        return {
+            "signal": "SKIP",
+            "reason": "EXECUTION_NOT_READY",
+            "code": code,
+            "name": name,
+        }
+
+    state = _read_json_dict(target_dir / "state.json")
+    if not _is_trade_watch_target(state):
+        return {
+            "signal": "SKIP",
+            "reason": "EXECUTION_NOT_READY",
+            "code": code,
+            "name": name,
+        }
+
+    definitions = _definitions if _definitions is not None else {
+        definition.definition_id: definition
+        for definition in load_routine_definitions()
+        if definition.package_enabled
+    }
+    module_cache = _module_cache if _module_cache is not None else {}
+    config = _read_json_dict(target_dir / "config.json")
+    instance_id = str(config.get("assigned_routine_instance_id", "") or "").strip()
+    definition_id = str(config.get("routine_definition_id", "") or "").strip()
+    routine_name = str(
+        config.get("routine_instance_name")
+        or config.get("routine")
+        or config.get("routine_name")
+        or ""
+    ).strip()
+    definition = definitions.get(definition_id)
+    if not instance_id or definition is None:
+        _observe_routine_contract_failure(
+            scope=f"routine_assignment:{code}",
+            reason_code="ROUTINE_ASSIGNMENT_UNRESOLVED",
+            routine_name=routine_name or definition_id,
+            stock_code=code,
+            stock_name=name,
+        )
+        return {
+            "signal": "ERROR",
+            "reason": "ROUTINE_ASSIGNMENT_UNRESOLVED",
+            "routine": routine_name,
+            "code": code,
+            "name": name,
+        }
+
+    if not routine_name:
+        routine_name = definition.display_name
+    try:
+        routine_module = module_cache.get(definition_id)
+        if routine_module is None:
+            routine_module = _load_routine_module(definition.package_dir)
+            module_cache[definition_id] = routine_module
+    except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="routine_signal_probe",
+            operation="load_routine_module",
+            source="routine_signal_probe.probe_execution_stock_for_committed_bar",
+            target_type="ROUTINE",
+            target_id=definition_id,
+            target_name=routine_name,
+            reason_code="ROUTINE_IMPORT_FAILED",
+            owner=_routine_observer_owner(),
+            failure_scope=f"routine_import:{definition_id}",
+            details={"stock_code": code},
+        )
+        return {
+            "signal": "ERROR",
+            "reason": "ROUTINE_IMPORT_FAILED",
+            "routine": routine_name,
+            "code": code,
+            "name": name,
+        }
+
+    observe_owner_failure_transition(
+        _routine_observer_owner(),
+        f"routine_import:{definition_id}",
+        active=False,
+    )
+    observe_owner_failure_transition(
+        _routine_observer_owner(),
+        f"routine_assignment:{code}",
+        active=False,
+    )
+    probe_kwargs = (
+        {"trigger_provenance": trigger_provenance}
+        if isinstance(trigger_provenance, dict) and trigger_provenance
+        else {}
+    )
+    return probe_routine_for_stock(
+        routine_module,
+        routine_name,
+        target_dir,
+        tick_key,
+        **probe_kwargs,
+    )

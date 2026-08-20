@@ -464,6 +464,10 @@ def enqueue_routine_signal(
             "signal_timeframe_minutes",
             "signal_trade_date",
             "signal_input_hash",
+            "trigger_commit_identity",
+            "trigger_bar_key",
+            "trigger_bar_identity",
+            "trigger_canonical_content_hash",
         ):
             value = result.get(field)
             if value not in (None, ""):

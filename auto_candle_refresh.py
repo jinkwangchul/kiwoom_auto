@@ -180,12 +180,25 @@ def refresh_operation_candles(
         summary["requested"] += 1
         summary["bootstrap_requested" if bootstrap else "incremental_requested"] += 1
         callback_called = False
+        owned_rqname = ""
 
         def received(result: dict[str, Any]) -> None:
-            nonlocal callback_called
+            nonlocal callback_called, owned_rqname
             if callback_called:
                 return
             callback_called = True
+            complete_owned_request = getattr(
+                window,
+                "complete_operation_candle_request",
+                None,
+            )
+            terminal_rqname = (
+                str(result.get("rqname") or "").strip()
+                if isinstance(result, dict)
+                else ""
+            ) or owned_rqname
+            if terminal_rqname and callable(complete_owned_request):
+                complete_owned_request(terminal_rqname)
             if isinstance(result, dict) and result.get("ok") is True:
                 summary["succeeded"] += 1
                 if bootstrap and _has_trade_date_candles(stock_dir, trade_date):
@@ -206,6 +219,25 @@ def refresh_operation_candles(
         except Exception as exc:
             received({"ok": False, "error": str(exc)})
             return
+        if (
+            isinstance(started, dict)
+            and started.get("ok") is True
+            and not callback_called
+        ):
+            owned_rqname = str(started.get("rqname") or "").strip()
+            register_owned_request = getattr(
+                window,
+                "register_operation_candle_request",
+                None,
+            )
+            if owned_rqname and callable(register_owned_request):
+                register_owned_request(
+                    owned_rqname,
+                    stock_code=code,
+                    stock_name=name,
+                    stock_dir=stock_dir,
+                    operation_cycle_minute_key=minute_key,
+                )
         if isinstance(started, dict) and started.get("ok") is not True and not callback_called:
             received(started)
 
