@@ -21,69 +21,8 @@ from gui_stock_data import (
 from runtime_io import read_json_dict
 from state_policy import real_trade_enabled
 
-OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
-
-
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def auto_trade_global_operation_running_for_assignment(window: object) -> bool:
-    current = window
-    for _ in range(6):
-        parent_getter = getattr(current, "parent", None)
-        if not callable(parent_getter):
-            return False
-        parent = parent_getter()
-        if parent is None:
-            return False
-
-        candidates = [parent]
-        auto_trade_setting = getattr(parent, "auto_trade_setting_window", None)
-        if auto_trade_setting is not None:
-            candidates.append(auto_trade_setting)
-
-        for candidate in candidates:
-            running_targets = getattr(
-                candidate,
-                "running_registered_operation_targets",
-                None,
-            )
-            if callable(running_targets):
-                try:
-                    return bool(running_targets())
-                except Exception:
-                    return False
-        current = parent
-    return False
-
-
-def apply_default_operation_exclusion_for_new_running_assignment(
-    window: object,
-    stock_dir: Path,
-    previous_config: dict[str, object],
-) -> bool:
-    previous_instance_id = str(
-        previous_config.get("assigned_routine_instance_id", "") or ""
-    ).strip()
-    if previous_instance_id:
-        return False
-    if not auto_trade_global_operation_running_for_assignment(window):
-        return False
-
-    config_path = stock_dir / "config.json"
-    config = read_json_dict(config_path)
-    if OPERATION_EXCLUDED_CONFIG_KEY in config:
-        return False
-
-    config[OPERATION_EXCLUDED_CONFIG_KEY] = True
-    config["updated_at"] = now_text()
-    try:
-        write_stock_config(stock_dir, config)
-        saved_config = read_json_dict(config_path)
-    except Exception:
-        return False
-    return saved_config.get(OPERATION_EXCLUDED_CONFIG_KEY) is True
 
 
 def default_config() -> dict[str, object]:

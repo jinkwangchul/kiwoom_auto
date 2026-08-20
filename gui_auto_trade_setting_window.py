@@ -712,13 +712,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
             return False
 
         repo = StockRepository(PROJECT_ROOT)
-        stock_dir = repo.resolve_stock_dir(code, name)
-        previous_config = (
-            read_json_dict(stock_dir / "config.json")
-            if isinstance(stock_dir, Path) and stock_dir.exists()
-            else {}
-        )
-
         if not update_base_stock_routine_instance(
             code,
             name,
@@ -731,11 +724,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
         try:
             stock_dir = repo.ensure_stock_folder(code, name, routine=routine_type)
-            apply_default_operation_exclusion_for_new_running_assignment(
-                self,
-                stock_dir,
-                previous_config,
-            )
             ensure_single_real_trade_routine_for_stock(code, name, routine_type)
         except Exception:
             LOGGER.exception("Failed to prepare stock assignment files")
@@ -1265,7 +1253,6 @@ from gui_auto_trade_table_loader import (
     auto_trade_load_selected_routine_stocks,
 )
 from gui_routine_service import (
-    apply_default_operation_exclusion_for_new_running_assignment,
     ensure_single_real_trade_routine_for_stock,
 )
 from gui_operation_environment import (

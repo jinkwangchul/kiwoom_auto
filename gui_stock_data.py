@@ -12,6 +12,7 @@ gui_stock_data.py
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -229,10 +230,56 @@ def append_base_stock(code: str, name: str) -> bool:
 
     try:
         repo = stock_repository_factory()
-        repo.ensure_stock_folder(clean_code, clean_name, routine="")
+        true_new = is_true_new_central_stock(repo, clean_code, clean_name)
+        stock_dir = repo.ensure_stock_folder(clean_code, clean_name, routine="")
+        if not apply_registration_location_for_new_stock(
+            stock_dir,
+            true_new=true_new,
+        ):
+            return False
         return True
     except Exception:
         return False
+
+
+def is_true_new_central_stock(repo: object, code: str, name: str) -> bool:
+    """Return true only when no central record or resolved folder exists."""
+    try:
+        if repo.find_by_code(str(code or "").strip()) is not None:
+            return False
+        resolved = repo.resolve_stock_dir(code, name)
+        return isinstance(resolved, Path) and not resolved.exists()
+    except Exception:
+        return False
+
+
+def apply_registration_location_for_new_stock(
+    stock_dir: Path,
+    *,
+    true_new: bool,
+    policy: dict[str, object] | None = None,
+) -> bool:
+    """Apply the registration default once without changing stock state."""
+    if not true_new:
+        return True
+    from gui_operation_environment import read_operation_policy, stock_registration_policy
+
+    effective_policy = policy if isinstance(policy, dict) else read_operation_policy()
+    location = stock_registration_policy(effective_policy)["default_location"]
+    config_path = Path(stock_dir) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            return False
+        config["operation_excluded"] = location == "EXCLUDED"
+        config["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        write_stock_config(Path(stock_dir), config)
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(saved, dict) and saved.get("operation_excluded") is (
+        location == "EXCLUDED"
+    )
 
 
 def remove_base_stock(code: str, name: str) -> bool:

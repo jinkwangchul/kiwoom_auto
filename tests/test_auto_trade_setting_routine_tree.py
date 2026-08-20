@@ -1075,7 +1075,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast"),
         ):
             self.assertTrue(dialog.register_or_assign_result_row(1))
@@ -1538,7 +1537,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_selected_result_rows())
@@ -1586,7 +1584,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_selected_result_rows())
@@ -1647,7 +1644,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment") as apply_exclusion,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -1667,7 +1663,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             routine="지표추종매매",
         )
         ensure_routine.assert_called_once_with("005930", "삼성전자", "지표추종매매")
-        apply_exclusion.assert_called_once()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(dialog, "종목 등록 및 지정이 완료됐습니다.")
 
@@ -1691,7 +1686,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -1743,7 +1737,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_or_assign_result_row(0))
@@ -5744,7 +5737,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
-            patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment") as exclusion,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -5767,7 +5759,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "가능1",
             routine="지표추종매매",
         )
-        exclusion.assert_called_once()
         ensure_single.assert_called_once_with("111111", "가능1", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 1종목 | 등록불가 0종목")
 
@@ -5807,7 +5798,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
-            patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -6026,7 +6016,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
             patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
-            patch.object(stock_register_window, "apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -10455,7 +10444,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
-            patch("gui_auto_trade_setting_window.apply_default_operation_exclusion_for_new_running_assignment"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(

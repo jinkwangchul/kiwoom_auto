@@ -68,6 +68,8 @@ SYSTEM_BUDGET_DEFAULTS = {
 REVIEW_POLICY_DEFAULTS = {
     "long_term_holding_enabled": False,
 }
+STOCK_REGISTRATION_LOCATIONS = ("WAITING", "EXCLUDED")
+STOCK_REGISTRATION_DEFAULTS = {"default_location": "WAITING"}
 BUFFER_RESPONSE_APPLICATION_MODES = ("UNIFIED", "SEGMENTED")
 BUFFER_RESPONSE_EVALUATION_FACTORS = ("손익비율", "손익금액", "투입금액")
 BUFFER_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
@@ -192,6 +194,7 @@ def default_operation_policy() -> dict[str, object]:
             "method": "시장가",
         },
         "review_policy": dict(REVIEW_POLICY_DEFAULTS),
+        "stock_registration": dict(STOCK_REGISTRATION_DEFAULTS),
         "system_budget": dict(SYSTEM_BUDGET_DEFAULTS),
         "starting_budget_defaults": dict(STARTING_BUDGET_DEFAULTS),
         "updated_at": "",
@@ -235,6 +238,7 @@ def write_operation_policy(
     if (
         "system_budget" not in policy
         or "review_policy" not in policy
+        or "stock_registration" not in policy
         or (preserve_buffer_response and "buffer_response" not in policy)
     ):
         existing = read_operation_policy(path=target_path)
@@ -248,6 +252,11 @@ def write_operation_policy(
         policy["review_policy"] = review_policy(existing)
     else:
         policy["review_policy"] = review_policy(policy)
+    if "stock_registration" not in policy:
+        assert existing is not None
+        policy["stock_registration"] = stock_registration_policy(existing)
+    else:
+        policy["stock_registration"] = stock_registration_policy(policy)
     if (
         preserve_buffer_response
         and "buffer_response" not in policy
@@ -267,6 +276,20 @@ def write_operation_policy(
         json.dumps(policy, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def stock_registration_policy(
+    policy: dict[str, object] | None = None,
+) -> dict[str, str]:
+    source = policy if isinstance(policy, dict) else {}
+    section = source.get("stock_registration")
+    raw_location = (
+        section.get("default_location") if isinstance(section, dict) else None
+    )
+    location = str(raw_location or "").strip().upper()
+    if location not in STOCK_REGISTRATION_LOCATIONS:
+        location = "WAITING"
+    return {"default_location": location}
 
 
 def _strict_integer(value: object) -> int:
@@ -756,7 +779,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 min-width: 82px;
             }
         """)
-        self.resize(1080, 640)
+        self.resize(1080, 700)
         self.policy = read_operation_policy()
         self.setStyleSheet(
             "QGroupBox { font-size: 9pt; font-weight: bold; margin-top: 10px; }"
@@ -841,6 +864,17 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.starting_amount_multiplier = self._make_short_line("1.5")
         self.limit_recommended_multiplier = self._make_short_line("100")
         self.limit_minimum_multiplier = self._make_short_line("25")
+        self.registration_waiting = QCheckBox("대기")
+        self.registration_excluded = QCheckBox("제외")
+        self.registration_waiting.setObjectName("stockRegistrationWaitingCheck")
+        self.registration_excluded.setObjectName("stockRegistrationExcludedCheck")
+        self.registration_waiting.setChecked(True)
+        self.registration_waiting.clicked.connect(
+            lambda _checked=False: self._select_registration_location("WAITING")
+        )
+        self.registration_excluded.clicked.connect(
+            lambda _checked=False: self._select_registration_location("EXCLUDED")
+        )
         self._setup_ui()
         self._connect_close_option_checks()
         self.manual_liquidation.clicked.connect(lambda _checked=False: self._update_manual_liquidation_mode())
@@ -1309,6 +1343,13 @@ class OperationEnvironmentSettingsDialog(QDialog):
         )
         layout.addWidget(budget_box)
 
+        # 8. 종목등록 설정
+        registration_box, registration_layout = make_row_box("8. 종목등록 설정")
+        registration_layout.addWidget(QLabel("등록위치 :"), 0, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        registration_layout.addWidget(self.registration_waiting, 0, 2, Qt.AlignLeft | Qt.AlignVCenter)
+        registration_layout.addWidget(self.registration_excluded, 0, 3, Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(registration_box)
+
         self.program_factory_reset_button = QPushButton("프로그램 초기화")
         self.program_factory_reset_button.setObjectName("operationEnvironmentProgramResetButton")
         self.program_factory_reset_button.clicked.connect(self._request_program_factory_reset)
@@ -1357,6 +1398,14 @@ class OperationEnvironmentSettingsDialog(QDialog):
     def _load_official_settings_defaults(self) -> None:
         self.policy = default_operation_policy()
         self.load_policy_to_widgets()
+
+    def _select_registration_location(self, location: str) -> None:
+        excluded = str(location or "").strip().upper() == "EXCLUDED"
+        self.registration_waiting.setChecked(not excluded)
+        self.registration_excluded.setChecked(excluded)
+
+    def _current_registration_location(self) -> str:
+        return "EXCLUDED" if self.registration_excluded.isChecked() else "WAITING"
 
     def _main_window_kiwoom_api(self) -> object | None:
         current: QWidget | None = persistent_feature_owner(self)
@@ -1494,6 +1543,9 @@ class OperationEnvironmentSettingsDialog(QDialog):
             _plain_number_text(budget_defaults["limit_minimum_multiplier"])
         )
 
+        registration = stock_registration_policy(self.policy)
+        self._select_registration_location(registration["default_location"])
+
         self._sync_combo_to_close_checkboxes()
         self.update_manual_extra_labels()
         self._update_manual_liquidation_mode()
@@ -1619,6 +1671,9 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 "method": self._current_liquidation_method(),
             },
             "review_policy": review_policy(self.policy),
+            "stock_registration": {
+                "default_location": self._current_registration_location(),
+            },
             "system_budget": system_budget_policy(self.policy),
             "starting_budget_defaults": (
                 dict(budget_defaults)

@@ -2,137 +2,145 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from gui_routine_service import apply_default_operation_exclusion_for_new_running_assignment
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt5.QtWidgets import QApplication, QLabel
+
+import gui_operation_environment as environment
+import gui_stock_data
+from stock_repository import StockRepository
 
 
-class RoutineAssignmentOperationExclusionTest(unittest.TestCase):
-    def _fixture(
-        self,
-        root: str,
-        *,
-        running: bool,
-        config: dict[str, object] | None = None,
-    ) -> tuple[SimpleNamespace, Path]:
-        stock_dir = Path(root) / "000001_TEST"
-        stock_dir.mkdir(parents=True)
-        (stock_dir / "config.json").write_text(
-            json.dumps(config or {}, ensure_ascii=False),
-            encoding="utf-8",
+class StockRegistrationRosterPolicyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_default_legacy_and_malformed_policy_are_waiting(self) -> None:
+        self.assertEqual({"default_location": "WAITING"}, environment.stock_registration_policy())
+        self.assertEqual(
+            {"default_location": "WAITING"},
+            environment.stock_registration_policy({"regular_market": {}}),
         )
-        host = SimpleNamespace(
-            running_registered_operation_targets=Mock(
-                return_value=[(stock_dir, "000001", "테스트")] if running else []
+        self.assertEqual(
+            {"default_location": "WAITING"},
+            environment.stock_registration_policy(
+                {"stock_registration": {"default_location": "RUNNING"}}
+            ),
+        )
+
+    def test_dialog_load_select_build_and_reset(self) -> None:
+        policy = environment.default_operation_policy()
+        policy["stock_registration"] = {"default_location": "EXCLUDED"}
+        with patch.object(environment, "read_operation_policy", return_value=policy):
+            dialog = environment.OperationEnvironmentSettingsDialog()
+        self.addCleanup(dialog.deleteLater)
+        self.assertFalse(dialog.registration_waiting.isChecked())
+        self.assertTrue(dialog.registration_excluded.isChecked())
+        self.assertIn("8. 종목등록 설정", [label.text() for label in dialog.findChildren(QLabel)])
+        dialog.registration_waiting.click()
+        self.assertTrue(dialog.registration_waiting.isChecked())
+        self.assertFalse(dialog.registration_excluded.isChecked())
+        self.assertEqual(
+            "WAITING",
+            dialog.build_policy_from_widgets()["stock_registration"]["default_location"],
+        )
+        dialog._load_official_settings_defaults()
+        self.assertTrue(dialog.registration_waiting.isChecked())
+        self.assertFalse(dialog.registration_excluded.isChecked())
+
+    def test_save_reload_and_partial_writer_preserve_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operation_policy.json"
+            policy = environment.default_operation_policy()
+            policy["stock_registration"] = {"default_location": "EXCLUDED"}
+            environment.write_operation_policy(policy, path=path)
+            environment.write_operation_policy(
+                {"regular_market": {"start_time": "09:10:00"}},
+                path=path,
             )
-        )
-        return SimpleNamespace(parent=lambda: host), stock_dir
+            loaded = environment.read_operation_policy(path=path)
+        self.assertEqual("EXCLUDED", loaded["stock_registration"]["default_location"])
 
-    def test_new_assignment_during_operation_is_excluded_and_read_back(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            window, stock_dir = self._fixture(root, running=True)
-            with patch("gui_routine_service.now_text", return_value="2026-08-06 13:00:00"):
-                changed = apply_default_operation_exclusion_for_new_running_assignment(
-                    window,
-                    stock_dir,
-                    {},
+    def test_dialog_save_reloads_excluded_from_temp_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operation_policy.json"
+            with patch.object(environment, "OPERATION_POLICY_PATH", path), patch.object(
+                environment, "append_changelog"
+            ), patch.object(environment, "show_toast"), patch.object(
+                environment, "append_production_event"
+            ):
+                dialog = environment.OperationEnvironmentSettingsDialog()
+                self.addCleanup(dialog.deleteLater)
+                dialog.registration_excluded.click()
+                dialog.accept()
+                reloaded = environment.OperationEnvironmentSettingsDialog()
+                self.addCleanup(reloaded.deleteLater)
+        self.assertFalse(reloaded.registration_waiting.isChecked())
+        self.assertTrue(reloaded.registration_excluded.isChecked())
+
+    def test_true_new_waiting_and_excluded_apply_once_without_state_mutation(self) -> None:
+        for location, excluded in (("WAITING", False), ("EXCLUDED", True)):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temp:
+                repo = StockRepository(Path(temp))
+                policy_reader = patch.object(
+                    environment,
+                    "read_operation_policy",
+                    return_value={"stock_registration": {"default_location": location}},
                 )
-            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                with patch.object(gui_stock_data, "stock_repository_factory", return_value=repo), policy_reader as reader:
+                    self.assertTrue(gui_stock_data.append_base_stock("005930", "Test"))
+                    stock_dir = repo.resolve_stock_dir("005930", "Test")
+                    first_config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                    first_state = (stock_dir / "state.json").read_bytes()
+                    reader.return_value = {
+                        "stock_registration": {
+                            "default_location": "WAITING" if excluded else "EXCLUDED"
+                        }
+                    }
+                    self.assertTrue(gui_stock_data.append_base_stock("005930", "Test"))
+                    second_config = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                self.assertIs(first_config["operation_excluded"], excluded)
+                self.assertEqual(first_config, second_config)
+                self.assertEqual(first_state, (stock_dir / "state.json").read_bytes())
+                self.assertEqual("STOPPED", json.loads(first_state.decode("utf-8"))["status"])
 
-        self.assertTrue(changed)
-        self.assertIs(saved["operation_excluded"], True)
-        self.assertEqual("2026-08-06 13:00:00", saved["updated_at"])
+    def test_existing_first_assignment_move_and_unassign_preserve_category(self) -> None:
+        for excluded in (False, True):
+            with self.subTest(excluded=excluded), tempfile.TemporaryDirectory() as temp:
+                repo = StockRepository(Path(temp))
+                stock_dir = repo.ensure_stock_folder("005930", "Test")
+                config_path = stock_dir / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["operation_excluded"] = excluded
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                self.assertTrue(repo.update_stock_routine_instance(
+                    "005930", "Test", instance_id="A", instance_name="A",
+                    definition_id="D1", routine_type="RoutineA",
+                ))
+                self.assertTrue(repo.update_stock_routine_instance(
+                    "005930", "Test", instance_id="B", instance_name="B",
+                    definition_id="D2", routine_type="RoutineB",
+                ))
+                self.assertTrue(repo.update_stock_routine("005930", "Test", []))
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertIs(saved["operation_excluded"], excluded)
 
-    def test_new_assignment_while_stopped_does_not_change_config(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            window, stock_dir = self._fixture(root, running=False, config={"marker": "kept"})
-            before = (stock_dir / "config.json").read_bytes()
-
-            changed = apply_default_operation_exclusion_for_new_running_assignment(
-                window,
-                stock_dir,
-                {},
-            )
-
-            after = (stock_dir / "config.json").read_bytes()
-
-        self.assertFalse(changed)
-        self.assertEqual(before, after)
-
-    def test_existing_assignment_does_not_change_config(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            window, stock_dir = self._fixture(root, running=True, config={"marker": "kept"})
-            before = (stock_dir / "config.json").read_bytes()
-
-            changed = apply_default_operation_exclusion_for_new_running_assignment(
-                window,
-                stock_dir,
-                {"assigned_routine_instance_id": "existing-instance"},
-            )
-
-            after = (stock_dir / "config.json").read_bytes()
-
-        self.assertFalse(changed)
-        self.assertEqual(before, after)
-
-    def test_existing_operation_excluded_value_is_not_overwritten(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            window, stock_dir = self._fixture(
-                root,
-                running=True,
-                config={"operation_excluded": False},
-            )
-
-            changed = apply_default_operation_exclusion_for_new_running_assignment(
-                window,
-                stock_dir,
-                {},
-            )
-            saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
-
-        self.assertFalse(changed)
-        self.assertIs(saved["operation_excluded"], False)
-
-    def test_read_back_mismatch_returns_false(self) -> None:
-        window = SimpleNamespace(
-            parent=lambda: SimpleNamespace(
-                running_registered_operation_targets=lambda: [(Path("stock"), "000001", "테스트")]
-            )
+    def test_registration_modules_do_not_register_session_participants(self) -> None:
+        sources = (
+            Path(gui_stock_data.__file__).read_text(encoding="utf-8"),
+            Path(__file__).parents[1].joinpath("gui_auto_trade_setting_window.py").read_text(encoding="utf-8"),
         )
-        with (
-            patch("gui_routine_service.read_json_dict", side_effect=[{}, {}]),
-            patch("gui_routine_service.write_stock_config") as writer,
-        ):
-            changed = apply_default_operation_exclusion_for_new_running_assignment(
-                window,
-                Path("stock"),
-                {},
-            )
-
-        self.assertFalse(changed)
-        writer.assert_called_once()
-
-    def test_write_failure_returns_false(self) -> None:
-        window = SimpleNamespace(
-            parent=lambda: SimpleNamespace(
-                running_registered_operation_targets=lambda: [(Path("stock"), "000001", "테스트")]
-            )
-        )
-        with (
-            patch("gui_routine_service.read_json_dict", return_value={}),
-            patch("gui_routine_service.write_stock_config", side_effect=OSError("write failed")),
-        ):
-            changed = apply_default_operation_exclusion_for_new_running_assignment(
-                window,
-                Path("stock"),
-                {},
-            )
-
-        self.assertFalse(changed)
+        self.assertTrue(all(
+            "auto_trade_register_current_session_operation_participants" not in source
+            for source in sources
+        ))
 
 
 if __name__ == "__main__":

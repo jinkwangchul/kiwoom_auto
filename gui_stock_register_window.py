@@ -148,7 +148,6 @@ from routine_instance_registry import (
 )
 from stock_repository import repository as stock_repository_factory
 from gui_routine_service import (
-    apply_default_operation_exclusion_for_new_running_assignment,
     ensure_single_real_trade_routine_for_stock,
 )
 from gui_toast import show_toast
@@ -2253,12 +2252,6 @@ class StockRegisterWindow(QDialog):
                 continue
 
             repo = stock_repository_factory()
-            resolved_stock_dir = repo.resolve_stock_dir(code, name)
-            previous_config = (
-                read_json_dict(resolved_stock_dir / "config.json")
-                if isinstance(resolved_stock_dir, Path)
-                else {}
-            )
             if not update_base_stock_routine_instance(
                 code,
                 name,
@@ -2275,11 +2268,6 @@ class StockRegisterWindow(QDialog):
                     code,
                     name,
                     routine=selected_routine_type,
-                )
-                apply_default_operation_exclusion_for_new_running_assignment(
-                    self,
-                    stock_dir,
-                    previous_config,
                 )
             except Exception:
                 skipped_items.append(f"{code} {name}: stocks 저장 실패")

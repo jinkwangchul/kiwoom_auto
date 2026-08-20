@@ -1335,11 +1335,8 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         code: str = "222222",
         name: str = "Fresh",
     ) -> Path:
-        import gui_routine_service as assignment
-
         repository = StockRepository(root)
         stock_dir = repository.ensure_stock_folder(code, name, routine="")
-        previous_config = read_json_dict(stock_dir / "config.json")
         auto_trade_setting = SimpleNamespace(
             running_registered_operation_targets=Mock(
                 return_value=[(Path("stocks/000001_Run"), "000001", "Run")]
@@ -1360,15 +1357,9 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             definition_id="def-running",
             routine_type="Routine",
         )
-        assignment.apply_default_operation_exclusion_for_new_running_assignment(
-            window,
-            stock_dir,
-            previous_config,
-        )
-
         return stock_dir
 
-    def test_running_global_operation_new_assignment_defaults_to_operation_excluded(self) -> None:
+    def test_running_global_operation_first_assignment_preserves_waiting(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = self._apply_routine_assignment(Path(temp), running=True)
             config = read_json_dict(stock_dir / "config.json")
@@ -1385,9 +1376,9 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             ):
                 start_targets = window.registered_operation_start_targets()
 
-        self.assertTrue(config[OPERATION_EXCLUDED_CONFIG_KEY])
+        self.assertNotIn(OPERATION_EXCLUDED_CONFIG_KEY, config)
         self.assertEqual("inst-running", config["assigned_routine_instance_id"])
-        self.assertEqual([], start_targets)
+        self.assertEqual(1, len(start_targets))
 
     def test_before_global_operation_new_assignment_keeps_existing_default(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1414,39 +1405,6 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             config = read_json_dict(stock_dir / "config.json")
 
         self.assertFalse(config[OPERATION_EXCLUDED_CONFIG_KEY])
-
-    def test_existing_assignment_reload_does_not_change_operation_exclusion(self) -> None:
-        import gui_routine_service as assignment
-
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            repository = StockRepository(root)
-            stock_dir = repository.ensure_stock_folder("222222", "Fresh", routine="")
-            repository.update_stock_routine_instance(
-                "222222",
-                "Fresh",
-                instance_id="inst-existing",
-                instance_name="Existing",
-                definition_id="def-existing",
-                routine_type="Routine",
-            )
-
-            changed = assignment.apply_default_operation_exclusion_for_new_running_assignment(
-                SimpleNamespace(
-                    parent=lambda: SimpleNamespace(
-                        running_registered_operation_targets=Mock(
-                            return_value=[(stock_dir, "222222", "Fresh")]
-                        )
-                    )
-                ),
-                stock_dir,
-                {"assigned_routine_instance_id": "inst-existing"},
-            )
-            config = read_json_dict(stock_dir / "config.json")
-
-        self.assertFalse(changed)
-        self.assertNotIn(OPERATION_EXCLUDED_CONFIG_KEY, config)
-
 
 if __name__ == "__main__":
     unittest.main()
