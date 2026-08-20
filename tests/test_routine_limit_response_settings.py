@@ -14,7 +14,7 @@ from uuid import UUID
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QWidget
 
 import gui_windows
 from routine_instance_registry import (
@@ -170,7 +170,7 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             self.assertFalse(surface.strategy_action_badges["loss"].isEnabled())
             owner.deleteLater()
 
-    def test_action_cycle_and_routine_close_color_contract(self) -> None:
+    def test_action_cycle_and_fixed_label_color_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repository = self._repository(root)
@@ -183,11 +183,15 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
                 "#DC2626",
                 surface.strategy_action_badges["profit"].styleSheet(),
             )
+            self.assertTrue(badge.isEnabled())
+            self.assertFalse(surface.strategy_action_badges["profit"].isEnabled())
+            self.assertIn("QPushButton:disabled", badge.styleSheet())
+            self.assertIn("color: #9CA3AF", badge.styleSheet())
+            self.assertIn("border-color: #D1D5DB", badge.styleSheet())
             loss_badge = surface.strategy_action_badges["loss"]
             loss_badge.setText("조기마감")
             surface._apply_action_badge_style(loss_badge)
             self.assertIn("#DC2626", loss_badge.styleSheet())
-            self.assertNotIn("green", surface.styleSheet().lower())
             self.assertEqual(
                 "※구간마감설정:",
                 surface.segment_close_title_label.text(),
@@ -238,20 +242,27 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
                 segment_layout.itemAt(5).widget(),
             )
             self.assertEqual(1, segment_layout.stretch(6))
-            self.assertIn(
-                "#DC2626",
-                surface.segment_early_close_label.styleSheet(),
+            surface.show()
+            self.application.processEvents()
+            upper_badge = surface.strategy_action_badges["unified"]
+            lower_badge_style = surface.segment_early_close_label.styleSheet()
+            immediate_badge_style = (
+                surface.segment_immediate_liquidation_label.styleSheet()
             )
-            self.assertNotIn(
-                "#2563EB",
-                surface.segment_early_close_label.styleSheet(),
-            )
-            self.assertIn(
-                "margin-top: 4px",
-                surface.segment_early_close_label.styleSheet(),
+            self.assertIsInstance(upper_badge, QPushButton)
+            self.assertIsInstance(surface.segment_early_close_label, QLabel)
+            self.assertIsInstance(surface.segment_immediate_liquidation_label, QLabel)
+            self.assertNotIsInstance(surface.segment_early_close_label, QPushButton)
+            self.assertIn("color: #DC2626", lower_badge_style)
+            self.assertIn("border: 1px solid #DC2626", lower_badge_style)
+            self.assertIn("border: 1px solid #b7bcc5", immediate_badge_style)
+            self.assertNotIn("#DC2626", immediate_badge_style)
+            self.assertEqual(
+                upper_badge.size(),
+                surface.segment_early_close_label.size(),
             )
             self.assertEqual(
-                surface.segment_early_close_label.size(),
+                upper_badge.size(),
                 surface.segment_immediate_liquidation_label.size(),
             )
             self.assertEqual("조기마감", surface.segment_early_close_label.text())
@@ -261,17 +272,13 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             )
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("즉시청산", badge.text())
-            self.assertIn("#374151", badge.styleSheet())
-            self.assertNotEqual("", badge.styleSheet())
+            self.assertEqual("", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("구간마감", badge.text())
-            self.assertIn("#374151", badge.styleSheet())
-            self.assertNotIn("#DC2626", badge.styleSheet())
+            self.assertEqual("", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("조기마감", badge.text())
             self.assertIn("#DC2626", badge.styleSheet())
-            for action_badge in surface.strategy_action_badges.values():
-                self.assertNotIn("#2563EB", action_badge.styleSheet())
             owner.deleteLater()
 
     def test_action_cycle_keeps_one_badge_geometry_and_style_structure(self) -> None:
@@ -283,8 +290,6 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             badge = surface.strategy_action_badges["unified"]
             widget_type = type(badge)
             fixed_size = badge.size()
-            normalized_styles = []
-
             for expected_text in (
                 "조기마감",
                 "즉시청산",
@@ -294,31 +299,27 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
                 self.assertEqual(expected_text, badge.text())
                 self.assertIs(widget_type, type(badge))
                 self.assertEqual(fixed_size, badge.size())
-                style = badge.styleSheet()
-                self.assertNotEqual("", style)
-                for token in (
-                    "border: 1px solid",
-                    "border-radius: 3px",
-                    "padding: 0px",
-                    "font-weight: bold",
-                ):
-                    self.assertIn(token, style)
-                self.assertNotIn("QPushButton:disabled", style)
-                normalized_styles.append(
-                    re.sub(r"#[0-9A-Fa-f]{6}", "#COLOR", style)
-                )
+                if expected_text == "조기마감":
+                    self.assertIn("#DC2626", badge.styleSheet())
+                else:
+                    self.assertEqual("", badge.styleSheet())
                 surface._cycle_strategy_action_badge("unified")
 
-            self.assertEqual(1, len(set(normalized_styles)))
             surface.set_application_mode(surface.MODE_SEGMENTED)
             self.assertFalse(badge.isEnabled())
             self.assertTrue(surface.strategy_action_badges["profit"].isEnabled())
             for action_badge in surface.strategy_action_badges.values():
                 self.assertEqual(fixed_size, action_badge.size())
-                self.assertNotIn(
-                    "QPushButton:disabled",
-                    action_badge.styleSheet(),
-                )
+                if action_badge.text() == "조기마감":
+                    self.assertIn(
+                        "QPushButton:disabled",
+                        action_badge.styleSheet(),
+                    )
+                else:
+                    self.assertNotIn(
+                        "QPushButton:disabled",
+                        action_badge.styleSheet(),
+                    )
             owner.deleteLater()
 
     def test_early_close_context_color_constants_remain_separated(self) -> None:
@@ -335,14 +336,6 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
         )
         self.assertIsNotNone(environment_color)
         self.assertEqual("#2563EB", environment_color.group(0).upper())
-        self.assertEqual(
-            "#DC2626",
-            gui_windows._RoutineLimitResponseSettingsSurface.ROUTINE_CLOSE_COLOR,
-        )
-        self.assertEqual(
-            "#374151",
-            gui_windows._RoutineLimitResponseSettingsSurface.NEUTRAL_ACTION_COLOR,
-        )
 
     def test_threshold_options_preserve_or_raise_immediate_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

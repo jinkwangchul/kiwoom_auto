@@ -764,8 +764,6 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
     MODE_UNIFIED = "UNIFIED"
     MODE_SEGMENTED = "SEGMENTED"
     ROUTINE_CLOSE_COLOR = "#DC2626"
-    NEUTRAL_ACTION_COLOR = "#374151"
-
     def __init__(
         self,
         owner: QWidget,
@@ -856,7 +854,6 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         self.segment_early_close_label = self._make_fixed_action_badge(
             "조기마감",
             fixed_badge_width,
-            color=self.ROUTINE_CLOSE_COLOR,
         )
         segment_layout.addWidget(self.segment_early_close_label)
         segment_layout.addStretch(1)
@@ -911,6 +908,12 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         self._loading_policy = False
         self.reload_from_persisted()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        action_badge_size = self.strategy_action_badges["unified"].size()
+        self.segment_early_close_label.setFixedSize(action_badge_size)
+        self.segment_immediate_liquidation_label.setFixedSize(action_badge_size)
+
     def _make_strategy_row(
         self,
         title: str,
@@ -964,17 +967,24 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
     def _make_fixed_action_badge(
         text: str,
         width: int,
-        *,
-        color: str = "#374151",
     ) -> QLabel:
         badge = QLabel(text)
         badge.setAlignment(Qt.AlignCenter)
         badge.setFixedSize(width, 30)
+        color = (
+            _RoutineLimitResponseSettingsSurface.ROUTINE_CLOSE_COLOR
+            if text == "조기마감"
+            else "palette(text)"
+        )
+        border_color = (
+            _RoutineLimitResponseSettingsSurface.ROUTINE_CLOSE_COLOR
+            if text == "조기마감"
+            else "#b7bcc5"
+        )
         badge.setStyleSheet(
             "QLabel {"
-            f" color: {color}; border: 1px solid {color};"
-            " border-radius: 3px; background: palette(base);"
-            " margin-top: 4px; padding: 0px; }"
+            f" color: {color}; border: 1px solid {border_color};"
+            " border-radius: 3px; background: palette(base); padding: 0px; }"
         )
         return badge
 
@@ -997,16 +1007,17 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         return combo
 
     def _apply_action_badge_style(self, badge: QPushButton) -> None:
-        color = (
-            self.ROUTINE_CLOSE_COLOR
-            if badge.text() == "조기마감"
-            else self.NEUTRAL_ACTION_COLOR
-        )
+        if badge.text() != "조기마감":
+            badge.setStyleSheet("")
+            return
         badge.setStyleSheet(
             "QPushButton {"
-            f" color: {color}; border: 1px solid {color};"
-            " border-radius: 3px; background: transparent; padding: 0px;"
-            " font-weight: bold; }"
+            f" color: {self.ROUTINE_CLOSE_COLOR};"
+            f" border: 1px solid {self.ROUTINE_CLOSE_COLOR};"
+            " border-radius: 3px; background: transparent; }"
+            "QPushButton:disabled {"
+            " color: #9CA3AF; border-color: #D1D5DB;"
+            " background: transparent; }"
         )
 
     def _cycle_strategy_action_badge(self, key: str) -> None:
