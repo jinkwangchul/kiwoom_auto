@@ -19,6 +19,10 @@ from buffer_response_ownership_service import (
     validate_batch_ownership_event,
 )
 from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from close_liquidation_transition_service import (
+    POLICY_ROUTINE_CLOSE,
+    is_routine_close_policy,
+)
 from operation_command_service import MODE_EARLY_CLOSE, SCOPE_STOCK
 from production_recovery_contract import ACCOUNT_COMPLETED, STOCK_RESTORED
 from production_recovery_state_registry import production_recovery_registry
@@ -29,7 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 FILLS_PATH = PROJECT_ROOT / "runtime" / "fills.json"
-ROUTINE_EARLY_CLOSE_METHOD = "루틴"
+ROUTINE_EARLY_CLOSE_METHOD = POLICY_ROUTINE_CLOSE
 SOURCE_PREFIX = "BUFFER_RESPONSE:"
 
 
@@ -171,7 +175,7 @@ def _read_back_matches(
         and _text(state.get("operation_command_id")) == command_id
         and _text(state.get("operation_command_source")) == source
         and _text(state.get("early_close_source")) == source
-        and _text(state.get("early_close_method")) == ROUTINE_EARLY_CLOSE_METHOD
+        and is_routine_close_policy(state.get("early_close_method"))
         and _text(state.get("status")).upper()
         in {MODE_EARLY_CLOSE, "EARLY_CLOSING", "EARLY_CLOSED"}
     )

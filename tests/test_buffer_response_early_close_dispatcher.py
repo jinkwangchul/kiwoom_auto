@@ -207,7 +207,7 @@ class BufferResponseEarlyCloseDispatcherTests(unittest.TestCase):
         self.assertEqual(command_id, state["operation_command_id"])
         self.assertEqual(source, state["operation_command_source"])
         self.assertEqual(source, state["early_close_source"])
-        self.assertEqual("루틴", state["early_close_method"])
+        self.assertEqual("루틴매도신호", state["early_close_method"])
         ownership_event = self.ownership.read_snapshot()["snapshot"]["events"][claim["event_id"]]
         self.assertEqual(STATUS_OWNED, ownership_event["status"])
         self.assertIsNone(ownership_event["completion"])

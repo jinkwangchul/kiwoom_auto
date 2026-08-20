@@ -27,6 +27,7 @@ from close_liquidation_transition_service import (
     REASON_UNKNOWN_REQUESTED_POLICY,
     TransitionEvidence,
     decide_close_liquidation_transition,
+    is_routine_close_policy,
     normalize_direct_close_policy_alias,
 )
 
@@ -38,6 +39,13 @@ class CloseLiquidationTransitionServiceTest(unittest.TestCase):
         self.assertEqual("시장가", normalize_direct_close_policy_alias("시장가"))
         self.assertEqual("현재가", normalize_direct_close_policy_alias("현재가"))
         self.assertEqual("루틴", normalize_direct_close_policy_alias("루틴"))
+
+    def test_routine_close_predicate_accepts_persisted_and_canonical_aliases(self) -> None:
+        for value in ("루틴", "루틴매도", "루틴마감", POLICY_ROUTINE_CLOSE):
+            with self.subTest(value=value):
+                self.assertTrue(is_routine_close_policy(value))
+        self.assertFalse(is_routine_close_policy(POLICY_MARKET))
+        self.assertFalse(is_routine_close_policy(POLICY_CURRENT_PRICE))
 
     def decide(
         self,

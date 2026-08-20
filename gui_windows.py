@@ -1438,6 +1438,10 @@ from stock_limit_response_service import (
     evaluate_main_window_stock_limit_after_chejan,
     resume_main_window_stock_limit_responses,
 )
+from routine_limit_response_service import (
+    evaluate_main_window_routine_limit_after_chejan,
+    resume_main_window_routine_limit_responses,
+)
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
 from gui_event_record_window import open_event_record_prototype
@@ -5531,7 +5535,7 @@ class MainWindow(QMainWindow):
         self.update_review_required_button_text()
 
     def _resume_limit_responses_after_recovery(self, identity) -> None:
-        """Settle system-buffer ownership before evaluating stock limits."""
+        """Settle Buffer and Routine ownership before evaluating stock limits."""
         self.last_buffer_response_recovery_coordination_result = (
             coordinate_main_window_buffer_response(
                 self,
@@ -5563,12 +5567,21 @@ class MainWindow(QMainWindow):
                 ),
             )
         )
+        self.last_routine_limit_recovery_result = (
+            resume_main_window_routine_limit_responses(
+                self,
+                buffer_result=(
+                    self.last_buffer_response_recovery_coordination_result
+                ),
+            )
+        )
         self.last_stock_limit_recovery_result = (
             resume_main_window_stock_limit_responses(
                 self,
                 higher_priority_result=(
                     self.last_buffer_response_recovery_coordination_result
                 ),
+                routine_priority_result=self.last_routine_limit_recovery_result,
             )
         )
 
@@ -9529,12 +9542,22 @@ class MainWindow(QMainWindow):
                     chejan_result=self.last_chejan_record_result,
                 )
             )
+            self.last_routine_limit_response_result = (
+                evaluate_main_window_routine_limit_after_chejan(
+                    self,
+                    chejan_result=self.last_chejan_record_result,
+                    buffer_result=self.last_buffer_response_coordination_result,
+                )
+            )
             self.last_stock_limit_response_result = (
                 evaluate_main_window_stock_limit_after_chejan(
                     self,
                     chejan_result=self.last_chejan_record_result,
                     higher_priority_result=(
                         self.last_buffer_response_coordination_result
+                    ),
+                    routine_priority_result=(
+                        self.last_routine_limit_response_result
                     ),
                 )
             )

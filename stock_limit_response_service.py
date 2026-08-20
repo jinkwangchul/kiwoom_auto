@@ -402,6 +402,7 @@ def evaluate_main_window_stock_limit_after_chejan(
     *,
     chejan_result: Mapping[str, object] | object,
     higher_priority_result: Mapping[str, object] | object,
+    routine_priority_result: Mapping[str, object] | object | None = None,
 ) -> dict[str, object]:
     if not isinstance(chejan_result, Mapping):
         return _result("CHEJAN_RESULT_UNAVAILABLE")
@@ -416,6 +417,15 @@ def evaluate_main_window_stock_limit_after_chejan(
             stock_code=_stock_code(position_result.get("code")),
             higher_priority_blocked=True,
         )
+    if routine_priority_result is not None:
+        from routine_limit_response_service import routine_layer_allows_stock
+
+        if not routine_layer_allows_stock(routine_priority_result):
+            return _result(
+                "ROUTINE_LIMIT_RESPONSE_NOT_CLEAR",
+                stock_code=_stock_code(position_result.get("code")),
+                higher_priority_blocked=True,
+            )
     selected_reader = getattr(window, "selected_account_no", None)
     account_no = _text(selected_reader()) if callable(selected_reader) else ""
     recovery = production_recovery_registry.snapshot()
@@ -444,6 +454,7 @@ def resume_main_window_stock_limit_responses(
     window: object,
     *,
     higher_priority_result: Mapping[str, object] | object,
+    routine_priority_result: Mapping[str, object] | object | None = None,
 ) -> dict[str, object]:
     if not _higher_priority_settled(higher_priority_result):
         return {
@@ -453,6 +464,17 @@ def resume_main_window_stock_limit_responses(
             "higher_priority_blocked": True,
             "reason": "HIGHER_PRIORITY_RESPONSE_NOT_SETTLED",
         }
+    if routine_priority_result is not None:
+        from routine_limit_response_service import routine_layer_allows_stock
+
+        if not routine_layer_allows_stock(routine_priority_result):
+            return {
+                "evaluated_count": 0,
+                "requested_count": 0,
+                "results": (),
+                "higher_priority_blocked": True,
+                "reason": "ROUTINE_LIMIT_RESPONSE_NOT_CLEAR",
+            }
     recovery = production_recovery_registry.snapshot()
     identity = getattr(recovery, "identity", None)
     account_no = _text(getattr(identity, "account_no", ""))

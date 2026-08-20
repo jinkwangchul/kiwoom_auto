@@ -19,8 +19,7 @@ from gui_auto_trade_integrity import (
 from gui_auto_trade_policy import auto_trade_setting_early_close_requested
 from gui_order_utils import order_current_pending_qty
 from close_liquidation_transition_service import (
-    POLICY_ROUTINE_CLOSE,
-    normalize_direct_close_policy_alias,
+    is_routine_close_policy,
 )
 from operation_close_completion_evaluator import (
     ACTIVE_QUEUE_STATUSES,
@@ -291,10 +290,7 @@ def buffer_owned_early_close_escalation_exclusion_reason(
         return "BUFFER_EARLY_CLOSE_SOURCE_MISMATCH"
     if _text(state.get("early_close_source")) != source:
         return "BUFFER_EARLY_CLOSE_SOURCE_MISMATCH"
-    if (
-        normalize_direct_close_policy_alias(state.get("early_close_method"))
-        != POLICY_ROUTINE_CLOSE
-    ):
+    if not is_routine_close_policy(state.get("early_close_method")):
         return "BUFFER_EARLY_CLOSE_METHOD_MISMATCH"
     status = _text(state.get("status")).upper()
     if status not in {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}:

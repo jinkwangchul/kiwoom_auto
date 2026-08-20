@@ -127,6 +127,11 @@ def _normalize_policy(value: object) -> str:
     return _POLICY_ALIASES.get(normalized, normalized)
 
 
+def is_routine_close_policy(value: object) -> bool:
+    """Return whether an existing alias denotes canonical routine close."""
+    return _normalize_policy(value) == POLICY_ROUTINE_CLOSE
+
+
 def _decision(
     *,
     allowed: bool,

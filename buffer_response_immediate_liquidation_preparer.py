@@ -41,6 +41,7 @@ from operation_close_completion_evaluator import resolve_liquidation_holding_qua
 from close_liquidation_transition_service import (
     POLICY_MARKET,
     POLICY_ROUTINE_CLOSE,
+    is_routine_close_policy,
     normalize_direct_close_policy_alias,
 )
 from production_recovery_state_registry import production_recovery_registry
@@ -271,8 +272,7 @@ class BufferResponseImmediateLiquidationPreparer:
             == buffer_response_command_source(identity)
             and _text(state.get("operation_command_id"))
             == deterministic_buffer_early_close_command_id(identity)
-            and normalize_direct_close_policy_alias(state.get("early_close_method"))
-            == POLICY_ROUTINE_CLOSE
+            and is_routine_close_policy(state.get("early_close_method"))
         )
         if same_event_routine_close:
             conflict = buffer_owned_early_close_escalation_exclusion_reason(
