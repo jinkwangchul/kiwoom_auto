@@ -322,6 +322,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
 
     def test_runtime_order_queue_rules_hash_unchanged_and_recorders_not_called(self) -> None:
         before = {path: _sha256(path) for path in _protected_paths()}
+        before_exists = {path: path.exists() for path in _protected_paths()}
         adapter = RecordingAdapter(0)
 
         with mock.patch("send_order_result_recorder.record_send_order_result") as result_recorder, \
@@ -335,8 +336,7 @@ class KiwoomSendOrderExecutorTest(unittest.TestCase):
         chejan_recorder.assert_not_called()
         send_order_stub.assert_not_called()
         self.assertEqual(before, {path: _sha256(path) for path in _protected_paths()})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertEqual(before_exists, {path: path.exists() for path in _protected_paths()})
 
     def test_claimed_send_order_success_records_send_call_accepted(self) -> None:
         tmp = tempfile.TemporaryDirectory()

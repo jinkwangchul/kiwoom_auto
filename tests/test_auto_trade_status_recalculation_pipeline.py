@@ -445,8 +445,8 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
 
             window = RecoveryBlockedWindow()
             window.__dict__.update(base_window.__dict__)
+            window.startup_recovery_session_ready = Mock(return_value=False)
             window.isVisible = lambda: True
-            window.update_startup_recovery_controls_mock = Mock()
             window.current_time_policy_minute_key = lambda: "2026-07-25 18:00"
             window._last_time_policy_minute_key = ""
             window.capture_stock_table_view_state = lambda: (set(), 0)
@@ -478,7 +478,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertEqual("RUNNING", state["status"])
         self.assertEqual("", window._last_time_policy_minute_key)
         window.refresh_all.assert_not_called()
-        window.update_startup_recovery_controls_mock.assert_called_once_with()
+        window.startup_recovery_session_ready.assert_called_once_with(refresh=True)
 
     def test_timer_no_target_tail_does_not_fallback_to_batch_probe(self) -> None:
         class RecoveryReadyWindow:

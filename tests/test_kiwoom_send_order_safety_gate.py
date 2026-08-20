@@ -328,6 +328,7 @@ class KiwoomSendOrderSafetyGateTest(unittest.TestCase):
 
     def test_runtime_order_queue_rules_hash_unchanged(self) -> None:
         before = {path: _sha256(path) for path in _protected_paths()}
+        before_exists = {path: path.exists() for path in _protected_paths()}
 
         with mock.patch("send_order_entrypoint.execute_send_order") as send_order, \
             mock.patch("kiwoom_order_adapter.send_order_stub") as kiwoom_send_order, \
@@ -344,8 +345,7 @@ class KiwoomSendOrderSafetyGateTest(unittest.TestCase):
         kiwoom_send_order.assert_not_called()
         broker_dispatch.assert_not_called()
         self.assertEqual(before, {path: _sha256(path) for path in _protected_paths()})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertEqual(before_exists, {path: path.exists() for path in _protected_paths()})
 
 
 if __name__ == "__main__":
