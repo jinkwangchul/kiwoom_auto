@@ -376,10 +376,10 @@ def _persisted_instance_from_directory(
 
     raw_buy_limit = metadata.get("buy_limit_amount")
     buy_limit_amount = _positive_integer(raw_buy_limit)
-    if buy_limit_enabled and buy_limit_amount is None:
+    if buy_limit_enabled and raw_buy_limit is not None and buy_limit_amount is None:
         return None, _instance_diagnostic(
             "INSTANCE_BUY_LIMIT_INVALID",
-            "enabled buy limit must be a positive integer",
+            "enabled buy limit must be null or a positive integer",
             metadata_path,
             definition_id,
         )

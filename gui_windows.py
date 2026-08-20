@@ -1954,12 +1954,31 @@ class _RoutineBuyLimitValueEditFilter(QObject):
 
     def eventFilter(self, watched, event):
         object_name = watched.objectName()
+        if object_name == "routineInstanceBuyLimitAmount":
+            if (
+                event.type() == QEvent.MouseButtonRelease
+                and event.button() == Qt.LeftButton
+            ):
+                if not self.window.consume_routine_instance_buy_limit_release(watched):
+                    self.window.schedule_routine_instance_buy_limit_single_click(watched)
+                event.accept()
+                return True
+            if (
+                event.type() == QEvent.MouseButtonDblClick
+                and event.button() == Qt.LeftButton
+            ):
+                self.window.cancel_routine_instance_buy_limit_single_click(
+                    suppress_release_widget=watched,
+                )
+                self.window.handle_routine_instance_buy_limit_double_click(watched)
+                event.accept()
+                return True
         if (
-            object_name == "routineInstanceBuyLimitAmount"
-            and event.type() == QEvent.MouseButtonDblClick
+            object_name == "routineInstanceBuyLimitSettings"
+            and event.type() == QEvent.MouseButtonRelease
             and event.button() == Qt.LeftButton
         ):
-            self.window.handle_routine_instance_buy_limit_double_click(watched)
+            self.window.handle_routine_instance_buy_limit_settings_click(watched)
             event.accept()
             return True
         if object_name == "routineInstanceBuyLimitEditor":
@@ -2792,6 +2811,13 @@ class MainWindow(QMainWindow):
         self._routine_instance_buy_limit_editor_instance_id = ""
         self._routine_instance_buy_limit_editor_label = None
         self._routine_instance_buy_limit_edit_finishing = False
+        self._routine_instance_buy_limit_pending_id = ""
+        self._routine_instance_buy_limit_suppressed_release_widget = None
+        self._routine_instance_buy_limit_click_timer = QTimer(self)
+        self._routine_instance_buy_limit_click_timer.setSingleShot(True)
+        self._routine_instance_buy_limit_click_timer.timeout.connect(
+            self._execute_routine_instance_buy_limit_single_click
+        )
         self._routine_stock_buy_limit_editor = None
         self._routine_stock_buy_limit_editor_config_path = ""
         self._routine_stock_buy_limit_edit_finishing = False
@@ -7195,6 +7221,7 @@ class MainWindow(QMainWindow):
             for object_name in (
                 "routineInstanceBuyLimitAmount",
                 "routineInstanceBuyLimitEditor",
+                "routineInstanceBuyLimitSettings",
             ):
                 child = status_widget.findChild(QWidget, object_name)
                 if child is not None:
@@ -7755,40 +7782,91 @@ class MainWindow(QMainWindow):
         self.load_routine_table()
 
     def handle_routine_instance_buy_limit_double_click(self, amount_label: QLabel) -> None:
-        instance_id = str(amount_label.property("routine_instance_id") or "").strip()
+        instance_id = self._routine_instance_id_for_buy_limit_widget(amount_label)
         if not instance_id:
-            row = self._routine_row_for_child_widget(amount_label)
-            if row < 0:
-                return
-            item = self.routine_table.item(row, 0)
-            if item is None:
-                return
-            if str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
-                return
-            instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-            if not instance_id:
-                return
+            return
         instance = routine_instance_by_id(instance_id)
         if instance is None:
             return
 
         self.finish_routine_stock_buy_limit_edit(save=True)
-        self.finish_routine_instance_buy_limit_edit(save=True)
-        if instance.buy_limit_enabled:
-            result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
-                instance_id,
-                enabled=False,
+        self.finish_routine_instance_buy_limit_edit(save=False)
+        result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
+            instance_id,
+            enabled=not instance.buy_limit_enabled,
+            amount=None,
+        )
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "매수한도 변경",
+                result.error or "매수한도를 변경하지 못했습니다.",
             )
-            if not result.success:
-                QMessageBox.warning(
-                    self,
-                    "매수한도 변경",
-                    result.error or "매수한도를 변경하지 못했습니다.",
-                )
-                return
-            amount_label.setText("미사용")
-            self.refresh_all()
             return
+        self.refresh_all()
+
+    def _routine_instance_id_for_buy_limit_widget(self, widget: QWidget) -> str:
+        instance_id = str(widget.property("routine_instance_id") or "").strip()
+        if instance_id:
+            return instance_id
+        row = self._routine_row_for_child_widget(widget)
+        if row < 0:
+            return ""
+        item = self.routine_table.item(row, 0)
+        if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
+            return ""
+        return str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
+
+    def schedule_routine_instance_buy_limit_single_click(self, amount_label: QLabel) -> None:
+        instance_id = self._routine_instance_id_for_buy_limit_widget(amount_label)
+        instance = routine_instance_by_id(instance_id) if instance_id else None
+        if instance is None or not instance.buy_limit_enabled:
+            return
+        self._routine_instance_buy_limit_pending_id = instance_id
+        self._routine_instance_buy_limit_click_timer.start(
+            QApplication.doubleClickInterval() + 25
+        )
+
+    def cancel_routine_instance_buy_limit_single_click(
+        self,
+        *,
+        suppress_release_widget: QWidget | None = None,
+    ) -> None:
+        self._routine_instance_buy_limit_click_timer.stop()
+        self._routine_instance_buy_limit_pending_id = ""
+        self._routine_instance_buy_limit_suppressed_release_widget = (
+            suppress_release_widget
+        )
+
+    def consume_routine_instance_buy_limit_release(self, widget: QWidget) -> bool:
+        if self._routine_instance_buy_limit_suppressed_release_widget is not widget:
+            return False
+        self._routine_instance_buy_limit_suppressed_release_widget = None
+        return True
+
+    def _execute_routine_instance_buy_limit_single_click(self) -> None:
+        instance_id = self._routine_instance_buy_limit_pending_id
+        self._routine_instance_buy_limit_pending_id = ""
+        if not instance_id:
+            return
+        for amount_label in self.routine_table.findChildren(
+            QLabel,
+            "routineInstanceBuyLimitAmount",
+        ):
+            if self._routine_instance_id_for_buy_limit_widget(amount_label) == instance_id:
+                self.start_routine_instance_buy_limit_edit(amount_label)
+                return
+
+    def start_routine_instance_buy_limit_edit(self, amount_label: QLabel) -> None:
+        instance_id = self._routine_instance_id_for_buy_limit_widget(amount_label)
+        if not instance_id:
+            return
+        instance = routine_instance_by_id(instance_id)
+        if instance is None or not instance.buy_limit_enabled:
+            return
+
+        self.finish_routine_stock_buy_limit_edit(save=True)
+        self.finish_routine_instance_buy_limit_edit(save=True)
 
         value_slot = amount_label.parentWidget()
         editor = (
@@ -7801,7 +7879,7 @@ class MainWindow(QMainWindow):
             return
 
         _apply_routine_inline_edit_style(editor, self.routine_table)
-        editor.setText("")
+        editor.setText(str(instance.buy_limit_amount or ""))
         editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         editor.selectAll()
         if hasattr(value_stack, "setCurrentWidget"):
@@ -7813,6 +7891,19 @@ class MainWindow(QMainWindow):
         self._routine_instance_buy_limit_editor = editor
         self._routine_instance_buy_limit_editor_instance_id = instance_id
         self._routine_instance_buy_limit_editor_label = amount_label
+
+    def handle_routine_instance_buy_limit_settings_click(
+        self,
+        settings_label: QLabel,
+    ) -> bool:
+        instance_id = self._routine_instance_id_for_buy_limit_widget(settings_label)
+        if not instance_id:
+            return False
+        return self.open_routine_instance_buy_limit_settings(instance_id)
+
+    def open_routine_instance_buy_limit_settings(self, instance_id: str) -> bool:
+        """Phase 2 boundary for the routine limit response settings dialog."""
+        return False
 
     def finish_routine_instance_buy_limit_edit(self, *, save: bool) -> None:
         editor = self._routine_instance_buy_limit_editor
@@ -7836,9 +7927,11 @@ class MainWindow(QMainWindow):
                 value_stack.setCurrentWidget(amount_label)
         self._routine_instance_buy_limit_edit_finishing = False
 
+        if not save or amount is None:
+            return
         result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
             instance_id,
-            enabled=amount is not None,
+            enabled=True,
             amount=amount,
         )
         if not result.success:

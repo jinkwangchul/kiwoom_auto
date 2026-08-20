@@ -106,6 +106,37 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertEqual("BUY_LIMIT_INVALID", result.error_code)
         self.assertFalse((root / "routine_instances").exists())
 
+    def test_create_round_trips_enabled_buy_limit_without_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+
+            result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Waiting Limit",
+                    buy_limit_enabled=True,
+                    buy_limit_amount=None,
+                ),
+                {"buy": {"enabled": True}},
+            )
+            loaded = repository.get_instance(str(INSTANCE_ID))
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(loaded)
+        self.assertTrue(loaded.buy_limit_enabled)
+        self.assertIsNone(loaded.buy_limit_amount)
+        self.assertTrue(metadata["buy_limit_enabled"])
+        self.assertIsNone(metadata["buy_limit_amount"])
+
     def test_unknown_definition_is_rejected_without_storage_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -286,6 +317,50 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertFalse(metadata["buy_limit_enabled"])
         self.assertIsNone(metadata["buy_limit_amount"])
         self.assertEqual({"sell": {"enabled": True}}, rules)
+
+    def test_update_buy_limit_waiting_round_trip_preserves_other_instance(self) -> None:
+        other_id = UUID("b52f539d-4f18-4ef6-b0cf-f471567982a2")
+        ids = iter((INSTANCE_ID, other_id))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root, id_factory=lambda: next(ids))
+            first = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="First",
+                ),
+                {"first": True},
+            )
+            second = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Second",
+                    buy_limit_enabled=True,
+                    buy_limit_amount=2_000_000,
+                ),
+                {"second": True},
+            )
+            other_before = (
+                root / "routine_instances" / str(other_id) / "instance.json"
+            ).read_bytes()
+
+            waiting = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=None,
+            )
+            loaded = repository.get_instance(str(INSTANCE_ID))
+            other_after = (
+                root / "routine_instances" / str(other_id) / "instance.json"
+            ).read_bytes()
+
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertTrue(waiting.success)
+        self.assertIsNotNone(loaded)
+        self.assertTrue(loaded.buy_limit_enabled)
+        self.assertIsNone(loaded.buy_limit_amount)
+        self.assertEqual(other_before, other_after)
 
     def test_update_buy_limit_rejects_non_positive_enabled_amount(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

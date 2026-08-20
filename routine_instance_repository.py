@@ -168,7 +168,7 @@ class RoutineInstanceRepository:
 
         if not isinstance(request.buy_limit_enabled, bool):
             return "BUY_LIMIT_ENABLED_INVALID", "매수한도 활성 여부가 올바르지 않습니다."
-        if request.buy_limit_enabled:
+        if request.buy_limit_enabled and request.buy_limit_amount is not None:
             amount = request.buy_limit_amount
             if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
                 return "BUY_LIMIT_INVALID", "매수한도는 0보다 큰 원 단위 정수여야 합니다."
@@ -370,7 +370,7 @@ class RoutineInstanceRepository:
                 error="매수한도 활성 여부가 올바르지 않습니다.",
             )
         clean_amount = None
-        if enabled:
+        if enabled and amount is not None:
             if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
                 return RoutineInstanceBuyLimitResult(
                     False,

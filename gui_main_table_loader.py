@@ -196,7 +196,7 @@ ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES = {
     "excluded": "제외(99)",
     "operation_or_stopped": "운영(99)",
     "review": "검토(99)",
-    "limit": "한도(99,999,999)",
+    "limit": "한도(99,999,999) [설정]",
     "consumed": "소모(99,999,999 / 100.0%)",
     "profit": "수익(-99,999,999 / -99.99%)",
 }
@@ -231,7 +231,7 @@ ROUTINE_AGGREGATE_LABELS = {
 }
 ROUTINE_AGGREGATE_NUMBER_SAMPLES = ("199", "999")
 ROUTINE_INSTANCE_AMOUNT_SAMPLES = {
-    "limit_amount": ("-99,999,999", "99,999,999", "미사용", "확인 필요"),
+    "limit_amount": ("-99,999,999", "99,999,999", "미설정", "대기", "확인 필요"),
     "consumed_amount": ("99,999,999",),
     "consumed_rate": ("100.0%", "-"),
     "profit_amount": ("-99,999,999", "+99,999,999"),
@@ -265,6 +265,7 @@ def routine_instance_grid_columns(font: QFont | None = None) -> dict[str, int]:
         metrics.horizontalAdvance("한도(")
         + number_widths["limit_amount"]
         + metrics.horizontalAdvance(")")
+        + metrics.horizontalAdvance(" [설정]")
         + (ROUTINE_INSTANCE_MONEY_OUTER_PADDING * 2)
     )
     columns["consumed"] = (
@@ -743,7 +744,7 @@ def _routine_limit_metric_widget(
         width=number_widths["limit_amount"],
         color_value=color_value,
     )
-    if amount_label.text() == "미설정":
+    if amount_label.text() in {"미설정", "대기"}:
         amount_label.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
     amount_label.setObjectName("routineInstanceBuyLimitAmount")
     amount_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
@@ -765,6 +766,11 @@ def _routine_limit_metric_widget(
     value_stack.setCurrentWidget(amount_label)
     layout.addWidget(value_slot)
     layout.addWidget(_routine_metric_text_label(")", color_value))
+    settings_label = _routine_metric_text_label(" [설정]", "#2563EB")
+    settings_label.setObjectName("routineInstanceBuyLimitSettings")
+    settings_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+    settings_label.setCursor(Qt.PointingHandCursor)
+    layout.addWidget(settings_label)
     return widget
 
 
@@ -844,6 +850,8 @@ def routine_instance_buy_limit_text(
 ) -> str:
     if not enabled:
         return "한도(미설정)"
+    if amount is None:
+        return "한도(대기)"
     try:
         limit_value = int(float(str(amount).replace(",", "").strip()))
     except (TypeError, ValueError):
@@ -1120,10 +1128,16 @@ def create_routine_instance_status_widget(
             metric_widget.setProperty("routine_instance_id", str(instance_id or ""))
             amount_label = metric_widget.findChild(QLabel, "routineInstanceBuyLimitAmount")
             amount_editor = metric_widget.findChild(QLineEdit, "routineInstanceBuyLimitEditor")
+            settings_label = metric_widget.findChild(
+                QLabel,
+                "routineInstanceBuyLimitSettings",
+            )
             if amount_label is not None:
                 amount_label.setProperty("routine_instance_id", str(instance_id or ""))
             if amount_editor is not None:
                 amount_editor.setProperty("routine_instance_id", str(instance_id or ""))
+            if settings_label is not None:
+                settings_label.setProperty("routine_instance_id", str(instance_id or ""))
         elif column_key == "consumed":
             metric_widget = _routine_ratio_metric_widget(
                 object_name=object_name,

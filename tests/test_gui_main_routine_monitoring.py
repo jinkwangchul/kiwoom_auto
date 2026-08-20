@@ -1102,6 +1102,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             "\uD55C\uB3C4(\uBBF8\uC124\uC815)",
         )
         self.assertEqual(
+            routine_instance_buy_limit_text(enabled=True, amount=None),
+            "\uD55C\uB3C4(\uB300\uAE30)",
+        )
+        self.assertEqual(
             routine_instance_buy_limit_text(enabled=True, amount=0),
             "\uD55C\uB3C4(\uD655\uC778 \uD544\uC694)",
         )
@@ -2910,6 +2914,125 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             amount_label = widget.findChild(QLabel, "routineInstanceBuyLimitAmount")
             self.assertIsNotNone(amount_label)
             self.assertEqual(int(Qt.AlignCenter | Qt.AlignVCenter), int(amount_label.alignment()))
+        finally:
+            widget.close()
+
+    def test_routine_buy_limit_always_shows_settings_without_inner_separator(self) -> None:
+        for buy_limit_text in (
+            "\uD55C\uB3C4(\uBBF8\uC124\uC815)",
+            "\uD55C\uB3C4(\uB300\uAE30)",
+            "\uD55C\uB3C4(12,000,000)",
+        ):
+            widget = gui_main_table_loader.create_routine_instance_status_widget(
+                "\uC815\uC9C0",
+                instance_id="instance-a",
+                registered=0,
+                excluded=0,
+                operation_or_stopped=0,
+                review=0,
+                buy_limit_text=buy_limit_text,
+                profit_text="\uC218\uC775(0 / 0.00%)",
+                enabled=True,
+            )
+            try:
+                limit_widget = widget.findChild(QWidget, "routineInstanceBuyLimit")
+                amount_label = widget.findChild(
+                    QLabel,
+                    "routineInstanceBuyLimitAmount",
+                )
+                settings_label = widget.findChild(
+                    QLabel,
+                    "routineInstanceBuyLimitSettings",
+                )
+                self.assertIsNotNone(limit_widget)
+                self.assertIsNotNone(amount_label)
+                self.assertIsNotNone(settings_label)
+                self.assertEqual(" [\uC124\uC815]", settings_label.text())
+                self.assertEqual("instance-a", settings_label.property("routine_instance_id"))
+                self.assertEqual([], limit_widget.findChildren(QLabel, "routineInstanceSeparator"))
+                window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+                window.open_routine_instance_buy_limit_settings = MagicMock(
+                    return_value=True
+                )
+                self.assertTrue(
+                    window.handle_routine_instance_buy_limit_settings_click(
+                        settings_label
+                    )
+                )
+                window.open_routine_instance_buy_limit_settings.assert_called_once_with(
+                    "instance-a"
+                )
+                if amount_label.text() in {"\uBBF8\uC124\uC815", "\uB300\uAE30"}:
+                    self.assertEqual(
+                        int(Qt.AlignCenter | Qt.AlignVCenter),
+                        int(amount_label.alignment()),
+                    )
+            finally:
+                widget.close()
+
+    def test_routine_buy_limit_double_click_toggles_three_states(self) -> None:
+        transitions = (
+            (False, None, True, None),
+            (True, None, False, None),
+            (True, 12_000_000, False, None),
+        )
+        for enabled, amount, expected_enabled, expected_amount in transitions:
+            label = QLabel()
+            label.setProperty("routine_instance_id", "instance-a")
+            window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            window.finish_routine_stock_buy_limit_edit = MagicMock()
+            window.finish_routine_instance_buy_limit_edit = MagicMock()
+            window.refresh_all = MagicMock()
+            result = SimpleNamespace(success=True, error="")
+            repository = MagicMock()
+            repository.update_buy_limit.return_value = result
+            instance = SimpleNamespace(
+                buy_limit_enabled=enabled,
+                buy_limit_amount=amount,
+            )
+
+            with (
+                patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(gui_windows, "RoutineInstanceRepository", return_value=repository),
+            ):
+                window.handle_routine_instance_buy_limit_double_click(label)
+
+            repository.update_buy_limit.assert_called_once_with(
+                "instance-a",
+                enabled=expected_enabled,
+                amount=expected_amount,
+            )
+            window.refresh_all.assert_called_once_with()
+            label.close()
+
+    def test_blank_routine_buy_limit_edit_preserves_enabled_state(self) -> None:
+        widget = gui_main_table_loader.create_routine_instance_status_widget(
+            "\uC815\uC9C0",
+            instance_id="instance-a",
+            registered=0,
+            excluded=0,
+            operation_or_stopped=0,
+            review=0,
+            buy_limit_text="\uD55C\uB3C4(\uB300\uAE30)",
+            profit_text="\uC218\uC775(0 / 0.00%)",
+            enabled=True,
+        )
+        try:
+            editor = widget.findChild(QLineEdit, "routineInstanceBuyLimitEditor")
+            label = widget.findChild(QLabel, "routineInstanceBuyLimitAmount")
+            editor.setText("")
+            window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            window._routine_instance_buy_limit_editor = editor
+            window._routine_instance_buy_limit_editor_instance_id = "instance-a"
+            window._routine_instance_buy_limit_editor_label = label
+            window._routine_instance_buy_limit_edit_finishing = False
+            window.refresh_all = MagicMock()
+
+            with patch.object(gui_windows, "RoutineInstanceRepository") as repository:
+                window.finish_routine_instance_buy_limit_edit(save=True)
+
+            repository.assert_not_called()
+            window.refresh_all.assert_not_called()
         finally:
             widget.close()
 

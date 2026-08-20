@@ -244,6 +244,24 @@ class RoutineInstanceRegistryTest(unittest.TestCase):
         self.assertEqual([], [item for item in registry.instances if item.persisted])
         self.assertIn("INSTANCE_BUY_LIMIT_INVALID", [item.code for item in registry.diagnostics])
 
+    def test_enabled_buy_limit_without_amount_loads_as_waiting(self) -> None:
+        instance_id = "a52f539d-4f18-4ef6-b0cf-f471567982a1"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_routine(root / "routines", "indicator")
+            self._write_instance(root, instance_id, buy_limit_amount=None)
+
+            registry = load_routine_instance_registry(project_root=root)
+
+        persisted = [item for item in registry.instances if item.persisted]
+        self.assertEqual(1, len(persisted))
+        self.assertTrue(persisted[0].buy_limit_enabled)
+        self.assertIsNone(persisted[0].buy_limit_amount)
+        self.assertNotIn(
+            "INSTANCE_BUY_LIMIT_INVALID",
+            [item.code for item in registry.diagnostics],
+        )
+
     def test_rules_path_must_stay_in_instance_directory(self) -> None:
         instance_id = "a52f539d-4f18-4ef6-b0cf-f471567982a1"
         with tempfile.TemporaryDirectory() as temp:
