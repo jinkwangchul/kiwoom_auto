@@ -1434,6 +1434,10 @@ from buffer_response_immediate_liquidation_preparer import (
 from buffer_response_immediate_liquidation_dispatcher import (
     dispatch_ready_main_window_buffer_immediate_preparations,
 )
+from stock_limit_response_service import (
+    evaluate_main_window_stock_limit_after_chejan,
+    resume_main_window_stock_limit_responses,
+)
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_toast import show_toast
 from gui_event_record_window import open_event_record_prototype
@@ -5519,31 +5523,54 @@ class MainWindow(QMainWindow):
             )
             self._request_account_funds_after_recovery(identity)
             self.update_budget_panel()
-            self.last_buffer_response_early_close_resume_result = (
-                resume_main_window_buffer_early_close(
-                    self,
-                    recovery_identity=identity,
-                )
-            )
-            self.last_buffer_response_immediate_preparation_resume_result = (
-                resume_main_window_buffer_immediate_liquidation_preparation(
-                    self,
-                    recovery_identity=identity,
-                )
-            )
-            self.last_buffer_response_immediate_dispatch_resume_result = (
-                dispatch_ready_main_window_buffer_immediate_preparations(
-                    self,
-                    preparation_resume_result=(
-                        self.last_buffer_response_immediate_preparation_resume_result
-                    ),
-                )
-            )
+            self._resume_limit_responses_after_recovery(identity)
         window = getattr(self, "auto_trade_setting_window", None)
         updater = getattr(window, "update_startup_recovery_controls", None)
         if callable(updater):
             updater()
         self.update_review_required_button_text()
+
+    def _resume_limit_responses_after_recovery(self, identity) -> None:
+        """Settle system-buffer ownership before evaluating stock limits."""
+        self.last_buffer_response_recovery_coordination_result = (
+            coordinate_main_window_buffer_response(
+                self,
+                chejan_result={
+                    "recorded": True,
+                    "stage": "RECOVERY_POSITION_REEVALUATION",
+                },
+            )
+            if main_window_buffer_response_integration_ready(self)
+            else {"reason": "BUFFER_RESPONSE_INTEGRATION_NOT_READY"}
+        )
+        self.last_buffer_response_early_close_resume_result = (
+            resume_main_window_buffer_early_close(
+                self,
+                recovery_identity=identity,
+            )
+        )
+        self.last_buffer_response_immediate_preparation_resume_result = (
+            resume_main_window_buffer_immediate_liquidation_preparation(
+                self,
+                recovery_identity=identity,
+            )
+        )
+        self.last_buffer_response_immediate_dispatch_resume_result = (
+            dispatch_ready_main_window_buffer_immediate_preparations(
+                self,
+                preparation_resume_result=(
+                    self.last_buffer_response_immediate_preparation_resume_result
+                ),
+            )
+        )
+        self.last_stock_limit_recovery_result = (
+            resume_main_window_stock_limit_responses(
+                self,
+                higher_priority_result=(
+                    self.last_buffer_response_recovery_coordination_result
+                ),
+            )
+        )
 
     def _request_account_funds_after_recovery(self, identity) -> dict[str, object]:
         """Refresh the UI projection only for the account Recovery just completed."""
@@ -7005,6 +7032,16 @@ class MainWindow(QMainWindow):
         if budget_total_label is not None:
             self.refresh_main_budget_orderable_validation()
             update_main_budget_panel(self)
+        if snapshot.status == ACCOUNT_FUNDS_READY:
+            recovery = production_recovery_registry.snapshot()
+            identity = getattr(recovery, "identity", None)
+            if (
+                recovery is not None
+                and recovery.account_status == ACCOUNT_COMPLETED
+                and identity is not None
+                and identity.account_no == account_id
+            ):
+                self._resume_limit_responses_after_recovery(identity)
 
     def refresh_all(self) -> None:
         self.load_routine_table()
@@ -9490,6 +9527,15 @@ class MainWindow(QMainWindow):
                 coordinate_main_window_buffer_response(
                     self,
                     chejan_result=self.last_chejan_record_result,
+                )
+            )
+            self.last_stock_limit_response_result = (
+                evaluate_main_window_stock_limit_after_chejan(
+                    self,
+                    chejan_result=self.last_chejan_record_result,
+                    higher_priority_result=(
+                        self.last_buffer_response_coordination_result
+                    ),
                 )
             )
         try:
