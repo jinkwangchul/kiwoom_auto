@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 
@@ -36,11 +37,25 @@ from gui_auto_trade_status_ops import (
 )
 from gui_auto_trade_timer import auto_trade_current_runtime_file_signature
 from candle_manager import canonical_candle_content_hash, load_candles
+from candle_timeframe_aggregation import candle_market_datetime
 from execution_universe import project_execution_universe
 from kiwoom_realtime_shadow import (
     NO_CANONICAL_BAR,
     RealtimeShadowBar,
     compare_shadow_bar_to_canonical,
+)
+from kiwoom_market_data_authority import (
+    MarketDataAuthority,
+    NORMAL_TR_REFRESH,
+    REALTIME_AUTHORITY,
+    REALTIME_ELIGIBLE,
+    REALTIME_PRIMARY,
+    REALTIME_PRIMARY_SKIP,
+    REALTIME_RECONCILIATION,
+    REALTIME_RECONCILIATION_REQUEST,
+    TR_PRIMARY_REFRESH,
+    TR_RECONCILIATION_AUTHORITY,
+    TR_RECONCILING,
 )
 from gui_review_utils import (
     build_review_required_item,
@@ -115,6 +130,11 @@ class AutoTradeOperationHost(QObject):
         ] = OrderedDict()
         self._last_realtime_shadow_comparison: dict[str, object] = {}
         self._realtime_shadow_session_identity: tuple[int, str] = (0, "")
+        self._market_data_authority = MarketDataAuthority()
+        self._pending_reconciliations: set[tuple[str, str]] = set()
+        self._reconciliation_shadow_bars: OrderedDict[
+            tuple[str, str], RealtimeShadowBar
+        ] = OrderedDict()
         self._bind_realtime_shadow_signals_once()
 
     def parent(self):
@@ -185,6 +205,9 @@ class AutoTradeOperationHost(QObject):
         self._realtime_shadow_trigger_queue.clear()
         self._realtime_shadow_retry_codes.clear()
         self._pending_shadow_comparisons.clear()
+        self._pending_reconciliations.clear()
+        self._reconciliation_shadow_bars.clear()
+        self._market_data_authority.reset()
         return self.stop_operation_timers()
 
     def operation_timer(self) -> QTimer:
@@ -263,7 +286,17 @@ class AutoTradeOperationHost(QObject):
                 self._pending_shadow_comparisons.clear()
                 self._realtime_shadow_trigger_queue.clear()
                 self._realtime_shadow_retry_codes.clear()
+                self._pending_reconciliations.clear()
+                self._reconciliation_shadow_bars.clear()
+                self._market_data_authority.ensure_session(*identity)
                 self._realtime_shadow_session_identity = identity
+            self._market_data_authority.sync_targets(target_codes)
+            if not bool(getattr(registration, "active", False)):
+                for code in target_codes:
+                    self._market_data_authority.force_tr_primary(
+                        code,
+                        "REALTIME_REGISTRATION_INACTIVE",
+                    )
             return dict(result) if isinstance(result, dict) else {
                 "ok": False,
                 "changed": False,
@@ -289,6 +322,9 @@ class AutoTradeOperationHost(QObject):
         self._pending_shadow_comparisons.clear()
         self._realtime_shadow_trigger_queue.clear()
         self._realtime_shadow_retry_codes.clear()
+        self._pending_reconciliations.clear()
+        self._reconciliation_shadow_bars.clear()
+        self._market_data_authority.reset()
         if not callable(clear):
             return {
                 "ok": True,
@@ -363,7 +399,13 @@ class AutoTradeOperationHost(QObject):
                     bar = RealtimeShadowBar(**payload)
                     if not self._shadow_bar_matches_current_session(bar):
                         continue
-                    self._compare_or_pend_realtime_shadow_bar(bar)
+                    mode = self._market_data_authority.mode(bar.stock_code)
+                    if mode == REALTIME_PRIMARY:
+                        self._process_realtime_primary_bar(bar)
+                    elif mode == TR_RECONCILING:
+                        self._remember_reconciliation_shadow_bar(bar)
+                    else:
+                        self._compare_or_pend_realtime_shadow_bar(bar)
                 except Exception as exc:
                     self._observe_realtime_shadow_exception(
                         exc,
@@ -434,8 +476,236 @@ class AutoTradeOperationHost(QObject):
                 self._pending_shadow_comparisons.popitem(last=False)
         else:
             self._pending_shadow_comparisons.pop(key, None)
+            self._observe_realtime_shadow_comparison(bar, result)
             self.realtime_shadow_comparison_completed.emit(dict(result))
         return result
+
+    def _observe_realtime_shadow_comparison(
+        self,
+        bar: RealtimeShadowBar,
+        result: dict[str, object],
+    ) -> None:
+        snapshot = project_execution_universe(
+            self,
+            stock_dirs=[StockRepository().resolve_stock_dir(bar.stock_code)],
+        )
+        entry = snapshot.entries[0] if snapshot.entries else None
+        eligible_context = bool(
+            entry is not None
+            and entry.execution_ready is True
+            and self._shadow_bar_matches_current_session(bar)
+            and not any(key[0] == bar.stock_code for key in self._pending_shadow_comparisons)
+            and (bar.stock_code, bar.minute_key) not in self._pending_reconciliations
+            and self._market_data_authority.authority(bar.stock_code, bar.minute_key)
+            != TR_RECONCILIATION_AUTHORITY
+        )
+        self._market_data_authority.observe_comparison(
+            bar.stock_code,
+            bar.minute_key,
+            status=str(result.get("status") or ""),
+            price_match=result.get("price_match") is True,
+            volume_compared=result.get("volume_compared") is True,
+            volume_match=result.get("volume_match") if isinstance(result.get("volume_match"), bool) else None,
+            eligible_context=eligible_context,
+        )
+
+    def market_data_mode_snapshot(self, stock_code: str):
+        return self._market_data_authority.snapshot(stock_code)
+
+    def prepare_market_data_operation_cycle(self, snapshot, minute_key: str) -> dict[str, object]:
+        """Promote eligible stocks only at a normal cycle boundary."""
+        registration_getter = getattr(
+            self._kiwoom_api(),
+            "realtime_shadow_registration_snapshot",
+            None,
+        )
+        registration = registration_getter() if callable(registration_getter) else None
+        identity = (
+            int(getattr(registration, "connection_epoch", 0) or 0),
+            str(getattr(registration, "login_session_id", "") or ""),
+        )
+        self._market_data_authority.ensure_session(*identity)
+        execution_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
+        self._market_data_authority.sync_targets(execution_codes)
+        refresh_inflight = bool(getattr(self, "_automatic_candle_refresh_inflight", False))
+        promoted: list[str] = []
+        for code in execution_codes:
+            unresolved = any(key[0] == code for key in self._pending_shadow_comparisons)
+            readiness_valid = bool(
+                getattr(registration, "active", False)
+                and code in getattr(registration, "target_stock_codes", ())
+                and identity == self._realtime_shadow_session_identity
+                and (code, self._market_data_authority.snapshot(code).reconciliation_minute)
+                not in self._pending_reconciliations
+            )
+            before = self._market_data_authority.mode(code)
+            after = self._market_data_authority.promote_at_cycle_boundary(
+                code,
+                readiness_valid=readiness_valid,
+                unresolved_pending=unresolved,
+                refresh_inflight=refresh_inflight,
+            )
+            if before == REALTIME_ELIGIBLE and after.mode == REALTIME_PRIMARY:
+                promoted.append(code)
+        return {
+            "minute_key": str(minute_key or ""),
+            "promoted_stock_codes": tuple(promoted),
+            "promoted_count": len(promoted),
+        }
+
+    def market_data_refresh_decision(
+        self,
+        stock_code: str,
+        minute_key: str,
+    ) -> dict[str, object]:
+        code = str(stock_code or "").strip()
+        mode = self._market_data_authority.mode(code)
+        if mode == TR_RECONCILING:
+            reconciliation_minute = self._market_data_authority.snapshot(code).reconciliation_minute
+            key = (code, reconciliation_minute)
+            request_required = bool(reconciliation_minute and key not in self._pending_reconciliations)
+            if request_required:
+                self._pending_reconciliations.add(key)
+            return {
+                "decision": REALTIME_RECONCILIATION,
+                "request_kind": REALTIME_RECONCILIATION_REQUEST,
+                "reconciliation_minute": reconciliation_minute,
+                "request_required": request_required,
+            }
+        if mode != REALTIME_PRIMARY:
+            return {"decision": TR_PRIMARY_REFRESH, "request_kind": NORMAL_TR_REFRESH}
+        expected = self._market_data_authority.expected_completed_minute(minute_key)
+        if not expected:
+            return {"decision": TR_PRIMARY_REFRESH, "request_kind": NORMAL_TR_REFRESH}
+        if (
+            self._market_data_authority.authority(code, expected) == REALTIME_AUTHORITY
+            and self._market_data_authority.realtime_committed(code, expected)
+        ):
+            return {
+                "decision": REALTIME_PRIMARY_SKIP,
+                "request_kind": "",
+                "reconciliation_minute": expected,
+            }
+        self._market_data_authority.begin_reconciliation(
+            code,
+            expected,
+            "EXPECTED_REALTIME_BAR_MISSING",
+        )
+        key = (code, expected)
+        request_required = key not in self._pending_reconciliations
+        if request_required:
+            self._pending_reconciliations.add(key)
+        return {
+            "decision": REALTIME_RECONCILIATION,
+            "request_kind": REALTIME_RECONCILIATION_REQUEST,
+            "reconciliation_minute": expected,
+            "request_required": request_required,
+        }
+
+    def _remember_reconciliation_shadow_bar(self, bar: RealtimeShadowBar) -> None:
+        key = (bar.stock_code, bar.minute_key)
+        self._reconciliation_shadow_bars[key] = bar
+        self._reconciliation_shadow_bars.move_to_end(key)
+        while len(self._reconciliation_shadow_bars) > self.MAX_PENDING_SHADOW_COMPARISONS:
+            self._reconciliation_shadow_bars.popitem(last=False)
+
+    def _process_realtime_primary_bar(self, bar: RealtimeShadowBar) -> dict[str, object]:
+        code = bar.stock_code
+        minute = bar.minute_key
+        if self._market_data_authority.authority(code, minute) == TR_RECONCILIATION_AUTHORITY:
+            self._remember_reconciliation_shadow_bar(bar)
+            return {"ok": False, "reason_code": "TR_RECONCILIATION_OWNS_MINUTE"}
+        if self._market_data_authority.realtime_committed(code, minute):
+            return {"ok": True, "changed": False, "reason_code": "REALTIME_BAR_ALREADY_COMMITTED"}
+        last_commit_minute = self._market_data_authority.snapshot(code).last_realtime_commit_minute
+        if last_commit_minute and minute < last_commit_minute:
+            return {"ok": False, "reason_code": "STALE_REALTIME_BAR"}
+        snapshot = project_execution_universe(
+            self,
+            stock_dirs=[StockRepository().resolve_stock_dir(code)],
+        )
+        entry = snapshot.entries[0] if snapshot.entries else None
+        valid = bool(
+            self._market_data_authority.mode(code) == REALTIME_PRIMARY
+            and entry is not None
+            and entry.execution_ready is True
+            and self._shadow_bar_matches_current_session(bar)
+            and bar.timeframe_minutes == 1
+            and bar.volume_complete is True
+            and bar.volume is not None
+        )
+        if not valid:
+            return self._fallback_realtime_bar(bar, "REALTIME_PRIMARY_BAR_INVALID")
+        if not self._market_data_authority.claim_authority(code, minute, REALTIME_AUTHORITY):
+            return {"ok": False, "reason_code": "MINUTE_AUTHORITY_CONFLICT"}
+        commit = getattr(self._kiwoom_api(), "commit_realtime_primary_bar", None)
+        if not callable(commit):
+            return self._fallback_realtime_bar(bar, "REALTIME_COMMIT_API_UNAVAILABLE")
+        result = commit(bar, stock_name=str(getattr(entry, "stock_name", "") or ""))
+        if not isinstance(result, dict) or result.get("ok") is not True or result.get("commit_verified") is not True:
+            return self._fallback_realtime_bar(bar, "REALTIME_CANONICAL_COMMIT_FAILED")
+        self._market_data_authority.mark_realtime_committed(code, minute)
+        return dict(result)
+
+    def _fallback_realtime_bar(self, bar: RealtimeShadowBar, reason: str) -> dict[str, object]:
+        code, minute = bar.stock_code, bar.minute_key
+        self._market_data_authority.replace_with_reconciliation_authority(code, minute)
+        self._market_data_authority.begin_reconciliation(code, minute, reason)
+        self._remember_reconciliation_shadow_bar(bar)
+        requested = self._request_realtime_reconciliation(code, minute)
+        return {
+            "ok": False,
+            "reason_code": reason,
+            "reconciliation_requested": requested,
+        }
+
+    def _request_realtime_reconciliation(self, stock_code: str, minute_key: str) -> bool:
+        key = (str(stock_code or "").strip(), str(minute_key or "").strip())
+        if not all(key) or key in self._pending_reconciliations:
+            return False
+        self._pending_reconciliations.add(key)
+        from auto_candle_refresh import request_operation_candle_for_stock
+
+        stock_dir = StockRepository().resolve_stock_dir(key[0])
+        evaluation_minute = (
+            datetime.strptime(key[1], "%Y-%m-%d %H:%M") + timedelta(minutes=1)
+        ).strftime("%Y-%m-%d %H:%M")
+        request_result = request_operation_candle_for_stock(
+            self,
+            stock_dir,
+            key[0],
+            "",
+            operation_cycle_minute_key=evaluation_minute,
+            request_kind=REALTIME_RECONCILIATION_REQUEST,
+            reconciliation_minute=key[1],
+            on_terminal=lambda result: self.complete_realtime_reconciliation(
+                key[0], key[1], stock_dir, result
+            ),
+        )
+        if request_result.get("ok") is not True:
+            return False
+        return True
+
+    def complete_realtime_reconciliation(
+        self,
+        stock_code: str,
+        minute_key: str,
+        stock_dir: Path,
+        result: object,
+    ) -> bool:
+        key = (str(stock_code or "").strip(), str(minute_key or "").strip())
+        self._pending_reconciliations.discard(key)
+        repaired = bool(
+            isinstance(result, dict)
+            and result.get("ok") is True
+            and any(
+                candle_market_datetime(candle) is not None
+                and candle_market_datetime(candle).strftime("%Y-%m-%d %H:%M") == key[1]
+                for candle in load_candles(Path(stock_dir))
+            )
+        )
+        self._market_data_authority.finish_reconciliation(key[0], key[1], repaired=repaired)
+        return repaired
 
     def _observe_realtime_shadow_exception(
         self,
@@ -467,6 +737,8 @@ class AutoTradeOperationHost(QObject):
         stock_name: str,
         stock_dir: Path,
         operation_cycle_minute_key: str,
+        request_kind: str = NORMAL_TR_REFRESH,
+        reconciliation_minute: str = "",
     ) -> bool:
         clean_rqname = str(rqname or "").strip()
         clean_code = str(stock_code or "").strip()
@@ -478,6 +750,8 @@ class AutoTradeOperationHost(QObject):
             "stock_name": str(stock_name or "").strip(),
             "stock_dir": Path(stock_dir),
             "operation_cycle_minute_key": minute_key,
+            "request_kind": str(request_kind or NORMAL_TR_REFRESH),
+            "reconciliation_minute": str(reconciliation_minute or ""),
         }
         return True
 
@@ -488,23 +762,28 @@ class AutoTradeOperationHost(QObject):
     def _valid_bar_committed_payload(payload: object) -> bool:
         if not isinstance(payload, dict):
             return False
-        if payload.get("event_type") != "BAR_COMMITTED" or payload.get("source") != "opt10080":
+        source = str(payload.get("source") or "")
+        if payload.get("event_type") != "BAR_COMMITTED" or source not in {"opt10080", "realtime_primary"}:
             return False
         timeframe = payload.get("timeframe_minutes")
         if isinstance(timeframe, bool) or timeframe != 1:
             return False
+        required = [
+            "stock_code",
+            "commit_identity",
+            "canonical_content_hash",
+            "canonical_path",
+            "bar_key",
+            "bar_identity",
+            "bar_time",
+        ]
+        if source == "opt10080":
+            required.append("rqname")
+        else:
+            required.append("login_session_id")
         return all(
             str(payload.get(field) or "").strip()
-            for field in (
-                "stock_code",
-                "rqname",
-                "commit_identity",
-                "canonical_content_hash",
-                "canonical_path",
-                "bar_key",
-                "bar_identity",
-                "bar_time",
-            )
+            for field in required
         )
 
     def _on_bar_committed(self, payload: object) -> None:
@@ -513,11 +792,17 @@ class AutoTradeOperationHost(QObject):
         if self._shutting_down or not self._valid_bar_committed_payload(payload):
             return
         event = dict(payload)
-        rqname = str(event.get("rqname") or "").strip()
-        context = self._operation_candle_requests.get(rqname)
-        if not isinstance(context, dict):
-            return
         stock_code = str(event.get("stock_code") or "").strip()
+        source = str(event.get("source") or "")
+        rqname = str(event.get("rqname") or "").strip()
+        if source == "opt10080":
+            context = self._operation_candle_requests.get(rqname)
+            if not isinstance(context, dict):
+                return
+        else:
+            context = self._realtime_bar_commit_context(event)
+            if context is None:
+                return
         if stock_code != str(context.get("stock_code") or "").strip():
             return
         expected_path = (Path(context["stock_dir"]) / "candles.json").resolve()
@@ -528,7 +813,8 @@ class AutoTradeOperationHost(QObject):
         if event_path != expected_path:
             return
 
-        self._operation_candle_requests.pop(rqname, None)
+        if source == "opt10080":
+            self._operation_candle_requests.pop(rqname, None)
         commit_identity = str(event.get("commit_identity") or "").strip()
         if self._last_bar_commit_identity_by_stock.get(stock_code) == commit_identity:
             return
@@ -537,6 +823,37 @@ class AutoTradeOperationHost(QObject):
         if not self._bar_commit_drain_scheduled and not self._bar_commit_drain_running:
             self._bar_commit_drain_scheduled = True
             QTimer.singleShot(0, self._drain_bar_commit_triggers)
+
+    def _realtime_bar_commit_context(self, event: dict[str, object]) -> dict[str, object] | None:
+        code = str(event.get("stock_code") or "").strip()
+        try:
+            bar_time = datetime.fromisoformat(str(event.get("bar_time") or ""))
+        except ValueError:
+            return None
+        minute = bar_time.strftime("%Y-%m-%d %H:%M")
+        registration_getter = getattr(
+            self._kiwoom_api(),
+            "realtime_shadow_registration_snapshot",
+            None,
+        )
+        registration = registration_getter() if callable(registration_getter) else None
+        if not (
+            self._market_data_authority.mode(code) == REALTIME_PRIMARY
+            and self._market_data_authority.authority(code, minute) == REALTIME_AUTHORITY
+            and getattr(registration, "active", False)
+            and code in getattr(registration, "target_stock_codes", ())
+            and int(event.get("connection_epoch") or -1) == getattr(registration, "connection_epoch", -2)
+            and str(event.get("login_session_id") or "") == getattr(registration, "login_session_id", "")
+        ):
+            return None
+        stock_dir = StockRepository().resolve_stock_dir(code, str(event.get("stock_name") or ""))
+        return {
+            "stock_code": code,
+            "stock_name": str(event.get("stock_name") or ""),
+            "stock_dir": stock_dir,
+            "operation_cycle_minute_key": (bar_time + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M"),
+            "request_kind": "REALTIME_PRIMARY",
+        }
 
     def _drain_bar_commit_triggers(self) -> None:
         self._bar_commit_drain_scheduled = False
@@ -585,6 +902,14 @@ class AutoTradeOperationHost(QObject):
         context = trigger.get("context") if isinstance(trigger, dict) else None
         if not isinstance(event, dict) or not isinstance(context, dict):
             return self._bar_commit_result(event, reason_code="MALFORMED_BAR_COMMIT_TRIGGER")
+        if event.get("source") == "realtime_primary":
+            current_context = self._realtime_bar_commit_context(event)
+            if current_context is None:
+                return self._bar_commit_result(
+                    event,
+                    reason_code="REALTIME_PRIMARY_OWNERSHIP_INVALID",
+                )
+            context = current_context
 
         stock_code = str(event.get("stock_code") or "").strip()
         stock_name = str(context.get("stock_name") or "").strip()
@@ -611,6 +936,7 @@ class AutoTradeOperationHost(QObject):
             "trigger_bar_key": event["bar_key"],
             "trigger_bar_identity": event["bar_identity"],
             "trigger_canonical_content_hash": event["canonical_content_hash"],
+            "trigger_market_data_source": str(event.get("source") or ""),
         }
         probe_result = probe_execution_stock_for_committed_bar(
             self,

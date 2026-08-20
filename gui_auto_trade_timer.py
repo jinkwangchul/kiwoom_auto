@@ -343,6 +343,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
         rebind_recovery()
 
     realtime_shadow_result: dict[str, object] = {}
+    market_data_cycle_result: dict[str, object] = {}
     try:
         execution_universe_snapshot = project_execution_universe(window)
         sync_realtime_shadow = getattr(
@@ -385,6 +386,35 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             "reason_code": "REALTIME_SHADOW_SYNC_FAILED",
             "error": str(exc),
         }
+    try:
+        prepare_market_data = getattr(window, "prepare_market_data_operation_cycle", None)
+        if callable(prepare_market_data):
+            prepared = prepare_market_data(
+                execution_universe_snapshot,
+                minute_key,
+            )
+            if isinstance(prepared, dict):
+                market_data_cycle_result = dict(prepared)
+    except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="market_data_authority",
+            operation="prepare_operation_cycle",
+            source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+            target_type="MARKET_DATA",
+            target_id="market_data_authority",
+            target_name="Market data authority",
+            reason_code="MARKET_DATA_CYCLE_PREPARATION_FAILED",
+            owner=window,
+            failure_scope="market_data_cycle_preparation",
+        )
+        market_data_cycle_result = {
+            "promoted_count": 0,
+            "reason_code": "MARKET_DATA_CYCLE_PREPARATION_FAILED",
+            "error": str(exc),
+        }
 
     close_result = auto_trade_continue_pending_close_liquidations(window, limit=5)
     close_processed = int(close_result.get("processed", 0) or 0)
@@ -424,6 +454,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             "close_processed": close_processed,
             "close_blocked": close_blocked,
             "realtime_shadow_result": dict(realtime_shadow_result),
+            "market_data_cycle_result": dict(market_data_cycle_result),
             "candle_refresh_result": dict(candle_refresh_result),
             "signal_result": dict(signal_result),
         }

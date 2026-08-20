@@ -26,7 +26,10 @@ else:
 
 from candle_manager import DEFAULT_CANDLES_MAX_COUNT
 from account_funds_foundation import ACCOUNT_AUTHENTICATION_REQUIRED
-from kiwoom_candle_adapter import commit_minute_candles_for_stock
+from kiwoom_candle_adapter import (
+    commit_minute_candles_for_stock,
+    commit_realtime_primary_bar_for_stock,
+)
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
 from event_journal_production import observe_production_exception
@@ -45,6 +48,7 @@ from kiwoom_realtime_fids import (
     REALTIME_SHADOW_FIDS,
 )
 from kiwoom_realtime_shadow import (
+    RealtimeShadowBar,
     RealtimeShadowBarBuilder,
     normalize_realtime_shadow_tick,
 )
@@ -522,6 +526,60 @@ class KiwoomApi(QObject):
     ) -> RealtimeShadowRegistrationSnapshot:
         self._ensure_realtime_shadow_state()
         return self._realtime_shadow_registration
+
+    def commit_realtime_primary_bar(
+        self,
+        bar: RealtimeShadowBar,
+        *,
+        stock_name: str = "",
+    ) -> dict[str, Any]:
+        """Commit and publish a current-session realtime bar from the central API."""
+        self._ensure_realtime_shadow_state()
+        registration = self._realtime_shadow_registration
+        session = self.broker_session_snapshot()
+        if not isinstance(bar, RealtimeShadowBar):
+            return {"ok": False, "changed": False, "reason_code": "INVALID_REALTIME_BAR"}
+        if (
+            not registration.active
+            or bar.stock_code not in registration.target_stock_codes
+            or not session.connected
+            or bar.connection_epoch != registration.connection_epoch
+            or bar.login_session_id != registration.login_session_id
+            or bar.connection_epoch != session.connection_epoch
+            or bar.login_session_id != session.login_session_id
+        ):
+            return {
+                "ok": False,
+                "changed": False,
+                "reason_code": "REALTIME_SESSION_OR_REGISTRATION_INVALID",
+            }
+        commit = commit_realtime_primary_bar_for_stock(
+            bar.stock_code,
+            stock_name,
+            bar,
+        )
+        result = {
+            "ok": commit.ok,
+            "changed": commit.changed,
+            "commit_verified": bool(commit.ok and commit.readback_verified),
+            "canonical_content_hash": commit.canonical_content_hash,
+            "canonical_path": commit.path,
+            "commit_identity": commit.commit_identity,
+            "bar_key": commit.bar_key,
+            "bar_identity": commit.bar_identity,
+            "bar_time": commit.bar_time,
+            "trade_date": commit.trade_date,
+            "error_kind": commit.error_kind,
+            "error": commit.error,
+            "reason_code": (
+                "REALTIME_CANONICAL_COMMITTED"
+                if commit.ok and commit.readback_verified
+                else "REALTIME_CANONICAL_COMMIT_FAILED"
+            ),
+        }
+        if commit.ok and commit.readback_verified and commit.changed and commit.notification is not None:
+            self.bar_committed.emit(commit.notification.to_payload())
+        return result
 
     def sync_realtime_shadow_registration(
         self,

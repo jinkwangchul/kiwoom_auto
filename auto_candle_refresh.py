@@ -19,6 +19,12 @@ from candle_timeframe_aggregation import (
 )
 from gui_auto_trade_runtime import all_registered_stock_dirs, parse_stock_folder_name
 from runtime_io import read_json_dict
+from kiwoom_market_data_authority import (
+    NORMAL_TR_REFRESH,
+    REALTIME_PRIMARY_SKIP,
+    REALTIME_RECONCILIATION,
+    REALTIME_RECONCILIATION_REQUEST,
+)
 
 
 BOOTSTRAP_REQUEST_COUNT = DEFAULT_CANDLES_MAX_COUNT
@@ -28,6 +34,74 @@ REQUEST_SPACING_MS = 1_000
 
 
 RefreshCompletion = Callable[[dict[str, Any]], None]
+
+
+def request_operation_candle_for_stock(
+    window: Any,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    *,
+    operation_cycle_minute_key: str,
+    request_kind: str = NORMAL_TR_REFRESH,
+    reconciliation_minute: str = "",
+    count: int = INCREMENTAL_REQUEST_COUNT,
+    on_terminal: RefreshCompletion | None = None,
+) -> dict[str, Any]:
+    """Use the existing governed opt10080 entrypoint for normal or fallback work."""
+    api = _api_from_host(window)
+    request = getattr(api, "request_minute_candles", None)
+    if not callable(request):
+        result = {"ok": False, "error": "request_minute_candles unavailable"}
+        if callable(on_terminal):
+            on_terminal(dict(result))
+        return result
+    callback_called = False
+    owned_rqname = ""
+
+    def received(result: dict[str, Any]) -> None:
+        nonlocal callback_called
+        if callback_called:
+            return
+        callback_called = True
+        terminal = dict(result) if isinstance(result, dict) else {"ok": False, "error": "malformed result"}
+        terminal_rqname = str(terminal.get("rqname") or "").strip() or owned_rqname
+        complete = getattr(window, "complete_operation_candle_request", None)
+        if terminal_rqname and callable(complete):
+            complete(terminal_rqname)
+        if callable(on_terminal):
+            on_terminal(terminal)
+
+    try:
+        started = request(
+            code,
+            name,
+            interval=1,
+            count=count,
+            max_count=DEFAULT_CANDLES_MAX_COUNT,
+            callback=received,
+        )
+    except Exception as exc:
+        started = {"ok": False, "error": str(exc)}
+    if isinstance(started, dict) and started.get("ok") is True and not callback_called:
+        owned_rqname = str(started.get("rqname") or "").strip()
+        register = getattr(window, "register_operation_candle_request", None)
+        if owned_rqname and callable(register):
+            kwargs = {
+                "stock_code": code,
+                "stock_name": name,
+                "stock_dir": stock_dir,
+                "operation_cycle_minute_key": operation_cycle_minute_key,
+            }
+            if request_kind != NORMAL_TR_REFRESH or reconciliation_minute:
+                kwargs.update(
+                    request_kind=request_kind,
+                    reconciliation_minute=reconciliation_minute,
+                )
+            register(owned_rqname, **kwargs)
+    if isinstance(started, dict) and started.get("ok") is not True and not callback_called:
+        received(started)
+    return dict(started) if isinstance(started, dict) else {"ok": False, "error": "malformed start result"}
 
 
 def _is_refresh_target(stock_dir: Path) -> bool:
@@ -143,6 +217,8 @@ def refresh_operation_candles(
         "failed": 0,
         "bootstrap_requested": 0,
         "incremental_requested": 0,
+        "realtime_skipped": 0,
+        "reconciliation_requested": 0,
         "max_requests_per_cycle": MAX_REQUESTS_PER_CYCLE,
         "request_spacing_ms": REQUEST_SPACING_MS,
     }
@@ -175,71 +251,67 @@ def refresh_operation_candles(
             finish()
             return
         stock_dir, code, name = targets[index]
+        decision = {"decision": "TR_PRIMARY_REFRESH", "request_kind": NORMAL_TR_REFRESH}
+        decide = getattr(window, "market_data_refresh_decision", None)
+        if callable(decide):
+            candidate = decide(code, minute_key)
+            if isinstance(candidate, dict):
+                decision = candidate
+        if decision.get("decision") == REALTIME_PRIMARY_SKIP:
+            summary["realtime_skipped"] += 1
+            QTimer.singleShot(0, lambda: request_next(index + 1))
+            return
+        if (
+            decision.get("decision") == REALTIME_RECONCILIATION
+            and decision.get("request_required") is False
+        ):
+            summary["realtime_skipped"] += 1
+            QTimer.singleShot(0, lambda: request_next(index + 1))
+            return
         bootstrap = code not in completed_codes and not _already_bootstrapped(stock_dir, trade_date, as_of)
-        count = BOOTSTRAP_REQUEST_COUNT if bootstrap else INCREMENTAL_REQUEST_COUNT
+        reconciliation = decision.get("decision") == REALTIME_RECONCILIATION
+        count = INCREMENTAL_REQUEST_COUNT if reconciliation else (
+            BOOTSTRAP_REQUEST_COUNT if bootstrap else INCREMENTAL_REQUEST_COUNT
+        )
         summary["requested"] += 1
-        summary["bootstrap_requested" if bootstrap else "incremental_requested"] += 1
-        callback_called = False
-        owned_rqname = ""
+        if reconciliation:
+            summary["reconciliation_requested"] += 1
+        else:
+            summary["bootstrap_requested" if bootstrap else "incremental_requested"] += 1
 
         def received(result: dict[str, Any]) -> None:
-            nonlocal callback_called, owned_rqname
-            if callback_called:
-                return
-            callback_called = True
-            complete_owned_request = getattr(
-                window,
-                "complete_operation_candle_request",
-                None,
-            )
-            terminal_rqname = (
-                str(result.get("rqname") or "").strip()
-                if isinstance(result, dict)
-                else ""
-            ) or owned_rqname
-            if terminal_rqname and callable(complete_owned_request):
-                complete_owned_request(terminal_rqname)
             if isinstance(result, dict) and result.get("ok") is True:
                 summary["succeeded"] += 1
-                if bootstrap and _has_trade_date_candles(stock_dir, trade_date):
+                if bootstrap and not reconciliation and _has_trade_date_candles(stock_dir, trade_date):
                     completed_codes.add(code)
             else:
                 summary["failed"] += 1
+            if reconciliation:
+                complete_reconciliation = getattr(
+                    window,
+                    "complete_realtime_reconciliation",
+                    None,
+                )
+                if callable(complete_reconciliation):
+                    complete_reconciliation(
+                        code,
+                        str(decision.get("reconciliation_minute") or ""),
+                        stock_dir,
+                        result,
+                    )
             QTimer.singleShot(REQUEST_SPACING_MS, lambda: request_next(index + 1))
 
-        try:
-            started = request(
-                code,
-                name,
-                interval=1,
-                count=count,
-                max_count=DEFAULT_CANDLES_MAX_COUNT,
-                callback=received,
-            )
-        except Exception as exc:
-            received({"ok": False, "error": str(exc)})
-            return
-        if (
-            isinstance(started, dict)
-            and started.get("ok") is True
-            and not callback_called
-        ):
-            owned_rqname = str(started.get("rqname") or "").strip()
-            register_owned_request = getattr(
-                window,
-                "register_operation_candle_request",
-                None,
-            )
-            if owned_rqname and callable(register_owned_request):
-                register_owned_request(
-                    owned_rqname,
-                    stock_code=code,
-                    stock_name=name,
-                    stock_dir=stock_dir,
-                    operation_cycle_minute_key=minute_key,
-                )
-        if isinstance(started, dict) and started.get("ok") is not True and not callback_called:
-            received(started)
+        request_operation_candle_for_stock(
+            window,
+            stock_dir,
+            code,
+            name,
+            operation_cycle_minute_key=minute_key,
+            request_kind=str(decision.get("request_kind") or NORMAL_TR_REFRESH),
+            reconciliation_minute=str(decision.get("reconciliation_minute") or ""),
+            count=count,
+            on_terminal=received,
+        )
 
     request_next(0)
     return dict(summary)

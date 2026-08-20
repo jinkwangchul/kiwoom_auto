@@ -9,8 +9,10 @@ them through the existing candle_manager helpers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
+import math
 from typing import Any
 
 from candle_manager import (
@@ -25,6 +27,7 @@ from stock_repository import StockRepository
 
 BAR_COMMITTED = "BAR_COMMITTED"
 OPT10080_SOURCE = "opt10080"
+REALTIME_PRIMARY_SOURCE = "realtime_primary"
 MINUTE_TIMEFRAME = 1
 
 
@@ -46,6 +49,7 @@ class BarCommittedNotification:
     rqname: str = ""
     trcode: str = ""
     connection_epoch: int = 0
+    login_session_id: str = ""
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -193,50 +197,23 @@ def normalize_opt10080_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return untimed_candles + timed_candles
 
 
-def commit_minute_candles_for_stock(
+def _commit_normalized_minute_candles_for_stock(
     code: str,
     name: str,
-    rows: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
     max_count: int = DEFAULT_CANDLES_MAX_COUNT,
     *,
+    source: str,
+    identity_time: datetime,
     rqname: str = "",
-    trcode: str = "opt10080",
+    trcode: str = "",
     connection_epoch: int = 0,
+    login_session_id: str = "",
 ) -> CanonicalMinuteCandleCommitResult:
-    """Merge opt10080 rows and return a verified canonical commit result."""
     stock_code = str(code or "").strip()
     stock_name = str(name or "").strip()
     stock_dir = StockRepository().resolve_stock_dir(stock_code, stock_name)
-    incoming = normalize_opt10080_rows(rows)
-    if not incoming:
-        return CanonicalMinuteCandleCommitResult(
-            ok=False,
-            changed=False,
-            readback_verified=False,
-            path=str(stock_dir / "candles.json"),
-            saved_count=0,
-            canonical_content_hash="",
-            error_kind="NO_VALID_CANDLES",
-            error="opt10080 response contains no valid candles",
-        )
-
-    incoming_times = [
-        bar_time
-        for candle in incoming
-        if (bar_time := candle_market_datetime(candle)) is not None
-    ]
-    if not incoming_times:
-        return CanonicalMinuteCandleCommitResult(
-            ok=False,
-            changed=False,
-            readback_verified=False,
-            path=str(stock_dir / "candles.json"),
-            saved_count=0,
-            canonical_content_hash="",
-            error_kind="NO_VALID_CANDLE_TIME",
-            error="opt10080 response contains no valid candle time",
-        )
-    target_date = max(incoming_times).date()
+    target_date = identity_time.date()
 
     with candle_commit_lock(stock_dir):
         merged_by_minute: dict[Any, dict[str, Any]] = {}
@@ -262,9 +239,14 @@ def commit_minute_candles_for_stock(
         )
 
     try:
+        identity_candle = next(
+            candle
+            for candle in saved
+            if candle_market_datetime(candle) == identity_time
+        )
         trade_date, bar_time, bar_key, bar_identity, commit_identity = _bar_commit_identity(
             stock_code,
-            saved[-1],
+            identity_candle,
             commit.canonical_content_hash,
         )
     except Exception as exc:
@@ -294,10 +276,11 @@ def commit_minute_candles_for_stock(
             canonical_content_hash=commit.canonical_content_hash,
             canonical_path=commit.path,
             saved_count=commit.saved_count,
-            source=OPT10080_SOURCE,
+            source=source,
             rqname=str(rqname or ""),
-            trcode=str(trcode or "opt10080"),
+            trcode=str(trcode or ""),
             connection_epoch=int(connection_epoch or 0),
+            login_session_id=str(login_session_id or ""),
         )
     return CanonicalMinuteCandleCommitResult(
         ok=True,
@@ -312,6 +295,110 @@ def commit_minute_candles_for_stock(
         bar_time=bar_time,
         trade_date=trade_date,
         notification=notification,
+    )
+
+
+def commit_minute_candles_for_stock(
+    code: str,
+    name: str,
+    rows: list[dict[str, Any]],
+    max_count: int = DEFAULT_CANDLES_MAX_COUNT,
+    *,
+    rqname: str = "",
+    trcode: str = "opt10080",
+    connection_epoch: int = 0,
+) -> CanonicalMinuteCandleCommitResult:
+    """Merge opt10080 rows and return a verified canonical commit result."""
+    stock_dir = StockRepository().resolve_stock_dir(str(code or "").strip(), str(name or "").strip())
+    incoming = normalize_opt10080_rows(rows)
+    if not incoming:
+        return CanonicalMinuteCandleCommitResult(
+            ok=False,
+            changed=False,
+            readback_verified=False,
+            path=str(stock_dir / "candles.json"),
+            saved_count=0,
+            canonical_content_hash="",
+            error_kind="NO_VALID_CANDLES",
+            error="opt10080 response contains no valid candles",
+        )
+    incoming_times = [
+        bar_time
+        for candle in incoming
+        if (bar_time := candle_market_datetime(candle)) is not None
+    ]
+    if not incoming_times:
+        return CanonicalMinuteCandleCommitResult(
+            ok=False,
+            changed=False,
+            readback_verified=False,
+            path=str(stock_dir / "candles.json"),
+            saved_count=0,
+            canonical_content_hash="",
+            error_kind="NO_VALID_CANDLE_TIME",
+            error="opt10080 response contains no valid candle time",
+        )
+    return _commit_normalized_minute_candles_for_stock(
+        code,
+        name,
+        incoming,
+        max_count=max_count,
+        source=OPT10080_SOURCE,
+        identity_time=max(incoming_times),
+        rqname=rqname,
+        trcode=trcode,
+        connection_epoch=connection_epoch,
+    )
+
+
+def commit_realtime_primary_bar_for_stock(
+    code: str,
+    name: str,
+    bar: object,
+    max_count: int = DEFAULT_CANDLES_MAX_COUNT,
+) -> CanonicalMinuteCandleCommitResult:
+    """Commit one verified complete realtime bar through the Phase 6 boundary."""
+    stock_code = str(code or "").strip()
+    stock_dir = StockRepository().resolve_stock_dir(stock_code, str(name or "").strip())
+    try:
+        timeframe = getattr(bar, "timeframe_minutes")
+        volume_complete = getattr(bar, "volume_complete")
+        bar_time = datetime.fromisoformat(str(getattr(bar, "bar_time"))).replace(second=0, microsecond=0)
+        values = {
+            field: getattr(bar, field)
+            for field in ("open", "high", "low", "close", "volume")
+        }
+        if timeframe != 1 or volume_complete is not True or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values.values()
+        ) or values["volume"] < 0 or str(getattr(bar, "trade_date", "")) != bar_time.date().isoformat():
+            raise ValueError("realtime primary bar requires valid complete 1m OHLCV")
+    except Exception as exc:
+        return CanonicalMinuteCandleCommitResult(
+            ok=False,
+            changed=False,
+            readback_verified=False,
+            path=str(stock_dir / "candles.json"),
+            saved_count=0,
+            canonical_content_hash="",
+            error_kind="INVALID_REALTIME_BAR",
+            error=str(exc),
+        )
+    candle = {
+        "time": bar_time.strftime("%Y%m%d%H%M%S"),
+        **values,
+    }
+    return _commit_normalized_minute_candles_for_stock(
+        stock_code,
+        name,
+        [candle],
+        max_count=max_count,
+        source=REALTIME_PRIMARY_SOURCE,
+        identity_time=bar_time,
+        connection_epoch=int(getattr(bar, "connection_epoch", 0) or 0),
+        login_session_id=str(getattr(bar, "login_session_id", "") or ""),
     )
 
 
