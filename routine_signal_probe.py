@@ -31,7 +31,11 @@ from candle_timeframe_aggregation import (
     completed_timeframe_candles,
     parse_market_datetime,
 )
-from gui_auto_trade_runtime import all_registered_stock_dirs
+from execution_universe import (
+    ExecutionUniverseSnapshot,
+    execution_ready_entries,
+    project_execution_universe,
+)
 from event_journal_production import (
     observe_owner_failure_transition,
     observe_production_exception,
@@ -563,7 +567,12 @@ def probe_routine_for_stock(
     return result
 
 
-def probe_selected_routine_once(window: Any, tick_key: str = "") -> dict[str, int]:
+def probe_selected_routine_once(
+    window: Any,
+    tick_key: str = "",
+    *,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
+) -> dict[str, int]:
     routine_dir_func = getattr(window, "current_selected_routine_dir", None)
     routine_name_func = getattr(window, "current_selected_routine_name", None)
 
@@ -612,7 +621,19 @@ def probe_selected_routine_once(window: Any, tick_key: str = "") -> dict[str, in
     skip = 0
     queued = 0
 
+    snapshot = execution_universe_snapshot or project_execution_universe(
+        window,
+        stock_dirs=stock_dirs,
+    )
+    ready_stock_dirs = {
+        str(entry.stock_dir.resolve())
+        for entry in execution_ready_entries(snapshot)
+    }
+
     for stock_dir in stock_dirs:
+        if str(Path(stock_dir).resolve()) not in ready_stock_dirs:
+            skip += 1
+            continue
         checked += 1
         result = probe_routine_for_stock(routine_module, routine_name, Path(stock_dir), tick_key)
         signal = str(result.get("signal", "") or "").upper()
@@ -633,6 +654,8 @@ def probe_selected_routine_once(window: Any, tick_key: str = "") -> dict[str, in
 def probe_all_enabled_routine_stocks_once(
     _window: Any = None,
     tick_key: str = "",
+    *,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
 ) -> dict[str, int]:
     """Probe all enabled central stocks using each stock's own routine."""
     definitions = {
@@ -647,7 +670,9 @@ def probe_all_enabled_routine_stocks_once(
     skip = 0
     queued = 0
 
-    for stock_dir in all_registered_stock_dirs():
+    snapshot = execution_universe_snapshot or project_execution_universe(_window)
+    for entry in execution_ready_entries(snapshot):
+        stock_dir = entry.stock_dir
         state = _read_json_dict(stock_dir / "state.json")
         if not _is_trade_watch_target(state):
             continue

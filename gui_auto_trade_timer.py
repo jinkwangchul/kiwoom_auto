@@ -7,7 +7,6 @@ gui_auto_trade_timer.py
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,10 @@ from gui_auto_trade_ats_ops import auto_trade_continue_pending_manual_ats_liquid
 from event_journal_production import (
     observe_owner_failure_transition,
     observe_production_exception,
+)
+from execution_universe import (
+    ExecutionUniverseSnapshot,
+    project_execution_universe,
 )
 
 try:
@@ -57,52 +60,34 @@ def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
     return result
 
 
-def _read_json_dict(path: Path) -> dict:
+def auto_trade_signal_probe_only_active(
+    window,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
+) -> bool:
     try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        snapshot = execution_universe_snapshot or project_execution_universe(window)
     except Exception:
-        return {}
-
-
-def auto_trade_signal_probe_only_active(window) -> bool:
-    try:
-        from gui_auto_trade_runtime import all_registered_stock_dirs
-        stock_dirs = all_registered_stock_dirs()
-    except Exception:
-        stock_dirs = []
-
-    for stock_dir in stock_dirs:
-        state = _read_json_dict(Path(stock_dir) / "state.json")
-        if state.get("signal_probe_only") is True:
+        return False
+    for entry in snapshot.entries:
+        if entry.execution_ready and entry.signal_probe_only:
             return True
     return False
 
 
-def auto_trade_real_execution_active(window) -> bool:
+def auto_trade_real_execution_active(
+    window,
+    execution_universe_snapshot: ExecutionUniverseSnapshot | None = None,
+) -> bool:
     try:
-        from gui_auto_trade_runtime import all_registered_stock_dirs
-        stock_dirs = all_registered_stock_dirs()
+        snapshot = execution_universe_snapshot or project_execution_universe(window)
     except Exception:
-        stock_dirs = []
-
-    for stock_dir in stock_dirs:
-        state = _read_json_dict(Path(stock_dir) / "state.json")
-        if state.get("signal_probe_only") is True:
-            continue
-        if state.get("review_required") is True:
-            continue
-        if str(state.get("status") or "").strip().upper() in {
-            "REVIEW_REQUIRED",
-            "REVIEW",
-            "EMERGENCY_STOPPED",
-            "EMERGENCY_STOP",
-            "EMERGENCY",
-        }:
-            continue
-        if state.get("trade_enabled") is True and state.get("real_trade_enabled") is True:
+        return False
+    for entry in snapshot.entries:
+        if (
+            entry.execution_ready
+            and entry.real_trade_enabled
+            and not entry.signal_probe_only
+        ):
             return True
     return False
 
@@ -185,7 +170,12 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
             )
         return signal_result
     try:
-        probe_result = probe_all_enabled_routine_stocks_once(window, minute_key)
+        execution_universe_snapshot = project_execution_universe(window)
+        probe_result = probe_all_enabled_routine_stocks_once(
+            window,
+            minute_key,
+            execution_universe_snapshot=execution_universe_snapshot,
+        )
         logged_count = int(probe_result.get("logged", 0) or 0)
         error_count = int(probe_result.get("error", 0) or 0)
         if logged_count > 0 or error_count > 0:
@@ -196,8 +186,8 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
         if (
             callable(consume_pending_routine_signals_dry_run)
             and (
-                auto_trade_signal_probe_only_active(window)
-                or auto_trade_real_execution_active(window)
+                auto_trade_signal_probe_only_active(window, execution_universe_snapshot)
+                or auto_trade_real_execution_active(window, execution_universe_snapshot)
             )
         ):
             consumer_result = consume_pending_routine_signals_dry_run(
@@ -247,7 +237,7 @@ def _auto_trade_run_signal_cycle(window, minute_key: str) -> dict[str, object]:
                     "error_count": errors,
                 },
             )
-            if auto_trade_real_execution_active(window):
+            if auto_trade_real_execution_active(window, execution_universe_snapshot):
                 auto_executor = getattr(
                     window,
                     "auto_process_executable_orders_for_real_trade",

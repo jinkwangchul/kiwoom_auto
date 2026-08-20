@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -514,10 +514,30 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         with (
             patch.object(auto_trade_timer, "probe_all_enabled_routine_stocks_once", probe),
             patch.object(auto_trade_timer, "consume_pending_routine_signals_dry_run", None),
+            patch.object(
+                auto_trade_timer,
+                "auto_trade_current_time_policy_minute_key",
+                return_value="2026-07-25 18:01",
+            ),
+            patch.object(
+                auto_trade_timer,
+                "auto_trade_continue_pending_close_liquidations",
+                return_value={"processed": 0, "blocked": 0},
+            ),
+            patch.object(
+                auto_trade_timer,
+                "auto_trade_continue_pending_manual_ats_liquidations",
+                return_value={"processed": 0, "failed": 0},
+            ),
+            patch("execution_universe.all_registered_stock_dirs", return_value=[]),
         ):
             auto_trade_timer.auto_trade_on_time_policy_timer_tick(window)
 
-        probe.assert_called_once_with(window, "2026-07-25 18:01")
+        probe.assert_called_once_with(
+            window,
+            "2026-07-25 18:01",
+            execution_universe_snapshot=ANY,
+        )
         self.assertEqual("", window.current_selected_routine_name())
 
     def test_runtime_file_signature_tracks_central_stocks_without_routine_scope(self) -> None:

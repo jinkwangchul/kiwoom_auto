@@ -508,15 +508,24 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = TimerWindow(routine_dir)
+            window._current_session_operation_participant_stock_codes = {"003550"}
             consumer = Mock(return_value={"summary": {"signals_checked": 1, "orders_created": 1}})
 
-            with patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
+            with patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
                 self.assertTrue(auto_trade_real_execution_active(window))
             with patch.object(gui_auto_trade_timer, "probe_all_enabled_routine_stocks_once", return_value={"logged": 0, "error": 0}), patch.object(
                 gui_auto_trade_timer,
                 "consume_pending_routine_signals_dry_run",
                 consumer,
-            ), patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
+            ), patch.object(
+                gui_auto_trade_timer,
+                "auto_trade_continue_pending_close_liquidations",
+                return_value={"processed": 0, "blocked": 0},
+            ), patch.object(
+                gui_auto_trade_timer,
+                "auto_trade_continue_pending_manual_ats_liquidations",
+                return_value={"processed": 0, "failed": 0},
+            ), patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
                 auto_trade_on_time_policy_timer_tick(window)
 
             consumer.assert_called_once_with(
@@ -552,7 +561,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("gui_auto_trade_runtime.all_registered_stock_dirs", return_value=[stock_dir]):
+            with patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
                 self.assertFalse(auto_trade_real_execution_active(Window(routine_dir)))
 
     def test_persisted_trade_enabled_does_not_mark_current_session_started_before_recovery(self) -> None:

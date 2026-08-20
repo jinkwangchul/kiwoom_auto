@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import auto_candle_refresh
 from candle_manager import load_candles, save_candles
@@ -208,7 +208,11 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             probe.assert_not_called()
             callbacks[0]({"completed": True})
 
-        probe.assert_called_once_with(host, "2026-08-10 10:00")
+        probe.assert_called_once_with(
+            host,
+            "2026-08-10 10:00",
+            execution_universe_snapshot=ANY,
+        )
         self.assertTrue(result["signal_result"]["deferred_for_candle_refresh"])
 
 

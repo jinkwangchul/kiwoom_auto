@@ -75,9 +75,17 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
                 calls.append((routine_name, stock_dir))
                 return {"signal": "NONE"}
 
+            window = SimpleNamespace(
+                _current_session_operation_participant_stock_codes={
+                    "111111",
+                    "222222",
+                }
+            )
+            window.startup_recovery_session_ready = lambda refresh=False: True
+
             with (
                 patch(
-                    "routine_signal_probe.all_registered_stock_dirs",
+                    "execution_universe.all_registered_stock_dirs",
                     return_value=[stock_a, stock_b],
                 ),
                 patch(
@@ -94,7 +102,7 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
                 ),
             ):
                 result = probe_all_enabled_routine_stocks_once(
-                    SimpleNamespace(),
+                    window,
                     "tick",
                 )
 
@@ -104,6 +112,54 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
         )
         self.assertEqual(
             {"checked": 2, "logged": 2, "error": 0, "skip": 0, "queued": 0},
+            result,
+        )
+
+    def test_probe_ignores_stale_trade_enabled_without_session_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "111111_A"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                '{"status":"MONITORING","trade_enabled":true}',
+                encoding="utf-8",
+            )
+            (stock_dir / "config.json").write_text(
+                (
+                    '{"assigned_routine_instance_id":"inst-a",'
+                    '"routine_definition_id":"def-a",'
+                    '"routine_instance_name":"루틴 A"}'
+                ),
+                encoding="utf-8",
+            )
+            window = SimpleNamespace(
+                _current_session_operation_participant_stock_codes=set()
+            )
+            window.startup_recovery_session_ready = lambda refresh=False: True
+
+            with (
+                patch(
+                    "execution_universe.all_registered_stock_dirs",
+                    return_value=[stock_dir],
+                ),
+                patch(
+                    "routine_signal_probe.load_routine_definitions",
+                    return_value=[
+                        SimpleNamespace(
+                            definition_id="def-a",
+                            display_name="정의 A",
+                            package_dir=root / "routine-a",
+                            package_enabled=True,
+                        )
+                    ],
+                ),
+                patch("routine_signal_probe.probe_routine_for_stock") as probe,
+            ):
+                result = probe_all_enabled_routine_stocks_once(window, "tick")
+
+        probe.assert_not_called()
+        self.assertEqual(
+            {"checked": 0, "logged": 0, "error": 0, "skip": 0, "queued": 0},
             result,
         )
 
