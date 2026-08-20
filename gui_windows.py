@@ -763,9 +763,7 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
     MODE_NONE = "NONE"
     MODE_UNIFIED = "UNIFIED"
     MODE_SEGMENTED = "SEGMENTED"
-    EARLY_CLOSE_COLOR = "#2563EB"
-    SEGMENT_CLOSE_COLOR = "#DC2626"
-
+    ROUTINE_CLOSE_COLOR = "#DC2626"
     def __init__(
         self,
         owner: QWidget,
@@ -780,7 +778,7 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         self._loading_policy = True
         self._last_save_error = ""
         self.setObjectName("routineLimitResponseSettingsSurface")
-        self.setWindowTitle("루틴 한도대응 설정")
+        self.setWindowTitle("한도대응")
         self.setModal(False)
         self.setMinimumSize(560, 360)
         self.resize(560, 360)
@@ -833,10 +831,18 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
 
         segment_settings = QWidget()
         segment_layout = QHBoxLayout(segment_settings)
-        segment_layout.setContentsMargins(12, 0, 0, 0)
-        segment_layout.setSpacing(4)
-        self.segment_close_title_label = QLabel("※구간마감:")
+        segment_layout.setContentsMargins(0, 0, 0, 0)
+        segment_layout.setSpacing(3)
+        badge_metrics = QFontMetrics(self.font())
+        self.segment_close_title_label = QLabel("※구간마감설정:")
+        self.segment_close_title_label.setFixedWidth(
+            badge_metrics.horizontalAdvance("※구간마감설정:") + 8
+        )
         segment_layout.addWidget(self.segment_close_title_label)
+        fixed_badge_width = max(
+            badge_metrics.horizontalAdvance(text)
+            for text in ("조기마감", "즉시청산")
+        ) + 20
         self.early_close_percent_combo = self._make_percent_combo(
             ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS
         )
@@ -845,12 +851,16 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         )
         segment_layout.addWidget(self.early_close_percent_combo)
         segment_layout.addWidget(QLabel("▷"))
-        self.segment_early_close_label = QLabel("조기마감")
-        self.segment_early_close_label.setStyleSheet(
-            f"QLabel {{ color: {self.SEGMENT_CLOSE_COLOR}; font-weight: bold; }}"
+        self.segment_early_close_label = self._make_fixed_action_badge(
+            "조기마감",
+            fixed_badge_width,
+            color=self.ROUTINE_CLOSE_COLOR,
         )
         segment_layout.addWidget(self.segment_early_close_label)
-        segment_layout.addWidget(QLabel("|"))
+        segment_layout.addStretch(1)
+        self.segment_close_separator_label = QLabel("|")
+        segment_layout.addWidget(self.segment_close_separator_label)
+        segment_layout.addStretch(1)
         self.immediate_liquidation_percent_combo = self._make_percent_combo(
             ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS
         )
@@ -859,9 +869,11 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         )
         segment_layout.addWidget(self.immediate_liquidation_percent_combo)
         segment_layout.addWidget(QLabel("▷"))
-        self.segment_immediate_liquidation_label = QLabel("즉시청산")
+        self.segment_immediate_liquidation_label = self._make_fixed_action_badge(
+            "즉시청산",
+            fixed_badge_width,
+        )
         segment_layout.addWidget(self.segment_immediate_liquidation_label)
-        segment_layout.addStretch(1)
         root.addWidget(segment_settings)
 
         self.button_box = QDialogButtonBox(
@@ -946,12 +958,30 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         self._apply_action_badge_style(action_badge)
         return widget
 
+    @staticmethod
+    def _make_fixed_action_badge(
+        text: str,
+        width: int,
+        *,
+        color: str = "#374151",
+    ) -> QLabel:
+        badge = QLabel(text)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setFixedSize(width, 30)
+        badge.setStyleSheet(
+            "QLabel {"
+            f" color: {color}; border: 1px solid {color};"
+            " border-radius: 3px; background: palette(base);"
+            " margin-top: 4px; padding: 0px; }"
+        )
+        return badge
+
     def _make_percent_combo(self, percents: tuple[int, ...]) -> _TextOnlyPopupComboBox:
         combo = _TextOnlyPopupComboBox()
         combo.addItems([f"{percent}%" for percent in percents])
         metrics = QFontMetrics(self.font())
-        combo.setFixedSize(metrics.horizontalAdvance("100%") + 8, 26)
-        combo.setPopupMinimumWidth(max(64, metrics.horizontalAdvance("100%") + 28))
+        combo.setFixedSize(metrics.horizontalAdvance("90%") + 8, 26)
+        combo.setPopupMinimumWidth(max(64, metrics.horizontalAdvance("90%") + 28))
         combo.view().setTextElideMode(Qt.ElideNone)
         combo.setCursor(Qt.PointingHandCursor)
         combo.setStyleSheet(
@@ -965,17 +995,18 @@ class _RoutineLimitResponseSettingsSurface(QDialog):
         return combo
 
     def _apply_action_badge_style(self, badge: QPushButton) -> None:
-        if badge.text() == "조기마감":
-            color = self.EARLY_CLOSE_COLOR
-        elif badge.text() == "구간마감":
-            color = self.SEGMENT_CLOSE_COLOR
-        else:
-            color = "#374151"
+        if badge.text() not in {"조기마감", "구간마감"}:
+            badge.setStyleSheet("")
+            return
+        color = self.ROUTINE_CLOSE_COLOR
         badge.setStyleSheet(
             "QPushButton {"
             f" color: {color}; border: 1px solid {color};"
             " border-radius: 3px; background: transparent; padding: 0px;"
             " font-weight: bold; }"
+            "QPushButton:disabled {"
+            " color: #9CA3AF; border-color: #D1D5DB;"
+            " background: transparent; }"
         )
 
     def _cycle_strategy_action_badge(self, key: str) -> None:

@@ -163,9 +163,13 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             self.assertFalse(surface.segmented_checkbox.isChecked())
             self.assertTrue(surface.unified_strategy_row.isEnabled())
             self.assertFalse(surface.profit_strategy_row.isEnabled())
+            self.assertFalse(
+                surface.strategy_action_badges["profit"].isEnabled()
+            )
+            self.assertFalse(surface.strategy_action_badges["loss"].isEnabled())
             owner.deleteLater()
 
-    def test_action_cycle_and_color_contract(self) -> None:
+    def test_action_cycle_and_routine_close_color_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repository = self._repository(root)
@@ -173,10 +177,82 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             owner, surface = self._surface(repository)
             badge = surface.strategy_action_badges["unified"]
 
-            self.assertIn("#2563EB", badge.styleSheet())
-            self.assertIn("#DC2626", surface.segment_early_close_label.styleSheet())
+            self.assertIn("#DC2626", badge.styleSheet())
+            self.assertIn(
+                "#DC2626",
+                surface.strategy_action_badges["profit"].styleSheet(),
+            )
+            loss_badge = surface.strategy_action_badges["loss"]
+            loss_badge.setText("조기마감")
+            surface._apply_action_badge_style(loss_badge)
+            self.assertIn("#DC2626", loss_badge.styleSheet())
             self.assertNotIn("green", surface.styleSheet().lower())
-            self.assertEqual("※구간마감:", surface.segment_close_title_label.text())
+            self.assertEqual(
+                "※구간마감설정:",
+                surface.segment_close_title_label.text(),
+            )
+            self.assertEqual(
+                0,
+                surface.segment_close_title_label.parentWidget()
+                .layout()
+                .contentsMargins()
+                .left(),
+            )
+            self.assertEqual(
+                3,
+                surface.segment_close_title_label.parentWidget()
+                .layout()
+                .spacing(),
+            )
+            self.assertEqual(560, surface.minimumWidth())
+            self.assertEqual(
+                surface.fontMetrics().horizontalAdvance("※구간마감설정:") + 8,
+                surface.segment_close_title_label.width(),
+            )
+            expected_ratio_width = surface.fontMetrics().horizontalAdvance("90%") + 8
+            expected_popup_width = max(
+                64,
+                surface.fontMetrics().horizontalAdvance("90%") + 28,
+            )
+            self.assertEqual(
+                expected_ratio_width,
+                surface.early_close_percent_combo.width(),
+            )
+            self.assertEqual(
+                expected_ratio_width,
+                surface.immediate_liquidation_percent_combo.width(),
+            )
+            self.assertEqual(
+                expected_popup_width,
+                surface.early_close_percent_combo.view().minimumWidth(),
+            )
+            self.assertEqual(
+                expected_popup_width,
+                surface.immediate_liquidation_percent_combo.view().minimumWidth(),
+            )
+            segment_layout = surface.segment_close_title_label.parentWidget().layout()
+            self.assertEqual(1, segment_layout.stretch(4))
+            self.assertIs(
+                surface.segment_close_separator_label,
+                segment_layout.itemAt(5).widget(),
+            )
+            self.assertEqual(1, segment_layout.stretch(6))
+            self.assertIn(
+                "#DC2626",
+                surface.segment_early_close_label.styleSheet(),
+            )
+            self.assertNotIn(
+                "#2563EB",
+                surface.segment_early_close_label.styleSheet(),
+            )
+            self.assertIn(
+                "margin-top: 4px",
+                surface.segment_early_close_label.styleSheet(),
+            )
+            self.assertEqual(
+                surface.segment_early_close_label.size(),
+                surface.segment_immediate_liquidation_label.size(),
+            )
             self.assertEqual("조기마감", surface.segment_early_close_label.text())
             self.assertEqual(
                 "즉시청산",
@@ -184,12 +260,15 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             )
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("즉시청산", badge.text())
+            self.assertNotIn("#DC2626", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("구간마감", badge.text())
             self.assertIn("#DC2626", badge.styleSheet())
             surface._cycle_strategy_action_badge("unified")
             self.assertEqual("조기마감", badge.text())
-            self.assertIn("#2563EB", badge.styleSheet())
+            self.assertIn("#DC2626", badge.styleSheet())
+            for action_badge in surface.strategy_action_badges.values():
+                self.assertNotIn("#2563EB", action_badge.styleSheet())
             owner.deleteLater()
 
     def test_threshold_options_preserve_or_raise_immediate_value(self) -> None:
@@ -353,7 +432,7 @@ class RoutineLimitResponseSettingsTest(unittest.TestCase):
             surfaces = owner._routine_limit_response_settings_surfaces
             self.assertEqual(3, len(surfaces))
             for surface in surfaces.values():
-                self.assertEqual("루틴 한도대응 설정", surface.windowTitle())
+                self.assertEqual("한도대응", surface.windowTitle())
                 surface.close()
             owner.deleteLater()
 

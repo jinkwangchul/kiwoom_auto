@@ -70,6 +70,7 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
         self._write(self.fills, {"fills": []})
         self._set_position(101)
         self.close_calls = []
+        self.pnl_profit = 10
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -110,7 +111,7 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
         self._write(self.stock_dir / "state.json", state)
         return {"ok": True, "reason": ""}
 
-    def _coordinator(self):
+    def _coordinator(self, *, operation_policy_reader=None, close_backend=None):
         return RoutineLimitResponseCoordinator(
             project_root=self.root,
             positions_path=self.positions,
@@ -119,9 +120,14 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
             broker_holdings_path=self.holdings,
             ownership=self.routine_ownership,
             buffer_ownership=self.buffer_ownership,
-            close_backend=self._close_backend,
+            close_backend=close_backend or self._close_backend,
             pnl_projector=lambda codes, **_kwargs: {
-                code: {"available": True, "cumulative_profit": 10, "cumulative_rate": 1, "open_cost": 101}
+                code: {
+                    "available": True,
+                    "cumulative_profit": self.pnl_profit,
+                    "cumulative_rate": 1 if self.pnl_profit >= 0 else -1,
+                    "open_cost": 101,
+                }
                 for code in codes
             },
             completion_projector=lambda: {
@@ -132,7 +138,7 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
             },
             instance_reader=lambda routine_id: self.instance if routine_id == ROUTINE else None,
             participant_reader=lambda _window: [CODE],
-            operation_policy_reader=lambda: {"early_close": {"method": "현재가", "offset_ticks": 1}},
+            operation_policy_reader=operation_policy_reader,
             recovery_snapshot_reader=lambda: self.context,
         )
 
@@ -144,15 +150,77 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
     def _trigger(side="BUY"):
         return {"position_committed": True, "side": side, "code": CODE, "execution_identity_source": "BROKER_EXECUTION", "execution_identity": "EXEC-1"}
 
-    def test_normal_early_close_uses_environment_policy_and_stock_scope(self) -> None:
+    def test_unified_early_close_uses_routine_close_and_stock_scope(self) -> None:
         result = self._coordinator().run(object(), buffer_result=self._buffer_clear(), trigger=self._trigger())
         self.assertTrue(result["ownership_claimed"])
         self.assertTrue(result["early_close_requested"])
         self.assertEqual(1, len(self.close_calls))
         call = self.close_calls[0]
-        self.assertEqual("현재가", call["requested_policy"])
+        self.assertEqual(POLICY_ROUTINE_CLOSE, call["requested_policy"])
         self.assertEqual("STOCK", call["target_scope"])
-        self.assertEqual({"offset_ticks": 1}, call["extra_policy"])
+        self.assertEqual({}, call["extra_policy"])
+
+    def test_segmented_profit_early_close_uses_routine_close(self) -> None:
+        self.policy["application_mode"] = "SEGMENTED"
+        self.policy["strategies"]["profit"]["response_mode"] = "조기마감"
+
+        result = self._coordinator().run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        self.assertEqual("profit", result["selected_strategy"])
+        self.assertEqual(POLICY_ROUTINE_CLOSE, self.close_calls[0]["requested_policy"])
+        self.assertEqual({}, self.close_calls[0]["extra_policy"])
+
+    def test_segmented_loss_early_close_uses_routine_close(self) -> None:
+        self.policy["application_mode"] = "SEGMENTED"
+        self.policy["strategies"]["loss"]["response_mode"] = "조기마감"
+        self.pnl_profit = -10
+
+        result = self._coordinator().run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        self.assertEqual("loss", result["selected_strategy"])
+        self.assertEqual(POLICY_ROUTINE_CLOSE, self.close_calls[0]["requested_policy"])
+        self.assertEqual({}, self.close_calls[0]["extra_policy"])
+
+    def test_environment_market_policy_is_not_read_for_routine_early(self) -> None:
+        reader = mock.Mock(
+            return_value={"early_close": {"method": "시장가", "offset_ticks": 3}}
+        )
+
+        self._coordinator(operation_policy_reader=reader).run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        reader.assert_not_called()
+        self.assertEqual(POLICY_ROUTINE_CLOSE, self.close_calls[0]["requested_policy"])
+        self.assertEqual({}, self.close_calls[0]["extra_policy"])
+
+    def test_environment_current_price_policy_is_not_read_for_routine_early(self) -> None:
+        reader = mock.Mock(
+            return_value={"early_close": {"method": "현재가", "offset_ticks": 1}}
+        )
+
+        self._coordinator(operation_policy_reader=reader).run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        reader.assert_not_called()
+        self.assertEqual(POLICY_ROUTINE_CLOSE, self.close_calls[0]["requested_policy"])
+        self.assertEqual({}, self.close_calls[0]["extra_policy"])
+
+    def test_operation_policy_reader_exception_cannot_block_routine_early(self) -> None:
+        reader = mock.Mock(side_effect=RuntimeError("must not be called"))
+
+        result = self._coordinator(operation_policy_reader=reader).run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        reader.assert_not_called()
+        self.assertTrue(result["early_close_requested"])
+        self.assertEqual(POLICY_ROUTINE_CLOSE, self.close_calls[0]["requested_policy"])
 
     def test_buffer_uncertain_blocks_routine_and_routine_ownership_blocks_stock(self) -> None:
         blocked = self._coordinator().run(
@@ -229,6 +297,78 @@ class RoutineLimitResponseRuntimeTests(unittest.TestCase):
         self.assertEqual(POLICY_MARKET, self.close_calls[1]["requested_policy"])
         snapshot = self.routine_ownership.read_snapshot()["snapshot"]
         self.assertEqual(INTENT_IMMEDIATE, snapshot["events"][first["event_id"]]["response_intent"])
+
+    def test_duplicate_evaluation_does_not_reissue_durable_early(self) -> None:
+        coordinator = self._coordinator()
+        first = coordinator.run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+        self.assertTrue(first["early_close_requested"])
+        self.assertEqual(1, len(self.close_calls))
+
+        duplicate = coordinator.run(
+            object(),
+            buffer_result=self._buffer_clear(),
+            trigger=self._trigger(side="SELL"),
+        )
+
+        self.assertEqual(first["event_id"], duplicate["event_id"])
+        self.assertTrue(duplicate["settled"])
+        self.assertFalse(duplicate["early_close_requested"])
+        self.assertEqual(1, len(self.close_calls))
+
+    def test_legacy_environment_early_command_is_not_overwritten_or_reissued(self) -> None:
+        coordinator = self._coordinator()
+        first = coordinator.run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+        state_path = self.stock_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["early_close_method"] = "현재가"
+        state["legacy_extra_policy"] = {"offset_ticks": 1}
+        self._write(state_path, state)
+        durable_before = state_path.read_bytes()
+        self.close_calls.clear()
+
+        resumed = coordinator.run(
+            object(),
+            buffer_result=self._buffer_clear(),
+            trigger=self._trigger(side="SELL"),
+        )
+
+        self.assertEqual(first["event_id"], resumed["event_id"])
+        self.assertTrue(resumed["settled"])
+        self.assertFalse(resumed["early_close_requested"])
+        self.assertEqual([], self.close_calls)
+        self.assertEqual(durable_before, state_path.read_bytes())
+
+    def test_other_source_close_is_not_claimed_as_same_event_evidence(self) -> None:
+        external = {
+            "status": "EARLY_CLOSE",
+            "holding_qty": 1,
+            "trade_started_at": "2026-08-21T09:00:00+09:00",
+            "operation_command_mode": "EARLY_CLOSE",
+            "operation_command_id": "BUFFER-COMMAND",
+            "operation_command_source": "BUFFER_RESPONSE:OTHER",
+            "early_close_method": POLICY_ROUTINE_CLOSE,
+        }
+        state_path = self.stock_dir / "state.json"
+        self._write(state_path, external)
+        before = state_path.read_bytes()
+        blocked_calls = []
+
+        def blocked_backend(**kwargs):
+            blocked_calls.append(dict(kwargs))
+            return {"ok": False, "reason": "ACTIVE_CLOSE_OWNED_BY_OTHER_SOURCE"}
+
+        result = self._coordinator(close_backend=blocked_backend).run(
+            object(), buffer_result=self._buffer_clear(), trigger=self._trigger()
+        )
+
+        self.assertFalse(result["settled"])
+        self.assertEqual("NO_ELIGIBLE_CANDIDATE", result["reason"])
+        self.assertEqual([], blocked_calls)
+        self.assertEqual(before, state_path.read_bytes())
 
     def test_only_same_routine_event_early_evidence_can_promote(self) -> None:
         coordinator = self._coordinator()

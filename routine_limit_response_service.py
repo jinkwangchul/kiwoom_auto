@@ -17,7 +17,6 @@ from buffer_response_ownership_service import BufferResponseOwnershipService
 from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
 from close_liquidation_transition_service import POLICY_MARKET, POLICY_ROUTINE_CLOSE, is_routine_close_policy, normalize_direct_close_policy_alias
 from gui_auto_trade_policy import auto_trade_current_session_operation_participant_codes
-from gui_operation_environment import read_operation_policy
 from limit_response_priority import STAGE_ROUTINE, arbitrate_limit_response_priority
 from operation_close_completion_evaluator import evaluate_operation_close_completion, resolve_liquidation_holding_quantity
 from operation_command_service import MODE_EARLY_CLOSE, SCOPE_STOCK
@@ -208,7 +207,7 @@ class RoutineLimitResponseCoordinator:
                   close_backend=apply_close_intent, pnl_projector=project_current_stock_pnl_snapshot,
                   completion_projector=None, instance_reader=routine_instance_by_id,
                   participant_reader=auto_trade_current_session_operation_participant_codes,
-                  operation_policy_reader=read_operation_policy,
+                  operation_policy_reader=None,
                   recovery_snapshot_reader=production_recovery_registry.snapshot) -> None:
         self.root = Path(project_root); self.positions_path = Path(positions_path); self.fills_path = Path(fills_path)
         self.queue_path = Path(order_queue_path); self.holdings_path = Path(broker_holdings_path)
@@ -216,7 +215,7 @@ class RoutineLimitResponseCoordinator:
         self.buffer_ownership = buffer_ownership or BufferResponseOwnershipService(self.root / "runtime" / "buffer_response_ownership.json")
         self.close_backend = close_backend; self.pnl_projector = pnl_projector
         self.instance_reader = instance_reader; self.participant_reader = participant_reader
-        self.operation_policy_reader = operation_policy_reader; self.recovery_snapshot_reader = recovery_snapshot_reader
+        self.recovery_snapshot_reader = recovery_snapshot_reader
         self.completion_projector = completion_projector or self._project_completion
 
     def _project_completion(self):
@@ -522,43 +521,25 @@ class RoutineLimitResponseCoordinator:
 
     def _dispatch_event(self, window, event, snapshot):
         if event["response_intent"] == INTENT_EARLY_CLOSE:
-            method, extra = self._early_policy(event["configured_response_mode"])
-            return self._early(event, method, extra)
+            return self._early(event)
         return self._immediate(window, event)
 
-    def _early_policy(self, configured_mode):
-        if configured_mode == "구간마감": return POLICY_ROUTINE_CLOSE, {}
-        policy = self.operation_policy_reader().get("early_close")
-        if not isinstance(policy, Mapping): return "", {}
-        method = normalize_direct_close_policy_alias(policy.get("method"))
-        return method, {key: value for key, value in policy.items() if key != "method" and _text(value)}
-
-    def _early(self, event, method, extra):
-        if not method: return {"settled": False, "reason": "EARLY_CLOSE_POLICY_UNAVAILABLE"}
+    def _early(self, event):
         try: stock_dir, config, state = self._selected_runtime(event["selected_stock_code"])
         except Exception as exc: return {"settled": False, "reason": str(exc)}
         command_id, source = routine_limit_early_command_id(event["event_id"]), routine_limit_source(event["event_id"])
         existing_matches = (
             _text(state.get("operation_command_id")) == command_id
             and _text(state.get("operation_command_source")) == source
-            and (
-                is_routine_close_policy(state.get("early_close_method"))
-                if method == POLICY_ROUTINE_CLOSE
-                else normalize_direct_close_policy_alias(state.get("early_close_method")) == method
-            )
         )
         if existing_matches:
             return {"settled": True, "reason": "", "early_close_requested": False}
         result = self.close_backend(intent=CLOSE_INTENT_EARLY_CLOSE, target_scope=SCOPE_STOCK, target_id=str(stock_dir.resolve()), source=source,
-            requested_policy=method, has_close_progress_quantity=True, extra_policy=extra, stock_code=event["selected_stock_code"], runtime_state=state,
+            requested_policy=POLICY_ROUTINE_CLOSE, has_close_progress_quantity=True, extra_policy={}, stock_code=event["selected_stock_code"], runtime_state=state,
             runtime_routine_instance_id=event["routine_instance_id"], current_policy="", current_started_at="", current_command_id=_text(state.get("operation_command_id")),
             command_id=command_id, requested_at=event["detected_at"], project_root=self.root, queue_path=self.queue_path, fills_path=self.fills_path)
         saved = self._selected_state(event["selected_stock_code"])
-        policy_matches = (
-            is_routine_close_policy(saved.get("early_close_method"))
-            if method == POLICY_ROUTINE_CLOSE
-            else normalize_direct_close_policy_alias(saved.get("early_close_method")) == method
-        )
+        policy_matches = is_routine_close_policy(saved.get("early_close_method"))
         ok = isinstance(result, Mapping) and result.get("ok") is True and _text(saved.get("operation_command_id")) == command_id and _text(saved.get("operation_command_source")) == source and policy_matches
         return {"settled": ok, "reason": "" if ok else _text(result.get("reason") if isinstance(result, Mapping) else "") or "EARLY_CLOSE_FAILED", "early_close_requested": ok}
 
