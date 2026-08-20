@@ -223,7 +223,25 @@ class MainStockOperationHostTest(unittest.TestCase):
 
         setting_window.assert_not_called()
         self.assertIs(first, second)
+        self.assertIs(first.market_data_host(), second.market_data_host())
         self.assertNotIsInstance(first, QWidget)
+
+    def test_settings_reopen_does_not_create_operation_or_market_host(self) -> None:
+        owner = SimpleNamespace(auto_trade_setting_window=None)
+
+        def setting_window(_owner):
+            window = Mock()
+            window.isVisible.return_value = False
+            window.isMinimized.return_value = False
+            return window
+
+        with patch.object(gui_windows, "AutoTradeSettingWindow", side_effect=setting_window), patch.object(
+            gui_windows, "AutoTradeOperationHost"
+        ) as operation_host, patch.object(gui_windows.sip, "isdeleted", return_value=False):
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+            gui_windows.MainWindow.open_auto_trade_setting_window(owner)
+
+        operation_host.assert_not_called()
 
     def test_operation_cycle_does_not_require_a_visible_settings_window(self) -> None:
         owner = QObject()

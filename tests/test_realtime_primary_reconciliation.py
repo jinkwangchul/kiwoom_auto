@@ -281,8 +281,9 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.owner = _Owner()
         self.host = AutoTradeOperationHost(self.owner)
-        self.host._realtime_shadow_session_identity = (7, "SESSION-7")
-        state = self.host._market_data_authority
+        self.market = self.host.market_data_host()
+        self.market._realtime_shadow_session_identity = (7, "SESSION-7")
+        state = self.market._market_data_authority
         state.ensure_session(7, "SESSION-7")
         state.sync_targets(("005930",))
         state.observe_comparison(
@@ -305,11 +306,11 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
         ),))
 
     def test_valid_primary_bar_commits_once_and_later_cycle_skips_tr(self) -> None:
-        with patch("gui_auto_trade_operation_host.project_execution_universe", return_value=self._ready_snapshot()), patch(
-            "gui_auto_trade_operation_host.StockRepository"
+        with patch.object(
+            self.market, "_execution_entry_provider", return_value=self._ready_snapshot().entries[0]
         ):
-            first = self.host._process_realtime_primary_bar(_bar())
-            duplicate = self.host._process_realtime_primary_bar(_bar())
+            first = self.market._process_realtime_primary_bar(_bar())
+            duplicate = self.market._process_realtime_primary_bar(_bar())
         self.assertTrue(first["ok"])
         self.assertEqual("REALTIME_BAR_ALREADY_COMMITTED", duplicate["reason_code"])
         self.owner.kiwoom_api.commit_realtime_primary_bar.assert_called_once()
@@ -319,35 +320,35 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
     def test_tr_claim_first_blocks_late_realtime_writer(self) -> None:
         decision = self.host.market_data_refresh_decision("005930", "2026-08-20 10:16")
         self.assertEqual(REALTIME_RECONCILIATION, decision["decision"])
-        with patch("gui_auto_trade_operation_host.project_execution_universe", return_value=self._ready_snapshot()), patch(
-            "gui_auto_trade_operation_host.StockRepository"
+        with patch.object(
+            self.market, "_execution_entry_provider", return_value=self._ready_snapshot().entries[0]
         ):
-            result = self.host._process_realtime_primary_bar(_bar())
+            result = self.market._process_realtime_primary_bar(_bar())
         self.assertEqual("TR_RECONCILIATION_OWNS_MINUTE", result["reason_code"])
         self.owner.kiwoom_api.commit_realtime_primary_bar.assert_not_called()
 
     def test_older_completed_event_cannot_rewrite_canonical(self) -> None:
-        state = self.host._market_data_authority
+        state = self.market._market_data_authority
         state.claim_authority("005930", "2026-08-20 10:16", REALTIME_AUTHORITY)
         state.mark_realtime_committed("005930", "2026-08-20 10:16")
-        result = self.host._process_realtime_primary_bar(_bar())
+        result = self.market._process_realtime_primary_bar(_bar())
         self.assertEqual("STALE_REALTIME_BAR", result["reason_code"])
         self.owner.kiwoom_api.commit_realtime_primary_bar.assert_not_called()
 
     def test_incomplete_volume_and_commit_failure_fall_back_once(self) -> None:
         request = Mock(return_value=True)
-        with patch.object(self.host, "_request_realtime_reconciliation", request), patch(
-            "gui_auto_trade_operation_host.project_execution_universe", return_value=self._ready_snapshot()
-        ), patch("gui_auto_trade_operation_host.StockRepository"):
-            incomplete = self.host._process_realtime_primary_bar(
+        with patch.object(self.market, "_request_realtime_reconciliation", request), patch.object(
+            self.market, "_execution_entry_provider", return_value=self._ready_snapshot().entries[0]
+        ), patch("gui_market_data_host.StockRepository"):
+            incomplete = self.market._process_realtime_primary_bar(
                 _bar(volume=None, volume_complete=False)
             )
         self.assertFalse(incomplete["ok"])
         self.assertEqual(TR_RECONCILING, self.host.market_data_mode_snapshot("005930").mode)
         request.assert_called_once_with("005930", "2026-08-20 10:15")
 
-        self.host._pending_reconciliations.clear()
-        state = self.host._market_data_authority
+        self.market._pending_reconciliations.clear()
+        state = self.market._market_data_authority
         state.finish_reconciliation("005930", "2026-08-20 10:15", repaired=True)
         state.observe_comparison(
             "005930", "2026-08-20 10:16", status="MATCH",
@@ -363,10 +364,10 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
             "commit_verified": False,
         }
         request.reset_mock()
-        with patch.object(self.host, "_request_realtime_reconciliation", request), patch(
-            "gui_auto_trade_operation_host.project_execution_universe", return_value=self._ready_snapshot()
-        ), patch("gui_auto_trade_operation_host.StockRepository"):
-            failed = self.host._process_realtime_primary_bar(
+        with patch.object(self.market, "_request_realtime_reconciliation", request), patch.object(
+            self.market, "_execution_entry_provider", return_value=self._ready_snapshot().entries[0]
+        ), patch("gui_market_data_host.StockRepository"):
+            failed = self.market._process_realtime_primary_bar(
                 _bar(bar_time="2026-08-20T10:16:00+09:00")
             )
         self.assertEqual("REALTIME_CANONICAL_COMMIT_FAILED", failed["reason_code"])
@@ -387,11 +388,12 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
             "login_session_id": "SESSION-7",
             "connection_epoch": 7,
         }
-        self.host._on_bar_committed(event)
+        self.market._on_bar_committed(event)
+        self.market._drain_canonical_events()
         self.assertEqual(0, len(self.host._bar_commit_trigger_queue))
 
     def test_realtime_context_uses_next_minute_evaluation_key(self) -> None:
-        state = self.host._market_data_authority
+        state = self.market._market_data_authority
         state.claim_authority("005930", "2026-08-20 10:15", REALTIME_AUTHORITY)
         event = {
             "stock_code": "005930",
@@ -400,45 +402,45 @@ class RealtimePrimaryOperationHostTests(unittest.TestCase):
             "connection_epoch": 7,
             "login_session_id": "SESSION-7",
         }
-        with patch("gui_auto_trade_operation_host.StockRepository"):
-            context = self.host._realtime_bar_commit_context(event)
-        self.assertEqual("2026-08-20 10:16", context["operation_cycle_minute_key"])
+        with patch("gui_market_data_host.StockRepository"):
+            context = self.market._realtime_event_context(event)
+        self.assertEqual("2026-08-20 10:16", context["evaluation_tick_key"])
 
     def test_reconciliation_requires_target_minute_in_canonical(self) -> None:
-        state = self.host._market_data_authority
+        state = self.market._market_data_authority
         state.begin_reconciliation("005930", "2026-08-20 10:15", "TEST")
-        self.host._pending_reconciliations.add(("005930", "2026-08-20 10:15"))
-        with patch("gui_auto_trade_operation_host.load_candles", return_value=[]):
-            repaired = self.host.complete_realtime_reconciliation(
+        self.market._pending_reconciliations.add(("005930", "2026-08-20 10:15"))
+        with patch("gui_market_data_host.load_candles", return_value=[]):
+            repaired = self.market.complete_reconciliation(
                 "005930", "2026-08-20 10:15", Path("C:/temp"), {"ok": True}
             )
         self.assertFalse(repaired)
         self.assertEqual(TR_RECONCILING, self.host.market_data_mode_snapshot("005930").mode)
-        with patch("gui_auto_trade_operation_host.load_candles", return_value=[{
+        with patch("gui_market_data_host.load_candles", return_value=[{
             "time": "20260820101500", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
         }]):
-            repaired = self.host.complete_realtime_reconciliation(
+            repaired = self.market.complete_reconciliation(
                 "005930", "2026-08-20 10:15", Path("C:/temp"), {"ok": True}
             )
         self.assertTrue(repaired)
         self.assertEqual(TR_PRIMARY_SHADOWING, self.host.market_data_mode_snapshot("005930").mode)
 
     def test_post_reconciliation_comparison_is_not_promotion_evidence(self) -> None:
-        state = self.host._market_data_authority
+        state = self.market._market_data_authority
         state.force_tr_primary("005930", "TEST")
         state.replace_with_reconciliation_authority("005930", "2026-08-20 10:15")
         canonical = [{
             "time": "20260820101500", "open": 100, "high": 105,
             "low": 98, "close": 103, "volume": 40,
         }]
-        with patch("gui_auto_trade_operation_host.StockRepository"), patch(
-            "gui_auto_trade_operation_host.load_candles", return_value=canonical
+        with patch("gui_market_data_host.StockRepository"), patch(
+            "gui_market_data_host.load_candles", return_value=canonical
         ), patch(
-            "gui_auto_trade_operation_host.canonical_candle_content_hash", return_value="hash"
-        ), patch(
-            "gui_auto_trade_operation_host.project_execution_universe", return_value=self._ready_snapshot()
+            "gui_market_data_host.canonical_candle_content_hash", return_value="hash"
+        ), patch.object(
+            self.market, "_execution_entry_provider", return_value=self._ready_snapshot().entries[0]
         ):
-            result = self.host._compare_or_pend_realtime_shadow_bar(_bar())
+            result = self.market._compare_or_pend_realtime_shadow_bar(_bar())
         self.assertEqual("MATCH", result["status"])
         self.assertEqual(TR_PRIMARY_SHADOWING, self.host.market_data_mode_snapshot("005930").mode)
 

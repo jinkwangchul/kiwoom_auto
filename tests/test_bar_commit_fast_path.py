@@ -106,6 +106,14 @@ class BarCommitFastPathTests(unittest.TestCase):
             entries=(SimpleNamespace(execution_ready=ready, stock_dir=self.stock_dir),)
         )
 
+    def ready_event(self, **changes):
+        event = self.payload(**changes)
+        event.update(
+            stock_dir=self.stock_dir,
+            evaluation_tick_key="2026-08-20 10:15",
+        )
+        return event
+
     def test_signal_binding_is_exactly_once(self) -> None:
         self.assertTrue(self.host._bind_bar_committed_signal_once())
         self.assertTrue(self.host._bind_bar_committed_signal_once())
@@ -133,7 +141,8 @@ class BarCommitFastPathTests(unittest.TestCase):
             self.owner.kiwoom_api.bar_committed.emit(self.payload())
             self.assertEqual(1, len(scheduled))
             probe.assert_not_called()
-            scheduled.pop(0)()
+            while scheduled:
+                scheduled.pop(0)()
 
         probe.assert_called_once()
         self.assertEqual(self.stock_dir, probe.call_args.args[1])
@@ -155,7 +164,8 @@ class BarCommitFastPathTests(unittest.TestCase):
             malformed.pop("bar_identity")
             self.owner.kiwoom_api.bar_committed.emit(malformed)
 
-        self.assertEqual([], scheduled)
+        while scheduled:
+            scheduled.pop(0)()
         self.assertEqual([], list(self.host._bar_commit_trigger_queue))
 
     def test_consecutive_duplicate_is_accepted_once_but_a_b_a_is_allowed(self) -> None:
@@ -169,8 +179,9 @@ class BarCommitFastPathTests(unittest.TestCase):
             self.owner.kiwoom_api.bar_committed.emit(self.payload(rqname="rq-3", commit_identity="B"))
             self.register("rq-4")
             self.owner.kiwoom_api.bar_committed.emit(self.payload(rqname="rq-4", commit_identity="A"))
+            scheduled.pop(0)()
 
-        identities = [item["event"]["commit_identity"] for item in self.host._bar_commit_trigger_queue]
+        identities = [item["commit_identity"] for item in self.host._bar_commit_trigger_queue]
         self.assertEqual(["A", "B", "A"], identities)
         self.assertEqual(1, len(scheduled))
 
@@ -178,10 +189,7 @@ class BarCommitFastPathTests(unittest.TestCase):
         probe = Mock()
         repository = Mock()
         repository.resolve_stock_dir.return_value = self.stock_dir
-        self.register("rq-old")
-        old = self.payload(rqname="rq-old", canonical_content_hash="0" * 64)
-        self.host._on_bar_committed(old)
-        superseded = self.host._bar_commit_trigger_queue.popleft()
+        superseded = self.ready_event(canonical_content_hash="0" * 64)
         with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch(
             "routine_signal_probe.probe_execution_stock_for_committed_bar", probe
         ):
@@ -189,9 +197,7 @@ class BarCommitFastPathTests(unittest.TestCase):
         self.assertEqual("SUPERSEDED_BAR_COMMIT", result["reason_code"])
         probe.assert_not_called()
 
-        self.register("rq-stop")
-        self.host._on_bar_committed(self.payload(rqname="rq-stop", commit_identity="stopped"))
-        stopped = self.host._bar_commit_trigger_queue.popleft()
+        stopped = self.ready_event(commit_identity="stopped")
         with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch(
             "gui_auto_trade_operation_host.project_execution_universe",
             return_value=self.ready_snapshot(False),
@@ -203,8 +209,8 @@ class BarCommitFastPathTests(unittest.TestCase):
     def test_drain_error_does_not_block_next_stock_trigger(self) -> None:
         self.host._bar_commit_trigger_queue.extend(
             [
-                {"event": self.payload(commit_identity="A"), "context": {}},
-                {"event": self.payload(commit_identity="B"), "context": {}},
+                self.ready_event(commit_identity="A"),
+                self.ready_event(commit_identity="B"),
             ]
         )
         with patch.object(
@@ -246,14 +252,15 @@ class BarCommitFastPathTests(unittest.TestCase):
                     canonical_path=str(second_dir / "candles.json"),
                 )
             )
+            self.host.market_data_host()._drain_canonical_events()
         with patch.object(
             self.host,
             "_process_bar_commit_trigger",
-            side_effect=lambda trigger: processed.append(trigger["event"]["stock_code"])
+            side_effect=lambda trigger: processed.append(trigger["stock_code"])
             or {
                 "accepted": True,
                 "evaluated": True,
-                "stock_code": trigger["event"]["stock_code"],
+                "stock_code": trigger["stock_code"],
             },
         ):
             self.host._drain_bar_commit_triggers()

@@ -23,13 +23,6 @@ from execution_universe import (
 )
 
 try:
-    from auto_candle_refresh import refresh_operation_candles
-    _CANDLE_REFRESH_IMPORT_ERROR = None
-except Exception as exc:
-    refresh_operation_candles = None
-    _CANDLE_REFRESH_IMPORT_ERROR = exc
-
-try:
     from routine_signal_probe import probe_all_enabled_routine_stocks_once
     _ROUTINE_PROBE_IMPORT_ERROR = None
 except Exception as exc:
@@ -344,26 +337,15 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
 
     realtime_shadow_result: dict[str, object] = {}
     market_data_cycle_result: dict[str, object] = {}
+    market_data_getter = getattr(window, "market_data_host", None)
+    market_data_host = market_data_getter() if callable(market_data_getter) else None
     try:
         execution_universe_snapshot = project_execution_universe(window)
-        sync_realtime_shadow = getattr(
-            type(window),
-            "sync_realtime_shadow_targets",
-            None,
-        )
-        if callable(sync_realtime_shadow):
-            realtime_shadow_result = sync_realtime_shadow(
-                window,
-                execution_universe_snapshot
-            )
-        else:
-            instance_sync = getattr(window, "__dict__", {}).get(
-                "sync_realtime_shadow_targets"
-            )
-            if callable(instance_sync):
-                realtime_shadow_result = instance_sync(
-                    execution_universe_snapshot
-                )
+        sync_targets = getattr(market_data_host, "sync_targets", None)
+        if callable(sync_targets):
+            synced = sync_targets(execution_universe_snapshot)
+            if isinstance(synced, dict):
+                realtime_shadow_result = dict(synced)
     except Exception as exc:
         observe_production_exception(
             type(exc),
@@ -387,7 +369,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             "error": str(exc),
         }
     try:
-        prepare_market_data = getattr(window, "prepare_market_data_operation_cycle", None)
+        prepare_market_data = getattr(market_data_host, "prepare_operation_cycle", None)
         if callable(prepare_market_data):
             prepared = prepare_market_data(
                 execution_universe_snapshot,
@@ -539,12 +521,21 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 )
                 LOGGER.exception("Deferred operation cycle completion notify failed")
 
-    if callable(refresh_operation_candles):
+    refresh_market_data = getattr(market_data_host, "refresh_operation_candles", None)
+    if callable(refresh_market_data):
         try:
-            candle_refresh_result = refresh_operation_candles(
-                window,
+            refreshed = refresh_market_data(
                 minute_key,
                 on_complete=continue_after_candle_refresh,
+            )
+            candle_refresh_result = (
+                dict(refreshed)
+                if isinstance(refreshed, dict)
+                else {
+                    "accepted": False,
+                    "completed": False,
+                    "reason_code": "CANDLE_REFRESH_RESULT_MALFORMED",
+                }
             )
         except Exception as exc:
             observe_production_exception(
@@ -583,21 +574,6 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
                 signal_result = {"deferred_for_candle_refresh": True}
                 deferred_cycle_completion_pending = True
     else:
-        if _CANDLE_REFRESH_IMPORT_ERROR is not None:
-            observe_production_exception(
-                type(_CANDLE_REFRESH_IMPORT_ERROR),
-                _CANDLE_REFRESH_IMPORT_ERROR,
-                _CANDLE_REFRESH_IMPORT_ERROR.__traceback__,
-                component="candle_refresh",
-                operation="import_auto_candle_refresh",
-                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
-                target_type="MARKET_DATA",
-                target_id="operation_candle_refresh",
-                target_name="분봉 갱신",
-                reason_code="CANDLE_REFRESH_IMPORT_FAILED",
-                owner=window,
-                failure_scope="candle_refresh_import",
-            )
         signal_result = _process_pending_signal_pipeline(window)
 
     if callable(rebind_recovery) and not signal_cycle_completed:

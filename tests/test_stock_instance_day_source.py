@@ -188,9 +188,16 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
         probe = Mock(return_value={"logged": 0, "error": 0})
         pipeline = Mock(return_value={})
 
-        def begin_refresh(_window, _minute_key, *, on_complete):
+        def begin_refresh(_minute_key, *, on_complete):
             callbacks.append(on_complete)
             return {"accepted": True, "completed": False, "reason_code": "CANDLE_REFRESH_STARTED"}
+
+        market_data = SimpleNamespace(
+            sync_targets=Mock(return_value={}),
+            prepare_operation_cycle=Mock(return_value={}),
+            refresh_operation_candles=Mock(side_effect=begin_refresh),
+        )
+        host.market_data_host.return_value = market_data
 
         with patch.object(gui_auto_trade_timer, "auto_trade_current_time_policy_minute_key", return_value="2026-08-10 10:00"), patch.object(
             gui_auto_trade_timer,
@@ -200,8 +207,7 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             gui_auto_trade_timer,
             "auto_trade_continue_pending_manual_ats_liquidations",
             return_value={"processed": 0, "failed": 0},
-        ), patch.object(gui_auto_trade_timer, "refresh_operation_candles", side_effect=begin_refresh), patch.object(
-            gui_auto_trade_timer,
+        ), patch.object(gui_auto_trade_timer,
             "probe_all_enabled_routine_stocks_once",
             probe,
         ), patch.object(

@@ -9,6 +9,7 @@ from PyQt5.QtCore import QCoreApplication, QObject
 
 import gui_auto_trade_timer
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+from gui_market_data_host import MarketDataHost
 from kiwoom_api import RealtimeShadowRegistrationSnapshot
 from kiwoom_realtime_fids import REALTIME_SHADOW_FIDS
 from kiwoom_realtime_shadow import RealtimeShadowBar
@@ -101,6 +102,7 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.owner = _Owner()
         self.host = AutoTradeOperationHost(self.owner)
+        self.market = self.host.market_data_host()
 
     def tearDown(self) -> None:
         self.host.shutdown()
@@ -127,23 +129,26 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
         repository.resolve_stock_dir.return_value = Path("C:/temp/005930_Test")
 
         with patch("gui_auto_trade_operation_host.QTimer.singleShot", side_effect=lambda _ms, callback: scheduled.append(callback)), patch(
-            "gui_auto_trade_operation_host.StockRepository", return_value=repository
-        ), patch("gui_auto_trade_operation_host.load_candles", side_effect=[[], _canonical()]), patch(
-            "gui_auto_trade_operation_host.canonical_candle_content_hash", return_value="hash"
+            "gui_market_data_host.StockRepository", return_value=repository
+        ), patch("gui_market_data_host.load_candles", side_effect=[[], _canonical()]), patch(
+            "gui_market_data_host.canonical_candle_content_hash", return_value="hash"
         ):
             self.owner.kiwoom_api.realtime_shadow_bar_completed.emit(_shadow_payload())
             self.assertEqual([], comparisons)
             scheduled.pop(0)()
-            self.assertEqual(1, len(self.host._pending_shadow_comparisons))
+            self.assertEqual(1, len(self.market._pending_shadow_comparisons))
             self.owner.kiwoom_api.bar_committed.emit({
                 "event_type": "BAR_COMMITTED",
                 "stock_code": "005930",
                 "source": "opt10080",
+                "timeframe_minutes": 1,
             })
+            scheduled.pop(0)()
+            scheduled.pop(0)()
             scheduled.pop(0)()
 
         self.assertEqual("MATCH", comparisons[0]["status"])
-        self.assertEqual(0, len(self.host._pending_shadow_comparisons))
+        self.assertEqual(0, len(self.market._pending_shadow_comparisons))
 
     def test_canonical_first_then_shadow_later_compares(self) -> None:
         scheduled = []
@@ -152,17 +157,20 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
         repository = Mock()
         repository.resolve_stock_dir.return_value = Path("C:/temp/005930_Test")
         with patch("gui_auto_trade_operation_host.QTimer.singleShot", side_effect=lambda _ms, callback: scheduled.append(callback)), patch(
-            "gui_auto_trade_operation_host.StockRepository", return_value=repository
-        ), patch("gui_auto_trade_operation_host.load_candles", return_value=_canonical()), patch(
-            "gui_auto_trade_operation_host.canonical_candle_content_hash", return_value="hash"
+            "gui_market_data_host.StockRepository", return_value=repository
+        ), patch("gui_market_data_host.load_candles", return_value=_canonical()), patch(
+            "gui_market_data_host.canonical_candle_content_hash", return_value="hash"
         ):
             self.owner.kiwoom_api.bar_committed.emit({
                 "event_type": "BAR_COMMITTED",
                 "stock_code": "005930",
                 "source": "opt10080",
+                "timeframe_minutes": 1,
             })
+            scheduled.pop(0)()
             self.assertEqual([], scheduled)
             self.owner.kiwoom_api.realtime_shadow_bar_completed.emit(_shadow_payload())
+            scheduled.pop(0)()
             scheduled.pop(0)()
 
         self.assertEqual("MATCH", comparisons[0]["status"])
@@ -170,14 +178,14 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
     def test_stale_session_shadow_bar_is_ignored(self) -> None:
         payload = _shadow_payload()
         payload["login_session_id"] = "OLD"
-        self.host._realtime_shadow_trigger_queue.append(payload)
-        with patch.object(self.host, "_compare_or_pend_realtime_shadow_bar") as compare:
-            self.host._drain_realtime_shadow_comparisons()
+        self.market._realtime_shadow_trigger_queue.append(payload)
+        with patch.object(self.market, "_compare_or_pend_realtime_shadow_bar") as compare:
+            self.market._drain_realtime_shadow_events()
         compare.assert_not_called()
 
     def test_shadow_comparison_has_no_trading_side_effect_calls(self) -> None:
         source = __import__("inspect").getsource(
-            AutoTradeOperationHost._compare_or_pend_realtime_shadow_bar
+            MarketDataHost._compare_or_pend_realtime_shadow_bar
         )
         for forbidden in (
             "probe_execution_stock_for_committed_bar",
@@ -194,10 +202,10 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
         repository.resolve_stock_dir.return_value = Path("C:/temp/005930_Test")
         mismatched = _canonical()
         mismatched[0]["close"] = 999
-        with patch("gui_auto_trade_operation_host.StockRepository", return_value=repository), patch(
-            "gui_auto_trade_operation_host.load_candles", return_value=mismatched
-        ), patch("gui_auto_trade_operation_host.canonical_candle_content_hash", return_value="hash"):
-            result = self.host._compare_or_pend_realtime_shadow_bar(
+        with patch("gui_market_data_host.StockRepository", return_value=repository), patch(
+            "gui_market_data_host.load_candles", return_value=mismatched
+        ), patch("gui_market_data_host.canonical_candle_content_hash", return_value="hash"):
+            result = self.market._compare_or_pend_realtime_shadow_bar(
                 RealtimeShadowBar(**_shadow_payload())
             )
         self.assertEqual("MISMATCH", result["status"])
@@ -220,22 +228,23 @@ class RealtimeSyncFailureIsolationTests(unittest.TestCase):
                 return {"changed": 0, "failed": 0}
 
             @staticmethod
-            def sync_realtime_shadow_targets(_snapshot):
-                raise RuntimeError("shadow sync failed")
-
-            @staticmethod
             def statusBarMessage(*_args, **_kwargs):
                 pass
 
         window = Window()
         refresh = Mock(return_value={"accepted": True, "completed": True})
+        market_data = SimpleNamespace(
+            sync_targets=Mock(side_effect=RuntimeError("shadow sync failed")),
+            prepare_operation_cycle=Mock(return_value={}),
+            refresh_operation_candles=refresh,
+        )
+        window.market_data_host = lambda: market_data
         snapshot = SimpleNamespace(entries=(), execution_stock_codes=())
         with patch.object(gui_auto_trade_timer, "auto_trade_current_time_policy_minute_key", return_value="2026-08-20 10:15"), patch.object(
             gui_auto_trade_timer, "project_execution_universe", return_value=snapshot
         ), patch.object(gui_auto_trade_timer, "auto_trade_continue_pending_close_liquidations", return_value={"processed": 0, "blocked": 0}), patch.object(
             gui_auto_trade_timer, "auto_trade_continue_pending_manual_ats_liquidations", return_value={"processed": 0, "failed": 0}
-        ), patch.object(gui_auto_trade_timer, "refresh_operation_candles", refresh), patch.object(
-            gui_auto_trade_timer, "_process_pending_signal_pipeline", return_value={}
+        ), patch.object(gui_auto_trade_timer, "_process_pending_signal_pipeline", return_value={}
         ), patch.object(gui_auto_trade_timer, "observe_production_exception") as observe:
             result = gui_auto_trade_timer.auto_trade_run_operation_cycle(window)
 
