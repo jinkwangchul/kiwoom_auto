@@ -312,7 +312,7 @@ class KiwoomSendOrderPreviewServiceTest(unittest.TestCase):
         self.assertEqual(100, preview["price"])
         self.assertEqual("LIMIT", preview["hoga"])
         self.assertEqual("", preview["original_order_no"])
-        self.assertEqual("9000", preview["screen_no"])
+        self.assertEqual("5000", preview["screen_no"])
         self.assertEqual("SEND_ORDER_PREVIEW_ORDER_1", preview["rqname"])
         self.assertEqual([], result["blocked_reasons"])
 

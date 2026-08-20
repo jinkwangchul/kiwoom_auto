@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kiwoom_screen_allocator import project_order_default_screen_no
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
@@ -65,7 +67,7 @@ def build_kiwoom_order_request(order: dict[str, Any], guard: dict[str, Any]) -> 
         "adapter": "kiwoom_order_adapter_stub",
         "send_order_enabled": False,
         "rqname": f"{order_kind}_{code}",
-        "screen_no": "9000",
+        "screen_no": project_order_default_screen_no(),
         "account_no": account_no,
         "order_kind": order_kind,
         "code": code,

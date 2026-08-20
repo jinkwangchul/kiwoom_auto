@@ -35,6 +35,12 @@ from kiwoom_candle_adapter import save_minute_candles_for_stock
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
 from event_journal_production import observe_production_exception
+from kiwoom_screen_allocator import (
+    ACCOUNT_TR,
+    MARKET_TR,
+    KiwoomScreenAllocator,
+    ScreenAllocationError,
+)
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
@@ -310,9 +316,9 @@ class KiwoomApi(QObject):
         "시간",
         "체결량",
     )
-    HOLDINGS_SCREEN_NO = "9101"
-    OPEN_ORDERS_SCREEN_NO = "9102"
-    ACCOUNT_FUNDS_SCREEN_NO = "9103"
+    HOLDINGS_SCREEN_NO = None
+    OPEN_ORDERS_SCREEN_NO = None
+    ACCOUNT_FUNDS_SCREEN_NO = None
     RECOVERY_TR_TIMEOUT_MS = 15_000
     ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
     MINUTE_CANDLE_TR_TIMEOUT_MS = 10_000
@@ -362,6 +368,7 @@ class KiwoomApi(QObject):
         self._tr_last_dispatch_monotonic_ms: int | None = None
         self._tr_governor_timer_scheduled = False
         self._tr_governor_dispatching = False
+        self._screen_allocator = KiwoomScreenAllocator()
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -535,6 +542,53 @@ class KiwoomApi(QObject):
             "current_login_session_id": session.login_session_id,
         }
 
+    def _ensure_screen_allocator(self) -> None:
+        if not hasattr(self, "_screen_allocator"):
+            self._screen_allocator = KiwoomScreenAllocator()
+
+    def _claim_tr_screen(
+        self,
+        *,
+        purpose: str,
+        rqname: str,
+        screen_no: str | None,
+        callback: Callable[[dict[str, Any]], None] | None,
+        failure_payload: dict[str, Any],
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        self._ensure_screen_allocator()
+        try:
+            lease = self._screen_allocator.claim(
+                purpose,
+                str(rqname),
+                requested_screen_no=str(screen_no or "").strip() or None,
+            )
+        except ScreenAllocationError as exc:
+            payload = dict(failure_payload)
+            payload.update(
+                {
+                    "ok": False,
+                    "rqname": str(rqname),
+                    "error": str(exc),
+                    "error_kind": exc.error_kind,
+                }
+            )
+            self._finish_callback(callback, payload)
+            return None, payload
+        return lease.screen_no, None
+
+    def _release_pending_tr_screen(
+        self,
+        rqname: str,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(pending, dict):
+            return
+        screen_no = str(pending.get("screen_no") or "").strip()
+        if not screen_no:
+            return
+        self._ensure_screen_allocator()
+        self._screen_allocator.release(str(rqname), screen_no)
+
     def _finish_stale_pending_tr(
         self,
         rqname: str,
@@ -544,6 +598,7 @@ class KiwoomApi(QObject):
         current = self._pending_tr.pop(request_name, None)
         if current is not pending:
             return
+        self._release_pending_tr_screen(request_name, pending)
         pending_type = pending.get("type")
         if pending_type == "account_funds":
             self._account_funds_request_accounts.pop(request_name, None)
@@ -1057,7 +1112,7 @@ class KiwoomApi(QObject):
         interval: int = 1,
         count: int = 300,
         max_count: int = DEFAULT_CANDLES_MAX_COUNT,
-        screen_no: str = "9001",
+        screen_no: str | None = None,
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
         """Request opt10080 minute candles and save the response on receipt."""
@@ -1097,6 +1152,15 @@ class KiwoomApi(QObject):
             clean_max_count = DEFAULT_CANDLES_MAX_COUNT
 
         rqname = f"opt10080_{clean_code}_{datetime.now().strftime('%H%M%S%f')}"
+        claimed_screen_no, claim_error = self._claim_tr_screen(
+            purpose=MARKET_TR,
+            rqname=rqname,
+            screen_no=screen_no,
+            callback=callback,
+            failure_payload={"code": clean_code},
+        )
+        if claimed_screen_no is None:
+            return claim_error or {"ok": False, "code": clean_code, "rqname": rqname}
         self._pending_tr[rqname] = {
             "type": "minute_candles",
             "code": clean_code,
@@ -1104,7 +1168,7 @@ class KiwoomApi(QObject):
             "interval": clean_interval,
             "count": clean_count,
             "max_count": clean_max_count,
-            "screen_no": str(screen_no or "9001"),
+            "screen_no": claimed_screen_no,
             "callback": callback,
             "rows": [],
             **request_identity,
@@ -1117,7 +1181,8 @@ class KiwoomApi(QObject):
             )
 
         def fail_request(result: Any, error: str) -> dict[str, Any]:
-            self._pending_tr.pop(rqname, None)
+            pending = self._pending_tr.pop(rqname, None)
+            self._release_pending_tr_screen(rqname, pending)
             return self._finish_callback(
                 callback,
                 {
@@ -1133,7 +1198,7 @@ class KiwoomApi(QObject):
             rqname=rqname,
             trcode="opt10080",
             prev_next=0,
-            screen_no=str(screen_no or "9001"),
+            screen_no=claimed_screen_no,
             inputs=(
                 ("종목코드", clean_code),
                 ("틱범위", str(clean_interval)),
@@ -1150,6 +1215,7 @@ class KiwoomApi(QObject):
             "status": dispatched.get("status", "REQUESTED"),
             "code": clean_code,
             "rqname": rqname,
+            "screen_no": claimed_screen_no,
             "result": dispatched.get("result"),
         }
 
@@ -1157,6 +1223,7 @@ class KiwoomApi(QObject):
         pending = self._pending_tr.pop(str(rqname), None)
         if not pending or pending.get("type") != "minute_candles":
             return
+        self._release_pending_tr_screen(str(rqname), pending)
         callback = pending.get("callback")
         self._finish_callback(
             callback if callable(callback) else None,
@@ -1174,7 +1241,7 @@ class KiwoomApi(QObject):
         self,
         identity: RecoverySessionIdentity,
         *,
-        screen_no: str = HOLDINGS_SCREEN_NO,
+        screen_no: str | None = HOLDINGS_SCREEN_NO,
         callback: RecoverySnapshotCallback | None = None,
         timeout_ms: int = RECOVERY_TR_TIMEOUT_MS,
     ) -> dict[str, Any]:
@@ -1204,7 +1271,7 @@ class KiwoomApi(QObject):
         self,
         identity: RecoverySessionIdentity,
         *,
-        screen_no: str = OPEN_ORDERS_SCREEN_NO,
+        screen_no: str | None = OPEN_ORDERS_SCREEN_NO,
         callback: RecoverySnapshotCallback | None = None,
         timeout_ms: int = RECOVERY_TR_TIMEOUT_MS,
     ) -> dict[str, Any]:
@@ -1236,7 +1303,7 @@ class KiwoomApi(QObject):
         account_id: str,
         *,
         request_id: int,
-        screen_no: str = ACCOUNT_FUNDS_SCREEN_NO,
+        screen_no: str | None = ACCOUNT_FUNDS_SCREEN_NO,
         callback: AccountFundsCallback | None = None,
         timeout_ms: int = ACCOUNT_FUNDS_TR_TIMEOUT_MS,
     ) -> dict[str, Any]:
@@ -1270,10 +1337,24 @@ class KiwoomApi(QObject):
             int(request_id),
             datetime.now().strftime("%H%M%S%f"),
         )
+        claimed_screen_no, claim_error = self._claim_tr_screen(
+            purpose=ACCOUNT_TR,
+            rqname=rqname,
+            screen_no=screen_no,
+            callback=callback,
+            failure_payload={"account_id": clean_account, "request_id": request_id},
+        )
+        if claimed_screen_no is None:
+            return claim_error or {
+                "ok": False,
+                "account_id": clean_account,
+                "request_id": request_id,
+                "rqname": rqname,
+            }
         pending = {
             "type": "account_funds",
             "trcode": "opw00001",
-            "screen_no": str(screen_no),
+            "screen_no": claimed_screen_no,
             "account_id": clean_account,
             "request_id": int(request_id),
             "callback": callback,
@@ -1300,7 +1381,8 @@ class KiwoomApi(QObject):
             )
 
         def fail_request(result: Any, error: str) -> dict[str, Any]:
-            self._pending_tr.pop(rqname, None)
+            pending = self._pending_tr.pop(rqname, None)
+            self._release_pending_tr_screen(rqname, pending)
             self._account_funds_request_accounts.pop(rqname, None)
             return self._finish_callback(
                 callback,
@@ -1312,7 +1394,7 @@ class KiwoomApi(QObject):
             rqname=rqname,
             trcode="opw00001",
             prev_next=0,
-            screen_no=str(screen_no),
+            screen_no=claimed_screen_no,
             inputs=(
                 ("계좌번호", clean_account),
                 ("비밀번호", ""),
@@ -1331,6 +1413,7 @@ class KiwoomApi(QObject):
             "account_id": clean_account,
             "request_id": int(request_id),
             "rqname": rqname,
+            "screen_no": claimed_screen_no,
             "result": dispatched.get("result"),
         }
 
@@ -1339,6 +1422,7 @@ class KiwoomApi(QObject):
         self._account_funds_request_accounts.pop(str(rqname), None)
         if not pending or pending.get("type") != "account_funds":
             return
+        self._release_pending_tr_screen(str(rqname), pending)
         callback = pending.get("callback")
         self._finish_callback(
             callback if callable(callback) else None,
@@ -1357,7 +1441,7 @@ class KiwoomApi(QObject):
         *,
         kind: str,
         trcode: str,
-        screen_no: str,
+        screen_no: str | None,
         callback: RecoverySnapshotCallback | None,
         timeout_ms: int,
         inputs: tuple[tuple[str, str], ...],
@@ -1404,11 +1488,25 @@ class KiwoomApi(QObject):
             trcode.upper(),
             datetime.now().strftime("%H%M%S%f"),
         )
+        claimed_screen_no, claim_error = self._claim_tr_screen(
+            purpose=ACCOUNT_TR,
+            rqname=rqname,
+            screen_no=screen_no,
+            callback=callback,
+            failure_payload={"is_complete": False, "kind": str(kind)},
+        )
+        if claimed_screen_no is None:
+            return claim_error or {
+                "ok": False,
+                "is_complete": False,
+                "kind": str(kind),
+                "rqname": rqname,
+            }
         pending = {
             "type": "recovery_snapshot",
             "kind": str(kind),
             "trcode": str(trcode),
-            "screen_no": str(screen_no),
+            "screen_no": claimed_screen_no,
             "callback": callback,
             "identity": identity,
             "inputs": tuple(inputs),
@@ -1445,6 +1543,7 @@ class KiwoomApi(QObject):
             "trading_day": identity.trading_day,
             "recovery_session_id": identity.recovery_session_id,
             "rqname": rqname,
+            "screen_no": claimed_screen_no,
             "result": dispatched.get("result"),
         }
 
@@ -1457,7 +1556,9 @@ class KiwoomApi(QObject):
         on_dispatched: Callable[[Any], None] | None = None,
     ) -> dict[str, Any]:
         def fail_request(result: Any, error: str) -> dict[str, Any]:
-            self._pending_tr.pop(str(rqname), None)
+            pending_for_release = self._pending_tr.pop(str(rqname), None)
+            if pending_for_release is pending:
+                self._release_pending_tr_screen(str(rqname), pending)
             return self._finish_recovery_snapshot(
                 str(rqname),
                 pending,
@@ -1480,6 +1581,7 @@ class KiwoomApi(QObject):
         pending = self._pending_tr.pop(str(rqname), None)
         if not pending or pending.get("type") != "recovery_snapshot":
             return
+        self._release_pending_tr_screen(str(rqname), pending)
         self._finish_recovery_snapshot(
             str(rqname),
             pending,
@@ -1590,6 +1692,7 @@ class KiwoomApi(QObject):
 
         self._account_funds_request_accounts.pop(request_name, None)
         pending = self._pending_tr.pop(request_name, None)
+        self._release_pending_tr_screen(request_name, pending)
         payload = {
             "ok": False,
             "account_id": account_id,
@@ -1633,6 +1736,7 @@ class KiwoomApi(QObject):
         pending = self._pending_tr.pop(request_name, None)
         if not pending or pending.get("type") != "minute_candles":
             return
+        self._release_pending_tr_screen(request_name, pending)
 
         callback = pending.get("callback")
         try:
@@ -1678,6 +1782,7 @@ class KiwoomApi(QObject):
         current = self._pending_tr.pop(rqname, None)
         if current is not pending:
             return
+        self._release_pending_tr_screen(rqname, pending)
         callback = pending.get("callback")
         try:
             raw_deposit = self._control.dynamicCall(
@@ -1791,6 +1896,7 @@ class KiwoomApi(QObject):
         collection_complete: bool,
         errors: tuple[str, ...] = (),
     ) -> dict[str, Any]:
+        self._release_pending_tr_screen(str(rqname), pending)
         identity = pending.get("identity")
         callback = pending.get("callback")
         if not isinstance(identity, RecoverySessionIdentity):

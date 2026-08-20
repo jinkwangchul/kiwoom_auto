@@ -11,6 +11,8 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from kiwoom_screen_allocator import project_order_default_screen_no
+
 
 NEXT_STAGE_BLOCKED = "BLOCKED"
 NEXT_STAGE_FINAL_SEND_GATE_REQUIRED = "FINAL_SEND_GATE_REQUIRED"
@@ -244,7 +246,7 @@ def preview_kiwoom_send_order_request(
     execution_id = _first_text(order_queued_record.get("execution_id"), execution_request.get("execution_id"))
     request_hash = _first_text(order_queued_record.get("request_hash"), execution_request.get("request_hash"))
     lock_id = _first_text(order_queued_record.get("lock_id"), execution_request.get("lock_id"))
-    screen_no = _clean_text(request_preview.get("screen_no")) or "9000"
+    screen_no = _clean_text(request_preview.get("screen_no")) or project_order_default_screen_no()
     rqname = _clean_text(request_preview.get("rqname")) or f"SEND_ORDER_PREVIEW_{order_id}"
 
     return {

@@ -49,6 +49,7 @@ from final_send_gate_service import evaluate_final_send_gate
 from kiwoom_send_order_adapter_contract import build_kiwoom_send_order_adapter_contract
 from kiwoom_send_order_call_preview import preview_kiwoom_send_order_call
 from kiwoom_send_order_executor import execute_claimed_send_order
+from kiwoom_screen_allocator import project_order_default_screen_no
 from kiwoom_send_order_safety_gate import evaluate_kiwoom_send_order_safety
 from order_queued_review_service import review_order_queued_record
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
@@ -992,7 +993,10 @@ class AutoTradeOrderExecutionBoundary:
         price = request_preview_dict.get("price", order.get("price", 0))
         quantity = request_preview_dict.get("quantity", order.get("quantity", 0))
         account_no = str(request_preview_dict.get("account_no") or "").strip()
-        screen_no = str(request_preview_dict.get("screen_no") or "0101").strip()
+        screen_no = str(
+            request_preview_dict.get("screen_no")
+            or project_order_default_screen_no()
+        ).strip()
 
         broker_dispatch_preview = {
             "status": "BROKER_DISPATCH_READY",
@@ -1206,7 +1210,7 @@ class AutoTradeOrderExecutionBoundary:
             "guard_snapshot": {"account_no": account_no, "source_queue_revision": queue_revision},
             "request_preview": {
                 "account_no": account_no,
-                "screen_no": "0101",
+                "screen_no": project_order_default_screen_no(),
                 "side": side,
                 "order_action": "CANCEL",
                 "code": code,

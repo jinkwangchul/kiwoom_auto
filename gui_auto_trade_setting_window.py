@@ -67,6 +67,7 @@ from auto_trade_order_execution_boundary import (
     AutoTradeOrderExecutionBoundary,
     AutoTradeOrderExecutionContext,
 )
+from kiwoom_screen_allocator import project_order_default_screen_no
 
 LOGGER = logging.getLogger(__name__)
 ROUTINE_INLINE_EDIT_STYLE = """
@@ -8649,7 +8650,7 @@ class AutoTradeSettingWindow(QDialog):
             "guard_snapshot": {"account_no": account_no, "source_queue_revision": queue_revision},
             "request_preview": {
                 "account_no": account_no,
-                "screen_no": "0101",
+                "screen_no": project_order_default_screen_no(),
                 "side": side,
                 "order_action": "MODIFY",
                 "code": code,

@@ -6,6 +6,12 @@ import sys
 import types
 import unittest
 
+from kiwoom_screen_allocator import (
+    MARKET_TR,
+    SCREEN_OUT_OF_RANGE,
+    SCREEN_POOL_EXHAUSTED,
+)
+
 
 class _Signal:
     def __init__(self) -> None:
@@ -194,10 +200,10 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         )
         rqname = str(requested["rqname"])
         self.control.rows = [self.holding_row("005930")]
-        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "2")
+        self.api._on_receive_tr_data("1000", rqname, "opw00018", "", "2")
         self.assertIn(rqname, self.api._pending_tr)
         self.control.rows = [self.holding_row("006400")]
-        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "0")
+        self.api._on_receive_tr_data("1000", rqname, "opw00018", "", "0")
         self.assertEqual(1, len(results))
         self.assertTrue(results[0]["is_complete"])
         self.assertEqual(2, results[0]["rows_count"])
@@ -211,7 +217,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         )
         self.control.rows = [self.order_row()]
         self.api._on_receive_tr_data(
-            "9102",
+            "1000",
             requested["rqname"],
             "opt10075",
             "",
@@ -291,7 +297,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
                 }
             ]
             self.api._on_receive_tr_data(
-                "9001",
+                "3000",
                 "OPT10080_TEST",
                 "opt10080",
                 "",
@@ -325,11 +331,11 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         )
         comm_call = next(args for signature, args in self.control.calls if signature.startswith("CommRqData"))
         self.assertEqual("opw00001", comm_call[1])
-        self.assertEqual("9103", comm_call[3])
+        self.assertEqual("1000", comm_call[3])
 
         self.control.summary = {"예수금": " +001,250,000 ", "주문가능금액": "000920000"}
         self.control.server_gubun = "1"
-        self.api._on_receive_tr_data("9103", requested["rqname"], "opw00001", "", "0")
+        self.api._on_receive_tr_data("1000", requested["rqname"], "opw00001", "", "0")
 
         self.assertEqual(1, len(results))
         self.assertEqual(" +001,250,000 ", results[0]["raw_deposit"])
@@ -350,7 +356,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.assertIn("timed out", results[0]["error"])
 
         self.control.summary = {"예수금": "100", "주문가능금액": "90"}
-        self.api._on_receive_tr_data("9103", rqname, "opw00001", "", "0")
+        self.api._on_receive_tr_data("1000", rqname, "opw00001", "", "0")
         self.assertEqual(1, len(results))
 
     def test_account_funds_commrq_failure_is_immediate(self) -> None:
@@ -387,7 +393,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         )
 
         self.api._on_receive_msg(
-            "9103",
+            "1000",
             requested["rqname"],
             "opw00001",
             "(55) 계좌비밀번호 입력을 확인해주시기 바랍니다.",
@@ -426,7 +432,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.control.summary = {"예수금": "(5)", "주문가능금액": "(55)"}
 
         self.api._on_receive_tr_data(
-            "9103",
+            "1000",
             requested["rqname"],
             "opw00001",
             "",
@@ -458,6 +464,62 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             pending["request_login_session_id"],
         )
         self.assertTrue(pending["started_at"])
+        self.assertEqual("3000", pending["screen_no"])
+        self.assertEqual("3000", requested["screen_no"])
+
+    def test_minute_candle_terminal_response_releases_screen(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles("005930", callback=results.append)
+        rqname = str(requested["rqname"])
+        self.assertTrue(self.api._screen_allocator.is_leased("3000"))
+
+        saved_function = self.module.save_minute_candles_for_stock
+        self.module.save_minute_candles_for_stock = lambda *args, **kwargs: []
+        try:
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
+        finally:
+            self.module.save_minute_candles_for_stock = saved_function
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(self.api._screen_allocator.is_leased("3000"))
+
+    def test_minute_candle_timeout_releases_screen(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles("005930", callback=results.append)
+        rqname = str(requested["rqname"])
+        self.assertTrue(self.api._screen_allocator.is_leased("3000"))
+
+        self.api._expire_minute_candle_request(rqname)
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(self.api._screen_allocator.is_leased("3000"))
+
+    def test_minute_candle_rejects_out_of_range_supplied_screen(self) -> None:
+        result = self.api.request_minute_candles("005930", screen_no="9001")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(SCREEN_OUT_OF_RANGE, result["error_kind"])
+        self.assertEqual([], self.comm_rq_calls())
+        self.assertEqual({}, self.api._pending_tr)
+
+    def test_minute_candle_accepts_free_market_screen(self) -> None:
+        result = self.api.request_minute_candles("005930", screen_no="3005")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("3005", result["screen_no"])
+        self.assertEqual("3005", self.comm_rq_calls()[0][3])
+
+    def test_minute_candle_pool_exhaustion_fails_closed(self) -> None:
+        self.api._screen_allocator = self.module.KiwoomScreenAllocator()
+        for index in range(1000):
+            self.api._screen_allocator.claim(MARKET_TR, f"owner-{index}")
+
+        result = self.api.request_minute_candles("005930")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(SCREEN_POOL_EXHAUSTED, result["error_kind"])
+        self.assertEqual([], self.comm_rq_calls())
+        self.assertEqual({}, self.api._pending_tr)
 
     def test_minute_candle_stale_after_disconnect_does_not_save(self) -> None:
         results: list[dict[str, object]] = []
@@ -486,7 +548,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
                     "거래량": "100",
                 }
             ]
-            self.api._on_receive_tr_data("9001", rqname, "opt10080", "", "0")
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
         finally:
             self.module.save_minute_candles_for_stock = saved_function
 
@@ -516,7 +578,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             self.api._connection_epoch = 3
             self.api._connected = True
             self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
-            self.api._on_receive_tr_data("9001", rqname, "opt10080", "", "0")
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
         finally:
             self.module.save_minute_candles_for_stock = saved_function
 
@@ -537,7 +599,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._connection_epoch = 2
         self.api._connected = False
         self.api._login_session_id = ""
-        self.api._on_receive_tr_data("9103", rqname, "opw00001", "", "0")
+        self.api._on_receive_tr_data("1000", rqname, "opw00001", "", "0")
 
         self.assertEqual(1, len(results))
         self.assertFalse(results[0]["ok"])
@@ -560,7 +622,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._connected = False
         self.api._login_session_id = ""
         self.control.rows = [self.holding_row("005930")]
-        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "0")
+        self.api._on_receive_tr_data("1000", rqname, "opw00018", "", "0")
 
         self.assertEqual(1, len(results))
         self.assertFalse(results[0]["is_complete"])
@@ -580,7 +642,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._connected = True
         self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
         self.control.rows = [self.order_row()]
-        self.api._on_receive_tr_data("9102", rqname, "opt10075", "", "0")
+        self.api._on_receive_tr_data("1000", rqname, "opt10075", "", "0")
 
         self.assertEqual(1, len(results))
         self.assertFalse(results[0]["is_complete"])
@@ -604,7 +666,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             return [self.holding_row("005930")]
 
         self.api._read_tr_rows = reconnect_during_first_page
-        self.api._on_receive_tr_data("9101", rqname, "opw00018", "", "2")
+        self.api._on_receive_tr_data("1000", rqname, "opw00018", "", "2")
         after_calls = len(
             [call for call in self.control.calls if call[0].startswith("CommRqData")]
         )
@@ -616,7 +678,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
 
     def test_unknown_rqname_is_ignored_without_affecting_pending(self) -> None:
         requested = self.api.request_minute_candles("005930")
-        self.api._on_receive_tr_data("9001", "UNKNOWN_RQNAME", "opt10080", "", "0")
+        self.api._on_receive_tr_data("3000", "UNKNOWN_RQNAME", "opt10080", "", "0")
         self.assertIn(requested["rqname"], self.api._pending_tr)
 
     def test_broker_request_not_ready_does_not_call_commrq_or_leak_pending(self) -> None:
@@ -710,7 +772,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._connected = False
         self.api._login_session_id = ""
         self.api._on_receive_msg(
-            "9103",
+            "1000",
             rqname,
             "opw00001",
             "(55) 계좌비밀번호 입력을 확인해주시기 바랍니다.",

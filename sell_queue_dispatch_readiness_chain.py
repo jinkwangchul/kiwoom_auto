@@ -12,6 +12,7 @@ from broker_dispatch_preview import preview_broker_dispatch
 from execution_order_dispatch_builder import build_order_dispatch_contract
 from execution_queue_committed_review import review_execution_queue_committed
 from execution_queue_review_to_send_order_preview_adapter import adapt_queue_review_to_send_order_preview
+from kiwoom_screen_allocator import project_order_default_screen_no
 
 
 READY = "READY"
@@ -276,7 +277,10 @@ def build_sell_broker_request_preview(dispatch_eligibility: Any, broker_context:
         params = _as_dict(broker_result.get("send_order_params_preview"))
         previews.append(
             {
-                "screen_no": _text(request_preview.get("screen_no") or "9000"),
+                "screen_no": _text(
+                    request_preview.get("screen_no")
+                    or project_order_default_screen_no()
+                ),
                 "account_no": _text(params.get("account_no")),
                 "order_type": "SELL",
                 "code": _text(params.get("code")),
