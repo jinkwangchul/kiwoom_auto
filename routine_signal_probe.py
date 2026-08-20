@@ -118,6 +118,41 @@ def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _production_account_budget_context(window: Any) -> dict[str, Any]:
+    """Collect fail-closed system-budget evidence from the current Recovery session."""
+    try:
+        from gui_main_budget_panel import collect_main_account_budget_consumption
+        from gui_operation_environment import read_system_total_budget_for_recalculation
+
+        selected_account = getattr(window, "selected_account_no", None)
+        account_no = str(selected_account() or "").strip() if callable(selected_account) else ""
+        total_budget = read_system_total_budget_for_recalculation()
+        consumption = collect_main_account_budget_consumption(window)
+        return {
+            "account_no": account_no or None,
+            "system_total_budget": total_budget,
+            "account_consumed_amount": (
+                consumption.get("consumed_amount")
+                if consumption.get("available") is True
+                else None
+            ),
+            "available": bool(
+                account_no
+                and total_budget is not None
+                and consumption.get("available") is True
+            ),
+            "reason": str(consumption.get("reason") or ""),
+        }
+    except Exception as exc:
+        return {
+            "account_no": None,
+            "system_total_budget": None,
+            "account_consumed_amount": None,
+            "available": False,
+            "reason": f"account budget evidence unavailable: {exc}",
+        }
+
+
 def _read_json(path: Path) -> Any:
     try:
         if not path.exists():
@@ -304,6 +339,7 @@ def probe_routine_for_stock(
     *,
     decision_trace_observer: Any = _DEFAULT_OBSERVER_SENTINEL,
     trigger_provenance: dict[str, Any] | None = None,
+    account_budget_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
     state = _read_json_dict(stock_dir / "state.json")
@@ -385,6 +421,8 @@ def probe_routine_for_stock(
                 "routine_instance_id": routine_instance_id,
                 "routine_type": routine_type,
             }
+            if isinstance(account_budget_context, dict):
+                context["account_budget"] = dict(account_budget_context)
             provenance = {
                 field: trigger_provenance.get(field)
                 for field in TRIGGER_PROVENANCE_FIELDS
@@ -651,7 +689,16 @@ def probe_selected_routine_once(
             skip += 1
             continue
         checked += 1
-        result = probe_routine_for_stock(routine_module, routine_name, Path(stock_dir), tick_key)
+        probe_kwargs = {}
+        if callable(getattr(window, "selected_account_no", None)):
+            probe_kwargs["account_budget_context"] = _production_account_budget_context(window)
+        result = probe_routine_for_stock(
+            routine_module,
+            routine_name,
+            Path(stock_dir),
+            tick_key,
+            **probe_kwargs,
+        )
         signal = str(result.get("signal", "") or "").upper()
         if signal == "SKIP":
             skip += 1
@@ -838,6 +885,8 @@ def probe_execution_stock_for_committed_bar(
         if isinstance(trigger_provenance, dict) and trigger_provenance
         else {}
     )
+    if callable(getattr(window, "selected_account_no", None)):
+        probe_kwargs["account_budget_context"] = _production_account_budget_context(window)
     return probe_routine_for_stock(
         routine_module,
         routine_name,

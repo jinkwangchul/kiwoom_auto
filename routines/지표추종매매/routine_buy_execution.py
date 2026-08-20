@@ -70,6 +70,16 @@ def _budget_context(
         "previous_buy_budget": _positive_float(cycle.get("last_filled_buy_amount")),
         "max_buy_rounds": _maximum_rounds(stock_config, rules),
     }
+    account_budget = _as_dict(cycle.get("account_budget"))
+    if account_budget:
+        budget.update(
+            {
+                "system_total_budget_gate_required": True,
+                "system_total_budget": account_budget.get("system_total_budget"),
+                "account_consumed_amount": account_budget.get("account_consumed_amount"),
+                "account_no": account_budget.get("account_no"),
+            }
+        )
     if mode == "QUANTITY":
         budget["starting_quantity"] = _positive_int(stock_config.get("buy_qty"))
     elif mode == "AMOUNT":
@@ -93,6 +103,8 @@ def build_indicator_follow_buy_intent(
     signal = deepcopy(_as_dict(buy_signal_result))
     runtime_context = _as_dict(context)
     cycle = _as_dict(runtime_context.get("cycle"))
+    if isinstance(runtime_context.get("account_budget"), dict):
+        cycle["account_budget"] = deepcopy(runtime_context["account_budget"])
     if cycle.get("status") != "resolved":
         return {
             "status": "BLOCKED",

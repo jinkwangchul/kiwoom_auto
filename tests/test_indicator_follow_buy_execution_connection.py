@@ -78,17 +78,36 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def _build(self, *, cycle=None, config=None, rules=None, price=100.0) -> dict:
+    def _build(self, *, cycle=None, config=None, rules=None, price=100.0, account_budget=None) -> dict:
+        context = {
+            "cycle": cycle if cycle is not None else self._cycle(),
+            "stock_config": config or {"trade_amount_type": "QUANTITY", "buy_qty": 1},
+            "rules": rules if rules is not None else self._rules(),
+            "current_price": price,
+            "routine_instance_id": "INSTANCE_A",
+        }
+        if account_budget is not None:
+            context["account_budget"] = account_budget
         return bridge.build_indicator_follow_buy_intent(
             buy_signal_result={"signal": "BUY", "reason": "indicator"},
-            context={
-                "cycle": cycle if cycle is not None else self._cycle(),
-                "stock_config": config or {"trade_amount_type": "QUANTITY", "buy_qty": 1},
-                "rules": rules if rules is not None else self._rules(),
-                "current_price": price,
-                "routine_instance_id": "INSTANCE_A",
+            context=context,
+        )
+
+    def test_account_total_budget_blocks_4000_plus_100_before_queueing(self) -> None:
+        result = self._build(
+            price=100,
+            account_budget={
+                "account_no": "12345678",
+                "system_total_budget": 4_000,
+                "account_consumed_amount": 4_000,
             },
         )
+
+        self.assertEqual("BLOCKED", result["status"])
+        self.assertEqual("SYSTEM_TOTAL_BUDGET_EXCEEDED", result["reason"])
+        evidence = result["preview"]["execution_policy_result"]["evidence"]
+        self.assertEqual(4_100, evidence["projected_account_consumption"])
+        self.assertEqual(4_000, evidence["system_total_budget"])
 
     def test_base_quantity_creates_round_one_intent(self) -> None:
         result = self._build(config={"trade_amount_type": "QUANTITY", "buy_qty": 2}, price=80000)

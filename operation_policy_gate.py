@@ -38,11 +38,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from account_auto_trade_budget_consumption import (
+    canonical_buy_candidate_amount,
+    project_account_auto_trade_budget_consumption,
+    project_system_total_budget_buy_admission,
+)
 from execution_queue_writer import mutate_order_queue
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
 )
+from gui_operation_environment import read_system_total_budget_for_recalculation
+from production_recovery_contract import ACCOUNT_COMPLETED, STOCK_RESTORED
+from production_recovery_state_registry import production_recovery_registry
 from runtime_atomic_writer import write_json_atomic
 
 
@@ -50,6 +58,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 STOCKS_DIR = PROJECT_ROOT / "stocks"
 ORDER_QUEUE_PATH = RUNTIME_DIR / "order_queue.json"
+POSITIONS_PATH = RUNTIME_DIR / "positions.json"
 OPERATION_STATE_PATH = RUNTIME_DIR / "operation_state.json"
 
 
@@ -435,7 +444,73 @@ def is_liquidating(stock_state: dict[str, Any]) -> bool:
     return status in {"LIQUIDATING", "LIQUIDATION", "청산", "청산중"}
 
 
-def evaluate_operation_policy(order: dict[str, Any]) -> dict[str, Any]:
+def _account_total_budget_admission(
+    order: dict[str, Any],
+    orders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    intent = order.get("execution_intent")
+    intent_dict = intent if isinstance(intent, dict) else {}
+    account_no = str(order.get("account_no") or intent_dict.get("account_no") or "").strip()
+    total_budget = read_system_total_budget_for_recalculation()
+    recovery = production_recovery_registry.snapshot()
+    identity = getattr(recovery, "identity", None)
+    recovery_ready = bool(
+        recovery is not None
+        and getattr(recovery, "account_status", None) == ACCOUNT_COMPLETED
+        and identity is not None
+        and str(getattr(identity, "account_no", "") or "").strip() == account_no
+        and str(getattr(identity, "trading_day", "") or "").strip()
+        == datetime.now().date().isoformat()
+    )
+    stocks = tuple(getattr(recovery, "stocks", ()) or ()) if recovery is not None else ()
+    reconciled_codes = {
+        str(getattr(stock, "stock_code", "") or "").strip()
+        for stock in stocks
+        if getattr(stock, "stock_status", None) == STOCK_RESTORED
+        and getattr(stock, "review_required", None) is False
+    }
+    order_code = str(order.get("code") or "").strip().upper().removeprefix("A")
+    if len(reconciled_codes) != len(stocks) or order_code not in reconciled_codes:
+        recovery_ready = False
+
+    consumption = project_account_auto_trade_budget_consumption(
+        account_no=account_no,
+        positions_path=POSITIONS_PATH,
+        order_queue_path=ORDER_QUEUE_PATH,
+        recovery_complete=recovery_ready,
+        reconciled_stock_codes=reconciled_codes,
+        order_records=orders,
+    )
+    try:
+        candidate_amount: object = canonical_buy_candidate_amount(order)
+    except ValueError:
+        candidate_amount = None
+    admission = project_system_total_budget_buy_admission(
+        total_budget=total_budget,
+        account_consumed_amount=(
+            consumption.get("consumed_amount")
+            if consumption.get("available") is True
+            else None
+        ),
+        candidate_buy_amount=candidate_amount,
+    )
+    admission.update(
+        {
+            "account_no": account_no or None,
+            "holding_cost": consumption.get("holding_cost"),
+            "outstanding_buy_reservation": consumption.get("open_buy_reservation"),
+            "consumption_reason": consumption.get("reason"),
+            "serialized_by": "execution_queue_writer.mutate_order_queue",
+        }
+    )
+    return admission
+
+
+def evaluate_operation_policy(
+    order: dict[str, Any],
+    *,
+    account_orders: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """주문후보 1건에 운영정책 차단 여부를 판정한다."""
     status = _norm(order.get("status"))
     side = _norm(order.get("side"))
@@ -486,6 +561,26 @@ def evaluate_operation_policy(order: dict[str, Any]) -> dict[str, Any]:
                 "policy_status": "BLOCKED_POLICY",
                 "policy_reason": order_reason,
             }
+
+    if side == "BUY" and account_orders is not None:
+        admission = _account_total_budget_admission(order, account_orders)
+        if admission.get("available") is not True:
+            return {
+                "policy_status": "BLOCKED_POLICY",
+                "policy_reason": "SYSTEM_TOTAL_BUDGET_EVIDENCE_UNAVAILABLE",
+                "policy_evidence": admission,
+            }
+        if admission.get("admitted") is not True:
+            return {
+                "policy_status": "BLOCKED_POLICY",
+                "policy_reason": "SYSTEM_TOTAL_BUDGET_EXCEEDED",
+                "policy_evidence": admission,
+            }
+        return {
+            "policy_status": "EXECUTABLE",
+            "policy_reason": "운영정책 및 시스템 전체예산 통과",
+            "policy_evidence": admission,
+        }
 
     return {
         "policy_status": "EXECUTABLE",
@@ -549,7 +644,7 @@ def _apply_operation_policy_gate_canonical() -> dict[str, Any]:
                 ignored += 1
                 continue
 
-            result = evaluate_operation_policy(order)
+            result = evaluate_operation_policy(order, account_orders=orders)
             policy_status = result.get("policy_status", "BLOCKED_POLICY")
             if policy_status == "IGNORED":
                 ignored += 1
@@ -558,6 +653,8 @@ def _apply_operation_policy_gate_canonical() -> dict[str, Any]:
             checked += 1
             order["policy_status"] = policy_status
             order["policy_reason"] = result.get("policy_reason", "")
+            if isinstance(result.get("policy_evidence"), dict):
+                order["policy_evidence"] = dict(result["policy_evidence"])
             order["policy_checked_at"] = now_text()
             order["execution_enabled"] = False
 
@@ -682,7 +779,7 @@ def _apply_operation_policy_gate_for_order_canonical(
                 }
             }
 
-        result = evaluate_operation_policy(order)
+        result = evaluate_operation_policy(order, account_orders=orders)
         policy_status = str(result.get("policy_status", "") or "").upper()
         if policy_status not in {"EXECUTABLE", "BLOCKED_POLICY"}:
             return {
@@ -701,6 +798,8 @@ def _apply_operation_policy_gate_for_order_canonical(
 
         order["policy_status"] = policy_status
         order["policy_reason"] = result.get("policy_reason", "")
+        if isinstance(result.get("policy_evidence"), dict):
+            order["policy_evidence"] = dict(result["policy_evidence"])
         order["policy_checked_at"] = now_text()
         order["execution_enabled"] = False
         order["status"] = policy_status
@@ -715,6 +814,7 @@ def _apply_operation_policy_gate_for_order_canonical(
                 "before_status": before_status,
                 "after_status": order.get("status", ""),
                 "policy_status": policy_status,
+                "policy_evidence": result.get("policy_evidence"),
                 "execution_enabled": bool(order.get("execution_enabled", False)),
                 "order_queue_path": str(target_path),
                 "changed": True,

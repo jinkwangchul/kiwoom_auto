@@ -18,6 +18,7 @@ from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
 from close_liquidation_transition_service import POLICY_MARKET, POLICY_ROUTINE_CLOSE, is_routine_close_policy, normalize_direct_close_policy_alias
 from gui_auto_trade_policy import auto_trade_current_session_operation_participant_codes
 from gui_operation_environment import read_operation_policy
+from limit_response_priority import STAGE_ROUTINE, arbitrate_limit_response_priority
 from operation_close_completion_evaluator import evaluate_operation_close_completion, resolve_liquidation_holding_quantity
 from operation_command_service import MODE_EARLY_CLOSE, SCOPE_STOCK
 from pnl_ui_refresh import project_current_stock_pnl_snapshot
@@ -198,27 +199,6 @@ def select_routine_limit_candidate(*, projection: object, candidates: object) ->
     return {"selectable": True, "selected_stock_code": code, "selected_stock": dict(item), "selected_value": factor, "reason": ""}
 
 
-def _buffer_clear(
-    buffer_result: object,
-    *,
-    account_no: str,
-    trading_day: str,
-    ownership: BufferResponseOwnershipService | None = None,
-) -> tuple[bool, str]:
-    if not isinstance(buffer_result, Mapping) or buffer_result.get("stable") is not True or buffer_result.get("ingress_committed") is not True:
-        return False, "BUFFER_RESPONSE_NOT_SETTLED"
-    if buffer_result.get("ownership_claimed") is True or buffer_result.get("ownership_existing") is True:
-        return False, "BUFFER_RESPONSE_OWNS_CURRENT_CYCLE"
-    if buffer_result.get("event_created") is True and buffer_result.get("policy_projected") is not True:
-        return False, "BUFFER_RESPONSE_POLICY_UNCERTAIN"
-    active = (ownership or BufferResponseOwnershipService()).active_owned_stock_codes(account_no=account_no, trading_day=trading_day)
-    if active.get("ok") is not True:
-        return False, "BUFFER_OWNERSHIP_UNAVAILABLE"
-    if active.get("stock_codes"):
-        return False, "BUFFER_RESPONSE_ACTIVE_OWNERSHIP"
-    return True, ""
-
-
 class RoutineLimitResponseCoordinator:
     def __init__(self, *, project_root: str | Path = PROJECT_ROOT, positions_path: str | Path = POSITIONS_PATH,
                  fills_path: str | Path = FILLS_PATH, order_queue_path: str | Path = ORDER_QUEUE_PATH,
@@ -255,14 +235,17 @@ class RoutineLimitResponseCoordinator:
         account = _text(getattr(identity, "account_no", "")); day = _text(getattr(identity, "trading_day", ""))
         if context is None or context.account_status != ACCOUNT_COMPLETED or not account or not day:
             return _result("RECOVERY_INCOMPLETE")
-        clear, reason = _buffer_clear(
-            buffer_result,
+        priority = arbitrate_limit_response_priority(
             account_no=account,
             trading_day=day,
-            ownership=self.buffer_ownership,
+            buffer_result=buffer_result,
+            stage=STAGE_ROUTINE,
+            project_root=self.root,
+            buffer_ownership=self.buffer_ownership,
+            routine_ownership=self.ownership,
         )
-        if not clear:
-            return _result(reason, evaluated=True, settled=False, higher_priority_blocked=True)
+        if priority.get("admitted") is not True:
+            return _result(priority.get("reason"), evaluated=True, settled=False, higher_priority_blocked=True)
         routine_ids = set(self._active_routine_ids(account=account, day=day))
         if recovery:
             routine_ids.update(self._routine_ids(trigger, context))

@@ -93,6 +93,7 @@ def _first_text(source: dict[str, Any], keys: tuple[str, ...]) -> str | None:
 def _execution_intent(signal: dict[str, Any], policy_result: dict[str, Any]) -> dict[str, Any]:
     """Translate a routine policy result without reinterpreting its strategy."""
     price_basis = policy_result.get("order_price_basis")
+    evidence = _as_dict(policy_result.get("evidence"))
     return {
         "side": "BUY",
         "buy_phase": policy_result.get("buy_phase"),
@@ -118,6 +119,17 @@ def _execution_intent(signal: dict[str, Any], policy_result: dict[str, Any]) -> 
         "is_last_round": policy_result.get("is_last_round"),
         "unresolved": False,
         "execution_snapshot": deepcopy(_as_dict(policy_result.get("execution_snapshot"))),
+        "account_no": evidence.get("account_no"),
+        "system_budget_admission": {
+            key: evidence.get(key)
+            for key in (
+                "system_total_budget",
+                "account_consumed_amount",
+                "candidate_buy_amount",
+                "projected_account_consumption",
+                "system_total_budget_exceeded",
+            )
+        },
     }
 
 

@@ -411,42 +411,30 @@ def evaluate_main_window_stock_limit_after_chejan(
         return _result("BUY_POSITION_COMMIT_NOT_CONFIRMED")
     if _text(position_result.get("side")).upper() != "BUY":
         return _result("NOT_BUY_POSITION_COMMIT")
-    if not _higher_priority_settled(higher_priority_result):
-        return _result(
-            "HIGHER_PRIORITY_RESPONSE_NOT_SETTLED",
-            stock_code=_stock_code(position_result.get("code")),
-            higher_priority_blocked=True,
-        )
-    if routine_priority_result is not None:
-        from routine_limit_response_service import routine_layer_allows_stock
-
-        if not routine_layer_allows_stock(routine_priority_result):
-            return _result(
-                "ROUTINE_LIMIT_RESPONSE_NOT_CLEAR",
-                stock_code=_stock_code(position_result.get("code")),
-                higher_priority_blocked=True,
-            )
     selected_reader = getattr(window, "selected_account_no", None)
     account_no = _text(selected_reader()) if callable(selected_reader) else ""
     recovery = production_recovery_registry.snapshot()
     trading_day = _text(getattr(getattr(recovery, "identity", None), "trading_day", ""))
+    from limit_response_priority import STAGE_STOCK, arbitrate_limit_response_priority
+
+    priority = arbitrate_limit_response_priority(
+        account_no=account_no,
+        trading_day=trading_day,
+        buffer_result=higher_priority_result,
+        routine_result=routine_priority_result,
+        stage=STAGE_STOCK,
+    )
+    if priority.get("admitted") is not True:
+        return _result(
+            priority.get("reason"),
+            stock_code=_stock_code(position_result.get("code")),
+            higher_priority_blocked=True,
+        )
     return StockLimitResponseService().evaluate_stock(
         account_no=account_no,
         trading_day=trading_day,
         stock_code=position_result.get("code"),
         recovery_context=recovery,
-    )
-
-
-def _higher_priority_settled(result: Mapping[str, object] | object) -> bool:
-    return bool(
-        isinstance(result, Mapping)
-        and result.get("stable") is True
-        and result.get("ingress_committed") is True
-        and not (
-            result.get("event_created") is True
-            and result.get("policy_projected") is not True
-        )
     )
 
 
@@ -456,29 +444,27 @@ def resume_main_window_stock_limit_responses(
     higher_priority_result: Mapping[str, object] | object,
     routine_priority_result: Mapping[str, object] | object | None = None,
 ) -> dict[str, object]:
-    if not _higher_priority_settled(higher_priority_result):
+    recovery = production_recovery_registry.snapshot()
+    identity = getattr(recovery, "identity", None)
+    account_no = _text(getattr(identity, "account_no", ""))
+    trading_day = _text(getattr(identity, "trading_day", ""))
+    from limit_response_priority import STAGE_STOCK, arbitrate_limit_response_priority
+
+    priority = arbitrate_limit_response_priority(
+        account_no=account_no,
+        trading_day=trading_day,
+        buffer_result=higher_priority_result,
+        routine_result=routine_priority_result,
+        stage=STAGE_STOCK,
+    )
+    if priority.get("admitted") is not True:
         return {
             "evaluated_count": 0,
             "requested_count": 0,
             "results": (),
             "higher_priority_blocked": True,
-            "reason": "HIGHER_PRIORITY_RESPONSE_NOT_SETTLED",
+            "reason": priority.get("reason"),
         }
-    if routine_priority_result is not None:
-        from routine_limit_response_service import routine_layer_allows_stock
-
-        if not routine_layer_allows_stock(routine_priority_result):
-            return {
-                "evaluated_count": 0,
-                "requested_count": 0,
-                "results": (),
-                "higher_priority_blocked": True,
-                "reason": "ROUTINE_LIMIT_RESPONSE_NOT_CLEAR",
-            }
-    recovery = production_recovery_registry.snapshot()
-    identity = getattr(recovery, "identity", None)
-    account_no = _text(getattr(identity, "account_no", ""))
-    trading_day = _text(getattr(identity, "trading_day", ""))
     service = StockLimitResponseService()
     results = []
     for stock in tuple(getattr(recovery, "stocks", ()) or ()):

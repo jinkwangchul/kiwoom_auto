@@ -2,8 +2,8 @@
 """Read-only account-wide auto-trade budget-consumption projection.
 
 The projection combines only canonical Runtime facts that already exist:
-current position cost basis and the unfilled reservation of broker-accepted
-BUY orders.  It never writes Runtime, persists a new SoT, or calls a broker.
+current position cost basis and one reservation per admitted BUY lifecycle.
+It never writes Runtime, persists a new SoT, or calls a broker.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 _OPEN_BROKER_STATUSES = {"BROKER_ACCEPTED", "PARTIALLY_FILLED"}
@@ -27,10 +27,32 @@ _TERMINAL_STATUSES = {
     "BROKER_REJECTED",
     "SEND_CALL_REJECTED",
 }
-_UNSENT_STATUSES = {
+_RESERVED_UNSENT_STATUSES = {
+    "EXECUTABLE",
+    "REAL_READY",
     "ORDER_QUEUED",
     "DISPATCH_CLAIMED",
     "SEND_ATTEMPTED",
+}
+_IGNORED_PRE_ADMISSION_STATUSES = {
+    "PENDING",
+    "APPROVED",
+    "BLOCKED",
+    "BLOCKED_POLICY",
+}
+_LIFECYCLE_RANK = {
+    **{status: 0 for status in _IGNORED_PRE_ADMISSION_STATUSES},
+    "EXECUTABLE": 10,
+    "REAL_READY": 20,
+    "ORDER_QUEUED": 30,
+    "DISPATCH_CLAIMED": 40,
+    "SEND_ATTEMPTED": 50,
+    "SEND_CALL_IN_PROGRESS": 60,
+    "SEND_CALL_ACCEPTED": 70,
+    "SEND_UNCERTAIN": 70,
+    "BROKER_ACCEPTED": 80,
+    "PARTIALLY_FILLED": 90,
+    **{status: 100 for status in _TERMINAL_STATUSES},
 }
 
 
@@ -164,6 +186,66 @@ def _order_price(record: dict[str, Any]) -> int:
     return _integer(value, field="open BUY order price", minimum=1)
 
 
+def canonical_buy_candidate_amount(record: Mapping[str, Any]) -> int:
+    """Return the already-computed BUY request budget without repricing it."""
+    order = dict(record) if isinstance(record, Mapping) else {}
+    intent = _as_dict(order.get("execution_intent"))
+    values = []
+    for value in (order.get("amount"), intent.get("budget")):
+        if value not in (None, ""):
+            values.append(_integer(value, field="candidate BUY amount", minimum=1))
+    if not values:
+        raise ValueError("candidate BUY amount is required")
+    if len(set(values)) != 1:
+        raise ValueError("candidate BUY amount is inconsistent")
+    return values[0]
+
+
+def project_system_total_budget_buy_admission(
+    *,
+    total_budget: object,
+    account_consumed_amount: object,
+    candidate_buy_amount: object,
+) -> dict[str, object]:
+    """Project the strict system-total ceiling for one deterministic BUY."""
+    try:
+        total = _integer(total_budget, field="system total budget")
+        consumed = _integer(account_consumed_amount, field="account consumed amount")
+        candidate = _integer(candidate_buy_amount, field="candidate BUY amount", minimum=1)
+    except ValueError as exc:
+        return {
+            "available": False,
+            "admitted": False,
+            "reason": str(exc),
+            "reason_code": "SYSTEM_TOTAL_BUDGET_EVIDENCE_UNAVAILABLE",
+            "system_total_budget": None,
+            "account_consumed_amount": None,
+            "candidate_buy_amount": None,
+            "projected_account_consumption": None,
+            "system_total_budget_exceeded": None,
+        }
+    projected = consumed + candidate
+    exceeded = projected > total
+    return {
+        "available": True,
+        "admitted": not exceeded,
+        "reason": "SYSTEM_TOTAL_BUDGET_EXCEEDED" if exceeded else "",
+        "reason_code": "SYSTEM_TOTAL_BUDGET_EXCEEDED" if exceeded else "",
+        "system_total_budget": total,
+        "account_consumed_amount": consumed,
+        "candidate_buy_amount": candidate,
+        "projected_account_consumption": projected,
+        "system_total_budget_exceeded": exceeded,
+    }
+
+
+def _validated_order_records(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    result = list(records)
+    if any(not isinstance(item, Mapping) for item in result):
+        raise ValueError("order_queue.json.orders must contain only objects")
+    return [dict(item) for item in result]
+
+
 def project_account_auto_trade_budget_consumption(
     *,
     account_no: object,
@@ -171,6 +253,7 @@ def project_account_auto_trade_budget_consumption(
     order_queue_path: str | Path,
     recovery_complete: bool,
     reconciled_stock_codes: Iterable[object] = (),
+    order_records: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, object]:
     """Project occupied capital for one reconciled account without mutation."""
     account = _text(account_no)
@@ -184,7 +267,11 @@ def project_account_auto_trade_budget_consumption(
 
     try:
         positions = _read_list(Path(positions_path), "positions")
-        orders = _read_list(Path(order_queue_path), "orders")
+        orders = (
+            _read_list(Path(order_queue_path), "orders")
+            if order_records is None
+            else _validated_order_records(order_records)
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return _unavailable(str(exc))
 
@@ -223,16 +310,15 @@ def project_account_auto_trade_budget_consumption(
             holding_cost += cost_basis
             position_count += 1
 
-        open_buy_reservation = 0
-        open_buy_order_count = 0
-        broker_order_numbers: set[str] = set()
+        reservations: dict[str, tuple[int, str, dict[str, Any]]] = {}
         for order in orders:
             status = _text(order.get("status")).upper()
             side = _order_side(order)
             if side != "BUY":
                 continue
             account_identity = _record_account(order)
-            if status in _OPEN_BROKER_STATUSES | _AMBIGUOUS_SEND_STATUSES:
+            active_statuses = _OPEN_BROKER_STATUSES | _AMBIGUOUS_SEND_STATUSES | _RESERVED_UNSENT_STATUSES
+            if status in active_statuses:
                 if not account_identity:
                     raise ValueError("active BUY order account_no is required")
                 if account_identity != account:
@@ -242,9 +328,7 @@ def project_account_auto_trade_budget_consumption(
 
             if status in _AMBIGUOUS_SEND_STATUSES:
                 raise ValueError(f"BUY order lifecycle is unresolved: {status}")
-            if status in _TERMINAL_STATUSES | _UNSENT_STATUSES:
-                continue
-            if status not in _OPEN_BROKER_STATUSES:
+            if status not in _LIFECYCLE_RANK:
                 if (
                     order.get("actual_order_sent") is True
                     or order.get("send_order_called") is True
@@ -252,15 +336,33 @@ def project_account_auto_trade_budget_consumption(
                 ):
                     raise ValueError(f"BUY order status is unsupported: {status or 'missing'}")
                 continue
+            source_signal_id = _text(order.get("source_signal_id"))
+            if status in active_statuses and not source_signal_id:
+                raise ValueError("active BUY source_signal_id is required")
+            if not source_signal_id:
+                continue
+            rank = _LIFECYCLE_RANK[status]
+            previous = reservations.get(source_signal_id)
+            if previous is None or rank > previous[0]:
+                reservations[source_signal_id] = (rank, status, order)
+
+        open_buy_reservation = 0
+        open_buy_order_count = 0
+        broker_order_numbers: set[str] = set()
+        for _rank, status, order in reservations.values():
+            if status in _TERMINAL_STATUSES | _IGNORED_PRE_ADMISSION_STATUSES:
+                continue
             if _order_action(order) != "NEW":
                 raise ValueError("active MODIFY/CANCEL BUY order cannot be projected safely")
-            if not _text(order.get("source_signal_id")):
-                raise ValueError("active BUY source_signal_id is required")
             code = _order_code(order)
             if not code:
                 raise ValueError("active BUY stock code is required")
             if code not in reconciled:
                 raise ValueError("active BUY order is outside reconciled stock scope")
+            if status in _RESERVED_UNSENT_STATUSES:
+                open_buy_reservation += canonical_buy_candidate_amount(order)
+                open_buy_order_count += 1
+                continue
             broker_order_no = _text(order.get("broker_order_no"))
             if not broker_order_no:
                 raise ValueError("active BUY broker_order_no is required")

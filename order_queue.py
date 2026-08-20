@@ -515,6 +515,9 @@ def signal_to_order_candidate(signal: dict[str, Any], index: int) -> dict[str, A
     }
     if isinstance(execution_intent, dict):
         order["execution_intent"] = deepcopy(execution_intent)
+        account_no = str(execution_intent.get("account_no") or "").strip()
+        if account_no:
+            order["account_no"] = account_no
 
     order.update(computed)
     _normalize_quantity_fields(order)

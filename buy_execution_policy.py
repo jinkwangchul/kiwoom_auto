@@ -15,6 +15,10 @@ import math
 from copy import deepcopy
 from typing import Any
 
+from account_auto_trade_budget_consumption import (
+    project_system_total_budget_buy_admission,
+)
+
 
 POLICY_TYPE = "BUY_EXECUTION_POLICY"
 STATUS_READY = "READY"
@@ -290,6 +294,17 @@ def _result(
         "budget_reference": budget_reference,
         "is_last_round": is_last_round,
         "remaining_budget_after_candidate": remaining_budget_after_candidate,
+        "system_budget_admission": {
+            key: (evidence or {}).get(key)
+            for key in (
+                "account_no",
+                "system_total_budget",
+                "account_consumed_amount",
+                "candidate_buy_amount",
+                "projected_account_consumption",
+                "system_total_budget_exceeded",
+            )
+        },
     }
     approved_rule_hash = _stable_hash(approved_payload)
     runtime_state_hash = _stable_hash(runtime_state)
@@ -306,6 +321,7 @@ def _result(
         "calculation_hash": calculation_hash,
         "policy_hash": policy_hash,
     }
+    system_evidence = evidence or {}
     return {
         "policy_type": POLICY_TYPE,
         "status": status,
@@ -330,6 +346,11 @@ def _result(
         "is_last_round": is_last_round,
         "remaining_budget_after_candidate": remaining_budget_after_candidate,
         "evidence": deepcopy(evidence or {}),
+        "system_total_budget": system_evidence.get("system_total_budget"),
+        "account_consumed_amount": system_evidence.get("account_consumed_amount"),
+        "candidate_buy_amount": system_evidence.get("candidate_buy_amount"),
+        "projected_account_consumption": system_evidence.get("projected_account_consumption"),
+        "system_total_budget_exceeded": system_evidence.get("system_total_budget_exceeded"),
         "execution_snapshot": snapshot,
     }
 
@@ -427,6 +448,20 @@ def evaluate_buy_execution_policy(
         if confirmed_cumulative + round_budget > total_budget:
             issues.append("TOTAL_BUDGET_EXCEEDED")
 
+    system_admission: dict[str, Any] = {}
+    if budget.get("system_total_budget_gate_required") is True:
+        system_admission = project_system_total_budget_buy_admission(
+            total_budget=budget.get("system_total_budget"),
+            account_consumed_amount=budget.get("account_consumed_amount"),
+            candidate_buy_amount=round_budget,
+        )
+        if system_admission.get("available") is not True:
+            issues.append("SYSTEM_TOTAL_BUDGET_EVIDENCE_UNAVAILABLE")
+        elif not str(budget.get("account_no") or "").strip():
+            issues.append("ACCOUNT_IDENTITY_UNAVAILABLE")
+        elif system_admission.get("admitted") is not True:
+            issues.append("SYSTEM_TOTAL_BUDGET_EXCEEDED")
+
     evidence.update({
         "price_source": price_source,
         "current_price_source": current_price_source,
@@ -437,6 +472,8 @@ def evaluate_buy_execution_policy(
         "total_budget": total_budget,
         "remaining_budget_before_candidate": remaining_budget,
         "budget_calculation": budget_evidence,
+        "account_no": budget.get("account_no"),
+        **system_admission,
     })
 
     result_args = dict(
