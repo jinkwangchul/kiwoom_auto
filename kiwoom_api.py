@@ -31,7 +31,7 @@ else:
 
 from candle_manager import DEFAULT_CANDLES_MAX_COUNT
 from account_funds_foundation import ACCOUNT_AUTHENTICATION_REQUIRED
-from kiwoom_candle_adapter import save_minute_candles_for_stock
+from kiwoom_candle_adapter import commit_minute_candles_for_stock
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
 from event_journal_production import observe_production_exception
@@ -46,6 +46,18 @@ from kiwoom_screen_allocator import (
 Opt10080Callback = Callable[[dict[str, Any]], None]
 RecoverySnapshotCallback = Callable[[dict[str, Any]], None]
 AccountFundsCallback = Callable[[dict[str, Any]], None]
+
+
+def _empty_candle_commit_projection() -> dict[str, Any]:
+    return {
+        "commit_verified": False,
+        "changed": False,
+        "canonical_content_hash": "",
+        "commit_identity": "",
+        "bar_key": "",
+        "bar_identity": "",
+        "bar_time": "",
+    }
 
 
 @dataclass(frozen=True)
@@ -287,6 +299,7 @@ class KiwoomApi(QObject):
     login_state_changed = pyqtSignal(dict)
     raw_chejan_received = pyqtSignal(dict)
     account_authentication_required = pyqtSignal(dict)
+    bar_committed = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -630,6 +643,7 @@ class KiwoomApi(QObject):
                     "type": "minute_candles",
                     "code": pending.get("code", ""),
                     "name": pending.get("name", ""),
+                    **_empty_candle_commit_projection(),
                 }
             )
             self._finish_callback(callback if callable(callback) else None, payload)
@@ -1234,6 +1248,7 @@ class KiwoomApi(QObject):
                 "name": pending.get("name", ""),
                 "rqname": str(rqname),
                 "error": "minute candle request timed out",
+                **_empty_candle_commit_projection(),
             },
         )
 
@@ -1742,24 +1757,40 @@ class KiwoomApi(QObject):
         try:
             rows = self._read_opt10080_rows(str(trcode), str(rqname), int(pending.get("count") or 300))
             pending["rows"] = rows
-            saved = save_minute_candles_for_stock(
+            commit = commit_minute_candles_for_stock(
                 str(pending.get("code", "")),
                 str(pending.get("name", "")),
                 rows,
                 max_count=int(pending.get("max_count") or DEFAULT_CANDLES_MAX_COUNT),
+                rqname=str(rqname),
+                trcode=str(trcode),
+                connection_epoch=int(pending.get("request_connection_epoch") or 0),
             )
             result = {
-                "ok": True,
+                "ok": commit.ok,
                 "type": "minute_candles",
                 "code": pending.get("code", ""),
                 "name": pending.get("name", ""),
                 "rqname": str(rqname),
                 "trcode": str(trcode),
                 "rows_count": len(rows),
-                "saved_count": len(saved),
+                "saved_count": commit.saved_count,
+                "commit_verified": bool(commit.ok and commit.readback_verified),
+                "changed": commit.changed,
+                "canonical_content_hash": commit.canonical_content_hash,
+                "canonical_path": commit.path,
+                "commit_identity": commit.commit_identity,
+                "bar_key": commit.bar_key,
+                "bar_identity": commit.bar_identity,
+                "bar_time": commit.bar_time,
+                "trade_date": commit.trade_date,
+                "error_kind": commit.error_kind,
+                "error": commit.error,
                 "has_more": str(prev_next).strip() == "2",
                 "warning": "additional pages available" if str(prev_next).strip() == "2" else "",
             }
+            if commit.ok and commit.readback_verified and commit.changed and commit.notification is not None:
+                self.bar_committed.emit(commit.notification.to_payload())
         except Exception as exc:
             result = {
                 "ok": False,
@@ -1769,6 +1800,7 @@ class KiwoomApi(QObject):
                 "rqname": str(rqname),
                 "trcode": str(trcode),
                 "error": str(exc),
+                **_empty_candle_commit_projection(),
             }
 
         self._finish_callback(callback if callable(callback) else None, result)

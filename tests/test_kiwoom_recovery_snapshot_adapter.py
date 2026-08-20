@@ -131,12 +131,38 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.api._unavailable_reason = ""
         self.api._pending_tr = {}
         self.api._account_funds_request_accounts = {}
+        self.api.bar_committed = _Signal()
         self.identity = self.module.RecoverySessionIdentity(
             recovery_session_id="RECOVERY_SESSION_TEST",
             login_session_id="KIWOOM_LOGIN_SESSION_TEST",
             account_no=self.account_no,
             trading_day="2026-07-27",
             requested_at="2026-07-27T09:00:00",
+        )
+
+    @staticmethod
+    def minute_commit_result(*, changed: bool = True, ok: bool = True):
+        payload = {
+            "event_type": "BAR_COMMITTED",
+            "stock_code": "005930",
+            "commit_identity": "commit-id",
+        }
+        notification = types.SimpleNamespace(to_payload=lambda: dict(payload)) if changed and ok else None
+        return types.SimpleNamespace(
+            ok=ok,
+            changed=changed,
+            readback_verified=ok,
+            path="C:/temp/005930/candles.json",
+            saved_count=1 if ok else 0,
+            canonical_content_hash="content-hash" if ok else "",
+            commit_identity="commit-id" if ok else "",
+            bar_key="005930:1:2026-07-27T09:00:00+09:00" if ok else "",
+            bar_identity="bar-id" if ok else "",
+            bar_time="2026-07-27T09:00:00+09:00" if ok else "",
+            trade_date="2026-07-27" if ok else "",
+            error_kind="" if ok else "CANDLE_REPLACE_FAILED",
+            error="" if ok else "replace failed",
+            notification=notification,
         )
 
     def comm_rq_calls(self) -> list[tuple[object, ...]]:
@@ -272,9 +298,9 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
 
     def test_existing_minute_candle_response_path_is_unchanged(self) -> None:
         results: list[dict[str, object]] = []
-        saved_function = self.module.save_minute_candles_for_stock
-        self.module.save_minute_candles_for_stock = (
-            lambda _code, _name, rows, max_count: rows[:max_count]
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
+            lambda *_args, **_kwargs: self.minute_commit_result()
         )
         try:
             self.api._pending_tr["OPT10080_TEST"] = {
@@ -304,10 +330,71 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
                 "0",
             )
         finally:
-            self.module.save_minute_candles_for_stock = saved_function
+            self.module.commit_minute_candles_for_stock = saved_function
         self.assertEqual(1, len(results))
         self.assertTrue(results[0]["ok"])
+        self.assertTrue(results[0]["commit_verified"])
         self.assertEqual(1, results[0]["saved_count"])
+        self.assertEqual("commit-id", results[0]["commit_identity"])
+        self.assertEqual(1, len(self.api.bar_committed.values))
+
+    def test_minute_candle_unchanged_commit_does_not_emit(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles("005930", callback=results.append)
+        rqname = str(requested["rqname"])
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
+            lambda *_args, **_kwargs: self.minute_commit_result(changed=False)
+        )
+        try:
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
+        finally:
+            self.module.commit_minute_candles_for_stock = saved_function
+
+        self.assertEqual(1, len(results))
+        self.assertTrue(results[0]["ok"])
+        self.assertTrue(results[0]["commit_verified"])
+        self.assertFalse(results[0]["changed"])
+        self.assertEqual([], self.api.bar_committed.values)
+
+    def test_minute_candle_failed_commit_finishes_once_without_event(self) -> None:
+        results: list[dict[str, object]] = []
+        requested = self.api.request_minute_candles("005930", callback=results.append)
+        rqname = str(requested["rqname"])
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
+            lambda *_args, **_kwargs: self.minute_commit_result(ok=False)
+        )
+        try:
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
+            self.api._expire_minute_candle_request(rqname)
+        finally:
+            self.module.commit_minute_candles_for_stock = saved_function
+
+        self.assertEqual(1, len(results))
+        self.assertFalse(results[0]["ok"])
+        self.assertFalse(results[0]["commit_verified"])
+        self.assertEqual("CANDLE_REPLACE_FAILED", results[0]["error_kind"])
+        self.assertEqual([], self.api.bar_committed.values)
+
+    def test_bar_committed_emits_before_existing_callback(self) -> None:
+        order: list[str] = []
+        self.api.bar_committed.connect(lambda _payload: order.append("event"))
+        requested = self.api.request_minute_candles(
+            "005930",
+            callback=lambda _result: order.append("callback"),
+        )
+        rqname = str(requested["rqname"])
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
+            lambda *_args, **_kwargs: self.minute_commit_result()
+        )
+        try:
+            self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
+        finally:
+            self.module.commit_minute_candles_for_stock = saved_function
+
+        self.assertEqual(["event", "callback"], order)
 
     def test_account_funds_request_uses_official_opw00001_contract(self) -> None:
         results: list[dict[str, object]] = []
@@ -473,12 +560,14 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         rqname = str(requested["rqname"])
         self.assertTrue(self.api._screen_allocator.is_leased("3000"))
 
-        saved_function = self.module.save_minute_candles_for_stock
-        self.module.save_minute_candles_for_stock = lambda *args, **kwargs: []
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
+            lambda *args, **kwargs: self.minute_commit_result()
+        )
         try:
             self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
         finally:
-            self.module.save_minute_candles_for_stock = saved_function
+            self.module.commit_minute_candles_for_stock = saved_function
 
         self.assertEqual(1, len(results))
         self.assertFalse(self.api._screen_allocator.is_leased("3000"))
@@ -530,8 +619,8 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             callback=results.append,
         )
         rqname = str(requested["rqname"])
-        saved_function = self.module.save_minute_candles_for_stock
-        self.module.save_minute_candles_for_stock = (
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
             lambda *args, **kwargs: saves.append((args, kwargs)) or []
         )
         try:
@@ -550,12 +639,13 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             ]
             self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
         finally:
-            self.module.save_minute_candles_for_stock = saved_function
+            self.module.commit_minute_candles_for_stock = saved_function
 
         self.assertEqual(1, len(results))
         self.assertFalse(results[0]["ok"])
         self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
         self.assertEqual([], saves)
+        self.assertEqual([], self.api.bar_committed.values)
         self.assertNotIn(rqname, self.api._pending_tr)
 
         self.api._expire_minute_candle_request(rqname)
@@ -570,8 +660,8 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             callback=results.append,
         )
         rqname = str(requested["rqname"])
-        saved_function = self.module.save_minute_candles_for_stock
-        self.module.save_minute_candles_for_stock = (
+        saved_function = self.module.commit_minute_candles_for_stock
+        self.module.commit_minute_candles_for_stock = (
             lambda *args, **kwargs: saves.append((args, kwargs)) or []
         )
         try:
@@ -580,7 +670,7 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
             self.api._on_receive_tr_data("3000", rqname, "opt10080", "", "0")
         finally:
-            self.module.save_minute_candles_for_stock = saved_function
+            self.module.commit_minute_candles_for_stock = saved_function
 
         self.assertEqual(1, len(results))
         self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
