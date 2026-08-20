@@ -413,6 +413,33 @@ def read_system_budget_policy(*, path: Path | None = None) -> dict[str, int]:
     return system_budget_policy(read_operation_policy(path=path))
 
 
+def read_system_total_budget_for_recalculation(
+    *,
+    path: Path | None = None,
+) -> int | None:
+    """Read total_budget without masking malformed persisted evidence."""
+    target_path = Path(path) if path is not None else OPERATION_POLICY_PATH
+    if not target_path.exists():
+        return int(SYSTEM_BUDGET_DEFAULTS["total_budget"])
+    try:
+        persisted = json.loads(target_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(persisted, dict):
+        return None
+    section = persisted.get("system_budget")
+    if section is None:
+        return int(SYSTEM_BUDGET_DEFAULTS["total_budget"])
+    if not isinstance(section, dict):
+        return None
+    if "total_budget" not in section:
+        return 0
+    try:
+        return validate_system_total_budget(section["total_budget"])
+    except ValueError:
+        return None
+
+
 def write_system_budget_policy(
     *,
     total_budget: object,
@@ -631,7 +658,18 @@ def effective_amount_starting_budget(
     quantity = int((price * multiplier / price).to_integral_value(rounding=ROUND_FLOOR))
     if quantity < 1:
         return None
-    return int((price * quantity).to_integral_value(rounding=ROUND_FLOOR))
+    return floor_money_to_won(price * quantity)
+
+
+def floor_money_to_won(value: object) -> int | None:
+    """Apply the existing budget-money FLOOR rule at the one-won boundary."""
+    try:
+        amount = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return int(amount.to_integral_value(rounding=ROUND_FLOOR))
 
 
 def round_up_to_leading_place(amount: object) -> int | None:

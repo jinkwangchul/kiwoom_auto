@@ -189,6 +189,7 @@ def write_global_operation_running_state(
     ok = result.get("status") == "OK" and result.get("written") is True
     return {
         "ok": ok,
+        "started_new_session": not already_running_today,
         "operation_date": operation_date,
         "operation_status": "RUNNING",
         "operation_participant_stock_codes": participants,

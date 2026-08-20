@@ -187,6 +187,41 @@ def _start_operation_host_after_explicit_operation_start(window) -> dict[str, ob
     }
 
 
+def _recalculate_routine_limits_after_new_session(window) -> dict[str, object]:
+    recalculator = getattr(
+        window,
+        "recalculate_routine_limits_for_new_operation_session",
+        None,
+    )
+    if not callable(recalculator):
+        return {"ok": False, "reason": "RECALCULATION_OWNER_UNAVAILABLE"}
+    try:
+        result = recalculator()
+    except Exception as exc:
+        LOGGER.exception("Routine limit recalculation failed after operation start")
+        return {
+            "ok": False,
+            "reason": "ROUTINE_LIMIT_RECALCULATION_FAILED",
+            "error": str(exc),
+        }
+    return result if isinstance(result, dict) else {
+        "ok": False,
+        "reason": "INVALID_ROUTINE_LIMIT_RECALCULATION_RESULT",
+    }
+
+
+def _apply_new_session_routine_limit_recalculation(
+    window,
+    operation_state_write: dict[str, object],
+) -> dict[str, object] | None:
+    if (
+        operation_state_write.get("ok") is not True
+        or operation_state_write.get("started_new_session") is not True
+    ):
+        return None
+    return _recalculate_routine_limits_after_new_session(window)
+
+
 def auto_trade_registered_operation_start_targets(window=None) -> list[tuple[Path, str, str]]:
     target_getter = getattr(window, "registered_operation_targets", None)
     registered = (
@@ -1889,6 +1924,14 @@ def auto_trade_start_selected_auto_trades(
         result["operation_state_write_failed"] = (
             operation_state_write.get("ok") is not True
         )
+        routine_limit_recalculation = (
+            _apply_new_session_routine_limit_recalculation(
+                window,
+                operation_state_write,
+            )
+        )
+        if routine_limit_recalculation is not None:
+            result["routine_limit_recalculation"] = routine_limit_recalculation
         result["operation_host_start_result"] = (
             _start_operation_host_after_explicit_operation_start(window)
         )

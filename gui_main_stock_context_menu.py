@@ -350,6 +350,16 @@ class MainMonitoringStockOperationAdapter:
             self._window.refresh_all()
         self.restore_stock_table_view_state(selected_paths, scroll_value)
 
+    def recalculate_routine_limits_for_new_operation_session(self) -> dict[str, object]:
+        recalculator = getattr(
+            self._window,
+            "recalculate_routine_limits_for_new_operation_session",
+            None,
+        )
+        if not callable(recalculator):
+            return {"ok": False, "reason": "RECALCULATION_OWNER_UNAVAILABLE"}
+        return recalculator()
+
     def update_action_buttons(self) -> None:
         return
 

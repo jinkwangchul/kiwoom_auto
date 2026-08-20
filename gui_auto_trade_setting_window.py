@@ -9629,6 +9629,13 @@ class AutoTradeSettingWindow(QDialog):
         if not parent_refreshed:
             self.update_global_operation_button_state()
 
+    def recalculate_routine_limits_for_new_operation_session(self) -> dict[str, object]:
+        from routine_limit_recalculation import (
+            recalculate_enabled_routine_limits_for_new_session,
+        )
+
+        return recalculate_enabled_routine_limits_for_new_session(self)
+
     def start_selected_rows_auto_trades(self) -> dict[str, object] | None:
         return auto_trade_start_selected_rows_auto_trades(self)
 

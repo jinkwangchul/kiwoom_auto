@@ -533,12 +533,10 @@ def _persisted_instance_from_directory(
             metadata_path,
             definition_id,
         )
-    if buy_limit_adjustment_ratio is not None and (
-        not buy_limit_enabled or buy_limit_amount is None
-    ):
+    if buy_limit_adjustment_ratio is not None and not buy_limit_enabled:
         return None, _instance_diagnostic(
             "INSTANCE_BUY_LIMIT_ADJUSTMENT_RATIO_ORPHANED",
-            "buy_limit_adjustment_ratio requires an enabled numeric buy limit",
+            "buy_limit_adjustment_ratio requires an enabled buy limit",
             metadata_path,
             definition_id,
         )

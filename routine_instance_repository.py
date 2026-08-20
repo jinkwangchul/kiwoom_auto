@@ -393,7 +393,7 @@ class RoutineInstanceRepository:
         try:
             clean_adjustment_ratio = (
                 buy_limit_adjustment_ratio_text(adjustment_ratio)
-                if enabled and clean_amount is not None
+                if enabled and adjustment_ratio is not None
                 else None
             )
         except ValueError as exc:

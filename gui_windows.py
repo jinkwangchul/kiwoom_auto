@@ -7014,6 +7014,13 @@ class MainWindow(QMainWindow):
         self.update_review_required_button_text()
         self.update_global_operation_button_state()
 
+    def recalculate_routine_limits_for_new_operation_session(self) -> dict[str, object]:
+        from routine_limit_recalculation import (
+            recalculate_enabled_routine_limits_for_new_session,
+        )
+
+        return recalculate_enabled_routine_limits_for_new_session(self)
+
     def update_global_operation_button_state(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(self, [])
         adapter.update_global_operation_button_state()
@@ -7341,8 +7348,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            persist_main_budget_percent(source, raw_value)
-        except (TypeError, ValueError):
+            saved_summary = persist_main_budget_percent(source, raw_value)
+        except Exception:
             self.update_budget_panel()
             self._finish_main_budget_percent_editing()
             show_toast(
@@ -7358,6 +7365,21 @@ class MainWindow(QMainWindow):
             return
         self.update_budget_panel()
         self._finish_main_budget_percent_editing()
+        if (
+            source == "buffer"
+            and raw_value.isdigit()
+            and int(raw_value) == 0
+            and int(saved_summary.get("buffer_budget_percent", -1)) == 0
+        ):
+            show_toast(
+                parent=self,
+                message=(
+                    "※완충 0%설정은 심각한 손실을 초래할수 있습니다. "
+                    "권장 완충은 20%입니다."
+                ),
+                duration_ms=3000,
+                position="center",
+            )
 
     def review_required_stock_count(self) -> int:
         """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
