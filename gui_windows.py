@@ -23,6 +23,7 @@ import logging
 import re
 from dataclasses import asdict
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from PyQt5 import sip
@@ -90,6 +91,14 @@ BUFFER_RESPONSE_RATIO_OPTIONS = tuple(f"{percent}%" for percent in range(10, 100
 ACCOUNT_NO_ROLE = Qt.UserRole
 ACCOUNT_POPUP_MEMO_ROLE = Qt.UserRole + 1
 ACCOUNT_ACTIVE_ROLE = Qt.UserRole + 2
+
+
+def _system_total_budget_amount() -> int | None:
+    try:
+        amount = int(read_system_budget_policy()["total_budget"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return amount if amount >= 0 else None
 
 
 def masked_account_no(account_no: object) -> str:
@@ -948,6 +957,8 @@ from gui_main_table_loader import (
     routine_aggregate_number_slot_width,
     routine_instance_number_widths,
     main_refresh_pnl_only,
+    main_stock_default_reference_price,
+    routine_instance_suggested_buy_limits,
     routine_stock_column_widths,
     routine_stock_position_value_widths,
     ROUTINE_STATUS_DEFAULT,
@@ -1045,6 +1056,7 @@ from gui_operation_environment import (
     default_buffer_response_policy,
     effective_amount_starting_budget,
     read_buffer_response_policy,
+    read_system_budget_policy,
     starting_budget_defaults,
     suggested_buy_limit,
     validate_buffer_response_policy,
@@ -7312,13 +7324,33 @@ class MainWindow(QMainWindow):
         return int(amount or 0)
 
     @staticmethod
-    def _stock_suggested_buy_limit(config_path: Path, *, minimum: bool = False) -> int | None:
+    def _stock_suggested_buy_limit(
+        config_path: Path,
+        *,
+        minimum: bool = False,
+        window=None,
+    ) -> int | None:
+        target_path = Path(config_path)
         defaults = starting_budget_defaults()
         multiplier_key = (
             "limit_minimum_multiplier" if minimum else "limit_recommended_multiplier"
         )
+        reference_price = MainWindow._stock_current_price_for_config(target_path)
+        if window is not None:
+            try:
+                stock_path = str(target_path.parent.relative_to(PROJECT_ROOT))
+            except ValueError:
+                stock_path = str(target_path.parent)
+            try:
+                reference_price = main_stock_default_reference_price(
+                    window,
+                    {"stock_path": stock_path},
+                    reference_price,
+                )
+            except RuntimeError:
+                pass
         return suggested_buy_limit(
-            MainWindow._stock_current_price_for_config(config_path),
+            reference_price,
             defaults[multiplier_key],
         )
 
@@ -7694,7 +7726,10 @@ class MainWindow(QMainWindow):
         configured_amount = self._parse_buy_limit_amount(
             str(config.get("buy_limit_amount") or "")
         )
-        suggested_amount = self._stock_suggested_buy_limit(config_path)
+        suggested_amount = self._stock_suggested_buy_limit(
+            config_path,
+            window=self,
+        )
         editor.setText(str(configured_amount or suggested_amount or ""))
         editor.setGeometry(editor_rect)
         editor.installEventFilter(self._routine_buy_limit_edit_filter)
@@ -7728,10 +7763,25 @@ class MainWindow(QMainWindow):
                 amount=None,
             )
         else:
+            recommended = self._stock_suggested_buy_limit(
+                config_path,
+                window=self,
+            )
+            total_budget = _system_total_budget_amount()
+            activate_limit = True
+            if (
+                recommended is not None
+                and total_budget is not None
+                and recommended > total_budget
+            ):
+                activate_limit = False
+                recommended = None
+            elif total_budget is None:
+                recommended = None
             self._write_stock_buy_limit_config(
                 config_path,
-                enabled=True,
-                amount=self._stock_suggested_buy_limit(config_path),
+                enabled=activate_limit,
+                amount=recommended,
             )
         self.load_routine_table()
 
@@ -7756,8 +7806,23 @@ class MainWindow(QMainWindow):
         config_path = Path(config_path_text)
         if amount is None:
             return
-        minimum_amount = self._stock_suggested_buy_limit(config_path, minimum=True)
+        minimum_amount = self._stock_suggested_buy_limit(
+            config_path,
+            minimum=True,
+            window=self,
+        )
         if minimum_amount is None:
+            return
+        total_budget = _system_total_budget_amount()
+        if total_budget is None:
+            return
+        if amount > total_budget:
+            self._write_stock_buy_limit_config(
+                config_path,
+                enabled=False,
+                amount=None,
+            )
+            self.load_routine_table()
             return
         if amount < minimum_amount:
             QMessageBox.warning(
@@ -7791,10 +7856,23 @@ class MainWindow(QMainWindow):
 
         self.finish_routine_stock_buy_limit_edit(save=True)
         self.finish_routine_instance_buy_limit_edit(save=False)
+        enabled = False
+        amount = None
+        if not instance.buy_limit_enabled:
+            recommended, _minimum = routine_instance_suggested_buy_limits(
+                self,
+                instance_id,
+            )
+            total_budget = _system_total_budget_amount()
+            if recommended is None or total_budget is None:
+                enabled = True
+            elif recommended <= total_budget:
+                enabled = True
+                amount = recommended
         result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
             instance_id,
-            enabled=not instance.buy_limit_enabled,
-            amount=None,
+            enabled=enabled,
+            amount=amount,
         )
         if not result.success:
             QMessageBox.warning(
@@ -7902,7 +7980,7 @@ class MainWindow(QMainWindow):
         return self.open_routine_instance_buy_limit_settings(instance_id)
 
     def open_routine_instance_buy_limit_settings(self, instance_id: str) -> bool:
-        """Phase 2 boundary for the routine limit response settings dialog."""
+        """Future routine-limit response settings boundary."""
         return False
 
     def finish_routine_instance_buy_limit_edit(self, *, save: bool) -> None:
@@ -7929,10 +8007,41 @@ class MainWindow(QMainWindow):
 
         if not save or amount is None:
             return
+        recommended, minimum = routine_instance_suggested_buy_limits(
+            self,
+            instance_id,
+        )
+        total_budget = _system_total_budget_amount()
+        if recommended is None or minimum is None or total_budget is None:
+            return
+        if amount > total_budget:
+            result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
+                instance_id,
+                enabled=False,
+                amount=None,
+            )
+            if not result.success:
+                QMessageBox.warning(
+                    self,
+                    "매수한도 변경",
+                    result.error or "매수한도를 변경하지 못했습니다.",
+                )
+                return
+            self.refresh_all()
+            return
+        if amount < minimum:
+            show_toast(
+                self,
+                f"최저금액은 {minimum:,}원입니다.",
+                duration_ms=2500,
+            )
+            return
+        adjustment_ratio = Decimal(amount) / Decimal(recommended)
         result = RoutineInstanceRepository(PROJECT_ROOT).update_buy_limit(
             instance_id,
             enabled=True,
             amount=amount,
+            adjustment_ratio=adjustment_ratio,
         )
         if not result.success:
             QMessageBox.warning(

@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 import tempfile
 import unittest
 from pathlib import Path
@@ -259,6 +260,35 @@ class RoutineInstanceRegistryTest(unittest.TestCase):
         self.assertIsNone(persisted[0].buy_limit_amount)
         self.assertNotIn(
             "INSTANCE_BUY_LIMIT_INVALID",
+            [item.code for item in registry.diagnostics],
+        )
+
+    def test_adjustment_ratio_loads_as_decimal_and_rejects_float_metadata(self) -> None:
+        valid_id = "a52f539d-4f18-4ef6-b0cf-f471567982a1"
+        invalid_id = "b52f539d-4f18-4ef6-b0cf-f471567982a2"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_routine(root / "routines", "indicator")
+            self._write_instance(
+                root,
+                valid_id,
+                buy_limit_adjustment_ratio="0.8",
+            )
+            self._write_instance(
+                root,
+                invalid_id,
+                display_name="Invalid Ratio",
+                buy_limit_adjustment_ratio=0.8,
+            )
+
+            registry = load_routine_instance_registry(project_root=root)
+
+        persisted = [item for item in registry.instances if item.persisted]
+        self.assertEqual(1, len(persisted))
+        self.assertIsInstance(persisted[0].buy_limit_adjustment_ratio, Decimal)
+        self.assertEqual(Decimal("0.8"), persisted[0].buy_limit_adjustment_ratio)
+        self.assertIn(
+            "INSTANCE_BUY_LIMIT_ADJUSTMENT_RATIO_INVALID",
             [item.code for item in registry.diagnostics],
         )
 

@@ -55,6 +55,7 @@ class RoutineInstanceRecord:
     description: str = ""
     buy_limit_enabled: bool = False
     buy_limit_amount: int | None = None
+    buy_limit_adjustment_ratio: Decimal | None = None
     rules_path: Path | None = None
     schema_version: str = ""
     created_at: str = ""
@@ -79,6 +80,26 @@ class RoutineDefinitionRegistry:
 class RoutineInstanceRegistry:
     instances: list[RoutineInstanceRecord]
     diagnostics: list[RoutineRegistryDiagnostic]
+
+
+def normalize_buy_limit_adjustment_ratio(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        ratio = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError("buy limit adjustment ratio must be a positive decimal")
+    if not ratio.is_finite() or ratio <= 0:
+        raise ValueError("buy limit adjustment ratio must be a positive decimal")
+    return ratio
+
+
+def buy_limit_adjustment_ratio_text(value: object) -> str | None:
+    ratio = normalize_buy_limit_adjustment_ratio(value)
+    if ratio is None:
+        return None
+    text = format(ratio.normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, RoutineRegistryDiagnostic | None]:
@@ -390,6 +411,37 @@ def _persisted_instance_from_directory(
             metadata_path,
             definition_id,
         )
+    raw_adjustment_ratio = metadata.get("buy_limit_adjustment_ratio")
+    if raw_adjustment_ratio is not None and not isinstance(
+        raw_adjustment_ratio,
+        str,
+    ):
+        return None, _instance_diagnostic(
+            "INSTANCE_BUY_LIMIT_ADJUSTMENT_RATIO_INVALID",
+            "buy_limit_adjustment_ratio must be a positive decimal string",
+            metadata_path,
+            definition_id,
+        )
+    try:
+        buy_limit_adjustment_ratio = normalize_buy_limit_adjustment_ratio(
+            raw_adjustment_ratio
+        )
+    except ValueError:
+        return None, _instance_diagnostic(
+            "INSTANCE_BUY_LIMIT_ADJUSTMENT_RATIO_INVALID",
+            "buy_limit_adjustment_ratio must be a positive decimal string",
+            metadata_path,
+            definition_id,
+        )
+    if buy_limit_adjustment_ratio is not None and (
+        not buy_limit_enabled or buy_limit_amount is None
+    ):
+        return None, _instance_diagnostic(
+            "INSTANCE_BUY_LIMIT_ADJUSTMENT_RATIO_ORPHANED",
+            "buy_limit_adjustment_ratio requires an enabled numeric buy limit",
+            metadata_path,
+            definition_id,
+        )
 
     rules_file = str(metadata.get("rules_file") or "").strip()
     rules_relative = Path(rules_file)
@@ -442,6 +494,7 @@ def _persisted_instance_from_directory(
         description=str(metadata.get("description") or "").strip(),
         buy_limit_enabled=buy_limit_enabled,
         buy_limit_amount=buy_limit_amount,
+        buy_limit_adjustment_ratio=buy_limit_adjustment_ratio,
         rules_path=rules_path,
         schema_version=schema_version,
         created_at=str(metadata.get("created_at") or "").strip(),

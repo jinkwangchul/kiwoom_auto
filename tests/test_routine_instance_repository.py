@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 import tempfile
@@ -361,6 +362,136 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertTrue(loaded.buy_limit_enabled)
         self.assertIsNone(loaded.buy_limit_amount)
         self.assertEqual(other_before, other_after)
+
+    def test_manual_adjustment_ratio_round_trips_without_float(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Ratio Routine",
+                ),
+                {},
+            )
+
+            result = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=8_000_000,
+                adjustment_ratio=Decimal("0.8"),
+            )
+            loaded = repository.get_instance(str(INSTANCE_ID))
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual("0.8", metadata["buy_limit_adjustment_ratio"])
+        self.assertIsInstance(loaded.buy_limit_adjustment_ratio, Decimal)
+        self.assertEqual(Decimal("0.8"), loaded.buy_limit_adjustment_ratio)
+
+    def test_disabling_buy_limit_clears_adjustment_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Ratio Routine",
+                ),
+                {},
+            )
+            repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=8_000_000,
+                adjustment_ratio=Decimal("0.8"),
+            )
+
+            result = repository.update_buy_limit(str(INSTANCE_ID), enabled=False)
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result.success)
+        self.assertNotIn("buy_limit_adjustment_ratio", metadata)
+
+    def test_automatic_limit_uses_implicit_one_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Automatic Routine",
+                ),
+                {},
+            )
+
+            result = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=4_000_000,
+            )
+            metadata = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / str(INSTANCE_ID)
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result.success)
+        self.assertNotIn("buy_limit_adjustment_ratio", metadata)
+
+    def test_invalid_adjustment_ratio_preserves_existing_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="Ratio Routine",
+                ),
+                {},
+            )
+            repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=8_000_000,
+                adjustment_ratio=Decimal("0.8"),
+            )
+            metadata_path = (
+                root
+                / "routine_instances"
+                / str(INSTANCE_ID)
+                / "instance.json"
+            )
+            before = metadata_path.read_bytes()
+
+            result = repository.update_buy_limit(
+                str(INSTANCE_ID),
+                enabled=True,
+                amount=7_000_000,
+                adjustment_ratio="not-a-decimal",
+            )
+            after = metadata_path.read_bytes()
+
+        self.assertFalse(result.success)
+        self.assertEqual("BUY_LIMIT_ADJUSTMENT_RATIO_INVALID", result.error_code)
+        self.assertEqual(before, after)
 
     def test_update_buy_limit_rejects_non_positive_enabled_amount(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

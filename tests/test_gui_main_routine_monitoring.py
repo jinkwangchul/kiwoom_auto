@@ -2993,6 +2993,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(
+                    gui_windows,
+                    "routine_instance_suggested_buy_limits",
+                    return_value=(None, None),
+                ),
                 patch.object(gui_windows, "RoutineInstanceRepository", return_value=repository),
             ):
                 window.handle_routine_instance_buy_limit_double_click(label)

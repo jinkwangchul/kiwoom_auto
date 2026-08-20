@@ -1488,6 +1488,58 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
     return result
 
 
+def routine_instance_suggested_buy_limits(
+    window,
+    instance_id: str,
+    *,
+    policy: dict[str, object] | None = None,
+) -> tuple[int | None, int | None]:
+    """Return complete registered-stock recommendation/minimum totals."""
+    target_id = str(instance_id or "").strip()
+    if not target_id:
+        return None, None
+    stocks = [
+        stock
+        for stock in _main_pnl_refresh_static_cache(window).get("stocks", ())
+        if isinstance(stock, dict)
+        and str(stock.get("instance_id", "") or "").strip() == target_id
+    ]
+    if not stocks:
+        return None, None
+
+    defaults = starting_budget_defaults(policy)
+    recommended_total = 0
+    minimum_total = 0
+    for stock in stocks:
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        code = str(stock.get("code", "") or "").strip()
+        name = str(stock.get("name", "") or "").strip()
+        stock_dir = Path(str(stock.get("stock_dir", "") or ""))
+        if not stock_path or not code or not name or not stock_dir.name:
+            return None, None
+        state = read_json_dict(stock_dir / "state.json")
+        if not isinstance(state, dict):
+            return None, None
+        reference_price = main_stock_default_reference_price(
+            window,
+            stock,
+            current_price_from_state(state),
+        )
+        recommended = suggested_buy_limit(
+            reference_price,
+            defaults["limit_recommended_multiplier"],
+        )
+        minimum = suggested_buy_limit(
+            reference_price,
+            defaults["limit_minimum_multiplier"],
+        )
+        if recommended is None or minimum is None:
+            return None, None
+        recommended_total += recommended
+        minimum_total += minimum
+    return recommended_total, minimum_total
+
+
 def _main_pnl_refresh_routine_metadata(window) -> tuple[list[object], list[object]]:
     cache = _main_pnl_refresh_static_cache(window)
     return list(cache["definitions"]), list(cache["instances"])

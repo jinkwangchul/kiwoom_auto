@@ -6,6 +6,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from event_journal_production import append_production_event
 
 from routine_instance_registry import (
     RoutineInstanceRecord,
+    buy_limit_adjustment_ratio_text,
     load_persisted_routine_instances,
     routine_definition_by_id,
     routine_instance_by_id,
@@ -355,6 +357,7 @@ class RoutineInstanceRepository:
         *,
         enabled: bool,
         amount: int | None = None,
+        adjustment_ratio: Decimal | str | None = None,
     ) -> RoutineInstanceBuyLimitResult:
         instance = self.get_instance(instance_id)
         if instance is None:
@@ -378,6 +381,18 @@ class RoutineInstanceRepository:
                     error="매수한도는 0보다 큰 원 단위 정수여야 합니다.",
                 )
             clean_amount = amount
+        try:
+            clean_adjustment_ratio = (
+                buy_limit_adjustment_ratio_text(adjustment_ratio)
+                if enabled and clean_amount is not None
+                else None
+            )
+        except ValueError as exc:
+            return RoutineInstanceBuyLimitResult(
+                False,
+                error_code="BUY_LIMIT_ADJUSTMENT_RATIO_INVALID",
+                error=str(exc),
+            )
 
         instance_dir = self.instances_root / instance.instance_id
         metadata_path = instance_dir / "instance.json"
@@ -388,6 +403,10 @@ class RoutineInstanceRepository:
                 raise ValueError("instance.json must contain an object")
             metadata["buy_limit_enabled"] = enabled
             metadata["buy_limit_amount"] = clean_amount
+            if clean_adjustment_ratio is None:
+                metadata.pop("buy_limit_adjustment_ratio", None)
+            else:
+                metadata["buy_limit_adjustment_ratio"] = clean_adjustment_ratio
             metadata["updated_at"] = self._now_factory().isoformat(timespec="seconds")
             self._write_json_replace(temp_path, metadata)
             os.replace(temp_path, metadata_path)
@@ -400,6 +419,10 @@ class RoutineInstanceRepository:
             if (
                 updated.buy_limit_enabled != enabled
                 or updated.buy_limit_amount != clean_amount
+                or buy_limit_adjustment_ratio_text(
+                    updated.buy_limit_adjustment_ratio
+                )
+                != clean_adjustment_ratio
             ):
                 raise RuntimeError("변경된 매수한도 값이 재읽기 검증과 일치하지 않습니다.")
             changes: list[dict[str, object]] = []
@@ -417,6 +440,21 @@ class RoutineInstanceRepository:
                         "field_key": "buy_limit_amount",
                         "before": instance.buy_limit_amount,
                         "after": updated.buy_limit_amount,
+                    }
+                )
+            if (
+                instance.buy_limit_adjustment_ratio
+                != updated.buy_limit_adjustment_ratio
+            ):
+                changes.append(
+                    {
+                        "field_key": "buy_limit_adjustment_ratio",
+                        "before": buy_limit_adjustment_ratio_text(
+                            instance.buy_limit_adjustment_ratio
+                        ),
+                        "after": buy_limit_adjustment_ratio_text(
+                            updated.buy_limit_adjustment_ratio
+                        ),
                     }
                 )
             _append_instance_setting_changed(
