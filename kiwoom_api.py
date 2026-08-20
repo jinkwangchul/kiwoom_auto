@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Data-query-only Kiwoom OpenAPI wrapper.
-
-This first wrapper only supports login status checks and opt10080 minute candle
-queries. It does not place orders, register realtime feeds, call the routine
-engine, or write rules.
-"""
+"""Central Kiwoom OpenAPI wrapper for broker, TR, and shadow realtime I/O."""
 
 from __future__ import annotations
 
 import ctypes
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import hashlib
 import os
@@ -38,8 +33,20 @@ from event_journal_production import observe_production_exception
 from kiwoom_screen_allocator import (
     ACCOUNT_TR,
     MARKET_TR,
+    REALTIME,
     KiwoomScreenAllocator,
     ScreenAllocationError,
+)
+from kiwoom_realtime_fids import (
+    REALTIME_CUMULATIVE_VOLUME_FID,
+    REALTIME_CURRENT_PRICE_FID,
+    REALTIME_EXECUTION_TIME_FID,
+    REALTIME_EXECUTION_TYPE,
+    REALTIME_SHADOW_FIDS,
+)
+from kiwoom_realtime_shadow import (
+    RealtimeShadowBarBuilder,
+    normalize_realtime_shadow_tick,
 )
 
 
@@ -80,6 +87,28 @@ class BrokerReadinessSnapshot:
     broker_request_ready: bool
     blockers: tuple[str, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class RealtimeShadowScreenBatch:
+    screen_no: str
+    owner: str
+    stock_codes: tuple[str, ...]
+    raw_registration_result: Any = None
+
+
+@dataclass(frozen=True)
+class RealtimeShadowRegistrationSnapshot:
+    active: bool
+    connection_epoch: int
+    login_session_id: str
+    target_stock_codes: tuple[str, ...]
+    fid_list: tuple[int, ...]
+    screen_batches: tuple[RealtimeShadowScreenBatch, ...]
+    last_error: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def account_authentication_required_message(message: object) -> bool:
@@ -300,6 +329,8 @@ class KiwoomApi(QObject):
     raw_chejan_received = pyqtSignal(dict)
     account_authentication_required = pyqtSignal(dict)
     bar_committed = pyqtSignal(object)
+    realtime_shadow_tick_received = pyqtSignal(object)
+    realtime_shadow_bar_completed = pyqtSignal(object)
 
     CONTROL_NAME = "KHOPENAPI.KHOpenAPICtrl.1"
     OPT10080_FIELDS = ("체결시간", "시가", "고가", "저가", "현재가", "거래량")
@@ -382,6 +413,8 @@ class KiwoomApi(QObject):
         self._tr_governor_timer_scheduled = False
         self._tr_governor_dispatching = False
         self._screen_allocator = KiwoomScreenAllocator()
+        self._realtime_shadow_builder = RealtimeShadowBarBuilder()
+        self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -398,6 +431,9 @@ class KiwoomApi(QObject):
                 return
             control.OnEventConnect.connect(self._on_event_connect)
             control.OnReceiveTrData.connect(self._on_receive_tr_data)
+            receive_realtime = getattr(control, "OnReceiveRealData", None)
+            if receive_realtime is not None:
+                receive_realtime.connect(self._on_receive_real_data)
             receive_message = getattr(control, "OnReceiveMsg", None)
             if receive_message is not None:
                 receive_message.connect(self._on_receive_msg)
@@ -453,6 +489,217 @@ class KiwoomApi(QObject):
             reason="READY" if ready else ",".join(blockers),
         )
 
+    @staticmethod
+    def _empty_realtime_shadow_snapshot(
+        *,
+        connection_epoch: int = 0,
+        login_session_id: str = "",
+        last_error: str = "",
+    ) -> RealtimeShadowRegistrationSnapshot:
+        return RealtimeShadowRegistrationSnapshot(
+            active=False,
+            connection_epoch=int(connection_epoch or 0),
+            login_session_id=str(login_session_id or ""),
+            target_stock_codes=(),
+            fid_list=tuple(REALTIME_SHADOW_FIDS),
+            screen_batches=(),
+            last_error=str(last_error or ""),
+        )
+
+    def _ensure_realtime_shadow_state(self) -> None:
+        if not hasattr(self, "_screen_allocator"):
+            self._screen_allocator = KiwoomScreenAllocator()
+        if not hasattr(self, "_realtime_shadow_builder"):
+            self._realtime_shadow_builder = RealtimeShadowBarBuilder()
+        if not isinstance(
+            getattr(self, "_realtime_shadow_registration", None),
+            RealtimeShadowRegistrationSnapshot,
+        ):
+            self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
+
+    def realtime_shadow_registration_snapshot(
+        self,
+    ) -> RealtimeShadowRegistrationSnapshot:
+        self._ensure_realtime_shadow_state()
+        return self._realtime_shadow_registration
+
+    def sync_realtime_shadow_registration(
+        self,
+        stock_codes: object,
+    ) -> dict[str, Any]:
+        """Replace shadow-only registrations for the current broker session."""
+
+        self._ensure_realtime_shadow_state()
+        session = self.broker_session_snapshot()
+        if not (
+            session.api_available
+            and session.connected
+            and session.login_session_id
+        ):
+            self.clear_realtime_shadow_registration(
+                remove_from_broker=False,
+                reason="BROKER_SESSION_NOT_READY",
+            )
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "BROKER_SESSION_NOT_READY",
+                "snapshot": self._realtime_shadow_registration,
+            }
+
+        candidates = stock_codes if isinstance(stock_codes, (list, tuple, set, frozenset)) else ()
+        targets = tuple(sorted({str(code or "").strip() for code in candidates if str(code or "").strip()}))
+        current = self._realtime_shadow_registration
+        if (
+            current.active
+            and current.connection_epoch == session.connection_epoch
+            and current.login_session_id == session.login_session_id
+            and current.target_stock_codes == targets
+            and current.fid_list == tuple(REALTIME_SHADOW_FIDS)
+        ):
+            return {
+                "ok": True,
+                "changed": False,
+                "active": True,
+                "reason_code": "REALTIME_SHADOW_UNCHANGED",
+                "snapshot": current,
+            }
+
+        had_registration = bool(current.screen_batches)
+        if had_registration:
+            clear_result = self.clear_realtime_shadow_registration(
+                remove_from_broker=True,
+                reason="REALTIME_SHADOW_TARGET_REPLACED",
+            )
+            if clear_result.get("ok") is not True:
+                return {
+                    "ok": False,
+                    "changed": True,
+                    "active": False,
+                    "reason_code": "REALTIME_SHADOW_REPLACEMENT_CLEAR_FAILED",
+                    "errors": tuple(clear_result.get("errors", ())),
+                    "snapshot": self._realtime_shadow_registration,
+                }
+        if not targets:
+            return {
+                "ok": True,
+                "changed": had_registration,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_EMPTY_TARGET",
+                "snapshot": self._realtime_shadow_registration,
+            }
+
+        fid_text = ";".join(str(fid) for fid in REALTIME_SHADOW_FIDS)
+        registered: list[RealtimeShadowScreenBatch] = []
+        try:
+            for offset in range(0, len(targets), 100):
+                codes = targets[offset:offset + 100]
+                owner = f"realtime_shadow:{session.connection_epoch}:{offset // 100}"
+                lease = self._screen_allocator.claim(REALTIME, owner)
+                batch = RealtimeShadowScreenBatch(
+                    screen_no=lease.screen_no,
+                    owner=owner,
+                    stock_codes=codes,
+                )
+                registered.append(batch)
+                raw_result = self._control.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    lease.screen_no,
+                    ";".join(codes),
+                    fid_text,
+                    "0",
+                )
+                registered[-1] = RealtimeShadowScreenBatch(
+                    screen_no=lease.screen_no,
+                    owner=owner,
+                    stock_codes=codes,
+                    raw_registration_result=raw_result,
+                )
+        except Exception as exc:
+            self._clear_realtime_shadow_batches(registered, remove_from_broker=True)
+            self._realtime_shadow_builder.reset()
+            self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot(
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+                last_error=str(exc),
+            )
+            return {
+                "ok": False,
+                "changed": True,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_REGISTRATION_FAILED",
+                "error": str(exc),
+                "snapshot": self._realtime_shadow_registration,
+            }
+
+        self._realtime_shadow_registration = RealtimeShadowRegistrationSnapshot(
+            active=True,
+            connection_epoch=session.connection_epoch,
+            login_session_id=session.login_session_id,
+            target_stock_codes=targets,
+            fid_list=tuple(REALTIME_SHADOW_FIDS),
+            screen_batches=tuple(registered),
+            last_error="",
+        )
+        return {
+            "ok": True,
+            "changed": True,
+            "active": True,
+            "reason_code": "REGISTER_CALL_RETURNED",
+            "snapshot": self._realtime_shadow_registration,
+        }
+
+    def clear_realtime_shadow_registration(
+        self,
+        *,
+        remove_from_broker: bool | None = None,
+        reason: str = "REALTIME_SHADOW_CLEARED",
+    ) -> dict[str, Any]:
+        self._ensure_realtime_shadow_state()
+        current = self._realtime_shadow_registration
+        batches = list(current.screen_batches)
+        if remove_from_broker is None:
+            remove_from_broker = bool(self._connected and self._control is not None)
+        errors = self._clear_realtime_shadow_batches(
+            batches,
+            remove_from_broker=bool(remove_from_broker),
+        )
+        self._realtime_shadow_builder.reset()
+        self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot(
+            connection_epoch=int(getattr(self, "_connection_epoch", 0) or 0),
+            login_session_id=str(getattr(self, "_login_session_id", "") or ""),
+            last_error="; ".join(errors),
+        )
+        return {
+            "ok": not errors,
+            "changed": bool(batches),
+            "active": False,
+            "reason_code": reason if not errors else "REALTIME_SHADOW_CLEAR_FAILED",
+            "errors": tuple(errors),
+            "snapshot": self._realtime_shadow_registration,
+        }
+
+    def _clear_realtime_shadow_batches(
+        self,
+        batches: list[RealtimeShadowScreenBatch],
+        *,
+        remove_from_broker: bool,
+    ) -> list[str]:
+        errors: list[str] = []
+        for batch in batches:
+            if remove_from_broker and self._control is not None:
+                try:
+                    self._control.dynamicCall(
+                        "SetRealRemove(QString, QString)",
+                        batch.screen_no,
+                        "ALL",
+                    )
+                except Exception as exc:
+                    errors.append(str(exc))
+            self._screen_allocator.release(batch.owner, batch.screen_no)
+        return errors
+
     def _observe_connected_state(self, connected: bool, *, reason: str) -> bool:
         connected = bool(connected)
         if connected:
@@ -486,6 +733,12 @@ class KiwoomApi(QObject):
         message: str = "kiwoom api disconnected",
     ) -> None:
         had_session = bool(self._connected or self._login_session_id)
+        reset_shadow = getattr(self, "clear_realtime_shadow_registration", None)
+        if callable(reset_shadow):
+            reset_shadow(
+                remove_from_broker=False,
+                reason="REALTIME_SHADOW_SESSION_INVALIDATED",
+            )
         self._connected = False
         self._login_session_id = ""
         if increment_epoch and had_session:
@@ -1614,6 +1867,10 @@ class KiwoomApi(QObject):
 
         self.last_login_error = code
         if code == 0:
+            self.clear_realtime_shadow_registration(
+                remove_from_broker=False,
+                reason="REALTIME_SHADOW_NEW_SESSION",
+            )
             account_payload = ";".join(self.account_numbers())
             self._establish_login_session(account_payload=account_payload)
             self.last_login_message = "login succeeded"
@@ -1685,6 +1942,67 @@ class KiwoomApi(QObject):
             except Exception:
                 pass
         self.raw_chejan_received.emit(raw_event)
+
+    def _on_receive_real_data(self, *args: Any) -> None:
+        """Read the three verified 주식체결 FIDs into process-local shadow state."""
+
+        if len(args) < 2:
+            return
+        self._ensure_realtime_shadow_state()
+        stock_code = str(args[0] or "").strip()
+        real_type = str(args[1] or "").strip()
+        registration = self._realtime_shadow_registration
+        if (
+            not registration.active
+            or stock_code not in registration.target_stock_codes
+            or real_type != REALTIME_EXECUTION_TYPE
+        ):
+            return
+        session = self.broker_session_snapshot()
+        if (
+            not session.connected
+            or session.connection_epoch != registration.connection_epoch
+            or session.login_session_id != registration.login_session_id
+        ):
+            return
+        try:
+            values = {
+                fid: self._control.dynamicCall(
+                    "GetCommRealData(QString, int)",
+                    stock_code,
+                    fid,
+                )
+                for fid in REALTIME_SHADOW_FIDS
+            }
+            tick = normalize_realtime_shadow_tick(
+                stock_code=stock_code,
+                real_type=real_type,
+                execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
+                current_price_raw=values[REALTIME_CURRENT_PRICE_FID],
+                cumulative_volume_raw=values[REALTIME_CUMULATIVE_VOLUME_FID],
+                connection_epoch=session.connection_epoch,
+                login_session_id=session.login_session_id,
+            )
+            if tick is None:
+                return
+            self.realtime_shadow_tick_received.emit(tick.to_payload())
+            _status, completed = self._realtime_shadow_builder.accept_tick(tick)
+            if completed is not None:
+                self.realtime_shadow_bar_completed.emit(completed.to_payload())
+        except Exception as exc:
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="realtime_shadow",
+                operation="receive_realtime_tick",
+                source="kiwoom_api.KiwoomApi._on_receive_real_data",
+                target_type="MARKET_DATA",
+                target_id=stock_code,
+                target_name=stock_code,
+                reason_code="REALTIME_SHADOW_TICK_FAILED",
+                failure_scope=f"realtime_shadow_tick:{stock_code}",
+            )
 
     def _on_receive_msg(self, *args: Any) -> None:
         """Project only verified account-password messages into account UI evidence."""

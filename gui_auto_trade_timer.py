@@ -342,6 +342,50 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
     if callable(rebind_recovery):
         rebind_recovery()
 
+    realtime_shadow_result: dict[str, object] = {}
+    try:
+        execution_universe_snapshot = project_execution_universe(window)
+        sync_realtime_shadow = getattr(
+            type(window),
+            "sync_realtime_shadow_targets",
+            None,
+        )
+        if callable(sync_realtime_shadow):
+            realtime_shadow_result = sync_realtime_shadow(
+                window,
+                execution_universe_snapshot
+            )
+        else:
+            instance_sync = getattr(window, "__dict__", {}).get(
+                "sync_realtime_shadow_targets"
+            )
+            if callable(instance_sync):
+                realtime_shadow_result = instance_sync(
+                    execution_universe_snapshot
+                )
+    except Exception as exc:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="realtime_shadow",
+            operation="sync_operation_targets",
+            source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+            target_type="MARKET_DATA",
+            target_id="realtime_shadow",
+            target_name="Realtime shadow target sync",
+            reason_code="REALTIME_SHADOW_SYNC_FAILED",
+            owner=window,
+            failure_scope="realtime_shadow_target_sync",
+        )
+        realtime_shadow_result = {
+            "ok": False,
+            "changed": False,
+            "active": False,
+            "reason_code": "REALTIME_SHADOW_SYNC_FAILED",
+            "error": str(exc),
+        }
+
     close_result = auto_trade_continue_pending_close_liquidations(window, limit=5)
     close_processed = int(close_result.get("processed", 0) or 0)
     close_blocked = int(close_result.get("blocked", 0) or 0)
@@ -379,6 +423,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             "failed": failed_count,
             "close_processed": close_processed,
             "close_blocked": close_blocked,
+            "realtime_shadow_result": dict(realtime_shadow_result),
             "candle_refresh_result": dict(candle_refresh_result),
             "signal_result": dict(signal_result),
         }

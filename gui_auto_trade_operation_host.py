@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 import logging
 from pathlib import Path
 
@@ -37,6 +37,11 @@ from gui_auto_trade_status_ops import (
 from gui_auto_trade_timer import auto_trade_current_runtime_file_signature
 from candle_manager import canonical_candle_content_hash, load_candles
 from execution_universe import project_execution_universe
+from kiwoom_realtime_shadow import (
+    NO_CANONICAL_BAR,
+    RealtimeShadowBar,
+    compare_shadow_bar_to_canonical,
+)
 from gui_review_utils import (
     build_review_required_item,
     safe_float_value,
@@ -59,6 +64,9 @@ class AutoTradeOperationHost(QObject):
     """Expose explicit production operations without constructing a GUI window."""
 
     operation_cycle_completed = pyqtSignal(dict)
+    realtime_shadow_comparison_completed = pyqtSignal(object)
+
+    MAX_PENDING_SHADOW_COMPARISONS = 512
 
     def __init__(self, owner) -> None:
         super().__init__(owner if isinstance(owner, QObject) else None)
@@ -96,6 +104,18 @@ class AutoTradeOperationHost(QObject):
         self._last_bar_commit_fast_path_result: dict[str, object] = {}
         self._bar_committed_signal_bound = False
         self._bind_bar_committed_signal_once()
+        self._realtime_shadow_signal_bound = False
+        self._shadow_canonical_signal_bound = False
+        self._realtime_shadow_trigger_queue: deque[dict[str, object]] = deque()
+        self._realtime_shadow_retry_codes: set[str] = set()
+        self._realtime_shadow_drain_scheduled = False
+        self._realtime_shadow_drain_running = False
+        self._pending_shadow_comparisons: OrderedDict[
+            tuple[str, str], RealtimeShadowBar
+        ] = OrderedDict()
+        self._last_realtime_shadow_comparison: dict[str, object] = {}
+        self._realtime_shadow_session_identity: tuple[int, str] = (0, "")
+        self._bind_realtime_shadow_signals_once()
 
     def parent(self):
         return self._owner
@@ -145,6 +165,7 @@ class AutoTradeOperationHost(QObject):
     def stop_operation_timers(self) -> dict[str, object]:
         from production_recovery_timer_lifecycle import stop_recovery_bound_timers
 
+        self.clear_realtime_shadow_registration()
         result = stop_recovery_bound_timers((self._operation_timer,))
         if result.get("stopped") is True and int(result.get("stopped_count") or 0) > 0:
             append_production_event(
@@ -161,6 +182,9 @@ class AutoTradeOperationHost(QObject):
         self._shutting_down = True
         self._operation_candle_requests.clear()
         self._bar_commit_trigger_queue.clear()
+        self._realtime_shadow_trigger_queue.clear()
+        self._realtime_shadow_retry_codes.clear()
+        self._pending_shadow_comparisons.clear()
         return self.stop_operation_timers()
 
     def operation_timer(self) -> QTimer:
@@ -193,6 +217,247 @@ class AutoTradeOperationHost(QObject):
             return False
         self._bar_committed_signal_bound = True
         return True
+
+    def _bind_realtime_shadow_signals_once(self) -> bool:
+        api = self._kiwoom_api()
+        shadow_signal = getattr(api, "realtime_shadow_bar_completed", None)
+        shadow_connect = getattr(shadow_signal, "connect", None)
+        if not self._realtime_shadow_signal_bound and callable(shadow_connect):
+            try:
+                shadow_connect(self._on_realtime_shadow_bar_completed)
+            except Exception as exc:
+                self._observe_realtime_shadow_exception(exc, "bind_shadow_bar_signal")
+            else:
+                self._realtime_shadow_signal_bound = True
+        self._shadow_canonical_signal_bound = self._bar_committed_signal_bound
+        return bool(
+            self._realtime_shadow_signal_bound
+            and self._shadow_canonical_signal_bound
+        )
+
+    def sync_realtime_shadow_targets(self, snapshot=None) -> dict[str, object]:
+        """Sync only current execution-ready codes; failure is diagnostic-only."""
+
+        try:
+            universe = snapshot or project_execution_universe(self)
+            target_codes = tuple(universe.execution_stock_codes)
+            sync = getattr(
+                self._kiwoom_api(),
+                "sync_realtime_shadow_registration",
+                None,
+            )
+            if not callable(sync):
+                return {
+                    "ok": False,
+                    "changed": False,
+                    "active": False,
+                    "reason_code": "REALTIME_SHADOW_API_UNAVAILABLE",
+                }
+            result = sync(target_codes)
+            registration = result.get("snapshot") if isinstance(result, dict) else None
+            identity = (
+                int(getattr(registration, "connection_epoch", 0) or 0),
+                str(getattr(registration, "login_session_id", "") or ""),
+            )
+            if identity != self._realtime_shadow_session_identity:
+                self._pending_shadow_comparisons.clear()
+                self._realtime_shadow_trigger_queue.clear()
+                self._realtime_shadow_retry_codes.clear()
+                self._realtime_shadow_session_identity = identity
+            return dict(result) if isinstance(result, dict) else {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_RESULT_MALFORMED",
+            }
+        except Exception as exc:
+            self._observe_realtime_shadow_exception(exc, "sync_targets")
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_SYNC_FAILED",
+                "error": str(exc),
+            }
+
+    def clear_realtime_shadow_registration(self) -> dict[str, object]:
+        clear = getattr(
+            self._kiwoom_api(),
+            "clear_realtime_shadow_registration",
+            None,
+        )
+        self._pending_shadow_comparisons.clear()
+        self._realtime_shadow_trigger_queue.clear()
+        self._realtime_shadow_retry_codes.clear()
+        if not callable(clear):
+            return {
+                "ok": True,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_API_UNAVAILABLE",
+            }
+        try:
+            return clear(reason="OPERATION_HOST_STOPPED")
+        except Exception as exc:
+            self._observe_realtime_shadow_exception(exc, "clear_registration")
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_CLEAR_FAILED",
+                "error": str(exc),
+            }
+
+    def _on_realtime_shadow_bar_completed(self, payload: object) -> None:
+        if self._shutting_down or not isinstance(payload, dict):
+            return
+        required = (
+            "stock_code",
+            "trade_date",
+            "bar_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "first_tick_time",
+            "last_tick_time",
+            "connection_epoch",
+            "login_session_id",
+        )
+        if any(payload.get(field) in (None, "") for field in required):
+            return
+        self._realtime_shadow_trigger_queue.append(dict(payload))
+        self._schedule_realtime_shadow_drain()
+
+    def _on_canonical_bar_for_shadow_comparison(self, payload: object) -> None:
+        if self._shutting_down or not isinstance(payload, dict):
+            return
+        if (
+            payload.get("event_type") != "BAR_COMMITTED"
+            or payload.get("source") != "opt10080"
+        ):
+            return
+        stock_code = str(payload.get("stock_code") or "").strip()
+        if not stock_code:
+            return
+        if not any(key[0] == stock_code for key in self._pending_shadow_comparisons):
+            return
+        self._realtime_shadow_retry_codes.add(stock_code)
+        self._schedule_realtime_shadow_drain()
+
+    def _schedule_realtime_shadow_drain(self) -> None:
+        if self._realtime_shadow_drain_scheduled or self._realtime_shadow_drain_running:
+            return
+        self._realtime_shadow_drain_scheduled = True
+        QTimer.singleShot(0, self._drain_realtime_shadow_comparisons)
+
+    def _drain_realtime_shadow_comparisons(self) -> None:
+        self._realtime_shadow_drain_scheduled = False
+        if self._shutting_down or self._realtime_shadow_drain_running:
+            return
+        self._realtime_shadow_drain_running = True
+        try:
+            while self._realtime_shadow_trigger_queue and not self._shutting_down:
+                payload = self._realtime_shadow_trigger_queue.popleft()
+                try:
+                    bar = RealtimeShadowBar(**payload)
+                    if not self._shadow_bar_matches_current_session(bar):
+                        continue
+                    self._compare_or_pend_realtime_shadow_bar(bar)
+                except Exception as exc:
+                    self._observe_realtime_shadow_exception(
+                        exc,
+                        "compare_completed_bar",
+                        stock_code=str(payload.get("stock_code") or ""),
+                    )
+
+            retry_codes = tuple(self._realtime_shadow_retry_codes)
+            self._realtime_shadow_retry_codes.clear()
+            for stock_code in retry_codes:
+                for key, bar in tuple(self._pending_shadow_comparisons.items()):
+                    if key[0] != stock_code:
+                        continue
+                    if not self._shadow_bar_matches_current_session(bar):
+                        self._pending_shadow_comparisons.pop(key, None)
+                        continue
+                    try:
+                        self._compare_or_pend_realtime_shadow_bar(bar)
+                    except Exception as exc:
+                        self._observe_realtime_shadow_exception(
+                            exc,
+                            "retry_pending_comparison",
+                            stock_code=stock_code,
+                        )
+        finally:
+            self._realtime_shadow_drain_running = False
+            if (
+                self._realtime_shadow_trigger_queue
+                or self._realtime_shadow_retry_codes
+            ) and not self._realtime_shadow_drain_scheduled:
+                self._schedule_realtime_shadow_drain()
+
+    def _shadow_bar_matches_current_session(self, bar: RealtimeShadowBar) -> bool:
+        snapshot_getter = getattr(
+            self._kiwoom_api(),
+            "realtime_shadow_registration_snapshot",
+            None,
+        )
+        if not callable(snapshot_getter):
+            return False
+        snapshot = snapshot_getter()
+        return bool(
+            getattr(snapshot, "active", False)
+            and bar.stock_code in getattr(snapshot, "target_stock_codes", ())
+            and bar.connection_epoch == getattr(snapshot, "connection_epoch", -1)
+            and bar.login_session_id == getattr(snapshot, "login_session_id", "")
+        )
+
+    def _compare_or_pend_realtime_shadow_bar(
+        self,
+        bar: RealtimeShadowBar,
+    ) -> dict[str, object]:
+        stock_dir = StockRepository().resolve_stock_dir(bar.stock_code)
+        candles = load_candles(stock_dir)
+        content_hash = canonical_candle_content_hash(candles) if candles else ""
+        comparison = compare_shadow_bar_to_canonical(
+            bar,
+            candles,
+            canonical_content_hash=content_hash,
+        )
+        result = comparison.to_payload()
+        self._last_realtime_shadow_comparison = result
+        key = (bar.stock_code, bar.minute_key)
+        if comparison.status == NO_CANONICAL_BAR:
+            self._pending_shadow_comparisons[key] = bar
+            self._pending_shadow_comparisons.move_to_end(key)
+            while len(self._pending_shadow_comparisons) > self.MAX_PENDING_SHADOW_COMPARISONS:
+                self._pending_shadow_comparisons.popitem(last=False)
+        else:
+            self._pending_shadow_comparisons.pop(key, None)
+            self.realtime_shadow_comparison_completed.emit(dict(result))
+        return result
+
+    def _observe_realtime_shadow_exception(
+        self,
+        exc: Exception,
+        operation: str,
+        *,
+        stock_code: str = "",
+    ) -> None:
+        observe_production_exception(
+            type(exc),
+            exc,
+            exc.__traceback__,
+            component="realtime_shadow",
+            operation=operation,
+            source="gui_auto_trade_operation_host.AutoTradeOperationHost",
+            target_type="MARKET_DATA",
+            target_id=stock_code or "realtime_shadow",
+            target_name=stock_code or "Realtime shadow",
+            reason_code="REALTIME_SHADOW_DIAGNOSTIC_FAILED",
+            owner=self,
+            failure_scope=f"realtime_shadow:{operation}:{stock_code}",
+        )
 
     def register_operation_candle_request(
         self,
@@ -244,6 +509,7 @@ class AutoTradeOperationHost(QObject):
 
     def _on_bar_committed(self, payload: object) -> None:
         """Validate and enqueue only; broker callback work ends here."""
+        self._on_canonical_bar_for_shadow_comparison(payload)
         if self._shutting_down or not self._valid_bar_committed_payload(payload):
             return
         event = dict(payload)
@@ -392,6 +658,9 @@ class AutoTradeOperationHost(QObject):
         bind_bar_committed = getattr(self, "_bind_bar_committed_signal_once", None)
         if callable(bind_bar_committed):
             bind_bar_committed()
+        bind_realtime = getattr(self, "_bind_realtime_shadow_signals_once", None)
+        if callable(bind_realtime):
+            bind_realtime()
         if self._operation_cycle_running:
             return {"processed": False, "reason_code": "OPERATION_CYCLE_REENTRY"}
 
