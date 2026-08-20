@@ -22,6 +22,7 @@ from routine_instance_registry import (
     load_persisted_routine_instances,
     routine_definition_by_id,
     routine_instance_by_id,
+    validate_routine_limit_response_policy,
 )
 
 
@@ -110,6 +111,14 @@ class RoutineInstanceDeleteResult:
 
 @dataclass(frozen=True)
 class RoutineInstanceBuyLimitResult:
+    success: bool
+    instance: RoutineInstanceRecord | None = None
+    error_code: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class RoutineInstanceBuyLimitResponsePolicyResult:
     success: bool
     instance: RoutineInstanceRecord | None = None
     error_code: str = ""
@@ -469,6 +478,73 @@ class RoutineInstanceRepository:
             return RoutineInstanceBuyLimitResult(
                 False,
                 error_code="INSTANCE_BUY_LIMIT_UPDATE_FAILED",
+                error=str(exc),
+            )
+
+    def update_buy_limit_response_policy(
+        self,
+        instance_id: str,
+        policy: object,
+    ) -> RoutineInstanceBuyLimitResponsePolicyResult:
+        instance = self.get_instance(instance_id)
+        if instance is None:
+            return RoutineInstanceBuyLimitResponsePolicyResult(
+                False,
+                error_code="INSTANCE_UNKNOWN",
+                error="변경할 등록 루틴을 찾을 수 없습니다.",
+            )
+        try:
+            normalized = validate_routine_limit_response_policy(policy)
+        except ValueError as exc:
+            return RoutineInstanceBuyLimitResponsePolicyResult(
+                False,
+                error_code="BUY_LIMIT_RESPONSE_POLICY_INVALID",
+                error=str(exc),
+            )
+
+        instance_dir = self.instances_root / instance.instance_id
+        metadata_path = instance_dir / "instance.json"
+        temp_path = instance_dir / f".instance.{uuid4().hex}.tmp"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise ValueError("instance.json must contain an object")
+            metadata["buy_limit_response_policy"] = deepcopy(normalized)
+            metadata["updated_at"] = self._now_factory().isoformat(timespec="seconds")
+            self._write_json_replace(temp_path, metadata)
+            os.replace(temp_path, metadata_path)
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if saved != metadata:
+                raise ValueError("instance.json 저장 후 검증이 일치하지 않습니다.")
+            updated = self.get_instance(instance.instance_id)
+            if updated is None:
+                raise RuntimeError("변경된 등록 루틴을 다시 읽어 검증하지 못했습니다.")
+            if updated.buy_limit_response_policy != normalized:
+                raise RuntimeError("변경된 한도대응 정책이 재읽기 검증과 일치하지 않습니다.")
+            changes = []
+            if instance.buy_limit_response_policy != updated.buy_limit_response_policy:
+                changes.append(
+                    {
+                        "field_key": "buy_limit_response_policy",
+                        "before": instance.buy_limit_response_policy,
+                        "after": updated.buy_limit_response_policy,
+                    }
+                )
+            _append_instance_setting_changed(
+                instance_id=instance.instance_id,
+                display_name=updated.display_name,
+                changes=changes,
+            )
+            return RoutineInstanceBuyLimitResponsePolicyResult(
+                True,
+                instance=updated,
+            )
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            return RoutineInstanceBuyLimitResponsePolicyResult(
+                False,
+                error_code="INSTANCE_BUY_LIMIT_RESPONSE_POLICY_UPDATE_FAILED",
                 error=str(exc),
             )
 

@@ -757,6 +757,405 @@ class _BufferResponseSettingsSurface(QDialog):
         super().closeEvent(event)
 
 
+class _RoutineLimitResponseSettingsSurface(QDialog):
+    """RoutineInstance-scoped editor for the persisted limit response policy."""
+
+    MODE_NONE = "NONE"
+    MODE_UNIFIED = "UNIFIED"
+    MODE_SEGMENTED = "SEGMENTED"
+    EARLY_CLOSE_COLOR = "#2563EB"
+    SEGMENT_CLOSE_COLOR = "#DC2626"
+
+    def __init__(
+        self,
+        owner: QWidget,
+        instance_id: str,
+        *,
+        repository: RoutineInstanceRepository | None = None,
+    ) -> None:
+        super().__init__(owner)
+        self.instance_id = str(instance_id or "").strip()
+        self._repository = repository or RoutineInstanceRepository(PROJECT_ROOT)
+        self._persisted_baseline: dict[str, object] | None = None
+        self._loading_policy = True
+        self._last_save_error = ""
+        self.setObjectName("routineLimitResponseSettingsSurface")
+        self.setWindowTitle("루틴 한도대응 설정")
+        self.setModal(False)
+        self.setMinimumSize(560, 360)
+        self.resize(560, 360)
+        self.setStyleSheet(
+            "QDialog#routineLimitResponseSettingsSurface,"
+            "QDialog#routineLimitResponseSettingsSurface QWidget,"
+            "QDialog#routineLimitResponseSettingsSurface QLabel,"
+            "QDialog#routineLimitResponseSettingsSurface QCheckBox,"
+            "QDialog#routineLimitResponseSettingsSurface QComboBox,"
+            "QDialog#routineLimitResponseSettingsSurface QPushButton {"
+            " font-family: 'Malgun Gothic'; font-size: 9pt;"
+            " }"
+            "QDialog#routineLimitResponseSettingsSurface QComboBox {"
+            " min-height: 30px;"
+            " }"
+            "QDialog#routineLimitResponseSettingsSurface QPushButton {"
+            " min-height: 28px; min-width: 82px;"
+            " }"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(34, 14, 34, 12)
+        root.setSpacing(10)
+
+        self.unified_checkbox = QCheckBox("일괄적용")
+        self.segmented_checkbox = QCheckBox("손익별 적용")
+        root.addWidget(self.unified_checkbox)
+
+        self.strategy_rows: dict[str, list[tuple[QComboBox, QComboBox]]] = {}
+        self.strategy_action_badges: dict[str, QPushButton] = {}
+        title_width = QFontMetrics(self.font()).horizontalAdvance("▪ 손실구간")
+        self.unified_strategy_row = self._make_strategy_row(
+            "", "unified", title_width, ("손익금액", "낮은순"), "조기마감"
+        )
+        self.profit_strategy_row = self._make_strategy_row(
+            "▪ 수익", "profit", title_width, ("손익금액", "높은순"), "조기마감"
+        )
+        self.loss_strategy_row = self._make_strategy_row(
+            "▪ 손실", "loss", title_width, ("손익금액", "낮은순"), "즉시청산"
+        )
+        root.addWidget(self.unified_strategy_row)
+        root.addWidget(self.segmented_checkbox)
+        root.addWidget(self.profit_strategy_row)
+        root.addWidget(self.loss_strategy_row)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        root.addWidget(separator)
+
+        segment_settings = QWidget()
+        segment_layout = QHBoxLayout(segment_settings)
+        segment_layout.setContentsMargins(12, 0, 0, 0)
+        segment_layout.setSpacing(4)
+        self.segment_close_title_label = QLabel("※구간마감:")
+        segment_layout.addWidget(self.segment_close_title_label)
+        self.early_close_percent_combo = self._make_percent_combo(
+            ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS
+        )
+        self.early_close_percent_combo.setObjectName(
+            "routineLimitEarlyClosePercentCombo"
+        )
+        segment_layout.addWidget(self.early_close_percent_combo)
+        segment_layout.addWidget(QLabel("▷"))
+        self.segment_early_close_label = QLabel("조기마감")
+        self.segment_early_close_label.setStyleSheet(
+            f"QLabel {{ color: {self.SEGMENT_CLOSE_COLOR}; font-weight: bold; }}"
+        )
+        segment_layout.addWidget(self.segment_early_close_label)
+        segment_layout.addWidget(QLabel("|"))
+        self.immediate_liquidation_percent_combo = self._make_percent_combo(
+            ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS
+        )
+        self.immediate_liquidation_percent_combo.setObjectName(
+            "routineLimitImmediateLiquidationPercentCombo"
+        )
+        segment_layout.addWidget(self.immediate_liquidation_percent_combo)
+        segment_layout.addWidget(QLabel("▷"))
+        self.segment_immediate_liquidation_label = QLabel("즉시청산")
+        segment_layout.addWidget(self.segment_immediate_liquidation_label)
+        segment_layout.addStretch(1)
+        root.addWidget(segment_settings)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        self.save_button = self.button_box.button(QDialogButtonBox.Save)
+        self.cancel_button = self.button_box.button(QDialogButtonBox.Cancel)
+        self.save_button.setText("저장")
+        self.cancel_button.setText("취소")
+        self.save_button.setMinimumWidth(110)
+        self.cancel_button.setMinimumWidth(110)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        root.addWidget(self.button_box)
+
+        self._mode_syncing = False
+        self.unified_checkbox.toggled.connect(self._on_unified_toggled)
+        self.segmented_checkbox.toggled.connect(self._on_segmented_toggled)
+        for rows in self.strategy_rows.values():
+            for factor_combo, direction_combo in rows:
+                factor_combo.currentTextChanged.connect(
+                    lambda _text: self._refresh_save_enabled()
+                )
+                direction_combo.currentTextChanged.connect(
+                    lambda _text: self._refresh_save_enabled()
+                )
+        self.early_close_percent_combo.currentTextChanged.connect(
+            self._on_early_close_percent_changed
+        )
+        self.immediate_liquidation_percent_combo.currentTextChanged.connect(
+            lambda _text: self._refresh_save_enabled()
+        )
+        self._loading_policy = False
+        self.reload_from_persisted()
+
+    def _make_strategy_row(
+        self,
+        title: str,
+        key: str,
+        title_width: int,
+        default: tuple[str, str],
+        action_default: str,
+    ) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(8)
+        title_label = QLabel(title)
+        title_label.setFixedWidth(title_width)
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        if title:
+            title_label.setContentsMargins(12, 0, 0, 0)
+        layout.addWidget(title_label)
+        factor_combo = QComboBox()
+        factor_combo.addItems(ROUTINE_LIMIT_RESPONSE_EVALUATION_FACTORS)
+        factor_combo.setCurrentText(default[0])
+        factor_combo.setFixedWidth(126)
+        direction_combo = QComboBox()
+        direction_combo.addItems(ROUTINE_LIMIT_RESPONSE_SORT_DIRECTIONS)
+        direction_combo.setCurrentText(default[1])
+        direction_combo.setFixedWidth(106)
+        layout.addWidget(factor_combo)
+        layout.addWidget(direction_combo)
+        layout.addSpacing(8)
+        action_badge = _DoubleClickActionButton(action_default)
+        action_badge.setCursor(Qt.PointingHandCursor)
+        action_badge.setFixedSize(
+            max(
+                QFontMetrics(action_badge.font()).horizontalAdvance(text)
+                for text in ROUTINE_LIMIT_RESPONSE_ACTION_MODES
+            )
+            + 20,
+            30,
+        )
+        action_badge.doubleClicked.connect(
+            lambda strategy_key=key: self._cycle_strategy_action_badge(strategy_key)
+        )
+        layout.addWidget(action_badge)
+        layout.addStretch(1)
+        self.strategy_rows[key] = [(factor_combo, direction_combo)]
+        self.strategy_action_badges[key] = action_badge
+        self._apply_action_badge_style(action_badge)
+        return widget
+
+    def _make_percent_combo(self, percents: tuple[int, ...]) -> _TextOnlyPopupComboBox:
+        combo = _TextOnlyPopupComboBox()
+        combo.addItems([f"{percent}%" for percent in percents])
+        metrics = QFontMetrics(self.font())
+        combo.setFixedSize(metrics.horizontalAdvance("100%") + 8, 26)
+        combo.setPopupMinimumWidth(max(64, metrics.horizontalAdvance("100%") + 28))
+        combo.view().setTextElideMode(Qt.ElideNone)
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.setStyleSheet(
+            "QComboBox { border: none; outline: none; background: transparent;"
+            " padding: 0px; }"
+            "QComboBox:hover, QComboBox:focus { border: none;"
+            " background: transparent; outline: none; }"
+            "QComboBox::drop-down { border: none; width: 0px; }"
+            "QComboBox::down-arrow { image: none; width: 0px; height: 0px; }"
+        )
+        return combo
+
+    def _apply_action_badge_style(self, badge: QPushButton) -> None:
+        if badge.text() == "조기마감":
+            color = self.EARLY_CLOSE_COLOR
+        elif badge.text() == "구간마감":
+            color = self.SEGMENT_CLOSE_COLOR
+        else:
+            color = "#374151"
+        badge.setStyleSheet(
+            "QPushButton {"
+            f" color: {color}; border: 1px solid {color};"
+            " border-radius: 3px; background: transparent; padding: 0px;"
+            " font-weight: bold; }"
+        )
+
+    def _cycle_strategy_action_badge(self, key: str) -> None:
+        badge = self.strategy_action_badges.get(key)
+        if badge is None or not badge.isEnabled():
+            return
+        try:
+            index = ROUTINE_LIMIT_RESPONSE_ACTION_MODES.index(badge.text())
+        except ValueError:
+            index = -1
+        badge.setText(
+            ROUTINE_LIMIT_RESPONSE_ACTION_MODES[
+                (index + 1) % len(ROUTINE_LIMIT_RESPONSE_ACTION_MODES)
+            ]
+        )
+        self._apply_action_badge_style(badge)
+        self._refresh_save_enabled()
+
+    def _on_unified_toggled(self, checked: bool) -> None:
+        if not self._mode_syncing:
+            self.set_application_mode(self.MODE_UNIFIED if checked else self.MODE_NONE)
+
+    def _on_segmented_toggled(self, checked: bool) -> None:
+        if not self._mode_syncing:
+            self.set_application_mode(
+                self.MODE_SEGMENTED if checked else self.MODE_NONE
+            )
+
+    def set_application_mode(self, mode: str) -> None:
+        self._mode_syncing = True
+        try:
+            self.unified_checkbox.setChecked(mode == self.MODE_UNIFIED)
+            self.segmented_checkbox.setChecked(mode == self.MODE_SEGMENTED)
+        finally:
+            self._mode_syncing = False
+        self.unified_strategy_row.setEnabled(mode == self.MODE_UNIFIED)
+        segmented = mode == self.MODE_SEGMENTED
+        self.profit_strategy_row.setEnabled(segmented)
+        self.loss_strategy_row.setEnabled(segmented)
+        self._refresh_save_enabled()
+
+    def application_mode(self) -> str:
+        if self.unified_checkbox.isChecked():
+            return self.MODE_UNIFIED
+        if self.segmented_checkbox.isChecked():
+            return self.MODE_SEGMENTED
+        return self.MODE_NONE
+
+    @staticmethod
+    def _percent_value(combo: QComboBox) -> int:
+        return int(combo.currentText().strip().rstrip("%"))
+
+    def _on_early_close_percent_changed(self, _text: str) -> None:
+        self._rebuild_immediate_percent_options()
+        self._refresh_save_enabled()
+
+    def _rebuild_immediate_percent_options(self, preferred: int | None = None) -> None:
+        if preferred is None and self.immediate_liquidation_percent_combo.currentText():
+            preferred = self._percent_value(self.immediate_liquidation_percent_combo)
+        early = self._percent_value(self.early_close_percent_combo)
+        valid = [
+            percent
+            for percent in ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS
+            if percent > early
+        ]
+        selected = preferred if preferred in valid else valid[0]
+        combo = self.immediate_liquidation_percent_combo
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItems([f"{percent}%" for percent in valid])
+            combo.setCurrentText(f"{selected}%")
+        finally:
+            combo.blockSignals(blocked)
+
+    def _editor_policy(self) -> dict[str, object]:
+        strategies: dict[str, dict[str, str]] = {}
+        for key in ("unified", "profit", "loss"):
+            factor_combo, direction_combo = self.strategy_rows[key][0]
+            strategies[key] = {
+                "evaluation_factor": factor_combo.currentText().strip(),
+                "direction": direction_combo.currentText().strip(),
+                "response_mode": self.strategy_action_badges[key].text().strip(),
+            }
+        return {
+            "application_mode": self.application_mode(),
+            "strategies": strategies,
+            "segment_close": {
+                "early_close_percent": self._percent_value(
+                    self.early_close_percent_combo
+                ),
+                "immediate_liquidation_percent": self._percent_value(
+                    self.immediate_liquidation_percent_combo
+                ),
+            },
+        }
+
+    def _apply_editor_policy(self, policy: object) -> None:
+        normalized = validate_routine_limit_response_policy(policy)
+        self._loading_policy = True
+        try:
+            self.set_application_mode(str(normalized["application_mode"]))
+            strategies = normalized["strategies"]
+            assert isinstance(strategies, dict)
+            for key in ("unified", "profit", "loss"):
+                strategy = strategies[key]
+                factor_combo, direction_combo = self.strategy_rows[key][0]
+                factor_combo.setCurrentText(strategy["evaluation_factor"])
+                direction_combo.setCurrentText(strategy["direction"])
+                badge = self.strategy_action_badges[key]
+                badge.setText(strategy["response_mode"])
+                self._apply_action_badge_style(badge)
+            segment_close = normalized["segment_close"]
+            assert isinstance(segment_close, dict)
+            self.early_close_percent_combo.setCurrentText(
+                f"{segment_close['early_close_percent']}%"
+            )
+            self._rebuild_immediate_percent_options(
+                int(segment_close["immediate_liquidation_percent"])
+            )
+        finally:
+            self._loading_policy = False
+        self._refresh_save_enabled()
+
+    def reload_from_persisted(self) -> None:
+        instance = self._repository.get_instance(self.instance_id)
+        persisted = instance.buy_limit_response_policy if instance is not None else None
+        if persisted is None:
+            self._persisted_baseline = None
+            self._apply_editor_policy(default_routine_limit_response_policy())
+            return
+        normalized = validate_routine_limit_response_policy(persisted)
+        self._persisted_baseline = normalized
+        self._apply_editor_policy(normalized)
+
+    def _refresh_save_enabled(self) -> None:
+        if self._loading_policy or not hasattr(self, "save_button"):
+            return
+        try:
+            current = validate_routine_limit_response_policy(self._editor_policy())
+        except (ValueError, TypeError):
+            self.save_button.setEnabled(False)
+            return
+        self.save_button.setEnabled(
+            self._persisted_baseline is None or current != self._persisted_baseline
+        )
+
+    def accept(self) -> None:
+        try:
+            current = validate_routine_limit_response_policy(self._editor_policy())
+            result = self._repository.update_buy_limit_response_policy(
+                self.instance_id,
+                current,
+            )
+            if not result.success or result.instance is None:
+                raise RuntimeError(
+                    result.error or "ROUTINE_LIMIT_RESPONSE_POLICY_SAVE_FAILED"
+                )
+            if result.instance.buy_limit_response_policy != current:
+                raise RuntimeError("ROUTINE_LIMIT_RESPONSE_POLICY_READBACK_MISMATCH")
+        except Exception as exc:
+            self._last_save_error = str(exc).strip() or (
+                "ROUTINE_LIMIT_RESPONSE_POLICY_SAVE_FAILED"
+            )
+            self._refresh_save_enabled()
+            return
+        self._last_save_error = ""
+        self._persisted_baseline = current
+        self._refresh_save_enabled()
+        super().accept()
+
+    def reject(self) -> None:
+        self.reload_from_persisted()
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        self.reload_from_persisted()
+        super().closeEvent(event)
+
+
 class _AccountPopupDisplayDelegate(QStyledItemDelegate):
     """Project memo text only in the popup without changing account identity."""
 
@@ -1080,7 +1479,17 @@ from gui_auto_trade_setting_window import (
     routine_display_name,
 )
 from gui_routine_registry import routine_record_by_name
-from routine_instance_registry import routine_definition_by_id, routine_instance_by_id
+from routine_instance_registry import (
+    ROUTINE_LIMIT_RESPONSE_ACTION_MODES,
+    ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS,
+    ROUTINE_LIMIT_RESPONSE_EVALUATION_FACTORS,
+    ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS,
+    ROUTINE_LIMIT_RESPONSE_SORT_DIRECTIONS,
+    default_routine_limit_response_policy,
+    routine_definition_by_id,
+    routine_instance_by_id,
+    validate_routine_limit_response_policy,
+)
 from routine_instance_repository import RoutineInstanceRepository
 from stock_repository import now_text as stock_now_text
 from gui_main_routine_selection import (
@@ -7980,8 +8389,29 @@ class MainWindow(QMainWindow):
         return self.open_routine_instance_buy_limit_settings(instance_id)
 
     def open_routine_instance_buy_limit_settings(self, instance_id: str) -> bool:
-        """Future routine-limit response settings boundary."""
-        return False
+        """Open the persisted response-policy editor for one RoutineInstance."""
+        clean_instance_id = str(instance_id or "").strip()
+        repository = RoutineInstanceRepository(PROJECT_ROOT)
+        if not clean_instance_id or repository.get_instance(clean_instance_id) is None:
+            return False
+        surfaces = getattr(self, "_routine_limit_response_settings_surfaces", None)
+        if surfaces is None:
+            surfaces = {}
+            self._routine_limit_response_settings_surfaces = surfaces
+        surface = surfaces.get(clean_instance_id)
+        if surface is None or sip.isdeleted(surface):
+            surface = _RoutineLimitResponseSettingsSurface(
+                self,
+                clean_instance_id,
+                repository=repository,
+            )
+            surfaces[clean_instance_id] = surface
+        elif not surface.isVisible():
+            surface.reload_from_persisted()
+        surface.show()
+        surface.raise_()
+        surface.activateWindow()
+        return True
 
     def finish_routine_instance_buy_limit_edit(self, *, save: bool) -> None:
         editor = self._routine_instance_buy_limit_editor

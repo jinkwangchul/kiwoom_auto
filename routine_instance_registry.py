@@ -24,6 +24,16 @@ LEGACY_INSTANCE_PREFIX = "legacy::"
 LEGACY_INSTANCE_SOURCE = "LEGACY_ADAPTER"
 PERSISTED_INSTANCE_SOURCE = "PERSISTED"
 SUPPORTED_INSTANCE_SCHEMA_VERSIONS = {"1.0"}
+ROUTINE_LIMIT_RESPONSE_APPLICATION_MODES = ("UNIFIED", "SEGMENTED")
+ROUTINE_LIMIT_RESPONSE_EVALUATION_FACTORS = (
+    "손익금액",
+    "손익비율",
+    "투입금액",
+)
+ROUTINE_LIMIT_RESPONSE_SORT_DIRECTIONS = ("높은순", "낮은순")
+ROUTINE_LIMIT_RESPONSE_ACTION_MODES = ("조기마감", "즉시청산", "구간마감")
+ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS = (50, 60, 70, 80, 90)
+ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS = (60, 70, 80, 90, 100)
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,7 @@ class RoutineInstanceRecord:
     buy_limit_enabled: bool = False
     buy_limit_amount: int | None = None
     buy_limit_adjustment_ratio: Decimal | None = None
+    buy_limit_response_policy: dict[str, object] | None = None
     rules_path: Path | None = None
     schema_version: str = ""
     created_at: str = ""
@@ -100,6 +111,95 @@ def buy_limit_adjustment_ratio_text(value: object) -> str | None:
         return None
     text = format(ratio.normalize(), "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def default_routine_limit_response_policy() -> dict[str, object]:
+    return {
+        "application_mode": "UNIFIED",
+        "strategies": {
+            "unified": {
+                "evaluation_factor": "손익금액",
+                "direction": "낮은순",
+                "response_mode": "조기마감",
+            },
+            "profit": {
+                "evaluation_factor": "손익금액",
+                "direction": "높은순",
+                "response_mode": "조기마감",
+            },
+            "loss": {
+                "evaluation_factor": "손익금액",
+                "direction": "낮은순",
+                "response_mode": "즉시청산",
+            },
+        },
+        "segment_close": {
+            "early_close_percent": 90,
+            "immediate_liquidation_percent": 100,
+        },
+    }
+
+
+def validate_routine_limit_response_policy(policy: object) -> dict[str, object]:
+    if not isinstance(policy, dict):
+        raise ValueError("routine limit response policy must be an object")
+
+    application_mode = policy.get("application_mode")
+    if application_mode not in ROUTINE_LIMIT_RESPONSE_APPLICATION_MODES:
+        raise ValueError("routine limit response application mode is invalid")
+
+    raw_strategies = policy.get("strategies")
+    if not isinstance(raw_strategies, dict):
+        raise ValueError("routine limit response strategies must be an object")
+    strategies: dict[str, dict[str, str]] = {}
+    for key in ("unified", "profit", "loss"):
+        raw_strategy = raw_strategies.get(key)
+        if not isinstance(raw_strategy, dict):
+            raise ValueError(f"routine limit response strategy is invalid: {key}")
+        evaluation_factor = raw_strategy.get("evaluation_factor")
+        direction = raw_strategy.get("direction")
+        response_mode = raw_strategy.get("response_mode")
+        if evaluation_factor not in ROUTINE_LIMIT_RESPONSE_EVALUATION_FACTORS:
+            raise ValueError(f"routine limit response evaluation factor is invalid: {key}")
+        if direction not in ROUTINE_LIMIT_RESPONSE_SORT_DIRECTIONS:
+            raise ValueError(f"routine limit response direction is invalid: {key}")
+        if response_mode not in ROUTINE_LIMIT_RESPONSE_ACTION_MODES:
+            raise ValueError(f"routine limit response mode is invalid: {key}")
+        strategies[key] = {
+            "evaluation_factor": evaluation_factor,
+            "direction": direction,
+            "response_mode": response_mode,
+        }
+
+    raw_segment_close = policy.get("segment_close")
+    if not isinstance(raw_segment_close, dict):
+        raise ValueError("routine limit segment close policy must be an object")
+    early_close_percent = raw_segment_close.get("early_close_percent")
+    immediate_liquidation_percent = raw_segment_close.get(
+        "immediate_liquidation_percent"
+    )
+    if (
+        isinstance(early_close_percent, bool)
+        or early_close_percent not in ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS
+    ):
+        raise ValueError("routine limit early close percent is invalid")
+    if (
+        isinstance(immediate_liquidation_percent, bool)
+        or immediate_liquidation_percent
+        not in ROUTINE_LIMIT_RESPONSE_IMMEDIATE_LIQUIDATION_PERCENTS
+    ):
+        raise ValueError("routine limit immediate liquidation percent is invalid")
+    if immediate_liquidation_percent <= early_close_percent:
+        raise ValueError("immediate liquidation percent must exceed early close percent")
+
+    return {
+        "application_mode": application_mode,
+        "strategies": strategies,
+        "segment_close": {
+            "early_close_percent": early_close_percent,
+            "immediate_liquidation_percent": immediate_liquidation_percent,
+        },
+    }
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, RoutineRegistryDiagnostic | None]:
@@ -443,6 +543,20 @@ def _persisted_instance_from_directory(
             definition_id,
         )
 
+    buy_limit_response_policy = None
+    if "buy_limit_response_policy" in metadata:
+        try:
+            buy_limit_response_policy = validate_routine_limit_response_policy(
+                metadata["buy_limit_response_policy"]
+            )
+        except ValueError as exc:
+            return None, _instance_diagnostic(
+                "INSTANCE_BUY_LIMIT_RESPONSE_POLICY_INVALID",
+                str(exc),
+                metadata_path,
+                definition_id,
+            )
+
     rules_file = str(metadata.get("rules_file") or "").strip()
     rules_relative = Path(rules_file)
     if (
@@ -495,6 +609,7 @@ def _persisted_instance_from_directory(
         buy_limit_enabled=buy_limit_enabled,
         buy_limit_amount=buy_limit_amount,
         buy_limit_adjustment_ratio=buy_limit_adjustment_ratio,
+        buy_limit_response_policy=buy_limit_response_policy,
         rules_path=rules_path,
         schema_version=schema_version,
         created_at=str(metadata.get("created_at") or "").strip(),
