@@ -133,6 +133,29 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
             requested_at="2026-07-27T09:00:00",
         )
 
+    def comm_rq_calls(self) -> list[tuple[object, ...]]:
+        return [
+            args
+            for signature, args in self.control.calls
+            if signature.startswith("CommRqData")
+        ]
+
+    def set_input_calls(self) -> list[tuple[object, ...]]:
+        return [
+            args
+            for signature, args in self.control.calls
+            if signature.startswith("SetInputValue")
+        ]
+
+    def run_governor_timer(self) -> None:
+        callbacks = [
+            callback
+            for callback in _Timer.callbacks
+            if getattr(callback, "__name__", "") == "_on_tr_governor_timer"
+        ]
+        self.assertTrue(callbacks)
+        callbacks[-1]()
+
     def holding_row(self, code: str) -> dict[str, object]:
         return {
             "종목번호": f"A{code}",
@@ -611,6 +634,51 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.assertEqual("BROKER_REQUEST_NOT_READY", result["error_kind"])
         self.assertEqual(before_calls, after_calls)
         self.assertEqual({}, self.api._pending_tr)
+
+    def test_global_tr_governor_queues_input_values_with_commrq(self) -> None:
+        now_ms = 10_000
+        self.api._tr_governor_now_ms = lambda: now_ms
+
+        first = self.api.request_minute_candles("005930")
+        self.assertEqual("REQUESTED", first["status"])
+        self.assertEqual(1, len(self.comm_rq_calls()))
+        self.assertEqual(3, len(self.set_input_calls()))
+
+        second = self.api.request_minute_candles("006400")
+        self.assertEqual("QUEUED", second["status"])
+        self.assertEqual(1, len(self.comm_rq_calls()))
+        self.assertEqual(3, len(self.set_input_calls()))
+        self.assertEqual(2, len(_Timer.callbacks))
+
+        now_ms = 11_000
+        self.run_governor_timer()
+
+        self.assertEqual(2, len(self.comm_rq_calls()))
+        self.assertEqual(6, len(self.set_input_calls()))
+        self.assertEqual(str(second["rqname"]), self.comm_rq_calls()[-1][0])
+        self.assertEqual(3, len(_Timer.callbacks))
+
+    def test_global_tr_governor_stale_queued_request_fails_before_commrq(self) -> None:
+        now_ms = 20_000
+        self.api._tr_governor_now_ms = lambda: now_ms
+        results: list[dict[str, object]] = []
+
+        self.api.request_minute_candles("005930")
+        second = self.api.request_minute_candles("006400", callback=results.append)
+        self.assertEqual("QUEUED", second["status"])
+        self.assertEqual(1, len(self.comm_rq_calls()))
+        self.assertEqual(3, len(self.set_input_calls()))
+
+        self.api._connection_epoch = 3
+        self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+        now_ms = 21_000
+        self.run_governor_timer()
+
+        self.assertEqual(1, len(self.comm_rq_calls()))
+        self.assertEqual(3, len(self.set_input_calls()))
+        self.assertEqual(1, len(results))
+        self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
+        self.assertNotIn(str(second["rqname"]), self.api._pending_tr)
 
     def test_reconnect_new_request_captures_new_session_identity(self) -> None:
         first = self.api.request_minute_candles("005930")

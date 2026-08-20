@@ -9,11 +9,13 @@ engine, or write rules.
 from __future__ import annotations
 
 import ctypes
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import os
 import threading
+from time import monotonic
 from typing import Any, Callable
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
@@ -315,6 +317,8 @@ class KiwoomApi(QObject):
     ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
     MINUTE_CANDLE_TR_TIMEOUT_MS = 10_000
     BROKER_CONNECTION_OBSERVATION_INTERVAL_MS = 5_000
+    # Project-conservative pacing, aligned with auto_candle_refresh.REQUEST_SPACING_MS.
+    TR_GOVERNOR_MIN_INTERVAL_MS = 1_000
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -354,6 +358,10 @@ class KiwoomApi(QObject):
         self.last_login_message = "login not requested"
         self._pending_tr: dict[str, dict[str, Any]] = {}
         self._account_funds_request_accounts: dict[str, str] = {}
+        self._tr_request_queue: deque[dict[str, Any]] = deque()
+        self._tr_last_dispatch_monotonic_ms: int | None = None
+        self._tr_governor_timer_scheduled = False
+        self._tr_governor_dispatching = False
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -570,6 +578,147 @@ class KiwoomApi(QObject):
                 }
             )
             self._finish_callback(callback if callable(callback) else None, payload)
+
+    def _ensure_tr_governor_state(self) -> None:
+        if not hasattr(self, "_tr_request_queue"):
+            self._tr_request_queue = deque()
+        if not hasattr(self, "_tr_last_dispatch_monotonic_ms"):
+            self._tr_last_dispatch_monotonic_ms = None
+        if not hasattr(self, "_tr_governor_timer_scheduled"):
+            self._tr_governor_timer_scheduled = False
+        if not hasattr(self, "_tr_governor_dispatching"):
+            self._tr_governor_dispatching = False
+
+    def _tr_governor_now_ms(self) -> int:
+        return int(monotonic() * 1000)
+
+    def _schedule_tr_governor_dispatch(self, delay_ms: int) -> None:
+        self._ensure_tr_governor_state()
+        if self._tr_governor_timer_scheduled:
+            return
+        self._tr_governor_timer_scheduled = True
+        QTimer.singleShot(
+            max(int(delay_ms or 0), 0),
+            self._on_tr_governor_timer,
+        )
+
+    def _on_tr_governor_timer(self) -> None:
+        self._ensure_tr_governor_state()
+        self._tr_governor_timer_scheduled = False
+        self._drain_tr_governor()
+
+    def _submit_governed_tr_request(
+        self,
+        *,
+        rqname: str,
+        trcode: str,
+        prev_next: int,
+        screen_no: str,
+        inputs: tuple[tuple[str, str], ...],
+        pending: dict[str, Any],
+        on_dispatched: Callable[[Any], None] | None = None,
+        on_failed: Callable[[Any, str], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_tr_governor_state()
+        request = {
+            "rqname": str(rqname),
+            "trcode": str(trcode),
+            "prev_next": int(prev_next),
+            "screen_no": str(screen_no),
+            "inputs": tuple((str(field), str(value)) for field, value in inputs),
+            "pending": pending,
+            "on_dispatched": on_dispatched,
+            "on_failed": on_failed,
+        }
+        self._tr_request_queue.append(request)
+        return self._drain_tr_governor()
+
+    def _drain_tr_governor(self) -> dict[str, Any]:
+        self._ensure_tr_governor_state()
+        if self._tr_governor_dispatching:
+            return {"ok": True, "status": "QUEUED"}
+        if not self._tr_request_queue:
+            return {"ok": True, "status": "IDLE"}
+
+        now_ms = self._tr_governor_now_ms()
+        last_ms = self._tr_last_dispatch_monotonic_ms
+        if last_ms is not None:
+            elapsed_ms = now_ms - int(last_ms)
+            if elapsed_ms < self.TR_GOVERNOR_MIN_INTERVAL_MS:
+                self._schedule_tr_governor_dispatch(
+                    self.TR_GOVERNOR_MIN_INTERVAL_MS - elapsed_ms
+                )
+                return {"ok": True, "status": "QUEUED"}
+
+        request = self._tr_request_queue.popleft()
+        self._tr_governor_dispatching = True
+        try:
+            result = self._dispatch_governed_tr_request(request)
+        finally:
+            self._tr_governor_dispatching = False
+        if self._tr_request_queue:
+            self._schedule_tr_governor_dispatch(self.TR_GOVERNOR_MIN_INTERVAL_MS)
+        return result
+
+    def _dispatch_governed_tr_request(
+        self,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        rqname = str(request.get("rqname") or "")
+        pending = request.get("pending")
+        if not isinstance(pending, dict) or self._pending_tr.get(rqname) is not pending:
+            return {"ok": False, "status": "DROPPED", "rqname": rqname}
+        if not self._pending_tr_matches_current_session(pending):
+            self._finish_stale_pending_tr(rqname, pending)
+            return {
+                "ok": False,
+                "status": "STALE_BROKER_SESSION",
+                "rqname": rqname,
+                "error_kind": "STALE_BROKER_SESSION",
+            }
+
+        try:
+            for field, value in request.get("inputs", ()):
+                self._control.dynamicCall(
+                    "SetInputValue(QString, QString)",
+                    str(field),
+                    str(value),
+                )
+            result = self._control.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                rqname,
+                str(request.get("trcode") or ""),
+                int(request.get("prev_next") or 0),
+                str(request.get("screen_no") or ""),
+            )
+            self._tr_last_dispatch_monotonic_ms = self._tr_governor_now_ms()
+        except Exception as exc:
+            result = -1
+            error = str(exc)
+        else:
+            error = "CommRqData failed"
+
+        if int(result or 0) == 0:
+            on_dispatched = request.get("on_dispatched")
+            if callable(on_dispatched):
+                on_dispatched(result)
+            return {
+                "ok": True,
+                "status": "REQUESTED",
+                "rqname": rqname,
+                "result": result,
+            }
+
+        on_failed = request.get("on_failed")
+        if callable(on_failed):
+            return on_failed(result, error)
+        return {
+            "ok": False,
+            "status": "REQUEST_FAILED",
+            "rqname": rqname,
+            "result": result,
+            "error": error,
+        }
 
     def show_account_password_window(self) -> dict[str, Any]:
         """Open the installed OpenAPI account-password dialog without reading it."""
@@ -961,36 +1110,48 @@ class KiwoomApi(QObject):
             **request_identity,
         }
 
-        try:
-            self._control.dynamicCall("SetInputValue(QString, QString)", "종목코드", clean_code)
-            self._control.dynamicCall("SetInputValue(QString, QString)", "틱범위", str(clean_interval))
-            self._control.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-            result = self._control.dynamicCall(
-                "CommRqData(QString, QString, int, QString)",
-                rqname,
-                "opt10080",
-                0,
-                str(screen_no or "9001"),
+        def start_timeout(_result: Any) -> None:
+            QTimer.singleShot(
+                self.MINUTE_CANDLE_TR_TIMEOUT_MS,
+                lambda request_name=rqname: self._expire_minute_candle_request(request_name),
             )
-        except Exception as exc:
+
+        def fail_request(result: Any, error: str) -> dict[str, Any]:
             self._pending_tr.pop(rqname, None)
             return self._finish_callback(
                 callback,
-                {"ok": False, "code": clean_code, "rqname": rqname, "error": str(exc)},
+                {
+                    "ok": False,
+                    "code": clean_code,
+                    "rqname": rqname,
+                    "result": result,
+                    "error": error,
+                },
             )
 
-        if int(result or 0) != 0:
-            self._pending_tr.pop(rqname, None)
-            return self._finish_callback(
-                callback,
-                {"ok": False, "code": clean_code, "rqname": rqname, "result": result},
-            )
-
-        QTimer.singleShot(
-            self.MINUTE_CANDLE_TR_TIMEOUT_MS,
-            lambda request_name=rqname: self._expire_minute_candle_request(request_name),
+        dispatched = self._submit_governed_tr_request(
+            rqname=rqname,
+            trcode="opt10080",
+            prev_next=0,
+            screen_no=str(screen_no or "9001"),
+            inputs=(
+                ("종목코드", clean_code),
+                ("틱범위", str(clean_interval)),
+                ("수정주가구분", "1"),
+            ),
+            pending=self._pending_tr[rqname],
+            on_dispatched=start_timeout,
+            on_failed=fail_request,
         )
-        return {"ok": True, "code": clean_code, "rqname": rqname, "result": result}
+        if not dispatched.get("ok"):
+            return dispatched
+        return {
+            "ok": True,
+            "status": dispatched.get("status", "REQUESTED"),
+            "code": clean_code,
+            "rqname": rqname,
+            "result": dispatched.get("result"),
+        }
 
     def _expire_minute_candle_request(self, rqname: str) -> None:
         pending = self._pending_tr.pop(str(rqname), None)
@@ -1121,57 +1282,56 @@ class KiwoomApi(QObject):
         self._pending_tr[rqname] = pending
         self._account_funds_request_accounts[rqname] = clean_account
         try:
-            for field, value in (
-                ("계좌번호", clean_account),
-                ("비밀번호", ""),
-                ("비밀번호입력매체구분", "00"),
-                ("조회구분", "2"),
-            ):
-                self._control.dynamicCall(
-                    "SetInputValue(QString, QString)",
-                    field,
-                    value,
-                )
-            result = self._control.dynamicCall(
-                "CommRqData(QString, QString, int, QString)",
-                rqname,
-                "opw00001",
-                0,
-                str(screen_no),
+            clean_timeout = max(int(timeout_ms), 1)
+        except (TypeError, ValueError):
+            clean_timeout = self.ACCOUNT_FUNDS_TR_TIMEOUT_MS
+
+        def start_timeout(_result: Any) -> None:
+            QTimer.singleShot(
+                clean_timeout,
+                lambda request_name=rqname: self._expire_account_funds_request(request_name),
             )
-        except Exception:
-            result = -1
-        if int(result or 0) != 0:
+            QTimer.singleShot(
+                clean_timeout + 1000,
+                lambda request_name=rqname: self._account_funds_request_accounts.pop(
+                    request_name,
+                    None,
+                ),
+            )
+
+        def fail_request(result: Any, error: str) -> dict[str, Any]:
             self._pending_tr.pop(rqname, None)
             self._account_funds_request_accounts.pop(rqname, None)
             return self._finish_callback(
                 callback,
                 {"ok": False, "account_id": clean_account, "request_id": request_id,
-                 "rqname": rqname, "result": result, "error": "CommRqData failed"},
+                 "rqname": rqname, "result": result, "error": error},
             )
 
-        try:
-            clean_timeout = max(int(timeout_ms), 1)
-        except (TypeError, ValueError):
-            clean_timeout = self.ACCOUNT_FUNDS_TR_TIMEOUT_MS
-        QTimer.singleShot(
-            clean_timeout,
-            lambda request_name=rqname: self._expire_account_funds_request(request_name),
-        )
-        QTimer.singleShot(
-            clean_timeout + 1000,
-            lambda request_name=rqname: self._account_funds_request_accounts.pop(
-                request_name,
-                None,
+        dispatched = self._submit_governed_tr_request(
+            rqname=rqname,
+            trcode="opw00001",
+            prev_next=0,
+            screen_no=str(screen_no),
+            inputs=(
+                ("계좌번호", clean_account),
+                ("비밀번호", ""),
+                ("비밀번호입력매체구분", "00"),
+                ("조회구분", "2"),
             ),
+            pending=pending,
+            on_dispatched=start_timeout,
+            on_failed=fail_request,
         )
+        if not dispatched.get("ok"):
+            return dispatched
         return {
             "ok": True,
-            "status": "REQUESTED",
+            "status": dispatched.get("status", "REQUESTED"),
             "account_id": clean_account,
             "request_id": int(request_id),
             "rqname": rqname,
-            "result": result,
+            "result": dispatched.get("result"),
         }
 
     def _expire_account_funds_request(self, rqname: str) -> None:
@@ -1257,37 +1417,35 @@ class KiwoomApi(QObject):
             **request_identity,
         }
         self._pending_tr[rqname] = pending
-        result = self._submit_recovery_snapshot_page(rqname, pending, prev_next=0)
-        if int(result or 0) != 0:
-            self._pending_tr.pop(rqname, None)
-            return self._finish_callback(
-                callback,
-                {
-                    "ok": False,
-                    "is_complete": False,
-                    "rqname": rqname,
-                    "result": result,
-                    "error": "CommRqData failed",
-                },
-            )
         try:
             clean_timeout = max(int(timeout_ms), 1)
         except (TypeError, ValueError):
             clean_timeout = self.RECOVERY_TR_TIMEOUT_MS
-        QTimer.singleShot(
-            clean_timeout,
-            lambda request_name=rqname: self._expire_recovery_snapshot_request(request_name),
+
+        def start_timeout(_result: Any) -> None:
+            QTimer.singleShot(
+                clean_timeout,
+                lambda request_name=rqname: self._expire_recovery_snapshot_request(request_name),
+            )
+
+        dispatched = self._submit_recovery_snapshot_page(
+            rqname,
+            pending,
+            prev_next=0,
+            on_dispatched=start_timeout,
         )
+        if not dispatched.get("ok"):
+            return dispatched
         return {
             "ok": True,
             "is_complete": False,
-            "status": "REQUESTED",
+            "status": dispatched.get("status", "REQUESTED"),
             "kind": kind,
             "account_no": identity.account_no,
             "trading_day": identity.trading_day,
             "recovery_session_id": identity.recovery_session_id,
             "rqname": rqname,
-            "result": result,
+            "result": dispatched.get("result"),
         }
 
     def _submit_recovery_snapshot_page(
@@ -1296,23 +1454,27 @@ class KiwoomApi(QObject):
         pending: dict[str, Any],
         *,
         prev_next: int,
-    ) -> Any:
-        try:
-            for field, value in pending.get("inputs", ()):
-                self._control.dynamicCall(
-                    "SetInputValue(QString, QString)",
-                    str(field),
-                    str(value),
-                )
-            return self._control.dynamicCall(
-                "CommRqData(QString, QString, int, QString)",
+        on_dispatched: Callable[[Any], None] | None = None,
+    ) -> dict[str, Any]:
+        def fail_request(result: Any, error: str) -> dict[str, Any]:
+            self._pending_tr.pop(str(rqname), None)
+            return self._finish_recovery_snapshot(
                 str(rqname),
-                str(pending.get("trcode") or ""),
-                int(prev_next),
-                str(pending.get("screen_no") or ""),
+                pending,
+                collection_complete=False,
+                errors=(error,),
             )
-        except Exception:
-            return -1
+
+        return self._submit_governed_tr_request(
+            rqname=str(rqname),
+            trcode=str(pending.get("trcode") or ""),
+            prev_next=int(prev_next),
+            screen_no=str(pending.get("screen_no") or ""),
+            inputs=tuple(pending.get("inputs", ())),
+            pending=pending,
+            on_dispatched=on_dispatched,
+            on_failed=fail_request,
+        )
 
     def _expire_recovery_snapshot_request(self, rqname: str) -> None:
         pending = self._pending_tr.pop(str(rqname), None)
@@ -1610,15 +1772,8 @@ class KiwoomApi(QObject):
                 pending,
                 prev_next=2,
             )
-            if int(result or 0) == 0:
+            if result.get("ok"):
                 return
-            self._pending_tr.pop(rqname, None)
-            self._finish_recovery_snapshot(
-                rqname,
-                pending,
-                collection_complete=False,
-                errors=("broker snapshot continuation request failed",),
-            )
             return
 
         self._pending_tr.pop(rqname, None)
