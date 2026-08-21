@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
+from gui_routine_registry import GroupRecord
 
 import gui_auto_trade_setting_window as setting_window
 import auto_trade_order_execution_boundary as execution_boundary
@@ -41,6 +42,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        self._canonical_auto_trade_projected_instance_ids = (
+            setting_window.auto_trade_projected_instance_ids
+        )
+        self._projection_patcher = patch.object(
+            setting_window,
+            "auto_trade_projected_instance_ids",
+            side_effect=lambda instances: {
+                str(instance.instance_id) for instance in instances
+            },
+        )
+        self._projection_patcher.start()
         self._app_env_patcher = patch.dict(
             os.environ,
             {setting_window.AUTO_TRADE_SETTING_APP_ENV: "production"},
@@ -49,6 +61,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._app_env_patcher.stop()
+        self._projection_patcher.stop()
 
     def test_review_button_count_uses_review_window_collector(self) -> None:
         rows = [
@@ -296,6 +309,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_tree_stock_performance_sort_active = False
         harness._routine_tree_valid_only = False
         harness._hidden_historical_stock_fixture_keys = set()
+        harness._routine_tree_projected_instance_ids_override = lambda instances: {
+            str(instance.instance_id) for instance in instances
+        }
         harness._routine_instance_name_editor = None
         harness._routine_instance_name_editor_instance_id = ""
         harness._routine_instance_name_editor_original = ""
@@ -565,7 +581,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         for row_kind, expected_labels in (
             ("definition", ["루틴등록"]),
-            ("instance", ["루틴수정", "루틴삭제", "이름변경", "종목등록"]),
+            ("instance", ["설정변경", "루틴삭제", "이름변경", "종목등록"]),
         ):
             item.setData(Qt.UserRole, metadata_by_kind[row_kind])
             menu = MagicMock()
@@ -10547,7 +10563,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent.refresh_all.assert_not_called()
         toast.assert_called_with(parent, "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
 
-    def test_development_historical_fixture_is_default_and_nonpersistent(self) -> None:
+    def test_development_historical_fixture_is_opt_in_and_nonpersistent(self) -> None:
         window = self._window_harness()
         instances = [
             self._instance("inst-a", "A 인스턴스"),
@@ -10572,16 +10588,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "load_persisted_routine_instances",
                 return_value=instances,
             ),
-            patch.dict(
-                os.environ,
-                {},
-            ),
+            patch.dict(os.environ, {}, clear=False),
         ):
-            os.environ.pop(setting_window.AUTO_TRADE_SETTING_APP_ENV, None)
-            os.environ.pop(
-                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV,
-                None,
-            )
+            os.environ[setting_window.AUTO_TRADE_SETTING_APP_ENV] = "development"
+            os.environ[
+                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV
+            ] = "1"
             historical = window._historical_stocks_by_instance()
             original_inst_a_count = len(historical["inst-a"])
             original_inst_b_count = len(historical["inst-b"])
@@ -10656,11 +10668,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.dict(os.environ, {}, clear=False),
         ):
-            os.environ.pop(setting_window.AUTO_TRADE_SETTING_APP_ENV, None)
-            os.environ.pop(
-                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV,
-                None,
-            )
+            os.environ[setting_window.AUTO_TRADE_SETTING_APP_ENV] = "development"
+            os.environ[
+                setting_window.AUTO_TRADE_SETTING_HISTORICAL_STOCK_FIXTURE_ENV
+            ] = "1"
             historical = window._historical_stocks_by_instance()
 
         names_by_code: dict[str, set[str]] = {}
@@ -10719,6 +10730,54 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
         ):
             self.assertEqual({}, window._historical_stocks_by_instance())
+
+    def test_development_historical_fixture_is_disabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                setting_window.auto_trade_setting_historical_fixture_enabled()
+            )
+
+    def test_auto_trade_projection_excludes_stockless_instance_like_main(self) -> None:
+        with TemporaryDirectory() as temp:
+            group = GroupRecord(
+                name="지표추종매매",
+                path=Path(temp) / "지표추종매매",
+                source_type="LEGACY_FOLDER",
+                budget={},
+                valid=True,
+            )
+            instances = [
+                self._instance("inst-b", "지표추종매매B"),
+                self._instance("inst-c", "지표추종매매C"),
+            ]
+            stocks = [
+                {
+                    "code": "000660",
+                    "name": "SK하이닉스",
+                    "stock_path": "stocks/000660_SK하이닉스",
+                    "routines": ["지표추종매매"],
+                    "assigned_routine_instance_id": "inst-b",
+                }
+            ]
+
+            main_projection = setting_window.build_main_group_projection(
+                [group],
+                instances,
+                stocks,
+            )
+            main_projected_ids = {
+                projected_instance.instance_id
+                for projected_group in main_projection
+                for projected_instance in projected_group.instances
+            }
+            projected_ids = self._canonical_auto_trade_projected_instance_ids(
+                instances,
+                groups=[group],
+                stocks=stocks,
+            )
+
+        self.assertEqual({"inst-b"}, main_projected_ids)
+        self.assertEqual(main_projected_ids, projected_ids)
 
     def test_development_historical_fixture_can_be_disabled_once(self) -> None:
         with patch.dict(

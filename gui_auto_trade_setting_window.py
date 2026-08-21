@@ -1267,9 +1267,11 @@ from gui_review_required_window import (
 )
 from gui_routine_registry import (
     get_group_dirs as registry_get_group_dirs,
+    get_group_records,
     routine_display_name as registry_routine_display_name,
     read_routine_budget,
 )
+from main_group_projection import build_main_group_projection
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
@@ -1513,7 +1515,26 @@ def auto_trade_setting_historical_fixture_enabled() -> bool:
     ).strip().lower()
     if fixture_value in {"0", "false", "no", "off"}:
         return False
-    return fixture_value in {"", "1", "true", "yes", "on"}
+    return fixture_value in {"1", "true", "yes", "on"}
+
+
+def auto_trade_projected_instance_ids(
+    instances: list[object],
+    *,
+    groups: list[object] | None = None,
+    stocks: list[dict[str, object]] | None = None,
+) -> set[str]:
+    """Return instances backed by the canonical Group/stock assignment relation."""
+    projection = build_main_group_projection(
+        get_group_records() if groups is None else groups,
+        instances,
+        read_base_stocks() if stocks is None else stocks,
+    )
+    return {
+        projected_instance.instance_id
+        for projected_group in projection
+        for projected_instance in projected_group.instances
+    }
 
 
 def routine_tree_instance_title_text(display_name: object) -> str:
@@ -2382,6 +2403,61 @@ def handle_stock_name_operation_exclusion_double_click(
 
     QTimer.singleShot(0, refresh_after_double_click)
     return True
+
+
+def delete_routine_instance_with_existing_policy(
+    window: QWidget,
+    metadata: dict[str, object],
+) -> None:
+    """Apply the canonical RoutineInstance deletion policy for a UI owner."""
+    if str(metadata.get("row_kind", "") or "") != "instance":
+        return
+    instance_id = str(metadata.get("instance_id", "") or "").strip()
+    instance_name = str(metadata.get("instance_name", "") or "").strip()
+    if not instance_id:
+        return
+
+    assigned_stocks: list[dict[str, object]] = []
+    for stock in read_base_stocks():
+        assigned_instance_id = str(
+            stock.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        if not assigned_instance_id and stock_path:
+            config = read_json_dict(PROJECT_ROOT / stock_path / "config.json")
+            assigned_instance_id = str(
+                config.get("assigned_routine_instance_id", "") or ""
+            ).strip()
+        if assigned_instance_id == instance_id:
+            assigned_stocks.append(stock)
+    if assigned_stocks:
+        QMessageBox.warning(
+            window,
+            "등록삭제",
+            "연결된 종목이 있는 루틴은 삭제할 수 없습니다.\n"
+            "매매루틴등록 창에서 종목의 루틴 연결을 먼저 해제하세요.",
+        )
+        return
+
+    answer = QMessageBox.question(
+        window,
+        "등록삭제",
+        f"'{instance_name or instance_id}' 루틴 등록을 삭제하시겠습니까?",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.No,
+    )
+    if answer != QMessageBox.Yes:
+        return
+
+    result = RoutineInstanceRepository(PROJECT_ROOT).delete_instance(instance_id)
+    if not result.success:
+        QMessageBox.warning(
+            window,
+            "등록삭제",
+            result.error or "루틴 등록을 삭제하지 못했습니다.",
+        )
+        return
+    window.refresh_all()
 
 
 class AutoTradeSettingWindow(QDialog):
@@ -5886,6 +5962,25 @@ class AutoTradeSettingWindow(QDialog):
         current_metadata = self.current_selected_routine_row_metadata()
         definitions = load_routine_definitions()
         instances = load_persisted_routine_instances()
+        projection_override = getattr(
+            self,
+            "_routine_tree_projected_instance_ids_override",
+            None,
+        )
+        projected_instance_ids = (
+            {
+                str(instance_id or "").strip()
+                for instance_id in projection_override(instances)
+                if str(instance_id or "").strip()
+            }
+            if callable(projection_override)
+            else auto_trade_projected_instance_ids(instances)
+        )
+        instances = [
+            instance
+            for instance in instances
+            if str(instance.instance_id) in projected_instance_ids
+        ]
         instances_by_definition: dict[str, list[object]] = {}
         for instance in instances:
             instances_by_definition.setdefault(str(instance.definition_id), []).append(instance)
@@ -6610,7 +6705,7 @@ class AutoTradeSettingWindow(QDialog):
             )
         elif row_kind == "instance":
             menu = QMenu(self.routine_table)
-            settings_action = menu.addAction("루틴수정")
+            settings_action = menu.addAction("설정변경")
             delete_action = menu.addAction("루틴삭제")
             rename_action = menu.addAction("이름변경")
             stock_register_action = menu.addAction("종목등록")
@@ -6996,54 +7091,7 @@ class AutoTradeSettingWindow(QDialog):
         self.refresh_all()
 
     def delete_routine_instance(self, metadata: dict[str, object]) -> None:
-        if str(metadata.get("row_kind", "") or "") != "instance":
-            return
-        instance_id = str(metadata.get("instance_id", "") or "").strip()
-        instance_name = str(metadata.get("instance_name", "") or "").strip()
-        if not instance_id:
-            return
-
-        assigned_stocks: list[dict[str, object]] = []
-        for stock in read_base_stocks():
-            assigned_instance_id = str(
-                stock.get("assigned_routine_instance_id", "") or ""
-            ).strip()
-            stock_path = str(stock.get("stock_path", "") or "").strip()
-            if not assigned_instance_id and stock_path:
-                config = read_json_dict(PROJECT_ROOT / stock_path / "config.json")
-                assigned_instance_id = str(
-                    config.get("assigned_routine_instance_id", "") or ""
-                ).strip()
-            if assigned_instance_id == instance_id:
-                assigned_stocks.append(stock)
-        if assigned_stocks:
-            QMessageBox.warning(
-                self,
-                "등록삭제",
-                "연결된 종목이 있는 루틴은 삭제할 수 없습니다.\n"
-                "매매루틴등록 창에서 종목의 루틴 연결을 먼저 해제하세요.",
-            )
-            return
-
-        answer = QMessageBox.question(
-            self,
-            "등록삭제",
-            f"'{instance_name or instance_id}' 루틴 등록을 삭제하시겠습니까?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-
-        result = RoutineInstanceRepository(PROJECT_ROOT).delete_instance(instance_id)
-        if not result.success:
-            QMessageBox.warning(
-                self,
-                "등록삭제",
-                result.error or "루틴 등록을 삭제하지 못했습니다.",
-            )
-            return
-        self.refresh_all()
+        delete_routine_instance_with_existing_policy(self, metadata)
 
     def open_instance_stock_search_register_window(
         self,

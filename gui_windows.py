@@ -1522,6 +1522,7 @@ from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
     InstanceStockSearchRegisterDialog,
     auto_trade_setting_badge_stylesheet,
+    delete_routine_instance_with_existing_policy,
     get_group_dirs,
     get_stock_dirs_in_routine,
     handle_stock_name_operation_exclusion_double_click,
@@ -3068,11 +3069,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         else:
             painter.setFont(option.font)
             child_text = self.display_text(index, option.widget)
-            child_text = painter.fontMetrics().elidedText(
-                child_text,
-                Qt.ElideRight,
-                text_rect.width(),
-            )
             painter.drawText(
                 text_rect,
                 Qt.AlignLeft | Qt.AlignVCenter,
@@ -9179,6 +9175,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self.routine_table)
         menu.setToolTipsVisible(True)
         settings_action = menu.addAction("설정변경")
+        delete_action = menu.addAction("루틴삭제")
         rename_action = menu.addAction("이름변경")
         stock_register_action = menu.addAction("종목등록")
         menu.addSeparator()
@@ -9192,6 +9189,12 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(
             lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
                 item
+            )
+        )
+        delete_action.triggered.connect(
+            lambda _checked=False, target_id=instance_id, target_name=instance.display_name: self.delete_routine_instance_from_main_table(
+                target_id,
+                target_name,
             )
         )
         rename_action.triggered.connect(
@@ -9260,6 +9263,20 @@ class MainWindow(QMainWindow):
                     "method": "market" if market_selected else "routine",
                 },
             )
+
+    def delete_routine_instance_from_main_table(
+        self,
+        instance_id: str,
+        instance_name: str,
+    ) -> None:
+        delete_routine_instance_with_existing_policy(
+            self,
+            {
+                "row_kind": "instance",
+                "instance_id": str(instance_id or "").strip(),
+                "instance_name": str(instance_name or "").strip(),
+            },
+        )
 
     def open_routine_instance_stock_register_from_main_table(self, instance_id: str) -> None:
         clean_instance_id = str(instance_id or "").strip()

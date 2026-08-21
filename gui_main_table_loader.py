@@ -190,6 +190,8 @@ ROUTINE_PROFIT_LED_BOX_SIZE = 18
 ROUTINE_PROFIT_LED_SIZE = 18
 ROUTINE_PROFIT_LED_GAP = 4
 ROUTINE_INSTANCE_NAME_WIDTH = 180
+ROUTINE_INSTANCE_NAME_PREFIX_CHARS = 6
+ROUTINE_INSTANCE_NAME_DISPLAY_CHARS = 7
 ROUTINE_INSTANCE_ROW_HEIGHT = 28
 ROUTINE_STOCK_ROW_HEIGHT = 24
 ROUTINE_STATUS_STAMP_WIDTH = 82
@@ -627,6 +629,14 @@ def routine_instance_count_display(value: object) -> str:
     if count < 0:
         return "0"
     return str(count)
+
+
+def routine_instance_name_display(display_name: object) -> str:
+    """Keep seven characters; use the canonical six-character ellipsis after that."""
+    text = str(display_name or "").strip()
+    if len(text) <= ROUTINE_INSTANCE_NAME_DISPLAY_CHARS:
+        return text
+    return f"{text[:ROUTINE_INSTANCE_NAME_PREFIX_CHARS]}..."
 
 
 def _routine_aggregate_metric_widget(
@@ -1746,28 +1756,14 @@ def _update_main_routine_summary(
             )
             for projected_group in projected_groups
             for projected_instance in projected_group.instances
-            if (
-                int(
-                    (relation_counts or {}).get(
-                        main_group_instance_relation_id(
-                            projected_group.group_id,
-                            projected_instance.instance_id,
-                        ),
-                        {},
-                    ).get("operation_running", 0)
-                    or 0
-                )
-                + int(
-                    (relation_counts or {}).get(
-                        main_group_instance_relation_id(
-                            projected_group.group_id,
-                            projected_instance.instance_id,
-                        ),
-                        {},
-                    ).get("waiting", 0)
-                    or 0
-                )
-                > 0
+            if bool(
+                (relation_counts or {}).get(
+                    main_group_instance_relation_id(
+                        projected_group.group_id,
+                        projected_instance.instance_id,
+                    ),
+                    {},
+                ).get("stocks", ())
             )
         }
         valid_projected_groups = sum(
@@ -1785,11 +1781,10 @@ def _update_main_routine_summary(
         valid_projected_relations = len(valid_relation_ids)
         valid_stock_count = (
             sum(
-                int(count.get("operation_running", 0) or 0)
-                + int(count.get("waiting", 0) or 0)
-                for count in instance_counts.values()
+                len((relation_counts or {}).get(relation_id, {}).get("stocks", ()))
+                for relation_id in valid_relation_ids
             )
-            if valid_projection
+            if valid_projection and projection_supplied
             else None
         )
         update(
@@ -2812,7 +2807,8 @@ def main_load_routine_table(window) -> None:
                     "relation_id": relation_id,
                     "definition_id": instance.definition_id,
                     "instance_id": instance.instance_id,
-                    "name": instance.display_name,
+                    "name": routine_instance_name_display(instance.display_name),
+                    "full_name": instance.display_name,
                     "description": instance.description,
                     "operation_status": routine_instance_operation_status(
                         operation_running_count,
@@ -3161,7 +3157,9 @@ def main_load_routine_table(window) -> None:
                         bool(row_data.get("stocks")),
                     )
             if row_data["kind"] == ROUTINE_ROW_CHILD:
-                tooltip_parts = [str(row_data.get("name") or "")]
+                tooltip_parts = [
+                    str(row_data.get("full_name") or row_data.get("name") or "")
+                ]
                 if row_data.get("description"):
                     tooltip_parts.append(str(row_data["description"]))
                 item.setToolTip("\n\n".join(part for part in tooltip_parts if part))

@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 
 import gui_main_table_loader
 import gui_windows
+import gui_auto_trade_setting_window as setting_window
 from gui_routine_registry import GroupRecord
 from gui_order_utils import (
     DIRECTIONAL_NEGATIVE_COLOR,
@@ -154,6 +155,70 @@ def _main_static_cache(definitions, instances, stocks) -> dict[str, object]:
     "requires real PyQt widgets; the legacy GUI test module installed global stubs",
 )
 class MainRoutineMonitoringDisplayTest(unittest.TestCase):
+    def test_routine_instance_name_display_keeps_seven_and_truncates_eight(self) -> None:
+        self.assertEqual(
+            "지표추종매매C",
+            gui_main_table_loader.routine_instance_name_display("지표추종매매C"),
+        )
+        self.assertEqual(
+            "지표추종매매...",
+            gui_main_table_loader.routine_instance_name_display("지표추종매매CD"),
+        )
+
+    def test_valid_summary_uses_projected_relation_stock_rows(self) -> None:
+        group = SimpleNamespace(
+            group_id="group-a",
+            instances=(
+                SimpleNamespace(instance_id="inst-a"),
+                SimpleNamespace(instance_id="inst-b"),
+            ),
+        )
+        relation_counts = {
+            gui_main_table_loader.main_group_instance_relation_id(
+                "group-a", "inst-a"
+            ): {"stocks": [{}] * 4},
+            gui_main_table_loader.main_group_instance_relation_id(
+                "group-a", "inst-b"
+            ): {"stocks": [{}] * 6},
+        }
+        instance_counts = {
+            "inst-a": {"waiting": 4, "review": 2},
+            "inst-b": {"waiting": 6, "review": 4},
+        }
+        window = SimpleNamespace(
+            _main_routine_valid_only=True,
+            _update_main_routine_summary=MagicMock(),
+        )
+
+        gui_main_table_loader._update_main_routine_summary(
+            window,
+            [SimpleNamespace(definition_id="indicator_follow")],
+            [
+                SimpleNamespace(
+                    instance_id="inst-a", definition_id="indicator_follow"
+                ),
+                SimpleNamespace(
+                    instance_id="inst-b", definition_id="indicator_follow"
+                ),
+            ],
+            instance_counts,
+            group_projection=(group,),
+            relation_counts=relation_counts,
+        )
+
+        projection = window._update_main_routine_summary.call_args.args[0]
+        self.assertEqual(
+            (
+                ("group", "그룹", 1),
+                ("routine", "루틴", 2),
+                ("stock", "종목", 10),
+                ("operation", "운영", 0),
+                ("waiting", "대기", 10),
+                ("excluded", "제외", 0),
+                ("review", "검토", 6),
+            ),
+            projection["count_badges"],
+        )
     def test_market_early_close_runtime_drives_stock_status_method_and_liquidation(self) -> None:
         requested_at = datetime.now().astimezone().isoformat(timespec="seconds")
         state = {
@@ -437,6 +502,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_main_table_loader.ROUTINE_INSTANCE_ID_ROLE,
             instance.instance_id,
         )
+        group_id = "group-a"
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_ID_ROLE, group_id)
         table.setItem(0, 0, item)
         table.resize(480, 120)
         table.show()
@@ -446,9 +513,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             request_routine_operation=MagicMock(),
             open_routine_settings_from_main_table=MagicMock(),
+            delete_routine_instance_from_main_table=MagicMock(),
             start_routine_instance_name_edit=MagicMock(),
             open_routine_instance_stock_register_from_main_table=MagicMock(),
-            _routine_instance_has_assigned_stocks=MagicMock(return_value=True),
+            _routine_stock_paths_by_group_instance={
+                gui_windows.main_group_instance_relation_id(
+                    group_id,
+                    instance.instance_id,
+                ): ("stocks/000001_Stock",),
+            },
             _set_routine_operation_actions_enabled=lambda actions, enabled: (
                 gui_windows.MainWindow._set_routine_operation_actions_enabled(
                     actions,
@@ -460,7 +533,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_windows._RoutineTreeInteractionController(window)
         )
         menu = MagicMock()
-        actions = [MagicMock() for _ in range(5)]
+        actions = [MagicMock() for _ in range(6)]
         menu.addAction.side_effect = actions
         menu.exec_.return_value = None
         with (
@@ -476,8 +549,25 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 table.visualItemRect(item).center(),
             )
 
-        actions[3].triggered.connect.call_args.args[0]()
-        actions[4].triggered.connect.call_args.args[0]()
+        self.assertEqual(
+            ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+            [call_item.args[0] for call_item in menu.addAction.call_args_list],
+        )
+        menu.addSeparator.assert_called_once_with()
+        for action in actions:
+            action.triggered.connect.assert_called_once()
+
+        for action in actions:
+            action.triggered.connect.call_args.args[0]()
+        window.open_routine_settings_from_main_table.assert_called_once_with(item)
+        window.delete_routine_instance_from_main_table.assert_called_once_with(
+            instance.instance_id,
+            instance.display_name,
+        )
+        window.start_routine_instance_name_edit.assert_called_once_with(0)
+        window.open_routine_instance_stock_register_from_main_table.assert_called_once_with(
+            instance.instance_id
+        )
         self.assertEqual(
             [
                 call(
@@ -485,17 +575,100 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     instance.display_name,
                     "루틴",
                     gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
+                    stock_paths=("stocks/000001_Stock",),
                 ),
                 call(
                     instance.instance_id,
                     instance.display_name,
                     gui_windows.POLICY_MARKET,
                     gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
+                    stock_paths=("stocks/000001_Stock",),
                 ),
             ],
             window.request_routine_operation.call_args_list,
         )
         table.close()
+
+    def test_main_routine_delete_blocks_assigned_stock(self) -> None:
+        window = SimpleNamespace(refresh_all=MagicMock())
+        assigned = [{"assigned_routine_instance_id": "instance-a"}]
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=assigned),
+            patch.object(setting_window, "RoutineInstanceRepository") as repository,
+            patch.object(setting_window.QMessageBox, "warning") as warning,
+            patch.object(setting_window.QMessageBox, "question") as question,
+        ):
+            gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                window, "instance-a", "오전루틴"
+            )
+
+        repository.assert_not_called()
+        question.assert_not_called()
+        warning.assert_called_once()
+        window.refresh_all.assert_not_called()
+
+    def test_main_routine_delete_no_confirmation_does_not_delete(self) -> None:
+        window = SimpleNamespace(refresh_all=MagicMock())
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(setting_window, "RoutineInstanceRepository") as repository,
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.No,
+            ),
+        ):
+            gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                window, "instance-a", "오전루틴"
+            )
+
+        repository.assert_not_called()
+        window.refresh_all.assert_not_called()
+
+    def test_main_routine_delete_success_uses_repository_and_refreshes(self) -> None:
+        window = SimpleNamespace(refresh_all=MagicMock())
+        repository = MagicMock()
+        repository.delete_instance.return_value = SimpleNamespace(success=True, error="")
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+        ):
+            gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                window, "instance-a", "오전루틴"
+            )
+
+        repository.delete_instance.assert_called_once_with("instance-a")
+        window.refresh_all.assert_called_once_with()
+
+    def test_main_routine_delete_failure_warns_without_refresh(self) -> None:
+        window = SimpleNamespace(refresh_all=MagicMock())
+        repository = MagicMock()
+        repository.delete_instance.return_value = SimpleNamespace(
+            success=False,
+            error="삭제 실패",
+        )
+        with (
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+            patch.object(setting_window.QMessageBox, "warning") as warning,
+        ):
+            gui_windows.MainWindow.delete_routine_instance_from_main_table(
+                window, "instance-a", "오전루틴"
+            )
+
+        repository.delete_instance.assert_called_once_with("instance-a")
+        warning.assert_called_once()
+        window.refresh_all.assert_not_called()
 
     def test_used_amount_buy_limit_and_usage_rate_are_independent(self) -> None:
         self.assertEqual(format_routine_used_amount(7_843_650), "\u20A97,843,650")
@@ -4413,27 +4586,21 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 settings_open.assert_called_once_with(window.routine_table.item(0, 0))
 
                 fake_menu = MagicMock()
-                child_actions = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
+                child_actions = [MagicMock() for _index in range(6)]
                 fake_menu.addAction.side_effect = child_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=fake_menu),
                     patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
                 ):
                     window.open_routine_context_menu(child_rect.center())
-                self.assertEqual(5, len(fake_menu.addAction.call_args_list))
                 self.assertEqual(
-                    "이름변경",
-                    fake_menu.addAction.call_args_list[1].args[0],
-                )
-                self.assertEqual(
-                    "종목등록",
-                    fake_menu.addAction.call_args_list[2].args[0],
+                    ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+                    [call.args[0] for call in fake_menu.addAction.call_args_list],
                 )
                 fake_menu.addSeparator.assert_called_once_with()
-                child_actions[0].triggered.connect.assert_called_once()
-                child_actions[1].triggered.connect.assert_called_once()
-                child_actions[2].triggered.connect.assert_called_once()
-                for action in child_actions[3:]:
+                for action in child_actions[:4]:
+                    action.triggered.connect.assert_called_once()
+                for action in child_actions[4:]:
                     action.setEnabled.assert_called_once_with(False)
                     action.setStatusTip.assert_called_once()
 
@@ -4452,33 +4619,27 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     action.setEnabled.assert_called_once_with(True)
 
                 active_child_menu = MagicMock()
-                active_child_actions = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
+                active_child_actions = [MagicMock() for _index in range(6)]
                 active_child_menu.addAction.side_effect = active_child_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=active_child_menu),
                     patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
                 ):
                     window.open_routine_context_menu(child_rect.center())
-                self.assertEqual(5, len(active_child_menu.addAction.call_args_list))
                 self.assertEqual(
-                    "이름변경",
-                    active_child_menu.addAction.call_args_list[1].args[0],
-                )
-                self.assertEqual(
-                    "종목등록",
-                    active_child_menu.addAction.call_args_list[2].args[0],
+                    ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+                    [call.args[0] for call in active_child_menu.addAction.call_args_list],
                 )
                 active_child_menu.addSeparator.assert_called_once_with()
-                active_child_actions[0].triggered.connect.assert_called_once()
-                active_child_actions[1].triggered.connect.assert_called_once()
-                active_child_actions[2].triggered.connect.assert_called_once()
-                for action in active_child_actions[3:]:
+                for action in active_child_actions[:4]:
+                    action.triggered.connect.assert_called_once()
+                for action in active_child_actions[4:]:
                     action.setEnabled.assert_called_once_with(True)
                 with patch.object(
                     window,
                     "open_routine_instance_stock_register_from_main_table",
                 ) as register_open:
-                    register_slot = active_child_actions[2].triggered.connect.call_args.args[0]
+                    register_slot = active_child_actions[3].triggered.connect.call_args.args[0]
                     register_slot()
                 register_open.assert_called_once_with(instance.instance_id)
 

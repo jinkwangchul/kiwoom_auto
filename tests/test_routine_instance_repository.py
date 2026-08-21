@@ -70,6 +70,50 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
         self.assertEqual(rules, saved_rules)
         self.assertFalse(result.instance.real_trade_allowed)
 
+    def test_clone_style_create_uses_new_id_without_copying_stock_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = self._repository(root)
+            source_instance_id = "b52f539d-4f18-4ef6-b0cf-f471567982a2"
+            stock_dir = root / "stocks" / "000660_SK하이닉스"
+            stock_dir.mkdir(parents=True)
+            config_path = stock_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "routines": ["지표추종매매"],
+                        "assigned_routine_instance_id": source_instance_id,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            before = config_path.read_bytes()
+
+            result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="지표추종매매C",
+                ),
+                {"buy": {"enabled": True}},
+            )
+
+            self.assertTrue(result.success)
+            self.assertIsNotNone(result.instance)
+            self.assertNotEqual(source_instance_id, result.instance.instance_id)
+            self.assertEqual(before, config_path.read_bytes())
+            saved = json.loads(
+                (
+                    root
+                    / "routine_instances"
+                    / result.instance.instance_id
+                    / "instance.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertNotIn("source_instance_id", saved)
+            self.assertNotIn("group_id", saved)
+
     def test_duplicate_name_within_definition_is_rejected_without_new_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
