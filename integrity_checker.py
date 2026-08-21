@@ -51,8 +51,6 @@ def decode_hash_unicode(text: object) -> str:
 
 
 LEGACY_ROUTINE_ALIASES: dict[str, str] = {
-    "등록확인폴더": "등록확인루틴",
-    "_등록확인폴더": "등록확인루틴",
     "지표추종매매": "지표추종매매",
     "_지표추종매매": "지표추종매매",
 }

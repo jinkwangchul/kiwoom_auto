@@ -76,10 +76,7 @@ def _safe_bool(value: Any, default: bool = True) -> bool:
 # 구형 루틴명 호환 매핑
 # - 기초종목.txt, 기존 config.json 등에 남아 있는 과거 이름을
 #   신규 routines/<루틴명>/routine.json 기준 이름으로 정규화한다.
-_LEGACY_ROUTINE_ALIASES: dict[str, str] = {
-    "등록확인폴더": "등록확인루틴",
-    "_등록확인폴더": "등록확인루틴",
-}
+_LEGACY_ROUTINE_ALIASES: dict[str, str] = {}
 
 
 def _normalize_routine_name(value: Any, fallback: str = "") -> str:

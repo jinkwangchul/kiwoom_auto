@@ -35,7 +35,6 @@ PROTECTED_NAMES = {
     "stocks",
     "archived_stocks",
     "_지표추종매매",
-    "_등록확인폴더",
     "reports",
     "operation_policy.json",
     "global_schedule.json",

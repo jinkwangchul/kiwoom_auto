@@ -47,7 +47,6 @@ class ProgramFactoryResetTests(unittest.TestCase):
             "artifacts",
             "reports",
             "routines",
-            "_등록확인폴더",
             "_지표추종매매",
         ):
             (root / name).mkdir(parents=True, exist_ok=True)
@@ -69,7 +68,6 @@ class ProgramFactoryResetTests(unittest.TestCase):
         _write_json(routine_dir / "approval_session.json", {"approved": True})
         (routine_dir / "reports").mkdir()
         (routine_dir / "reports" / "user-report.txt").write_text("generated", encoding="utf-8")
-        _write_json(root / "_등록확인폴더" / "budget.json", {"default": True})
         _write_json(root / "_지표추종매매" / "budget.json", {"default": True})
         (root / "stock_library.json").write_text("{}\n", encoding="utf-8")
         (root / "screen_registry.json").write_text("{}\n", encoding="utf-8")
@@ -298,7 +296,6 @@ class ProgramFactoryResetTests(unittest.TestCase):
             self.assertEqual(parent_rules, (routine_dir / "rules.json").read_bytes())
             self.assertFalse((routine_dir / "approval_session.json").exists())
             self.assertFalse((routine_dir / "reports").exists())
-            self.assertTrue((root / "_등록확인폴더" / "budget.json").exists())
             self.assertTrue((root / "_지표추종매매" / "budget.json").exists())
             self.assertEqual("history\n", (root / "PROJECT_CHANGELOG.txt").read_text(encoding="utf-8"))
 
@@ -357,6 +354,7 @@ class ProgramFactoryResetTests(unittest.TestCase):
         self.assertIn("stocks", manifest["DELETE_CONTENTS"])
         self.assertIn("operation_policy.json", manifest["RESET"])
         self.assertIn("routines", manifest["PRESERVE"])
+        self.assertNotIn("_등록확인폴더", manifest["PRESERVE"])
 
 
 if __name__ == "__main__":

@@ -3129,7 +3129,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     def test_empty_definition_keeps_default_performance_visible(self) -> None:
         empty_definition = RoutineDefinitionRecord(
             definition_id="review",
-            display_name="등록확인루틴",
+            display_name="보조루틴",
             package_dir=Path("routines") / "review",
             schema_version="1.0",
             version="1.0",
@@ -3206,7 +3206,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     def test_empty_definition_summary_follows_visible_tree_depth(self) -> None:
         empty_definition = RoutineDefinitionRecord(
             definition_id="review",
-            display_name="등록확인루틴",
+            display_name="보조루틴",
             package_dir=Path("routines") / "review",
             schema_version="1.0",
             version="1.0",
@@ -4303,7 +4303,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     def test_parent_arrow_stays_locked_for_empty_definition(self) -> None:
         review_definition = RoutineDefinitionRecord(
             definition_id="review",
-            display_name="등록확인루틴",
+            display_name="보조루틴",
             package_dir=Path("routines") / "review",
             schema_version="1.0",
             version="1.0",
@@ -6969,7 +6969,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "row_kind": "definition",
                 "definition_id": "review",
                 "instance_id": "",
-                "display_name": "등록확인루틴",
+                "display_name": "보조루틴",
                 "tree_icon": "▶",
                 "instance_count": 0,
                 "performance_period_text": "기간(0000)",
@@ -7914,7 +7914,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             {
                 "row_kind": "definition",
                 "definition_id": "registration_review",
-                "definition_name": "등록확인루틴",
+                "definition_name": "보조루틴",
                 "instance_count": 1,
                 "registered": 5,
                 "running": 2,
@@ -7972,7 +7972,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         window.routine_table.selectRow(1)
         self.assertFalse(window._all_stocks_scope_active)
-        self.assertEqual("등록확인루틴", window.selected_routine_name_button.text())
+        self.assertEqual("보조루틴", window.selected_routine_name_button.text())
         self.assertTrue(window.selected_routine_group_count_badge.isHidden())
         self.assertFalse(window.selected_routine_signal_label.isHidden())
 

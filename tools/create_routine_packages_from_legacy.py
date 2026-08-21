@@ -2,7 +2,7 @@
 """
 create_routine_packages_from_legacy.py
 
-중앙 stocks 통합 이후, 구형 루틴폴더(_지표추종매매, _등록확인폴더)의 budget.json을
+중앙 stocks 통합 이후, 구형 루틴폴더(_지표추종매매)의 budget.json을
 신규 routines/<루틴명>/routine.json 구조로 이관하는 안전 도구입니다.
 
 기본 실행은 DRY-RUN입니다.
@@ -36,13 +36,6 @@ LEGACY_ROUTINES = [
         "module_name": "macd_routine",
         "routine_type": "auto_trade",
         "description": "MACD 기반 자동매매 루틴 패키지입니다. 현재는 패키지 자동인식용 더미 routine.py를 포함합니다.",
-    },
-    {
-        "legacy_dir": "_등록확인폴더",
-        "package_name": "등록확인루틴",
-        "module_name": "register_check_routine",
-        "routine_type": "utility",
-        "description": "등록 확인 및 테스트용 루틴 패키지입니다. 현재는 패키지 자동인식용 더미 routine.py를 포함합니다.",
     },
 ]
 

@@ -178,7 +178,7 @@ class StockOperationRow(QFrame):
         layout.addWidget(self._value("주문", stock.order_status), 0, 6)
 
         routine = self._combo(
-            ("지표추종매매", "등록확인루틴"), stock.routine, 150
+            ("지표추종매매",), stock.routine, 150
         )
         increase = self._combo(
             ("비율 증가", "동일 금액"), stock.increase_method, 88

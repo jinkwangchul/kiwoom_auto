@@ -32,7 +32,6 @@ ROUTINE_DERIVED_DIRS = ("reports",)
 RESET_FILES = ("operation_policy.json", "global_schedule.json")
 PRESERVE_PATHS = (
     "routines",
-    "_등록확인폴더",
     "_지표추종매매",
     "stock_library.json",
     "screen_registry.json",
