@@ -27,7 +27,7 @@ from gui_auto_trade_integrity import (
 from gui_auto_trade_runtime import now_text
 from gui_auto_trade_runtime import get_stock_dirs_in_routine
 from gui_base_stock_service import read_base_stocks
-from gui_routine_registry import get_routine_dirs
+from gui_routine_registry import get_group_dirs
 from gui_auto_trade_status_ops import (
     auto_trade_recalculate_all_status_by_operation_policy,
     auto_trade_recalculate_stock_status_by_operation_policy,
@@ -81,7 +81,7 @@ class AutoTradeOperationHost(QObject):
                 selected_routine_metadata=lambda: None,
                 selected_target_instance_ids=lambda: (),
                 selected_routine_dir=lambda: None,
-                routine_dirs=lambda: get_routine_dirs(),
+                routine_dirs=lambda: get_group_dirs(),
                 stock_dirs_in_routine=lambda routine_dir: get_stock_dirs_in_routine(routine_dir),
                 base_stocks=lambda: read_base_stocks(),
                 order_queue_path=lambda: ORDER_QUEUE_PATH,

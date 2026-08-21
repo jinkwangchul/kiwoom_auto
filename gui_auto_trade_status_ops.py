@@ -278,15 +278,16 @@ def auto_trade_clear_selected_stock_operation_exclusions(window) -> None:
 
 
 
+def get_group_dirs() -> list[Path]:
+    """Return project-root Group paths from the canonical discovery boundary."""
+    from gui_routine_registry import get_group_dirs as registry_get_group_dirs
+
+    return registry_get_group_dirs()
+
+
 def get_routine_dirs() -> list[Path]:
-    """자동매매 루틴 폴더 목록을 반환한다."""
-    if not ROUTINES_DIR.exists() or not ROUTINES_DIR.is_dir():
-        return []
-    return [
-        path
-        for path in sorted(ROUTINES_DIR.iterdir(), key=lambda item: item.name)
-        if path.is_dir() and not path.name.startswith(".") and not path.name.startswith("__")
-    ]
+    """Compatibility wrapper for historical Group-path callers."""
+    return get_group_dirs()
 
 
 def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
@@ -739,7 +740,7 @@ def auto_trade_recalculate_all_status_by_operation_policy(
 ) -> dict[str, int]:
     """전체 루틴 전체 종목을 운영방식/현재시간 기준으로 재판정한다."""
     result = {"changed": 0, "unchanged": 0, "protected": 0, "failed": 0}
-    for routine_dir in get_routine_dirs():
+    for routine_dir in get_group_dirs():
         for stock_dir in get_stock_dirs_in_routine(routine_dir):
             code, name = parse_stock_folder_name(stock_dir.name)
             status, _, _ = window.recalculate_stock_status_by_operation_policy(

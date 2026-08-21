@@ -426,19 +426,18 @@ def _state_issue_review_record_from_manifest(
     }
 
 
-def get_routine_dirs() -> list[Path]:
-    """
-    호환용 루틴 path 조회.
-
-    신규 기준은 routines/*/routine.json이며, 기존 _루틴폴더/budget.json은
-    gui_routine_registry의 fallback 정책에만 맡긴다.
-    이 함수는 더 이상 루틴폴더 내부 종목폴더를 전제로 하지 않는다.
-    """
+def get_group_dirs() -> list[Path]:
+    """Return project-root Group paths for review assignment operations."""
     try:
-        from gui_routine_registry import get_routine_dirs as registry_get_routine_dirs
-        return registry_get_routine_dirs()
+        from gui_routine_registry import get_group_dirs as registry_get_group_dirs
+        return registry_get_group_dirs()
     except Exception:
         return []
+
+
+def get_routine_dirs() -> list[Path]:
+    """Compatibility wrapper for historical Group-path callers."""
+    return get_group_dirs()
 
 
 def routine_display_name(routine_dir: Path) -> str:

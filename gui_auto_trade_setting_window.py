@@ -1266,7 +1266,7 @@ from gui_review_required_window import (
     GlobalReviewRequiredWindow,
 )
 from gui_routine_registry import (
-    get_routine_dirs as registry_get_routine_dirs,
+    get_group_dirs as registry_get_group_dirs,
     routine_display_name as registry_routine_display_name,
     read_routine_budget,
 )
@@ -2098,14 +2098,14 @@ def _record_fill_and_position_from_chejan(
     return fill_result, position_result, realized_pnl_result, reconciliation
 
 
-def get_routine_dirs() -> list[Path]:
-    """루틴 원본 경로를 조회한다.
+def get_group_dirs() -> list[Path]:
+    """Return project-root Group paths used by stock assignment operations."""
+    return registry_get_group_dirs()
 
-    신규 기준:
-    - routines/<루틴명>/routine.json 패키지를 우선 인식한다.
-    - 신규 패키지가 없을 때만 기존 _루틴폴더/budget.json을 fallback으로 사용한다.
-    """
-    return registry_get_routine_dirs()
+
+def get_routine_dirs() -> list[Path]:
+    """Compatibility wrapper for historical Group-path callers."""
+    return get_group_dirs()
 
 
 def routine_display_name(routine_dir: Path) -> str:
@@ -6502,7 +6502,7 @@ class AutoTradeSettingWindow(QDialog):
             selected_routine_metadata=lambda: self.current_selected_routine_row_metadata(),
             selected_target_instance_ids=lambda: self.current_selected_target_instance_ids(),
             selected_routine_dir=lambda: self.current_selected_routine_dir(),
-            routine_dirs=lambda: get_routine_dirs(),
+            routine_dirs=lambda: get_group_dirs(),
             stock_dirs_in_routine=lambda routine_dir: get_stock_dirs_in_routine(routine_dir),
             base_stocks=lambda: read_base_stocks(),
             order_queue_path=lambda: ORDER_QUEUE_PATH,

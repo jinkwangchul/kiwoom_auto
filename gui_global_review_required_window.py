@@ -41,7 +41,6 @@ from gui_auto_trade_setting_window import (
     append_changelog,
     append_stock_log,
     auto_trade_setting_server_mismatch_detected,
-    get_routine_dirs,
     get_stock_dirs_in_routine,
     is_review_required_state,
     now_text,

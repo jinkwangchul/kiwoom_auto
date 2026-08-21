@@ -2,13 +2,11 @@
 """
 gui_routine_registry.py
 
-루틴 패키지 자동 인식 레지스트리.
+Routine Definition package와 프로젝트 루트 Group을 독립적으로 인식한다.
 
-1차 전환 범위:
-- 신규 routines/<루틴명>/routine.json 구조를 우선 인식한다.
-- 기존 _루틴폴더/budget.json 구조는 routines/가 비어 있을 때만 fallback으로 사용한다.
-- routine.py는 현재 존재 여부만 확인하며 직접 매매 실행하지 않는다.
-- 종목 연결은 계속 stocks/config.json의 routines 값 또는 routine 값을 기준으로 한다.
+- Routine Definition: routines/<루틴명>/routine.json
+- Group: _<그룹명>/budget.json
+- routine.py는 존재 여부만 확인하며 직접 매매 실행하지 않는다.
 """
 
 from __future__ import annotations
@@ -36,6 +34,16 @@ class RoutineRecord:
     rules_path: Path
     settings_ui: str
     metadata: dict[str, Any]
+    budget: dict[str, Any]
+    valid: bool
+    problem: str = ""
+
+
+@dataclass(frozen=True)
+class GroupRecord:
+    name: str
+    path: Path
+    source_type: str
     budget: dict[str, Any]
     valid: bool
     problem: str = ""
@@ -154,47 +162,67 @@ def _record_from_package(package_dir: Path) -> RoutineRecord | None:
     )
 
 
-def _legacy_display_name(path: Path) -> str:
+def _group_display_name(path: Path) -> str:
     return _normalize_routine_name(path.name)
 
 
-def _record_from_legacy_folder(routine_dir: Path) -> RoutineRecord | None:
-    budget_path = routine_dir / "budget.json"
-    if not routine_dir.is_dir() or not routine_dir.name.startswith("_") or not budget_path.exists():
+def _record_from_legacy_folder(group_dir: Path) -> GroupRecord | None:
+    """Compatibility helper for the existing root Group folder contract."""
+    budget_path = group_dir / "budget.json"
+    if not group_dir.is_dir() or not group_dir.name.startswith("_") or not budget_path.exists():
         return None
     budget = _safe_read_json(budget_path)
-    return RoutineRecord(
-        name=_legacy_display_name(routine_dir),
-        path=routine_dir,
+    return GroupRecord(
+        name=_group_display_name(group_dir),
+        path=group_dir,
         source_type="legacy_folder",
-        enabled=True,
-        version="legacy",
-        routine_type="legacy",
-        entry_file="",
-        rules_path=routine_dir / "rules.json",
-        settings_ui="",
-        metadata={"source": "legacy_budget_json"},
         budget=budget,
         valid=True,
         problem="",
     )
 
 
-def scan_routine_records(include_legacy_fallback: bool = True) -> list[RoutineRecord]:
-    """루틴 레코드를 반환한다. 신규 routines 패키지를 우선한다."""
+def scan_routine_records(
+    include_legacy_fallback: bool = True,
+    *,
+    project_root: Path | str | None = None,
+    routines_root: Path | str | None = None,
+) -> list[RoutineRecord]:
+    """Return Routine Definition packages only.
+
+    ``include_legacy_fallback`` remains for caller compatibility. Root Groups are
+    never Routine Definitions and are discovered by :func:`scan_group_records`.
+    """
+    del include_legacy_fallback
+    root = Path(project_root) if project_root is not None else PROJECT_ROOT
+    if routines_root is not None:
+        routine_root = Path(routines_root)
+    elif project_root is not None:
+        routine_root = root / "routines"
+    else:
+        routine_root = ROUTINES_ROOT
     records: list[RoutineRecord] = []
 
-    if ROUTINES_ROOT.exists() and ROUTINES_ROOT.is_dir():
-        for child in sorted(ROUTINES_ROOT.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
+    if routine_root.exists() and routine_root.is_dir():
+        for child in sorted(routine_root.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
             record = _record_from_package(child)
             if record is not None:
                 records.append(record)
 
-    # 신규 패키지가 하나라도 있으면 기존 _루틴폴더는 루틴 원본으로 보지 않는다.
-    if records or not include_legacy_fallback:
-        return sorted(records, key=lambda item: item.name)
+    return sorted(records, key=lambda item: item.name)
 
-    for child in sorted(PROJECT_ROOT.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
+
+def scan_group_records(
+    *,
+    project_root: Path | str | None = None,
+) -> list[GroupRecord]:
+    """Return valid root Groups independently of Routine Definition packages."""
+    root = Path(project_root) if project_root is not None else PROJECT_ROOT
+    records: list[GroupRecord] = []
+    if not root.exists() or not root.is_dir():
+        return records
+
+    for child in sorted(root.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
         record = _record_from_legacy_folder(child)
         if record is not None:
             records.append(record)
@@ -203,12 +231,20 @@ def scan_routine_records(include_legacy_fallback: bool = True) -> list[RoutineRe
 
 
 def get_routine_records() -> list[RoutineRecord]:
-    return scan_routine_records(include_legacy_fallback=True)
+    return scan_routine_records()
+
+
+def get_group_records() -> list[GroupRecord]:
+    return scan_group_records()
+
+
+def get_group_dirs() -> list[Path]:
+    return [record.path for record in get_group_records()]
 
 
 def get_routine_dirs() -> list[Path]:
-    """기존 호출부 호환용: 루틴 원본 path 목록만 반환한다."""
-    return [record.path for record in get_routine_records()]
+    """Compatibility wrapper for callers that historically consumed Group dirs."""
+    return get_group_dirs()
 
 
 def routine_display_name(routine_path: Path) -> str:
@@ -218,9 +254,9 @@ def routine_display_name(routine_path: Path) -> str:
         record = _record_from_package(path)
         if record is not None:
             return record.name
-        legacy = _record_from_legacy_folder(path)
-        if legacy is not None:
-            return legacy.name
+        group = _record_from_legacy_folder(path)
+        if group is not None:
+            return group.name
     return _normalize_routine_name(path.name)
 
 
@@ -248,9 +284,9 @@ def read_routine_budget(routine_path_or_name: Path | str) -> dict[str, Any]:
         package = _record_from_package(path)
         if package is not None:
             return dict(package.budget)
-        legacy = _record_from_legacy_folder(path)
-        if legacy is not None:
-            return dict(legacy.budget)
+        group = _record_from_legacy_folder(path)
+        if group is not None:
+            return dict(group.budget)
         return {}
 
     record = routine_record_by_name(str(routine_path_or_name))

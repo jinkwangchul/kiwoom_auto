@@ -253,7 +253,7 @@ from gui_auto_trade_setting_window import (
     effective_liquidation_policy_for_config,
     ensure_single_real_trade_routine_for_all_stocks,
     find_library_stock_by_code,
-    get_routine_dirs,
+    get_group_dirs,
     get_stock_dirs_in_routine,
     individual_liquidation_policy_from_config,
     is_review_required_state,
@@ -408,7 +408,7 @@ def pending_routine_names_for_stock(
     assigned_set = {routine.strip() for routine in assigned_routines if routine.strip()}
     pending: list[str] = []
 
-    for routine_dir in get_routine_dirs():
+    for routine_dir in get_group_dirs():
         routine_name = routine_display_name(routine_dir)
         if routine_name in assigned_set:
             continue

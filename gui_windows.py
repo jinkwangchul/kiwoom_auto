@@ -1355,6 +1355,8 @@ from gui_main_emergency_ops import (
     on_emergency_stop_clicked as emergency_on_emergency_stop_clicked,
 )
 from gui_main_table_loader import (
+    ROUTINE_GROUP_ID_ROLE,
+    ROUTINE_GROUP_PATH_ROLE,
     ROUTINE_DEFINITION_ID_ROLE,
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
     ROUTINE_CHILD_COLLAPSED_ROLE,
@@ -1398,6 +1400,7 @@ from gui_main_table_loader import (
     routine_aggregate_number_slot_width,
     routine_instance_number_widths,
     main_refresh_pnl_only,
+    main_group_instance_relation_id,
     main_stock_default_reference_price,
     routine_instance_suggested_buy_limits,
     routine_stock_column_widths,
@@ -1519,7 +1522,7 @@ from gui_auto_trade_setting_window import (
     AutoTradeSettingWindow,
     InstanceStockSearchRegisterDialog,
     auto_trade_setting_badge_stylesheet,
-    get_routine_dirs,
+    get_group_dirs,
     get_stock_dirs_in_routine,
     handle_stock_name_operation_exclusion_double_click,
     handle_kiwoom_raw_chejan_event,
@@ -2160,13 +2163,13 @@ class _RoutineTreeInteractionController(QObject):
         self.window = window
         self.table = window.routine_table
 
-    def _set_parent_name_hover(self, definition_id: str) -> None:
+    def _set_parent_name_hover(self, group_id: str) -> None:
         current = str(
-            getattr(self.table, "_hovered_routine_definition_id", "") or ""
+            getattr(self.table, "_hovered_main_group_id", "") or ""
         )
-        if definition_id == current:
+        if group_id == current:
             return
-        self.table._hovered_routine_definition_id = definition_id
+        self.table._hovered_main_group_id = group_id
         self.table.viewport().update()
 
     def _parent_name_rect(self, index) -> QRect:
@@ -2261,17 +2264,17 @@ class _RoutineTreeInteractionController(QObject):
     def eventFilter(self, watched, event):
         if event.type() == QEvent.MouseMove:
             index = self.table.indexAt(event.pos())
-            definition_id = ""
+            group_id = ""
             if (
                 index.isValid()
                 and index.column() == 0
                 and str(index.data(ROUTINE_ROW_KIND_ROLE) or "") == ROUTINE_ROW_PARENT
                 and self._parent_name_rect(index).contains(event.pos())
             ):
-                definition_id = str(
-                    index.data(ROUTINE_DEFINITION_ID_ROLE) or ""
+                group_id = str(
+                    index.data(ROUTINE_GROUP_ID_ROLE) or ""
                 ).strip()
-            self._set_parent_name_hover(definition_id)
+            self._set_parent_name_hover(group_id)
         elif event.type() == QEvent.Leave:
             self._set_parent_name_hover("")
 
@@ -2571,13 +2574,13 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
         display_text = str(index.data(Qt.DisplayRole) or "")
         if str(index.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
             return display_text
-        definition_id = str(index.data(ROUTINE_DEFINITION_ID_ROLE) or "")
+        group_id = str(index.data(ROUTINE_GROUP_ID_ROLE) or "")
         aggregate = str(index.data(ROUTINE_PARENT_AGGREGATE_ROLE) or "")
         collapsed = bool(index.data(ROUTINE_PARENT_COLLAPSED_ROLE))
         hovered = str(
-            getattr(widget, "_hovered_routine_definition_id", "") or ""
+            getattr(widget, "_hovered_main_group_id", "") or ""
         )
-        if aggregate and (collapsed or definition_id == hovered):
+        if aggregate and (collapsed or group_id == hovered):
             return f"{display_text}    {aggregate}"
         return display_text
 
@@ -3093,7 +3096,7 @@ def routine_dir_by_display_name() -> dict[str, Path]:
     """
     GUI 표시 루틴명 기준으로 루틴 폴더를 찾는다.
     """
-    return {routine_display_name(path): path for path in get_routine_dirs()}
+    return {routine_display_name(path): path for path in get_group_dirs()}
 
 
 class MainWindow(QMainWindow):
@@ -3250,10 +3253,15 @@ class MainWindow(QMainWindow):
         self._main_routine_sort_order = Qt.AscendingOrder
         self._collapsed_routine_definition_ids: set[str] = set()
         self._collapsed_routine_instance_ids: set[str] = set()
+        self._collapsed_main_group_ids: set[str] = set()
+        self._collapsed_main_group_instance_ids: set[str] = set()
         self._routine_definition_enabled: dict[str, bool] = {}
         self._routine_instance_selection: dict[str, bool] = {}
         self._routine_stock_selection: dict[str, bool] = {}
         self._routine_instance_ids_by_definition: dict[str, tuple[str, ...]] = {}
+        self._routine_instance_ids_by_group: dict[str, tuple[str, ...]] = {}
+        self._routine_stock_paths_by_group: dict[str, tuple[str, ...]] = {}
+        self._routine_stock_paths_by_group_instance: dict[str, tuple[str, ...]] = {}
         self._routine_definition_by_instance: dict[str, str] = {}
         self._routine_assigned_stock_count_by_instance: dict[str, int] = {}
         self._routine_instance_name_editor = None
@@ -4663,8 +4671,8 @@ class MainWindow(QMainWindow):
             )
         MainWindow._update_main_routine_summary_badge_styles(self)
 
-    def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str], ...]:
-        selected_keys: list[tuple[str, str, str, str]] = []
+    def _main_routine_selected_row_keys(self) -> tuple[tuple[str, str, str, str, str], ...]:
+        selected_keys: list[tuple[str, str, str, str, str]] = []
         for index in self.routine_table.selectionModel().selectedRows():
             item = self.routine_table.item(index.row(), 0)
             if item is None:
@@ -4672,6 +4680,7 @@ class MainWindow(QMainWindow):
             selected_keys.append(
                 (
                     str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
+                    str(item.data(ROUTINE_GROUP_ID_ROLE) or ""),
                     str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
                     str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
                     str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
@@ -4692,6 +4701,7 @@ class MainWindow(QMainWindow):
                 continue
             key = (
                 str(item.data(ROUTINE_ROW_KIND_ROLE) or ""),
+                str(item.data(ROUTINE_GROUP_ID_ROLE) or ""),
                 str(item.data(ROUTINE_DEFINITION_ID_ROLE) or ""),
                 str(item.data(ROUTINE_INSTANCE_ID_ROLE) or ""),
                 str(item.data(ROUTINE_STOCK_PATH_ROLE) or ""),
@@ -4758,20 +4768,16 @@ class MainWindow(QMainWindow):
             return
 
 
-        definition_ids = set(self._routine_instance_ids_by_definition)
-        instance_ids = {
-            instance_id
-            for values in self._routine_instance_ids_by_definition.values()
-            for instance_id in values
-        }
+        group_ids = set(self._routine_instance_ids_by_group)
+        relation_ids = set(self._routine_stock_paths_by_group_instance)
         if clean_level == "group":
-            self._collapsed_routine_definition_ids.update(definition_ids)
+            self._collapsed_main_group_ids.update(group_ids)
         elif clean_level == "routine":
-            self._collapsed_routine_definition_ids.difference_update(definition_ids)
-            self._collapsed_routine_instance_ids.update(instance_ids)
+            self._collapsed_main_group_ids.difference_update(group_ids)
+            self._collapsed_main_group_instance_ids.update(relation_ids)
         else:
-            self._collapsed_routine_definition_ids.difference_update(definition_ids)
-            self._collapsed_routine_instance_ids.difference_update(instance_ids)
+            self._collapsed_main_group_ids.difference_update(group_ids)
+            self._collapsed_main_group_instance_ids.difference_update(relation_ids)
         available_metrics = MAIN_ROUTINE_METRIC_KEYS_BY_LEVEL[clean_level]
         if (
             self._main_routine_metric_sort_active
@@ -4887,7 +4893,7 @@ class MainWindow(QMainWindow):
         self.routine_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.routine_table.setMouseTracking(True)
         self.routine_table.viewport().setMouseTracking(True)
-        self.routine_table._hovered_routine_definition_id = ""
+        self.routine_table._hovered_main_group_id = ""
         self._routine_tree_item_delegate = _RoutineTreeItemDelegate(self.routine_table)
         self.routine_table.setItemDelegateForColumn(0, self._routine_tree_item_delegate)
 
@@ -7506,7 +7512,7 @@ class MainWindow(QMainWindow):
         """전체 루틴의 종목 runtime 폴더를 중복 없이 조회한다."""
         stock_dirs: list[Path] = []
         seen: set[str] = set()
-        for routine_dir in get_routine_dirs():
+        for routine_dir in get_group_dirs():
             for stock_dir in get_stock_dirs_in_routine(routine_dir):
                 key = str(stock_dir.resolve())
                 if key in seen:
@@ -7649,13 +7655,13 @@ class MainWindow(QMainWindow):
         item = self.routine_table.item(row, 0)
         if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_PARENT:
             return
-        definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-        if not definition_id:
+        group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+        if not group_id:
             return
-        if definition_id in self._collapsed_routine_definition_ids:
-            self._collapsed_routine_definition_ids.discard(definition_id)
+        if group_id in self._collapsed_main_group_ids:
+            self._collapsed_main_group_ids.discard(group_id)
         else:
-            self._collapsed_routine_definition_ids.add(definition_id)
+            self._collapsed_main_group_ids.add(group_id)
         self.load_routine_table()
 
     def toggle_routine_instance_expansion(self, row: int) -> None:
@@ -7663,12 +7669,14 @@ class MainWindow(QMainWindow):
         if item is None or str(item.data(ROUTINE_ROW_KIND_ROLE) or "") != ROUTINE_ROW_CHILD:
             return
         instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        if not instance_id:
+        group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+        if not instance_id or not group_id:
             return
-        if instance_id in self._collapsed_routine_instance_ids:
-            self._collapsed_routine_instance_ids.discard(instance_id)
+        relation_id = main_group_instance_relation_id(group_id, instance_id)
+        if relation_id in self._collapsed_main_group_instance_ids:
+            self._collapsed_main_group_instance_ids.discard(relation_id)
         else:
-            self._collapsed_routine_instance_ids.add(instance_id)
+            self._collapsed_main_group_instance_ids.add(relation_id)
         self.load_routine_table()
 
     def start_routine_instance_name_edit(self, row: int) -> None:
@@ -7924,10 +7932,11 @@ class MainWindow(QMainWindow):
             return False
 
         instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        if not instance_id:
+        group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+        if not instance_id or not group_id:
             return False
 
-        stock_dirs = list(self._routine_instance_stock_dirs(instance_id))
+        stock_dirs = self._projected_group_instance_stock_dirs(group_id, instance_id)
         if not stock_dirs:
             return False
 
@@ -7966,16 +7975,11 @@ class MainWindow(QMainWindow):
         ):
             return False
 
-        definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-        if not definition_id:
+        group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+        if not group_id:
             return False
 
-        stock_dirs = []
-        for instance_id in self._routine_instance_ids_by_definition.get(
-            definition_id,
-            (),
-        ):
-            stock_dirs.extend(self._routine_instance_stock_dirs(instance_id))
+        stock_dirs = self._projected_group_stock_dirs(group_id)
         if not stock_dirs:
             return False
 
@@ -8615,9 +8619,44 @@ class MainWindow(QMainWindow):
                 result.append(stock_dir)
         return result
 
+    @staticmethod
+    def _projected_stock_dirs(stock_paths) -> list[Path]:
+        result: list[Path] = []
+        seen: set[str] = set()
+        for stock_path in stock_paths:
+            text = str(stock_path or "").strip()
+            if not text:
+                continue
+            path = Path(text)
+            if not path.is_absolute():
+                path = PROJECT_ROOT / path
+            key = str(path.resolve())
+            if key in seen or not path.is_dir():
+                continue
+            seen.add(key)
+            result.append(path)
+        return result
+
+    def _projected_group_instance_stock_dirs(
+        self,
+        group_id: str,
+        instance_id: str,
+    ) -> list[Path]:
+        relation_id = main_group_instance_relation_id(group_id, instance_id)
+        return MainWindow._projected_stock_dirs(
+            self._routine_stock_paths_by_group_instance.get(relation_id, ())
+        )
+
+    def _projected_group_stock_dirs(self, group_id: str) -> list[Path]:
+        return MainWindow._projected_stock_dirs(
+            self._routine_stock_paths_by_group.get(str(group_id or "").strip(), ())
+        )
+
     def _running_routine_operation_targets(
         self,
         instance_ids,
+        *,
+        stock_paths=None,
     ) -> list[MainMonitoringStockTarget]:
         running_by_path = {
             str(Path(stock_dir).resolve()): (Path(stock_dir), code, name)
@@ -8627,12 +8666,22 @@ class MainWindow(QMainWindow):
         }
         targets: list[MainMonitoringStockTarget] = []
         seen_paths: set[str] = set()
+        allowed_paths = (
+            {
+                str(path.resolve())
+                for path in MainWindow._projected_stock_dirs(stock_paths)
+            }
+            if stock_paths is not None
+            else None
+        )
         for instance_id in instance_ids:
             clean_instance_id = str(instance_id or "").strip()
             if not clean_instance_id:
                 continue
             for stock_dir in self._routine_instance_stock_dirs(clean_instance_id):
                 stock_path = str(Path(stock_dir).resolve())
+                if allowed_paths is not None and stock_path not in allowed_paths:
+                    continue
                 running = running_by_path.get(stock_path)
                 if running is None or stock_path in seen_paths:
                     continue
@@ -8772,7 +8821,25 @@ class MainWindow(QMainWindow):
             f"관제창 조기마감: 성공 {applied_count} / 차단 {failed_count}"
         )
 
-    def toggle_routine_instance_operation(self, instance_id: str) -> None:
+    def toggle_projected_routine_instance_operation(
+        self,
+        group_id: str,
+        instance_id: str,
+    ) -> None:
+        self.toggle_routine_instance_operation(
+            instance_id,
+            stock_dirs=self._projected_group_instance_stock_dirs(
+                group_id,
+                instance_id,
+            ),
+        )
+
+    def toggle_routine_instance_operation(
+        self,
+        instance_id: str,
+        *,
+        stock_dirs=None,
+    ) -> None:
         instance = routine_instance_by_id(instance_id)
         if instance is None:
             result = {
@@ -8791,6 +8858,11 @@ class MainWindow(QMainWindow):
             )
             return
 
+        projected_stock_dirs = (
+            list(stock_dirs)
+            if stock_dirs is not None
+            else self._routine_instance_stock_dirs(instance_id)
+        )
         targets: list[MainMonitoringStockTarget] = []
         operational_targets: list[MainMonitoringStockTarget] = []
         current_running_stock_dirs = {
@@ -8800,7 +8872,7 @@ class MainWindow(QMainWindow):
             )
         }
         current_running_targets: list[MainMonitoringStockTarget] = []
-        for stock_dir in self._routine_instance_stock_dirs(instance_id):
+        for stock_dir in projected_stock_dirs:
             code, separator, name = stock_dir.name.partition("_")
             if not separator or not code or not name:
                 continue
@@ -8895,7 +8967,7 @@ class MainWindow(QMainWindow):
         }
         running_after = any(
             str(stock_dir.resolve()) in running_after_stock_dirs
-            for stock_dir in self._routine_instance_stock_dirs(instance_id)
+            for stock_dir in projected_stock_dirs
         )
         transition_succeeded = running_after
         self._reload_main_routine_table_preserving_view()
@@ -9023,21 +9095,18 @@ class MainWindow(QMainWindow):
                 position
             ):
                 return
-            definition_id = str(
-                first_item.data(ROUTINE_DEFINITION_ID_ROLE) or ""
-            ).strip()
-            definition = routine_definition_by_id(definition_id)
-            if definition is None:
+            group_id = str(first_item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+            group_path = str(first_item.data(ROUTINE_GROUP_PATH_ROLE) or "").strip()
+            group_name = str(first_item.data(ROUTINE_PARENT_NAME_ROLE) or "").strip()
+            if not group_id or not group_path:
                 QMessageBox.warning(
                     self,
                     "루틴 운영",
-                    "선택한 루틴 카테고리를 확인할 수 없습니다.",
+                    "선택한 그룹을 확인할 수 없습니다.",
                 )
                 return
             menu = QMenu(self.routine_table)
             menu.setToolTipsVisible(True)
-            new_routine_action = menu.addAction("신규루틴")
-            menu.addSeparator()
             early_close_action = menu.addAction("조기마감")
             immediate_action = menu.addAction("즉시청산")
             set_menu_action_text_color(
@@ -9047,33 +9116,27 @@ class MainWindow(QMainWindow):
             )
             has_valid_target = any(
                 routine_instance_checked(self, instance_id)
-                and self._routine_instance_has_assigned_stocks(instance_id)
-                for instance_id in self._routine_instance_ids_by_definition.get(
-                    definition_id,
+                for instance_id in self._routine_instance_ids_by_group.get(
+                    group_id,
                     (),
                 )
-            )
+            ) and bool(self._routine_stock_paths_by_group.get(group_id, ()))
             self._set_routine_operation_actions_enabled(
                 (early_close_action, immediate_action),
                 has_valid_target,
             )
-            new_routine_action.triggered.connect(
-                lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
-                    item
-                )
-            )
             early_close_action.triggered.connect(
-                lambda _checked=False: self.request_routine_definition_operation(
-                    definition_id,
-                    definition.display_name,
+                lambda _checked=False: self.request_routine_group_operation(
+                    group_id,
+                    group_name,
                     "루틴",
                     ROUTINE_STATUS_EARLY_CLOSE,
                 )
             )
             immediate_action.triggered.connect(
-                lambda _checked=False: self.request_routine_definition_operation(
-                    definition_id,
-                    definition.display_name,
+                lambda _checked=False: self.request_routine_group_operation(
+                    group_id,
+                    group_name,
                     POLICY_MARKET,
                     ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
                 )
@@ -9085,15 +9148,15 @@ class MainWindow(QMainWindow):
                     "OPERATOR_OPERATION_DECISION",
                     result="ACCEPTED",
                     source="gui_windows.MainWindow.open_routine_context_menu",
-                    target_type="ROUTINE_DEFINITION",
-                    target_id=definition_id,
-                    target_name=definition.display_name,
-                    routine=definition.display_name,
+                    target_type="ROUTINE_GROUP",
+                    target_id=group_id,
+                    target_name=group_name,
+                    routine=group_name,
                     details={
                         "interaction_type": "SELECTION",
-                        "prompt_key": "ROUTINE_DEFINITION_CONTEXT_MENU",
-                        "prompt_title": "루틴 카테고리 메뉴",
-                        "prompt_summary": "루틴 카테고리 운영 action 선택",
+                        "prompt_key": "ROUTINE_GROUP_CONTEXT_MENU",
+                        "prompt_title": "그룹 메뉴",
+                        "prompt_summary": "그룹 운영 action 선택",
                         "offered_options": ["조기마감", "즉시청산"],
                         "selected_option": (
                             "EARLY_CLOSE_MARKET" if market_selected else "EARLY_CLOSE_ROUTINE"
@@ -9105,7 +9168,8 @@ class MainWindow(QMainWindow):
         if row_kind != ROUTINE_ROW_CHILD:
             return
         instance_id = str(first_item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-        if not instance_id:
+        group_id = str(first_item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+        if not instance_id or not group_id:
             return
         instance = routine_instance_by_id(instance_id)
         if instance is None:
@@ -9142,7 +9206,12 @@ class MainWindow(QMainWindow):
         )
         self._set_routine_operation_actions_enabled(
             (early_close_action, immediate_action),
-            self._routine_instance_has_assigned_stocks(instance_id),
+            bool(
+                self._routine_stock_paths_by_group_instance.get(
+                    main_group_instance_relation_id(group_id, instance_id),
+                    (),
+                )
+            ),
         )
         early_close_action.triggered.connect(
             lambda _checked=False: self.request_routine_operation(
@@ -9150,6 +9219,10 @@ class MainWindow(QMainWindow):
                 instance.display_name,
                 "루틴",
                 ROUTINE_STATUS_EARLY_CLOSE,
+                stock_paths=self._routine_stock_paths_by_group_instance.get(
+                    main_group_instance_relation_id(group_id, instance_id),
+                    (),
+                ),
             )
         )
         immediate_action.triggered.connect(
@@ -9158,6 +9231,10 @@ class MainWindow(QMainWindow):
                 instance.display_name,
                 POLICY_MARKET,
                 ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
+                stock_paths=self._routine_stock_paths_by_group_instance.get(
+                    main_group_instance_relation_id(group_id, instance_id),
+                    (),
+                ),
             )
         )
         chosen = menu.exec_(self.routine_table.viewport().mapToGlobal(position))
@@ -9219,12 +9296,21 @@ class MainWindow(QMainWindow):
         display_name: str,
         requested_policy: str,
         display_status: str,
+        *,
+        instance_ids_override=None,
+        stock_paths=None,
+        target_type: str = "ROUTINE_DEFINITION",
+        scope_label: str = "카테고리",
+        event_source: str = "gui_windows.MainWindow.request_routine_definition_operation",
     ) -> None:
+        candidate_ids = (
+            tuple(instance_ids_override)
+            if instance_ids_override is not None
+            else self._routine_instance_ids_by_definition.get(definition_id, ())
+        )
         instance_ids = tuple(
             instance_id
-            for instance_id in sorted(
-                self._routine_instance_ids_by_definition.get(definition_id, ())
-            )
+            for instance_id in sorted(candidate_ids)
             if routine_instance_checked(self, instance_id)
             and self._routine_instance_has_assigned_stocks(instance_id)
         )
@@ -9238,12 +9324,16 @@ class MainWindow(QMainWindow):
             )
             return
 
-        targets = MainWindow._running_routine_operation_targets(self, instance_ids)
+        targets = MainWindow._running_routine_operation_targets(
+            self,
+            instance_ids,
+            stock_paths=stock_paths,
+        )
         if not targets:
             message = f"{command_label} 대상이 없습니다."
             show_toast(self, message, duration_ms=2500)
             self.statusBar().showMessage(
-                f"카테고리 {command_label}: {display_name} / 대상 0"
+                f"{scope_label} {command_label}: {display_name} / 대상 0"
             )
             return
 
@@ -9259,16 +9349,16 @@ class MainWindow(QMainWindow):
         append_production_event(
             "OPERATOR_OPERATION_DECISION",
             result="ACCEPTED" if accepted else "CANCELLED",
-            source="gui_windows.MainWindow.request_routine_definition_operation",
-            target_type="ROUTINE_DEFINITION",
+            source=event_source,
+            target_type=target_type,
             target_id=definition_id,
             target_name=display_name,
             routine=display_name,
             details={
                 "interaction_type": "CONFIRM",
-                "prompt_key": "ROUTINE_DEFINITION_EARLY_CLOSE_CONFIRM",
+                "prompt_key": f"{target_type}_EARLY_CLOSE_CONFIRM",
                 "prompt_title": "즉시청산" if market_requested else "조기마감",
-                "prompt_summary": "루틴 카테고리 조기마감 적용",
+                "prompt_summary": f"{scope_label} 조기마감 적용",
                 "offered_options": ["진행", "취소"],
                 "selected_option": "진행" if accepted else "취소",
                 "operation": "EARLY_CLOSE",
@@ -9277,7 +9367,7 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage(
-                f"카테고리 {command_label} 취소: {display_name}"
+                f"{scope_label} {command_label} 취소: {display_name}"
             )
             return
 
@@ -9335,8 +9425,30 @@ class MainWindow(QMainWindow):
                 duration_ms=2500,
             )
         self.statusBar().showMessage(
-            f"카테고리 {command_label}: {display_name} / 성공 {applied_count} / "
+            f"{scope_label} {command_label}: {display_name} / 성공 {applied_count} / "
             f"차단 {failed_count}"
+        )
+
+    def request_routine_group_operation(
+        self,
+        group_id: str,
+        display_name: str,
+        requested_policy: str,
+        display_status: str,
+    ) -> None:
+        self.request_routine_definition_operation(
+            group_id,
+            display_name,
+            requested_policy,
+            display_status,
+            instance_ids_override=self._routine_instance_ids_by_group.get(
+                group_id,
+                (),
+            ),
+            stock_paths=self._routine_stock_paths_by_group.get(group_id, ()),
+            target_type="ROUTINE_GROUP",
+            scope_label="그룹",
+            event_source="gui_windows.MainWindow.request_routine_group_operation",
         )
 
     def request_routine_operation(
@@ -9345,10 +9457,16 @@ class MainWindow(QMainWindow):
         display_name: str,
         requested_policy: str,
         display_status: str,
+        *,
+        stock_paths=None,
     ) -> None:
         command_label = display_status
         market_requested = requested_policy == POLICY_MARKET
-        targets = MainWindow._running_routine_operation_targets(self, (instance_id,))
+        targets = MainWindow._running_routine_operation_targets(
+            self,
+            (instance_id,),
+            stock_paths=stock_paths,
+        )
         if not targets:
             message = f"{command_label} 대상이 없습니다."
             show_toast(self, message, duration_ms=2500)

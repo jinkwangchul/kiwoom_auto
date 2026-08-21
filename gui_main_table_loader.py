@@ -87,6 +87,8 @@ from gui_auto_trade_policy import (
     effective_liquidation_policy_for_config,
 )
 from gui_base_stock_service import read_base_stocks
+from gui_routine_registry import get_group_records
+from main_group_projection import build_main_group_projection
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
@@ -171,8 +173,10 @@ ROUTINE_STOCK_INITIAL_BUY_ROLE = Qt.UserRole + 219
 ROUTINE_STOCK_DISPLAY_ROLE = Qt.UserRole + 220
 ROUTINE_PARENT_AGGREGATE_VALUES_ROLE = Qt.UserRole + 221
 ROUTINE_PARENT_PROFIT_ROLE = Qt.UserRole + 222
+ROUTINE_GROUP_ID_ROLE = Qt.UserRole + 223
+ROUTINE_GROUP_PATH_ROLE = Qt.UserRole + 224
 _MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
-ROUTINE_ROW_PARENT = "definition"
+ROUTINE_ROW_PARENT = "group"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
 ROUTINE_PARENT_CHECKBOX_OFFSET = 4
@@ -1306,6 +1310,7 @@ def _instance_stock_counts(
     *,
     window=None,
     stock_scope: str | None = None,
+    stock_paths: set[str] | None = None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
     clean_scope = str(stock_scope or "").strip().lower()
@@ -1332,6 +1337,8 @@ def _instance_stock_counts(
         dynamic_stocks.append((stock, state))
     for stock, state in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
+        if stock_paths is not None and stock_path not in stock_paths:
+            continue
         instance_id = str(stock.get("instance_id", "") or "").strip()
         operation_excluded = bool(stock.get("operation_excluded", False))
         review_required = is_review_required_state(state)
@@ -1462,7 +1469,9 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
         stock_dir = Path(__file__).resolve().parent / stock_path
         config = read_json_dict(stock_dir / "config.json")
         instance_id = str(
-            config.get("assigned_routine_instance_id", "") or ""
+            stock.get("assigned_routine_instance_id", "")
+            or config.get("assigned_routine_instance_id", "")
+            or ""
         ).strip()
         if not instance_id or instance_id not in valid_instance_ids:
             continue
@@ -1476,6 +1485,8 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
                 "code": str(stock.get("code", "") or "").strip(),
                 "name": str(stock.get("name", "") or "").strip(),
                 "enabled": bool(stock.get("enabled", True)),
+                "routines": tuple(_routine_names_for_stock_record(stock)),
+                "assigned_routine_instance_id": instance_id,
             }
         )
     result: dict[str, object] = {
@@ -1683,6 +1694,9 @@ def _update_main_routine_summary(
     definitions: list[object],
     instances: list[object],
     instance_counts: dict[str, dict[str, object]],
+    *,
+    group_projection=None,
+    relation_counts: dict[str, dict[str, object]] | None = None,
 ) -> None:
     update = getattr(window, "_update_main_routine_summary", None)
     if callable(update):
@@ -1720,6 +1734,55 @@ def _update_main_routine_summary(
             for definition in definitions
             if str(getattr(definition, "definition_id", "") or "").strip()
         }
+        projection_supplied = group_projection is not None
+        projected_groups = tuple(group_projection or ())
+        projected_relation_count = sum(
+            len(projected_group.instances) for projected_group in projected_groups
+        )
+        valid_relation_ids = {
+            main_group_instance_relation_id(
+                projected_group.group_id,
+                projected_instance.instance_id,
+            )
+            for projected_group in projected_groups
+            for projected_instance in projected_group.instances
+            if (
+                int(
+                    (relation_counts or {}).get(
+                        main_group_instance_relation_id(
+                            projected_group.group_id,
+                            projected_instance.instance_id,
+                        ),
+                        {},
+                    ).get("operation_running", 0)
+                    or 0
+                )
+                + int(
+                    (relation_counts or {}).get(
+                        main_group_instance_relation_id(
+                            projected_group.group_id,
+                            projected_instance.instance_id,
+                        ),
+                        {},
+                    ).get("waiting", 0)
+                    or 0
+                )
+                > 0
+            )
+        }
+        valid_projected_groups = sum(
+            1
+            for projected_group in projected_groups
+            if any(
+                main_group_instance_relation_id(
+                    projected_group.group_id,
+                    projected_instance.instance_id,
+                )
+                in valid_relation_ids
+                for projected_instance in projected_group.instances
+            )
+        )
+        valid_projected_relations = len(valid_relation_ids)
         valid_stock_count = (
             sum(
                 int(count.get("operation_running", 0) or 0)
@@ -1735,12 +1798,22 @@ def _update_main_routine_summary(
                 instances,
                 instance_counts,
                 group_badge_count=(
-                    len(valid_definition_ids & registered_definition_ids)
+                    valid_projected_groups
+                    if valid_projection and projection_supplied
+                    else len(projected_groups)
+                    if projection_supplied
+                    else len(valid_definition_ids & registered_definition_ids)
                     if valid_projection
                     else None
                 ),
                 routine_badge_count=(
-                    len(valid_instance_ids) if valid_projection else None
+                    valid_projected_relations
+                    if valid_projection and projection_supplied
+                    else projected_relation_count
+                    if projection_supplied
+                    else len(valid_instance_ids)
+                    if valid_projection
+                    else None
                 ),
                 stock_badge_count=valid_stock_count,
             )
@@ -1752,7 +1825,36 @@ def main_refresh_pnl_only(window) -> None:
     instance_counts = _instance_stock_counts(window=window)
     pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
-    _update_main_routine_summary(window, definitions, instances, instance_counts)
+    group_projection = build_main_group_projection(
+        get_group_records(),
+        instances,
+        tuple(_main_pnl_refresh_static_cache(window).get("stocks", ())),
+    )
+    has_projected_relation_row = any(
+        (
+            item := window.routine_table.item(row, 0)
+        ) is not None
+        and item.data(ROUTINE_ROW_KIND_ROLE) == ROUTINE_ROW_CHILD
+        and bool(str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip())
+        for row in range(window.routine_table.rowCount())
+    )
+    relation_counts = (
+        _projected_group_relation_counts(
+            window,
+            group_projection,
+            str(getattr(window, "_main_routine_stock_scope", "all") or "all"),
+        )
+        if has_projected_relation_row
+        else {}
+    )
+    _update_main_routine_summary(
+        window,
+        definitions,
+        instances,
+        instance_counts,
+        group_projection=group_projection,
+        relation_counts=relation_counts,
+    )
     changed = False
     for row in range(window.routine_table.rowCount()):
         item = window.routine_table.item(row, 0)
@@ -1774,7 +1876,10 @@ def main_refresh_pnl_only(window) -> None:
                 changed = True
         elif kind == ROUTINE_ROW_CHILD:
             instance_id = str(item.data(ROUTINE_INSTANCE_ID_ROLE) or "").strip()
-            count = instance_counts.get(instance_id)
+            group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+            count = relation_counts.get(
+                main_group_instance_relation_id(group_id, instance_id)
+            )
             widget = window.routine_table.cellWidget(row, 1)
             label = widget.findChild(QLabel, "routineInstanceProfit") if widget is not None else None
             if not count or label is None:
@@ -1785,15 +1890,18 @@ def main_refresh_pnl_only(window) -> None:
                 label.setStyleSheet(f"color: {color}; border: none; background: transparent;")
                 changed = True
         elif kind == ROUTINE_ROW_PARENT:
-            definition_id = str(item.data(ROUTINE_DEFINITION_ID_ROLE) or "").strip()
-            definition_instance_ids = (
-                instance.instance_id
-                for instance in instances
-                if str(instance.definition_id) == definition_id
-            )
+            group_id = str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
+            group_instance_ids = getattr(
+                window,
+                "_routine_instance_ids_by_group",
+                {},
+            ).get(group_id, ())
             text, color, _amount = routine_group_profit_projection(
-                definition_instance_ids,
-                instance_counts,
+                (
+                    main_group_instance_relation_id(group_id, instance_id)
+                    for instance_id in group_instance_ids
+                ),
+                relation_counts,
             )
             profit_data = (text, color)
             if item.data(ROUTINE_PARENT_PROFIT_ROLE) != profit_data:
@@ -2435,6 +2543,61 @@ def _routine_monitor_sort_value(row: dict[str, object], column: int):
     return str(row.get("values", [""] * len(ROUTINE_MONITORING_HEADERS))[column]).casefold()
 
 
+def main_group_instance_relation_id(group_id: object, instance_id: object) -> str:
+    """Return a window-local identity for one projected Group/Instance relation."""
+    return f"{str(group_id or '').strip()}\x1f{str(instance_id or '').strip()}"
+
+
+def _empty_instance_count() -> dict[str, object]:
+    return {
+        "registered": 0,
+        "running": 0,
+        "stopped": 0,
+        "operation_running": 0,
+        "waiting": 0,
+        "normal": 0,
+        "excluded": 0,
+        "review": 0,
+        "consumed_amount": 0,
+        "consumed_unknown": False,
+        "profit_amount": 0,
+        "profit_cost_basis": 0,
+        "profit_unknown": False,
+        "pnl_stock_codes": [],
+        "pnl_flat_stock_codes": [],
+        "stocks": [],
+    }
+
+
+def _projected_group_relation_counts(window, projection, stock_scope: str):
+    relation_counts: dict[str, dict[str, object]] = {}
+    for projected_group in projection:
+        if not projected_group.instances:
+            continue
+        group_stock_paths = {
+            str(stock.get("stock_path", "") or "").strip()
+            for projected_instance in projected_group.instances
+            for stock in projected_instance.stocks
+            if str(stock.get("stock_path", "") or "").strip()
+        }
+        group_counts = _instance_stock_counts(
+            window=window,
+            stock_scope=stock_scope,
+            stock_paths=group_stock_paths,
+        )
+        for projected_instance in projected_group.instances:
+            relation_id = main_group_instance_relation_id(
+                projected_group.group_id,
+                projected_instance.instance_id,
+            )
+            relation_counts[relation_id] = group_counts.get(
+                projected_instance.instance_id,
+                _empty_instance_count(),
+            )
+    _refresh_instance_pnl_from_batch(relation_counts)
+    return relation_counts
+
+
 def main_load_routine_table(window) -> None:
     """등록 루틴의 운영 수와 1차 관제 상태를 메인 좌측 표에 표시한다.
 
@@ -2465,7 +2628,17 @@ def main_load_routine_table(window) -> None:
     )
     _refresh_instance_pnl_from_batch(instance_counts)
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
-    _update_main_routine_summary(window, definitions, instances, instance_counts)
+    static_stocks = tuple(_main_pnl_refresh_static_cache(window).get("stocks", ()))
+    group_projection = build_main_group_projection(
+        get_group_records(),
+        instances,
+        static_stocks,
+    )
+    relation_counts = _projected_group_relation_counts(
+        window,
+        group_projection,
+        stock_scope,
+    )
     trade_counts_by_code = current_stock_trade_counts_by_code()
     window._routine_assigned_stock_count_by_instance = {
         instance.instance_id: int(
@@ -2473,20 +2646,56 @@ def main_load_routine_table(window) -> None:
         )
         for instance in instances
     }
-    total_groups = len(definitions)
-    total_instances = len(instances)
-    total_stocks = sum(
-        int(
-            window._routine_assigned_stock_count_by_instance.get(
-                instance.instance_id, 0
+    window._routine_instance_ids_by_group = {
+        projected_group.group_id: tuple(
+            projected_instance.instance_id
+            for projected_instance in projected_group.instances
+        )
+        for projected_group in group_projection
+    }
+    window._routine_stock_paths_by_group_instance = {
+        main_group_instance_relation_id(
+            projected_group.group_id,
+            projected_instance.instance_id,
+        ): tuple(
+            str(stock.get("stock_path", "") or "").strip()
+            for stock in projected_instance.stocks
+            if str(stock.get("stock_path", "") or "").strip()
+        )
+        for projected_group in group_projection
+        for projected_instance in projected_group.instances
+    }
+    window._routine_stock_paths_by_group = {
+        projected_group.group_id: tuple(
+            dict.fromkeys(
+                str(stock.get("stock_path", "") or "").strip()
+                for projected_instance in projected_group.instances
+                for stock in projected_instance.stocks
+                if str(stock.get("stock_path", "") or "").strip()
             )
         )
-        for instance in instances
+        for projected_group in group_projection
+    }
+    total_groups = len(group_projection)
+    total_instances = sum(
+        len(projected_group.instances) for projected_group in group_projection
+    )
+    total_stocks = sum(
+        len(projected_instance.stocks)
+        for projected_group in group_projection
+        for projected_instance in projected_group.instances
     )
     apply_routine_height = getattr(window, "_apply_main_routine_table_height", None)
     if callable(apply_routine_height):
         apply_routine_height(total_groups, total_instances, total_stocks)
     sync_routine_selection_state(window, definitions, instances)
+    if not isinstance(getattr(window, "_collapsed_main_group_ids", None), set):
+        window._collapsed_main_group_ids = set()
+    if not isinstance(
+        getattr(window, "_collapsed_main_group_instance_ids", None),
+        set,
+    ):
+        window._collapsed_main_group_instance_ids = set()
     display_level = str(
         getattr(window, "_main_routine_display_level", "") or ""
     ).strip()
@@ -2496,51 +2705,43 @@ def main_load_routine_table(window) -> None:
             getattr(window, "_main_routine_display_level_applied", False)
         )
     ):
-        definition_ids = {
-            str(definition.definition_id) for definition in definitions
+        group_ids = {projected_group.group_id for projected_group in group_projection}
+        relation_ids = {
+            main_group_instance_relation_id(
+                projected_group.group_id,
+                projected_instance.instance_id,
+            )
+            for projected_group in group_projection
+            for projected_instance in projected_group.instances
         }
-        instance_ids = {str(instance.instance_id) for instance in instances}
         if display_level == "group":
-            window._collapsed_routine_definition_ids.update(definition_ids)
+            window._collapsed_main_group_ids.update(group_ids)
         elif display_level == "routine":
-            window._collapsed_routine_definition_ids.difference_update(
-                definition_ids
-            )
-            window._collapsed_routine_instance_ids.update(instance_ids)
+            window._collapsed_main_group_ids.difference_update(group_ids)
+            window._collapsed_main_group_instance_ids.update(relation_ids)
         else:
-            window._collapsed_routine_definition_ids.difference_update(
-                definition_ids
-            )
-            window._collapsed_routine_instance_ids.difference_update(
-                instance_ids
-            )
+            window._collapsed_main_group_ids.difference_update(group_ids)
+            window._collapsed_main_group_instance_ids.difference_update(relation_ids)
         window._main_routine_display_level_applied = True
 
-    by_definition: dict[str, list[object]] = {}
-    for instance in instances:
-        by_definition.setdefault(instance.definition_id, []).append(instance)
-
     groups: list[dict[str, object]] = []
-    collapsed = getattr(window, "_collapsed_routine_definition_ids", set())
-    for definition in definitions:
+    collapsed_groups = getattr(window, "_collapsed_main_group_ids", set())
+    collapsed_relations = getattr(
+        window,
+        "_collapsed_main_group_instance_ids",
+        set(),
+    )
+    for projected_group in group_projection:
         children: list[dict[str, object]] = []
-        definition_instances = by_definition.get(definition.definition_id, [])
-        for instance in definition_instances:
-            count = instance_counts.get(
-                instance.instance_id,
-                {
-                    "registered": 0,
-                    "running": 0,
-                    "stopped": 0,
-                    "review": 0,
-                    "consumed_amount": 0,
-                    "consumed_unknown": False,
-                    "profit_amount": 0,
-                    "profit_cost_basis": 0,
-                    "profit_unknown": False,
-                    "stocks": [],
-                },
+        child_relation_ids: list[str] = []
+        for projected_instance in projected_group.instances:
+            instance = projected_instance.instance
+            relation_id = main_group_instance_relation_id(
+                projected_group.group_id,
+                projected_instance.instance_id,
             )
+            child_relation_ids.append(relation_id)
+            count = relation_counts.get(relation_id, _empty_instance_count())
             buy_limit_text = routine_instance_buy_limit_text(
                 enabled=instance.buy_limit_enabled,
                 amount=instance.buy_limit_amount,
@@ -2563,7 +2764,7 @@ def main_load_routine_table(window) -> None:
             stock_rows = [
                 _routine_tree_stock_row(
                     window,
-                    definition_id=definition.definition_id,
+                    definition_id=instance.definition_id,
                     instance_id=instance.instance_id,
                     stock=stock,
                     trade_counts=trade_counts_by_code.get(
@@ -2574,6 +2775,10 @@ def main_load_routine_table(window) -> None:
                 for stock in count.get("stocks", [])
                 if isinstance(stock, dict)
             ]
+            for stock_row in stock_rows:
+                stock_row["group_id"] = projected_group.group_id
+                stock_row["group_path"] = str(projected_group.group_path)
+                stock_row["relation_id"] = relation_id
             operation_running_count = int(
                 count.get("operation_running", count.get("running", 0)) or 0
             )
@@ -2602,7 +2807,10 @@ def main_load_routine_table(window) -> None:
             children.append(
                 {
                     "kind": ROUTINE_ROW_CHILD,
-                    "definition_id": definition.definition_id,
+                    "group_id": projected_group.group_id,
+                    "group_path": str(projected_group.group_path),
+                    "relation_id": relation_id,
+                    "definition_id": instance.definition_id,
                     "instance_id": instance.instance_id,
                     "name": instance.display_name,
                     "description": instance.description,
@@ -2628,8 +2836,7 @@ def main_load_routine_table(window) -> None:
                     ),
                     "profit_color": profit_color,
                     "rules_path": instance.rules_path,
-                    "collapsed": instance.instance_id
-                    in getattr(window, "_collapsed_routine_instance_ids", set()),
+                    "collapsed": relation_id in collapsed_relations,
                     "stocks": stock_rows,
                 }
             )
@@ -2659,15 +2866,17 @@ def main_load_routine_table(window) -> None:
         parent_review = sum(int(item["review"]) for item in all_children)
         parent_profit_text, parent_profit_color, parent_profit_amount = (
             routine_group_profit_projection(
-                (instance.instance_id for instance in definition_instances),
-                instance_counts,
+                child_relation_ids,
+                relation_counts,
             )
         )
         groups.append(
             {
                 "kind": ROUTINE_ROW_PARENT,
-                "definition_id": definition.definition_id,
-                "name": definition.display_name,
+                "group_id": projected_group.group_id,
+                "group_path": str(projected_group.group_path),
+                "definition_id": "",
+                "name": projected_group.display_name,
                 "operation_status": routine_instance_operation_status(
                     parent_operation_running
                 ),
@@ -2686,10 +2895,19 @@ def main_load_routine_table(window) -> None:
                 "profit_display": parent_profit_text,
                 "profit_amount": parent_profit_amount,
                 "profit_color": parent_profit_color,
-                "collapsed": definition.definition_id in collapsed,
+                "collapsed": projected_group.group_id in collapsed_groups,
                 "children": children,
             }
         )
+
+    _update_main_routine_summary(
+        window,
+        definitions,
+        instances,
+        instance_counts,
+        group_projection=group_projection,
+        relation_counts=relation_counts,
+    )
 
     sort_column = getattr(window, "_main_routine_sort_column", -1)
     reverse = getattr(window, "_main_routine_sort_order", Qt.AscendingOrder) == Qt.DescendingOrder
@@ -2816,9 +3034,13 @@ def main_load_routine_table(window) -> None:
                 row,
                 ROUTINE_STOCK_ROW_HEIGHT if is_stock else ROUTINE_INSTANCE_ROW_HEIGHT,
             )
-        group_enabled = routine_definition_enabled(
-            window,
-            str(row_data["definition_id"]),
+        group_enabled = (
+            True
+            if is_parent
+            else routine_definition_enabled(
+                window,
+                str(row_data["definition_id"]),
+            )
         )
         if is_parent:
             checked = group_enabled
@@ -2887,6 +3109,8 @@ def main_load_routine_table(window) -> None:
             display_value = "" if is_child and col > 0 else value
             item = SortableTableWidgetItem(display_value)
             item.setData(ROUTINE_ROW_KIND_ROLE, row_data["kind"])
+            item.setData(ROUTINE_GROUP_ID_ROLE, row_data.get("group_id", ""))
+            item.setData(ROUTINE_GROUP_PATH_ROLE, row_data.get("group_path", ""))
             item.setData(ROUTINE_DEFINITION_ID_ROLE, row_data["definition_id"])
             item.setData(ROUTINE_INSTANCE_ID_ROLE, row_data.get("instance_id", ""))
             item.setData(ROUTINE_STOCK_CODE_ROLE, row_data.get("code", ""))
@@ -2986,8 +3210,12 @@ def main_load_routine_table(window) -> None:
                     enabled=operation_badge_enabled,
                     on_status_click=lambda row=row: window.routine_table.selectRow(row),
                     on_status_double_click=(
-                        lambda instance_id=str(row_data.get("instance_id", "")): (
-                            window.toggle_routine_instance_operation(instance_id)
+                        lambda group_id=str(row_data.get("group_id", "")),
+                        instance_id=str(row_data.get("instance_id", "")): (
+                            window.toggle_projected_routine_instance_operation(
+                                group_id,
+                                instance_id,
+                            )
                         )
                     ),
                 ),
