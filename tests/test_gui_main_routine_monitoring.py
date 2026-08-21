@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 
 import gui_main_table_loader
 import gui_windows
+from gui_routine_registry import GroupRecord
 from gui_order_utils import (
     DIRECTIONAL_NEGATIVE_COLOR,
     DIRECTIONAL_NEUTRAL_COLOR,
@@ -112,6 +113,40 @@ class FakeCellWidget:
 
     def deleteLater(self) -> None:
         self.deleted = True
+
+
+def _main_group(name: str = "Parent") -> GroupRecord:
+    return GroupRecord(
+        name=name,
+        path=Path("group-root") / f"_{name}",
+        source_type="legacy_folder",
+        budget={},
+        valid=True,
+    )
+
+
+def _assigned_stock(
+    instance_id: str,
+    *,
+    group_name: str = "Parent",
+    code: str = "000001",
+    name: str = "Stock",
+) -> dict[str, object]:
+    return {
+        "code": code,
+        "name": name,
+        "stock_path": f"stocks/{code}_{name}",
+        "routines": [group_name],
+        "assigned_routine_instance_id": instance_id,
+    }
+
+
+def _main_static_cache(definitions, instances, stocks) -> dict[str, object]:
+    return {
+        "definitions": tuple(definitions),
+        "instances": tuple(instances),
+        "stocks": tuple(stocks),
+    }
 
 
 @unittest.skipIf(
@@ -265,34 +300,26 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_parent_new_routine_moves_from_double_click_to_context_menu(self) -> None:
-        definition = RoutineDefinitionRecord(
-            definition_id="indicator_follow",
-            display_name="지표추종매매",
-            package_dir=Path("routine-path"),
-            schema_version="1.0",
-            version="0.1.0",
-            routine_type="auto_trade",
-            entry_file="routine.py",
-            module_name="indicator_follow_routine",
-            settings_ui="indicator_follow",
-            default_rules_file="rules.json",
-            package_enabled=True,
-            source_name="지표추종매매",
-        )
+    def test_group_parent_context_menu_uses_group_scope(self) -> None:
+        group = _main_group("지표추종매매")
+        group_id = str(group.path.resolve())
         table = QTableWidget(1, 1)
-        item = QTableWidgetItem(definition.display_name)
+        item = QTableWidgetItem(group.name)
         item.setData(
             gui_main_table_loader.ROUTINE_ROW_KIND_ROLE,
             gui_main_table_loader.ROUTINE_ROW_PARENT,
         )
         item.setData(
-            gui_main_table_loader.ROUTINE_DEFINITION_ID_ROLE,
-            definition.definition_id,
+            gui_main_table_loader.ROUTINE_GROUP_ID_ROLE,
+            group_id,
+        )
+        item.setData(
+            gui_main_table_loader.ROUTINE_GROUP_PATH_ROLE,
+            str(group.path),
         )
         item.setData(
             gui_main_table_loader.ROUTINE_PARENT_NAME_ROLE,
-            definition.display_name,
+            group.name,
         )
         table.setItem(0, 0, item)
         table.resize(480, 120)
@@ -308,10 +335,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         window = SimpleNamespace(
             routine_table=table,
             handle_routine_group_name_double_click=MagicMock(return_value=True),
-            open_routine_settings_from_main_table=MagicMock(),
-            request_routine_definition_operation=MagicMock(),
-            _routine_instance_ids_by_definition={},
-            _routine_instance_has_assigned_stocks=MagicMock(return_value=False),
+            request_routine_group_operation=MagicMock(),
+            _routine_instance_ids_by_group={group_id: ("instance-a",)},
+            _routine_stock_paths_by_group={group_id: ("stocks/000001_Stock",)},
             _set_routine_operation_actions_enabled=set_operation_actions_enabled,
         )
         controller = gui_windows._RoutineTreeInteractionController(window)
@@ -328,18 +354,16 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertTrue(controller.eventFilter(table.viewport(), double_click))
         window.handle_routine_group_name_double_click.assert_called_once_with(0)
-        window.open_routine_settings_from_main_table.assert_not_called()
-
         menu = MagicMock()
-        actions = [MagicMock(), MagicMock(), MagicMock()]
+        actions = [MagicMock(), MagicMock()]
         menu.addAction.side_effect = actions
         menu.exec_.return_value = None
         with (
             patch.object(gui_windows, "QMenu", return_value=menu),
             patch.object(
                 gui_windows,
-                "routine_definition_by_id",
-                return_value=definition,
+                "routine_instance_checked",
+                return_value=True,
             ),
         ):
             gui_windows.MainWindow.open_routine_context_menu(
@@ -348,33 +372,30 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["신규루틴", "조기마감", "즉시청산"],
+            ["조기마감", "즉시청산"],
             [call_item.args[0] for call_item in menu.addAction.call_args_list],
         )
-        menu.addSeparator.assert_called_once_with()
-        new_routine_slot = actions[0].triggered.connect.call_args.args[0]
-        new_routine_slot()
-        window.open_routine_settings_from_main_table.assert_called_once_with(item)
-        for action in actions[1:]:
-            action.setEnabled.assert_called_once_with(False)
+        menu.addSeparator.assert_not_called()
+        for action in actions:
+            action.setEnabled.assert_called_once_with(True)
+        actions[0].triggered.connect.call_args.args[0]()
         actions[1].triggered.connect.call_args.args[0]()
-        actions[2].triggered.connect.call_args.args[0]()
         self.assertEqual(
             [
                 call(
-                    definition.definition_id,
-                    definition.display_name,
+                    group_id,
+                    group.name,
                     "루틴",
                     gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
                 ),
                 call(
-                    definition.definition_id,
-                    definition.display_name,
+                    group_id,
+                    group.name,
                     gui_windows.POLICY_MARKET,
                     gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
                 ),
             ],
-            window.request_routine_definition_operation.call_args_list,
+            window.request_routine_group_operation.call_args_list,
         )
         table.close()
 
@@ -3109,7 +3130,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=0,
-            _collapsed_routine_definition_ids=set(),
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
         )
         definition = RoutineDefinitionRecord(
             definition_id="indicator_follow",
@@ -3139,13 +3161,25 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             buy_limit_amount=None,
             rules_path=Path("instance-rules.json"),
         )
+        group = _main_group("지표추종매매")
+        group_id = str(group.path.resolve())
+        assigned_stocks = [
+            _assigned_stock(instance.instance_id, group_name=group.name)
+        ]
         first_widget = FakeCellWidget()
         second_widget = FakeCellWidget()
 
         with (
             patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
             patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
-            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
+            patch.object(gui_main_table_loader, "get_group_records", return_value=[group]),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], [instance], assigned_stocks
+                ),
+            ),
             patch.object(gui_main_table_loader, "_instance_stock_counts", return_value={}),
             patch.object(
                 gui_main_table_loader,
@@ -3157,14 +3191,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual(2, table.row_count)
             self.assertIs(first_widget, table.cellWidget(1, 1))
 
-            window._collapsed_routine_definition_ids = {"indicator_follow"}
+            window._collapsed_main_group_ids = {group_id}
             gui_main_table_loader.main_load_routine_table(window)
             self.assertTrue(first_widget.deleted)
             self.assertEqual(1, table.row_count)
             self.assertIsNone(table.cellWidget(1, 1))
             self.assertIsNone(table.cellWidget(0, 1))
 
-            window._collapsed_routine_definition_ids = set()
+            window._collapsed_main_group_ids = set()
             gui_main_table_loader.main_load_routine_table(window)
             self.assertEqual(2, table.row_count)
             self.assertIs(second_widget, table.cellWidget(1, 1))
@@ -3175,7 +3209,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=0,
-            _collapsed_routine_definition_ids=set(),
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
         )
         definition = RoutineDefinitionRecord(
             definition_id="indicator_follow",
@@ -3205,11 +3240,22 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             buy_limit_amount=12_000_000,
             rules_path=Path("instance-rules.json"),
         )
+        group = _main_group("지표추종매매")
+        assigned_stocks = [
+            _assigned_stock(instance.instance_id, group_name=group.name)
+        ]
 
         with (
             patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
             patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
-            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
+            patch.object(gui_main_table_loader, "get_group_records", return_value=[group]),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], [instance], assigned_stocks
+                ),
+            ),
             patch.object(
                 gui_main_table_loader,
                 "_instance_stock_counts",
@@ -3392,8 +3438,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=Qt.AscendingOrder,
-            _collapsed_routine_definition_ids=set(),
-            _collapsed_routine_instance_ids={"visible", "review-only"},
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
             _main_routine_display_level="routine",
             _main_routine_display_level_applied=True,
             _main_routine_valid_only=False,
@@ -3431,6 +3477,19 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         instances = [instance("visible"), instance("review-only")]
+        group = _main_group()
+        group_id = str(group.path.resolve())
+        assigned_stocks = [
+            _assigned_stock("visible", group_name=group.name, code="000001"),
+            _assigned_stock("review-only", group_name=group.name, code="000002"),
+        ]
+        window._collapsed_main_group_instance_ids = {
+            gui_main_table_loader.main_group_instance_relation_id(
+                group_id,
+                item.instance_id,
+            )
+            for item in instances
+        }
         counts = {
             "visible": {
                 "registered": 10,
@@ -3465,6 +3524,18 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 gui_main_table_loader,
                 "load_persisted_routine_instances",
                 return_value=instances,
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "get_group_records",
+                return_value=[group],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], instances, assigned_stocks
+                ),
             ),
             patch.object(
                 gui_main_table_loader,
@@ -3531,8 +3602,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=0,
-            _collapsed_routine_definition_ids=set(),
-            _collapsed_routine_instance_ids=set(),
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
         )
         definition = RoutineDefinitionRecord(
             definition_id="definition-a",
@@ -3583,11 +3654,22 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 }
             ],
         }
+        group = _main_group()
+        assigned_stocks = [
+            _assigned_stock(instance.instance_id, group_name=group.name)
+        ]
 
         with (
             patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
             patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
-            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
+            patch.object(gui_main_table_loader, "get_group_records", return_value=[group]),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], [instance], assigned_stocks
+                ),
+            ),
             patch.object(
                 gui_main_table_loader,
                 "_instance_stock_counts",
@@ -3621,8 +3703,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=Qt.AscendingOrder,
-            _collapsed_routine_definition_ids=set(),
-            _collapsed_routine_instance_ids=set(),
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
             _main_routine_display_level="stock",
             _main_routine_display_level_applied=True,
             _main_routine_valid_only=False,
@@ -3671,6 +3753,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "stock_path": "stocks/000002_High",
             },
         ]
+        group = _main_group()
+        assigned_stocks = [
+            {
+                **stock,
+                "routines": [group.name],
+                "assigned_routine_instance_id": instance.instance_id,
+            }
+            for stock in stocks
+        ]
 
         def metric_values(_window, stock, **_kwargs):
             profit = 10 if stock["name"] == "High" else -5
@@ -3701,8 +3792,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             ),
             patch.object(
                 gui_main_table_loader,
-                "_routine_stock_counts_from_base_stocks",
-                return_value={},
+                "get_group_records",
+                return_value=[group],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], [instance], assigned_stocks
+                ),
             ),
             patch.object(
                 gui_main_table_loader,
@@ -3792,8 +3890,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             _main_routine_sort_column=-1,
             _main_routine_sort_order=Qt.AscendingOrder,
-            _collapsed_routine_definition_ids=set(),
-            _collapsed_routine_instance_ids=set(),
+            _collapsed_main_group_ids=set(),
+            _collapsed_main_group_instance_ids=set(),
             _main_routine_display_level="routine",
             _main_routine_display_level_applied=True,
             _main_routine_valid_only=False,
@@ -3842,6 +3940,19 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             buy_limit_amount=1_000_000,
             rules_path=Path("high-profit-rules.json"),
         )
+        group = _main_group()
+        assigned_stocks = [
+            _assigned_stock(
+                high_limit.instance_id,
+                group_name=group.name,
+                code="000001",
+            ),
+            _assigned_stock(
+                high_profit.instance_id,
+                group_name=group.name,
+                code="000002",
+            ),
+        ]
 
         def count(profit_amount):
             return {
@@ -3867,6 +3978,18 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 gui_main_table_loader,
                 "load_persisted_routine_instances",
                 return_value=[high_limit, high_profit],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "get_group_records",
+                return_value=[group],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], [high_limit, high_profit], assigned_stocks
+                ),
             ),
             patch.object(
                 gui_main_table_loader,
@@ -4909,6 +5032,18 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "stocks": [],
             },
         }
+        group = _main_group("손익방향검증")
+        assigned_stocks = [
+            _assigned_stock(
+                instance.instance_id,
+                group_name=group.name,
+                code=f"{index:06d}",
+                name=instance.instance_id,
+            )
+            for index, instance in enumerate(instances, start=1)
+        ]
+        for instance, stock in zip(instances, assigned_stocks):
+            counts[instance.instance_id]["stocks"] = [stock]
         api = SimpleNamespace(
             unavailable_reason=lambda: "test double",
             login_state_changed=None,
@@ -4937,8 +5072,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             ),
             patch.object(
                 gui_main_table_loader,
-                "_routine_stock_counts_from_base_stocks",
-                return_value={},
+                "get_group_records",
+                return_value=[group],
+            ),
+            patch.object(
+                gui_main_table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=_main_static_cache(
+                    [definition], instances, assigned_stocks
+                ),
             ),
             patch.object(
                 gui_main_table_loader,
@@ -4954,13 +5096,34 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 window.show()
                 self.app.processEvents()
 
-                expected = (
-                    ("+125,000", "+3.25%", DIRECTIONAL_NEGATIVE_COLOR),
-                    ("-48,000", "-1.40%", DIRECTIONAL_POSITIVE_COLOR),
-                    ("0", "0.00%", DIRECTIONAL_NEUTRAL_COLOR),
-                )
+                expected = {
+                    "directional-positive": (
+                        "+125,000",
+                        "+3.25%",
+                        DIRECTIONAL_NEGATIVE_COLOR,
+                    ),
+                    "directional-negative": (
+                        "-48,000",
+                        "-1.40%",
+                        DIRECTIONAL_POSITIVE_COLOR,
+                    ),
+                    "directional-zero": (
+                        "0",
+                        "0.00%",
+                        DIRECTIONAL_NEUTRAL_COLOR,
+                    ),
+                }
                 right_edges = set()
-                for row, (amount, rate, color) in enumerate(expected, start=1):
+                rendered_instance_ids = set()
+                for row in range(1, window.routine_table.rowCount()):
+                    instance_id = str(
+                        window.routine_table.item(row, 0).data(
+                            gui_main_table_loader.ROUTINE_INSTANCE_ID_ROLE
+                        )
+                        or ""
+                    )
+                    amount, rate, color = expected[instance_id]
+                    rendered_instance_ids.add(instance_id)
                     widget = window.routine_table.cellWidget(row, 1)
                     amount_label = widget.findChild(
                         QLabel,
@@ -4977,6 +5140,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     right_edges.add(
                         rate_label.mapTo(widget, rate_label.rect().topRight()).x()
                     )
+                self.assertEqual(set(expected), rendered_instance_ids)
                 self.assertEqual(1, len(right_edges))
 
                 screenshot_path = os.environ.get(
