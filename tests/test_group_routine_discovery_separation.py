@@ -82,7 +82,10 @@ class GroupRoutineDiscoverySeparationTests(unittest.TestCase):
 
             (group / "budget.json").unlink()
             group.rmdir()
-            self.assertEqual([], scan_group_records(project_root=root))
+            self.assertEqual(
+                [],
+                scan_group_records(project_root=root, sync_recovery=False),
+            )
 
     def test_public_group_path_boundary_uses_root_groups_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

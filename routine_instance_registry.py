@@ -71,6 +71,7 @@ class RoutineInstanceRecord:
     schema_version: str = ""
     created_at: str = ""
     updated_at: str = ""
+    group_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -612,6 +613,7 @@ def _persisted_instance_from_directory(
         schema_version=schema_version,
         created_at=str(metadata.get("created_at") or "").strip(),
         updated_at=str(metadata.get("updated_at") or "").strip(),
+        group_id=str(metadata.get("group_id") or "").strip(),
     ), None
 
 

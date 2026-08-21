@@ -87,7 +87,7 @@ from gui_auto_trade_policy import (
     effective_liquidation_policy_for_config,
 )
 from gui_base_stock_service import read_base_stocks
-from gui_routine_registry import get_group_records
+from gui_routine_registry import get_group_records, get_group_recovery_control_records
 from main_group_projection import build_main_group_projection
 from routine_instance_registry import (
     load_persisted_routine_instances,
@@ -175,6 +175,7 @@ ROUTINE_PARENT_AGGREGATE_VALUES_ROLE = Qt.UserRole + 221
 ROUTINE_PARENT_PROFIT_ROLE = Qt.UserRole + 222
 ROUTINE_GROUP_ID_ROLE = Qt.UserRole + 223
 ROUTINE_GROUP_PATH_ROLE = Qt.UserRole + 224
+ROUTINE_GROUP_RECOVERY_ROLE = Qt.UserRole + 225
 _MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
 ROUTINE_ROW_PARENT = "group"
 ROUTINE_ROW_CHILD = "instance"
@@ -189,7 +190,7 @@ ROUTINE_CHECKBOX_SIZE = 16
 ROUTINE_PROFIT_LED_BOX_SIZE = 18
 ROUTINE_PROFIT_LED_SIZE = 18
 ROUTINE_PROFIT_LED_GAP = 4
-ROUTINE_INSTANCE_NAME_WIDTH = 180
+ROUTINE_INSTANCE_NAME_WIDTH = 210
 ROUTINE_INSTANCE_NAME_PREFIX_CHARS = 6
 ROUTINE_INSTANCE_NAME_DISPLAY_CHARS = 7
 ROUTINE_INSTANCE_ROW_HEIGHT = 28
@@ -1785,6 +1786,12 @@ def _update_main_routine_summary(
                 for relation_id in valid_relation_ids
             )
             if valid_projection and projection_supplied
+            else sum(
+                int(count.get("operation_running", 0) or 0)
+                + int(count.get("waiting", 0) or 0)
+                for count in instance_counts.values()
+            )
+            if valid_projection
             else None
         )
         update(
@@ -1815,31 +1822,38 @@ def _update_main_routine_summary(
         )
 
 
+def _main_routine_effective_stock_scope(window) -> str:
+    stock_scope = str(
+        getattr(window, "_main_routine_stock_scope", "") or ""
+    ).strip().lower()
+    if bool(getattr(window, "_main_routine_excluded_only", False)):
+        stock_scope = "excluded"
+    if stock_scope not in {
+        "normal", "all", "operation", "waiting", "excluded", "review"
+    }:
+        stock_scope = "normal"
+    if bool(getattr(window, "_main_routine_valid_only", False)) and stock_scope == "all":
+        stock_scope = "normal"
+    return stock_scope
+
+
 def main_refresh_pnl_only(window) -> None:
     """Refresh monitoring stock/instance PnL without rebuilding either table."""
     instance_counts = _instance_stock_counts(window=window)
     pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
     group_projection = build_main_group_projection(
-        get_group_records(),
+        get_group_records(sync_recovery=False),
         instances,
         tuple(_main_pnl_refresh_static_cache(window).get("stocks", ())),
-    )
-    has_projected_relation_row = any(
-        (
-            item := window.routine_table.item(row, 0)
-        ) is not None
-        and item.data(ROUTINE_ROW_KIND_ROLE) == ROUTINE_ROW_CHILD
-        and bool(str(item.data(ROUTINE_GROUP_ID_ROLE) or "").strip())
-        for row in range(window.routine_table.rowCount())
     )
     relation_counts = (
         _projected_group_relation_counts(
             window,
             group_projection,
-            str(getattr(window, "_main_routine_stock_scope", "all") or "all"),
+            _main_routine_effective_stock_scope(window),
         )
-        if has_projected_relation_row
+        if any(projected_group.instances for projected_group in group_projection)
         else {}
     )
     _update_main_routine_summary(
@@ -2603,20 +2617,7 @@ def main_load_routine_table(window) -> None:
     state.json의 보유수량/평단/현재가 후보 필드만 사용한다.
     """
     _invalidate_main_pnl_refresh_cache(window)
-    operation_excluded_only = bool(
-        getattr(window, "_main_routine_excluded_only", False)
-    )
-    stock_scope = str(
-        getattr(window, "_main_routine_stock_scope", "") or ""
-    ).strip().lower()
-    if operation_excluded_only:
-        stock_scope = "excluded"
-    if stock_scope not in {
-        "normal", "all", "operation", "waiting", "excluded", "review"
-    }:
-        stock_scope = "normal"
-    if bool(getattr(window, "_main_routine_valid_only", False)) and stock_scope == "all":
-        stock_scope = "normal"
+    stock_scope = _main_routine_effective_stock_scope(window)
     instance_counts = _instance_stock_counts(
         window=window,
         stock_scope=stock_scope,
@@ -2629,6 +2630,7 @@ def main_load_routine_table(window) -> None:
         instances,
         static_stocks,
     )
+    recovery_controls = get_group_recovery_control_records()
     relation_counts = _projected_group_relation_counts(
         window,
         group_projection,
@@ -2671,7 +2673,10 @@ def main_load_routine_table(window) -> None:
         )
         for projected_group in group_projection
     }
-    total_groups = len(group_projection)
+    window._routine_recovery_control_by_group = {
+        control.group_id: control for control in recovery_controls
+    }
+    total_groups = len(group_projection) + len(recovery_controls)
     total_instances = sum(
         len(projected_group.instances) for projected_group in group_projection
     )
@@ -2807,6 +2812,10 @@ def main_load_routine_table(window) -> None:
                     "relation_id": relation_id,
                     "definition_id": instance.definition_id,
                     "instance_id": instance.instance_id,
+                    "explicit_group_assignment": (
+                        str(getattr(instance, "group_id", "") or "").strip()
+                        == projected_group.group_id
+                    ),
                     "name": routine_instance_name_display(instance.display_name),
                     "full_name": instance.display_name,
                     "description": instance.description,
@@ -2893,6 +2902,40 @@ def main_load_routine_table(window) -> None:
                 "profit_color": parent_profit_color,
                 "collapsed": projected_group.group_id in collapsed_groups,
                 "children": children,
+            }
+        )
+
+    normal_group_ids = {projected_group.group_id for projected_group in group_projection}
+    for control in recovery_controls:
+        if control.group_id in normal_group_ids:
+            continue
+        groups.append(
+            {
+                "kind": ROUTINE_ROW_PARENT,
+                "group_id": control.group_id,
+                "group_path": str(control.target_path),
+                "definition_id": "",
+                "name": control.display_name,
+                "operation_status": ROUTINE_STATUS_STOPPED,
+                "registered": 0,
+                "operation_running": 0,
+                "waiting": 0,
+                "operation_or_stopped": 0,
+                "normal": 0,
+                "excluded": 0,
+                "review": 0,
+                "buy_limit_enabled": False,
+                "buy_limit_amount": None,
+                "buy_limit_configured": False,
+                "buy_limit_display": "",
+                "consumed_display": "",
+                "profit_display": "-",
+                "profit_amount": 0,
+                "profit_color": "",
+                "collapsed": True,
+                "children": [],
+                "recovery_control": True,
+                "deletion_pending": control.deletion_pending,
             }
         )
 
@@ -3107,6 +3150,10 @@ def main_load_routine_table(window) -> None:
             item.setData(ROUTINE_ROW_KIND_ROLE, row_data["kind"])
             item.setData(ROUTINE_GROUP_ID_ROLE, row_data.get("group_id", ""))
             item.setData(ROUTINE_GROUP_PATH_ROLE, row_data.get("group_path", ""))
+            item.setData(
+                ROUTINE_GROUP_RECOVERY_ROLE,
+                bool(row_data.get("recovery_control", False)),
+            )
             item.setData(ROUTINE_DEFINITION_ID_ROLE, row_data["definition_id"])
             item.setData(ROUTINE_INSTANCE_ID_ROLE, row_data.get("instance_id", ""))
             item.setData(ROUTINE_STOCK_CODE_ROLE, row_data.get("code", ""))

@@ -1266,6 +1266,7 @@ from gui_review_required_window import (
     GlobalReviewRequiredWindow,
 )
 from gui_routine_registry import (
+    consume_group_recovery_messages,
     get_group_dirs as registry_get_group_dirs,
     get_group_records,
     routine_display_name as registry_routine_display_name,
@@ -2458,6 +2459,84 @@ def delete_routine_instance_with_existing_policy(
         )
         return
     window.refresh_all()
+
+
+def open_routine_settings_dialog_for_owner(
+    owner: QWidget,
+    metadata: dict[str, object],
+    *,
+    registration: bool,
+) -> None:
+    definition_id = str(metadata.get("definition_id", "") or "").strip()
+    definition = routine_definition_by_id(definition_id)
+    if definition is None:
+        QMessageBox.warning(owner, "루틴 설정", "선택한 루틴 정의를 확인할 수 없습니다.")
+        return
+
+    instance = None
+    if not registration:
+        instance_id = str(metadata.get("instance_id", "") or "").strip()
+        instance = routine_instance_by_id(instance_id)
+        if instance is None:
+            QMessageBox.warning(owner, "루틴 설정", "선택한 루틴을 확인할 수 없습니다.")
+            return
+
+    settings_ui = str(definition.settings_ui or "").strip().lower()
+    if settings_ui != "indicator_follow":
+        QMessageBox.information(
+            owner,
+            "루틴 설정",
+            f"선택한 루틴의 설정창이 아직 연결되지 않았습니다.\n루틴명: {definition.display_name}",
+        )
+        return
+
+    rules_path = (
+        definition.package_dir / definition.default_rules_file
+        if registration
+        else instance.rules_path
+    )
+    if rules_path is None or not rules_path.exists():
+        QMessageBox.warning(
+            owner,
+            "rules.json 없음",
+            f"선택한 루틴의 rules.json을 찾을 수 없습니다.\n{rules_path}",
+        )
+        return
+
+    try:
+        from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
+    except Exception as exc:
+        QMessageBox.critical(
+            owner,
+            "설정창 로드 실패",
+            "gui_indicator_follow_routine_settings_dialog.py 파일을 불러오지 못했습니다.\n"
+            f"{exc}",
+        )
+        return
+
+    dialog = IndicatorFollowRoutineSettingsDialog(
+        rules_path=rules_path,
+        routine_path=definition.package_dir,
+        routine_name=definition.display_name if registration else instance.display_name,
+        parent=owner,
+        definition_id=definition.definition_id,
+        definition_display_name=definition.display_name,
+        instance_id="" if registration else instance.instance_id,
+        group_id=str(metadata.get("group_id", "") or "").strip(),
+        settings_mode="registration" if registration else "edit",
+    )
+    dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+    windows = getattr(owner, "_routine_settings_windows", None)
+    if not isinstance(windows, set):
+        windows = set()
+        owner._routine_settings_windows = windows
+    windows.add(dialog)
+    dialog.destroyed.connect(
+        lambda _obj=None, target=dialog: windows.discard(target)
+    )
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
 
 
 class AutoTradeSettingWindow(QDialog):
@@ -4612,6 +4691,15 @@ class AutoTradeSettingWindow(QDialog):
         except (TypeError, ValueError):
             return 0.0
 
+    def _routine_tree_instance_identity_sort_key(
+        self,
+        row: dict[str, object],
+    ) -> tuple[str, str]:
+        return (
+            str(row.get("instance_name", "") or "").casefold(),
+            str(row.get("instance_id", "") or ""),
+        )
+
     def _routine_tree_sort_definition_blocks(
         self,
         rows: list[dict[str, object]],
@@ -4676,8 +4764,10 @@ class AutoTradeSettingWindow(QDialog):
 
             sorted_blocks = sorted(
                 instance_blocks,
-                key=lambda block: self._routine_tree_row_sort_value(block[0], criterion),
-                reverse=True,
+                key=lambda block: (
+                    -self._routine_tree_row_sort_value(block[0], criterion),
+                    *self._routine_tree_instance_identity_sort_key(block[0]),
+                ),
             )
             for block_index, block in enumerate(sorted_blocks):
                 block[0]["instance_group_top_gap"] = block_index > 0
@@ -5976,6 +6066,8 @@ class AutoTradeSettingWindow(QDialog):
             if callable(projection_override)
             else auto_trade_projected_instance_ids(instances)
         )
+        for message in consume_group_recovery_messages():
+            show_toast(self, message)
         instances = [
             instance
             for instance in instances
@@ -6024,7 +6116,19 @@ class AutoTradeSettingWindow(QDialog):
 
         for definition in definitions:
             definition_id = str(definition.definition_id)
-            child_instances = instances_by_definition.get(definition_id, [])
+            child_instances = sorted(
+                instances_by_definition.get(definition_id, []),
+                key=lambda instance: (
+                    str(getattr(instance, "display_name", "") or "").casefold(),
+                    str(getattr(instance, "instance_id", "") or ""),
+                ),
+            )
+            if valid_only_for_rows and display_level_for_rows == "routine":
+                child_instances = [
+                    instance
+                    for instance in child_instances
+                    if current_stocks_by_instance.get(str(instance.instance_id), [])
+                ]
             display_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
             for instance in child_instances:
                 instance_id = str(instance.instance_id)
@@ -6915,75 +7019,11 @@ class AutoTradeSettingWindow(QDialog):
         *,
         registration: bool,
     ) -> None:
-        definition_id = str(metadata.get("definition_id", "") or "").strip()
-        definition = routine_definition_by_id(definition_id)
-        if definition is None:
-            QMessageBox.warning(self, "루틴 설정", "선택한 루틴 정의를 확인할 수 없습니다.")
-            return
-
-        instance = None
-        if not registration:
-            instance_id = str(metadata.get("instance_id", "") or "").strip()
-            instance = routine_instance_by_id(instance_id)
-            if instance is None:
-                QMessageBox.warning(self, "루틴 설정", "선택한 루틴을 확인할 수 없습니다.")
-                return
-
-        settings_ui = str(definition.settings_ui or "").strip().lower()
-        if settings_ui != "indicator_follow":
-            QMessageBox.information(
-                self,
-                "루틴 설정",
-                f"선택한 루틴의 설정창이 아직 연결되지 않았습니다.\n루틴명: {definition.display_name}",
-            )
-            return
-
-        rules_path = (
-            definition.package_dir / definition.default_rules_file
-            if registration
-            else instance.rules_path
+        open_routine_settings_dialog_for_owner(
+            self,
+            metadata,
+            registration=registration,
         )
-        if rules_path is None or not rules_path.exists():
-            QMessageBox.warning(
-                self,
-                "rules.json 없음",
-                f"선택한 루틴의 rules.json을 찾을 수 없습니다.\n{rules_path}",
-            )
-            return
-
-        try:
-            from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "설정창 로드 실패",
-                "gui_indicator_follow_routine_settings_dialog.py 파일을 불러오지 못했습니다.\n"
-                f"{exc}",
-            )
-            return
-
-        dialog = IndicatorFollowRoutineSettingsDialog(
-            rules_path=rules_path,
-            routine_path=definition.package_dir,
-            routine_name=definition.display_name if registration else instance.display_name,
-            parent=self,
-            definition_id=definition.definition_id,
-            definition_display_name=definition.display_name,
-            instance_id="" if registration else instance.instance_id,
-            settings_mode="registration" if registration else "edit",
-        )
-        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        windows = getattr(self, "_routine_settings_windows", None)
-        if not isinstance(windows, set):
-            windows = set()
-            self._routine_settings_windows = windows
-        windows.add(dialog)
-        dialog.destroyed.connect(
-            lambda _obj=None, target=dialog: windows.discard(target)
-        )
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def open_routine_registration(self, metadata: dict[str, object]) -> None:
         if str(metadata.get("row_kind", "") or "") != "definition":

@@ -13,9 +13,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtWidgets import QApplication, QDialog, QPushButton
 
-from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
+from gui_indicator_follow_routine_settings_dialog import (
+    IndicatorFollowRoutineSettingsDialog,
+    register_routine_instance_snapshot,
+)
 from gui_routine_registration_dialog import (
     RoutineRegistrationDialog,
+    suggest_cloned_routine_instance_display_name,
     suggest_routine_instance_display_name,
 )
 from routine_instance_repository import RoutineInstanceCreateRequest, RoutineInstanceRepository
@@ -34,11 +38,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         dialog = RoutineRegistrationDialog(
             definition_id="indicator_follow",
             definition_display_name="지표추종매매",
+            group_id=str(Path("groups") / "대형주"),
         )
         dialog.name_edit.setText("대형주 추세형")
         dialog.description_edit.setText("대형주 중심")
-        dialog.buy_limit_enabled_check.setChecked(True)
-        dialog.buy_limit_amount_edit.setText("12,000,000")
 
         screenshot_path = os.environ.get("ROUTINE_REGISTRATION_SCREENSHOT_PATH", "").strip()
         if screenshot_path:
@@ -54,8 +57,137 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         assert request is not None
         self.assertEqual("indicator_follow", request.definition_id)
         self.assertEqual("대형주 추세형", request.display_name)
-        self.assertEqual(12_000_000, request.buy_limit_amount)
-        self.assertEqual("비활성", dialog.new_status_label.text())
+        self.assertEqual("대형주 중심", request.description)
+        self.assertEqual(str(Path("groups") / "대형주"), request.group_id)
+        self.assertFalse(request.buy_limit_enabled)
+        self.assertIsNone(request.buy_limit_amount)
+
+    def test_dialog_uses_aligned_three_row_layout_without_removed_fields(self) -> None:
+        dialog = RoutineRegistrationDialog(
+            definition_id="indicator_follow",
+            definition_display_name="지표추종매매",
+            initial_display_name="지표추종매매C",
+            group_id=str(Path("groups") / "_지표추종매매"),
+        )
+        dialog.show()
+        self.app.processEvents()
+
+        screenshot_path = os.environ.get(
+            "ROUTINE_REGISTRATION_ALIGNMENT_SCREENSHOT_PATH",
+            "",
+        ).strip()
+        if screenshot_path:
+            self.assertTrue(dialog.grab().save(screenshot_path))
+
+        title_labels = (
+            dialog.group_title_label,
+            dialog.name_title_label,
+            dialog.description_title_label,
+        )
+        self.assertEqual(
+            ["그      룹", "루 틴 명", "메     모"],
+            [label.text() for label in title_labels],
+        )
+        self.assertEqual(1, len({label.width() for label in title_labels}))
+        self.assertEqual(
+            dialog.fontMetrics().horizontalAdvance("한" * 3) + 8,
+            title_labels[0].width(),
+        )
+        self.assertEqual(1, len({label.geometry().left() for label in title_labels}))
+        self.assertEqual(1, len({label.geometry().right() for label in title_labels}))
+        self.assertEqual(1, len({label.visual_ink_edges() for label in title_labels}))
+        self.assertEqual((0, title_labels[0].width() - 1), title_labels[0].visual_ink_edges())
+        self.assertEqual(
+            1,
+            len(
+                {
+                    dialog.definition_label.geometry().left(),
+                    dialog.name_edit.geometry().left(),
+                    dialog.description_edit.geometry().left(),
+                }
+            ),
+        )
+        margins = dialog.layout().contentsMargins()
+        self.assertEqual((34, 34), (margins.left(), margins.right()))
+        self.assertEqual(28, dialog.form_layout.horizontalSpacing())
+        self.assertEqual(34, dialog.width() - dialog.name_edit.geometry().right() - 1)
+        self.assertEqual("지표추종매매", dialog.definition_label.text())
+        self.assertNotIn("_", dialog.definition_label.text())
+        self.assertEqual("지표추종매매C", dialog.name_edit.text())
+        self.assertEqual("", dialog.description_edit.placeholderText())
+        self.assertEqual(3, dialog.form_layout.rowCount())
+        self.assertEqual(12, dialog.name_edit.maxLength())
+        self.assertEqual(12, dialog.description_edit.maxLength())
+        self.assertEqual(dialog.name_edit.width(), dialog.description_edit.width())
+        self.assertEqual(
+            dialog.fontMetrics().horizontalAdvance("한한한A00000000") + 10,
+            dialog.name_edit.width(),
+        )
+        self.assertLess(
+            dialog.name_edit.width(),
+            dialog.fontMetrics().horizontalAdvance("한" * 12) + 14,
+        )
+        dialog.name_edit.setText("가" * 13)
+        dialog.description_edit.setText("나" * 13)
+        self.assertEqual("가" * 12, dialog.name_edit.text())
+        self.assertEqual("나" * 12, dialog.description_edit.text())
+        self.assertIn("border: none", dialog.name_edit.styleSheet())
+        self.assertIn("border: none", dialog.description_edit.styleSheet())
+        self.assertNotIn("border-bottom", dialog.name_edit.styleSheet())
+        self.assertNotIn("border-bottom", dialog.description_edit.styleSheet())
+        self.assertFalse(hasattr(dialog, "buy_limit_enabled_check"))
+        self.assertFalse(hasattr(dialog, "buy_limit_amount_edit"))
+        self.assertFalse(hasattr(dialog, "new_status_label"))
+        dialog.close()
+
+    def test_clone_name_suggestion_follows_source_instance_family(self) -> None:
+        self.assertEqual(
+            "동전주A",
+            suggest_cloned_routine_instance_display_name("동전주", []),
+        )
+        self.assertEqual(
+            "동전주B",
+            suggest_cloned_routine_instance_display_name("동전주A", ["동전주A"]),
+        )
+        self.assertEqual(
+            "지표추종매매C",
+            suggest_cloned_routine_instance_display_name(
+                "지표추종매매B",
+                ["지표추종매매A", "지표추종매매B"],
+            ),
+        )
+
+    def test_snapshot_clone_opens_dialog_with_source_instance_family_name(self) -> None:
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Rejected
+        fake_dialog.registration_request = None
+        existing = [
+            SimpleNamespace(
+                definition_id="indicator_follow",
+                display_name="동전주A",
+            )
+        ]
+        with (
+            patch(
+                "gui_routine_registration_dialog.RoutineRegistrationDialog",
+                return_value=fake_dialog,
+            ) as dialog_type,
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.load_persisted_routine_instances",
+                return_value=existing,
+            ),
+        ):
+            result = register_routine_instance_snapshot(
+                SimpleNamespace(),
+                definition_id="indicator_follow",
+                definition_display_name="지표추종매매",
+                group_id=str(Path("groups") / "_동전주"),
+                source_instance_display_name="동전주A",
+                rules_provider=Mock(),
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual("동전주B", dialog_type.call_args.kwargs["initial_display_name"])
 
     def test_default_name_uses_persisted_instance_count_and_description_label_is_memo(self) -> None:
         self.assertEqual(
@@ -77,7 +209,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         )
 
         self.assertEqual("지표추종매매C", dialog.name_edit.text())
-        self.assertEqual("메모", dialog.form_layout.labelForField(dialog.description_edit).text())
+        self.assertEqual("메     모", dialog.form_layout.labelForField(dialog.description_edit).text())
 
     def test_default_name_stops_at_z_without_inventing_an_overflow_rule(self) -> None:
         self.assertEqual(
@@ -111,7 +243,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         repository.assert_not_called()
 
     def test_success_refreshes_parent_once_after_repository_success(self) -> None:
-        parent = SimpleNamespace(refresh_all=Mock())
+        parent = SimpleNamespace(
+            refresh_auto_trade_assignment_views=Mock(),
+            refresh_all=Mock(),
+        )
         request = RoutineInstanceCreateRequest(
             definition_id="indicator_follow",
             display_name="대형주 추세형",
@@ -139,16 +274,26 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         with (
             patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
             patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository", return_value=repository),
-            patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.information"),
+            patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.information") as information,
+            patch("gui_indicator_follow_routine_settings_dialog.show_toast") as toast,
         ):
             result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
 
         self.assertIs(instance, result)
         repository.create_instance.assert_called_once_with(request, {"buy": {}})
-        parent.refresh_all.assert_called_once_with()
+        parent.refresh_auto_trade_assignment_views.assert_called_once_with()
+        parent.refresh_all.assert_not_called()
+        information.assert_not_called()
+        toast.assert_called_once_with(
+            fake_self,
+            "'대형주 추세형' 루틴을 비활성 상태로 등록했습니다.",
+        )
 
     def test_storage_failure_does_not_refresh_parent(self) -> None:
-        parent = SimpleNamespace(refresh_all=Mock())
+        parent = SimpleNamespace(
+            refresh_auto_trade_assignment_views=Mock(),
+            refresh_all=Mock(),
+        )
         request = RoutineInstanceCreateRequest(
             definition_id="indicator_follow",
             display_name="대형주 추세형",
@@ -180,6 +325,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
 
         self.assertIsNone(result)
+        parent.refresh_auto_trade_assignment_views.assert_not_called()
         parent.refresh_all.assert_not_called()
 
     def test_registration_rules_use_existing_ui_mapper_without_writing(self) -> None:
@@ -284,7 +430,12 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             self.assertEqual(312, dialog.registration_mode_label.width())
             self.assertEqual(52, dialog.registration_mode_label.height())
             self.assertEqual("edit", dialog.settings_mode)
-            self.assertEqual("다른 이름으로 등록", dialog.register_button.text())
+            self.assertFalse(
+                any(
+                    button.text() == "다른 이름으로 등록"
+                    for button in dialog.findChildren(QPushButton)
+                )
+            )
             self.assertEqual("저장", dialog.save_button.text())
             screenshot_path = os.environ.get(
                 "ROUTINE_EXISTING_SETTINGS_SCREENSHOT_PATH",

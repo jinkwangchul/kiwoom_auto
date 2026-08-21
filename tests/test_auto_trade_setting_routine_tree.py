@@ -272,7 +272,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             source_name="routine.json",
         )
 
-    def _instance(self, instance_id: str, name: str) -> RoutineInstanceRecord:
+    def _instance(
+        self,
+        instance_id: str,
+        name: str,
+        *,
+        group_id: str = "",
+    ) -> RoutineInstanceRecord:
         return RoutineInstanceRecord(
             instance_id=instance_id,
             definition_id="indicator_follow",
@@ -284,6 +290,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             real_trade_allowed=False,
             rules_path=Path("routine_instances") / instance_id / "rules.json",
             schema_version="1.0",
+            group_id=group_id,
         )
 
     def _window_harness(self):
@@ -337,6 +344,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_routine_tree_metric_text_parts",
             "_routine_tree_metric_values",
             "_routine_tree_row_sort_value",
+            "_routine_tree_instance_identity_sort_key",
             "_routine_tree_sort_definition_blocks",
             "_routine_tree_sort_instance_blocks",
             "_routine_tree_row_widget",
@@ -2343,6 +2351,163 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(2, window.routine_table.rowHeight(0) - window.routine_table.rowHeight(1))
         self.assertLessEqual(window.routine_table.rowHeight(0), 40)
 
+    def test_instance_default_order_is_name_then_id_across_refresh(self) -> None:
+        instances = [
+            self._instance("uuid-z", "지표추종매매B"),
+            self._instance("uuid-y", "동전주A"),
+            self._instance("uuid-x", "동전주"),
+        ]
+        window = self._window_harness()
+        window._routine_tree_display_level = "routine"
+        window._routine_instance_operation_counts = lambda: {}
+
+        def visible_instance_order() -> list[tuple[str, str]]:
+            order: list[tuple[str, str]] = []
+            for row in range(window.routine_table.rowCount()):
+                metadata = window.routine_table.item(row, 0).data(
+                    setting_window.Qt.UserRole
+                )
+                if isinstance(metadata, dict) and metadata.get("row_kind") == "instance":
+                    order.append((metadata["instance_name"], metadata["instance_id"]))
+            return order
+
+        with (
+            patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]),
+            patch.object(setting_window, "load_persisted_routine_instances", return_value=instances),
+            patch.object(setting_window, "read_base_stocks", return_value=[]),
+        ):
+            window.load_routine_table()
+            first_order = visible_instance_order()
+            window.load_routine_table()
+            second_order = visible_instance_order()
+
+        expected = [
+            ("동전주", "uuid-x"),
+            ("동전주A", "uuid-y"),
+            ("지표추종매매B", "uuid-z"),
+        ]
+        self.assertEqual(expected, first_order)
+        self.assertEqual(expected, second_order)
+
+    def test_valid_routine_scope_excludes_zero_stock_instance_from_tree_and_summary(self) -> None:
+        instances = [
+            self._instance("inst-b", "지표추종매매B"),
+            self._instance("inst-a", "동전주"),
+            self._instance("inst-clone", "동전주A"),
+        ]
+        current_stocks = {
+            "inst-a": [
+                {
+                    "instance_id": "inst-a",
+                    "stock_code": "000001",
+                    "stock_name": "종목1",
+                    "stock_path": "stocks/000001_종목1",
+                }
+            ],
+            "inst-b": [
+                {
+                    "instance_id": "inst-b",
+                    "stock_code": "000002",
+                    "stock_name": "종목2",
+                    "stock_path": "stocks/000002_종목2",
+                }
+            ],
+            "inst-clone": [],
+        }
+        window = self._window_harness()
+        window._routine_tree_display_level = "routine"
+        window._current_stocks_by_instance = lambda: current_stocks
+        window._historical_stocks_by_instance = lambda: {}
+        window._routine_instance_operation_counts = lambda: {
+            "inst-a": {"registered": 1},
+            "inst-b": {"registered": 1},
+            "inst-clone": {"registered": 0},
+        }
+
+        def scope_snapshot() -> tuple[int, list[str]]:
+            parent = window.routine_table.item(0, 0).data(setting_window.Qt.UserRole)
+            names = []
+            for row in range(window.routine_table.rowCount()):
+                metadata = window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)
+                if isinstance(metadata, dict) and metadata.get("row_kind") == "instance":
+                    names.append(metadata["instance_name"])
+            return int(parent["instance_count"]), names
+
+        with (
+            patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]),
+            patch.object(setting_window, "load_persisted_routine_instances", return_value=instances),
+        ):
+            window._routine_tree_valid_only = False
+            window.load_routine_table()
+            all_count, all_names = scope_snapshot()
+            window._routine_tree_valid_only = True
+            window.load_routine_table()
+            valid_count, valid_names = scope_snapshot()
+            window.load_routine_table()
+            refreshed_valid_count, refreshed_valid_names = scope_snapshot()
+
+        self.assertEqual(3, all_count)
+        self.assertEqual(["동전주", "동전주A", "지표추종매매B"], all_names)
+        self.assertEqual(2, valid_count)
+        self.assertEqual(["동전주", "지표추종매매B"], valid_names)
+        self.assertEqual(valid_count, len(valid_names))
+        self.assertEqual((valid_count, valid_names), (refreshed_valid_count, refreshed_valid_names))
+
+    def test_instance_performance_sort_keeps_metric_then_name_then_id(self) -> None:
+        window = self._window_harness()
+        metric_key_by_criterion = {
+            "period": "performance_period_sort_value",
+            "profit": "performance_profit_sort_value",
+            "average": "performance_average_sort_value",
+            "efficiency": "performance_efficiency_sort_value",
+        }
+        for criterion, metric_key in metric_key_by_criterion.items():
+            with self.subTest(criterion=criterion):
+                rows = [
+                    {"row_kind": "definition"},
+                    {
+                        "row_kind": "instance",
+                        "instance_name": "지표추종매매B",
+                        "instance_id": "uuid-z",
+                        metric_key: 20,
+                    },
+                    {
+                        "row_kind": "instance",
+                        "instance_name": "동전주A",
+                        "instance_id": "uuid-y",
+                        metric_key: 10,
+                    },
+                    {
+                        "row_kind": "instance",
+                        "instance_name": "동전주",
+                        "instance_id": "uuid-x",
+                        metric_key: 20,
+                    },
+                    {
+                        "row_kind": "instance",
+                        "instance_name": "동전주",
+                        "instance_id": "uuid-w",
+                        metric_key: 20,
+                    },
+                ]
+                sorted_rows = window._routine_tree_sort_instance_blocks(
+                    rows,
+                    criterion,
+                )
+                self.assertEqual(
+                    [
+                        ("동전주", "uuid-w"),
+                        ("동전주", "uuid-x"),
+                        ("지표추종매매B", "uuid-z"),
+                        ("동전주A", "uuid-y"),
+                    ],
+                    [
+                        (row["instance_name"], row["instance_id"])
+                        for row in sorted_rows
+                        if row.get("row_kind") == "instance"
+                    ],
+                )
+
     def test_tree_display_level_badges_reserve_control_area_without_changing_table_width(self) -> None:
         window = self._window_harness()
         window.eventFilter = MethodType(lambda _self, _obj, _event: False, window)
@@ -2809,7 +2974,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             level_buttons = window._routine_tree_display_level_buttons
             scope_buttons = window._routine_tree_display_scope_buttons
             criterion_buttons = window._routine_tree_display_criterion_buttons
-            window._routine_tree_valid_button.click()
             level_buttons["routine"].click()
             self._app.processEvents()
             window._collapsed_auto_trade_instance_ids.clear()
@@ -10778,6 +10942,31 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertEqual({"inst-b"}, main_projected_ids)
         self.assertEqual(main_projected_ids, projected_ids)
+
+    def test_auto_trade_projection_includes_explicit_group_stockless_instance(self) -> None:
+        with TemporaryDirectory() as temp:
+            group = GroupRecord(
+                name="지표추종매매",
+                path=Path(temp) / "지표추종매매",
+                source_type="LEGACY_FOLDER",
+                budget={},
+                valid=True,
+            )
+            instances = [
+                self._instance(
+                    "inst-c",
+                    "지표추종매매C",
+                    group_id=str(group.path.resolve()),
+                )
+            ]
+
+            projected_ids = self._canonical_auto_trade_projected_instance_ids(
+                instances,
+                groups=[group],
+                stocks=[],
+            )
+
+        self.assertEqual({"inst-c"}, projected_ids)
 
     def test_development_historical_fixture_can_be_disabled_once(self) -> None:
         with patch.dict(

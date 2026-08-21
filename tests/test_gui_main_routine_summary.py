@@ -386,6 +386,132 @@ class MainRoutineSummaryTests(unittest.TestCase):
         self.assertIn("대기(2)", first["counts_text"])
         self.assertIn("운영(1)", second["counts_text"])
 
+    def test_pnl_refresh_keeps_canonical_valid_summary_at_every_display_level(self) -> None:
+        class EmptyTable:
+            @staticmethod
+            def rowCount():
+                return 0
+
+        instances = [
+            SimpleNamespace(
+                instance_id="instance-a",
+                definition_id="definition-a",
+                display_name="A",
+            ),
+            SimpleNamespace(
+                instance_id="instance-b",
+                definition_id="definition-a",
+                display_name="B",
+            ),
+            SimpleNamespace(
+                instance_id="instance-c",
+                definition_id="definition-a",
+                display_name="C",
+            ),
+        ]
+        stocks = [
+            {
+                "code": f"{index:06d}",
+                "name": f"Stock {index}",
+                "stock_path": f"stocks/{index:06d}",
+                "routines": ["Group A"],
+                "assigned_routine_instance_id": (
+                    "instance-a" if index < 4 else "instance-b"
+                ),
+            }
+            for index in range(10)
+        ]
+        instance_counts = {
+            "instance-a": {
+                "operation_running": 0,
+                "waiting": 4,
+                "excluded": 0,
+                "review": 2,
+                "pnl_stock_codes": [],
+            },
+            "instance-b": {
+                "operation_running": 0,
+                "waiting": 6,
+                "excluded": 0,
+                "review": 4,
+                "pnl_stock_codes": [],
+            },
+            "instance-c": {
+                "operation_running": 0,
+                "waiting": 0,
+                "excluded": 0,
+                "review": 0,
+                "pnl_stock_codes": [],
+            },
+        }
+        relation_scopes = []
+
+        def relation_counts(_window, projection, stock_scope):
+            relation_scopes.append(stock_scope)
+            self.assertEqual(1, len(projection))
+            self.assertEqual(
+                ["instance-a", "instance-b"],
+                [item.instance_id for item in projection[0].instances],
+            )
+            return {
+                table_loader.main_group_instance_relation_id(
+                    projection[0].group_id, projected_instance.instance_id
+                ): {
+                    "stocks": list(projected_instance.stocks),
+                }
+                for projected_instance in projection[0].instances
+            }
+
+        window = SimpleNamespace(
+            routine_table=EmptyTable(),
+            _main_routine_valid_only=True,
+            _main_routine_stock_scope="all",
+            _main_routine_excluded_only=False,
+            _update_main_routine_summary=MagicMock(),
+        )
+        static_cache = {
+            "definitions": (SimpleNamespace(definition_id="definition-a"),),
+            "instances": tuple(instances),
+            "stocks": tuple(stocks),
+        }
+        with (
+            patch.object(table_loader, "_instance_stock_counts", return_value=instance_counts),
+            patch.object(table_loader, "_refresh_instance_pnl_from_batch", return_value={}),
+            patch.object(
+                table_loader,
+                "_main_pnl_refresh_routine_metadata",
+                return_value=(list(static_cache["definitions"]), instances),
+            ),
+            patch.object(
+                table_loader,
+                "_main_pnl_refresh_static_cache",
+                return_value=static_cache,
+            ),
+            patch.object(
+                table_loader,
+                "get_group_records",
+                return_value=[SimpleNamespace(name="Group A", path=Path("groups/a"))],
+            ),
+            patch.object(
+                table_loader,
+                "_projected_group_relation_counts",
+                side_effect=relation_counts,
+            ),
+        ):
+            for display_level in ("group", "routine", "stock"):
+                window._main_routine_display_level = display_level
+                table_loader.main_refresh_pnl_only(window)
+                projection = window._update_main_routine_summary.call_args.args[0]
+                self.assertEqual(
+                    (1, 2, 10, 0, 10, 0, 6),
+                    tuple(value for _key, _label, value in projection["count_badges"]),
+                )
+
+            window._main_routine_valid_only = False
+            table_loader.main_refresh_pnl_only(window)
+
+        self.assertEqual(["normal", "normal", "normal", "all"], relation_scopes)
+
     def test_visible_summary_updates_without_right_excluded_badge(self) -> None:
         routine_table = QTableWidget()
         host = SimpleNamespace(

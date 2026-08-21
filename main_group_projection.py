@@ -74,6 +74,10 @@ def build_main_group_projection(
         for instance in instances
         if (instance_id := str(getattr(instance, "instance_id", "") or "").strip())
     }
+    explicit_group_id_by_instance = {
+        instance_id: str(getattr(instance, "group_id", "") or "").strip()
+        for instance_id, instance in instance_by_id.items()
+    }
     groups_by_name: dict[str, list[object]] = {}
     for group in ordered_groups:
         name = str(getattr(group, "name", "") or "").strip()
@@ -105,7 +109,11 @@ def build_main_group_projection(
         projected_instances: list[ProjectedGroupInstance] = []
         for instance_id, instance in instance_by_id.items():
             related = stocks_by_relation.get((group_id, instance_id), {})
-            if not related:
+            explicit_group_id = explicit_group_id_by_instance.get(instance_id, "")
+            if explicit_group_id:
+                if explicit_group_id != group_id:
+                    continue
+            elif not related:
                 continue
             projected_instances.append(
                 ProjectedGroupInstance(

@@ -84,6 +84,7 @@ class RoutineInstanceCreateRequest:
     description: str = ""
     buy_limit_enabled: bool = False
     buy_limit_amount: int | None = None
+    group_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,9 @@ class RoutineInstanceRepository:
             "created_at": now,
             "updated_at": now,
         }
+        group_id = str(request.group_id or "").strip()
+        if group_id:
+            metadata["group_id"] = group_id
 
         try:
             self.instances_root.mkdir(parents=True, exist_ok=True)

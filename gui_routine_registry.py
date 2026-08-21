@@ -12,14 +12,30 @@ Routine Definition package와 프로젝트 루트 Group을 독립적으로 인�
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from group_recovery_repository import (
+    GroupRecoveryControlRecord,
+    list_group_recovery_controls,
+    restore_missing_group_snapshots,
+    sync_group_recovery_snapshot,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ROUTINES_ROOT = PROJECT_ROOT / "routines"
+LOGGER = logging.getLogger(__name__)
+_PENDING_GROUP_RECOVERY_MESSAGES: list[str] = []
+
+
+def consume_group_recovery_messages() -> tuple[str, ...]:
+    messages = tuple(_PENDING_GROUP_RECOVERY_MESSAGES)
+    _PENDING_GROUP_RECOVERY_MESSAGES.clear()
+    return messages
 
 
 @dataclass(frozen=True)
@@ -215,6 +231,7 @@ def scan_routine_records(
 def scan_group_records(
     *,
     project_root: Path | str | None = None,
+    sync_recovery: bool = True,
 ) -> list[GroupRecord]:
     """Return valid root Groups independently of Routine Definition packages."""
     root = Path(project_root) if project_root is not None else PROJECT_ROOT
@@ -222,10 +239,34 @@ def scan_group_records(
     if not root.exists() or not root.is_dir():
         return records
 
+    if sync_recovery:
+        for result in restore_missing_group_snapshots(root):
+            if result.restored:
+                message = f"{result.display_name} 그룹을 복구하였습니다."
+                if message not in _PENDING_GROUP_RECOVERY_MESSAGES:
+                    _PENDING_GROUP_RECOVERY_MESSAGES.append(message)
+            elif not result.success:
+                LOGGER.warning(
+                    "Group recovery restore failed: target=%s error=%s",
+                    result.target_path,
+                    result.error,
+                )
+
     for child in sorted(root.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
         record = _record_from_legacy_folder(child)
         if record is not None:
             records.append(record)
+
+    if sync_recovery:
+        for record in records:
+            result = sync_group_recovery_snapshot(root, record)
+            if not result.success:
+                LOGGER.warning(
+                    "Group recovery sync failed: group=%s path=%s error=%s",
+                    record.name,
+                    record.path,
+                    result.error,
+                )
 
     return sorted(records, key=lambda item: item.name)
 
@@ -234,8 +275,12 @@ def get_routine_records() -> list[RoutineRecord]:
     return scan_routine_records()
 
 
-def get_group_records() -> list[GroupRecord]:
-    return scan_group_records()
+def get_group_records(*, sync_recovery: bool = True) -> list[GroupRecord]:
+    return scan_group_records(sync_recovery=sync_recovery)
+
+
+def get_group_recovery_control_records() -> tuple[GroupRecoveryControlRecord, ...]:
+    return list_group_recovery_controls(PROJECT_ROOT)
 
 
 def get_group_dirs() -> list[Path]:

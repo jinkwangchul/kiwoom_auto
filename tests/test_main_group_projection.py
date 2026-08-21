@@ -26,7 +26,12 @@ def _group(root: Path, name: str) -> GroupRecord:
     )
 
 
-def _instance(instance_id: str, name: str | None = None) -> RoutineInstanceRecord:
+def _instance(
+    instance_id: str,
+    name: str | None = None,
+    *,
+    group_id: str = "",
+) -> RoutineInstanceRecord:
     return RoutineInstanceRecord(
         instance_id=instance_id,
         definition_id="definition-a",
@@ -36,6 +41,7 @@ def _instance(instance_id: str, name: str | None = None) -> RoutineInstanceRecor
         source="PERSISTED",
         enabled=True,
         real_trade_allowed=True,
+        group_id=group_id,
     )
 
 
@@ -50,6 +56,20 @@ def _stock(code: str, group: str | None, instance_id: str) -> dict[str, object]:
 
 
 class MainGroupProjectionTests(unittest.TestCase):
+    def test_explicit_group_instance_projects_without_stock_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group = _group(root, "동전주")
+            instance = _instance(
+                "instance-c",
+                "C",
+                group_id=str(group.path.resolve()),
+            )
+            projection = build_main_group_projection([group], [instance], [])
+
+        self.assertEqual(["instance-c"], [item.instance_id for item in projection[0].instances])
+        self.assertEqual((), projection[0].instances[0].stocks)
+
     def test_one_group_one_instance_one_stock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -77,6 +97,23 @@ class MainGroupProjectionTests(unittest.TestCase):
 
         self.assertEqual(
             ["instance-a", "instance-b"],
+            [item.instance_id for item in projection[0].instances],
+        )
+
+    def test_instance_order_is_display_name_then_instance_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group = _group(root, "동전주")
+            instances = [
+                _instance("uuid-z", "지표추종매매B", group_id=str(group.path.resolve())),
+                _instance("uuid-b", "동전주A", group_id=str(group.path.resolve())),
+                _instance("uuid-a", "동전주A", group_id=str(group.path.resolve())),
+                _instance("uuid-x", "동전주", group_id=str(group.path.resolve())),
+            ]
+            projection = build_main_group_projection([group], instances, [])
+
+        self.assertEqual(
+            ["uuid-x", "uuid-a", "uuid-b", "uuid-z"],
             [item.instance_id for item in projection[0].instances],
         )
 
@@ -219,6 +256,11 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
             root = Path(temp)
             group = _group(root, "동전주")
             instance = _instance("instance-a", "A")
+            cloned_instance = _instance(
+                "instance-c",
+                "C",
+                group_id=str(group.path.resolve()),
+            )
             stock = _stock("000001", "동전주", "instance-a")
             table = _RoutineTable()
             window = SimpleNamespace(
@@ -226,7 +268,7 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
                 _main_routine_sort_column=-1,
                 _main_routine_sort_order=0,
                 _main_routine_valid_only=False,
-                _main_routine_display_level="stock",
+                _main_routine_display_level="routine",
                 _main_routine_display_level_applied=True,
                 _main_routine_stock_scope="all",
                 _main_routine_excluded_only=False,
@@ -280,7 +322,7 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
                 patch.object(
                     loader,
                     "_main_pnl_refresh_routine_metadata",
-                    return_value=([], [instance]),
+                    return_value=([], [instance, cloned_instance]),
                 ),
                 patch.object(
                     loader,
@@ -309,7 +351,26 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
                     for row in range(table.rowCount())
                 ]
                 loader.main_load_routine_table(window)
-                second_rows = [
+                all_rows = [
+                    (
+                        table.item(row, 0).data(loader.ROUTINE_ROW_KIND_ROLE),
+                        table.item(row, 0).data(loader.ROUTINE_GROUP_ID_ROLE),
+                        table.item(row, 0).data(loader.ROUTINE_INSTANCE_ID_ROLE),
+                    )
+                    for row in range(table.rowCount())
+                ]
+                window._main_routine_valid_only = True
+                loader.main_load_routine_table(window)
+                valid_rows = [
+                    (
+                        table.item(row, 0).data(loader.ROUTINE_ROW_KIND_ROLE),
+                        table.item(row, 0).data(loader.ROUTINE_GROUP_ID_ROLE),
+                        table.item(row, 0).data(loader.ROUTINE_INSTANCE_ID_ROLE),
+                    )
+                    for row in range(table.rowCount())
+                ]
+                loader.main_load_routine_table(window)
+                refreshed_valid_rows = [
                     (
                         table.item(row, 0).data(loader.ROUTINE_ROW_KIND_ROLE),
                         table.item(row, 0).data(loader.ROUTINE_GROUP_ID_ROLE),
@@ -319,13 +380,29 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
                 ]
 
         self.assertEqual(
-            [loader.ROUTINE_ROW_PARENT, loader.ROUTINE_ROW_CHILD, loader.ROUTINE_ROW_STOCK],
-            [row[0] for row in first_rows],
+            [
+                loader.ROUTINE_ROW_PARENT,
+                loader.ROUTINE_ROW_CHILD,
+                loader.ROUTINE_ROW_STOCK,
+                loader.ROUTINE_ROW_CHILD,
+            ],
+            [row[0] for row in all_rows],
         )
-        self.assertTrue(all(row[1] == str(group.path.resolve()) for row in first_rows))
-        self.assertEqual("", first_rows[0][2])
-        self.assertEqual("instance-a", first_rows[1][2])
-        self.assertEqual(first_rows, second_rows)
+        self.assertTrue(all(row[1] == str(group.path.resolve()) for row in all_rows))
+        self.assertEqual(first_rows, all_rows)
+        self.assertEqual("", all_rows[0][2])
+        self.assertEqual("instance-a", all_rows[1][2])
+        self.assertEqual("instance-c", all_rows[3][2])
+        self.assertEqual(
+            [
+                loader.ROUTINE_ROW_PARENT,
+                loader.ROUTINE_ROW_CHILD,
+                loader.ROUTINE_ROW_STOCK,
+            ],
+            [row[0] for row in valid_rows],
+        )
+        self.assertNotIn("instance-c", [row[2] for row in valid_rows])
+        self.assertEqual(valid_rows, refreshed_valid_rows)
 
     def test_group_operation_delegates_only_projected_instances_and_stocks(self) -> None:
         delegate = MagicMock()
@@ -354,6 +431,65 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
             scope_label="그룹",
             event_source="gui_windows.MainWindow.request_routine_group_operation",
         )
+
+    def test_recovery_control_row_is_not_counted_as_operational_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "_지표추종매매"
+            control = SimpleNamespace(
+                group_id=str(target.resolve()),
+                display_name="지표추종매매",
+                target_path=target,
+                deletion_pending=False,
+            )
+            table = _RoutineTable()
+            window = SimpleNamespace(
+                routine_table=table,
+                _main_routine_sort_column=-1,
+                _main_routine_sort_order=0,
+                _main_routine_valid_only=False,
+                _main_routine_display_level="group",
+                _main_routine_display_level_applied=True,
+                _main_routine_stock_scope="all",
+                _main_routine_excluded_only=False,
+                _collapsed_main_group_ids=set(),
+                _collapsed_main_group_instance_ids=set(),
+                _routine_definition_enabled={},
+                _routine_instance_selection={},
+            )
+            with (
+                patch.object(loader, "get_group_records", return_value=[]),
+                patch.object(
+                    loader,
+                    "get_group_recovery_control_records",
+                    return_value=(control,),
+                ),
+                patch.object(
+                    loader,
+                    "_main_pnl_refresh_routine_metadata",
+                    return_value=([], []),
+                ),
+                patch.object(
+                    loader,
+                    "_main_pnl_refresh_static_cache",
+                    return_value={"stocks": ()},
+                ),
+                patch.object(loader, "_instance_stock_counts", return_value={}),
+                patch.object(loader, "_refresh_instance_pnl_from_batch", return_value={}),
+                patch.object(loader, "current_stock_trade_counts_by_code", return_value={}),
+                patch.object(loader, "main_apply_routine_sort"),
+                patch.object(loader, "_update_main_routine_summary") as update_summary,
+            ):
+                loader.main_load_routine_table(window)
+
+            self.assertEqual(1, table.rowCount())
+            item = table.item(0, 0)
+            self.assertEqual("지표추종매매", item.data(loader.ROUTINE_PARENT_NAME_ROLE))
+            self.assertTrue(item.data(loader.ROUTINE_GROUP_RECOVERY_ROLE))
+            self.assertNotIn("오류", item.text())
+            self.assertEqual({}, window._routine_instance_ids_by_group)
+            self.assertEqual({}, window._routine_stock_paths_by_group)
+            self.assertEqual((), update_summary.call_args.kwargs["group_projection"])
 
     def test_group_instance_stock_dirs_do_not_leak_shared_instance_stocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

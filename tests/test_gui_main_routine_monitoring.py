@@ -156,13 +156,33 @@ def _main_static_cache(definitions, instances, stocks) -> dict[str, object]:
 )
 class MainRoutineMonitoringDisplayTest(unittest.TestCase):
     def test_routine_instance_name_display_keeps_seven_and_truncates_eight(self) -> None:
+        persisted_name = "지표추종매매C"
         self.assertEqual(
-            "지표추종매매C",
-            gui_main_table_loader.routine_instance_name_display("지표추종매매C"),
+            persisted_name,
+            gui_main_table_loader.routine_instance_name_display(persisted_name),
         )
         self.assertEqual(
             "지표추종매매...",
             gui_main_table_loader.routine_instance_name_display("지표추종매매CD"),
+        )
+        self.assertEqual("지표추종매매C", persisted_name)
+
+        font = gui_main_table_loader.main_monitoring_table_font()
+        metrics = QFontMetrics(font)
+        prefix_width = (
+            gui_main_table_loader.ROUTINE_CHILD_CHECKBOX_OFFSET
+            + metrics.horizontalAdvance("▶")
+            + 4
+            + gui_main_table_loader.ROUTINE_PROFIT_LED_BOX_SIZE
+            + gui_main_table_loader.ROUTINE_PROFIT_LED_GAP
+        )
+        name_rect = gui_windows._RoutineTreeItemDelegate._child_name_text_rect(
+            QRect(0, 0, 1000, gui_main_table_loader.ROUTINE_INSTANCE_ROW_HEIGHT),
+            prefix_width,
+        )
+        self.assertGreaterEqual(
+            name_rect.width(),
+            metrics.horizontalAdvance("가나다라마바사"),
         )
 
     def test_valid_summary_uses_projected_relation_stock_rows(self) -> None:
@@ -400,6 +420,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         window = SimpleNamespace(
             routine_table=table,
             handle_routine_group_name_double_click=MagicMock(return_value=True),
+            open_routine_registration_from_main_group=MagicMock(return_value=True),
+            delete_routine_group_completely=MagicMock(return_value=True),
             request_routine_group_operation=MagicMock(),
             _routine_instance_ids_by_group={group_id: ("instance-a",)},
             _routine_stock_paths_by_group={group_id: ("stocks/000001_Stock",)},
@@ -420,7 +442,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertTrue(controller.eventFilter(table.viewport(), double_click))
         window.handle_routine_group_name_double_click.assert_called_once_with(0)
         menu = MagicMock()
-        actions = [MagicMock(), MagicMock()]
+        actions = [MagicMock() for _ in range(5)]
         menu.addAction.side_effect = actions
         menu.exec_.return_value = None
         with (
@@ -437,14 +459,23 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["조기마감", "즉시청산"],
+            ["루틴등록", "그룹복구", "그룹삭제", "조기마감", "즉시청산"],
             [call_item.args[0] for call_item in menu.addAction.call_args_list],
         )
-        menu.addSeparator.assert_not_called()
-        for action in actions:
+        self.assertEqual(2, menu.addSeparator.call_count)
+        actions[1].setEnabled.assert_called_once_with(False)
+        actions[2].setEnabled.assert_called_once_with(True)
+        for action in actions[3:]:
             action.setEnabled.assert_called_once_with(True)
         actions[0].triggered.connect.call_args.args[0]()
-        actions[1].triggered.connect.call_args.args[0]()
+        actions[2].triggered.connect.call_args.args[0]()
+        actions[3].triggered.connect.call_args.args[0]()
+        actions[4].triggered.connect.call_args.args[0]()
+        window.open_routine_registration_from_main_group.assert_called_once_with(group_id)
+        window.delete_routine_group_completely.assert_called_once_with(
+            group_id,
+            group.name,
+        )
         self.assertEqual(
             [
                 call(
@@ -463,6 +494,377 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window.request_routine_group_operation.call_args_list,
         )
         table.close()
+
+    def test_recovery_group_context_menu_enables_only_recovery_and_delete(self) -> None:
+        group = _main_group("지표추종매매")
+        group_id = str(group.path.resolve())
+        table = QTableWidget(1, 1)
+        item = QTableWidgetItem(group.name)
+        item.setData(gui_main_table_loader.ROUTINE_ROW_KIND_ROLE, gui_main_table_loader.ROUTINE_ROW_PARENT)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_ID_ROLE, group_id)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_PATH_ROLE, str(group.path))
+        item.setData(gui_main_table_loader.ROUTINE_PARENT_NAME_ROLE, group.name)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_RECOVERY_ROLE, True)
+        table.setItem(0, 0, item)
+        table.resize(480, 120)
+        table.show()
+        self.app.processEvents()
+        window = SimpleNamespace(
+            routine_table=table,
+            restore_routine_group_manually=MagicMock(return_value=True),
+            delete_routine_group_completely=MagicMock(return_value=True),
+            open_routine_registration_from_main_group=MagicMock(),
+            request_routine_group_operation=MagicMock(),
+            _routine_recovery_control_by_group={
+                group_id: SimpleNamespace(deletion_pending=False),
+            },
+            _routine_instance_ids_by_group={},
+            _routine_stock_paths_by_group={},
+            _set_routine_operation_actions_enabled=lambda actions, enabled: (
+                gui_windows.MainWindow._set_routine_operation_actions_enabled(actions, enabled)
+            ),
+        )
+        controller = gui_windows._RoutineTreeInteractionController(window)
+        window._routine_tree_interaction_controller = controller
+        point = controller._parent_name_rect(table.model().index(0, 0)).center()
+        menu = MagicMock()
+        actions = [MagicMock() for _ in range(5)]
+        menu.addAction.side_effect = actions
+        menu.exec_.return_value = None
+
+        with patch.object(gui_windows, "QMenu", return_value=menu):
+            gui_windows.MainWindow.open_routine_context_menu(window, point)
+
+        self.assertEqual(
+            ["루틴등록", "그룹복구", "그룹삭제", "조기마감", "즉시청산"],
+            [entry.args[0] for entry in menu.addAction.call_args_list],
+        )
+        self.assertEqual(2, menu.addSeparator.call_count)
+        actions[0].setEnabled.assert_called_once_with(False)
+        actions[1].setEnabled.assert_called_once_with(True)
+        actions[2].setEnabled.assert_called_once_with(True)
+        actions[3].setEnabled.assert_called_once_with(False)
+        actions[4].setEnabled.assert_called_once_with(False)
+        actions[1].triggered.connect.call_args.args[0]()
+        actions[2].triggered.connect.call_args.args[0]()
+        window.restore_routine_group_manually.assert_called_once_with(group_id, group.name)
+        window.delete_routine_group_completely.assert_called_once_with(group_id, group.name)
+        window.open_routine_registration_from_main_group.assert_not_called()
+        window.request_routine_group_operation.assert_not_called()
+        table.close()
+
+    def test_deletion_pending_recovery_group_disables_manual_restore(self) -> None:
+        group = _main_group("지표추종매매")
+        group_id = str(group.path.resolve())
+        table = QTableWidget(1, 1)
+        item = QTableWidgetItem(group.name)
+        item.setData(gui_main_table_loader.ROUTINE_ROW_KIND_ROLE, gui_main_table_loader.ROUTINE_ROW_PARENT)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_ID_ROLE, group_id)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_PATH_ROLE, str(group.path))
+        item.setData(gui_main_table_loader.ROUTINE_PARENT_NAME_ROLE, group.name)
+        item.setData(gui_main_table_loader.ROUTINE_GROUP_RECOVERY_ROLE, True)
+        table.setItem(0, 0, item)
+        table.resize(480, 120)
+        table.show()
+        self.app.processEvents()
+        window = SimpleNamespace(
+            routine_table=table,
+            _routine_recovery_control_by_group={
+                group_id: SimpleNamespace(deletion_pending=True),
+            },
+            _routine_instance_ids_by_group={},
+            _routine_stock_paths_by_group={},
+            delete_routine_group_completely=MagicMock(),
+            _set_routine_operation_actions_enabled=lambda actions, enabled: (
+                gui_windows.MainWindow._set_routine_operation_actions_enabled(actions, enabled)
+            ),
+        )
+        controller = gui_windows._RoutineTreeInteractionController(window)
+        window._routine_tree_interaction_controller = controller
+        point = controller._parent_name_rect(table.model().index(0, 0)).center()
+        menu = MagicMock()
+        actions = [MagicMock() for _ in range(5)]
+        menu.addAction.side_effect = actions
+        menu.exec_.return_value = None
+
+        with patch.object(gui_windows, "QMenu", return_value=menu):
+            gui_windows.MainWindow.open_routine_context_menu(window, point)
+
+        actions[1].setEnabled.assert_called_once_with(False)
+        actions[1].triggered.connect.assert_not_called()
+        actions[2].setEnabled.assert_called_once_with(True)
+        table.close()
+
+    def test_manual_group_restore_refreshes_views_and_toasts_once(self) -> None:
+        group_id = str(Path("_지표추종매매").resolve())
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=MagicMock())
+        result = SimpleNamespace(success=True, restored=True, error="")
+        with (
+            patch.object(gui_windows, "restore_group_snapshot", return_value=result),
+            patch.object(
+                gui_windows,
+                "scan_group_records",
+                return_value=[SimpleNamespace(path=Path(group_id))],
+            ),
+            patch.object(gui_windows, "show_toast") as show_toast,
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+        ):
+            restored = gui_windows.MainWindow.restore_routine_group_manually(
+                window,
+                group_id,
+                "지표추종매매",
+            )
+
+        self.assertTrue(restored)
+        window.refresh_auto_trade_assignment_views.assert_called_once_with()
+        show_toast.assert_called_once_with(
+            window,
+            "지표추종매매 그룹을 복구하였습니다.",
+        )
+        warning.assert_not_called()
+
+    def test_manual_group_restore_failure_keeps_view_without_refresh(self) -> None:
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=MagicMock())
+        result = SimpleNamespace(success=False, restored=False, error="restore failed")
+        with (
+            patch.object(gui_windows, "restore_group_snapshot", return_value=result),
+            patch.object(gui_windows, "scan_group_records") as scan,
+            patch.object(gui_windows, "show_toast") as show_toast,
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+            self.assertLogs(gui_windows.LOGGER, level="WARNING"),
+        ):
+            restored = gui_windows.MainWindow.restore_routine_group_manually(
+                window,
+                "group-a",
+                "지표추종매매",
+            )
+
+        self.assertFalse(restored)
+        window.refresh_auto_trade_assignment_views.assert_not_called()
+        show_toast.assert_not_called()
+        scan.assert_not_called()
+        warning.assert_called_once_with(window, "그룹복구", "restore failed")
+
+    def test_group_complete_delete_cancel_changes_nothing(self) -> None:
+        window = SimpleNamespace()
+        with (
+            patch.object(
+                gui_windows.QMessageBox,
+                "question",
+                return_value=gui_windows.QMessageBox.No,
+            ) as question,
+            patch.object(gui_windows, "collect_group_deletion_scope") as collect_scope,
+            patch.object(gui_windows, "delete_group_completely") as delete_group,
+        ):
+            result = gui_windows.MainWindow.delete_routine_group_completely(
+                window,
+                "group-a",
+                "지표추종매매",
+            )
+
+        self.assertFalse(result)
+        question.assert_called_once_with(
+            window,
+            "그룹삭제",
+            "지표추종매매 그룹을 완전삭제 하겠습니까?",
+            gui_windows.QMessageBox.Yes | gui_windows.QMessageBox.No,
+            gui_windows.QMessageBox.No,
+        )
+        collect_scope.assert_not_called()
+        delete_group.assert_not_called()
+
+    def test_group_complete_delete_success_refreshes_views_and_toasts(self) -> None:
+        scope = SimpleNamespace()
+        result = SimpleNamespace(
+            success=True,
+            error="",
+            blocked_reasons=(),
+            deleted_instance_ids=("instance-a",),
+            cleared_stock_codes=("000001",),
+        )
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=MagicMock())
+        with (
+            patch.object(
+                gui_windows.QMessageBox,
+                "question",
+                return_value=gui_windows.QMessageBox.Yes,
+            ),
+            patch.object(gui_windows, "collect_group_deletion_scope", return_value=scope),
+            patch.object(
+                gui_windows,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
+            ),
+            patch.object(gui_windows, "delete_group_completely", return_value=result) as delete_group,
+            patch.object(gui_windows, "append_production_event") as append_event,
+            patch.object(gui_windows, "show_toast") as show_toast,
+        ):
+            deleted = gui_windows.MainWindow.delete_routine_group_completely(
+                window,
+                "group-a",
+                "지표추종매매",
+            )
+
+        self.assertTrue(deleted)
+        delete_group.assert_called_once_with(
+            gui_windows.PROJECT_ROOT,
+            scope,
+            can_unassign=gui_windows.can_unassign_active_routine_from_stock,
+            running_stock_dirs=[],
+        )
+        window.refresh_auto_trade_assignment_views.assert_called_once_with()
+        show_toast.assert_called_once_with(
+            window,
+            "지표추종매매 그룹을 완전삭제 하였습니다.",
+        )
+        append_event.assert_called_once()
+
+    def test_group_complete_delete_safety_block_warns_without_refresh(self) -> None:
+        scope = SimpleNamespace()
+        result = SimpleNamespace(
+            success=False,
+            error="",
+            blocked_reasons=("대상종목: 보유 1",),
+            deleted_instance_ids=(),
+            cleared_stock_codes=(),
+        )
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=MagicMock())
+        with (
+            patch.object(
+                gui_windows.QMessageBox,
+                "question",
+                return_value=gui_windows.QMessageBox.Yes,
+            ),
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+            patch.object(gui_windows, "collect_group_deletion_scope", return_value=scope),
+            patch.object(
+                gui_windows,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
+            ),
+            patch.object(gui_windows, "delete_group_completely", return_value=result),
+            patch.object(gui_windows, "show_toast") as show_toast,
+        ):
+            deleted = gui_windows.MainWindow.delete_routine_group_completely(
+                window,
+                "group-a",
+                "지표추종매매",
+            )
+
+        self.assertFalse(deleted)
+        warning.assert_called_once_with(window, "그룹삭제", "대상종목: 보유 1")
+        window.refresh_auto_trade_assignment_views.assert_not_called()
+        show_toast.assert_not_called()
+
+    def test_group_registration_opens_registration_dialog_without_auto_trade_window(self) -> None:
+        definition = SimpleNamespace(
+            definition_id="definition-a",
+            display_name="Definition A",
+        )
+        window = SimpleNamespace(
+            _routine_instance_ids_by_group={"group-a": ("instance-a",)},
+        )
+        with (
+            patch.object(
+                gui_windows,
+                "routine_instance_by_id",
+                return_value=SimpleNamespace(definition_id="definition-a"),
+            ),
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=definition,
+            ),
+            patch.object(
+                gui_windows,
+                "open_routine_settings_dialog_for_owner",
+            ) as open_registration_dialog,
+            patch.object(gui_windows, "AutoTradeSettingWindow") as auto_trade_window,
+        ):
+            self.assertTrue(
+                gui_windows.MainWindow.open_routine_registration_from_main_group(
+                    window,
+                    "group-a",
+                )
+            )
+
+        auto_trade_window.assert_not_called()
+        open_registration_dialog.assert_called_once_with(
+            window,
+            {
+                "row_kind": "definition",
+                "definition_id": "definition-a",
+                "definition_name": "Definition A",
+                "group_id": "group-a",
+            },
+            registration=True,
+        )
+
+    def test_instance_clone_reuses_saved_rules_snapshot_and_unique_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            rules_path = Path(temp) / "rules.json"
+            source_rules = {"buy": {"enabled": True}, "settings": {"period": 5}}
+            rules_path.write_text(
+                json.dumps(source_rules, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            instance = SimpleNamespace(
+                instance_id="instance-b",
+                definition_id="definition-a",
+                display_name="동전주B",
+                rules_path=rules_path,
+            )
+            definition = SimpleNamespace(display_name="Definition A")
+            window = SimpleNamespace(
+                _routine_instance_ids_by_group={"group-a": ("instance-b",)},
+            )
+            registered = SimpleNamespace(instance_id="instance-c")
+            with (
+                patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
+                patch(
+                    "gui_indicator_follow_routine_settings_dialog.register_routine_instance_snapshot",
+                    return_value=registered,
+                ) as clone_snapshot,
+            ):
+                self.assertTrue(
+                    gui_windows.MainWindow.clone_routine_instance_from_main_group(
+                        window,
+                        "group-a",
+                        "instance-b",
+                    )
+                )
+
+            kwargs = clone_snapshot.call_args.kwargs
+            self.assertEqual("definition-a", kwargs["definition_id"])
+            self.assertEqual("group-a", kwargs["group_id"])
+            self.assertEqual("동전주B", kwargs["source_instance_display_name"])
+            self.assertEqual(
+                {"success": True, "rules": source_rules, "error": ""},
+                kwargs["rules_provider"](),
+            )
+
+    def test_instance_clone_blocks_ambiguous_group_assignment(self) -> None:
+        window = SimpleNamespace(
+            _routine_instance_ids_by_group={
+                "group-a": ("instance-b",),
+                "group-b": ("instance-b",),
+            },
+        )
+        with (
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+            patch.object(gui_windows, "routine_instance_by_id") as find_instance,
+        ):
+            self.assertFalse(
+                gui_windows.MainWindow.clone_routine_instance_from_main_group(
+                    window,
+                    "group-a",
+                    "instance-b",
+                )
+            )
+
+        warning.assert_called_once()
+        find_instance.assert_not_called()
 
     def test_routine_operation_confirmations_use_project_copy(self) -> None:
         import gui_windows
@@ -513,6 +915,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             routine_table=table,
             request_routine_operation=MagicMock(),
             open_routine_settings_from_main_table=MagicMock(),
+            clone_routine_instance_from_main_group=MagicMock(return_value=True),
             delete_routine_instance_from_main_table=MagicMock(),
             start_routine_instance_name_edit=MagicMock(),
             open_routine_instance_stock_register_from_main_table=MagicMock(),
@@ -533,7 +936,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             gui_windows._RoutineTreeInteractionController(window)
         )
         menu = MagicMock()
-        actions = [MagicMock() for _ in range(6)]
+        actions = [MagicMock() for _ in range(7)]
         menu.addAction.side_effect = actions
         menu.exec_.return_value = None
         with (
@@ -550,7 +953,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+            [
+                "설정변경",
+                "루틴복제",
+                "루틴삭제",
+                "이름변경",
+                "종목등록",
+                "조기마감",
+                "즉시청산",
+            ],
             [call_item.args[0] for call_item in menu.addAction.call_args_list],
         )
         menu.addSeparator.assert_called_once_with()
@@ -560,6 +971,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         for action in actions:
             action.triggered.connect.call_args.args[0]()
         window.open_routine_settings_from_main_table.assert_called_once_with(item)
+        window.clone_routine_instance_from_main_group.assert_called_once_with(
+            group_id,
+            instance.instance_id,
+        )
         window.delete_routine_instance_from_main_table.assert_called_once_with(
             instance.instance_id,
             instance.display_name,
@@ -4483,24 +4898,24 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
                 parent_rect = window.routine_table.visualItemRect(window.routine_table.item(0, 0))
                 parent_menu = MagicMock()
-                parent_actions = [MagicMock(), MagicMock(), MagicMock()]
+                parent_actions = [MagicMock() for _ in range(5)]
                 parent_menu.addAction.side_effect = parent_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=parent_menu),
                     patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
                 ):
                     window.open_routine_context_menu(parent_name_rect.center())
-                self.assertEqual(3, len(parent_menu.addAction.call_args_list))
+                self.assertEqual(5, len(parent_menu.addAction.call_args_list))
                 self.assertEqual(
-                    ["신규루틴", "조기마감", "즉시청산"],
+                    ["루틴등록", "그룹복구", "그룹삭제", "조기마감", "즉시청산"],
                     [call.args[0] for call in parent_menu.addAction.call_args_list],
                 )
-                parent_menu.addSeparator.assert_called_once_with()
+                self.assertEqual(2, parent_menu.addSeparator.call_count)
                 parent_actions[0].triggered.connect.assert_called_once()
-
-
-
-                for action in parent_actions[1:]:
+                parent_actions[1].setEnabled.assert_called_once_with(False)
+                parent_actions[2].setEnabled.assert_called_once_with(True)
+                parent_actions[2].triggered.connect.assert_called_once()
+                for action in parent_actions[3:]:
                     action.setEnabled.assert_called_once_with(False)
                     action.setStatusTip.assert_called_once()
 
@@ -4579,14 +4994,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
                 with patch.object(
                     window,
-                    "open_routine_settings_from_main_table",
-                ) as settings_open:
+                    "open_routine_registration_from_main_group",
+                ) as registration_open:
                     new_routine_slot = parent_actions[0].triggered.connect.call_args.args[0]
                     new_routine_slot()
-                settings_open.assert_called_once_with(window.routine_table.item(0, 0))
+                registration_open.assert_called_once_with(group_id)
 
                 fake_menu = MagicMock()
-                child_actions = [MagicMock() for _index in range(6)]
+                child_actions = [MagicMock() for _index in range(7)]
                 fake_menu.addAction.side_effect = child_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=fake_menu),
@@ -4594,13 +5009,21 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 ):
                     window.open_routine_context_menu(child_rect.center())
                 self.assertEqual(
-                    ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+                    [
+                        "설정변경",
+                        "루틴복제",
+                        "루틴삭제",
+                        "이름변경",
+                        "종목등록",
+                        "조기마감",
+                        "즉시청산",
+                    ],
                     [call.args[0] for call in fake_menu.addAction.call_args_list],
                 )
                 fake_menu.addSeparator.assert_called_once_with()
-                for action in child_actions[:4]:
+                for action in child_actions[:5]:
                     action.triggered.connect.assert_called_once()
-                for action in child_actions[4:]:
+                for action in child_actions[5:]:
                     action.setEnabled.assert_called_once_with(False)
                     action.setStatusTip.assert_called_once()
 
@@ -4619,7 +5042,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     action.setEnabled.assert_called_once_with(True)
 
                 active_child_menu = MagicMock()
-                active_child_actions = [MagicMock() for _index in range(6)]
+                active_child_actions = [MagicMock() for _index in range(7)]
                 active_child_menu.addAction.side_effect = active_child_actions
                 with (
                     patch.object(gui_windows, "QMenu", return_value=active_child_menu),
@@ -4627,19 +5050,27 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 ):
                     window.open_routine_context_menu(child_rect.center())
                 self.assertEqual(
-                    ["설정변경", "루틴삭제", "이름변경", "종목등록", "조기마감", "즉시청산"],
+                    [
+                        "설정변경",
+                        "루틴복제",
+                        "루틴삭제",
+                        "이름변경",
+                        "종목등록",
+                        "조기마감",
+                        "즉시청산",
+                    ],
                     [call.args[0] for call in active_child_menu.addAction.call_args_list],
                 )
                 active_child_menu.addSeparator.assert_called_once_with()
-                for action in active_child_actions[:4]:
+                for action in active_child_actions[:5]:
                     action.triggered.connect.assert_called_once()
-                for action in active_child_actions[4:]:
+                for action in active_child_actions[5:]:
                     action.setEnabled.assert_called_once_with(True)
                 with patch.object(
                     window,
                     "open_routine_instance_stock_register_from_main_table",
                 ) as register_open:
-                    register_slot = active_child_actions[3].triggered.connect.call_args.args[0]
+                    register_slot = active_child_actions[4].triggered.connect.call_args.args[0]
                     register_slot()
                 register_open.assert_called_once_with(instance.instance_id)
 

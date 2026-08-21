@@ -114,6 +114,33 @@ class RoutineInstanceRepositoryTest(unittest.TestCase):
             self.assertNotIn("source_instance_id", saved)
             self.assertNotIn("group_id", saved)
 
+    def test_explicit_group_assignment_round_trips_without_stock_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group_id = str((root / "_지표추종매매").resolve())
+            source_rules = {"buy": {"enabled": True}, "settings": {"period": 5}}
+            repository = self._repository(
+                root,
+                id_factory=lambda: "d7fe5d71-81fb-485d-a73b-e4b012a8bf3e",
+            )
+
+            result = repository.create_instance(
+                RoutineInstanceCreateRequest(
+                    definition_id="indicator_follow",
+                    display_name="지표추종매매C",
+                    group_id=group_id,
+                ),
+                source_rules,
+            )
+            reloaded = repository.get_instance(result.instance.instance_id)
+            saved_rules = json.loads(reloaded.rules_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.success)
+        self.assertFalse(reloaded.enabled)
+        self.assertEqual(group_id, reloaded.group_id)
+        self.assertEqual(source_rules, saved_rules)
+        self.assertFalse((root / "stocks").exists())
+
     def test_duplicate_name_within_definition_is_rejected_without_new_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

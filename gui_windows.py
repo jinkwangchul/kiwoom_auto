@@ -1357,6 +1357,7 @@ from gui_main_emergency_ops import (
 from gui_main_table_loader import (
     ROUTINE_GROUP_ID_ROLE,
     ROUTINE_GROUP_PATH_ROLE,
+    ROUTINE_GROUP_RECOVERY_ROLE,
     ROUTINE_DEFINITION_ID_ROLE,
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
     ROUTINE_CHILD_COLLAPSED_ROLE,
@@ -1460,6 +1461,11 @@ from gui_auto_trade_run_control import (
     auto_trade_running_registered_operation_targets,
     show_auto_trade_operation_failure_dialog,
 )
+from gui_routine_policy import can_unassign_active_routine_from_stock
+from group_complete_deletion_service import (
+    collect_group_deletion_scope,
+    delete_group_completely,
+)
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
     operation_policy_section,
@@ -1530,9 +1536,15 @@ from gui_auto_trade_setting_window import (
     is_emergency_stopped_state,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
+    open_routine_settings_dialog_for_owner,
     routine_display_name,
 )
-from gui_routine_registry import routine_record_by_name
+from gui_routine_registry import (
+    consume_group_recovery_messages,
+    routine_record_by_name,
+    scan_group_records,
+)
+from group_recovery_repository import restore_group_snapshot
 from routine_instance_registry import (
     ROUTINE_LIMIT_RESPONSE_ACTION_MODES,
     ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS,
@@ -2499,6 +2511,16 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
     """Paint the first-column hierarchy without text-based indentation."""
 
     @staticmethod
+    def _child_name_text_rect(row_rect: QRect, left_offset: int) -> QRect:
+        left = row_rect.left() + left_offset
+        return QRect(
+            left,
+            row_rect.top(),
+            max(0, ROUTINE_INSTANCE_NAME_WIDTH - left_offset - 4),
+            row_rect.height(),
+        )
+
+    @staticmethod
     def _child_arrow_state(has_stocks: bool, collapsed: bool) -> tuple[str, bool]:
         if not has_stocks:
             return "▶", False
@@ -2905,6 +2927,8 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
             -4,
             0,
         )
+        if row_kind == ROUTINE_ROW_CHILD:
+            text_rect = self._child_name_text_rect(option.rect, text_left_offset)
         painter.save()
         if not visually_enabled:
             painter.setPen(QColor("#9ca3af"))
@@ -7499,6 +7523,8 @@ class MainWindow(QMainWindow):
 
     def load_routine_table(self) -> None:
         main_load_routine_table(self)
+        for message in consume_group_recovery_messages():
+            show_toast(self, message)
         self._install_routine_buy_limit_edit_filters()
 
     def load_running_stock_table(self) -> None:
@@ -9074,6 +9100,205 @@ class MainWindow(QMainWindow):
             action.setStatusTip("" if enabled else unavailable_reason)
             action.setToolTip("" if enabled else unavailable_reason)
 
+    def open_routine_registration_from_main_group(self, group_id: str) -> bool:
+        definition_by_id: dict[str, object] = {}
+        for instance_id in self._routine_instance_ids_by_group.get(group_id, ()):
+            instance = routine_instance_by_id(instance_id)
+            definition_id = str(
+                getattr(instance, "definition_id", "") or ""
+            ).strip()
+            definition = routine_definition_by_id(definition_id) if definition_id else None
+            if definition is not None:
+                definition_by_id[definition_id] = definition
+
+        if len(definition_by_id) != 1:
+            QMessageBox.information(
+                self,
+                "루틴 등록",
+                "선택한 그룹의 루틴 유형을 하나로 확인할 수 없습니다.",
+            )
+            return False
+
+        definition_id, definition = next(iter(definition_by_id.items()))
+        open_routine_settings_dialog_for_owner(
+            self,
+            {
+                "row_kind": "definition",
+                "definition_id": definition_id,
+                "definition_name": str(
+                    getattr(definition, "display_name", "") or ""
+                ).strip(),
+                "group_id": group_id,
+            },
+            registration=True,
+        )
+        return True
+
+    def clone_routine_instance_from_main_group(
+        self,
+        group_id: str,
+        instance_id: str,
+    ) -> bool:
+        owning_group_ids = {
+            candidate_group_id
+            for candidate_group_id, instance_ids in self._routine_instance_ids_by_group.items()
+            if instance_id in instance_ids
+        }
+        if owning_group_ids != {group_id}:
+            QMessageBox.warning(
+                self,
+                "루틴 복제",
+                "원본 루틴의 Group 귀속을 하나로 확인할 수 없어 복제할 수 없습니다.",
+            )
+            return False
+
+        instance = routine_instance_by_id(instance_id)
+        definition_id = str(getattr(instance, "definition_id", "") or "").strip()
+        definition = routine_definition_by_id(definition_id) if definition_id else None
+        rules_path = getattr(instance, "rules_path", None)
+        if instance is None or definition is None or rules_path is None:
+            QMessageBox.warning(self, "루틴 복제", "복제할 루틴 설정을 확인할 수 없습니다.")
+            return False
+
+        def rules_provider() -> dict[str, object]:
+            try:
+                rules = json.loads(Path(rules_path).read_text(encoding="utf-8"))
+                if not isinstance(rules, dict):
+                    raise ValueError("rules.json root must be an object")
+                return {"success": True, "rules": rules, "error": ""}
+            except Exception as exc:
+                return {"success": False, "rules": {}, "error": str(exc)}
+
+        from gui_indicator_follow_routine_settings_dialog import (
+            register_routine_instance_snapshot,
+        )
+
+        return register_routine_instance_snapshot(
+            self,
+            definition_id=definition_id,
+            definition_display_name=str(
+                getattr(definition, "display_name", "") or ""
+            ).strip(),
+            group_id=group_id,
+            source_instance_display_name=str(
+                getattr(instance, "display_name", "") or ""
+            ).strip(),
+            rules_provider=rules_provider,
+        ) is not None
+
+    def delete_routine_group_completely(
+        self,
+        group_id: str,
+        group_name: str,
+    ) -> bool:
+        clean_group_name = str(group_name or "").strip()
+        answer = QMessageBox.question(
+            self,
+            "그룹삭제",
+            f"{clean_group_name} 그룹을 완전삭제 하겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return False
+
+        try:
+            scope = collect_group_deletion_scope(PROJECT_ROOT, group_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "그룹삭제", str(exc))
+            return False
+
+        try:
+            running_stock_dirs = [
+                stock_dir
+                for stock_dir, _code, _name in auto_trade_running_registered_operation_targets(
+                    self
+                )
+            ]
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "그룹삭제",
+                f"현재 운영 종목을 확인하지 못해 그룹을 삭제할 수 없습니다.\n{exc}",
+            )
+            return False
+
+        result = delete_group_completely(
+            PROJECT_ROOT,
+            scope,
+            can_unassign=can_unassign_active_routine_from_stock,
+            running_stock_dirs=running_stock_dirs,
+        )
+        if not result.success:
+            reason = result.error
+            if result.blocked_reasons:
+                reason = "\n".join(result.blocked_reasons)
+            QMessageBox.warning(
+                self,
+                "그룹삭제",
+                reason or "현재 상태에서는 그룹을 삭제할 수 없습니다.",
+            )
+            return False
+
+        append_production_event(
+            "ROUTINE_GROUP_COMPLETELY_DELETED",
+            result="COMPLETED",
+            source="gui_windows.MainWindow.delete_routine_group_completely",
+            target_type="ROUTINE_GROUP",
+            target_id=str(group_id or "").strip(),
+            target_name=clean_group_name,
+            routine=clean_group_name,
+            details={
+                "deleted_instance_ids": list(result.deleted_instance_ids),
+                "cleared_stock_codes": list(result.cleared_stock_codes),
+            },
+        )
+        self.refresh_auto_trade_assignment_views()
+        show_toast(
+            self,
+            f"{clean_group_name} 그룹을 완전삭제 하였습니다.",
+        )
+        return True
+
+    def restore_routine_group_manually(
+        self,
+        group_id: str,
+        group_name: str,
+    ) -> bool:
+        result = restore_group_snapshot(PROJECT_ROOT, group_id)
+        if not result.success or not result.restored:
+            LOGGER.warning(
+                "Manual Group recovery failed: target=%s error=%s",
+                group_id,
+                result.error or "Group was not restored",
+            )
+            QMessageBox.warning(
+                self,
+                "그룹복구",
+                result.error or "그룹을 복구하지 못했습니다.",
+            )
+            return False
+
+        restored_group_ids = {
+            str(Path(group.path).resolve(strict=False))
+            for group in scan_group_records(sync_recovery=False)
+        }
+        if str(Path(group_id).resolve(strict=False)) not in restored_group_ids:
+            LOGGER.warning(
+                "Manual Group recovery discovery failed: target=%s",
+                group_id,
+            )
+            QMessageBox.warning(
+                self,
+                "그룹복구",
+                "복원된 그룹을 확인하지 못했습니다.",
+            )
+            return False
+
+        self.refresh_auto_trade_assignment_views()
+        show_toast(self, f"{str(group_name or '').strip()} 그룹을 복구하였습니다.")
+        return True
+
     def open_routine_context_menu(self, position) -> None:
         item = self.routine_table.itemAt(position)
         if item is None:
@@ -9094,6 +9319,7 @@ class MainWindow(QMainWindow):
             group_id = str(first_item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
             group_path = str(first_item.data(ROUTINE_GROUP_PATH_ROLE) or "").strip()
             group_name = str(first_item.data(ROUTINE_PARENT_NAME_ROLE) or "").strip()
+            recovery_control = bool(first_item.data(ROUTINE_GROUP_RECOVERY_ROLE))
             if not group_id or not group_path:
                 QMessageBox.warning(
                     self,
@@ -9103,6 +9329,12 @@ class MainWindow(QMainWindow):
                 return
             menu = QMenu(self.routine_table)
             menu.setToolTipsVisible(True)
+            register_action = menu.addAction("루틴등록")
+            menu.addSeparator()
+            recovery_action = menu.addAction("그룹복구")
+            delete_group_action = menu.addAction("그룹삭제")
+            delete_group_action.setEnabled(True)
+            menu.addSeparator()
             early_close_action = menu.addAction("조기마감")
             immediate_action = menu.addAction("즉시청산")
             set_menu_action_text_color(
@@ -9110,7 +9342,17 @@ class MainWindow(QMainWindow):
                 early_close_action,
                 CONTEXT_MENU_DANGER_TEXT_COLOR,
             )
-            has_valid_target = any(
+            recovery_record = getattr(
+                self,
+                "_routine_recovery_control_by_group",
+                {},
+            ).get(group_id)
+            deletion_pending = bool(
+                getattr(recovery_record, "deletion_pending", False)
+            )
+            register_action.setEnabled(not recovery_control)
+            recovery_action.setEnabled(recovery_control and not deletion_pending)
+            has_valid_target = not recovery_control and any(
                 routine_instance_checked(self, instance_id)
                 for instance_id in self._routine_instance_ids_by_group.get(
                     group_id,
@@ -9120,6 +9362,25 @@ class MainWindow(QMainWindow):
             self._set_routine_operation_actions_enabled(
                 (early_close_action, immediate_action),
                 has_valid_target,
+            )
+            if recovery_control and not deletion_pending:
+                recovery_action.triggered.connect(
+                    lambda _checked=False: self.restore_routine_group_manually(
+                        group_id,
+                        group_name,
+                    )
+                )
+            elif not recovery_control:
+                register_action.triggered.connect(
+                    lambda _checked=False: self.open_routine_registration_from_main_group(
+                        group_id
+                    )
+                )
+            delete_group_action.triggered.connect(
+                lambda _checked=False: self.delete_routine_group_completely(
+                    group_id,
+                    group_name,
+                )
             )
             early_close_action.triggered.connect(
                 lambda _checked=False: self.request_routine_group_operation(
@@ -9175,6 +9436,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self.routine_table)
         menu.setToolTipsVisible(True)
         settings_action = menu.addAction("설정변경")
+        clone_action = menu.addAction("루틴복제")
         delete_action = menu.addAction("루틴삭제")
         rename_action = menu.addAction("이름변경")
         stock_register_action = menu.addAction("종목등록")
@@ -9189,6 +9451,14 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(
             lambda _checked=False, item=first_item: self.open_routine_settings_from_main_table(
                 item
+            )
+        )
+        clone_action.triggered.connect(
+            lambda _checked=False, target_group_id=group_id, target_id=instance_id: (
+                self.clone_routine_instance_from_main_group(
+                    target_group_id,
+                    target_id,
+                )
             )
         )
         delete_action.triggered.connect(
