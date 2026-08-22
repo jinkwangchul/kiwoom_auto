@@ -379,6 +379,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "on_routine_table_context_menu",
             "_open_routine_settings_dialog",
             "open_routine_registration",
+            "delete_routine_group",
             "open_routine_instance_settings",
             "rename_routine_instance",
             "finish_routine_instance_name_edit",
@@ -569,6 +570,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "row_kind": "definition",
                 "definition_id": "indicator_follow",
                 "definition_name": "지표추종매매",
+                "display_name": "지표추종매매",
+                "group_id": str(Path("groups") / "_지표추종매매"),
             },
             "instance": {
                 "row_kind": "instance",
@@ -588,7 +591,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.routine_table.setItem(0, 0, item)
 
         for row_kind, expected_labels in (
-            ("definition", ["루틴등록"]),
+            ("definition", ["루틴등록", "그룹삭제"]),
             ("instance", ["설정변경", "루틴삭제", "이름변경", "종목등록"]),
         ):
             item.setData(Qt.UserRole, metadata_by_kind[row_kind])
@@ -607,6 +610,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             menu.exec_.assert_called_once()
             for action in actions:
                 action.triggered.connect.assert_called_once()
+            if row_kind == "definition":
+                actions[1].setEnabled.assert_called_once_with(True)
+                menu.addSeparator.assert_not_called()
 
         item.setData(Qt.UserRole, metadata_by_kind["stock"])
         stock_menu = MagicMock()
@@ -627,6 +633,64 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         for action in stock_actions[1:]:
             action.setEnabled.assert_called_once_with(False)
         stock_menu.exec_.assert_called_once()
+
+    def test_group_delete_action_reuses_main_owner_service(self) -> None:
+        window = self._window_harness()
+        owner = SimpleNamespace(
+            delete_routine_group_completely=MagicMock(return_value=True),
+        )
+        metadata = {
+            "row_kind": "definition",
+            "group_id": str(Path("groups") / "_지표추종매매"),
+            "display_name": "지표추종매매",
+        }
+        with patch.object(setting_window, "persistent_feature_owner", return_value=owner):
+            self.assertTrue(window.delete_routine_group(metadata))
+
+        owner.delete_routine_group_completely.assert_called_once_with(
+            metadata["group_id"],
+            "지표추종매매",
+        )
+
+    def test_group_registration_settings_window_uses_group_display_name(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir)
+            (package_dir / "rules.json").write_text("{}", encoding="utf-8")
+            definition = SimpleNamespace(
+                definition_id="indicator_follow",
+                display_name="지표추종매매",
+                settings_ui="indicator_follow",
+                package_dir=package_dir,
+                default_rules_file="rules.json",
+            )
+            owner = SimpleNamespace()
+            dialog = MagicMock()
+            with (
+                patch.object(
+                    setting_window,
+                    "routine_definition_by_id",
+                    return_value=definition,
+                ),
+                patch(
+                    "gui_indicator_follow_routine_settings_dialog.IndicatorFollowRoutineSettingsDialog",
+                    return_value=dialog,
+                ) as dialog_type,
+            ):
+                setting_window.open_routine_settings_dialog_for_owner(
+                    owner,
+                    {
+                        "definition_id": "indicator_follow",
+                        "definition_name": "지표추종매매",
+                        "display_name": "지표추종복사",
+                        "group_id": str(Path("groups") / "_지표추종복사"),
+                    },
+                    registration=True,
+                )
+
+        self.assertEqual(
+            "지표추종복사",
+            dialog_type.call_args.kwargs["routine_name"],
+        )
 
     def test_routine_tree_context_actions_dispatch_to_captured_target(self) -> None:
         window = self._window_harness()
@@ -1111,6 +1175,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(("111111", "대상종목"), dialog._result_stock_at_row(row))
         self.assertEqual([row], [index.row() for index in dialog.result_table.selectionModel().selectedRows()])
         parent.refresh_all.assert_called()
+
+    def test_instance_stock_registration_refreshes_main_and_open_auto_trade_once(self) -> None:
+        dialog, parent = self._instance_stock_search_dialog()
+        parent.refresh_auto_trade_assignment_views = MagicMock()
+
+        dialog._refresh_parent_views()
+
+        parent.refresh_auto_trade_assignment_views.assert_called_once_with()
+        parent.refresh_all.assert_not_called()
 
     def test_instance_stock_search_register_failure_keeps_classification_cell(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
@@ -2223,6 +2296,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent_meta_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeMetaGroup")
         parent_status_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeStatusGroup")
         parent_period = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
+
         parent_period_spacer = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
         parent_identity_compensation = parent_widget.findChild(
             setting_window.QWidget,
@@ -7447,6 +7521,127 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertIsNone(window.current_selected_routine_dir())
             self.assertEqual(("inst-a", "inst-b"), window.current_selected_target_instance_ids())
 
+    def test_group_selection_projects_canonical_instances_into_stock_table_scope(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            group_a = GroupRecord(
+                name="지표추종매매",
+                path=root / "_지표추종매매",
+                source_type="logical_registry",
+                group_id="group-a",
+                budget={},
+                valid=True,
+            )
+            group_b = GroupRecord(
+                name="지표추종복사",
+                path=root / "_지표추종복사",
+                source_type="logical_registry",
+                group_id="group-b",
+                budget={},
+                valid=True,
+            )
+            instances = [self._instance("inst-a", "지표추종매매A", group_id=group_a.group_id)]
+            stocks = [
+                {
+                    "stock_path": f"stocks/{index:06d}_GROUP_A_{index}",
+                    "assigned_routine_instance_id": "inst-a",
+                    "routines": ["지표추종매매"],
+                    "code": f"{index:06d}",
+                    "name": f"종목{index}",
+                }
+                for index in range(1, 11)
+            ]
+            window = self._window_harness()
+            window._routine_tree_projected_instance_ids_override = None
+            window._routine_instance_operation_counts = lambda: {}
+            window.stock_table.setColumnCount(11)
+            window._stock_status_filter = "all"
+            window._stock_visual_order = []
+            window._current_session_operation_participant_stock_codes = set()
+            window.capture_stock_table_view_state = lambda: (set(), 0)
+            window.restore_stock_table_view_state = lambda _paths, _scroll: None
+            window.update_selected_routine_status_bar = lambda: None
+            window.update_action_buttons = lambda: None
+
+            def select_group(group_id: str) -> None:
+                row = next(
+                    row
+                    for row in range(window.routine_table.rowCount())
+                    if window.routine_table.item(row, 0).data(
+                        setting_window.Qt.UserRole
+                    ).get("group_id") == group_id
+                )
+                window.routine_table.selectRow(row)
+
+            with (
+                patch.object(
+                    setting_window,
+                    "load_routine_definitions",
+                    return_value=[self._definition()],
+                ),
+                patch.object(
+                    setting_window,
+                    "load_persisted_routine_instances",
+                    side_effect=lambda: list(instances),
+                ),
+                patch.object(
+                    setting_window,
+                    "get_group_records",
+                    return_value=[group_a, group_b],
+                ),
+                patch.object(
+                    setting_window,
+                    "read_base_stocks",
+                    side_effect=lambda: list(stocks),
+                ),
+                patch.object(
+                    table_loader,
+                    "read_base_stocks",
+                    side_effect=lambda: list(stocks),
+                ),
+                patch.object(table_loader, "read_json_dict", return_value={}),
+                patch.object(
+                    table_loader,
+                    "current_stock_trade_counts_by_code",
+                    return_value={},
+                ),
+            ):
+                window.load_routine_table()
+                select_group(group_a.group_id)
+                self.assertEqual(("inst-a",), window.current_selected_target_instance_ids())
+                table_loader.auto_trade_load_selected_routine_stocks(window)
+                self.assertEqual(10, window.stock_table.rowCount())
+
+                select_group(group_b.group_id)
+                self.assertEqual((), window.current_selected_target_instance_ids())
+                table_loader.auto_trade_load_selected_routine_stocks(window)
+                self.assertEqual(0, window.stock_table.rowCount())
+
+                instances.append(
+                    self._instance(
+                        "inst-b",
+                        "지표추종복사A",
+                        group_id=group_b.group_id,
+                    )
+                )
+                stocks.append(
+                    {
+                        "stock_path": "stocks/999999_GROUP_B",
+                        "assigned_routine_instance_id": "inst-b",
+                        "routines": ["지표추종복사"],
+                        "code": "999999",
+                        "name": "복사종목",
+                    }
+                )
+                window.load_routine_table()
+                select_group(group_b.group_id)
+                table_loader.auto_trade_load_selected_routine_stocks(window)
+                self.assertEqual(1, window.stock_table.rowCount())
+
+                select_group(group_a.group_id)
+                table_loader.auto_trade_load_selected_routine_stocks(window)
+                self.assertEqual(10, window.stock_table.rowCount())
+
     def test_instance_selection_returns_single_instance_scope(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스")]
         window = self._window_harness()
@@ -10906,12 +11101,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             group = GroupRecord(
                 name="지표추종매매",
                 path=Path(temp) / "지표추종매매",
-                source_type="LEGACY_FOLDER",
+                source_type="logical_registry",
+                group_id="group-a",
                 budget={},
                 valid=True,
             )
             instances = [
-                self._instance("inst-b", "지표추종매매B"),
+                self._instance("inst-b", "지표추종매매B", group_id=group.group_id),
                 self._instance("inst-c", "지표추종매매C"),
             ]
             stocks = [
@@ -10948,7 +11144,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             group = GroupRecord(
                 name="지표추종매매",
                 path=Path(temp) / "지표추종매매",
-                source_type="LEGACY_FOLDER",
+                source_type="logical_registry",
+                group_id="group-a",
                 budget={},
                 valid=True,
             )
@@ -10956,7 +11153,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 self._instance(
                     "inst-c",
                     "지표추종매매C",
-                    group_id=str(group.path.resolve()),
+                    group_id=group.group_id,
                 )
             ]
 
@@ -10967,6 +11164,219 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
 
         self.assertEqual({"inst-c"}, projected_ids)
+
+    def test_valid_routine_view_includes_explicit_group_assigned_stock(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            target_group = GroupRecord(
+                name="지표추종복사",
+                path=root / "_지표추종복사",
+                source_type="logical_registry",
+                group_id="group-b",
+                budget={},
+                valid=True,
+            )
+            other_group = GroupRecord(
+                name="지표추종매매",
+                path=root / "_지표추종매매",
+                source_type="logical_registry",
+                group_id="group-a",
+                budget={},
+                valid=True,
+            )
+            instance = self._instance(
+                "inst-b",
+                "지표추종복사B",
+                group_id=target_group.group_id,
+            )
+            stock = {
+                "code": "105560",
+                "name": "KB금융",
+                "stock_path": "stocks/105560_KB금융",
+                "routines": ["지표추종매매"],
+                "assigned_routine_instance_id": "inst-b",
+            }
+            window = self._window_harness()
+            window._routine_tree_projected_instance_ids_override = None
+            window._routine_tree_display_level = "routine"
+            window._routine_tree_valid_only = True
+            window._routine_instance_operation_counts = lambda: {
+                "inst-b": {"registered": 1}
+            }
+
+            with (
+                patch.object(
+                    setting_window,
+                    "load_routine_definitions",
+                    return_value=[self._definition()],
+                ),
+                patch.object(
+                    setting_window,
+                    "load_persisted_routine_instances",
+                    return_value=[instance],
+                ),
+                patch.object(
+                    setting_window,
+                    "get_group_records",
+                    return_value=[target_group, other_group],
+                ),
+                patch.object(
+                    setting_window,
+                    "read_base_stocks",
+                    return_value=[stock],
+                ),
+            ):
+                window.load_routine_table()
+
+            visible_instances = [
+                window.routine_table.item(row, 0).data(
+                    setting_window.Qt.UserRole
+                )
+                for row in range(window.routine_table.rowCount())
+                if not window.routine_table.isRowHidden(row)
+                and window.routine_table.item(row, 0).data(
+                    setting_window.Qt.UserRole
+                ).get("row_kind") == "instance"
+            ]
+
+        self.assertEqual(["inst-b"], [item["instance_id"] for item in visible_instances])
+        self.assertEqual(1, visible_instances[0]["registered"])
+
+    def test_group_level_displays_discovered_group_without_instances(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            group_a = GroupRecord(
+                name="지표추종매매",
+                path=root / "_지표추종매매",
+                source_type="logical_registry",
+                group_id="group-a",
+                budget={},
+                valid=True,
+            )
+            group_b = GroupRecord(
+                name="지표추종복사",
+                path=root / "_지표추종복사",
+                source_type="logical_registry",
+                group_id="group-b",
+                budget={},
+                valid=True,
+            )
+            instances = [
+                self._instance(
+                    "inst-a",
+                    "지표추종매매B",
+                    group_id=group_a.group_id,
+                )
+            ]
+            window = self._window_harness()
+            window._routine_tree_projected_instance_ids_override = None
+            window._routine_tree_display_level = "category"
+            window._routine_tree_valid_only = True
+            window._routine_instance_operation_counts = lambda: {}
+
+            def group_snapshot() -> list[tuple[str, int, str]]:
+                snapshot = []
+                for row in range(window.routine_table.rowCount()):
+                    metadata = window.routine_table.item(row, 0).data(
+                        setting_window.Qt.UserRole
+                    )
+                    if metadata.get("row_kind") == "definition":
+                        snapshot.append(
+                            (
+                                metadata["display_name"],
+                                int(metadata["instance_count"]),
+                                metadata["group_id"],
+                            )
+                        )
+                return snapshot
+
+            with (
+                patch.object(
+                    setting_window,
+                    "load_routine_definitions",
+                    return_value=[self._definition()],
+                ),
+                patch.object(
+                    setting_window,
+                    "load_persisted_routine_instances",
+                    side_effect=lambda: list(instances),
+                ),
+                patch.object(
+                    setting_window,
+                    "get_group_records",
+                    return_value=[group_a, group_b],
+                ),
+                patch.object(setting_window, "read_base_stocks", return_value=[]),
+            ):
+                window.load_routine_table()
+                first = group_snapshot()
+                first_hidden = [
+                    window.routine_table.isRowHidden(row)
+                    for row in range(window.routine_table.rowCount())
+                    if window.routine_table.item(row, 0).data(
+                        setting_window.Qt.UserRole
+                    ).get("row_kind") == "definition"
+                ]
+                empty_group_metadata = next(
+                    window.routine_table.item(row, 0).data(
+                        setting_window.Qt.UserRole
+                    )
+                    for row in range(window.routine_table.rowCount())
+                    if window.routine_table.item(row, 0).data(
+                        setting_window.Qt.UserRole
+                    ).get("group_id") == group_b.group_id
+                )
+                open_registration = MagicMock()
+                window._open_routine_settings_dialog = open_registration
+                window.open_routine_registration(empty_group_metadata)
+                window.load_routine_table()
+                refreshed = group_snapshot()
+
+                instances.append(
+                    self._instance(
+                        "inst-b",
+                        "지표추종복사A",
+                        group_id=group_b.group_id,
+                    )
+                )
+                window.load_routine_table()
+                registered = group_snapshot()
+
+            self.assertEqual(
+                [
+                    ("지표추종매매", 1, group_a.group_id),
+                    ("지표추종복사", 0, group_b.group_id),
+                ],
+                first,
+            )
+            self.assertEqual(first, refreshed)
+            self.assertEqual([False, False], first_hidden)
+            open_registration.assert_called_once_with(
+                empty_group_metadata,
+                registration=True,
+            )
+            self.assertEqual(2, len(setting_window.build_main_group_projection(
+                [group_a, group_b], instances[:1], []
+            )))
+            self.assertEqual(
+                [
+                    ("지표추종매매", 1, group_a.group_id),
+                    ("지표추종복사", 1, group_b.group_id),
+                ],
+                registered,
+            )
+
+            group_b_row = next(
+                row
+                for row in range(window.routine_table.rowCount())
+                if window.routine_table.item(row, 0).data(
+                    setting_window.Qt.UserRole
+                ).get("group_id") == group_b.group_id
+            )
+            metadata = window.routine_table.item(group_b_row, 0).data(
+                setting_window.Qt.UserRole
+            )
+            self.assertEqual("indicator_follow", metadata["definition_id"])
 
     def test_development_historical_fixture_can_be_disabled_once(self) -> None:
         with patch.dict(

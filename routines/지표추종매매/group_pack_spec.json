@@ -1,0 +1,20 @@
+{
+  "definition_id": "indicator_follow",
+  "base_name": "지표추종매매",
+  "files": [
+    "routines/지표추종매매/routine.json",
+    "routines/지표추종매매/routine.py",
+    "routines/지표추종매매/rules.json",
+    "routines/지표추종매매/routine_buy_execution.py",
+    "routines/지표추종매매/routine_condition_engine.py",
+    "routines/지표추종매매/routine_cycle_projection.py",
+    "routines/지표추종매매/routine_macd_engine.py",
+    "routines/지표추종매매/routine_rule_mapper.py",
+    "gui_indicator_follow_routine_settings_dialog.py",
+    "gui_indicator_follow_common_widgets.py",
+    "gui_indicator_follow_control_tab.py",
+    "gui_indicator_follow_buy_controls.py",
+    "gui_indicator_follow_buy_method_controls.py",
+    "gui_indicator_follow_sell_controls.py"
+  ]
+}

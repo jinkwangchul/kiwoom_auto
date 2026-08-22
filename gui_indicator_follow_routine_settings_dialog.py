@@ -64,7 +64,7 @@ from gui_indicator_follow_common_widgets import IndicatorFollowCommonWidgetsMixi
 from gui_indicator_follow_control_tab import IndicatorFollowControlTabMixin
 from gui_indicator_follow_buy_controls import IndicatorFollowBuyControlsMixin
 from gui_indicator_follow_sell_controls import IndicatorFollowSellControlsMixin
-from gui_routine_registry import get_routine_records
+from gui_routine_registry import get_routine_records, normalize_routine_name
 from gui_toast import show_toast
 from gui_window_policy import (
     configure_persistent_feature_window,
@@ -127,12 +127,14 @@ def register_routine_instance_snapshot(
     definition_id: str,
     definition_display_name: str,
     group_id: str = "",
+    group_display_name: str = "",
     source_instance_display_name: str = "",
     rules_provider,
 ):
     from gui_routine_registration_dialog import (
         RoutineRegistrationDialog,
         suggest_cloned_routine_instance_display_name,
+        suggest_group_routine_instance_display_name,
         suggest_routine_instance_display_name,
     )
 
@@ -152,9 +154,16 @@ def register_routine_instance_snapshot(
             existing_names,
         )
         if str(source_instance_display_name or "").strip()
-        else suggest_routine_instance_display_name(
-            definition_display_name,
-            len(existing_names),
+        else (
+            suggest_group_routine_instance_display_name(
+                group_display_name,
+                existing_names,
+            )
+            if (group_display_name := normalize_routine_name(group_display_name))
+            else suggest_routine_instance_display_name(
+                definition_display_name,
+                len(existing_names),
+            )
         )
     )
     dialog = RoutineRegistrationDialog(
@@ -162,6 +171,7 @@ def register_routine_instance_snapshot(
         definition_display_name=definition_display_name,
         initial_display_name=initial_display_name,
         group_id=group_id,
+        group_display_name=group_display_name,
         parent=owner,
     )
     if dialog.exec_() != QDialog.Accepted or dialog.registration_request is None:
@@ -190,6 +200,12 @@ def register_routine_instance_snapshot(
         return None
 
     owner.last_registered_instance_id = result.instance.instance_id
+    success_message = (
+        f"'{result.instance.display_name}' 루틴을 비활성 상태로 등록했습니다."
+        if str(source_instance_display_name or "").strip()
+        else f"'{result.instance.display_name}' 루틴을 등록했습니다."
+    )
+    show_toast(owner, success_message)
     refresh_owner = persistent_feature_root(owner)
     refresh_views = getattr(
         refresh_owner,
@@ -202,10 +218,6 @@ def register_routine_instance_snapshot(
         refresh_all = getattr(refresh_owner, "refresh_all", None)
         if callable(refresh_all):
             refresh_all()
-    show_toast(
-        owner,
-        f"'{result.instance.display_name}' 루틴을 비활성 상태로 등록했습니다.",
-    )
     return result.instance
 
 
@@ -236,6 +248,7 @@ class IndicatorFollowRoutineSettingsDialog(
         definition_display_name=None,
         instance_id=None,
         group_id=None,
+        group_display_name=None,
         settings_mode=None,
     ):
         super().__init__(None)
@@ -246,6 +259,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self.definition_display_name = str(definition_display_name or routine_name or "").strip()
         self.instance_id = str(instance_id or "").strip()
         self.group_id = str(group_id or "").strip()
+        self.group_display_name = str(group_display_name or "").strip()
         inferred_mode = "edit" if self.instance_id else "registration"
         self.settings_mode = str(settings_mode or inferred_mode).strip().lower()
         if self.settings_mode not in {"registration", "edit"}:
@@ -756,13 +770,19 @@ class IndicatorFollowRoutineSettingsDialog(
             }
 
     def open_registration_dialog(self):
-        return register_routine_instance_snapshot(
+        instance = register_routine_instance_snapshot(
             self,
             definition_id=self.definition_id,
             definition_display_name=self.definition_display_name,
             group_id=str(getattr(self, "group_id", "") or "").strip(),
+            group_display_name=str(
+                getattr(self, "group_display_name", "") or ""
+            ).strip(),
             rules_provider=self.build_registration_rules_from_current_ui_state,
         )
+        if instance is not None and self.settings_mode == "registration":
+            self.close()
+        return instance
 
     def _load_indicator_follow_rule_mapper(self):
         import importlib.util

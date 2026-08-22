@@ -20,6 +20,7 @@ from gui_indicator_follow_routine_settings_dialog import (
 from gui_routine_registration_dialog import (
     RoutineRegistrationDialog,
     suggest_cloned_routine_instance_display_name,
+    suggest_group_routine_instance_display_name,
     suggest_routine_instance_display_name,
 )
 from routine_instance_repository import RoutineInstanceCreateRequest, RoutineInstanceRepository
@@ -39,6 +40,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             definition_id="indicator_follow",
             definition_display_name="지표추종매매",
             group_id=str(Path("groups") / "대형주"),
+            group_display_name="대형주",
         )
         dialog.name_edit.setText("대형주 추세형")
         dialog.description_edit.setText("대형주 중심")
@@ -68,6 +70,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             definition_display_name="지표추종매매",
             initial_display_name="지표추종매매C",
             group_id=str(Path("groups") / "_지표추종매매"),
+            group_display_name="지표추종매매",
         )
         dialog.show()
         self.app.processEvents()
@@ -182,12 +185,100 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 definition_id="indicator_follow",
                 definition_display_name="지표추종매매",
                 group_id=str(Path("groups") / "_동전주"),
+                group_display_name="동전주",
                 source_instance_display_name="동전주A",
                 rules_provider=Mock(),
             )
 
         self.assertIsNone(result)
         self.assertEqual("동전주B", dialog_type.call_args.kwargs["initial_display_name"])
+
+    def test_group_registration_name_uses_normalized_group_family(self) -> None:
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Rejected
+        fake_dialog.registration_request = None
+        existing = [
+            SimpleNamespace(
+                definition_id="indicator_follow",
+                display_name="지표추종복사A",
+            ),
+            SimpleNamespace(
+                definition_id="indicator_follow",
+                display_name="지표추종복사B",
+            ),
+        ]
+        with (
+            patch(
+                "gui_routine_registration_dialog.RoutineRegistrationDialog",
+                return_value=fake_dialog,
+            ) as dialog_type,
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.load_persisted_routine_instances",
+                return_value=existing,
+            ),
+        ):
+            result = register_routine_instance_snapshot(
+                SimpleNamespace(),
+                definition_id="indicator_follow",
+                definition_display_name="지표추종매매",
+                group_id=str(Path("groups") / "_지표추종복사"),
+                group_display_name="지표추종복사",
+                rules_provider=Mock(),
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            "지표추종복사C",
+            dialog_type.call_args.kwargs["initial_display_name"],
+        )
+
+    def test_group_registration_name_starts_with_group_display_name(self) -> None:
+        fake_dialog = Mock()
+        fake_dialog.exec_.return_value = QDialog.Rejected
+        fake_dialog.registration_request = None
+        with (
+            patch(
+                "gui_routine_registration_dialog.RoutineRegistrationDialog",
+                return_value=fake_dialog,
+            ) as dialog_type,
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.load_persisted_routine_instances",
+                return_value=[],
+            ),
+        ):
+            register_routine_instance_snapshot(
+                SimpleNamespace(),
+                definition_id="indicator_follow",
+                definition_display_name="지표추종매매",
+                group_id=str(Path("groups") / "_지표추종복사"),
+                group_display_name="지표추종복사",
+                rules_provider=Mock(),
+            )
+
+        self.assertEqual(
+            "지표추종복사A",
+            dialog_type.call_args.kwargs["initial_display_name"],
+        )
+
+    def test_group_registration_name_uses_first_available_suffix(self) -> None:
+        self.assertEqual(
+            "지표추종복사A",
+            suggest_group_routine_instance_display_name("지표추종복사", []),
+        )
+        self.assertEqual(
+            "지표추종복사B",
+            suggest_group_routine_instance_display_name(
+                "지표추종복사",
+                ["지표추종복사A"],
+            ),
+        )
+        self.assertEqual(
+            "지표추종복사B",
+            suggest_group_routine_instance_display_name(
+                "지표추종복사",
+                ["지표추종복사A", "지표추종복사C"],
+            ),
+        )
 
     def test_default_name_uses_persisted_instance_count_and_description_label_is_memo(self) -> None:
         self.assertEqual(
@@ -227,6 +318,8 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             definition_display_name="지표추종매매",
             routine_name="지표추종매매",
             build_registration_rules_from_current_ui_state=Mock(),
+            settings_mode="registration",
+            close=Mock(),
         )
         fake_dialog = Mock()
         fake_dialog.exec_.return_value = QDialog.Rejected
@@ -241,10 +334,14 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         self.assertIsNone(result)
         fake_self.build_registration_rules_from_current_ui_state.assert_not_called()
         repository.assert_not_called()
+        fake_self.close.assert_not_called()
 
     def test_success_refreshes_parent_once_after_repository_success(self) -> None:
+        lifecycle_events = []
         parent = SimpleNamespace(
-            refresh_auto_trade_assignment_views=Mock(),
+            refresh_auto_trade_assignment_views=Mock(
+                side_effect=lambda: lifecycle_events.append("refresh")
+            ),
             refresh_all=Mock(),
         )
         request = RoutineInstanceCreateRequest(
@@ -259,6 +356,8 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 return_value={"success": True, "rules": {"buy": {}}, "error": ""}
             ),
             parent=lambda: parent,
+            settings_mode="registration",
+            close=Mock(side_effect=lambda: lifecycle_events.append("close")),
         )
         fake_dialog = Mock()
         fake_dialog.exec_.return_value = QDialog.Accepted
@@ -275,7 +374,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
             patch("gui_routine_registration_dialog.RoutineRegistrationDialog", return_value=fake_dialog),
             patch("gui_indicator_follow_routine_settings_dialog.RoutineInstanceRepository", return_value=repository),
             patch("gui_indicator_follow_routine_settings_dialog.QMessageBox.information") as information,
-            patch("gui_indicator_follow_routine_settings_dialog.show_toast") as toast,
+            patch(
+                "gui_indicator_follow_routine_settings_dialog.show_toast",
+                side_effect=lambda *_args: lifecycle_events.append("toast"),
+            ) as toast,
         ):
             result = IndicatorFollowRoutineSettingsDialog.open_registration_dialog(fake_self)
 
@@ -286,8 +388,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         information.assert_not_called()
         toast.assert_called_once_with(
             fake_self,
-            "'대형주 추세형' 루틴을 비활성 상태로 등록했습니다.",
+            "'대형주 추세형' 루틴을 등록했습니다.",
         )
+        fake_self.close.assert_called_once_with()
+        self.assertEqual(["toast", "refresh", "close"], lifecycle_events)
 
     def test_storage_failure_does_not_refresh_parent(self) -> None:
         parent = SimpleNamespace(
@@ -306,6 +410,8 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                 return_value={"success": True, "rules": {}, "error": ""}
             ),
             parent=lambda: parent,
+            settings_mode="registration",
+            close=Mock(),
         )
         fake_dialog = Mock()
         fake_dialog.exec_.return_value = QDialog.Accepted
@@ -327,6 +433,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
         self.assertIsNone(result)
         parent.refresh_auto_trade_assignment_views.assert_not_called()
         parent.refresh_all.assert_not_called()
+        fake_self.close.assert_not_called()
 
     def test_registration_rules_use_existing_ui_mapper_without_writing(self) -> None:
         base_rules = {"indicator_follow_ui_state": {"state": {"basic": {}}}}

@@ -1,4 +1,4 @@
-"""Read-only Main projection from root Groups and existing stock assignments."""
+"""Read-only projection from logical Groups and explicit assignments."""
 
 from __future__ import annotations
 
@@ -24,8 +24,7 @@ class ProjectedMainGroup:
 
     @property
     def group_id(self) -> str:
-        path = Path(getattr(self.group, "path", ""))
-        return str(path.resolve(strict=False))
+        return str(getattr(self.group, "group_id", "") or "").strip()
 
     @property
     def group_path(self) -> Path:
@@ -33,19 +32,11 @@ class ProjectedMainGroup:
 
     @property
     def display_name(self) -> str:
-        return str(getattr(self.group, "name", "") or "").strip()
-
-
-def stock_group_assignment_names(stock: dict[str, object]) -> tuple[str, ...]:
-    """Read the existing central-stock Group assignment compatibility field."""
-    raw = stock.get("routines", ())
-    values = raw if isinstance(raw, (list, tuple, set)) else (raw,)
-    names: list[str] = []
-    for value in values:
-        name = str(value or "").strip()
-        if name and name not in names:
-            names.append(name)
-    return tuple(names)
+        return str(
+            getattr(self.group, "display_name", "")
+            or getattr(self.group, "name", "")
+            or ""
+        ).strip()
 
 
 def _stock_identity(stock: dict[str, object]) -> tuple[str, str, str]:
@@ -65,8 +56,12 @@ def build_main_group_projection(
     ordered_groups = sorted(
         groups,
         key=lambda group: (
-            str(getattr(group, "name", "") or "").casefold(),
-            str(Path(getattr(group, "path", ""))).casefold(),
+            str(
+                getattr(group, "display_name", "")
+                or getattr(group, "name", "")
+                or ""
+            ).casefold(),
+            str(getattr(group, "group_id", "") or "").casefold(),
         ),
     )
     instance_by_id = {
@@ -78,43 +73,28 @@ def build_main_group_projection(
         instance_id: str(getattr(instance, "group_id", "") or "").strip()
         for instance_id, instance in instance_by_id.items()
     }
-    groups_by_name: dict[str, list[object]] = {}
-    for group in ordered_groups:
-        name = str(getattr(group, "name", "") or "").strip()
-        path = Path(getattr(group, "path", ""))
-        if not name or not path:
-            continue
-        groups_by_name.setdefault(name, []).append(group)
-
-    stocks_by_relation: dict[tuple[str, str], dict[tuple[str, str, str], dict[str, object]]] = {}
+    stocks_by_instance: dict[
+        str,
+        dict[tuple[str, str, str], dict[str, object]],
+    ] = {}
     for stock in stocks:
         if not isinstance(stock, dict):
             continue
         instance_id = str(stock.get("assigned_routine_instance_id", "") or "").strip()
         if instance_id not in instance_by_id:
             continue
-        for group_name in stock_group_assignment_names(stock):
-            matching_groups = groups_by_name.get(group_name, ())
-            if len(matching_groups) != 1:
-                continue
-            group = matching_groups[0]
-            group_id = str(Path(getattr(group, "path", "")).resolve(strict=False))
-            stocks_by_relation.setdefault((group_id, instance_id), {})[
-                _stock_identity(stock)
-            ] = stock
+        stock_identity = _stock_identity(stock)
+        stocks_by_instance.setdefault(instance_id, {})[stock_identity] = stock
 
     projected: list[ProjectedMainGroup] = []
     for group in ordered_groups:
-        group_id = str(Path(getattr(group, "path", "")).resolve(strict=False))
+        group_id = str(getattr(group, "group_id", "") or "").strip()
         projected_instances: list[ProjectedGroupInstance] = []
         for instance_id, instance in instance_by_id.items():
-            related = stocks_by_relation.get((group_id, instance_id), {})
             explicit_group_id = explicit_group_id_by_instance.get(instance_id, "")
-            if explicit_group_id:
-                if explicit_group_id != group_id:
-                    continue
-            elif not related:
+            if not explicit_group_id or explicit_group_id != group_id:
                 continue
+            related = stocks_by_instance.get(instance_id, {})
             projected_instances.append(
                 ProjectedGroupInstance(
                     instance=instance,

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPainter
 from PyQt5.QtWidgets import (
@@ -18,7 +16,6 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-from gui_routine_registry import normalize_routine_name
 from routine_instance_repository import RoutineInstanceCreateRequest
 
 
@@ -79,6 +76,24 @@ def suggest_routine_instance_display_name(
     return f"{base}{chr(ord('A') + count)}"
 
 
+def suggest_group_routine_instance_display_name(
+    group_display_name: str,
+    existing_display_names: list[str],
+) -> str:
+    base = str(group_display_name or "").strip()
+    if not base:
+        return ""
+    existing = {
+        str(display_name or "").strip()
+        for display_name in existing_display_names
+    }
+    for suffix_index in range(26):
+        candidate = f"{base}{chr(ord('A') + suffix_index)}"
+        if candidate not in existing:
+            return candidate
+    return ""
+
+
 def suggest_cloned_routine_instance_display_name(
     source_display_name: str,
     existing_display_names: list[str],
@@ -111,6 +126,7 @@ class RoutineRegistrationDialog(QDialog):
         definition_display_name: str,
         initial_display_name: str = "",
         group_id: str = "",
+        group_display_name: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -130,12 +146,8 @@ class RoutineRegistrationDialog(QDialog):
         form.setHorizontalSpacing(28)
         form.setVerticalSpacing(10)
 
-        group_display_name = (
-            normalize_routine_name(Path(self.group_id).name)
-            if self.group_id
-            else "-"
-        )
-        self.definition_label = QLabel(group_display_name)
+        self.group_display_name = str(group_display_name or "").strip()
+        self.definition_label = QLabel(self.group_display_name or "-")
         self.definition_label.setObjectName("routineRegistrationDefinition")
         self.name_edit = QLineEdit()
         self.name_edit.setObjectName("routineRegistrationName")

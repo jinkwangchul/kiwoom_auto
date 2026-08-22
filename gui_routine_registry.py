@@ -2,47 +2,30 @@
 """
 gui_routine_registry.py
 
-Routine Definition package와 프로젝트 루트 Group을 독립적으로 인식한다.
+Routine Definition package와 Logical Group Registry를 독립적으로 인식한다.
 
 - Routine Definition: routines/<루틴명>/routine.json
-- Group: _<그룹명>/budget.json
+- Group: groups/registry.json + groups/<UUID>/group.json
 - routine.py는 존재 여부만 확인하며 직접 매매 실행하지 않는다.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from group_recovery_repository import (
-    GroupRecoveryControlRecord,
-    list_group_recovery_controls,
-    restore_missing_group_snapshots,
-    sync_group_recovery_snapshot,
-)
-
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 ROUTINES_ROOT = PROJECT_ROOT / "routines"
-LOGGER = logging.getLogger(__name__)
-_PENDING_GROUP_RECOVERY_MESSAGES: list[str] = []
-
-
-def consume_group_recovery_messages() -> tuple[str, ...]:
-    messages = tuple(_PENDING_GROUP_RECOVERY_MESSAGES)
-    _PENDING_GROUP_RECOVERY_MESSAGES.clear()
-    return messages
 
 
 @dataclass(frozen=True)
 class RoutineRecord:
     name: str
     path: Path
-    source_type: str  # package | legacy_folder
+    source_type: str  # package
     enabled: bool
     version: str
     routine_type: str
@@ -57,12 +40,29 @@ class RoutineRecord:
 
 @dataclass(frozen=True)
 class GroupRecord:
-    name: str
-    path: Path
-    source_type: str
-    budget: dict[str, Any]
-    valid: bool
+    name: str = ""
+    path: Path = field(default_factory=Path)
+    source_type: str = ""
+    budget: dict[str, Any] = field(default_factory=dict)
+    valid: bool = True
     problem: str = ""
+    group_id: str = ""
+    definition_id: str = ""
+    base_name: str = ""
+    display_name: str = ""
+    slot: int = 0
+
+    def __post_init__(self) -> None:
+        path = Path(self.path)
+        display_name = str(self.display_name or self.name or "").strip()
+        group_id = str(self.group_id or "").strip()
+        if not group_id:
+            raise ValueError("GroupRecord.group_id is required")
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "name", display_name)
+        object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "base_name", str(self.base_name or display_name).strip())
+        object.__setattr__(self, "group_id", group_id)
 
 
 def _decode_hash_unicode(text: str) -> str:
@@ -178,38 +178,15 @@ def _record_from_package(package_dir: Path) -> RoutineRecord | None:
     )
 
 
-def _group_display_name(path: Path) -> str:
-    return _normalize_routine_name(path.name)
-
-
-def _record_from_legacy_folder(group_dir: Path) -> GroupRecord | None:
-    """Compatibility helper for the existing root Group folder contract."""
-    budget_path = group_dir / "budget.json"
-    if not group_dir.is_dir() or not group_dir.name.startswith("_") or not budget_path.exists():
-        return None
-    budget = _safe_read_json(budget_path)
-    return GroupRecord(
-        name=_group_display_name(group_dir),
-        path=group_dir,
-        source_type="legacy_folder",
-        budget=budget,
-        valid=True,
-        problem="",
-    )
-
-
 def scan_routine_records(
-    include_legacy_fallback: bool = True,
     *,
     project_root: Path | str | None = None,
     routines_root: Path | str | None = None,
 ) -> list[RoutineRecord]:
     """Return Routine Definition packages only.
 
-    ``include_legacy_fallback`` remains for caller compatibility. Root Groups are
-    never Routine Definitions and are discovered by :func:`scan_group_records`.
+    Root folders are never Routine Definitions.
     """
-    del include_legacy_fallback
     root = Path(project_root) if project_root is not None else PROJECT_ROOT
     if routines_root is not None:
         routine_root = Path(routines_root)
@@ -231,56 +208,63 @@ def scan_routine_records(
 def scan_group_records(
     *,
     project_root: Path | str | None = None,
-    sync_recovery: bool = True,
 ) -> list[GroupRecord]:
-    """Return valid root Groups independently of Routine Definition packages."""
+    """Return Groups listed by a valid logical registry."""
     root = Path(project_root) if project_root is not None else PROJECT_ROOT
-    records: list[GroupRecord] = []
     if not root.exists() or not root.is_dir():
-        return records
+        return []
 
-    if sync_recovery:
-        for result in restore_missing_group_snapshots(root):
-            if result.restored:
-                message = f"{result.display_name} 그룹을 복구하였습니다."
-                if message not in _PENDING_GROUP_RECOVERY_MESSAGES:
-                    _PENDING_GROUP_RECOVERY_MESSAGES.append(message)
-            elif not result.success:
-                LOGGER.warning(
-                    "Group recovery restore failed: target=%s error=%s",
-                    result.target_path,
-                    result.error,
-                )
+    from logical_group_registry import LogicalGroupRepository
 
-    for child in sorted(root.iterdir(), key=lambda item: _decode_hash_unicode(item.name)):
-        record = _record_from_legacy_folder(child)
-        if record is not None:
-            records.append(record)
-
-    if sync_recovery:
-        for record in records:
-            result = sync_group_recovery_snapshot(root, record)
-            if not result.success:
-                LOGGER.warning(
-                    "Group recovery sync failed: group=%s path=%s error=%s",
-                    record.name,
-                    record.path,
-                    result.error,
-                )
-
-    return sorted(records, key=lambda item: item.name)
+    logical_repository = LogicalGroupRepository(root)
+    registry_state = logical_repository.registry_state()
+    if not (
+        registry_state.exists
+        and registry_state.valid
+        and registry_state.mode == "logical"
+    ):
+        return []
+    logical_scan = logical_repository.scan_groups()
+    records = [
+        GroupRecord(
+            name=record.display_name,
+            path=record.group_dir,
+            source_type="logical_registry",
+            budget={},
+            valid=True,
+            problem="",
+            group_id=record.group_id,
+            definition_id=record.definition_id,
+            base_name=record.base_name,
+            display_name=record.display_name,
+            slot=record.slot,
+        )
+        for record in logical_scan.groups
+    ]
+    return sorted(
+        records,
+        key=lambda item: (item.display_name.casefold(), item.group_id),
+    )
 
 
 def get_routine_records() -> list[RoutineRecord]:
     return scan_routine_records()
 
 
-def get_group_records(*, sync_recovery: bool = True) -> list[GroupRecord]:
-    return scan_group_records(sync_recovery=sync_recovery)
+def get_group_records() -> list[GroupRecord]:
+    return scan_group_records()
 
 
-def get_group_recovery_control_records() -> tuple[GroupRecoveryControlRecord, ...]:
-    return list_group_recovery_controls(PROJECT_ROOT)
+def group_record_by_id(
+    group_id: str,
+) -> GroupRecord | None:
+    target = str(group_id or "").strip()
+    if not target:
+        return None
+    for record in get_group_records():
+        if record.group_id == target:
+            return record
+    return None
 
 
 def get_group_dirs() -> list[Path]:
@@ -299,9 +283,6 @@ def routine_display_name(routine_path: Path) -> str:
         record = _record_from_package(path)
         if record is not None:
             return record.name
-        group = _record_from_legacy_folder(path)
-        if group is not None:
-            return group.name
     return _normalize_routine_name(path.name)
 
 
@@ -323,15 +304,12 @@ def routine_exists(name: str) -> bool:
 
 
 def read_routine_budget(routine_path_or_name: Path | str) -> dict[str, Any]:
-    """신규 routine.json budget 또는 기존 budget.json을 같은 형태로 반환한다."""
+    """Return the budget declared by a Routine Definition package."""
     if isinstance(routine_path_or_name, Path):
         path = routine_path_or_name
         package = _record_from_package(path)
         if package is not None:
             return dict(package.budget)
-        group = _record_from_legacy_folder(path)
-        if group is not None:
-            return dict(group.budget)
         return {}
 
     record = routine_record_by_name(str(routine_path_or_name))

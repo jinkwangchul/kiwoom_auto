@@ -23,7 +23,7 @@ from gui_schedule_utils import (
     schedule_config_updates,
 )
 from runtime_io import read_json_dict
-from gui_auto_trade_runtime import get_stock_dirs_in_routine
+from group_scope import load_group_scope
 from runtime_stock_state_mutation import mutate_runtime_stock_state
 from gui_order_utils import pending_order_side_quantities
 from gui_ats_utils import manual_ats_active_now
@@ -740,19 +740,24 @@ def auto_trade_recalculate_all_status_by_operation_policy(
 ) -> dict[str, int]:
     """전체 루틴 전체 종목을 운영방식/현재시간 기준으로 재판정한다."""
     result = {"changed": 0, "unchanged": 0, "protected": 0, "failed": 0}
-    for routine_dir in get_group_dirs():
-        for stock_dir in get_stock_dirs_in_routine(routine_dir):
-            code, name = parse_stock_folder_name(stock_dir.name)
-            status, _, _ = window.recalculate_stock_status_by_operation_policy(
-                stock_dir,
-                code,
-                name,
-                reason,
-                silent_unchanged=silent_unchanged,
-            )
-            if status not in result:
-                result[status] = 0
-            result[status] += 1
+    stock_dirs_getter = getattr(window, "all_runtime_stock_dirs", None)
+    stock_dirs = (
+        list(stock_dirs_getter())
+        if callable(stock_dirs_getter)
+        else list(load_group_scope().all_group_stock_dirs())
+    )
+    for stock_dir in stock_dirs:
+        code, name = parse_stock_folder_name(stock_dir.name)
+        status, _, _ = window.recalculate_stock_status_by_operation_policy(
+            stock_dir,
+            code,
+            name,
+            reason,
+            silent_unchanged=silent_unchanged,
+        )
+        if status not in result:
+            result[status] = 0
+        result[status] += 1
     if write_changelog_when_unchanged or result.get("changed", 0) or result.get("failed", 0):
         append_changelog(
             "UPDATE",

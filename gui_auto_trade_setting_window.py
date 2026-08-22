@@ -449,6 +449,17 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     def _refresh_parent_views(self) -> None:
         parent = persistent_feature_owner(self)
+        refresh_assignment_views = getattr(
+            parent,
+            "refresh_auto_trade_assignment_views",
+            None,
+        )
+        if callable(refresh_assignment_views):
+            try:
+                refresh_assignment_views()
+                return
+            except Exception:
+                LOGGER.exception("Failed to refresh assignment views")
         if parent is not None and hasattr(parent, "refresh_all"):
             try:
                 parent.refresh_all()
@@ -1266,7 +1277,6 @@ from gui_review_required_window import (
     GlobalReviewRequiredWindow,
 )
 from gui_routine_registry import (
-    consume_group_recovery_messages,
     get_group_dirs as registry_get_group_dirs,
     get_group_records,
     routine_display_name as registry_routine_display_name,
@@ -1281,6 +1291,7 @@ from routine_instance_registry import (
 )
 from routine_instance_repository import RoutineInstanceRepository
 from stock_repository import StockRepository
+from group_scope import load_group_scope
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_final_send_gate_input_adapter import adapt_final_send_gate_readiness_to_input
 from execution_final_send_gate_orchestrator import orchestrate_final_send_gate_preview
@@ -1544,6 +1555,14 @@ def routine_tree_instance_title_text(display_name: object) -> str:
     if len(text) <= 7:
         return text
     return f"{text[:ROUTINE_TREE_TITLE_PREFIX_CHARS]}..."
+
+
+def routine_tree_parent_identity(metadata: dict[str, object]) -> str:
+    return str(
+        metadata.get("group_id", "")
+        or metadata.get("definition_id", "")
+        or ""
+    ).strip()
 
 
 def routine_tree_title_width(font_metrics) -> int:
@@ -2514,15 +2533,22 @@ def open_routine_settings_dialog_for_owner(
         )
         return
 
+    registration_display_name = str(
+        metadata.get("group_display_name", "")
+        or metadata.get("display_name", "")
+        or metadata.get("definition_name", "")
+        or definition.display_name
+    ).strip()
     dialog = IndicatorFollowRoutineSettingsDialog(
         rules_path=rules_path,
         routine_path=definition.package_dir,
-        routine_name=definition.display_name if registration else instance.display_name,
+        routine_name=registration_display_name if registration else instance.display_name,
         parent=owner,
         definition_id=definition.definition_id,
         definition_display_name=definition.display_name,
         instance_id="" if registration else instance.instance_id,
         group_id=str(metadata.get("group_id", "") or "").strip(),
+        group_display_name=registration_display_name if registration else "",
         settings_mode="registration" if registration else "edit",
     )
     dialog.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -4977,7 +5003,7 @@ class AutoTradeSettingWindow(QDialog):
             icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
             icon_label.setProperty(
                 "autoTradeSettingRoutineTreeToggleDefinitionId",
-                str(row_data.get("definition_id", "") or ""),
+                routine_tree_parent_identity(row_data),
             )
             icon_label.setProperty(
                 "autoTradeSettingRoutineTreeToggleEnabled",
@@ -5750,9 +5776,9 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             row_kind = str(metadata.get("row_kind", "") or "")
             if row_kind == "definition":
-                definition_id = str(metadata.get("definition_id", "") or "").strip()
-                if definition_id:
-                    definition_ids.add(definition_id)
+                parent_id = routine_tree_parent_identity(metadata)
+                if parent_id:
+                    definition_ids.add(parent_id)
             elif row_kind == "instance":
                 instance_id = str(metadata.get("instance_id", "") or "").strip()
                 if instance_id:
@@ -5918,7 +5944,6 @@ class AutoTradeSettingWindow(QDialog):
         clean_target_id = str(target_id or "").strip()
         if not clean_row_kind or not clean_target_id:
             return False
-        target_key = "definition_id" if clean_row_kind == "definition" else "instance_id"
         for row in range(self.routine_table.rowCount()):
             item = self.routine_table.item(row, 0)
             metadata = item.data(Qt.UserRole) if item is not None else None
@@ -5926,7 +5951,12 @@ class AutoTradeSettingWindow(QDialog):
                 continue
             if str(metadata.get("row_kind", "") or "") != clean_row_kind:
                 continue
-            if str(metadata.get(target_key, "") or "") != clean_target_id:
+            metadata_target_id = (
+                routine_tree_parent_identity(metadata)
+                if clean_row_kind == "definition"
+                else str(metadata.get("instance_id", "") or "")
+            )
+            if metadata_target_id != clean_target_id:
                 continue
             return bool(metadata.get("has_toggle_children", True))
         return False
@@ -5958,14 +5988,17 @@ class AutoTradeSettingWindow(QDialog):
             if not isinstance(metadata, dict):
                 continue
             row_kind = str(metadata.get("row_kind", "") or "")
-            definition_id = str(metadata.get("definition_id", "") or "")
+            definition_id = routine_tree_parent_identity(metadata)
             instance_id = str(metadata.get("instance_id", "") or "")
             widget = self.routine_table.cellWidget(row, 0)
             icon = widget.findChild(QLabel, "autoTradeSettingRoutineTreeIcon") if widget is not None else None
             if row_kind == "definition":
                 has_toggle_children = bool(metadata.get("has_toggle_children", True))
                 if display_level == "category":
-                    definition_valid = bool(metadata.get("has_instances", has_toggle_children))
+                    definition_valid = bool(
+                        metadata.get("is_discovered_group", False)
+                        or metadata.get("has_instances", has_toggle_children)
+                    )
                 else:
                     definition_valid = bool(metadata.get("has_stocked_instances", False))
                 current_definition_filtered = valid_only and not definition_valid
@@ -6051,32 +6084,112 @@ class AutoTradeSettingWindow(QDialog):
     def load_routine_table(self) -> None:
         current_metadata = self.current_selected_routine_row_metadata()
         definitions = load_routine_definitions()
-        instances = load_persisted_routine_instances()
+        loaded_instances = load_persisted_routine_instances()
+        definition_by_id = {
+            str(definition.definition_id): definition
+            for definition in definitions
+        }
         projection_override = getattr(
             self,
             "_routine_tree_projected_instance_ids_override",
             None,
         )
-        projected_instance_ids = (
-            {
+        parent_specs: list[dict[str, object]] = []
+        def definition_parent_specs(
+            projected_instance_ids: set[str],
+        ) -> tuple[list[object], list[dict[str, object]]]:
+            projected_instances = [
+                instance
+                for instance in loaded_instances
+                if str(instance.instance_id) in projected_instance_ids
+            ]
+            instances_by_definition: dict[str, list[object]] = {}
+            for instance in projected_instances:
+                instances_by_definition.setdefault(
+                    str(instance.definition_id),
+                    [],
+                ).append(instance)
+            specs = [
+                {
+                    "group_id": "",
+                    "parent_id": str(definition.definition_id),
+                    "display_name": str(definition.display_name),
+                    "registration_definition": definition,
+                    "child_instances": instances_by_definition.get(
+                        str(definition.definition_id),
+                        [],
+                    ),
+                }
+                for definition in definitions
+            ]
+            return projected_instances, specs
+
+        if callable(projection_override):
+            override_instance_ids = {
                 str(instance_id or "").strip()
-                for instance_id in projection_override(instances)
+                for instance_id in projection_override(loaded_instances)
                 if str(instance_id or "").strip()
             }
-            if callable(projection_override)
-            else auto_trade_projected_instance_ids(instances)
-        )
-        for message in consume_group_recovery_messages():
-            show_toast(self, message)
-        instances = [
-            instance
-            for instance in instances
-            if str(instance.instance_id) in projected_instance_ids
-        ]
-        instances_by_definition: dict[str, list[object]] = {}
-        for instance in instances:
-            instances_by_definition.setdefault(str(instance.definition_id), []).append(instance)
-
+            instances, parent_specs = definition_parent_specs(override_instance_ids)
+        else:
+            group_records = get_group_records()
+            base_stocks = read_base_stocks()
+            group_projection = build_main_group_projection(
+                group_records,
+                loaded_instances,
+                base_stocks,
+            )
+            canonical_instance_ids = {
+                projected_instance.instance_id
+                for projected_group in group_projection
+                for projected_instance in projected_group.instances
+            }
+            try:
+                effective_instance_ids = auto_trade_projected_instance_ids(
+                    loaded_instances,
+                    groups=group_records,
+                    stocks=base_stocks,
+                )
+            except TypeError:
+                effective_instance_ids = auto_trade_projected_instance_ids(
+                    loaded_instances
+                )
+            if effective_instance_ids != canonical_instance_ids:
+                instances, parent_specs = definition_parent_specs(
+                    effective_instance_ids
+                )
+                group_projection = ()
+            else:
+                instances = [
+                projected_instance.instance
+                for projected_group in group_projection
+                for projected_instance in projected_group.instances
+                ]
+            sole_definition = definitions[0] if len(definitions) == 1 else None
+            for projected_group in group_projection:
+                child_instances = [
+                    projected_instance.instance
+                    for projected_instance in projected_group.instances
+                ]
+                child_definition_ids = {
+                    str(getattr(instance, "definition_id", "") or "").strip()
+                    for instance in child_instances
+                    if str(getattr(instance, "definition_id", "") or "").strip()
+                }
+                registration_definition = (
+                    definition_by_id.get(next(iter(child_definition_ids)))
+                    if len(child_definition_ids) == 1
+                    else sole_definition if not child_definition_ids else None
+                )
+                parent_specs.append(
+                    {
+                        "group_id": projected_group.group_id,
+                        "parent_id": projected_group.group_id,
+                        "display_name": projected_group.display_name,
+                        "registration_definition": registration_definition,
+                        "child_instances": child_instances,
+                    }
+                )
         instance_counts = self._routine_instance_operation_counts()
         current_stocks_by_instance = self._current_stocks_by_instance()
         historical_stocks_by_instance = self._historical_stocks_by_instance()
@@ -6114,10 +6227,18 @@ class AutoTradeSettingWindow(QDialog):
             )
         )
 
-        for definition in definitions:
-            definition_id = str(definition.definition_id)
+        for parent_spec in parent_specs:
+            definition = parent_spec.get("registration_definition")
+            definition_id = str(
+                getattr(definition, "definition_id", "") or ""
+            ).strip()
+            group_id = str(parent_spec.get("group_id", "") or "").strip()
+            parent_id = str(parent_spec.get("parent_id", "") or definition_id).strip()
+            parent_display_name = str(
+                parent_spec.get("display_name", "") or ""
+            ).strip()
             child_instances = sorted(
-                instances_by_definition.get(definition_id, []),
+                list(parent_spec.get("child_instances", []) or []),
                 key=lambda instance: (
                     str(getattr(instance, "display_name", "") or "").casefold(),
                     str(getattr(instance, "instance_id", "") or ""),
@@ -6243,21 +6364,29 @@ class AutoTradeSettingWindow(QDialog):
             )
             has_definition_children = bool(child_instances)
             if not has_definition_children:
-                collapsed.discard(definition_id)
-            is_collapsed = has_definition_children and definition_id in collapsed
+                collapsed.discard(parent_id)
+            is_collapsed = has_definition_children and parent_id in collapsed
             rows.append(
                 {
                     "row_kind": "definition",
                     "definition_id": definition_id,
+                    "group_id": group_id,
+                    "tree_parent_id": parent_id,
+                    "is_discovered_group": bool(group_id),
                     "instance_id": "",
-                    "definition_name": str(definition.display_name),
+                    "definition_name": parent_display_name,
                     "instance_name": "",
-                    "package_dir": str(definition.package_dir),
+                    "package_dir": str(getattr(definition, "package_dir", "") or ""),
                     "instance_dir": "",
-                    "display_name": str(definition.display_name),
+                    "display_name": parent_display_name,
                     "tree_icon": "\u25b6" if is_collapsed or not has_definition_children else "\u25bc",
                     "has_toggle_children": has_definition_children,
                     "has_instances": has_definition_children,
+                    "target_instance_ids": tuple(
+                        str(instance.instance_id)
+                        for instance in child_instances
+                        if str(instance.instance_id).strip()
+                    ),
                     "has_stocked_instances": any(
                         (
                             display_stocks_by_instance.get(
@@ -6320,6 +6449,10 @@ class AutoTradeSettingWindow(QDialog):
                 }
             )
             for _index, instance in enumerate(child_instances):
+                instance_definition_id = str(
+                    getattr(instance, "definition_id", "") or ""
+                ).strip()
+                instance_definition = definition_by_id.get(instance_definition_id)
                 instance_dir = Path(instance.rules_path).parent if instance.rules_path else Path()
                 instance_id = str(instance.instance_id)
                 current_stocks = current_stocks_by_instance.get(instance_id, [])
@@ -6351,11 +6484,14 @@ class AutoTradeSettingWindow(QDialog):
                 rows.append(
                     {
                         "row_kind": "instance",
-                        "definition_id": definition_id,
+                        "definition_id": instance_definition_id,
+                        "group_id": group_id,
                         "instance_id": instance_id,
-                        "definition_name": str(definition.display_name),
+                        "definition_name": parent_display_name,
                         "instance_name": str(instance.display_name),
-                        "package_dir": str(definition.package_dir),
+                        "package_dir": str(
+                            getattr(instance_definition, "package_dir", "") or ""
+                        ),
                         "instance_dir": str(instance_dir) if instance_dir else "",
                         "display_name": str(instance.display_name),
                         "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
@@ -6394,11 +6530,14 @@ class AutoTradeSettingWindow(QDialog):
                     rows.append(
                         {
                             "row_kind": "stock",
-                            "definition_id": definition_id,
+                            "definition_id": instance_definition_id,
+                            "group_id": group_id,
                             "instance_id": instance_id,
-                            "definition_name": str(definition.display_name),
+                            "definition_name": parent_display_name,
                             "instance_name": str(instance.display_name),
-                            "package_dir": str(definition.package_dir),
+                            "package_dir": str(
+                                getattr(instance_definition, "package_dir", "") or ""
+                            ),
                             "instance_dir": str(instance_dir) if instance_dir else "",
                             "display_name": stock_name,
                             "display_level": str(
@@ -6628,6 +6767,24 @@ class AutoTradeSettingWindow(QDialog):
             instance_id = str(metadata.get("instance_id", "") or "").strip()
             return (instance_id,) if instance_id else ()
         if row_kind == "definition":
+            projected_instance_ids = metadata.get("target_instance_ids")
+            if isinstance(projected_instance_ids, (list, tuple, set)):
+                return tuple(
+                    instance_id
+                    for instance_id in (
+                        str(value or "").strip()
+                        for value in projected_instance_ids
+                    )
+                    if instance_id
+                )
+            group_id = str(metadata.get("group_id", "") or "").strip()
+            if group_id:
+                return tuple(
+                    str(instance.instance_id)
+                    for instance in load_persisted_routine_instances()
+                    if str(getattr(instance, "group_id", "") or "").strip()
+                    == group_id
+                )
             definition_id = str(metadata.get("definition_id", "") or "").strip()
             return tuple(
                 str(instance.instance_id)
@@ -6701,8 +6858,8 @@ class AutoTradeSettingWindow(QDialog):
             selected_routine_metadata=lambda: self.current_selected_routine_row_metadata(),
             selected_target_instance_ids=lambda: self.current_selected_target_instance_ids(),
             selected_routine_dir=lambda: self.current_selected_routine_dir(),
-            routine_dirs=lambda: get_group_dirs(),
-            stock_dirs_in_routine=lambda routine_dir: get_stock_dirs_in_routine(routine_dir),
+            routine_dirs=lambda: [],
+            stock_dirs_in_routine=lambda _routine_dir: [],
             base_stocks=lambda: read_base_stocks(),
             order_queue_path=lambda: ORDER_QUEUE_PATH,
             order_executions_path=lambda: ORDER_EXECUTIONS_PATH,
@@ -6712,6 +6869,9 @@ class AutoTradeSettingWindow(QDialog):
                     order_executions_path=executions_path,
                     order_locks_path=locks_path,
                 )
+            ),
+            all_group_stock_dirs=lambda: list(
+                load_group_scope().all_group_stock_dirs()
             ),
         )
         boundary = AutoTradeOrderExecutionBoundary(context)
@@ -6807,6 +6967,13 @@ class AutoTradeSettingWindow(QDialog):
             register_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.open_routine_registration(target)
             )
+            group_id = str(metadata.get("group_id", "") or "").strip()
+            if group_id:
+                delete_group_action = menu.addAction("그룹삭제")
+                delete_group_action.setEnabled(True)
+                delete_group_action.triggered.connect(
+                    lambda _checked=False, target=dict(metadata): self.delete_routine_group(target)
+                )
         elif row_kind == "instance":
             menu = QMenu(self.routine_table)
             settings_action = menu.addAction("설정변경")
@@ -7029,6 +7196,18 @@ class AutoTradeSettingWindow(QDialog):
         if str(metadata.get("row_kind", "") or "") != "definition":
             return
         self._open_routine_settings_dialog(metadata, registration=True)
+
+    def delete_routine_group(self, metadata: dict[str, object]) -> bool:
+        owner = persistent_feature_owner(self)
+        handler = getattr(owner, "delete_routine_group_completely", None)
+        if not callable(handler):
+            return False
+        return bool(
+            handler(
+                str(metadata.get("group_id", "") or "").strip(),
+                str(metadata.get("display_name", "") or metadata.get("definition_name", "")).strip(),
+            )
+        )
 
     def open_routine_instance_settings(self, metadata: dict[str, object]) -> None:
         if str(metadata.get("row_kind", "") or "") != "instance":
@@ -9834,12 +10013,8 @@ def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
     루틴 폴더 안에 물리 폴더가 남아 있어도 기초종목.txt 에 연결 정보가 없으면
     자동매매설정 창에는 표시하지 않는다.
     """
-    routine_name = routine_display_name(routine_dir)
     result: list[Path] = []
     for stock_dir in get_stock_dirs_in_routine(routine_dir):
-        code, name = parse_stock_folder_name(stock_dir.name)
-        if not is_stock_assigned_to_routine(code, name, routine_name):
-            continue
         if is_review_required_stock_dir(stock_dir):
             continue
         result.append(stock_dir)

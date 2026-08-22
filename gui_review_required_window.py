@@ -65,6 +65,7 @@ from account_funds_foundation import READY as ACCOUNT_FUNDS_READY
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from stock_repository import repository as stock_repository_factory
+from group_scope import load_group_scope
 from stock_long_hold_policy import long_hold_excludes_holding_review
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_integrity import (
@@ -708,23 +709,19 @@ def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
 
 
 def get_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """
-    호환용 종목 조회.
-
-    과거에는 루틴폴더 아래 종목폴더를 조회했지만, 현재 기준 종목 원본은
-    중앙 stocks/이며 루틴 연결은 각 종목 config.json의 routine 값으로 판단한다.
-    """
-    routine_name = routine_display_name(routine_dir)
+    """Compatibility adapter from a legacy Group path to canonical scope."""
     try:
-        repo = stock_repository_factory()
-        result: list[Path] = []
-        for record in repo.list_stocks():
-            if str(record.routine or "").strip() != routine_name:
-                continue
-            stock_dir = repo.resolve_stock_dir(record.code, record.name)
-            if stock_dir.exists() and stock_dir.is_dir():
-                result.append(stock_dir)
-        return sorted(result, key=lambda path: path.name)
+        target = Path(routine_dir).resolve(strict=False)
+        scope = load_group_scope()
+        group_id = next(
+            (
+                group_id
+                for group_id, group in scope.groups_by_id.items()
+                if Path(getattr(group, "path", "")).resolve(strict=False) == target
+            ),
+            "",
+        )
+        return list(scope.group_stock_dirs(group_id)) if group_id else []
     except Exception:
         return []
 

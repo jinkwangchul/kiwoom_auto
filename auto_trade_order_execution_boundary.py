@@ -308,6 +308,7 @@ class AutoTradeOrderExecutionContext:
     order_executions_path: Callable[[], Path]
     order_locks_path: Callable[[], Path]
     confirm_runtime_file_init: Callable[[Path, Path], bool] | None = None
+    all_group_stock_dirs: Callable[[], list[Path]] | None = None
 
 
 class AutoTradeOrderExecutionBoundary:
@@ -315,6 +316,18 @@ class AutoTradeOrderExecutionBoundary:
 
     def __init__(self, context: AutoTradeOrderExecutionContext) -> None:
         self._context = context
+
+    def all_group_stock_dirs(self) -> list[Path]:
+        callback = self._context.all_group_stock_dirs
+        if callable(callback):
+            try:
+                return list(callback())
+            except Exception:
+                return []
+        result: list[Path] = []
+        for routine_dir in self._context.routine_dirs():
+            result.extend(self._context.stock_dirs_in_routine(routine_dir))
+        return result
 
     def current_selected_routine_row_metadata(self) -> dict[str, object] | None:
         try:
@@ -421,13 +434,12 @@ class AutoTradeOrderExecutionBoundary:
                     config = read_json_dict(Path(stock_dir) / "config.json")
                     return (config if isinstance(config, dict) else {}, str(stock_dir))
 
-        for routine_dir in self._context.routine_dirs():
-            for stock_dir in self._context.stock_dirs_in_routine(routine_dir):
-                stock_code, _stock_name = parse_stock_folder_name(Path(stock_dir).name)
-                if stock_code != code:
-                    continue
-                config = read_json_dict(Path(stock_dir) / "config.json")
-                return (config if isinstance(config, dict) else {}, str(stock_dir))
+        for stock_dir in self.all_group_stock_dirs():
+            stock_code, _stock_name = parse_stock_folder_name(Path(stock_dir).name)
+            if stock_code != code:
+                continue
+            config = read_json_dict(Path(stock_dir) / "config.json")
+            return (config if isinstance(config, dict) else {}, str(stock_dir))
 
         return {}, "stock_config_not_found"
 
@@ -1567,27 +1579,19 @@ class AutoTradeOrderExecutionBoundary:
                 "issues": ["runtime stock state is not found for selected routine instance"],
             }
 
-        try:
-            routine_dir = self.current_selected_routine_dir()
-        except Exception:
-            routine_dir = None
-        routine_dirs = [routine_dir] if isinstance(routine_dir, Path) else self._context.routine_dirs()
-        for candidate_routine_dir in routine_dirs:
-            if not isinstance(candidate_routine_dir, Path):
+        for stock_dir in self.all_group_stock_dirs():
+            stock_code, _stock_name = parse_stock_folder_name(Path(stock_dir).name)
+            if stock_code != code:
                 continue
-            for stock_dir in self._context.stock_dirs_in_routine(candidate_routine_dir):
-                stock_code, _stock_name = parse_stock_folder_name(Path(stock_dir).name)
-                if stock_code != code:
-                    continue
-                state = read_json_dict(Path(stock_dir) / "state.json")
-                config = read_json_dict(Path(stock_dir) / "config.json")
-                return {
-                    "found": True,
-                    "state": state if isinstance(state, dict) else {},
-                    "config": config if isinstance(config, dict) else {},
-                    "stock_dir": str(stock_dir),
-                    "issues": [],
-                }
+            state = read_json_dict(Path(stock_dir) / "state.json")
+            config = read_json_dict(Path(stock_dir) / "config.json")
+            return {
+                "found": True,
+                "state": state if isinstance(state, dict) else {},
+                "config": config if isinstance(config, dict) else {},
+                "stock_dir": str(stock_dir),
+                "issues": [],
+            }
         return {"found": False, "state": {}, "config": {}, "stock_dir": "", "issues": ["runtime stock state is not found"]}
 
     def auto_trade_execution_block_reasons(self, order: dict[str, object]) -> list[str]:

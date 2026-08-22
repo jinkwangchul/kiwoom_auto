@@ -51,8 +51,9 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         (stock_dir / "orders.json").write_text("[]", encoding="utf-8")
         return routines_dir, stocks_dir, stock_dir
 
-    def _window(self):
+    def _window(self, stock_dirs=()):
         window = SimpleNamespace()
+        window.all_runtime_stock_dirs = lambda: list(stock_dirs)
         window.update_stock_status = (
             lambda stock_dir, code, name, status, metadata, log_suffix:
             status_ops.auto_trade_update_stock_status(
@@ -81,7 +82,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
     def test_central_stock_is_recalculated_and_persisted_as_monitoring(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            window = self._window()
+            window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
@@ -123,7 +124,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
     def test_recalculated_state_unblocks_mode_change_and_unregister(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            window = self._window()
+            window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
@@ -434,7 +435,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
     def test_first_timer_tick_before_recovery_keeps_running_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            base_window = self._window()
+            base_window = self._window([stock_dir])
 
             class RecoveryBlockedWindow:
                 def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
@@ -575,7 +576,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
             (stock_dir / "state.json").unlink()
-            window = self._window()
+            window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),
@@ -593,7 +594,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
     def test_write_without_matching_read_back_is_reported_as_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            window = self._window()
+            window = self._window([stock_dir])
             with (
                 patch.object(status_ops, "ROUTINES_DIR", routines_dir),
                 patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir),

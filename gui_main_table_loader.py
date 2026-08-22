@@ -87,7 +87,7 @@ from gui_auto_trade_policy import (
     effective_liquidation_policy_for_config,
 )
 from gui_base_stock_service import read_base_stocks
-from gui_routine_registry import get_group_records, get_group_recovery_control_records
+from gui_routine_registry import get_group_records
 from main_group_projection import build_main_group_projection
 from routine_instance_registry import (
     load_persisted_routine_instances,
@@ -175,7 +175,6 @@ ROUTINE_PARENT_AGGREGATE_VALUES_ROLE = Qt.UserRole + 221
 ROUTINE_PARENT_PROFIT_ROLE = Qt.UserRole + 222
 ROUTINE_GROUP_ID_ROLE = Qt.UserRole + 223
 ROUTINE_GROUP_PATH_ROLE = Qt.UserRole + 224
-ROUTINE_GROUP_RECOVERY_ROLE = Qt.UserRole + 225
 _MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
 ROUTINE_ROW_PARENT = "group"
 ROUTINE_ROW_CHILD = "instance"
@@ -1843,7 +1842,7 @@ def main_refresh_pnl_only(window) -> None:
     pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
     group_projection = build_main_group_projection(
-        get_group_records(sync_recovery=False),
+        get_group_records(),
         instances,
         tuple(_main_pnl_refresh_static_cache(window).get("stocks", ())),
     )
@@ -2630,7 +2629,6 @@ def main_load_routine_table(window) -> None:
         instances,
         static_stocks,
     )
-    recovery_controls = get_group_recovery_control_records()
     relation_counts = _projected_group_relation_counts(
         window,
         group_projection,
@@ -2648,6 +2646,10 @@ def main_load_routine_table(window) -> None:
             projected_instance.instance_id
             for projected_instance in projected_group.instances
         )
+        for projected_group in group_projection
+    }
+    window._routine_group_records_by_id = {
+        projected_group.group_id: projected_group.group
         for projected_group in group_projection
     }
     window._routine_stock_paths_by_group_instance = {
@@ -2673,10 +2675,7 @@ def main_load_routine_table(window) -> None:
         )
         for projected_group in group_projection
     }
-    window._routine_recovery_control_by_group = {
-        control.group_id: control for control in recovery_controls
-    }
-    total_groups = len(group_projection) + len(recovery_controls)
+    total_groups = len(group_projection)
     total_instances = sum(
         len(projected_group.instances) for projected_group in group_projection
     )
@@ -2905,40 +2904,6 @@ def main_load_routine_table(window) -> None:
             }
         )
 
-    normal_group_ids = {projected_group.group_id for projected_group in group_projection}
-    for control in recovery_controls:
-        if control.group_id in normal_group_ids:
-            continue
-        groups.append(
-            {
-                "kind": ROUTINE_ROW_PARENT,
-                "group_id": control.group_id,
-                "group_path": str(control.target_path),
-                "definition_id": "",
-                "name": control.display_name,
-                "operation_status": ROUTINE_STATUS_STOPPED,
-                "registered": 0,
-                "operation_running": 0,
-                "waiting": 0,
-                "operation_or_stopped": 0,
-                "normal": 0,
-                "excluded": 0,
-                "review": 0,
-                "buy_limit_enabled": False,
-                "buy_limit_amount": None,
-                "buy_limit_configured": False,
-                "buy_limit_display": "",
-                "consumed_display": "",
-                "profit_display": "-",
-                "profit_amount": 0,
-                "profit_color": "",
-                "collapsed": True,
-                "children": [],
-                "recovery_control": True,
-                "deletion_pending": control.deletion_pending,
-            }
-        )
-
     _update_main_routine_summary(
         window,
         definitions,
@@ -3150,10 +3115,6 @@ def main_load_routine_table(window) -> None:
             item.setData(ROUTINE_ROW_KIND_ROLE, row_data["kind"])
             item.setData(ROUTINE_GROUP_ID_ROLE, row_data.get("group_id", ""))
             item.setData(ROUTINE_GROUP_PATH_ROLE, row_data.get("group_path", ""))
-            item.setData(
-                ROUTINE_GROUP_RECOVERY_ROLE,
-                bool(row_data.get("recovery_control", False)),
-            )
             item.setData(ROUTINE_DEFINITION_ID_ROLE, row_data["definition_id"])
             item.setData(ROUTINE_INSTANCE_ID_ROLE, row_data.get("instance_id", ""))
             item.setData(ROUTINE_STOCK_CODE_ROLE, row_data.get("code", ""))

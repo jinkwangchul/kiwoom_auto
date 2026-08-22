@@ -1520,6 +1520,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_visible_early_close_button_reuses_top_summary_badge_font(self) -> None:
         window = SimpleNamespace()
+        window.btn_group_pack_register = QPushButton("그룹등록")
         window.btn_main_visible_early_close = QPushButton("조기마감")
         vertical_badge = QPushButton("보유")
         top_badge = QPushButton("유효")
@@ -1546,7 +1547,9 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         window._create_routine_filter_badge_area = create_filter_badge_area
         window._create_main_routine_summary = create_main_routine_summary
 
-        gui_windows.MainWindow._create_table_area(window)
+        table_area = gui_windows.MainWindow._create_table_area(window)
+        routine_box = table_area.itemAt(0).widget()
+        header_layout = routine_box.layout().itemAt(0).layout()
 
         self.assertEqual(
             top_badge.font().pointSize(),
@@ -1571,9 +1574,66 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             early_close_metrics.boundingRect("조기마감").height(),
         )
         self.assertEqual(28, window.btn_main_visible_early_close.minimumHeight())
+        self.assertEqual(28, window.btn_group_pack_register.minimumHeight())
+        self.assertEqual(
+            window.btn_main_visible_early_close.font(),
+            window.btn_group_pack_register.font(),
+        )
+        self.assertIn(
+            "QPushButton#mainGroupPackRegisterButton",
+            window.btn_group_pack_register.styleSheet(),
+        )
+        self.assertIs(window.btn_group_pack_register, header_layout.itemAt(2).widget())
+        self.assertIs(window.btn_main_visible_early_close, header_layout.itemAt(3).widget())
         self.assertIn(
             "color: #2563eb; font-weight: bold;",
             window.btn_main_visible_early_close.styleSheet(),
+        )
+
+    def test_group_pack_registration_cancel_has_no_side_effect(self) -> None:
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=Mock())
+        with (
+            patch.object(gui_windows.QFileDialog, "getOpenFileName", return_value=("", "")),
+            patch.object(gui_windows, "register_group_pack") as register,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow.register_group_pack_from_file(window)
+
+        register.assert_not_called()
+        window.refresh_auto_trade_assignment_views.assert_not_called()
+        toast.assert_not_called()
+
+    def test_group_pack_registration_success_refreshes_and_toasts_once(self) -> None:
+        window = SimpleNamespace(refresh_auto_trade_assignment_views=Mock())
+        result = SimpleNamespace(
+            success=True,
+            group=SimpleNamespace(
+                group_id="11111111-1111-4111-8111-111111111111",
+                display_name="지표추종매매_1",
+            ),
+        )
+        with (
+            patch.object(
+                gui_windows.QFileDialog,
+                "getOpenFileName",
+                return_value=("sample.group.zip", "Group Pack (*.group.zip)"),
+            ),
+            patch.object(gui_windows, "register_group_pack", return_value=result) as register,
+            patch.object(gui_windows, "show_toast") as toast,
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
+        ):
+            gui_windows.MainWindow.register_group_pack_from_file(window)
+
+        register.assert_called_once_with(
+            "sample.group.zip",
+            project_root=gui_windows.PROJECT_ROOT,
+        )
+        window.refresh_auto_trade_assignment_views.assert_called_once_with()
+        warning.assert_not_called()
+        toast.assert_called_once_with(
+            window,
+            "지표추종매매_1 그룹을 등록했습니다.",
+            duration_ms=2500,
         )
 
     def test_routine_close_candidates_intersect_current_session_running_targets(self) -> None:

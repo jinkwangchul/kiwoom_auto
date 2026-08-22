@@ -24,7 +24,8 @@ from gui_auto_trade_integrity import (
     is_review_required_state,
     read_review_state_with_issue,
 )
-from gui_routine_registry import routine_display_name as registry_routine_display_name
+from group_scope import load_group_scope
+from gui_routine_registry import scan_group_records
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -45,16 +46,6 @@ def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
     if len(parts) != 2:
         return "", str(folder_name).strip()
     return parts[0].strip(), parts[1].strip()
-
-
-def _read_json_dict(path: Path) -> dict[str, Any]:
-    try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
 
 
 def _central_stocks_available() -> bool:
@@ -89,109 +80,32 @@ def all_registered_stock_dirs() -> list[Path]:
     return result
 
 
-def _routine_display_name_from_dir(routine_dir: Path) -> str:
-    """루틴 원본 경로에서 화면 표시 루틴명을 만든다."""
-    if routine_dir is None:
-        return ""
-    return registry_routine_display_name(routine_dir).strip()
-
-
-def _routine_values_from_config(config: dict[str, Any]) -> list[str]:
-    """종목 config.json 안의 루틴 관련 값을 모두 수집한다."""
-    values: list[str] = []
-
-    for key in ("routine", "routine_name", "assigned_routine", "active_routine"):
-        value = config.get(key, "")
-        if isinstance(value, str):
-            text = value.strip()
-            if text:
-                values.append(text)
-        elif isinstance(value, list):
-            for item in value:
-                text = str(item or "").strip()
-                if text:
-                    values.append(text)
-
-    routines = config.get("routines")
-    if isinstance(routines, list):
-        for item in routines:
-            text = str(item or "").strip()
-            if text:
-                values.append(text)
-
-    # 중복 제거, 순서 유지
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if value not in seen:
-            result.append(value)
-            seen.add(value)
-    return result
-
-
-def _central_stock_dirs_for_routine(routine_name: str) -> list[Path]:
-    """
-    중앙 stocks/ 기준으로 특정 루틴에 연결된 종목폴더를 조회한다.
-
-    정책:
-    - stocks/가 존재하면 이것을 현재 종목 진실의 기준으로 본다.
-    - 기존 _루틴폴더 직접 스캔은 stocks/가 없을 때만 fallback한다.
-    """
-    target_routine = str(routine_name or "").strip()
-    if not target_routine or not _central_stocks_available():
-        return []
-
-    result: list[Path] = []
-    try:
-        for stock_dir in CENTRAL_STOCKS_DIR.iterdir():
-            if not stock_dir.is_dir():
-                continue
-            if stock_dir.name.startswith(".") or stock_dir.name.startswith("__"):
-                continue
-            config = _read_json_dict(stock_dir / "config.json")
-            routine_values = _routine_values_from_config(config)
-            if target_routine in routine_values:
-                result.append(stock_dir)
-    except Exception:
-        return []
-
-    result.sort(key=lambda path: path.name)
-    return result
-
-
-def _legacy_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """기존 루틴폴더 아래 종목 runtime 폴더 직접 조회."""
-    if routine_dir is None or not routine_dir.exists() or not routine_dir.is_dir():
-        return []
-    result = [
-        child
-        for child in routine_dir.iterdir()
-        if (
-            child.is_dir()
-            and not child.name.startswith(".")
-            and not child.name.startswith("__")
-        )
-    ]
-    result.sort(key=lambda path: path.name)
-    return result
-
-
 def stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """
-    루틴에 연결된 종목 runtime 폴더를 조회한다.
+    """Compatibility adapter from a physical legacy Group path to logical scope."""
+    target = Path(routine_dir).resolve(strict=False)
+    group = next(
+        (
+            record
+            for record in scan_group_records()
+            if record.path.resolve(strict=False) == target
+        ),
+        None,
+    )
+    if group is None:
+        return []
+    return list(load_group_scope().group_stock_dirs(group.group_id))
 
-    중앙화 개편 이후 기준:
-    - stocks/ 중앙 종목폴더가 존재하면 stocks/*/config.json의 routine 값을 기준으로 조회한다.
-    - stocks/가 아직 없을 때만 기존 루틴폴더 직접 스캔을 사용한다.
 
-    이렇게 해야 자동매매설정 하단 종목표와 해제 가능/불가 판정이
-    과거 구형 루틴폴더 잔재가 아니라 중앙 종목 상태를 기준으로 동작한다.
-    """
-    routine_name = _routine_display_name_from_dir(routine_dir)
-    central_dirs = _central_stock_dirs_for_routine(routine_name)
-    if _central_stocks_available():
-        return central_dirs
-    return _legacy_stock_dirs_in_routine(routine_dir)
+def group_stock_dirs(group_id: str) -> list[Path]:
+    return list(load_group_scope().group_stock_dirs(group_id))
+
+
+def instance_stock_dirs(instance_id: str) -> list[Path]:
+    return list(load_group_scope().instance_stock_dirs(instance_id))
+
+
+def all_group_stock_dirs() -> list[Path]:
+    return list(load_group_scope().all_group_stock_dirs())
 
 
 def get_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:

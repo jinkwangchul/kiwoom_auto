@@ -20,7 +20,8 @@ def _group(root: Path, name: str) -> GroupRecord:
     return GroupRecord(
         name=name,
         path=path,
-        source_type="legacy_folder",
+        source_type="logical_registry",
+        group_id=f"{root.name}:{name}",
         budget={},
         valid=True,
     )
@@ -56,6 +57,28 @@ def _stock(code: str, group: str | None, instance_id: str) -> dict[str, object]:
 
 
 class MainGroupProjectionTests(unittest.TestCase):
+    def test_explicit_logical_group_id_is_independent_from_physical_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            group = GroupRecord(
+                name="지표추종매매",
+                display_name="지표추종매매",
+                group_id="logical-group-uuid",
+                path=Path(temp) / "groups" / "physical-directory",
+                source_type="logical_registry",
+                definition_id="indicator_follow",
+                base_name="지표추종매매",
+                slot=0,
+            )
+            instance = _instance(
+                "instance-a",
+                "지표추종매매A",
+                group_id="logical-group-uuid",
+            )
+            projection = build_main_group_projection([group], [instance], [])
+
+        self.assertEqual("logical-group-uuid", projection[0].group_id)
+        self.assertEqual(["instance-a"], [item.instance_id for item in projection[0].instances])
+
     def test_explicit_group_instance_projects_without_stock_assignment(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -63,19 +86,63 @@ class MainGroupProjectionTests(unittest.TestCase):
             instance = _instance(
                 "instance-c",
                 "C",
-                group_id=str(group.path.resolve()),
+                group_id=group.group_id,
             )
             projection = build_main_group_projection([group], [instance], [])
 
         self.assertEqual(["instance-c"], [item.instance_id for item in projection[0].instances])
         self.assertEqual((), projection[0].instances[0].stocks)
 
+    def test_explicit_group_uses_instance_assignment_without_routine_name_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target_group = _group(root, "지표추종복사")
+            other_group = _group(root, "지표추종매매")
+            instance = _instance(
+                "instance-b",
+                "지표추종복사B",
+                group_id=target_group.group_id,
+            )
+            stock = _stock("105560", "지표추종매매", "instance-b")
+            projection = build_main_group_projection(
+                [target_group, other_group],
+                [instance],
+                [stock],
+            )
+
+        by_name = {group.display_name: group for group in projection}
+        self.assertEqual(
+            ["105560"],
+            [item["code"] for item in by_name["지표추종복사"].instances[0].stocks],
+        )
+        self.assertEqual((), by_name["지표추종매매"].instances)
+
+    def test_explicit_group_does_not_fallback_to_stock_routine_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group_a = _group(root, "그룹A")
+            group_b = _group(root, "그룹B")
+            instance = _instance(
+                "instance-a",
+                group_id=group_a.group_id,
+            )
+            projection = build_main_group_projection(
+                [group_a, group_b],
+                [instance],
+                [_stock("000001", "그룹B", "instance-a")],
+            )
+
+        by_name = {group.display_name: group for group in projection}
+        self.assertEqual(["instance-a"], [item.instance_id for item in by_name["그룹A"].instances])
+        self.assertEqual((), by_name["그룹B"].instances)
+
     def test_one_group_one_instance_one_stock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            group = _group(root, "동전주")
             projection = build_main_group_projection(
-                [_group(root, "동전주")],
-                [_instance("instance-a", "A")],
+                [group],
+                [_instance("instance-a", "A", group_id=group.group_id)],
                 [_stock("000001", "동전주", "instance-a")],
             )
 
@@ -86,9 +153,13 @@ class MainGroupProjectionTests(unittest.TestCase):
     def test_one_group_multiple_instances(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            group = _group(root, "동전주")
             projection = build_main_group_projection(
-                [_group(root, "동전주")],
-                [_instance("instance-a", "A"), _instance("instance-b", "B")],
+                [group],
+                [
+                    _instance("instance-a", "A", group_id=group.group_id),
+                    _instance("instance-b", "B", group_id=group.group_id),
+                ],
                 [
                     _stock("000001", "동전주", "instance-a"),
                     _stock("000002", "동전주", "instance-b"),
@@ -105,10 +176,10 @@ class MainGroupProjectionTests(unittest.TestCase):
             root = Path(temp)
             group = _group(root, "동전주")
             instances = [
-                _instance("uuid-z", "지표추종매매B", group_id=str(group.path.resolve())),
-                _instance("uuid-b", "동전주A", group_id=str(group.path.resolve())),
-                _instance("uuid-a", "동전주A", group_id=str(group.path.resolve())),
-                _instance("uuid-x", "동전주", group_id=str(group.path.resolve())),
+                _instance("uuid-z", "지표추종매매B", group_id=group.group_id),
+                _instance("uuid-b", "동전주A", group_id=group.group_id),
+                _instance("uuid-a", "동전주A", group_id=group.group_id),
+                _instance("uuid-x", "동전주", group_id=group.group_id),
             ]
             projection = build_main_group_projection([group], instances, [])
 
@@ -117,12 +188,14 @@ class MainGroupProjectionTests(unittest.TestCase):
             [item.instance_id for item in projection[0].instances],
         )
 
-    def test_multiple_groups_can_project_the_same_instance(self) -> None:
+    def test_instance_projects_only_under_its_explicit_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            group_a = _group(root, "동전주")
+            group_b = _group(root, "대형주")
             projection = build_main_group_projection(
-                [_group(root, "동전주"), _group(root, "대형주")],
-                [_instance("instance-a", "A")],
+                [group_a, group_b],
+                [_instance("instance-a", "A", group_id=group_a.group_id)],
                 [
                     _stock("000001", "동전주", "instance-a"),
                     _stock("000002", "대형주", "instance-a"),
@@ -130,21 +203,24 @@ class MainGroupProjectionTests(unittest.TestCase):
             )
 
         by_name = {group.display_name: group for group in projection}
-        self.assertEqual("000001", by_name["동전주"].instances[0].stocks[0]["code"])
-        self.assertEqual("000002", by_name["대형주"].instances[0].stocks[0]["code"])
+        self.assertEqual(
+            ["000001", "000002"],
+            [stock["code"] for stock in by_name["동전주"].instances[0].stocks],
+        )
+        self.assertEqual((), by_name["대형주"].instances)
 
     def test_same_group_and_definition_name_do_not_collapse_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             group = _group(root, "지표추종매매")
-            instance = _instance("instance-a")
+            instance = _instance("instance-a", group_id=group.group_id)
             projection = build_main_group_projection(
                 [group],
                 [instance],
                 [_stock("000001", "지표추종매매", "instance-a")],
             )
 
-        self.assertEqual(str(group.path.resolve()), projection[0].group_id)
+        self.assertEqual(group.group_id, projection[0].group_id)
         self.assertEqual("definition-a", projection[0].instances[0].instance.definition_id)
         self.assertNotEqual(projection[0].group_id, instance.definition_id)
 
@@ -185,7 +261,7 @@ class MainGroupProjectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             groups = [_group(root, "동전주")]
-            instances = [_instance("instance-a")]
+            instances = [_instance("instance-a", group_id=groups[0].group_id)]
             stock = _stock("000001", "동전주", "instance-a")
 
             first = build_main_group_projection(groups, instances, [stock, stock])
@@ -255,11 +331,11 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             group = _group(root, "동전주")
-            instance = _instance("instance-a", "A")
+            instance = _instance("instance-a", "A", group_id=group.group_id)
             cloned_instance = _instance(
                 "instance-c",
                 "C",
-                group_id=str(group.path.resolve()),
+                group_id=group.group_id,
             )
             stock = _stock("000001", "동전주", "instance-a")
             table = _RoutineTable()
@@ -388,7 +464,7 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
             ],
             [row[0] for row in all_rows],
         )
-        self.assertTrue(all(row[1] == str(group.path.resolve()) for row in all_rows))
+        self.assertTrue(all(row[1] == group.group_id for row in all_rows))
         self.assertEqual(first_rows, all_rows)
         self.assertEqual("", all_rows[0][2])
         self.assertEqual("instance-a", all_rows[1][2])
@@ -431,65 +507,6 @@ class MainGroupTreeLoaderTests(unittest.TestCase):
             scope_label="그룹",
             event_source="gui_windows.MainWindow.request_routine_group_operation",
         )
-
-    def test_recovery_control_row_is_not_counted_as_operational_projection(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = root / "_지표추종매매"
-            control = SimpleNamespace(
-                group_id=str(target.resolve()),
-                display_name="지표추종매매",
-                target_path=target,
-                deletion_pending=False,
-            )
-            table = _RoutineTable()
-            window = SimpleNamespace(
-                routine_table=table,
-                _main_routine_sort_column=-1,
-                _main_routine_sort_order=0,
-                _main_routine_valid_only=False,
-                _main_routine_display_level="group",
-                _main_routine_display_level_applied=True,
-                _main_routine_stock_scope="all",
-                _main_routine_excluded_only=False,
-                _collapsed_main_group_ids=set(),
-                _collapsed_main_group_instance_ids=set(),
-                _routine_definition_enabled={},
-                _routine_instance_selection={},
-            )
-            with (
-                patch.object(loader, "get_group_records", return_value=[]),
-                patch.object(
-                    loader,
-                    "get_group_recovery_control_records",
-                    return_value=(control,),
-                ),
-                patch.object(
-                    loader,
-                    "_main_pnl_refresh_routine_metadata",
-                    return_value=([], []),
-                ),
-                patch.object(
-                    loader,
-                    "_main_pnl_refresh_static_cache",
-                    return_value={"stocks": ()},
-                ),
-                patch.object(loader, "_instance_stock_counts", return_value={}),
-                patch.object(loader, "_refresh_instance_pnl_from_batch", return_value={}),
-                patch.object(loader, "current_stock_trade_counts_by_code", return_value={}),
-                patch.object(loader, "main_apply_routine_sort"),
-                patch.object(loader, "_update_main_routine_summary") as update_summary,
-            ):
-                loader.main_load_routine_table(window)
-
-            self.assertEqual(1, table.rowCount())
-            item = table.item(0, 0)
-            self.assertEqual("지표추종매매", item.data(loader.ROUTINE_PARENT_NAME_ROLE))
-            self.assertTrue(item.data(loader.ROUTINE_GROUP_RECOVERY_ROLE))
-            self.assertNotIn("오류", item.text())
-            self.assertEqual({}, window._routine_instance_ids_by_group)
-            self.assertEqual({}, window._routine_stock_paths_by_group)
-            self.assertEqual((), update_summary.call_args.kwargs["group_projection"])
 
     def test_group_instance_stock_dirs_do_not_leak_shared_instance_stocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

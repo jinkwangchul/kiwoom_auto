@@ -277,6 +277,7 @@ from gui_auto_trade_setting_window import (
     validate_base_stock_record,
 )
 from gui_main_table_loader import ROUTINE_INSTANCE_GRID_COLUMNS
+from group_scope import load_group_scope
 
 LOGGER = logging.getLogger(__name__)
 UNEXPECTED_STATUS_REASON = "처리할 수 없는 종목입니다."
@@ -401,21 +402,21 @@ def pending_routine_names_for_stock(
     name: str,
     assigned_routines: list[str],
 ) -> list[str]:
-    """
-    중앙 종목관리에는 현재 루틴 등록이 없지만
-    루틴 폴더 안에 종목 대상 폴더가 남아 있는 경우 등록대기로 표시한다.
-    """
+    """Return canonical Group assignments absent from the supplied display list."""
     assigned_set = {routine.strip() for routine in assigned_routines if routine.strip()}
     pending: list[str] = []
 
-    for routine_dir in get_group_dirs():
-        routine_name = routine_display_name(routine_dir)
-        if routine_name in assigned_set:
+    scope = load_group_scope()
+    for group_id, group in scope.groups_by_id.items():
+        group_name = str(getattr(group, "display_name", "") or "").strip()
+        if not group_name or group_name in assigned_set:
             continue
-
-        stock_dir = routine_dir / f"{sanitize_path_part(code)}_{sanitize_path_part(name)}"
-        if stock_dir.exists():
-            pending.append(routine_name)
+        if any(
+            stock.code == str(code or "").strip()
+            and stock.name == str(name or "").strip()
+            for stock in scope.group_stocks(group_id)
+        ):
+            pending.append(group_name)
 
     return pending
 

@@ -8,9 +8,8 @@ Windows GUI 창 클래스 정의 파일.
 
 현재 단계:
 - 메인 윈도우 안정 버전
-- 자동매매 루틴 폴더 자동 탐색
+- Logical Group Registry 자동 탐색
 - __pycache__ 제외
-- budget.json 이 있는 폴더만 루틴으로 인정
 - 키움 로그인, 주문, 실시간 수신 기능은 아직 연결하지 않음
 - 수동등록/검색등록 검증 강화
 - 신규 종목은 stock_library.json 검색 결과에서만 등록 허용
@@ -56,6 +55,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
+    QFileDialog,
     QGroupBox,
     QGridLayout,
     QHeaderView,
@@ -1357,7 +1357,6 @@ from gui_main_emergency_ops import (
 from gui_main_table_loader import (
     ROUTINE_GROUP_ID_ROLE,
     ROUTINE_GROUP_PATH_ROLE,
-    ROUTINE_GROUP_RECOVERY_ROLE,
     ROUTINE_DEFINITION_ID_ROLE,
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
     ROUTINE_CHILD_COLLAPSED_ROLE,
@@ -1418,6 +1417,7 @@ from gui_main_table_loader import (
     main_monitoring_table_font,
     main_monitoring_cell_font,
 )
+from distribution_profile import group_packing_enabled
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
 from gui_main_budget_panel import (
     MAIN_TOTAL_BUDGET_PERCENT_OPTIONS,
@@ -1466,6 +1466,8 @@ from group_complete_deletion_service import (
     collect_group_deletion_scope,
     delete_group_completely,
 )
+from group_pack_registration import register_group_pack
+from group_pack_packing import pack_group
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
     operation_policy_section,
@@ -1540,11 +1542,9 @@ from gui_auto_trade_setting_window import (
     routine_display_name,
 )
 from gui_routine_registry import (
-    consume_group_recovery_messages,
+    group_record_by_id,
     routine_record_by_name,
-    scan_group_records,
 )
-from group_recovery_repository import restore_group_snapshot
 from routine_instance_registry import (
     ROUTINE_LIMIT_RESPONSE_ACTION_MODES,
     ROUTINE_LIMIT_RESPONSE_EARLY_CLOSE_PERCENTS,
@@ -3280,6 +3280,7 @@ class MainWindow(QMainWindow):
         self._routine_stock_selection: dict[str, bool] = {}
         self._routine_instance_ids_by_definition: dict[str, tuple[str, ...]] = {}
         self._routine_instance_ids_by_group: dict[str, tuple[str, ...]] = {}
+        self._routine_group_records_by_id: dict[str, object] = {}
         self._routine_stock_paths_by_group: dict[str, tuple[str, ...]] = {}
         self._routine_stock_paths_by_group_instance: dict[str, tuple[str, ...]] = {}
         self._routine_definition_by_instance: dict[str, str] = {}
@@ -3349,6 +3350,7 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
         self.btn_review_required = QPushButton("검토관리(0)")
+        self.btn_group_pack_register = QPushButton("그룹등록")
         self.btn_main_visible_early_close = QPushButton("조기마감")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
@@ -4133,7 +4135,12 @@ class MainWindow(QMainWindow):
         routine_header_layout.addStretch(1)
         if hasattr(self, "_main_routine_valid_only"):
             MainWindow._update_main_routine_filter_badges(self)
-        MainWindow._style_main_visible_early_close_button(self)
+        MainWindow._style_main_top_action_buttons(self)
+        routine_header_layout.addWidget(
+            self.btn_group_pack_register,
+            0,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
         routine_header_layout.addWidget(
             self.btn_main_visible_early_close,
             0,
@@ -4152,23 +4159,30 @@ class MainWindow(QMainWindow):
 
         return layout
 
-    def _style_main_visible_early_close_button(self) -> None:
-        self.btn_main_visible_early_close.setObjectName("mainVisibleEarlyCloseButton")
-        early_close_style = (
-            "QPushButton#mainVisibleEarlyCloseButton {"
-            f" {AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE}"
-        )
+    def _style_main_top_action_buttons(self) -> None:
         reference_button = getattr(self, "_main_routine_valid_button", None)
-        if reference_button is not None:
-            reference_font = reference_button.font()
-            self.btn_main_visible_early_close.setFont(reference_font)
-            if reference_font.pixelSize() > 0:
-                early_close_style += f" font-size: {reference_font.pixelSize()}px;"
-            elif reference_font.pointSizeF() > 0:
-                early_close_style += f" font-size: {reference_font.pointSizeF():g}pt;"
-        early_close_style += " }"
-        self.btn_main_visible_early_close.setMinimumHeight(28)
-        self.btn_main_visible_early_close.setStyleSheet(early_close_style)
+        for button, object_name in (
+            (self.btn_group_pack_register, "mainGroupPackRegisterButton"),
+            (self.btn_main_visible_early_close, "mainVisibleEarlyCloseButton"),
+        ):
+            button.setObjectName(object_name)
+            style = (
+                f"QPushButton#{object_name} {{"
+                f" {AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE}"
+            )
+            if reference_button is not None:
+                reference_font = reference_button.font()
+                button.setFont(reference_font)
+                if reference_font.pixelSize() > 0:
+                    style += f" font-size: {reference_font.pixelSize()}px;"
+                elif reference_font.pointSizeF() > 0:
+                    style += f" font-size: {reference_font.pointSizeF():g}pt;"
+            style += " }"
+            button.setMinimumHeight(28)
+            button.setStyleSheet(style)
+
+    def _style_main_visible_early_close_button(self) -> None:
+        self._style_main_top_action_buttons()
 
     def _create_main_routine_summary(self) -> QWidget:
         summary = QWidget()
@@ -5153,6 +5167,7 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.doubleClicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
+        self.btn_group_pack_register.clicked.connect(self.register_group_pack_from_file)
         self.btn_main_visible_early_close.clicked.connect(
             self.request_visible_monitoring_early_close
         )
@@ -7523,25 +7538,16 @@ class MainWindow(QMainWindow):
 
     def load_routine_table(self) -> None:
         main_load_routine_table(self)
-        for message in consume_group_recovery_messages():
-            show_toast(self, message)
         self._install_routine_buy_limit_edit_filters()
 
     def load_running_stock_table(self) -> None:
         main_load_running_stock_table(self)
 
     def all_runtime_stock_dirs(self) -> list[Path]:
-        """전체 루틴의 종목 runtime 폴더를 중복 없이 조회한다."""
-        stock_dirs: list[Path] = []
-        seen: set[str] = set()
-        for routine_dir in get_group_dirs():
-            for stock_dir in get_stock_dirs_in_routine(routine_dir):
-                key = str(stock_dir.resolve())
-                if key in seen:
-                    continue
-                seen.add(key)
-                stock_dirs.append(stock_dir)
-        return stock_dirs
+        """Return canonical Group-assigned central stock runtime folders."""
+        from group_scope import load_group_scope
+
+        return list(load_group_scope().all_group_stock_dirs())
 
     def routine_name_for_stock_dir(self, stock_dir: Path) -> str:
         """종목 runtime 폴더 기준 루틴 표시명을 반환한다."""
@@ -8751,6 +8757,71 @@ class MainWindow(QMainWindow):
             )
         return targets
 
+    def register_group_pack_from_file(self) -> None:
+        pack_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "그룹등록",
+            "",
+            "Group Pack (*.group.zip)",
+        )
+        if not pack_path:
+            return
+        result = register_group_pack(pack_path, project_root=PROJECT_ROOT)
+        if not result.success or result.group is None:
+            QMessageBox.warning(
+                self,
+                "그룹등록 실패",
+                result.error or "Group Pack을 등록하지 못했습니다.",
+            )
+            return
+        try:
+            self.refresh_auto_trade_assignment_views()
+        except Exception:
+            LOGGER.exception(
+                "Group Pack registration persisted but view refresh failed: %s",
+                result.group.group_id,
+            )
+        show_toast(
+            self,
+            f"{result.group.display_name} 그룹을 등록했습니다.",
+            duration_ms=2500,
+        )
+
+    def pack_routine_group(self, group_id: str) -> bool:
+        group = getattr(self, "_routine_group_records_by_id", {}).get(group_id)
+        if group is None:
+            group = group_record_by_id(group_id)
+        if group is None:
+            QMessageBox.warning(self, "그룹패킹 실패", "선택한 Group을 찾을 수 없습니다.")
+            return False
+        base_name = str(getattr(group, "base_name", "") or "").strip()
+        output_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "그룹패킹",
+            f"{base_name}.group.zip",
+            "Group Pack (*.group.zip)",
+        )
+        if not output_path:
+            return False
+        result = pack_group(
+            str(getattr(group, "group_id", "") or "").strip(),
+            output_path,
+            project_root=PROJECT_ROOT,
+        )
+        if not result.success:
+            QMessageBox.warning(
+                self,
+                "그룹패킹 실패",
+                result.error or "그룹팩을 생성하지 못했습니다.",
+            )
+            return False
+        show_toast(
+            self,
+            f"{base_name} 그룹팩을 생성했습니다.",
+            duration_ms=2500,
+        )
+        return True
+
     def request_visible_monitoring_early_close(self) -> None:
         targets = self._visible_monitoring_early_close_targets()
         if not targets:
@@ -9112,11 +9183,20 @@ class MainWindow(QMainWindow):
                 definition_by_id[definition_id] = definition
 
         if len(definition_by_id) != 1:
-            QMessageBox.information(
+            show_toast(
                 self,
-                "루틴 등록",
                 "선택한 그룹의 루틴 유형을 하나로 확인할 수 없습니다.",
             )
+            return False
+
+        group = getattr(self, "_routine_group_records_by_id", {}).get(group_id)
+        if group is None:
+            group = group_record_by_id(group_id)
+        group_display_name = str(
+            getattr(group, "display_name", "") or ""
+        ).strip()
+        if not group_display_name:
+            show_toast(self, "선택한 그룹을 확인할 수 없습니다.")
             return False
 
         definition_id, definition = next(iter(definition_by_id.items()))
@@ -9128,6 +9208,7 @@ class MainWindow(QMainWindow):
                 "definition_name": str(
                     getattr(definition, "display_name", "") or ""
                 ).strip(),
+                "group_display_name": group_display_name,
                 "group_id": group_id,
             },
             registration=True,
@@ -9173,6 +9254,16 @@ class MainWindow(QMainWindow):
             register_routine_instance_snapshot,
         )
 
+        group = getattr(self, "_routine_group_records_by_id", {}).get(group_id)
+        if group is None:
+            group = group_record_by_id(group_id)
+        group_display_name = str(
+            getattr(group, "display_name", "") or ""
+        ).strip()
+        if not group_display_name:
+            QMessageBox.warning(self, "루틴 복제", "원본 루틴의 Group을 확인할 수 없습니다.")
+            return False
+
         return register_routine_instance_snapshot(
             self,
             definition_id=definition_id,
@@ -9180,6 +9271,7 @@ class MainWindow(QMainWindow):
                 getattr(definition, "display_name", "") or ""
             ).strip(),
             group_id=group_id,
+            group_display_name=group_display_name,
             source_instance_display_name=str(
                 getattr(instance, "display_name", "") or ""
             ).strip(),
@@ -9260,45 +9352,6 @@ class MainWindow(QMainWindow):
         )
         return True
 
-    def restore_routine_group_manually(
-        self,
-        group_id: str,
-        group_name: str,
-    ) -> bool:
-        result = restore_group_snapshot(PROJECT_ROOT, group_id)
-        if not result.success or not result.restored:
-            LOGGER.warning(
-                "Manual Group recovery failed: target=%s error=%s",
-                group_id,
-                result.error or "Group was not restored",
-            )
-            QMessageBox.warning(
-                self,
-                "그룹복구",
-                result.error or "그룹을 복구하지 못했습니다.",
-            )
-            return False
-
-        restored_group_ids = {
-            str(Path(group.path).resolve(strict=False))
-            for group in scan_group_records(sync_recovery=False)
-        }
-        if str(Path(group_id).resolve(strict=False)) not in restored_group_ids:
-            LOGGER.warning(
-                "Manual Group recovery discovery failed: target=%s",
-                group_id,
-            )
-            QMessageBox.warning(
-                self,
-                "그룹복구",
-                "복원된 그룹을 확인하지 못했습니다.",
-            )
-            return False
-
-        self.refresh_auto_trade_assignment_views()
-        show_toast(self, f"{str(group_name or '').strip()} 그룹을 복구하였습니다.")
-        return True
-
     def open_routine_context_menu(self, position) -> None:
         item = self.routine_table.itemAt(position)
         if item is None:
@@ -9319,7 +9372,6 @@ class MainWindow(QMainWindow):
             group_id = str(first_item.data(ROUTINE_GROUP_ID_ROLE) or "").strip()
             group_path = str(first_item.data(ROUTINE_GROUP_PATH_ROLE) or "").strip()
             group_name = str(first_item.data(ROUTINE_PARENT_NAME_ROLE) or "").strip()
-            recovery_control = bool(first_item.data(ROUTINE_GROUP_RECOVERY_ROLE))
             if not group_id or not group_path:
                 QMessageBox.warning(
                     self,
@@ -9331,28 +9383,21 @@ class MainWindow(QMainWindow):
             menu.setToolTipsVisible(True)
             register_action = menu.addAction("루틴등록")
             menu.addSeparator()
-            recovery_action = menu.addAction("그룹복구")
             delete_group_action = menu.addAction("그룹삭제")
             delete_group_action.setEnabled(True)
             menu.addSeparator()
+            packing_available = group_packing_enabled()
+            if packing_available:
+                packing_action = menu.addAction("그룹패킹")
+                packing_action.setEnabled(True)
+                menu.addSeparator()
             early_close_action = menu.addAction("조기마감")
-            immediate_action = menu.addAction("즉시청산")
             set_menu_action_text_color(
                 menu,
                 early_close_action,
                 CONTEXT_MENU_DANGER_TEXT_COLOR,
             )
-            recovery_record = getattr(
-                self,
-                "_routine_recovery_control_by_group",
-                {},
-            ).get(group_id)
-            deletion_pending = bool(
-                getattr(recovery_record, "deletion_pending", False)
-            )
-            register_action.setEnabled(not recovery_control)
-            recovery_action.setEnabled(recovery_control and not deletion_pending)
-            has_valid_target = not recovery_control and any(
+            has_valid_target = any(
                 routine_instance_checked(self, instance_id)
                 for instance_id in self._routine_instance_ids_by_group.get(
                     group_id,
@@ -9360,28 +9405,24 @@ class MainWindow(QMainWindow):
                 )
             ) and bool(self._routine_stock_paths_by_group.get(group_id, ()))
             self._set_routine_operation_actions_enabled(
-                (early_close_action, immediate_action),
+                (early_close_action,),
                 has_valid_target,
             )
-            if recovery_control and not deletion_pending:
-                recovery_action.triggered.connect(
-                    lambda _checked=False: self.restore_routine_group_manually(
-                        group_id,
-                        group_name,
-                    )
+            register_action.triggered.connect(
+                lambda _checked=False: self.open_routine_registration_from_main_group(
+                    group_id
                 )
-            elif not recovery_control:
-                register_action.triggered.connect(
-                    lambda _checked=False: self.open_routine_registration_from_main_group(
-                        group_id
-                    )
-                )
+            )
             delete_group_action.triggered.connect(
                 lambda _checked=False: self.delete_routine_group_completely(
                     group_id,
                     group_name,
                 )
             )
+            if packing_available:
+                packing_action.triggered.connect(
+                    lambda _checked=False: self.pack_routine_group(group_id)
+                )
             early_close_action.triggered.connect(
                 lambda _checked=False: self.request_routine_group_operation(
                     group_id,
@@ -9390,17 +9431,8 @@ class MainWindow(QMainWindow):
                     ROUTINE_STATUS_EARLY_CLOSE,
                 )
             )
-            immediate_action.triggered.connect(
-                lambda _checked=False: self.request_routine_group_operation(
-                    group_id,
-                    group_name,
-                    POLICY_MARKET,
-                    ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
-                )
-            )
             chosen = menu.exec_(self.routine_table.viewport().mapToGlobal(position))
-            if chosen in (early_close_action, immediate_action):
-                market_selected = chosen == immediate_action
+            if chosen == early_close_action:
                 append_production_event(
                     "OPERATOR_OPERATION_DECISION",
                     result="ACCEPTED",
@@ -9414,11 +9446,9 @@ class MainWindow(QMainWindow):
                         "prompt_key": "ROUTINE_GROUP_CONTEXT_MENU",
                         "prompt_title": "그룹 메뉴",
                         "prompt_summary": "그룹 운영 action 선택",
-                        "offered_options": ["조기마감", "즉시청산"],
-                        "selected_option": (
-                            "EARLY_CLOSE_MARKET" if market_selected else "EARLY_CLOSE_ROUTINE"
-                        ),
-                        "method": "market" if market_selected else "routine",
+                        "offered_options": ["조기마감"],
+                        "selected_option": "EARLY_CLOSE_ROUTINE",
+                        "method": "routine",
                     },
                 )
             return

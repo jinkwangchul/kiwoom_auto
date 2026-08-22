@@ -2270,7 +2270,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
-                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
             ):
                 result = gui.AutoTradeSettingWindow.process_executable_order_for_auto_trade(
                     window,
@@ -2384,7 +2388,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
-                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
             ):
                 result = gui.AutoTradeSettingWindow.process_executable_order_for_auto_trade(
                     window,
@@ -2421,7 +2429,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
                 window.current_selected_routine_dir = lambda: routine_dir
 
-                with mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]):
+                with mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ):
                     reasons = gui.AutoTradeSettingWindow.auto_trade_execution_block_reasons(
                         window,
                         {"code": "003550"},
@@ -2474,7 +2486,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
-                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
             ):
                 result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
                     window,
@@ -2527,7 +2543,11 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
-                mock.patch.object(gui, "get_stock_dirs_in_routine", return_value=[stock_dir]),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
             ):
                 result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
                     window,

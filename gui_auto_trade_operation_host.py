@@ -24,10 +24,8 @@ from gui_auto_trade_integrity import (
     operator_review_location,
     operator_review_reason,
 )
-from gui_auto_trade_runtime import now_text
-from gui_auto_trade_runtime import get_stock_dirs_in_routine
+from gui_auto_trade_runtime import all_group_stock_dirs, now_text
 from gui_base_stock_service import read_base_stocks
-from gui_routine_registry import get_group_dirs
 from gui_auto_trade_status_ops import (
     auto_trade_recalculate_all_status_by_operation_policy,
     auto_trade_recalculate_stock_status_by_operation_policy,
@@ -81,13 +79,14 @@ class AutoTradeOperationHost(QObject):
                 selected_routine_metadata=lambda: None,
                 selected_target_instance_ids=lambda: (),
                 selected_routine_dir=lambda: None,
-                routine_dirs=lambda: get_group_dirs(),
-                stock_dirs_in_routine=lambda routine_dir: get_stock_dirs_in_routine(routine_dir),
+                routine_dirs=lambda: [],
+                stock_dirs_in_routine=lambda _routine_dir: [],
                 base_stocks=lambda: read_base_stocks(),
                 order_queue_path=lambda: ORDER_QUEUE_PATH,
                 order_executions_path=lambda: ORDER_EXECUTIONS_PATH,
                 order_locks_path=lambda: ORDER_LOCKS_PATH,
                 confirm_runtime_file_init=None,
+                all_group_stock_dirs=all_group_stock_dirs,
             )
         )
         self._bar_commit_trigger_queue: deque[dict[str, object]] = deque()
