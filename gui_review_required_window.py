@@ -64,7 +64,10 @@ from gui_operation_environment import (
 from account_funds_foundation import READY as ACCOUNT_FUNDS_READY
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
-from stock_repository import repository as stock_repository_factory
+from stock_repository import (
+    repository as stock_repository_factory,
+    safe_stock_folder_name,
+)
 from group_scope import load_group_scope
 from stock_long_hold_policy import long_hold_excludes_holding_review
 from gui_auto_trade_runtime import write_state_json
@@ -875,7 +878,12 @@ def auto_trade_setting_server_mismatch_detected(state: dict[str, object] | None)
     return False
 
 
-def collect_global_review_required_rows(availability_window=None) -> list[dict[str, object]]:
+def collect_global_review_required_rows(
+    availability_window=None,
+    *,
+    preloaded_stocks: object | None = None,
+    preloaded_stock_data_by_dir: dict[str, dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """
     프로그램 전체 단위 검토관리 대상 목록을 중앙 stocks/ 기준으로 수집한다.
 
@@ -890,21 +898,64 @@ def collect_global_review_required_rows(availability_window=None) -> list[dict[s
         read_review_policy().get("long_term_holding_enabled", False)
     )
 
-    try:
-        repo = stock_repository_factory()
-        records = repo.list_stocks()
-    except Exception:
-        records = []
+    repo = None
+    if preloaded_stocks is None:
+        try:
+            repo = stock_repository_factory()
+            records = repo.list_stocks()
+        except Exception:
+            records = []
+    else:
+        records = list(preloaded_stocks)
 
     for record in records:
-        code = str(record.code or "").strip()
-        name = str(record.name or "").strip()
-        stock_dir = repo.resolve_stock_dir(code, name)
-        state, state_issue_reason = _read_central_review_state(stock_dir / "state.json")
-        routine_name = str(record.routine or state.get("review_routine", "") or "-").strip() or "-"
+        if isinstance(record, dict):
+            code = str(record.get("code", "") or "").strip()
+            name = str(record.get("name", "") or "").strip()
+            stock_path = str(record.get("stock_path", "") or "").strip()
+            stock_dir = (
+                PROJECT_ROOT / stock_path
+                if stock_path
+                else PROJECT_ROOT / "stocks" / safe_stock_folder_name(code, name)
+            )
+            routines = record.get("routines", ())
+            routine_name_source = (
+                next(
+                    (
+                        str(value or "").strip()
+                        for value in routines
+                        if str(value or "").strip()
+                    ),
+                    "",
+                )
+                if isinstance(routines, (list, tuple, set))
+                else ""
+            )
+        else:
+            code = str(record.code or "").strip()
+            name = str(record.name or "").strip()
+            stock_dir = repo.resolve_stock_dir(code, name)
+            routine_name_source = str(record.routine or "").strip()
+        snapshot_data = (
+            preloaded_stock_data_by_dir.get(str(stock_dir), {})
+            if preloaded_stock_data_by_dir is not None
+            else {}
+        )
+        if snapshot_data:
+            state = dict(snapshot_data.get("state", {}))
+            state_issue_reason = str(
+                snapshot_data.get("state_issue_reason", "") or ""
+            )
+        else:
+            state, state_issue_reason = _read_central_review_state(
+                stock_dir / "state.json"
+            )
+        routine_name = str(
+            routine_name_source or state.get("review_routine", "") or "-"
+        ).strip() or "-"
 
         if state_issue_reason:
-            if not str(record.routine or "").strip():
+            if not routine_name_source:
                 continue
             state_issue_record = _state_issue_review_record_from_manifest(code, name)
             holding_qty = 0

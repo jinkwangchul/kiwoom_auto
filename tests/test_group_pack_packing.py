@@ -122,21 +122,20 @@ class GroupPackPackingTest(unittest.TestCase):
         self.assertTrue(instance.success)
         self.assertFalse(instance.instance.enabled)
 
-    def test_non_developer_profiles_create_no_actionable_output(self) -> None:
+    def test_distribution_profile_environment_does_not_gate_packing(self) -> None:
         for profile in ("beta", "production", "", "invalid"):
             with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 group, _second, _files = self._source_project(root)
-                output = root / "blocked.group.zip"
+                output = root / "packed.group.zip"
                 with patch.dict(
                     os.environ,
                     {"KIWOOM_AUTO_DISTRIBUTION_PROFILE": profile},
                     clear=False,
                 ):
                     result = pack_group(group.group_id, output, project_root=root)
-                self.assertFalse(result.success)
-                self.assertEqual("DEVELOPER_PROFILE_REQUIRED", result.error_code)
-                self.assertFalse(output.exists())
+                self.assertTrue(result.success)
+                self.assertTrue(output.exists())
 
     def test_protected_or_missing_source_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

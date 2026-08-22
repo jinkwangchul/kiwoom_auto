@@ -877,6 +877,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = _StartWindow([stock])
+            window._current_session_operation_participant_stock_codes = {"068270"}
             window.split_start_targets = Mock(
                 return_value=([], ["068270 셀트리온(운영)"])
             )

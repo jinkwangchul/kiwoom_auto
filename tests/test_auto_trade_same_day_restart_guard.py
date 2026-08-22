@@ -229,8 +229,16 @@ class SameDayRestartGuardTest(unittest.TestCase):
         self.assertEqual("PENDING_CANCEL", self.guard()["reason"])
 
         self.queue_path.write_text('{"orders": []}', encoding="utf-8")
+        self.assertTrue(
+            self.guard(state=dict(self.state, status="EARLY_CLOSE"))["allowed"]
+        )
+
         for updates in (
-            {"status": "EARLY_CLOSE"},
+            {
+                "status": "EARLY_CLOSING",
+                "early_close_requested_at": "2026-08-10 09:50:00",
+                "early_close_source": "routine_context_menu",
+            },
             {"liquidation_policy_forced": True},
             {"close_routine_final_sell_ordered": True},
         ):

@@ -26,6 +26,11 @@ from PyQt5.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QStacke
 
 from gui_table_utils import next_sort_order
 from gui_common_utils import safe_int_value
+from routine_tree_title_display import (
+    tree_title_slot_width,
+    tree_title_text,
+    tree_title_tooltip,
+)
 from gui_config_utils import default_config
 from execution_fill_recorder import read_execution_fill_records
 from gui_stock_data import stock_runtime_dir_for_routine
@@ -45,11 +50,13 @@ from gui_operation_environment import (
 )
 from runtime_io import read_json_dict
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_BADGE_HEIGHT,
     RatioMetricDisplay,
     apply_auto_trade_plain_metric_item_style,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
     apply_auto_trade_setting_protection_row_style,
+    auto_trade_setting_badge_stylesheet,
     auto_trade_setting_status_sort_rank,
     confirmable_stock_profit_metric,
     create_auto_trade_operation_item,
@@ -189,20 +196,22 @@ ROUTINE_CHECKBOX_SIZE = 16
 ROUTINE_PROFIT_LED_BOX_SIZE = 18
 ROUTINE_PROFIT_LED_SIZE = 18
 ROUTINE_PROFIT_LED_GAP = 4
-ROUTINE_INSTANCE_NAME_WIDTH = 210
-ROUTINE_INSTANCE_NAME_PREFIX_CHARS = 6
-ROUTINE_INSTANCE_NAME_DISPLAY_CHARS = 7
+ROUTINE_INSTANCE_NAME_WIDTH = 270
 ROUTINE_INSTANCE_ROW_HEIGHT = 28
 ROUTINE_STOCK_ROW_HEIGHT = 24
 ROUTINE_STATUS_STAMP_WIDTH = 82
-ROUTINE_STATUS_STAMP_HEIGHT = 26
+# The painted stock badge's 1px outline occupies the full stock-row footprint.
+ROUTINE_STATUS_STAMP_HEIGHT = ROUTINE_STOCK_ROW_HEIGHT
+ROUTINE_STATUS_STAMP_GRID_INSET = 8
+ROUTINE_LIMIT_SETTINGS_BADGE_WIDTH = 64
+ROUTINE_LIMIT_SETTINGS_BADGE_GAP = 4
 ROUTINE_INSTANCE_GRID_COLUMN_SAMPLES = {
     "status": "[기본운영]",
     "registered": "등록(99)",
     "excluded": "제외(99)",
     "operation_or_stopped": "운영(99)",
     "review": "검토(99)",
-    "limit": "한도(99,999,999) [설정]",
+    "limit": "[설정] 한도(99,999,999)",
     "consumed": "소모(99,999,999 / 100.0%)",
     "profit": "수익(-99,999,999 / -99.99%)",
 }
@@ -268,10 +277,11 @@ def routine_instance_grid_columns(font: QFont | None = None) -> dict[str, int]:
         columns[column_key] = routine_aggregate_metric_width(column_key, font)
     number_widths = routine_instance_number_widths(font)
     columns["limit"] = (
-        metrics.horizontalAdvance("한도(")
+        ROUTINE_LIMIT_SETTINGS_BADGE_WIDTH
+        + ROUTINE_LIMIT_SETTINGS_BADGE_GAP
+        + metrics.horizontalAdvance("한도(")
         + number_widths["limit_amount"]
         + metrics.horizontalAdvance(")")
-        + metrics.horizontalAdvance(" [설정]")
         + (ROUTINE_INSTANCE_MONEY_OUTER_PADDING * 2)
     )
     columns["consumed"] = (
@@ -383,6 +393,7 @@ def routine_stock_position_value_widths(font: QFont | None = None) -> dict[str, 
 
 
 def routine_stock_column_widths(font: QFont | None = None) -> tuple[int, ...]:
+    metrics = QFontMetrics(font or QFont())
     value_widths = routine_stock_position_value_widths(font)
     metric_widths = tuple(
         stock_position_metric_width(
@@ -394,12 +405,26 @@ def routine_stock_column_widths(font: QFont | None = None) -> tuple[int, ...]:
         for label in ("보유", "가격", "수익", "매매")
     )
     instance_widths = routine_instance_grid_columns(font)
+    group_title_column_width = max(
+        ROUTINE_STOCK_BASE_COLUMN_WIDTHS[0],
+        ROUTINE_PARENT_CHECKBOX_OFFSET
+        + metrics.horizontalAdvance("▼ ")
+        + tree_title_slot_width(metrics)
+        + 8,
+    )
     return (
-        *ROUTINE_STOCK_BASE_COLUMN_WIDTHS,
+        group_title_column_width,
+        *ROUTINE_STOCK_BASE_COLUMN_WIDTHS[1:],
         *metric_widths,
         instance_widths["limit"],
         instance_widths["consumed"],
     )
+
+
+def routine_instance_status_column_left(font: QFont | None = None) -> int:
+    return ROUTINE_STOCK_TEXT_OFFSET + routine_stock_column_widths(
+        font or main_monitoring_table_font()
+    )[0]
 
 
 ROUTINE_STOCK_COLUMN_WIDTHS = (*ROUTINE_STOCK_BASE_COLUMN_WIDTHS, 174, 154, 174, 110, 148, 226)
@@ -632,11 +657,7 @@ def routine_instance_count_display(value: object) -> str:
 
 
 def routine_instance_name_display(display_name: object) -> str:
-    """Keep seven characters; use the canonical six-character ellipsis after that."""
-    text = str(display_name or "").strip()
-    if len(text) <= ROUTINE_INSTANCE_NAME_DISPLAY_CHARS:
-        return text
-    return f"{text[:ROUTINE_INSTANCE_NAME_PREFIX_CHARS]}..."
+    return tree_title_text(display_name)
 
 
 def _routine_aggregate_metric_widget(
@@ -744,6 +765,30 @@ def _routine_limit_metric_widget(
         0,
     )
     layout.setSpacing(0)
+    settings_label = _routine_metric_text_label("설정", "#2563EB")
+    settings_label.setObjectName("routineInstanceBuyLimitSettings")
+    settings_label.setFixedSize(
+        ROUTINE_LIMIT_SETTINGS_BADGE_WIDTH,
+        AUTO_TRADE_SETTING_BADGE_HEIGHT,
+    )
+    settings_label.setAlignment(Qt.AlignCenter)
+    settings_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+    settings_label.setCursor(Qt.PointingHandCursor)
+    settings_label.setStyleSheet(
+        auto_trade_setting_badge_stylesheet(
+            "QLabel#routineInstanceBuyLimitSettings",
+            text_color="#2563EB",
+            border_color="#2563EB",
+        )
+        + (
+            "QLabel#routineInstanceBuyLimitSettings:disabled {"
+            " color: #9CA3AF; border-color: #D1D5DB;"
+            " background-color: transparent;"
+            "}"
+        )
+    )
+    layout.addWidget(settings_label, 0, Qt.AlignVCenter)
+    layout.addSpacing(ROUTINE_LIMIT_SETTINGS_BADGE_GAP)
     layout.addWidget(_routine_metric_text_label("한도(", color_value))
     value_slot = QWidget()
     value_slot.setObjectName("routineInstanceBuyLimitValueSlot")
@@ -780,11 +825,6 @@ def _routine_limit_metric_widget(
     value_stack.setCurrentWidget(amount_label)
     layout.addWidget(value_slot)
     layout.addWidget(_routine_metric_text_label(")", color_value))
-    settings_label = _routine_metric_text_label(" [설정]", "#2563EB")
-    settings_label.setObjectName("routineInstanceBuyLimitSettings")
-    settings_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-    settings_label.setCursor(Qt.PointingHandCursor)
-    layout.addWidget(settings_label)
     return widget
 
 
@@ -1011,7 +1051,8 @@ def create_routine_instance_status_widget(
     container.setFocusPolicy(Qt.NoFocus)
 
     layout = QHBoxLayout(container)
-    layout.setContentsMargins(8, 0, 4, 0)
+    status_column_left = routine_instance_status_column_left()
+    layout.setContentsMargins(0, 0, 4, 0)
     layout.setSpacing(0)
 
     stamp = RoutineInstanceStatusStamp(
@@ -1023,6 +1064,8 @@ def create_routine_instance_status_widget(
     stamp.setFocusPolicy(Qt.NoFocus)
     stamp.setAttribute(Qt.WA_StyledBackground, True)
     stamp.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+    if display_status == ROUTINE_STATUS_STOPPED:
+        stamp.setToolTip("더블클릭 | 운영시작")
     stamp.setStyleSheet(
         "QWidget#routineInstanceStatusStamp {"
         " background-color: #FFFFFF;"
@@ -1057,6 +1100,11 @@ def create_routine_instance_status_widget(
     stamp_layout.addWidget(status_text, 0, Qt.AlignCenter)
 
     layout.addWidget(stamp, 0, Qt.AlignVCenter)
+    layout.addSpacing(
+        ROUTINE_INSTANCE_NAME_WIDTH
+        + ROUTINE_STATUS_STAMP_GRID_INSET
+        - status_column_left
+    )
     column_widths = routine_instance_grid_columns(container.font())
     number_widths = routine_instance_number_widths(container.font())
     separator_width = routine_aggregate_separator_width(container.font())
@@ -1321,6 +1369,8 @@ def _instance_stock_counts(
     window=None,
     stock_scope: str | None = None,
     stock_paths: set[str] | None = None,
+    static_data: dict[str, object] | None = None,
+    state_by_stock_dir: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
     clean_scope = str(stock_scope or "").strip().lower()
@@ -1339,11 +1389,19 @@ def _instance_stock_counts(
             clean_scope = "normal"
         else:
             clean_scope = "all_non_review"
-    static_cache = _main_pnl_refresh_static_cache(window)
+    static_cache = (
+        static_data
+        if isinstance(static_data, dict)
+        else _main_pnl_refresh_static_cache(window)
+    )
     dynamic_stocks: list[tuple[dict[str, object], dict[str, object]]] = []
     for stock in static_cache["stocks"]:
         stock_dir = Path(stock["stock_dir"])
-        state = read_json_dict(stock_dir / "state.json")
+        state = (
+            state_by_stock_dir.get(str(stock_dir), {})
+            if state_by_stock_dir is not None
+            else read_json_dict(stock_dir / "state.json")
+        )
         dynamic_stocks.append((stock, state))
     for stock, state in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
@@ -3091,8 +3149,9 @@ def main_load_routine_table(window) -> None:
         aggregate_text = " | ".join(aggregate_slots)
         parent_aggregate = aggregate_text
         child_aggregate = aggregate_text
+        raw_group_name = str(row_data.get("name", "") or "")
         values = (
-            [f"{prefix}{row_data['name']}"] + ([""] * 9)
+            [f"{prefix}{tree_title_text(raw_group_name)}"] + ([""] * 9)
             if is_parent
             else [
                 str(row_data["name"]),
@@ -3130,6 +3189,7 @@ def main_load_routine_table(window) -> None:
                 item.setData(ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE, row_visually_enabled)
                 if is_parent:
                     item.setData(ROUTINE_PARENT_NAME_ROLE, str(row_data["name"]))
+                    item.setToolTip(tree_title_tooltip(row_data["name"]))
                     item.setData(ROUTINE_PARENT_AGGREGATE_ROLE, parent_aggregate)
                     item.setData(
                         ROUTINE_PARENT_AGGREGATE_VALUES_ROLE,
@@ -3165,9 +3225,10 @@ def main_load_routine_table(window) -> None:
                         bool(row_data.get("stocks")),
                     )
             if row_data["kind"] == ROUTINE_ROW_CHILD:
-                tooltip_parts = [
-                    str(row_data.get("full_name") or row_data.get("name") or "")
-                ]
+                full_name = str(
+                    row_data.get("full_name") or row_data.get("name") or ""
+                )
+                tooltip_parts = [tree_title_tooltip(full_name)]
                 if row_data.get("description"):
                     tooltip_parts.append(str(row_data["description"]))
                 item.setToolTip("\n\n".join(part for part in tooltip_parts if part))

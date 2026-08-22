@@ -41,6 +41,7 @@ from gui_review_utils import (
     safe_float_value,
     safe_int_value,
 )
+from gui_auto_trade_policy import auto_trade_setting_start_target_allowed
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
 from stock_repository import StockRepository
@@ -607,17 +608,6 @@ class AutoTradeOperationHost(QObject):
         return is_review_required_stock_dir(stock_dir)
 
     def split_start_targets(self, selected):
-        allowed = {
-            "STOPPED",
-            "STOP",
-            "WAIT",
-            "WAIT_BUY",
-            "WAIT_SELL",
-            "MONITORING",
-            "WATCHING",
-            "WATCH",
-            "WATCH_BUY",
-        }
         targets = []
         skipped = []
         for stock_dir, code, name in selected:
@@ -626,7 +616,7 @@ class AutoTradeOperationHost(QObject):
                 continue
             state = read_json_dict(Path(stock_dir) / "state.json")
             status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-            if status in allowed:
+            if auto_trade_setting_start_target_allowed(self, state, code):
                 targets.append((stock_dir, code, name))
             else:
                 skipped.append(f"{code} {name}({auto_trade_status_display(status)})")

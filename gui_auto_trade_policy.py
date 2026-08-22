@@ -334,6 +334,47 @@ def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], stat
     return False
 
 
+_OPERATION_START_ALLOWED_STATUSES = frozenset(
+    {
+        "STOPPED",
+        "STOP",
+        "WAIT",
+        "WAIT_BUY",
+        "WAIT_SELL",
+        "MONITORING",
+        "WATCHING",
+        "WATCH",
+        "WATCH_BUY",
+    }
+)
+_EARLY_CLOSE_STATUS_VALUES = frozenset(
+    {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}
+)
+
+
+def auto_trade_setting_start_target_allowed(
+    window,
+    state: dict[str, object],
+    stock_code: object,
+) -> bool:
+    """Return whether an explicit current-session start may classify the target."""
+    persisted_started = auto_trade_setting_trade_started(state)
+    if auto_trade_setting_current_session_trade_started(
+        window,
+        persisted_started,
+        stock_code,
+    ):
+        return False
+
+    raw_status = str((state or {}).get("status", "STOPPED")).strip().upper()
+    raw_status = raw_status or "STOPPED"
+    if raw_status in _OPERATION_START_ALLOWED_STATUSES:
+        return True
+    if raw_status in _EARLY_CLOSE_STATUS_VALUES:
+        return not auto_trade_setting_should_preserve_raw_status(state, raw_status)
+    return False
+
+
 def auto_trade_setting_no_next_step_notice(state: dict[str, object] | None) -> bool:
     """정상 흐름이지만 다음 절차로 진행할 대상이 없어 주황 현황으로 표시할 상태.
 

@@ -262,6 +262,10 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
 
     def test_group_registration_name_uses_first_available_suffix(self) -> None:
         self.assertEqual(
+            "지표추종매매_2A",
+            suggest_group_routine_instance_display_name("지표추종매매_2", []),
+        )
+        self.assertEqual(
             "지표추종복사A",
             suggest_group_routine_instance_display_name("지표추종복사", []),
         )
@@ -543,7 +547,7 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                     for button in dialog.findChildren(QPushButton)
                 )
             )
-            self.assertEqual("저장", dialog.save_button.text())
+            self.assertEqual("변경", dialog.save_button.text())
             screenshot_path = os.environ.get(
                 "ROUTINE_EXISTING_SETTINGS_SCREENSHOT_PATH",
                 "",
@@ -604,6 +608,48 @@ class RoutineRegistrationDialogTest(unittest.TestCase):
                     "basic_error_policy_combo"
                 ],
             )
+
+    def test_edit_success_refreshes_and_closes_without_changing_identity(self) -> None:
+        fake_self = SimpleNamespace(
+            instance_id="instance-id",
+            group_id="group-id",
+            save_indicator_follow_ui_state_to_rules=Mock(
+                return_value={"success": True}
+            ),
+            close=Mock(),
+        )
+
+        with patch(
+            "gui_indicator_follow_routine_settings_dialog._refresh_routine_assignment_views"
+        ) as refresh:
+            result = IndicatorFollowRoutineSettingsDialog.save_edit_settings_and_close(
+                fake_self
+            )
+
+        self.assertTrue(result["success"])
+        refresh.assert_called_once_with(fake_self)
+        fake_self.close.assert_called_once_with()
+        self.assertEqual("instance-id", fake_self.instance_id)
+        self.assertEqual("group-id", fake_self.group_id)
+
+    def test_edit_failure_keeps_dialog_open_without_refresh(self) -> None:
+        fake_self = SimpleNamespace(
+            save_indicator_follow_ui_state_to_rules=Mock(
+                return_value={"success": False, "error": "write failed"}
+            ),
+            close=Mock(),
+        )
+
+        with patch(
+            "gui_indicator_follow_routine_settings_dialog._refresh_routine_assignment_views"
+        ) as refresh:
+            result = IndicatorFollowRoutineSettingsDialog.save_edit_settings_and_close(
+                fake_self
+            )
+
+        self.assertFalse(result["success"])
+        refresh.assert_not_called()
+        fake_self.close.assert_not_called()
 
     def test_long_instance_name_shrinks_then_uses_ellipsis_inside_fixed_stamp(self) -> None:
         project_root = Path(__file__).resolve().parents[1]

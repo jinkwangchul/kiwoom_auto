@@ -20,6 +20,20 @@ from event_journal_production import (
 from gui_windows import MainWindow
 
 
+def center_main_window_on_primary_screen(
+    app: QApplication,
+    window: MainWindow,
+) -> bool:
+    screen = app.primaryScreen()
+    if screen is None:
+        return False
+
+    frame_geometry = window.frameGeometry()
+    frame_geometry.moveCenter(screen.availableGeometry().center())
+    window.move(frame_geometry.topLeft())
+    return True
+
+
 def main() -> int:
     install_global_exception_observers()
     app = QApplication(sys.argv)
@@ -27,6 +41,7 @@ def main() -> int:
     try:
         window = MainWindow()
         window.show()
+        center_main_window_on_primary_screen(app, window)
         return app.exec_()
 
     except Exception as exc:

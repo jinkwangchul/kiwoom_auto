@@ -34,8 +34,10 @@ from gui_auto_trade_integrity import (
 )
 from gui_auto_trade_policy import (
     auto_trade_register_current_session_operation_participants,
+    auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
+    clear_early_close_runtime_metadata_only,
 )
 from gui_auto_trade_runtime import all_registered_stock_dirs, parse_stock_folder_name
 from gui_auto_trade_status_ops import (
@@ -493,7 +495,11 @@ def _close_completion_evidence_for_today(
 
 def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> bool:
     status = str(state.get("status") or "").strip().upper()
-    if status in _ACTIVE_CLOSE_STATUSES:
+    stale_early_close_status = (
+        status in {"EARLY_CLOSE", "EARLY_CLOSING", "EARLY_CLOSED"}
+        and not auto_trade_setting_should_preserve_raw_status(state, status)
+    )
+    if status in _ACTIVE_CLOSE_STATUSES and not stale_early_close_status:
         return True
     if bool(state.get("liquidation_policy_forced", False)):
         return True
@@ -510,7 +516,7 @@ def _active_close_or_liquidation(state: dict[str, object], now_dt: datetime) -> 
             return True
 
     command_mode = str(state.get("operation_command_mode") or "").strip().upper()
-    if command_mode == "EARLY_CLOSE":
+    if command_mode == "EARLY_CLOSE" and not stale_early_close_status:
         notice = str(state.get("operation_notice") or "").strip().upper()
         if notice != "EARLY_CLOSE_NO_TARGET" and not _close_completion_evidence_for_today(
             state, now_dt
@@ -1506,10 +1512,14 @@ def auto_trade_start_selected_auto_trades(
     if not start_targets:
         all_review = bool(excluded_review) and not skipped
         all_already_running = bool(skipped) and all(
-            auto_trade_setting_trade_started(
-                read_json_dict(stock_dir / "state.json")
+            auto_trade_setting_current_session_trade_started(
+                window,
+                auto_trade_setting_trade_started(
+                    read_json_dict(stock_dir / "state.json")
+                ),
+                code,
             )
-            for stock_dir, _code, _name in candidate_targets
+            for stock_dir, code, _name in candidate_targets
         )
         result = {
             "ok": False,
@@ -1797,6 +1807,20 @@ def auto_trade_start_selected_auto_trades(
             "start_policy_status": start_status,
             "start_policy_checked_at": started_at,
         }
+        cleared_close_state = clear_early_close_runtime_metadata_only(dict(state))
+        for key in (
+            "early_close_requested_at",
+            "early_close_source",
+            "early_close_method",
+            "early_close_policy",
+            "liquidation_policy_forced",
+            "liquidation_policy_reason",
+            "close_routine_final_sell_ordered",
+            "close_routine_final_sell_ordered_at",
+            "close_routine_final_sell_source",
+            "close_routine_final_sell_reason",
+        ):
+            metadata[key] = cleared_close_state.get(key)
         try:
             result, _, applied_status = (
                 window.recalculate_stock_status_by_operation_policy(
@@ -2132,7 +2156,11 @@ def auto_trade_start_status_indicator(
         }
 
     state = read_json_dict(Path(stock_dir) / "state.json")
-    if auto_trade_setting_trade_started(state):
+    if auto_trade_setting_current_session_trade_started(
+        window,
+        auto_trade_setting_trade_started(state),
+        code,
+    ):
         result: dict[str, object] = {
             "ok": False,
             "reason": "ALREADY_RUNNING",

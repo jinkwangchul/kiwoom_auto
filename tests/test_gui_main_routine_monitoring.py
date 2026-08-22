@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -156,17 +157,42 @@ def _main_static_cache(definitions, instances, stocks) -> dict[str, object]:
     "requires real PyQt widgets; the legacy GUI test module installed global stubs",
 )
 class MainRoutineMonitoringDisplayTest(unittest.TestCase):
-    def test_routine_instance_name_display_keeps_seven_and_truncates_eight(self) -> None:
-        persisted_name = "지표추종매매C"
+    def test_group_title_display_keeps_ten_and_truncates_eleven(self) -> None:
+        ten_chars = "가" * 10
+        eleven_chars = "나" * 11
+
+        self.assertEqual(ten_chars, gui_main_table_loader.tree_title_text(ten_chars))
+        self.assertEqual(
+            ("나" * 9) + "...",
+            gui_main_table_loader.tree_title_text(eleven_chars),
+        )
+        self.assertEqual("", gui_main_table_loader.tree_title_tooltip(ten_chars))
+        self.assertEqual(
+            eleven_chars,
+            gui_main_table_loader.tree_title_tooltip(eleven_chars),
+        )
+
+        metrics = QFontMetrics(gui_main_table_loader.main_monitoring_table_font())
+        self.assertGreaterEqual(
+            gui_main_table_loader.routine_stock_column_widths(
+                gui_main_table_loader.main_monitoring_table_font()
+            )[0],
+            gui_main_table_loader.ROUTINE_PARENT_CHECKBOX_OFFSET
+            + metrics.horizontalAdvance("▼ ")
+            + gui_main_table_loader.tree_title_slot_width(metrics),
+        )
+
+    def test_routine_instance_name_display_uses_shared_ten_character_contract(self) -> None:
+        persisted_name = "가" * 10
         self.assertEqual(
             persisted_name,
             gui_main_table_loader.routine_instance_name_display(persisted_name),
         )
         self.assertEqual(
-            "지표추종매매...",
-            gui_main_table_loader.routine_instance_name_display("지표추종매매CD"),
+            ("나" * 9) + "...",
+            gui_main_table_loader.routine_instance_name_display("나" * 11),
         )
-        self.assertEqual("지표추종매매C", persisted_name)
+        self.assertEqual("가" * 10, persisted_name)
 
         font = gui_main_table_loader.main_monitoring_table_font()
         metrics = QFontMetrics(font)
@@ -183,7 +209,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertGreaterEqual(
             name_rect.width(),
-            metrics.horizontalAdvance("가나다라마바사"),
+            metrics.horizontalAdvance("가" * 10),
         )
 
     def test_valid_summary_uses_projected_relation_stock_rows(self) -> None:
@@ -449,12 +475,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         menu.exec_.return_value = None
         with (
             patch.object(gui_windows, "QMenu", return_value=menu),
-            patch.object(
-                gui_windows,
-                "routine_instance_checked",
-                return_value=True,
-            ),
-            patch.object(gui_windows, "group_packing_enabled", return_value=False),
         ):
             gui_windows.MainWindow.open_routine_context_menu(
                 window,
@@ -462,10 +482,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["루틴등록", "그룹삭제", "조기마감"],
+            ["루틴등록", "그룹삭제", "그룹패킹"],
             [call_item.args[0] for call_item in menu.addAction.call_args_list],
         )
-        self.assertEqual(2, menu.addSeparator.call_count)
+        self.assertEqual(1, menu.addSeparator.call_count)
         actions[1].setEnabled.assert_called_once_with(True)
         actions[2].setEnabled.assert_called_once_with(True)
         actions[0].triggered.connect.call_args.args[0]()
@@ -476,38 +496,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             group_id,
             group.name,
         )
-        self.assertEqual(
-            [
-                call(
-                    group_id,
-                    group.name,
-                    "루틴",
-                    gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
-                ),
-            ],
-            window.request_routine_group_operation.call_args_list,
-        )
-
-        developer_menu = MagicMock()
-        developer_actions = [MagicMock() for _ in range(4)]
-        developer_menu.addAction.side_effect = developer_actions
-        developer_menu.exec_.return_value = None
-        with (
-            patch.object(gui_windows, "QMenu", return_value=developer_menu),
-            patch.object(gui_windows, "routine_instance_checked", return_value=True),
-            patch.object(gui_windows, "group_packing_enabled", return_value=True),
-        ):
-            gui_windows.MainWindow.open_routine_context_menu(
-                window,
-                parent_name_point,
-            )
-        self.assertEqual(
-            ["루틴등록", "그룹삭제", "그룹패킹", "조기마감"],
-            [call_item.args[0] for call_item in developer_menu.addAction.call_args_list],
-        )
-        self.assertEqual(3, developer_menu.addSeparator.call_count)
-        developer_actions[2].setEnabled.assert_called_once_with(True)
-        developer_actions[2].triggered.connect.call_args.args[0]()
+        window.request_routine_group_operation.assert_not_called()
         window.pack_routine_group.assert_called_once_with(group_id)
         table.close()
 
@@ -675,15 +664,17 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         window = SimpleNamespace(
             _routine_instance_ids_by_group={"group-a": ("instance-a",)},
             _routine_group_records_by_id={
-                "group-a": SimpleNamespace(display_name="Group A")
+                "group-a": SimpleNamespace(
+                    display_name="Group A",
+                    definition_id="definition-a",
+                )
             },
         )
         with (
             patch.object(
                 gui_windows,
                 "routine_instance_by_id",
-                return_value=SimpleNamespace(definition_id="definition-a"),
-            ),
+            ) as instance_lookup,
             patch.object(
                 gui_windows,
                 "routine_definition_by_id",
@@ -703,6 +694,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             )
 
         auto_trade_window.assert_not_called()
+        instance_lookup.assert_not_called()
         open_registration_dialog.assert_called_once_with(
             window,
             {
@@ -715,10 +707,31 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             registration=True,
         )
 
-    def test_group_registration_ambiguous_definition_uses_toast(self) -> None:
-        window = SimpleNamespace(_routine_instance_ids_by_group={"group-a": ()})
+    def test_empty_group_registration_uses_group_record_definition(self) -> None:
+        definition = SimpleNamespace(
+            definition_id="definition-a",
+            display_name="Definition A",
+        )
+        window = SimpleNamespace(
+            _routine_instance_ids_by_group={"group-a": ()},
+            _routine_group_records_by_id={
+                "group-a": SimpleNamespace(
+                    display_name="지표추종매매_2",
+                    definition_id="definition-a",
+                )
+            },
+        )
         with (
-            patch.object(gui_windows.QMessageBox, "information") as information,
+            patch.object(gui_windows, "routine_instance_by_id") as instance_lookup,
+            patch.object(
+                gui_windows,
+                "routine_definition_by_id",
+                return_value=definition,
+            ),
+            patch.object(
+                gui_windows,
+                "open_routine_settings_dialog_for_owner",
+            ) as open_registration_dialog,
             patch.object(gui_windows, "show_toast") as toast,
         ):
             registered = gui_windows.MainWindow.open_routine_registration_from_main_group(
@@ -726,11 +739,19 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "group-a",
             )
 
-        self.assertFalse(registered)
-        information.assert_not_called()
-        toast.assert_called_once_with(
+        self.assertTrue(registered)
+        instance_lookup.assert_not_called()
+        toast.assert_not_called()
+        open_registration_dialog.assert_called_once_with(
             window,
-            "선택한 그룹의 루틴 유형을 하나로 확인할 수 없습니다.",
+            {
+                "row_kind": "definition",
+                "definition_id": "definition-a",
+                "definition_name": "Definition A",
+                "group_display_name": "지표추종매매_2",
+                "group_id": "group-a",
+            },
+            registration=True,
         )
 
     def test_instance_clone_reuses_saved_rules_snapshot_and_unique_group(self) -> None:
@@ -3493,7 +3514,17 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertIsNotNone(limit_widget)
                 self.assertIsNotNone(amount_label)
                 self.assertIsNotNone(settings_label)
-                self.assertEqual(" [\uC124\uC815]", settings_label.text())
+                self.assertEqual("\uC124\uC815", settings_label.text())
+                self.assertEqual(
+                    gui_main_table_loader.ROUTINE_LIMIT_SETTINGS_BADGE_WIDTH,
+                    settings_label.width(),
+                )
+                self.assertEqual(
+                    gui_main_table_loader.AUTO_TRADE_SETTING_BADGE_HEIGHT,
+                    settings_label.height(),
+                )
+                self.assertIn("border: 1px solid #2563EB", settings_label.styleSheet())
+                self.assertIs(settings_label, limit_widget.layout().itemAt(0).widget())
                 self.assertEqual("instance-a", settings_label.property("routine_instance_id"))
                 self.assertEqual([], limit_widget.findChildren(QLabel, "routineInstanceSeparator"))
                 window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
@@ -3672,10 +3703,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             package_enabled=True,
             source_name="지?�추종매�?",
         )
+        full_instance_name = "다" * 11
         instance = RoutineInstanceRecord(
             instance_id="a52f539d-4f18-4ef6-b0cf-f471567982a1",
             definition_id="indicator_follow",
-            display_name="?�?�주 추세??",
+            display_name=full_instance_name,
             source_routine_name="지?�추종매�?",
             persisted=True,
             source="PERSISTED",
@@ -3686,8 +3718,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             buy_limit_amount=None,
             rules_path=Path("instance-rules.json"),
         )
-        group = _main_group("지표추종매매")
+        full_group_name = "나" * 11
+        group = _main_group(full_group_name)
         group_id = group.group_id
+        instance = replace(instance, group_id=group_id)
         assigned_stocks = [
             _assigned_stock(instance.instance_id, group_name=group.name)
         ]
@@ -3714,6 +3748,17 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         ):
             gui_main_table_loader.main_load_routine_table(window)
             self.assertEqual(2, table.row_count)
+            parent_item = table.item(0, 0)
+            self.assertEqual(f"▼ {('나' * 9)}...", parent_item.text())
+            self.assertEqual(full_group_name, parent_item.toolTip())
+            self.assertEqual(
+                full_group_name,
+                parent_item.data(gui_main_table_loader.ROUTINE_PARENT_NAME_ROLE),
+            )
+            child_item = table.item(1, 0)
+            self.assertEqual(("다" * 9) + "...", child_item.text())
+            self.assertEqual(full_instance_name, child_item.toolTip())
+            self.assertEqual(full_instance_name, instance.display_name)
             self.assertIs(first_widget, table.cellWidget(1, 1))
 
             window._collapsed_main_group_ids = {group_id}
@@ -4844,15 +4889,15 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     window.open_routine_context_menu(parent_name_rect.center())
                 self.assertEqual(3, len(parent_menu.addAction.call_args_list))
                 self.assertEqual(
-                    ["루틴등록", "그룹삭제", "조기마감"],
+                    ["루틴등록", "그룹삭제", "그룹패킹"],
                     [call.args[0] for call in parent_menu.addAction.call_args_list],
                 )
-                self.assertEqual(2, parent_menu.addSeparator.call_count)
+                self.assertEqual(1, parent_menu.addSeparator.call_count)
                 parent_actions[0].triggered.connect.assert_called_once()
                 parent_actions[1].setEnabled.assert_called_once_with(True)
                 parent_actions[1].triggered.connect.assert_called_once()
-                parent_actions[2].setEnabled.assert_called_once_with(False)
-                parent_actions[2].setStatusTip.assert_called_once()
+                parent_actions[2].setEnabled.assert_called_once_with(True)
+                parent_actions[2].triggered.connect.assert_called_once()
 
 
 

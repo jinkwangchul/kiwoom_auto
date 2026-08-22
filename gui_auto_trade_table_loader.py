@@ -150,8 +150,14 @@ def apply_auto_trade_operation_excluded_row_style(
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _selected_instance_stock_dirs(window) -> list[Path]:
-    if bool(getattr(window, "_all_stocks_scope_active", False)):
+def _selected_instance_stock_dirs(
+    window,
+    *,
+    include_flat_stock_scope: bool = False,
+) -> list[Path]:
+    if bool(getattr(window, "_all_stocks_scope_active", False)) or bool(
+        include_flat_stock_scope
+    ):
         instance_ids_getter = getattr(window, "all_registered_instance_ids", None)
     else:
         instance_ids_getter = getattr(window, "current_selected_target_instance_ids", None)
@@ -167,7 +173,18 @@ def _selected_instance_stock_dirs(window) -> list[Path]:
 
     result: list[Path] = []
     seen: set[str] = set()
-    for stock in read_base_stocks():
+    snapshot = getattr(window, "_auto_trade_initial_read_snapshot", None)
+    stocks = (
+        snapshot.get("stocks", ())
+        if isinstance(snapshot, dict)
+        else read_base_stocks()
+    )
+    stock_data_by_dir = (
+        snapshot.get("stock_data_by_dir", {})
+        if isinstance(snapshot, dict)
+        else {}
+    )
+    for stock in stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if not stock_path:
             continue
@@ -176,7 +193,12 @@ def _selected_instance_stock_dirs(window) -> list[Path]:
             stock.get("assigned_routine_instance_id", "") or ""
         ).strip()
         if not assigned_instance_id:
-            config = read_json_dict(stock_dir / "config.json")
+            snapshot_data = stock_data_by_dir.get(str(stock_dir), {})
+            config = (
+                snapshot_data.get("config", {})
+                if snapshot_data
+                else read_json_dict(stock_dir / "config.json")
+            )
             assigned_instance_id = str(
                 config.get("assigned_routine_instance_id", "") or ""
             ).strip()
@@ -236,7 +258,13 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 window.stock_table.removeCellWidget(row, col)
         window.stock_table.clearContents()
 
-        stock_dirs = _selected_instance_stock_dirs(window)
+        stock_dirs = _selected_instance_stock_dirs(
+            window,
+            include_flat_stock_scope=(
+                str(getattr(window, "_routine_tree_display_level", "") or "")
+                == "stock"
+            ),
+        )
         if not stock_dirs:
             window.stock_table.setRowCount(0)
             return
@@ -255,9 +283,20 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
         window.stock_table.setRowCount(0)
         row = 0
 
+        snapshot = getattr(window, "_auto_trade_initial_read_snapshot", None)
+        stock_data_by_dir = (
+            snapshot.get("stock_data_by_dir", {})
+            if isinstance(snapshot, dict)
+            else {}
+        )
         for stock_dir in stock_dirs:
             code, name = parse_stock_folder_name(stock_dir.name)
-            state = read_json_dict(stock_dir / "state.json")
+            snapshot_data = stock_data_by_dir.get(str(stock_dir), {})
+            state = (
+                dict(snapshot_data.get("state", {}))
+                if snapshot_data
+                else read_json_dict(stock_dir / "state.json")
+            )
             trade_key = str(code or "").strip().lstrip("A")
             buy_trade_count, sell_trade_count = trade_counts_by_code.get(
                 trade_key,
@@ -265,7 +304,11 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             )
 
             # 검토종목은 자동매매설정 창에서 완전 제외한다.
-            config = read_json_dict(stock_dir / "config.json")
+            config = (
+                dict(snapshot_data.get("config", {}))
+                if snapshot_data
+                else read_json_dict(stock_dir / "config.json")
+            )
             if not config:
                 config = default_config()
             operation_excluded = is_operation_excluded(config)
@@ -620,4 +663,5 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
 
     refresh_auto_trade_chart_open_code_styles(window)
-    window.update_action_buttons()
+    if not bool(getattr(window, "_defer_stock_loader_action_update", False)):
+        window.update_action_buttons()

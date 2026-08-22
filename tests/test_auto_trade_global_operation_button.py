@@ -14,6 +14,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import gui_auto_trade_run_control as run_control
+import gui_auto_trade_policy as auto_trade_policy
 import gui_main_emergency_ops as emergency_ops
 import gui_main_stock_context_menu as monitoring_context_menu
 import gui_auto_trade_setting_window as setting_window
@@ -444,6 +445,101 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.assertEqual("운영중", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
+
+    def test_stale_early_close_starts_then_rejects_current_session_rerun(self) -> None:
+        targets = list(self.targets[:2])
+        for target in targets:
+            self._write_state(
+                target[0],
+                status="EARLY_CLOSE",
+                trade_enabled=True,
+                trade_started_at="2026-08-09 10:00:00",
+                early_close_requested_at="2026-08-09 13:00:00",
+                early_close_source="main_routine_context_menu",
+                early_close_method="루틴",
+                early_close_policy={"method": "루틴"},
+                operation_command_mode="EARLY_CLOSE",
+            )
+        queue_path = self.root / "runtime" / "order_queue.json"
+        queue_path.write_text('{"orders": []}', encoding="utf-8")
+
+        target = targets[0]
+        before_state = read_json_dict(target[0] / "state.json")
+        self.assertTrue(auto_trade_policy.auto_trade_setting_trade_started(before_state))
+        self.assertFalse(
+            auto_trade_policy.auto_trade_setting_current_session_trade_started(
+                self.window,
+                True,
+                target[1],
+            )
+        )
+        self.assertEqual(
+            "waiting",
+            auto_trade_policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code=target[1],
+                persisted_trade_started=True,
+                operation_excluded=False,
+                review_required=False,
+            ),
+        )
+        start_targets, skipped = self.window.split_start_targets(targets)
+        self.assertEqual(targets, start_targets)
+        self.assertEqual([], skipped)
+
+        with patch.object(run_control, "ORDER_QUEUE_PATH", queue_path):
+            first = run_control.auto_trade_start_selected_auto_trades(
+                self.window,
+                selected_targets=targets,
+            )
+
+        self.assertTrue(first["ok"], first)
+        saved = read_json_dict(target[0] / "state.json")
+        self.assertEqual("RUNNING", saved["status"])
+        self.assertIs(saved["trade_enabled"], True)
+        self.assertTrue(str(saved.get("trade_started_at") or ""))
+        self.assertEqual("", saved.get("early_close_requested_at"))
+        self.assertEqual("", saved.get("early_close_source"))
+        self.assertEqual("", saved.get("early_close_method"))
+        self.assertEqual({}, saved.get("early_close_policy"))
+        self.assertTrue(
+            auto_trade_policy.auto_trade_setting_current_session_trade_started(
+                self.window,
+                auto_trade_policy.auto_trade_setting_trade_started(saved),
+                target[1],
+            )
+        )
+        self.assertEqual(
+            "operation",
+            auto_trade_policy.auto_trade_stock_operation_category(
+                self.window,
+                stock_code=target[1],
+                persisted_trade_started=True,
+                operation_excluded=False,
+                review_required=False,
+            ),
+        )
+
+        with (
+            patch.object(run_control, "ORDER_QUEUE_PATH", queue_path),
+            patch.object(run_control, "show_toast") as toast,
+        ):
+            second = run_control.auto_trade_start_selected_auto_trades(
+                self.window,
+                selected_targets=targets,
+            )
+
+        self.assertFalse(second["ok"])
+        self.assertEqual("NO_STARTABLE_TARGETS", second["reason"])
+        self.assertEqual(
+            "선택한 루틴은 이미 운영 중입니다.",
+            second["user_message"],
+        )
+        toast.assert_called_once()
+        self.assertEqual(
+            "선택한 루틴은 이미 운영 중입니다.",
+            toast.call_args.kwargs["message"],
+        )
 
     def test_monitoring_and_setting_buttons_share_owner_recovery_context(self) -> None:
         self._write_state(

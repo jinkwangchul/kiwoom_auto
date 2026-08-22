@@ -1395,6 +1395,7 @@ from gui_main_table_loader import (
     routine_instance_separator_width,
     routine_aggregate_separator_width,
     routine_instance_grid_columns,
+    routine_instance_status_column_left,
     routine_aggregate_slot_lefts,
     routine_aggregate_label_width,
     routine_aggregate_number_slot_width,
@@ -1417,7 +1418,7 @@ from gui_main_table_loader import (
     main_monitoring_table_font,
     main_monitoring_cell_font,
 )
-from distribution_profile import group_packing_enabled
+from routine_tree_title_display import tree_title_text
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
 from gui_main_budget_panel import (
     MAIN_TOTAL_BUDGET_PERCENT_OPTIONS,
@@ -2187,7 +2188,7 @@ class _RoutineTreeInteractionController(QObject):
 
     def _parent_name_rect(self, index) -> QRect:
         cell_rect = self.table.visualRect(index)
-        name = str(index.data(ROUTINE_PARENT_NAME_ROLE) or "")
+        name = tree_title_text(index.data(ROUTINE_PARENT_NAME_ROLE))
         prefix = "▶ " if index.data(ROUTINE_PARENT_COLLAPSED_ROLE) else "▼ "
         metrics = QFontMetrics(_routine_parent_font(self.table.font()))
         text_left = (
@@ -4908,7 +4909,10 @@ class MainWindow(QMainWindow):
         routine_header.setSectionResizeMode(QHeaderView.Fixed)
         routine_header.setStretchLastSection(False)
 
-        self.routine_table.setColumnWidth(0, ROUTINE_INSTANCE_NAME_WIDTH)
+        self.routine_table.setColumnWidth(
+            0,
+            routine_instance_status_column_left(self.routine_table.font()),
+        )
         for column in range(1, len(headers) - 1):
             self.routine_table.setColumnWidth(column, 0)
         routine_header.setSectionResizeMode(len(headers) - 1, QHeaderView.Stretch)
@@ -9172,23 +9176,6 @@ class MainWindow(QMainWindow):
             action.setToolTip("" if enabled else unavailable_reason)
 
     def open_routine_registration_from_main_group(self, group_id: str) -> bool:
-        definition_by_id: dict[str, object] = {}
-        for instance_id in self._routine_instance_ids_by_group.get(group_id, ()):
-            instance = routine_instance_by_id(instance_id)
-            definition_id = str(
-                getattr(instance, "definition_id", "") or ""
-            ).strip()
-            definition = routine_definition_by_id(definition_id) if definition_id else None
-            if definition is not None:
-                definition_by_id[definition_id] = definition
-
-        if len(definition_by_id) != 1:
-            show_toast(
-                self,
-                "선택한 그룹의 루틴 유형을 하나로 확인할 수 없습니다.",
-            )
-            return False
-
         group = getattr(self, "_routine_group_records_by_id", {}).get(group_id)
         if group is None:
             group = group_record_by_id(group_id)
@@ -9199,7 +9186,12 @@ class MainWindow(QMainWindow):
             show_toast(self, "선택한 그룹을 확인할 수 없습니다.")
             return False
 
-        definition_id, definition = next(iter(definition_by_id.items()))
+        definition_id = str(getattr(group, "definition_id", "") or "").strip()
+        definition = routine_definition_by_id(definition_id) if definition_id else None
+        if definition is None:
+            show_toast(self, "선택한 그룹의 등록 설정을 확인할 수 없습니다.")
+            return False
+
         open_routine_settings_dialog_for_owner(
             self,
             {
@@ -9385,29 +9377,8 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             delete_group_action = menu.addAction("그룹삭제")
             delete_group_action.setEnabled(True)
-            menu.addSeparator()
-            packing_available = group_packing_enabled()
-            if packing_available:
-                packing_action = menu.addAction("그룹패킹")
-                packing_action.setEnabled(True)
-                menu.addSeparator()
-            early_close_action = menu.addAction("조기마감")
-            set_menu_action_text_color(
-                menu,
-                early_close_action,
-                CONTEXT_MENU_DANGER_TEXT_COLOR,
-            )
-            has_valid_target = any(
-                routine_instance_checked(self, instance_id)
-                for instance_id in self._routine_instance_ids_by_group.get(
-                    group_id,
-                    (),
-                )
-            ) and bool(self._routine_stock_paths_by_group.get(group_id, ()))
-            self._set_routine_operation_actions_enabled(
-                (early_close_action,),
-                has_valid_target,
-            )
+            packing_action = menu.addAction("그룹패킹")
+            packing_action.setEnabled(True)
             register_action.triggered.connect(
                 lambda _checked=False: self.open_routine_registration_from_main_group(
                     group_id
@@ -9419,38 +9390,10 @@ class MainWindow(QMainWindow):
                     group_name,
                 )
             )
-            if packing_available:
-                packing_action.triggered.connect(
-                    lambda _checked=False: self.pack_routine_group(group_id)
-                )
-            early_close_action.triggered.connect(
-                lambda _checked=False: self.request_routine_group_operation(
-                    group_id,
-                    group_name,
-                    "루틴",
-                    ROUTINE_STATUS_EARLY_CLOSE,
-                )
+            packing_action.triggered.connect(
+                lambda _checked=False: self.pack_routine_group(group_id)
             )
-            chosen = menu.exec_(self.routine_table.viewport().mapToGlobal(position))
-            if chosen == early_close_action:
-                append_production_event(
-                    "OPERATOR_OPERATION_DECISION",
-                    result="ACCEPTED",
-                    source="gui_windows.MainWindow.open_routine_context_menu",
-                    target_type="ROUTINE_GROUP",
-                    target_id=group_id,
-                    target_name=group_name,
-                    routine=group_name,
-                    details={
-                        "interaction_type": "SELECTION",
-                        "prompt_key": "ROUTINE_GROUP_CONTEXT_MENU",
-                        "prompt_title": "그룹 메뉴",
-                        "prompt_summary": "그룹 운영 action 선택",
-                        "offered_options": ["조기마감"],
-                        "selected_option": "EARLY_CLOSE_ROUTINE",
-                        "method": "routine",
-                    },
-                )
+            menu.exec_(self.routine_table.viewport().mapToGlobal(position))
             return
         if row_kind != ROUTINE_ROW_CHILD:
             return

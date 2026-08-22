@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QItemSelectionModel, Qt
+from PyQt5.QtCore import QItemSelectionModel, QRect, Qt
 from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -127,6 +127,70 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertEqual(table_loader.ROUTINE_STATUS_STAMP_HEIGHT, stamp.height())
         self.assertTrue(stamp.testAttribute(Qt.WA_StyledBackground))
         widget.close()
+
+    def test_stopped_badge_has_start_tooltip_and_reuses_stock_badge_height(self) -> None:
+        on_double_click = MagicMock()
+        stopped_widget = table_loader.create_routine_instance_status_widget(
+            table_loader.ROUTINE_STATUS_STOPPED,
+            registered=1,
+            excluded=0,
+            operation_or_stopped=1,
+            review=0,
+            on_status_double_click=on_double_click,
+        )
+        running_widget = table_loader.create_routine_instance_status_widget(
+            table_loader.ROUTINE_STATUS_RUNNING,
+            registered=1,
+            excluded=0,
+            operation_or_stopped=1,
+            review=0,
+        )
+        stopped_widget.show()
+        running_widget.show()
+        self.app.processEvents()
+        stopped_stamp = stopped_widget.findChild(
+            QWidget,
+            "routineInstanceStatusStamp",
+        )
+        running_stamp = running_widget.findChild(
+            QWidget,
+            "routineInstanceStatusStamp",
+        )
+
+        self.assertEqual("더블클릭 | 운영시작", stopped_stamp.toolTip())
+        self.assertEqual("", running_stamp.toolTip())
+        stock_badge_rect = gui_windows._initial_buy_component_rects(
+            QRect(0, 0, 176, table_loader.ROUTINE_STOCK_ROW_HEIGHT)
+        )["badge"]
+        stock_badge_outer_rect = stock_badge_rect.adjusted(0, -1, 0, 1)
+        self.assertEqual(stock_badge_outer_rect.height(), stopped_stamp.height())
+        self.assertEqual(stopped_stamp.height(), running_stamp.height())
+        self.assertEqual(table_loader.ROUTINE_STATUS_STAMP_WIDTH, stopped_stamp.width())
+        stock_badge_left = (
+            table_loader.ROUTINE_STOCK_TEXT_OFFSET
+            + table_loader.routine_stock_column_widths(
+                table_loader.main_monitoring_table_font()
+            )[0]
+        )
+        instance_column_left = table_loader.routine_instance_status_column_left(
+            table_loader.main_monitoring_table_font()
+        )
+        instance_badge_left = instance_column_left + stopped_stamp.geometry().left()
+        self.assertEqual(stock_badge_left, instance_badge_left)
+
+        registered = stopped_widget.findChild(QWidget, "routineInstanceRegistered")
+        self.assertEqual(
+            table_loader.ROUTINE_INSTANCE_NAME_WIDTH
+            + table_loader.ROUTINE_STATUS_STAMP_GRID_INSET
+            + table_loader.ROUTINE_STATUS_STAMP_WIDTH
+            + table_loader.ROUTINE_AGGREGATE_LEADING_GAP,
+            instance_column_left + registered.geometry().left(),
+        )
+
+        QTest.mouseDClick(stopped_stamp, Qt.LeftButton)
+        on_double_click.assert_called_once()
+        stopped_widget.close()
+        running_widget.close()
 
     def test_missing_instance_uses_one_actionable_failure_dialog(self) -> None:
         status_bar = MagicMock()
@@ -845,6 +909,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             window = SimpleNamespace(
                 statusBarMessage=Mock(),
+                startup_recovery_session_ready=Mock(return_value=True),
+                _current_session_operation_participant_stock_codes={"000660"},
             )
             target = (stock_dir, "000660", "SK하이닉스")
 
@@ -1844,7 +1910,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                         label,
                     )
 
-                collect_targets.assert_called_once_with(window, ("instance-a",))
+                collect_targets.assert_called_once_with(
+                    window,
+                    ("instance-a",),
+                    stock_paths=None,
+                )
                 adapter_factory.assert_called_once_with(
                     window,
                     [target],
@@ -1920,6 +1990,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         collect_targets.assert_called_once_with(
             window,
             ("instance-a", "instance-b"),
+            stock_paths=None,
         )
         adapter_factory.assert_called_once_with(
             window,

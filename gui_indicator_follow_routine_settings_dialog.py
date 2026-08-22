@@ -121,6 +121,22 @@ def normalize_indicator_follow_basic_ui_state(state):
     return normalized
 
 
+def _refresh_routine_assignment_views(owner):
+    refresh_owner = persistent_feature_root(owner)
+    refresh_views = getattr(
+        refresh_owner,
+        "refresh_auto_trade_assignment_views",
+        None,
+    )
+    if callable(refresh_views):
+        refresh_views()
+        return
+
+    refresh_all = getattr(refresh_owner, "refresh_all", None)
+    if callable(refresh_all):
+        refresh_all()
+
+
 def register_routine_instance_snapshot(
     owner,
     *,
@@ -206,18 +222,7 @@ def register_routine_instance_snapshot(
         else f"'{result.instance.display_name}' 루틴을 등록했습니다."
     )
     show_toast(owner, success_message)
-    refresh_owner = persistent_feature_root(owner)
-    refresh_views = getattr(
-        refresh_owner,
-        "refresh_auto_trade_assignment_views",
-        None,
-    )
-    if callable(refresh_views):
-        refresh_views()
-    else:
-        refresh_all = getattr(refresh_owner, "refresh_all", None)
-        if callable(refresh_all):
-            refresh_all()
+    _refresh_routine_assignment_views(owner)
     return result.instance
 
 
@@ -353,7 +358,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self.reload_button = QPushButton("다시 불러오기")
         self.validate_button = QPushButton("설정 검증")
         if self.settings_mode == "edit":
-            self.save_button = QPushButton("저장")
+            self.save_button = QPushButton("변경")
         else:
             self.save_button = QPushButton("등록")
             self.save_button.setObjectName("routineRegisterButton")
@@ -379,7 +384,7 @@ class IndicatorFollowRoutineSettingsDialog(
         )
         self.validate_button.clicked.connect(self._handle_validate_clicked)
         if self.settings_mode == "edit":
-            self.save_button.clicked.connect(self.save_indicator_follow_ui_state_to_rules)
+            self.save_button.clicked.connect(self.save_edit_settings_and_close)
         else:
             self.save_button.clicked.connect(self.open_registration_dialog)
         self.close_button.clicked.connect(self.close)
@@ -783,6 +788,13 @@ class IndicatorFollowRoutineSettingsDialog(
         if instance is not None and self.settings_mode == "registration":
             self.close()
         return instance
+
+    def save_edit_settings_and_close(self):
+        result = self.save_indicator_follow_ui_state_to_rules()
+        if result.get("success") is True:
+            _refresh_routine_assignment_views(self)
+            self.close()
+        return result
 
     def _load_indicator_follow_rule_mapper(self):
         import importlib.util

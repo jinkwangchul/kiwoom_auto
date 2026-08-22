@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Developer-only source inspection and deterministic Group Pack creation."""
+"""Source inspection and deterministic Group Pack creation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from pathlib import Path, PurePosixPath
 from uuid import uuid4
 import zipfile
 
-from distribution_profile import group_packing_enabled
 from group_pack_registration import (
     GROUP_PACK_SCHEMA_VERSION,
     GroupPackValidationError,
@@ -167,12 +166,6 @@ def pack_group(
     *,
     project_root: Path | str | None = None,
 ) -> GroupPackPackingResult:
-    if not group_packing_enabled():
-        return GroupPackPackingResult(
-            False,
-            error_code="DEVELOPER_PROFILE_REQUIRED",
-            error="그룹패킹은 developer 배포 Profile에서만 사용할 수 있습니다.",
-        )
     root = Path(project_root or PROJECT_ROOT)
     output = Path(output_path)
     if not output.name.casefold().endswith(".group.zip"):
