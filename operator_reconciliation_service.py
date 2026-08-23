@@ -26,6 +26,12 @@ from operation_close_completion_check_service import (
     check_global_close_completion_after_durable_update,
 )
 from position_update_service import update_position_from_fill
+from production_performance_linkage import (
+    append_performance_from_realization,
+    prepare_sell_fifo_realization,
+    record_buy_entry_lot,
+)
+from realized_pnl_ledger import record_realized_pnl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,6 +42,7 @@ DEFAULT_BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
 DEFAULT_ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 DEFAULT_ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 DEFAULT_ROUTINE_SIGNALS_PATH = PROJECT_ROOT / "runtime" / "routine_signals.json"
+DEFAULT_REALIZED_PNL_PATH = PROJECT_ROOT / "runtime" / "realized_pnl.json"
 
 STARTUP_RESUME_READY = "RESUME_READY"
 STARTUP_REVIEW_REQUIRED = "REVIEW_REQUIRED"
@@ -812,6 +819,7 @@ def retry_operator_chejan_reconciliation(
     queue_path: str | Path = DEFAULT_QUEUE_PATH,
     fills_path: str | Path = DEFAULT_FILLS_PATH,
     positions_path: str | Path = DEFAULT_POSITIONS_PATH,
+    realized_pnl_path: str | Path = DEFAULT_REALIZED_PNL_PATH,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     queue_data, queue_error = _read_json(queue_path)
@@ -844,6 +852,8 @@ def retry_operator_chejan_reconciliation(
     retry_context = {
         "manual_fill_record_confirmed": True,
         "manual_position_update_confirmed": True,
+        "manual_realized_pnl_confirmed": True,
+        "broker": "KIWOOM",
         "operator_reconciliation_action": True,
         "chejan_reconciliation_reprocess": True,
         "operator_reconciliation_confirmed_at": _now_text(),
@@ -918,6 +928,82 @@ def retry_operator_chejan_reconciliation(
         }
 
     completed_steps.append("POSITION_UPDATE")
+    canonical_root = Path(fills_path).parent
+    if canonical_root.name == "runtime":
+        canonical_root = canonical_root.parent
+    canonical_enabled = (
+        (canonical_root / "groups" / "registry.json").is_file()
+        and (canonical_root / "stocks").is_dir()
+    )
+    side = _clean_text(fill_record.get("side")).upper()
+    if canonical_enabled and side == "BUY":
+        lot_result = record_buy_entry_lot(canonical_root, fill_record, position_result)
+        if lot_result.get("success") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                queue_path,
+                chejan_result,
+                required=True,
+                failed_stage="ENTRY_LOT_LINKAGE",
+                completed_steps=completed_steps,
+                reasons=list(lot_result.get("blocked_reasons") or ["BUY entry-lot linkage failed"]),
+                context=retry_context,
+            )
+            return {"retried": False, "stage": "entry_lot", "fill_result": fill_result, "position_result": position_result, "reconciliation_result": reconciliation, "manual_reconciliation_required": True}
+        completed_steps.append("ENTRY_LOT_LINKAGE")
+    if canonical_enabled and side == "SELL":
+        fifo_result = None
+        fifo_result = prepare_sell_fifo_realization(canonical_root, fill_record, position_result)
+        if fifo_result.get("success") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                queue_path,
+                chejan_result,
+                required=True,
+                failed_stage="FIFO_ENTRY_LOT",
+                completed_steps=completed_steps,
+                reasons=list(fifo_result.get("blocked_reasons") or ["SELL FIFO ownership failed"]),
+                context=retry_context,
+            )
+            return {"retried": False, "stage": "fifo_entry_lot", "fill_result": fill_result, "position_result": position_result, "reconciliation_result": reconciliation, "manual_reconciliation_required": True}
+        realized_context = dict(retry_context)
+        realized_context["fills_path"] = str(fills_path)
+        realized_context["canonical_fifo_allocations"] = fifo_result["allocations"]
+        realized_result = record_realized_pnl(
+            fill_record,
+            position_result,
+            record,
+            realized_pnl_path,
+            context=realized_context,
+        )
+        if realized_result.get("realized_pnl_recorded") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                queue_path,
+                chejan_result,
+                required=True,
+                failed_stage="REALIZED_PNL_LEDGER",
+                completed_steps=completed_steps,
+                reasons=list(realized_result.get("blocked_reasons") or ["realized P/L ledger write failed"]),
+                context=retry_context,
+            )
+            return {"retried": False, "stage": "realized_pnl", "fill_result": fill_result, "position_result": position_result, "realized_pnl_result": realized_result, "reconciliation_result": reconciliation, "manual_reconciliation_required": True}
+        completed_steps.append("REALIZED_PNL_LEDGER")
+        performance_result = append_performance_from_realization(
+            canonical_root,
+            fill_record,
+            realized_result,
+            fifo_result,
+        )
+        if performance_result.get("success") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                queue_path,
+                chejan_result,
+                required=True,
+                failed_stage="PERFORMANCE_LEDGER",
+                completed_steps=completed_steps,
+                reasons=list(performance_result.get("blocked_reasons") or ["canonical Performance Ledger append failed"]),
+                context=retry_context,
+            )
+            return {"retried": False, "stage": "performance_ledger", "fill_result": fill_result, "position_result": position_result, "realized_pnl_result": realized_result, "performance_result": performance_result, "reconciliation_result": reconciliation, "manual_reconciliation_required": True}
+        completed_steps.append("PERFORMANCE_LEDGER")
     reconciliation = mark_chejan_reconciliation_state(
         queue_path,
         chejan_result,

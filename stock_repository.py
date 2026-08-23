@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -168,6 +169,7 @@ class StockRepository:
     def __init__(self, project_root: Path | None = None) -> None:
         self.project_root = Path(project_root or PROJECT_ROOT)
         self.stocks_dir = self.project_root / "stocks"
+        self.last_assignment_linkage_result = None
 
     def has_central_stocks(self) -> bool:
         if not self.stocks_dir.exists():
@@ -401,7 +403,14 @@ class StockRepository:
             return self.project_root / record.stock_path
         return self.stocks_dir / safe_stock_folder_name(code, name)
 
-    def update_stock_routine(self, code: str, name: str, routines: list[str]) -> bool:
+    def update_stock_routine(
+        self,
+        code: str,
+        name: str,
+        routines: list[str],
+        *,
+        _episode_before_target=None,
+    ) -> bool:
         """
         중앙 stocks/ 구조에서 종목의 현재 소속 루틴을 config.json에 반영한다.
 
@@ -427,6 +436,7 @@ class StockRepository:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
+        before_config = deepcopy(config)
         before_assignment = _routine_assignment(config)
         changed_at = now_text()
         self._close_assignment_history(
@@ -453,7 +463,22 @@ class StockRepository:
         config["routine_type"] = routine_name
 
         config["updated_at"] = changed_at
-        write_json_dict(config_path, config)
+        from assignment_episode_linkage import commit_assignment_with_episode
+
+        linkage = commit_assignment_with_episode(
+            self.project_root,
+            normalize_stock_code(code),
+            config_path,
+            before_config,
+            config,
+            changed_at=datetime.now().astimezone(),
+            reason="STOCK_ASSIGNMENT_REMOVED",
+            source="STOCK_REPOSITORY",
+            before_target=_episode_before_target,
+        )
+        self.last_assignment_linkage_result = linkage
+        if not linkage.success:
+            return False
         saved = read_json_dict(config_path)
         expected_assignment = _routine_assignment(config)
         saved_assignment = _routine_assignment(saved)
@@ -496,6 +521,7 @@ class StockRepository:
             return False
         config_path = path / "config.json"
         config = read_json_dict(config_path)
+        before_config = deepcopy(config)
         before_assignment = _routine_assignment(config)
         changed_at = now_text()
         previous_instance_id = str(
@@ -528,7 +554,21 @@ class StockRepository:
         config["routine_definition_id"] = clean_definition_id
         config["routine_type"] = clean_routine_type
         config["updated_at"] = changed_at
-        write_json_dict(config_path, config)
+        from assignment_episode_linkage import commit_assignment_with_episode
+
+        linkage = commit_assignment_with_episode(
+            self.project_root,
+            normalize_stock_code(code),
+            config_path,
+            before_config,
+            config,
+            changed_at=datetime.now().astimezone(),
+            reason="STOCK_ASSIGNMENT_CHANGED",
+            source="STOCK_REPOSITORY",
+        )
+        self.last_assignment_linkage_result = linkage
+        if not linkage.success:
+            return False
         saved = read_json_dict(config_path)
         expected_assignment = _routine_assignment(config)
         saved_assignment = _routine_assignment(saved)

@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_LEDGER_PATH = PROJECT_ROOT / "runtime" / "realized_pnl.json"
 LEDGER_VERSION = 1
 COST_BASIS_METHOD = "WEIGHTED_AVERAGE_POSITION"
+FIFO_ENTRY_LOT_COST_BASIS_METHOD = "FIFO_ENTRY_LOTS"
 _THREAD_LOCK = threading.RLock()
 _LOCK_POLL_SECONDS = 0.02
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
@@ -156,7 +157,7 @@ def _routine_instance_id(order_record: dict[str, Any]) -> str:
     )
 
 
-def _realization_id(fill: dict[str, Any], fill_delta: int) -> str:
+def canonical_realization_id(fill: dict[str, Any], fill_delta: int) -> str:
     identity = "|".join(
         (
             "REALIZED_PNL_V1",
@@ -282,7 +283,21 @@ def record_realized_pnl(
                     return {**_blocked("stock_code", "fill stock code is required"), "lock_acquired": True, "lock_wait_ms": lock.wait_ms}
 
                 fill_delta = int(fill_delta_value)
-                matched_cost = previous_average * fill_delta
+                fifo_allocations = _as_dict(context).get("canonical_fifo_allocations")
+                if fifo_allocations is not None:
+                    if not isinstance(fifo_allocations, list) or not fifo_allocations:
+                        return {**_blocked("fifo_cost_basis", "canonical FIFO allocations are invalid"), "lock_acquired": True, "lock_wait_ms": lock.wait_ms}
+                    try:
+                        fifo_quantity = sum(int(item["quantity"]) for item in fifo_allocations)
+                        matched_cost = sum(float(item["cost_basis"]) for item in fifo_allocations)
+                    except (KeyError, TypeError, ValueError):
+                        return {**_blocked("fifo_cost_basis", "canonical FIFO allocation evidence is invalid"), "lock_acquired": True, "lock_wait_ms": lock.wait_ms}
+                    if fifo_quantity != fill_delta:
+                        return {**_blocked("fifo_cost_basis", "canonical FIFO quantity does not match SELL fill delta"), "lock_acquired": True, "lock_wait_ms": lock.wait_ms}
+                    cost_basis_method = FIFO_ENTRY_LOT_COST_BASIS_METHOD
+                else:
+                    matched_cost = previous_average * fill_delta
+                    cost_basis_method = COST_BASIS_METHOD
                 gross = sell_price * fill_delta - matched_cost
                 fee = _explicit_cost(fill, "fee", "commission")
                 tax = _explicit_cost(fill, "tax")
@@ -298,7 +313,7 @@ def record_realized_pnl(
                 )
                 normalized = _as_dict(fill.get("normalized_event"))
                 record = {
-                    "realization_id": _realization_id(fill, fill_delta),
+                    "realization_id": canonical_realization_id(fill, fill_delta),
                     "trade_date": trade_date,
                     "stock_code": stock_code,
                     "stock_name": _clean(normalized.get("name")),
@@ -320,7 +335,7 @@ def record_realized_pnl(
                     "net_realized_profit": _json_number(net) if net is not None else None,
                     "cumulative_daily_gross_realized_profit": _json_number(cumulative_gross),
                     "cumulative_daily_realized_profit": _json_number(cumulative_net) if cumulative_net is not None else None,
-                    "cost_basis_method": COST_BASIS_METHOD,
+                    "cost_basis_method": cost_basis_method,
                     "source": "execution_fill+position_update",
                     "provenance": {
                         "fills_path": _clean(_as_dict(context).get("fills_path")),

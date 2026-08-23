@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -19,6 +20,8 @@ from logical_group_registry import LogicalGroupRepository
 from routine_instance_registry import load_persisted_routine_instances
 from runtime_io import read_json_dict
 from stock_repository import StockRecord, StockRepository
+from assignment_episode_repository import CanonicalAssignmentEpisodeRepository
+from assignment_episode_repository import AssignmentEpisodeTarget
 
 
 @dataclass(frozen=True)
@@ -124,7 +127,12 @@ def validate_group_deletion_safety(
     return tuple(reasons)
 
 
-def _restore_file(path: Path, payload: bytes) -> None:
+def _restore_file(path: Path, payload: bytes | None) -> None:
+    if payload is None:
+        path.unlink(missing_ok=True)
+        if path.parent.is_dir() and not any(path.parent.iterdir()):
+            path.parent.rmdir()
+        return
     temp_path = path.parent / f".{path.name}.{uuid4().hex}.rollback.tmp"
     temp_path.write_bytes(payload)
     os.replace(temp_path, path)
@@ -133,7 +141,7 @@ def _restore_file(path: Path, payload: bytes) -> None:
 def _rollback_group_deletion(
     transaction_root: Path,
     moved_paths: list[tuple[Path, Path]],
-    stock_backups: list[tuple[Path, bytes]],
+    stock_backups: list[tuple[Path, bytes | None]],
     expected_original_paths: tuple[Path, ...],
 ) -> bool:
     for config_path, payload in reversed(stock_backups):
@@ -156,7 +164,10 @@ def _rollback_group_deletion(
             not transaction_root.exists()
             and all(path.is_dir() for path in expected_original_paths)
             and all(
-                config_path.is_file() and config_path.read_bytes() == payload
+                (
+                    (payload is None and not config_path.exists())
+                    or (payload is not None and config_path.is_file() and config_path.read_bytes() == payload)
+                )
                 for config_path, payload in stock_backups
             )
         )
@@ -193,7 +204,7 @@ def delete_group_completely(
         f".{marker.marker_path.stem}.{uuid4().hex}.delete.tmp"
     )
     moved_paths: list[tuple[Path, Path]] = []
-    stock_backups: list[tuple[Path, bytes]] = []
+    stock_backups: list[tuple[Path, bytes | None]] = []
     cleared_codes: list[str] = []
     try:
         transaction_root.mkdir(parents=True)
@@ -206,6 +217,48 @@ def delete_group_completely(
                 logical_repository.registry_path.read_bytes(),
             )
         )
+        repository = StockRepository(root)
+        episode_repository = CanonicalAssignmentEpisodeRepository(root)
+        group_record = next(
+            group for group in scan_group_records(project_root=root)
+            if group.group_id == scope.group_id
+        )
+        for stock in scope.stocks:
+            config_path = root / stock.stock_path / "config.json"
+            if not config_path.is_file():
+                raise RuntimeError(f"종목 config.json을 확인할 수 없습니다: {stock.code}")
+            stock_backups.append((config_path, config_path.read_bytes()))
+            episode_path = episode_repository.document_path(stock.code)
+            stock_backups.append(
+                (episode_path, episode_path.read_bytes() if episode_path.exists() else None)
+            )
+            before_target = AssignmentEpisodeTarget.assigned(
+                instance_id=stock.assigned_routine_instance_id,
+                group_id=scope.group_id,
+                definition_id=group_record.definition_id,
+                instance_name_snapshot=(stock.routine_instance_name or stock.assigned_routine_instance_id),
+                group_name_snapshot=scope.group_name,
+            )
+            update_parameters = inspect.signature(repository.update_stock_routine).parameters
+            if "_episode_before_target" in update_parameters:
+                updated = repository.update_stock_routine(
+                    stock.code,
+                    stock.name,
+                    [],
+                    _episode_before_target=before_target,
+                )
+            else:
+                updated = repository.update_stock_routine(stock.code, stock.name, [])
+            if not updated:
+                raise RuntimeError(f"종목 관계를 해제하지 못했습니다: {stock.code} {stock.name}")
+            saved = read_json_dict(config_path)
+            if (
+                str(saved.get("assigned_routine_instance_id", "") or "").strip()
+                or saved.get("routines")
+            ):
+                raise RuntimeError(f"종목 관계 해제 검증에 실패했습니다: {stock.code}")
+            cleared_codes.append(stock.code)
+
         if scope.group_path.exists():
             staged_group = transaction_root / "group"
             os.replace(scope.group_path, staged_group)
@@ -217,22 +270,6 @@ def delete_group_completely(
             staged_instance = staged_instances / instance_dir.name
             os.replace(instance_dir, staged_instance)
             moved_paths.append((staged_instance, instance_dir))
-
-        repository = StockRepository(root)
-        for stock in scope.stocks:
-            config_path = root / stock.stock_path / "config.json"
-            if not config_path.is_file():
-                raise RuntimeError(f"종목 config.json을 확인할 수 없습니다: {stock.code}")
-            stock_backups.append((config_path, config_path.read_bytes()))
-            if not repository.update_stock_routine(stock.code, stock.name, []):
-                raise RuntimeError(f"종목 관계를 해제하지 못했습니다: {stock.code} {stock.name}")
-            saved = read_json_dict(config_path)
-            if (
-                str(saved.get("assigned_routine_instance_id", "") or "").strip()
-                or saved.get("routines")
-            ):
-                raise RuntimeError(f"종목 관계 해제 검증에 실패했습니다: {stock.code}")
-            cleared_codes.append(stock.code)
 
         if scope.group_path.exists() or any(path.exists() for path in scope.instance_dirs):
             raise RuntimeError("Group 또는 RoutineInstance 삭제 staging 검증에 실패했습니다.")

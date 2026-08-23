@@ -23,6 +23,7 @@ from PyQt5 import sip
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QSize, QEvent, QSignalBlocker
@@ -62,6 +63,11 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 from event_journal_production import append_production_event
+from routine_tree_title_display import (
+    tree_title_slot_width,
+    tree_title_text,
+    tree_title_tooltip,
+)
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS, project_current_stock_pnl
 from auto_trade_order_execution_boundary import (
     AutoTradeOrderExecutionBoundary,
@@ -1286,6 +1292,11 @@ from gui_routine_registry import (
     read_routine_budget,
 )
 from main_group_projection import build_main_group_projection
+from auto_trade_performance_ui import (
+    CanonicalPerformanceUiSnapshot,
+    build_canonical_performance_ui_snapshot,
+)
+from performance_metrics import MetricStatus
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
@@ -1335,6 +1346,11 @@ from final_send_gate_service import evaluate_final_send_gate
 from order_queued_review_service import review_order_queued_record
 from position_update_service import update_position_from_fill
 from realized_pnl_ledger import record_realized_pnl
+from production_performance_linkage import (
+    append_performance_from_realization,
+    prepare_sell_fifo_realization,
+    record_buy_entry_lot,
+)
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -2249,9 +2265,47 @@ def _record_fill_and_position_from_chejan(
 
     completed_steps.append("POSITION_UPDATE")
     realized_pnl_result = None
-    if _clean_runtime_text(fill_record.get("side")).upper() == "SELL":
+    canonical_root = Path(FILLS_PATH).parent
+    if canonical_root.name == "runtime":
+        canonical_root = canonical_root.parent
+    canonical_enabled = (
+        (canonical_root / "groups" / "registry.json").is_file()
+        and (canonical_root / "stocks").is_dir()
+    )
+    fill_side = _clean_runtime_text(fill_record.get("side")).upper()
+    if canonical_enabled and fill_side == "BUY":
+        lot_result = record_buy_entry_lot(canonical_root, fill_record, position_result)
+        if lot_result.get("success") is not True:
+            reconciliation = mark_chejan_reconciliation_state(
+                ORDER_QUEUE_PATH,
+                chejan_result,
+                required=True,
+                failed_stage="ENTRY_LOT_LINKAGE",
+                completed_steps=completed_steps,
+                reasons=list(lot_result.get("blocked_reasons") or ["BUY entry-lot linkage failed"]),
+                context=live_context,
+            )
+            return fill_result, position_result, None, reconciliation
+        completed_steps.append("ENTRY_LOT_LINKAGE")
+    if fill_side == "SELL":
+        fifo_result = None
+        if canonical_enabled:
+            fifo_result = prepare_sell_fifo_realization(canonical_root, fill_record, position_result)
+            if fifo_result.get("success") is not True:
+                reconciliation = mark_chejan_reconciliation_state(
+                    ORDER_QUEUE_PATH,
+                    chejan_result,
+                    required=True,
+                    failed_stage="FIFO_ENTRY_LOT",
+                    completed_steps=completed_steps,
+                    reasons=list(fifo_result.get("blocked_reasons") or ["SELL FIFO ownership failed"]),
+                    context=live_context,
+                )
+                return fill_result, position_result, None, reconciliation
         realized_context = dict(live_context)
         realized_context["fills_path"] = str(FILLS_PATH)
+        if fifo_result is not None:
+            realized_context["canonical_fifo_allocations"] = fifo_result["allocations"]
         realized_pnl_result = record_realized_pnl(
             fill_record,
             position_result,
@@ -2271,6 +2325,26 @@ def _record_fill_and_position_from_chejan(
             )
             return fill_result, position_result, realized_pnl_result, reconciliation
         completed_steps.append("REALIZED_PNL_LEDGER")
+        if fifo_result is not None:
+            performance_result = append_performance_from_realization(
+                canonical_root,
+                fill_record,
+                realized_pnl_result,
+                fifo_result,
+            )
+            realized_pnl_result["performance_linkage_result"] = performance_result
+            if performance_result.get("success") is not True:
+                reconciliation = mark_chejan_reconciliation_state(
+                    ORDER_QUEUE_PATH,
+                    chejan_result,
+                    required=True,
+                    failed_stage="PERFORMANCE_LEDGER",
+                    completed_steps=completed_steps,
+                    reasons=list(performance_result.get("blocked_reasons") or ["canonical Performance Ledger append failed"]),
+                    context=live_context,
+                )
+                return fill_result, position_result, realized_pnl_result, reconciliation
+            completed_steps.append("PERFORMANCE_LEDGER")
     reconciliation = mark_chejan_reconciliation_state(
         ORDER_QUEUE_PATH,
         chejan_result,
@@ -3809,20 +3883,32 @@ class AutoTradeSettingWindow(QDialog):
                 }
             )
 
+        canonical_performance = None
+        canonical_performance_error = ""
+        try:
+            canonical_performance = build_canonical_performance_ui_snapshot(
+                PROJECT_ROOT,
+                stocks=stocks,
+                instances=instances,
+                groups=groups,
+            )
+        except Exception as exc:
+            canonical_performance_error = str(exc)
+            LOGGER.exception("canonical AutoTrade performance snapshot failed")
+
         return {
             "definitions": definitions,
             "instances": instances,
             "groups": groups,
             "stocks": stocks,
             "stock_data_by_dir": stock_data_by_dir,
-            "assignment_history": tuple(
-                StockRepository(PROJECT_ROOT).list_routine_assignment_history()
-            ),
             "count_static_data": {
                 "definitions": definitions,
                 "instances": instances,
                 "stocks": tuple(count_stocks),
             },
+            "canonical_performance": canonical_performance,
+            "canonical_performance_error": canonical_performance_error,
         }
 
     def refresh_all(self) -> None:
@@ -4696,6 +4782,204 @@ class AutoTradeSettingWindow(QDialog):
             )
         return stocks_by_instance
 
+    def _canonical_performance_snapshot_for_tree(
+        self,
+        *,
+        stocks: list[object],
+        instances: list[object],
+        groups: list[object],
+    ) -> CanonicalPerformanceUiSnapshot | None:
+        initial = auto_trade_initial_read_snapshot(self)
+        if initial is not None:
+            snapshot = initial.get("canonical_performance")
+            if isinstance(snapshot, CanonicalPerformanceUiSnapshot):
+                return snapshot
+            self._canonical_performance_snapshot_error = str(
+                initial.get("canonical_performance_error", "") or ""
+            )
+            return None
+        try:
+            snapshot = build_canonical_performance_ui_snapshot(
+                PROJECT_ROOT,
+                stocks=stocks,
+                instances=instances,
+                groups=groups,
+            )
+        except Exception as exc:
+            self._canonical_performance_snapshot_error = str(exc)
+            LOGGER.exception("canonical AutoTrade performance snapshot failed")
+            return None
+        self._canonical_performance_snapshot_error = ""
+        return snapshot
+
+    def _canonical_metric_status_rank(self, status: MetricStatus) -> int:
+        return {
+            MetricStatus.VALID: 0,
+            MetricStatus.VALID_ZERO: 0,
+            MetricStatus.INCOMPLETE: 1,
+            MetricStatus.UNDEFINED: 2,
+            MetricStatus.UNAVAILABLE: 3,
+        }[status]
+
+    def _canonical_metric_tooltip(self, label: str, metric) -> str:
+        lines = [f"{label}: {metric.status.value}"]
+        if metric.reasons:
+            lines.append("사유: " + ", ".join(metric.reasons))
+        return "\n".join(lines)
+
+    def _routine_tree_canonical_performance_texts(
+        self,
+        projection_row: object | None,
+        canonical_snapshot: CanonicalPerformanceUiSnapshot | None,
+    ) -> dict[str, object]:
+        unavailable_reason = str(
+            getattr(self, "_canonical_performance_snapshot_error", "") or ""
+        ).strip()
+        if projection_row is None or canonical_snapshot is None:
+            reason = unavailable_reason or "CANONICAL_PERFORMANCE_NOT_RECORDED"
+            tooltip = f"UNAVAILABLE\n사유: {reason}"
+            return {
+                "performance_period_text": "기간(-)",
+                "performance_profit_text": "수익(- / -)",
+                "performance_average_text": "평균(- / -)",
+                "performance_efficiency_text": "효율(-)",
+                "performance_period_value": "-",
+                "performance_profit_amount": "-",
+                "performance_profit_rate": "-",
+                "performance_average_amount": "-",
+                "performance_average_rate": "-",
+                "performance_efficiency_value": "-",
+                "performance_period_sort_value": 0.0,
+                "performance_profit_sort_value": 0.0,
+                "performance_average_sort_value": 0.0,
+                "performance_efficiency_sort_value": 0.0,
+                "performance_period_sort_status_rank": 3,
+                "performance_profit_sort_status_rank": 3,
+                "performance_average_sort_status_rank": 3,
+                "performance_efficiency_sort_status_rank": 3,
+                "performance_period_tooltip": tooltip,
+                "performance_profit_tooltip": tooltip,
+                "performance_average_tooltip": tooltip,
+                "performance_efficiency_tooltip": tooltip,
+                "performance_source": "CANONICAL",
+            }
+
+        metrics = canonical_snapshot.metric_result(projection_row)
+        aggregate = getattr(projection_row, "lifetime", None) or getattr(
+            projection_row,
+            "aggregate",
+        )
+        event_count = int(
+            getattr(
+                aggregate,
+                "event_count",
+                getattr(aggregate, "performance_event_count", 0),
+            )
+            or 0
+        )
+
+        def _display(metric, formatter) -> str:
+            if event_count == 0 or metric.value is None:
+                return "-"
+            return formatter(metric.value)
+
+        period_value = _display(metrics.period, lambda value: str(int(value)))
+        profit_amount = _display(metrics.profit_amount, format_signed_money)
+        profit_rate = _display(
+            metrics.profit_rate,
+            lambda value: format_signed_percent(value, digits=2),
+        )
+        average_amount = _display(metrics.average_amount, format_signed_money)
+        average_rate = _display(
+            metrics.average_rate,
+            lambda value: format_signed_percent(value, digits=2),
+        )
+        efficiency_value = _display(
+            metrics.efficiency,
+            lambda value: f"{float(value):.1f}",
+        )
+
+        status_metrics = {
+            "period": metrics.period,
+            "profit": metrics.profit_amount,
+            "average": metrics.average_amount,
+            "efficiency": metrics.efficiency,
+        }
+        if event_count == 0:
+            status_ranks = {key: 3 for key in status_metrics}
+            no_event_tooltip = "UNAVAILABLE\n사유: NO_CANONICAL_PERFORMANCE_EVENTS"
+            tooltips = {key: no_event_tooltip for key in status_metrics}
+        else:
+            status_ranks = {
+                key: self._canonical_metric_status_rank(metric.status)
+                for key, metric in status_metrics.items()
+            }
+            tooltips = {
+                "period": self._canonical_metric_tooltip("기간", metrics.period),
+                "profit": "\n".join(
+                    (
+                        self._canonical_metric_tooltip("수익 금액", metrics.profit_amount),
+                        self._canonical_metric_tooltip("수익률", metrics.profit_rate),
+                    )
+                ),
+                "average": "\n".join(
+                    (
+                        self._canonical_metric_tooltip("평균 금액", metrics.average_amount),
+                        self._canonical_metric_tooltip("평균 수익률", metrics.average_rate),
+                        (
+                            "기간 진단: "
+                            f"전체 {metrics.average_rate_diagnostics.period_count}, "
+                            f"유효 {metrics.average_rate_diagnostics.valid_rate_period_count}, "
+                            f"불완전 {metrics.average_rate_diagnostics.incomplete_rate_period_count}, "
+                            f"미정의 {metrics.average_rate_diagnostics.undefined_rate_period_count}"
+                        ),
+                    )
+                ),
+                "efficiency": self._canonical_metric_tooltip("효율", metrics.efficiency),
+            }
+
+        mismatch_reasons = canonical_snapshot.current_relation_mismatch_reasons(
+            projection_row
+        )
+        if mismatch_reasons:
+            mismatch = "CURRENT 관계 불일치: " + ", ".join(mismatch_reasons)
+            tooltips = {key: f"{value}\n{mismatch}" for key, value in tooltips.items()}
+
+        return {
+            "performance_period_text": f"기간({period_value})",
+            "performance_profit_text": f"수익({profit_amount} / {profit_rate})",
+            "performance_average_text": f"평균({average_amount} / {average_rate})",
+            "performance_efficiency_text": f"효율({efficiency_value})",
+            "performance_period_value": period_value,
+            "performance_profit_amount": profit_amount,
+            "performance_profit_rate": profit_rate,
+            "performance_profit_color": profit_loss_value_color(
+                metrics.profit_amount.value if event_count else None
+            ),
+            "performance_average_amount": average_amount,
+            "performance_average_rate": average_rate,
+            "performance_average_color": profit_loss_value_color(
+                metrics.average_amount.value if event_count else None
+            ),
+            "performance_efficiency_value": efficiency_value,
+            "performance_efficiency_color": directional_value_color(
+                metrics.efficiency.value if event_count else None
+            ),
+            "performance_period_sort_value": float(metrics.period.sort_value or 0),
+            "performance_profit_sort_value": float(metrics.profit_amount.sort_value or 0),
+            "performance_average_sort_value": float(metrics.average_amount.sort_value or 0),
+            "performance_efficiency_sort_value": float(metrics.efficiency.sort_value or 0),
+            "performance_period_sort_status_rank": status_ranks["period"],
+            "performance_profit_sort_status_rank": status_ranks["profit"],
+            "performance_average_sort_status_rank": status_ranks["average"],
+            "performance_efficiency_sort_status_rank": status_ranks["efficiency"],
+            "performance_period_tooltip": tooltips["period"],
+            "performance_profit_tooltip": tooltips["profit"],
+            "performance_average_tooltip": tooltips["average"],
+            "performance_efficiency_tooltip": tooltips["efficiency"],
+            "performance_source": "CANONICAL",
+        }
+
     def _routine_tree_stock_performance_source(
         self,
         stock: dict[str, object],
@@ -5102,6 +5386,31 @@ class AutoTradeSettingWindow(QDialog):
             str(row.get("instance_id", "") or ""),
         )
 
+    def _routine_tree_canonical_sort_key(
+        self,
+        row: dict[str, object],
+        criterion: str,
+    ) -> tuple[int, float, str, str]:
+        rank = int(
+            row.get(
+                f"performance_{criterion}_sort_status_rank",
+                0,
+            )
+            or 0
+        )
+        stable_id = str(
+            row.get("group_id", "")
+            or row.get("instance_id", "")
+            or row.get("stock_code", "")
+            or ""
+        )
+        return (
+            rank,
+            -self._routine_tree_row_sort_value(row, criterion),
+            str(row.get("display_name", "") or "").casefold(),
+            stable_id,
+        )
+
     def _routine_tree_sort_definition_blocks(
         self,
         rows: list[dict[str, object]],
@@ -5121,8 +5430,10 @@ class AutoTradeSettingWindow(QDialog):
 
         sorted_blocks = sorted(
             blocks,
-            key=lambda block: self._routine_tree_row_sort_value(block[0], criterion),
-            reverse=True,
+            key=lambda block: self._routine_tree_canonical_sort_key(
+                block[0],
+                criterion,
+            ),
         )
         return [row for block in sorted_blocks for row in block]
 
@@ -5156,8 +5467,10 @@ class AutoTradeSettingWindow(QDialog):
                 if len(block) > 2:
                     sorted_children = sorted(
                         block[1:],
-                        key=lambda child: self._routine_tree_row_sort_value(child, criterion),
-                        reverse=True,
+                        key=lambda child: self._routine_tree_canonical_sort_key(
+                            child,
+                            criterion,
+                        ),
                     )
                     for child_index, child in enumerate(sorted_children):
                         child["first_stock_for_instance"] = child_index == 0
@@ -5166,9 +5479,9 @@ class AutoTradeSettingWindow(QDialog):
 
             sorted_blocks = sorted(
                 instance_blocks,
-                key=lambda block: (
-                    -self._routine_tree_row_sort_value(block[0], criterion),
-                    *self._routine_tree_instance_identity_sort_key(block[0]),
+                key=lambda block: self._routine_tree_canonical_sort_key(
+                    block[0],
+                    criterion,
                 ),
             )
             for block_index, block in enumerate(sorted_blocks):
@@ -5503,10 +5816,23 @@ class AutoTradeSettingWindow(QDialog):
         title_label.setWordWrap(False)
         title_label.setFocusPolicy(Qt.NoFocus)
         title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        if is_stock:
-            title_label.setToolTip(str(row_data.get("display_name", "") or text))
-        elif is_definition or is_instance:
-            title_label.setToolTip(tree_title_tooltip(raw_title_text))
+        title_tooltip = (
+            str(row_data.get("display_name", "") or text)
+            if is_stock
+            else tree_title_tooltip(raw_title_text)
+            if is_definition or is_instance
+            else ""
+        )
+        canonical_identity_tooltip = str(
+            row_data.get("canonical_identity_tooltip", "") or ""
+        )
+        title_label.setToolTip(
+            "\n".join(
+                value
+                for value in (title_tooltip, canonical_identity_tooltip)
+                if value
+            )
+        )
         base_title_font = QFont(container.font())
         title_font = QFont(base_title_font)
         if not is_definition:
@@ -5702,6 +6028,9 @@ class AutoTradeSettingWindow(QDialog):
             metric_widget.setAttribute(Qt.WA_StyledBackground, True)
             metric_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             metric_widget.setStyleSheet("background: transparent;")
+            metric_widget.setToolTip(
+                str(row_data.get(f"performance_{key}_tooltip", "") or "")
+            )
             metric_layout = QHBoxLayout(metric_widget)
             metric_layout.setContentsMargins(0, 0, 0, 0)
             metric_layout.setSpacing(0)
@@ -5771,6 +6100,13 @@ class AutoTradeSettingWindow(QDialog):
             layout.addWidget(metric_widget, 0, Qt.AlignVCenter)
 
         layout.addStretch(1)
+        metric_tooltips = [
+            str(row_data.get(f"performance_{metric}_tooltip", "") or "").strip()
+            for metric in ("period", "profit", "average", "efficiency")
+        ]
+        container.setToolTip(
+            "\n\n".join(dict.fromkeys(value for value in metric_tooltips if value))
+        )
         container.setProperty("autoTradeSettingRoutineTreeRowKind", row_kind)
         try:
             can_install_event_filter = (
@@ -6495,6 +6831,11 @@ class AutoTradeSettingWindow(QDialog):
                     )
                 else:
                     definition_valid = bool(metadata.get("has_stocked_instances", False))
+                if (
+                    display_scope in {"historical", "all"}
+                    and bool(metadata.get("canonical_historical_only", False))
+                ):
+                    definition_valid = True
                 current_definition_filtered = valid_only and not definition_valid
                 if not has_toggle_children:
                     collapsed_definitions.discard(definition_id)
@@ -6524,6 +6865,10 @@ class AutoTradeSettingWindow(QDialog):
                     valid_only
                     and display_level in {"routine", "stock"}
                     and not bool(metadata.get("has_displayable_stocks", False))
+                    and not (
+                        display_scope in {"historical", "all"}
+                        and bool(metadata.get("canonical_historical_only", False))
+                    )
                 )
                 if not has_toggle_children:
                     collapsed_instances.discard(instance_id)
@@ -6588,6 +6933,50 @@ class AutoTradeSettingWindow(QDialog):
             if snapshot is not None
             else load_persisted_routine_instances()
         )
+        group_records = list(
+            snapshot.get("groups", ())
+            if snapshot is not None
+            else get_group_records()
+        )
+        base_stocks = list(
+            snapshot.get("stocks", ())
+            if snapshot is not None
+            else read_base_stocks()
+        )
+        selected_scope = str(
+            getattr(self, "_routine_tree_display_scope", "") or "all"
+        )
+        if selected_scope not in {"all", "current", "historical"}:
+            selected_scope = "all"
+        canonical_performance = self._canonical_performance_snapshot_for_tree(
+            stocks=base_stocks,
+            instances=loaded_instances,
+            groups=group_records,
+        )
+        canonical_group_rows = {
+            row.group_id: row
+            for row in (
+                canonical_performance.group_rows(selected_scope)
+                if canonical_performance is not None
+                else ()
+            )
+        }
+        canonical_instance_rows = {
+            row.instance_id: row
+            for row in (
+                canonical_performance.instance_rows(selected_scope)
+                if canonical_performance is not None
+                else ()
+            )
+        }
+        canonical_stock_rows = {
+            row.stock_code: row
+            for row in (
+                canonical_performance.stock_rows(selected_scope)
+                if canonical_performance is not None
+                else ()
+            )
+        }
         definition_by_id = {
             str(definition.definition_id): definition
             for definition in definitions
@@ -6635,16 +7024,6 @@ class AutoTradeSettingWindow(QDialog):
             }
             instances, parent_specs = definition_parent_specs(override_instance_ids)
         else:
-            group_records = list(
-                snapshot.get("groups", ())
-                if snapshot is not None
-                else get_group_records()
-            )
-            base_stocks = list(
-                snapshot.get("stocks", ())
-                if snapshot is not None
-                else read_base_stocks()
-            )
             group_projection = build_main_group_projection(
                 group_records,
                 loaded_instances,
@@ -6700,24 +7079,160 @@ class AutoTradeSettingWindow(QDialog):
                         "child_instances": child_instances,
                     }
                 )
+            if selected_scope in {"historical", "all"}:
+                known_parent_ids = {
+                    str(spec.get("parent_id", "") or "").strip()
+                    for spec in parent_specs
+                }
+                instance_by_id = {
+                    str(instance.instance_id): instance
+                    for instance in loaded_instances
+                }
+                for group_row in canonical_group_rows.values():
+                    if group_row.group_id in known_parent_ids:
+                        continue
+                    episode_instances: dict[str, object] = {}
+                    for episode_id in group_row.episode_ids:
+                        episode = canonical_performance.aggregator.snapshot.episodes_by_id.get(
+                            episode_id
+                        )
+                        if episode is None or not episode.instance_id:
+                            continue
+                        instance = instance_by_id.get(episode.instance_id)
+                        if instance is None:
+                            instance = SimpleNamespace(
+                                instance_id=episode.instance_id,
+                                definition_id=episode.definition_id or "",
+                                display_name=(
+                                    episode.instance_name_snapshot
+                                    or episode.instance_id
+                                ),
+                                group_id=group_row.group_id,
+                                rules_path="",
+                            )
+                        episode_instances[episode.instance_id] = instance
+                    latest_episode = max(
+                        (
+                            canonical_performance.aggregator.snapshot.episodes_by_id[episode_id]
+                            for episode_id in group_row.episode_ids
+                            if episode_id
+                            in canonical_performance.aggregator.snapshot.episodes_by_id
+                        ),
+                        key=lambda episode: episode.started_at,
+                        default=None,
+                    )
+                    definition_id = str(
+                        getattr(latest_episode, "definition_id", "") or ""
+                    )
+                    parent_specs.append(
+                        {
+                            "group_id": group_row.group_id,
+                            "parent_id": group_row.group_id,
+                            "display_name": canonical_performance.group_name(
+                                group_row,
+                                prefer_episode_snapshot=(
+                                    selected_scope == "historical"
+                                ),
+                            ),
+                            "registration_definition": definition_by_id.get(
+                                definition_id
+                            ),
+                            "child_instances": list(episode_instances.values()),
+                            "canonical_historical_only": True,
+                        }
+                    )
+            if canonical_performance is not None:
+                current_instance_by_id = {
+                    str(instance.instance_id): instance
+                    for instance in loaded_instances
+                }
+                scoped_specs: list[dict[str, object]] = []
+                for spec in parent_specs:
+                    spec_group_id = str(spec.get("group_id", "") or "").strip()
+                    if not spec_group_id:
+                        scoped_specs.append(spec)
+                        continue
+                    group_row = canonical_group_rows.get(spec_group_id)
+                    if selected_scope in {"current", "historical"} and group_row is None:
+                        continue
+                    if group_row is not None:
+                        scoped_instance_ids: set[str] = set()
+                        scoped_episode_instances: dict[str, object] = {}
+                        for episode_id in group_row.episode_ids:
+                            episode = canonical_performance.aggregator.snapshot.episodes_by_id.get(
+                                episode_id
+                            )
+                            if episode is None or not episode.instance_id:
+                                continue
+                            scoped_instance_ids.add(episode.instance_id)
+                            instance = current_instance_by_id.get(episode.instance_id)
+                            if instance is None:
+                                instance = SimpleNamespace(
+                                    instance_id=episode.instance_id,
+                                    definition_id=episode.definition_id or "",
+                                    display_name=(
+                                        episode.instance_name_snapshot
+                                        or episode.instance_id
+                                    ),
+                                    group_id=spec_group_id,
+                                    rules_path="",
+                                )
+                            scoped_episode_instances[episode.instance_id] = instance
+                        children = list(spec.get("child_instances", []) or [])
+                        known_children = {
+                            str(child.instance_id) for child in children
+                        }
+                        children.extend(
+                            instance
+                            for instance_id, instance in scoped_episode_instances.items()
+                            if instance_id not in known_children
+                        )
+                        if selected_scope in {"current", "historical"}:
+                            children = [
+                                child
+                                for child in children
+                                if str(child.instance_id) in scoped_instance_ids
+                            ]
+                        spec = {**spec, "child_instances": children}
+                    scoped_specs.append(spec)
+                parent_specs = scoped_specs
         instance_counts = self._routine_instance_operation_counts()
-        current_stocks_by_instance = self._current_stocks_by_instance()
-        historical_stocks_by_instance = self._historical_stocks_by_instance()
-        performance_source_cache: dict[str, dict[str, object]] = {}
+        canonical_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
+        if canonical_performance is not None:
+            for instance_id, instance_row in canonical_instance_rows.items():
+                codes = set(canonical_performance.instance_stock_codes(instance_row))
+                if selected_scope in {"all", "current"}:
+                    codes.update(
+                        code
+                        for code, relation in canonical_performance.projection.current_relations.stocks_by_code.items()
+                        if relation.current_instance_id == instance_id
+                    )
+                for code in sorted(codes):
+                    projected_stock = canonical_stock_rows.get(code)
+                    detail = canonical_performance.current_stock_detail(code)
+                    current_relation = canonical_performance.projection.current_relations.stocks_by_code.get(code)
+                    is_current = bool(
+                        current_relation
+                        and current_relation.current_instance_id == instance_id
+                        and selected_scope in {"all", "current"}
+                    )
+                    canonical_stocks_by_instance.setdefault(instance_id, []).append(
+                        {
+                            "instance_id": instance_id,
+                            "stock_path": str(detail.get("stock_path", "") or ""),
+                            "stock_code": code,
+                            "stock_name": (
+                                canonical_performance.stock_name(projected_stock)
+                                if projected_stock is not None
+                                else str(detail.get("stock_name", "") or code)
+                            ),
+                            "is_historical": not is_current,
+                            "canonical_projection_row": projected_stock,
+                        }
+                    )
         collapsed = getattr(self, "_collapsed_auto_trade_definition_ids", set())
         collapsed_instances = getattr(self, "_collapsed_auto_trade_instance_ids", set())
-        selected_scope = str(
-            getattr(self, "_routine_tree_display_scope", "") or ""
-        )
-        stock_data_scope = selected_scope
-        if stock_data_scope not in {"all", "current", "historical"}:
-            stock_data_scope = str(
-                getattr(self, "_routine_tree_last_stock_scope", "all") or "all"
-            )
-        if stock_data_scope not in {"all", "current", "historical"}:
-            stock_data_scope = "all"
         rows: list[dict[str, object]] = []
-        global_stock_sort_values: dict[tuple[str, str, str], float] = {}
         display_level_for_rows = str(
             getattr(self, "_routine_tree_display_level", "category") or "category"
         )
@@ -6747,6 +7262,15 @@ class AutoTradeSettingWindow(QDialog):
             parent_display_name = str(
                 parent_spec.get("display_name", "") or ""
             ).strip()
+            if (
+                canonical_performance is not None
+                and group_id in canonical_group_rows
+                and selected_scope == "historical"
+            ):
+                parent_display_name = canonical_performance.group_name(
+                    canonical_group_rows[group_id],
+                    prefer_episode_snapshot=True,
+                )
             child_instances = sorted(
                 list(parent_spec.get("child_instances", []) or []),
                 key=lambda instance: (
@@ -6758,22 +7282,12 @@ class AutoTradeSettingWindow(QDialog):
                 child_instances = [
                     instance
                     for instance in child_instances
-                    if current_stocks_by_instance.get(str(instance.instance_id), [])
+                    if canonical_stocks_by_instance.get(str(instance.instance_id), [])
                 ]
             display_stocks_by_instance: dict[str, list[dict[str, object]]] = {}
             for instance in child_instances:
                 instance_id = str(instance.instance_id)
-                current_stocks = current_stocks_by_instance.get(instance_id, [])
-                historical_stocks = [
-                    stock
-                    for stock in historical_stocks_by_instance.get(instance_id, [])
-                ]
-                if stock_data_scope == "historical":
-                    display_stocks = list(historical_stocks)
-                elif stock_data_scope == "all":
-                    display_stocks = current_stocks + historical_stocks
-                else:
-                    display_stocks = list(current_stocks)
+                display_stocks = list(canonical_stocks_by_instance.get(instance_id, []))
                 if sort_visible_stocks_by_metric:
                     display_criterion = str(
                         getattr(
@@ -6783,94 +7297,40 @@ class AutoTradeSettingWindow(QDialog):
                         )
                         or "profit"
                     )
-                    source_key_by_criterion = {
-                        "period": "trade_days",
-                        "profit": "realized_profit",
-                        "average": "average",
-                        "efficiency": "profit_factor",
-                    }
-                    source_key = source_key_by_criterion.get(
-                        display_criterion,
-                        "realized_profit",
-                    )
-
-                    def _performance_sort_value(
+                    def _performance_sort_key(
                         stock: dict[str, object],
-                    ) -> float:
-                        stock_path_key = str(
-                            stock.get("stock_path", "") or ""
-                        ).strip()
-                        is_historical = bool(
-                            stock.get("is_historical", False)
+                    ) -> tuple[int, float, str]:
+                        payload = self._routine_tree_canonical_performance_texts(
+                            stock.get("canonical_projection_row"),
+                            canonical_performance,
                         )
-                        cache_key = stock_path_key
-                        if is_historical or not cache_key:
-                            cache_key = "|".join(
-                                (
-                                    str(
-                                        stock.get("instance_id", "")
-                                        or instance_id
-                                    ).strip(),
-                                    str(
-                                        stock.get("stock_code", "") or ""
-                                    ).strip(),
-                                    stock_path_key,
-                                    (
-                                        "historical"
-                                        if is_historical
-                                        else "current"
-                                    ),
-                                )
+                        rank = int(
+                            payload.get(
+                                f"performance_{display_criterion}_sort_status_rank",
+                                3,
                             )
-                        if cache_key not in performance_source_cache:
-                            performance_source_cache[cache_key] = (
-                                self._routine_tree_stock_performance_source(
-                                    stock
-                                )
+                        )
+                        value = float(
+                            payload.get(
+                                f"performance_{display_criterion}_sort_value",
+                                0.0,
                             )
-                        raw_value = performance_source_cache[cache_key].get(
-                            source_key
+                            or 0.0
                         )
-                        if (
-                            source_key == "profit_factor"
-                            and raw_value is None
-                        ):
-                            raw_value = performance_source_cache[
-                                cache_key
-                            ].get("efficiency")
-                        if source_key == "profit_factor":
-                            value = normalize_profit_factor(raw_value)
-                        else:
-                            try:
-                                value = float(raw_value)
-                            except (TypeError, ValueError):
-                                value = 0.0
-                        stock_key = (
-                            str(stock.get("instance_id", "") or instance_id).strip(),
-                            str(stock.get("stock_code", "") or "").strip(),
-                            str(stock.get("stock_path", "") or "").strip(),
+                        return (
+                            rank,
+                            -value,
+                            str(stock.get("stock_name", "") or "").casefold(),
                         )
-                        global_stock_sort_values[stock_key] = value
-                        return value
 
                     display_stocks = sorted(
                         display_stocks,
-                        key=_performance_sort_value,
-                        reverse=True,
+                        key=_performance_sort_key,
                     )
                 display_stocks_by_instance[instance_id] = display_stocks
-            definition_stocks = [
-                stock
-                for instance in child_instances
-                for stock in (
-                    display_stocks_by_instance.get(str(instance.instance_id), [])
-                    if selected_scope
-                    else current_stocks_by_instance.get(str(instance.instance_id), [])
-                )
-            ]
-            definition_performance = self._routine_tree_performance_texts(
-                definition_stocks,
-                performance_source_cache,
+            definition_performance = self._routine_tree_canonical_performance_texts(
+                canonical_group_rows.get(group_id),
+                canonical_performance,
             )
             has_definition_children = bool(child_instances)
             if not has_definition_children:
@@ -6898,16 +7358,9 @@ class AutoTradeSettingWindow(QDialog):
                         if str(instance.instance_id).strip()
                     ),
                     "has_stocked_instances": any(
-                        (
-                            display_stocks_by_instance.get(
-                                str(instance.instance_id),
-                                [],
-                            )
-                            if selected_scope
-                            else current_stocks_by_instance.get(
-                                str(instance.instance_id),
-                                [],
-                            )
+                        display_stocks_by_instance.get(
+                            str(instance.instance_id),
+                            [],
                         )
                         for instance in child_instances
                     ),
@@ -6966,6 +7419,21 @@ class AutoTradeSettingWindow(QDialog):
                     "display_metric": str(
                         getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
                     ),
+                    "canonical_historical_only": bool(
+                        parent_spec.get("canonical_historical_only", False)
+                        or (
+                            selected_scope == "historical"
+                            and group_id in canonical_group_rows
+                        )
+                    ),
+                    "canonical_identity_tooltip": (
+                        canonical_performance.identity_tooltip(
+                            canonical_group_rows[group_id]
+                        )
+                        if canonical_performance is not None
+                        and group_id in canonical_group_rows
+                        else ""
+                    ),
                     **definition_performance,
                 }
             )
@@ -6974,19 +7442,16 @@ class AutoTradeSettingWindow(QDialog):
                     getattr(instance, "definition_id", "") or ""
                 ).strip()
                 instance_definition = definition_by_id.get(instance_definition_id)
-                instance_dir = Path(instance.rules_path).parent if instance.rules_path else Path()
+                rules_path = str(getattr(instance, "rules_path", "") or "")
+                instance_dir = Path(rules_path).parent if rules_path else Path()
                 instance_id = str(instance.instance_id)
-                current_stocks = current_stocks_by_instance.get(instance_id, [])
-                historical_stocks = [
-                    stock
-                    for stock in historical_stocks_by_instance.get(instance_id, [])
-                ]
                 visible_stocks = display_stocks_by_instance.get(instance_id, [])
-                instance_performance = self._routine_tree_performance_texts(
-                    visible_stocks if selected_scope else current_stocks,
-                    performance_source_cache,
+                instance_projection_row = canonical_instance_rows.get(instance_id)
+                instance_performance = self._routine_tree_canonical_performance_texts(
+                    instance_projection_row,
+                    canonical_performance,
                 )
-                has_instance_children = bool(current_stocks or historical_stocks)
+                has_instance_children = bool(visible_stocks)
                 if not has_instance_children:
                     collapsed_instances.discard(instance_id)
                 count = instance_counts.get(
@@ -7009,16 +7474,55 @@ class AutoTradeSettingWindow(QDialog):
                         "group_id": group_id,
                         "instance_id": instance_id,
                         "definition_name": parent_display_name,
-                        "instance_name": str(instance.display_name),
+                        "instance_name": (
+                            canonical_performance.instance_name(
+                                instance_projection_row,
+                                prefer_episode_snapshot=(
+                                    selected_scope == "historical"
+                                ),
+                            )
+                            if canonical_performance is not None
+                            and instance_projection_row is not None
+                            else str(instance.display_name)
+                        ),
                         "package_dir": str(
                             getattr(instance_definition, "package_dir", "") or ""
                         ),
                         "instance_dir": str(instance_dir) if instance_dir else "",
-                        "display_name": str(instance.display_name),
+                        "display_name": (
+                            canonical_performance.instance_name(
+                                instance_projection_row,
+                                prefer_episode_snapshot=(
+                                    selected_scope == "historical"
+                                ),
+                            )
+                            if canonical_performance is not None
+                            and instance_projection_row is not None
+                            else str(instance.display_name)
+                        ),
                         "tree_icon": "\u25b6" if is_instance_collapsed or not has_instance_children else "\u25bc",
                         "has_toggle_children": has_instance_children,
                         "has_displayable_stocks": bool(
-                            visible_stocks if selected_scope else current_stocks
+                            visible_stocks
+                        ),
+                        "canonical_historical_only": bool(
+                            instance_projection_row is not None
+                            and (
+                                selected_scope == "historical"
+                                or instance_id
+                                not in {
+                                    str(value.instance_id)
+                                    for value in loaded_instances
+                                }
+                            )
+                        ),
+                        "canonical_identity_tooltip": (
+                            canonical_performance.identity_tooltip(
+                                instance_projection_row
+                            )
+                            if canonical_performance is not None
+                            and instance_projection_row is not None
+                            else ""
                         ),
                         "instance_group_top_gap": _index > 0,
                         "instance_count": 0,
@@ -7044,9 +7548,10 @@ class AutoTradeSettingWindow(QDialog):
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
                     is_historical = bool(stock.get("is_historical", False))
-                    stock_performance = self._routine_tree_performance_texts(
-                        [stock],
-                        performance_source_cache,
+                    stock_projection_row = stock.get("canonical_projection_row")
+                    stock_performance = self._routine_tree_canonical_performance_texts(
+                        stock_projection_row,
+                        canonical_performance,
                     )
                     rows.append(
                         {
@@ -7076,6 +7581,14 @@ class AutoTradeSettingWindow(QDialog):
                             "is_development_fixture": bool(
                                 stock.get("is_development_fixture", False)
                             ),
+                            "canonical_identity_tooltip": (
+                                canonical_performance.identity_tooltip(
+                                    stock_projection_row
+                                )
+                                if canonical_performance is not None
+                                and stock_projection_row is not None
+                                else ""
+                            ),
                             "_source_stock": dict(stock),
                             **stock_performance,
                         }
@@ -7087,6 +7600,81 @@ class AutoTradeSettingWindow(QDialog):
             getattr(self, "_routine_tree_display_level", "category") or "category"
         ) == "stock"
         if valid_stock_only:
+            existing_stock_codes = {
+                str(row.get("stock_code", "") or "").strip()
+                for row in rows
+                if str(row.get("row_kind", "") or "") == "stock"
+            }
+            for stock_projection_row in canonical_stock_rows.values():
+                if stock_projection_row.stock_code in existing_stock_codes:
+                    continue
+                relation = stock_projection_row.current_relation_consistency
+                instance_id = str(
+                    stock_projection_row.current_instance_id or ""
+                )
+                instance = next(
+                    (
+                        value
+                        for value in loaded_instances
+                        if str(value.instance_id) == instance_id
+                    ),
+                    None,
+                )
+                detail = (
+                    canonical_performance.current_stock_detail(
+                        stock_projection_row.stock_code
+                    )
+                    if canonical_performance is not None
+                    else {}
+                )
+                rows.append(
+                    {
+                        "row_kind": "stock",
+                        "definition_id": str(
+                            getattr(instance, "definition_id", "") or ""
+                        ),
+                        "group_id": str(
+                            stock_projection_row.current_group_id or ""
+                        ),
+                        "instance_id": instance_id,
+                        "definition_name": "",
+                        "instance_name": str(
+                            getattr(instance, "display_name", "") or ""
+                        ),
+                        "package_dir": "",
+                        "instance_dir": "",
+                        "display_name": canonical_performance.stock_name(
+                            stock_projection_row
+                        ),
+                        "display_level": "stock",
+                        "display_scope": selected_scope,
+                        "display_metric": str(
+                            getattr(
+                                self,
+                                "_routine_tree_display_criterion",
+                                "profit",
+                            )
+                            or "profit"
+                        ),
+                        "stock_code": stock_projection_row.stock_code,
+                        "stock_path": str(detail.get("stock_path", "") or ""),
+                        "first_stock_for_instance": False,
+                        "tree_icon": (
+                            "\u2713"
+                            if stock_projection_row.is_currently_assigned
+                            else "\u25aa"
+                        ),
+                        "is_historical": not stock_projection_row.is_currently_assigned,
+                        "canonical_identity_tooltip": canonical_performance.identity_tooltip(
+                            stock_projection_row
+                        ),
+                        "canonical_relation_consistent": relation.consistent,
+                        **self._routine_tree_canonical_performance_texts(
+                            stock_projection_row,
+                            canonical_performance,
+                        ),
+                    }
+                )
             parent_rows = [
                 row
                 for row in rows
@@ -7097,10 +7685,16 @@ class AutoTradeSettingWindow(QDialog):
                 for row in rows
                 if str(row.get("row_kind", "") or "") == "stock"
             ]
-            stock_rows = self._routine_tree_group_stock_rows_by_code(
-                stock_rows,
-                performance_source_cache,
-            )
+            stock_by_code: dict[str, dict[str, object]] = {}
+            for stock_row in stock_rows:
+                code = str(stock_row.get("stock_code", "") or "").strip()
+                existing = stock_by_code.get(code)
+                if existing is None or (
+                    bool(existing.get("is_historical", False))
+                    and not bool(stock_row.get("is_historical", False))
+                ):
+                    stock_by_code[code] = stock_row
+            stock_rows = list(stock_by_code.values())
             rows = parent_rows + stock_rows
 
         if valid_stock_only and bool(
@@ -7109,59 +7703,21 @@ class AutoTradeSettingWindow(QDialog):
             display_criterion = str(
                 getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
             )
-            source_key_by_criterion = {
-                "period": "trade_days",
-                "profit": "realized_profit",
-                "average": "average",
-                "efficiency": "profit_factor",
-            }
-            source_key = source_key_by_criterion.get(
-                display_criterion,
-                "realized_profit",
-            )
-
-            def _global_stock_sort_value(row: dict[str, object]) -> float:
-                fixture = row.get("performance_fixture")
-                if isinstance(fixture, dict):
-                    raw_value = fixture.get(source_key)
-                    if source_key == "profit_factor":
-                        return normalize_profit_factor(raw_value)
-                    try:
-                        return float(raw_value)
-                    except (TypeError, ValueError):
-                        return 0.0
-                stock_key = (
-                    str(row.get("instance_id", "") or "").strip(),
-                    str(row.get("stock_code", "") or "").strip(),
-                    str(row.get("stock_path", "") or "").strip(),
+            def _global_stock_sort_key(row: dict[str, object]):
+                rank = int(
+                    row.get(
+                        f"performance_{display_criterion}_sort_status_rank",
+                        3,
+                    )
+                    or 0
                 )
-                if stock_key in global_stock_sort_values:
-                    return global_stock_sort_values[stock_key]
-                cache_key = str(row.get("stock_path", "") or "").strip()
-                if bool(row.get("is_historical", False)) or not cache_key:
-                    cache_key = "|".join(
-                        (
-                            stock_key[0],
-                            stock_key[1],
-                            stock_key[2],
-                            (
-                                "historical"
-                                if bool(row.get("is_historical", False))
-                                else "current"
-                            ),
-                        )
-                    )
-                raw_value = performance_source_cache.get(cache_key, {}).get(source_key)
-                if source_key == "profit_factor" and raw_value is None:
-                    raw_value = performance_source_cache.get(cache_key, {}).get(
-                        "efficiency"
-                    )
-                if source_key == "profit_factor":
-                    return normalize_profit_factor(raw_value)
-                try:
-                    return float(raw_value)
-                except (TypeError, ValueError):
-                    return 0.0
+                value = self._routine_tree_row_sort_value(row, display_criterion)
+                return (
+                    rank,
+                    -value,
+                    str(row.get("display_name", "") or "").casefold(),
+                    str(row.get("stock_code", "") or ""),
+                )
 
             parent_rows = [
                 row
@@ -7175,8 +7731,7 @@ class AutoTradeSettingWindow(QDialog):
             ]
             stock_rows = sorted(
                 stock_rows,
-                key=_global_stock_sort_value,
-                reverse=True,
+                key=_global_stock_sort_key,
             )
             for index, row in enumerate(stock_rows):
                 row["first_stock_for_instance"] = index == 0
@@ -7224,14 +7779,22 @@ class AutoTradeSettingWindow(QDialog):
                 item = SortableTableWidgetItem("")
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 item.setData(Qt.UserRole, dict(row_data))
+                title_tooltip = (
+                    str(row_data.get("display_name", "") or "")
+                    if row_kind == "stock"
+                    else tree_title_tooltip(row_data.get("display_name", ""))
+                    if row_kind in {"definition", "instance"}
+                    else ""
+                )
+                canonical_tooltip = str(
+                    row_data.get("canonical_identity_tooltip", "") or ""
+                )
                 item.setData(
                     Qt.ToolTipRole,
-                    (
-                        str(row_data.get("display_name", "") or "")
-                        if row_kind == "stock"
-                        else tree_title_tooltip(row_data.get("display_name", ""))
-                        if row_kind in {"definition", "instance"}
-                        else ""
+                    "\n".join(
+                        value
+                        for value in (title_tooltip, canonical_tooltip)
+                        if value
                     ),
                 )
                 item.setData(SORT_ROLE, str(row_data["definition_name"]))

@@ -161,8 +161,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "routines": ["지표추종매매"],
             },
         )
-        repository = MagicMock()
-        repository.list_routine_assignment_history.return_value = []
+        canonical_snapshot = MagicMock()
 
         with patch.object(
             setting_window,
@@ -194,9 +193,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             return_value=[],
         ) as orders_reader, patch.object(
             setting_window,
-            "StockRepository",
-            return_value=repository,
-        ) as repository_factory:
+            "build_canonical_performance_ui_snapshot",
+            return_value=canonical_snapshot,
+        ) as canonical_reader:
             snapshot = AutoTradeSettingWindow._build_initial_read_snapshot(
                 SimpleNamespace()
             )
@@ -208,8 +207,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(2, config_reader.call_count)
         self.assertEqual(2, state_reader.call_count)
         self.assertEqual(2, orders_reader.call_count)
-        repository_factory.assert_called_once_with(setting_window.PROJECT_ROOT)
-        repository.list_routine_assignment_history.assert_called_once_with()
+        canonical_reader.assert_called_once_with(
+            setting_window.PROJECT_ROOT,
+            stocks=stocks,
+            instances=instances,
+            groups=groups,
+        )
+        self.assertIs(canonical_snapshot, snapshot["canonical_performance"])
         self.assertEqual(stocks, snapshot["stocks"])
         self.assertEqual(2, len(snapshot["stock_data_by_dir"]))
         self.assertEqual(2, len(snapshot["count_static_data"]["stocks"]))
@@ -469,6 +473,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "set_default_operation_instance_from_metadata",
             "_refresh_default_operation_stamps",
             "_routine_tree_stock_performance_source",
+            "_canonical_performance_snapshot_for_tree",
+            "_canonical_metric_status_rank",
+            "_canonical_metric_tooltip",
+            "_routine_tree_canonical_performance_texts",
             "_routine_tree_stock_group_performance_source",
             "_routine_tree_group_stock_rows_by_code",
             "_routine_tree_performance_texts",
@@ -477,6 +485,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_configure_routine_tree_row_layout",
             "_routine_tree_row_sort_value",
             "_routine_tree_instance_identity_sort_key",
+            "_routine_tree_canonical_sort_key",
             "_routine_tree_sort_definition_blocks",
             "_routine_tree_sort_instance_blocks",
             "_routine_tree_row_widget",

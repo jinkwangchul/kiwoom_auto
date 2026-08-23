@@ -530,6 +530,16 @@ def record_execution_fill(
         recorded_at=now,
         routine_instance_id=_clean_text(_as_dict(context).get("routine_instance_id")),
     )
+    if not fill_record.get("broker"):
+        context_broker = _clean_text(_as_dict(context).get("broker"))
+        if context_broker:
+            fill_record["broker"] = context_broker
+        elif (
+            _as_dict(context).get("kiwoom_api_live_event") is True
+            and _clean_text(_as_dict(context).get("live_event_source"))
+            == "KiwoomApi.raw_chejan_received"
+        ):
+            fill_record["broker"] = "KIWOOM"
 
     try:
         with _FILL_THREAD_LOCK:
