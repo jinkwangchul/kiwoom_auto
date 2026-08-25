@@ -499,6 +499,19 @@ class MainMonitoringStockOperationAdapter:
         self.statusBarMessage(message)
         return False
 
+    def global_operation_start_prerequisite(self, action_name: str) -> dict[str, object]:
+        checker = getattr(self._window, "global_operation_start_prerequisite", None)
+        if callable(checker):
+            result = checker(action_name)
+            return result if isinstance(result, dict) else {"allowed": True}
+        if self.require_startup_recovery_session(action_name):
+            return {"allowed": True, "reason": "GLOBAL_PREREQUISITE_READY"}
+        return {
+            "allowed": False,
+            "reason": self._last_operation_block_reason or "RECOVERY_NOT_READY",
+            "user_message": self._last_operation_user_message,
+        }
+
     def start_target_is_review_isolated(
         self,
         stock_dir: Path,

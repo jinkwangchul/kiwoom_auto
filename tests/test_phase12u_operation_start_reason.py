@@ -1,0 +1,245 @@
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import gui_auto_trade_run_control as run_control
+import gui_main_stock_context_menu as monitoring_context_menu
+import gui_auto_trade_setting_window as setting_window_module
+from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+
+class _StartReasonWindow:
+    def __init__(self, targets):
+        self.targets = list(targets)
+        self.status_messages = []
+        self._operation_start_batch_active = False
+        self.stock_table = SimpleNamespace(
+            viewport=lambda: SimpleNamespace(
+                update=MagicMock(),
+                repaint=MagicMock(),
+            ),
+            repaint=MagicMock(),
+        )
+        self.recalculate_stock_status_by_operation_policy = MagicMock(
+            return_value=("failed", None, None)
+        )
+
+    def selected_stock_infos(self):
+        return list(self.targets)
+
+    def start_target_is_review_isolated(self, _stock_dir, _code):
+        return False
+
+    def split_start_targets(self, selected):
+        return list(selected), []
+
+    def pre_start_review_check(self, *_args):
+        return {}
+
+    def mark_review_required(self, *_args, **_kwargs):
+        return False
+
+    def statusBarMessage(self, message):
+        self.status_messages.append(str(message))
+
+
+def _write_target(root: Path, code: str, *, start: str = "09:00:00"):
+    stock_dir = root / f"{code}_테스트"
+    stock_dir.mkdir()
+    (stock_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "assigned_routine_instance_id": "instance-1",
+                "routine_instance_name": "routine-1",
+                "trade_amount_type": "QUANTITY",
+                "buy_qty": 1,
+                "operation_mode": "SCHEDULED",
+                "start_time": start,
+                "end_buy_time": "13:30:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stock_dir / "state.json").write_text(
+        json.dumps({"status": "STOPPED", "holding_qty": 0}),
+        encoding="utf-8",
+    )
+    return stock_dir, code, "테스트"
+
+
+class Phase12UOperationStartReasonTest(unittest.TestCase):
+    def test_structural_no_target_keeps_generic_message(self) -> None:
+        self.assertEqual(
+            "현재 운영을 시작할 수 있는 종목이 없습니다.\n"
+            "검토관리와 자동매매 설정을 확인하십시오.",
+            run_control._start_failure_user_message([]),
+        )
+
+    def test_all_structural_targets_outside_time_gets_time_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = _write_target(Path(temp_dir), "000001")
+            window = _StartReasonWindow([target])
+            with (
+                patch.object(
+                    run_control,
+                    "read_operation_state",
+                    return_value={},
+                ),
+                patch.object(
+                    run_control,
+                    "current_datetime",
+                    return_value=run_control.datetime(2026, 8, 25, 20, 0),
+                ),
+                patch.object(run_control, "refresh_auto_trade_views"),
+                patch.object(run_control, "append_changelog"),
+                patch.object(run_control, "_show_start_failure_once"),
+                patch.object(run_control, "write_global_operation_running_state") as writer,
+            ):
+                result = run_control.auto_trade_start_selected_auto_trades(
+                    window,
+                    selected_targets=[target],
+                    request_scope=run_control.START_REQUEST_MULTIPLE,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                "현재는 매매 운영 시간이 아닙니다.",
+                result["user_message"],
+            )
+            self.assertEqual(("000001 테스트",), result["eligible"])
+            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+            self.assertEqual((), result["time_eligible_targets"])
+            writer.assert_not_called()
+
+    def test_time_eligible_target_keeps_downstream_validation_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outside = _write_target(Path(temp_dir), "000001", start="18:00:00")
+            inside = _write_target(Path(temp_dir), "000002")
+            outside_config = json.loads(
+                (outside[0] / "config.json").read_text(encoding="utf-8")
+            )
+            outside_config["end_buy_time"] = "19:00:00"
+            (outside[0] / "config.json").write_text(
+                json.dumps(outside_config),
+                encoding="utf-8",
+            )
+            window = _StartReasonWindow([outside, inside])
+            with (
+                patch.object(run_control, "read_operation_state", return_value={}),
+                patch.object(
+                    run_control,
+                    "current_datetime",
+                    return_value=run_control.datetime(2026, 8, 25, 10, 0),
+                ),
+                patch.object(run_control, "refresh_auto_trade_views"),
+                patch.object(run_control, "append_changelog"),
+                patch.object(run_control, "_show_start_failure_once"),
+                patch.object(run_control, "write_global_operation_running_state") as writer,
+            ):
+                result = run_control.auto_trade_start_selected_auto_trades(
+                    window,
+                    selected_targets=[outside, inside],
+                    request_scope=run_control.START_REQUEST_MULTIPLE,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertIn("운영 상태를 저장하지 못했습니다", str(result["user_message"]))
+            self.assertNotIn("매매 운영 시간이 아닙니다", str(result["user_message"]))
+            self.assertEqual((inside,), result["time_eligible_targets"])
+            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+            writer.assert_not_called()
+
+    def test_schedule_helper_matches_guard_time_contract(self) -> None:
+        config = {
+            "operation_mode": "SCHEDULED",
+            "start_time": "09:00:00",
+            "end_buy_time": "13:30:00",
+        }
+        before = run_control.datetime(2026, 8, 25, 8, 59)
+        during = run_control.datetime(2026, 8, 25, 10, 0)
+        after = run_control.datetime(2026, 8, 25, 13, 30)
+        self.assertFalse(run_control.auto_trade_operation_time_allowed(config, now_dt=before))
+        self.assertTrue(run_control.auto_trade_operation_time_allowed(config, now_dt=during))
+        self.assertFalse(run_control.auto_trade_operation_time_allowed(config, now_dt=after))
+
+    def test_main_global_adapter_path_preserves_outside_time_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = _write_target(Path(temp_dir), "012210")
+
+            class _Host:
+                def split_start_targets(self, selected):
+                    return list(selected), []
+
+                def filter_start_targets_by_recovery(self, targets, *, action):
+                    return {
+                        "allowed": True,
+                        "reason": "RECOVERY_COMPLETED",
+                        "eligible": tuple(targets),
+                        "excluded_review": (),
+                    }
+
+            class _Owner:
+                def __init__(self):
+                    self.routine_table = SimpleNamespace()
+                    self.btn_start = SimpleNamespace(
+                        setText=MagicMock(),
+                        setStyleSheet=MagicMock(),
+                        setEnabled=MagicMock(),
+                    )
+                    self.refresh_all = MagicMock()
+                    self._host = _Host()
+
+                def main_monitoring_auto_trade_operation_host(self):
+                    return self._host
+
+                def global_operation_start_prerequisite(self, _action):
+                    return {"allowed": True, "reason": "GLOBAL_PREREQUISITE_READY"}
+
+                def statusBar(self):
+                    return SimpleNamespace(showMessage=MagicMock())
+
+            owner = _Owner()
+            adapter = monitoring_context_menu.MainMonitoringStockOperationAdapter(
+                owner,
+                [SimpleNamespace(stock_dir=target[0], code=target[1], name=target[2], routine_instance_id="instance-1")],
+            )
+            result_holder = {}
+
+            def invoke_backend(window, **kwargs):
+                result = run_control.auto_trade_start_selected_auto_trades(window, **kwargs)
+                result_holder["result"] = result
+                return result
+
+            with (
+                patch.object(monitoring_context_menu, "auto_trade_registered_operation_targets", return_value=[target]),
+                patch.object(run_control, "auto_trade_registered_operation_targets", return_value=[target]),
+                patch.object(run_control, "auto_trade_stock_operation_excluded", return_value=False),
+                patch.object(run_control, "read_operation_state", return_value={}),
+                patch.object(run_control, "current_datetime", return_value=run_control.datetime(2026, 8, 25, 20, 38)),
+                patch.object(setting_window_module, "_today_global_operation_status", return_value=""),
+                patch.object(setting_window_module, "read_operation_state", return_value={}),
+                patch.object(setting_window_module, "auto_trade_start_selected_auto_trades", side_effect=invoke_backend),
+                patch.object(run_control, "refresh_auto_trade_views"),
+                patch.object(run_control, "append_changelog"),
+                patch.object(run_control, "_show_start_failure_once"),
+                patch.object(run_control, "write_global_operation_running_state") as writer,
+            ):
+                AutoTradeSettingWindow.start_selected_auto_trades(adapter)
+
+            self.assertEqual(
+                "현재는 매매 운영 시간이 아닙니다.",
+                result_holder["result"]["user_message"],
+            )
+            self.assertEqual(("012210 테스트",), result_holder["result"]["failed"])
+            writer.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

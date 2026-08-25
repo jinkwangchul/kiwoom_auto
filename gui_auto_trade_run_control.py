@@ -589,17 +589,8 @@ def auto_trade_same_day_restart_guard(
     if is_review_required_state(state):
         return blocked("REVIEW_REQUIRED")
 
-    mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    if mode == "CONTINUOUS":
-        if not in_regular_manual_session(current):
-            return blocked("OUTSIDE_OPERATION_TIME")
-    else:
-        start_time, end_buy_time, _custom = effective_schedule_times(config)
-        current_seconds = current.hour * 3600 + current.minute * 60 + current.second
-        start_seconds = seconds_from_hhmmss(start_time, "09:00:00")
-        end_seconds = seconds_from_hhmmss(end_buy_time, "13:30:00")
-        if not start_seconds <= current_seconds < end_seconds:
-            return blocked("OUTSIDE_OPERATION_TIME")
+    if not auto_trade_operation_time_allowed(config, now_dt=current):
+        return blocked("OUTSIDE_OPERATION_TIME")
 
     review_needed, _review_reason, details = restart_initial_review_reason_for_stock(
         Path(stock_dir), state
@@ -626,6 +617,23 @@ def auto_trade_same_day_restart_guard(
     return {"allowed": True, "reason": "ALLOWED"}
 
 
+def auto_trade_operation_time_allowed(
+    config: dict[str, object],
+    *,
+    now_dt: datetime | None = None,
+) -> bool:
+    """Return whether the target's persisted operation schedule allows a start."""
+    current = now_dt or current_datetime()
+    mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
+    if mode == "CONTINUOUS":
+        return in_regular_manual_session(current)
+    start_time, end_buy_time, _custom = effective_schedule_times(config)
+    current_seconds = current.hour * 3600 + current.minute * 60 + current.second
+    start_seconds = seconds_from_hhmmss(start_time, "09:00:00")
+    end_seconds = seconds_from_hhmmss(end_buy_time, "13:30:00")
+    return start_seconds <= current_seconds < end_seconds
+
+
 def startup_recovery_operation_block_message(action: str, reason: str = "") -> str:
     message = (
         f"{action}할 수 없습니다. "
@@ -636,6 +644,41 @@ def startup_recovery_operation_block_message(action: str, reason: str = "") -> s
     if clean_detail and not _is_internal_reason_code(clean_detail):
         message += f"\n\n원인: {clean_detail}"
     return message
+
+
+def _global_start_prerequisite_result(
+    window,
+    *,
+    action: str,
+) -> dict[str, object] | None:
+    checker = getattr(window, "global_operation_start_prerequisite", None)
+    if not callable(checker):
+        return None
+    try:
+        result = checker(action)
+    except Exception:
+        LOGGER.exception("운영 시작 Global prerequisite 판정 실패")
+        return {
+            "allowed": False,
+            "reason": "GLOBAL_PREREQUISITE_CHECK_FAILED",
+            "user_message": (
+                "운영 시작 전 서버와 계좌 상태를 확인하는 중 오류가 발생했습니다.\n"
+                "로그를 확인한 뒤 다시 시도하십시오."
+            ),
+        }
+    if not isinstance(result, dict):
+        return None
+    if result.get("allowed") is True:
+        return None
+    reason = str(result.get("reason") or "GLOBAL_PREREQUISITE_NOT_READY").strip()
+    message = str(result.get("user_message") or "").strip()
+    if not message:
+        message = startup_recovery_operation_block_message(action, reason)
+    return {
+        "allowed": False,
+        "reason": reason,
+        "user_message": message,
+    }
 
 
 def _show_operation_warning(window, title: str, message: str) -> None:
@@ -779,8 +822,11 @@ def _start_failure_user_message(
     all_emergency: bool = False,
     all_review: bool = False,
     all_already_running: bool = False,
+    time_eligible_targets: bool = False,
 ) -> str:
     reasons = {str(item or "").strip() for item in failure_reasons if str(item or "").strip()}
+    if time_eligible_targets:
+        reasons.discard("OUTSIDE_OPERATION_TIME")
     if all_emergency or (
         reasons
         and reasons <= {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
@@ -820,8 +866,8 @@ def _start_failure_user_message(
         )
     if "NORMAL_ENDED" in reasons:
         return "오늘의 정상 운영이 이미 종료되었습니다.\n다음 거래일에 운영을 시작하십시오."
-    if reasons & {"OUTSIDE_OPERATION_TIME"}:
-        return "현재는 선택한 종목의 운영시작 가능 시간이 아닙니다."
+    if reasons and reasons <= {"OUTSIDE_OPERATION_TIME"}:
+        return "현재는 매매 운영 시간이 아닙니다."
     if reasons & {"HOLDING_EXISTS"}:
         return "보유수량이 남아 있어 운영을 다시 시작할 수 없습니다."
     if reasons & {"PENDING_BUY", "PENDING_SELL", "PENDING_ORDER", "PENDING_ORDER_UNKNOWN"}:
@@ -1446,6 +1492,45 @@ def auto_trade_start_selected_auto_trades(
         _show_start_failure_once(window, result)
         return result
 
+    global_prerequisite = _global_start_prerequisite_result(
+        window,
+        action="운영시작",
+    )
+    if global_prerequisite is not None:
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+        reason = str(global_prerequisite.get("reason") or "GLOBAL_PREREQUISITE_NOT_READY")
+        result = {
+            "ok": False,
+            "reason": reason,
+            "user_message": str(global_prerequisite.get("user_message") or "").strip(),
+            "requested": requested,
+            "excluded_review": (),
+            "eligible": (),
+            "completed": (),
+            "blocked_validation": (),
+            "review_required": (),
+            "failed": (),
+            "skipped": (),
+            "operation": "START",
+            "requested_count": len(requested),
+            "started_count": 0,
+            "excluded_review_count": 0,
+            "excluded_validation_count": 0,
+            "failed_count": 0,
+            "global_failure_reason": reason,
+            "internal_reason": (reason,),
+            "blocked": True,
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            global_failure=True,
+        )
+        _show_start_failure_once(window, result)
+        return result
+
     if not selected:
         result = {
             "ok": False,
@@ -1548,6 +1633,52 @@ def auto_trade_start_selected_auto_trades(
                 if all_review
                 else ("ALREADY_RUNNING" if all_already_running else "NOT_STARTABLE")
             ),
+        )
+        _show_start_failure_once(window, result)
+        return result
+
+    time_eligible_targets: list[tuple[Path, str, str]] = []
+    time_blocked_targets: list[str] = []
+    time_pending_validation: list[tuple[Path, str, str]] = []
+    for target in start_targets:
+        stock_dir, code, name = target
+        config_path = stock_dir / "config.json"
+        state_path = stock_dir / "state.json"
+        config = read_json_dict(config_path)
+        state = read_json_dict(state_path)
+        if not config_path.exists() or not config or not state_path.exists() or not state:
+            time_pending_validation.append(target)
+            continue
+        if not auto_trade_operation_time_allowed(config, now_dt=request_now):
+            time_blocked_targets.append(f"{code} {name}")
+            continue
+        time_eligible_targets.append(target)
+
+    start_targets = time_eligible_targets + time_pending_validation
+    if not start_targets and time_blocked_targets:
+        result = {
+            "ok": False,
+            "reason": "NO_STARTABLE_TARGETS",
+            "user_message": _start_failure_user_message(
+                ["OUTSIDE_OPERATION_TIME"],
+            ),
+            "requested": requested,
+            "excluded_review": tuple(excluded_review),
+            "eligible": tuple(time_blocked_targets),
+            "completed": (),
+            "blocked_validation": (),
+            "failed": tuple(time_blocked_targets),
+            "skipped": tuple(skipped),
+            "time_eligible_targets": (),
+            "time_blocked_targets": tuple(time_blocked_targets),
+        }
+        _apply_start_request_context(
+            result,
+            request_scope=request_scope,
+            selected=selected,
+            request_source=source,
+            stock_failure_reason="OUTSIDE_OPERATION_TIME",
+            global_failure=True,
         )
         _show_start_failure_once(window, result)
         return result
@@ -1660,6 +1791,7 @@ def auto_trade_start_selected_auto_trades(
                 [],
                 all_emergency=_all_start_targets_emergency_stopped(selected),
                 all_review=bool(excluded_review),
+                time_eligible_targets=bool(time_eligible_targets),
             ),
             "requested": requested,
             "excluded_review": tuple(excluded_review),
@@ -1668,6 +1800,8 @@ def auto_trade_start_selected_auto_trades(
             "blocked_validation": (),
             "failed": (),
             "skipped": tuple(skipped),
+            "time_eligible_targets": tuple(time_eligible_targets),
+            "time_blocked_targets": tuple(time_blocked_targets),
         }
         _apply_start_request_context(
             result,
@@ -1920,6 +2054,8 @@ def auto_trade_start_selected_auto_trades(
         "review_required": tuple(review_required),
         "failed": tuple(failed),
         "skipped": tuple(skipped),
+        "time_eligible_targets": tuple(time_eligible_targets),
+        "time_blocked_targets": tuple(time_blocked_targets),
         "operation": "START",
         "requested_count": len(requested),
         "started_count": len(completed),
@@ -2025,6 +2161,7 @@ def auto_trade_start_selected_auto_trades(
                 failure_reasons,
                 all_emergency=_all_start_targets_emergency_stopped(selected),
                 all_review=bool(review_required) and not failed,
+                time_eligible_targets=bool(time_eligible_targets),
             )
         result["user_action"] = str(result["user_message"]).splitlines()[-1]
         result["global_failure_reason"] = str(result["reason"])

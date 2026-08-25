@@ -49,7 +49,38 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
         }
 
     def _amounts(self, stocks):
-        window = SimpleNamespace()
+        def fresh_state(code):
+            target = next(
+                (
+                    stock
+                    for stock in stocks
+                    if str(stock.get("code", "")) == str(code)
+                ),
+                None,
+            )
+            price = (
+                json.loads(
+                    (target["stock_dir"] / "state.json").read_text(encoding="utf-8")
+                ).get("current_price")
+                if target is not None
+                else None
+            )
+            return (
+                SimpleNamespace(
+                    connection_epoch=7,
+                    login_session_id="SESSION-7",
+                    last_price=price,
+                )
+                if price is not None
+                else None
+            )
+
+        operation_host = SimpleNamespace(
+            fresh_monitoring_market_information_state=fresh_state,
+        )
+        window = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=lambda: operation_host,
+        )
         with (
             patch.object(
                 main_loader,
@@ -60,6 +91,11 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 main_loader,
                 "starting_budget_defaults",
                 return_value=self._defaults(),
+            ),
+            patch.object(
+                main_loader,
+                "stock_limit_digit_alignment_enabled",
+                return_value=True,
             ),
         ):
             return main_loader.routine_instance_suggested_buy_limits(
@@ -89,26 +125,56 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
 
             recommended, minimum = self._amounts([first, second])
 
-        self.assertEqual(4_000_000, recommended)
-        self.assertEqual(900_000, minimum)
+        self.assertEqual(3_200_000, recommended)
+        self.assertEqual(810_000, minimum)
 
     def test_single_stock_matches_existing_stock_recommendation_helper(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, "000001_First", 12_345)
+            fresh_state = SimpleNamespace(
+                connection_epoch=7,
+                login_session_id="SESSION-7",
+                last_price=12_345,
+            )
+            operation_host = SimpleNamespace(
+                fresh_monitoring_market_information_state=lambda _code: fresh_state,
+            )
+            window = SimpleNamespace(
+                main_monitoring_auto_trade_operation_host=lambda: operation_host,
+            )
             with patch.object(
                 gui_windows,
                 "starting_budget_defaults",
                 return_value=self._defaults(),
+            ), patch.object(
+                gui_windows,
+                "stock_limit_digit_alignment_enabled",
+                return_value=True,
             ):
                 stock_recommended = gui_windows.MainWindow._stock_suggested_buy_limit(
-                    stock["stock_dir"] / "config.json"
+                    stock["stock_dir"] / "config.json",
+                    window=window,
                 )
 
             recommended, minimum = self._amounts([stock])
 
         self.assertEqual(stock_recommended, recommended)
-        self.assertEqual(400_000, minimum)
+        self.assertEqual(310_000, minimum)
+
+    def test_instance_recommendation_uses_stock_starting_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(
+                Path(temp),
+                "000001_First",
+                7_270,
+                trade_amount_type="QUANTITY",
+                buy_qty=5,
+            )
+            recommended, minimum = self._amounts([stock])
+
+        self.assertEqual(3_600_000, recommended)
+        self.assertEqual(910_000, minimum)
 
     def test_missing_price_or_empty_registration_forbids_partial_sum(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -119,11 +185,23 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             self.assertEqual((None, None), self._amounts([ready, waiting]))
             self.assertEqual((None, None), self._amounts([]))
 
-    def test_reference_price_is_stable_after_first_valid_price(self):
+    def test_same_session_price_change_does_not_recalculate_instance_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, "000001_First", 12_345)
-            window = SimpleNamespace()
+            live = SimpleNamespace(
+                value=SimpleNamespace(
+                    connection_epoch=7,
+                    login_session_id="SESSION-7",
+                    last_price=12_345,
+                )
+            )
+            operation_host = SimpleNamespace(
+                fresh_monitoring_market_information_state=lambda _code: live.value,
+            )
+            window = SimpleNamespace(
+                main_monitoring_auto_trade_operation_host=lambda: operation_host,
+            )
             with (
                 patch.object(
                     main_loader,
@@ -135,20 +213,27 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                     "starting_budget_defaults",
                     return_value=self._defaults(),
                 ),
+                patch.object(
+                    main_loader,
+                    "stock_limit_digit_alignment_enabled",
+                    return_value=True,
+                ),
             ):
                 first = main_loader.routine_instance_suggested_buy_limits(
                     window,
                     "instance-a",
                 )
-                (stock["stock_dir"] / "state.json").write_text(
-                    json.dumps({"current_price": 99_999}),
-                    encoding="utf-8",
+                live.value = SimpleNamespace(
+                    connection_epoch=7,
+                    login_session_id="SESSION-7",
+                    last_price=99_999,
                 )
                 second = main_loader.routine_instance_suggested_buy_limits(
                     window,
                     "instance-a",
                 )
 
+        self.assertEqual((1_200_000, 310_000), first)
         self.assertEqual(first, second)
 
     @staticmethod
@@ -278,7 +363,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             duration_ms=2500,
         )
 
-    def test_manual_over_total_disables_and_clears_ratio(self):
+    def test_manual_over_total_toasts_and_preserves_limit(self):
         host, _editor, _label = self._routine_host("5000001")
         repository = MagicMock()
         repository.update_buy_limit.return_value = SimpleNamespace(success=True, error="")
@@ -351,7 +436,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 )
             repository.assert_not_called()
 
-    def test_stock_recommendation_and_manual_over_total_disable_only_target(self):
+    def test_stock_double_click_rejects_recommendation_above_total_budget(self):
         with tempfile.TemporaryDirectory() as temp:
             config_path = Path(temp) / "First" / "config.json"
             config_path.parent.mkdir()
@@ -363,23 +448,44 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 _stock_config_path_for_routine_row=MagicMock(return_value=config_path),
                 finish_routine_instance_buy_limit_edit=MagicMock(),
                 finish_routine_stock_buy_limit_edit=MagicMock(),
-                _stock_suggested_buy_limit=MagicMock(return_value=5_000_001),
+                _parse_buy_limit_amount=gui_windows.MainWindow._parse_buy_limit_amount,
+                _stock_suggested_buy_limit=MagicMock(
+                    side_effect=lambda _path, minimum=False, window=None: (
+                        900_000 if minimum else 5_000_001
+                    )
+                ),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                start_routine_stock_buy_limit_edit=MagicMock(),
             )
             with patch.object(
                 gui_windows,
                 "_system_total_budget_amount",
                 return_value=5_000_000,
-            ):
+            ), patch.object(gui_windows, "show_toast") as toast:
                 gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
                     host,
                     0,
                 )
-            host._write_stock_buy_limit_config.assert_called_once_with(
+            host._write_stock_buy_limit_config.assert_not_called()
+            self.assertEqual(2, host._stock_suggested_buy_limit.call_count)
+            host._stock_suggested_buy_limit.assert_any_call(
                 config_path,
-                enabled=False,
-                amount=None,
+                window=host,
+            )
+            host._stock_suggested_buy_limit.assert_any_call(
+                config_path,
+                minimum=True,
+                window=host,
+            )
+            toast.assert_called_once_with(
+                host,
+                "권장한도가 전체예산을 초과 합니다",
+                duration_ms=2500,
+            )
+            host.start_routine_stock_buy_limit_edit.assert_called_once_with(
+                0,
+                use_suggested_amount=False,
             )
 
         editor = QLineEdit("5000001")
@@ -396,10 +502,14 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             _write_stock_buy_limit_config=MagicMock(),
             load_routine_table=MagicMock(),
         )
-        with patch.object(
-            gui_windows,
-            "_system_total_budget_amount",
-            return_value=5_000_000,
+        with (
+            patch.object(
+                gui_windows,
+                "_system_total_budget_amount",
+                return_value=5_000_000,
+            ),
+            patch.object(gui_windows, "show_toast") as toast,
+            patch.object(gui_windows.QMessageBox, "warning") as warning,
         ):
             gui_windows.MainWindow.finish_routine_stock_buy_limit_edit(
                 manual_host,
@@ -409,9 +519,19 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             Path("C:/target/config.json"),
             enabled=False,
             amount=None,
+            source=None,
         )
+        manual_host.load_routine_table.assert_called_once_with()
+        toast.assert_called_once_with(
+            manual_host,
+            "입력값이 전체예산을 초과합니다.",
+            duration_ms=2500,
+        )
+        warning.assert_not_called()
+        self.assertIsNone(manual_host._routine_stock_buy_limit_editor)
+        self.assertEqual("", manual_host._routine_stock_buy_limit_editor_config_path)
 
-    def test_stock_values_equal_to_total_budget_are_allowed(self):
+    def test_stock_double_click_enables_unset_limit_with_recommendation(self):
         with tempfile.TemporaryDirectory() as temp:
             config_path = Path(temp) / "First" / "config.json"
             config_path.parent.mkdir()
@@ -423,7 +543,12 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 _stock_config_path_for_routine_row=MagicMock(return_value=config_path),
                 finish_routine_instance_buy_limit_edit=MagicMock(),
                 finish_routine_stock_buy_limit_edit=MagicMock(),
-                _stock_suggested_buy_limit=MagicMock(return_value=5_000_000),
+                _parse_buy_limit_amount=gui_windows.MainWindow._parse_buy_limit_amount,
+                _stock_suggested_buy_limit=MagicMock(
+                    side_effect=lambda _path, minimum=False, window=None: (
+                        900_000 if minimum else 5_000_000
+                    )
+                ),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
             )
@@ -436,11 +561,23 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                     host,
                     0,
                 )
+            self.assertEqual(2, host._stock_suggested_buy_limit.call_count)
+            host._stock_suggested_buy_limit.assert_any_call(
+                config_path,
+                window=host,
+            )
+            host._stock_suggested_buy_limit.assert_any_call(
+                config_path,
+                minimum=True,
+                window=host,
+            )
             host._write_stock_buy_limit_config.assert_called_once_with(
                 config_path,
                 enabled=True,
                 amount=5_000_000,
+                source=gui_windows.BUY_LIMIT_SOURCE_RECOMMENDED,
             )
+            host.load_routine_table.assert_called_once_with()
 
         editor = QLineEdit("5000000")
         manual_host = SimpleNamespace(
@@ -469,6 +606,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             Path("C:/target/config.json"),
             enabled=True,
             amount=5_000_000,
+            source=gui_windows.BUY_LIMIT_SOURCE_MANUAL,
         )
 
 

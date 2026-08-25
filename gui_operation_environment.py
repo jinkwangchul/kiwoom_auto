@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Mapping
 
-from PyQt5.QtCore import Qt, QTime
+from PyQt5.QtCore import QSettings, Qt, QTime, QTimer
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QStyle,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -60,6 +61,7 @@ STARTING_BUDGET_DEFAULTS = {
     "limit_recommended_multiplier": 100.0,
     "limit_minimum_multiplier": 25.0,
 }
+STOCK_LIMIT_DIGIT_ALIGNMENT_SETTINGS_KEY = "ui/stock_limit_digit_alignment"
 SYSTEM_BUDGET_MAX_AMOUNT = 9_999_999_999
 SYSTEM_BUDGET_DEFAULTS = {
     "total_budget": 2_000_000,
@@ -644,6 +646,34 @@ def starting_budget_defaults(policy: dict[str, object] | None = None) -> dict[st
     }
 
 
+def _ui_settings() -> QSettings:
+    return QSettings(
+        QSettings.IniFormat,
+        QSettings.UserScope,
+        "jinkwangchul",
+        "kiwoom_auto",
+    )
+
+
+def stock_limit_digit_alignment_enabled() -> bool:
+    raw_value = _ui_settings().value(
+        STOCK_LIMIT_DIGIT_ALIGNMENT_SETTINGS_KEY,
+        True,
+    )
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    return str(raw_value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def set_stock_limit_digit_alignment_enabled(enabled: bool) -> None:
+    _ui_settings().setValue(
+        STOCK_LIMIT_DIGIT_ALIGNMENT_SETTINGS_KEY,
+        bool(enabled),
+    )
+
+
 def effective_amount_starting_budget(
     current_price: object,
     amount_multiplier: object,
@@ -655,10 +685,7 @@ def effective_amount_starting_budget(
         return None
     if not price.is_finite() or not multiplier.is_finite() or price <= 0 or multiplier <= 0:
         return None
-    quantity = int((price * multiplier / price).to_integral_value(rounding=ROUND_FLOOR))
-    if quantity < 1:
-        return None
-    return floor_money_to_won(price * quantity)
+    return floor_money_to_won(price * multiplier)
 
 
 def floor_money_to_won(value: object) -> int | None:
@@ -684,14 +711,26 @@ def round_up_to_leading_place(amount: object) -> int | None:
     return ((integer_value + place - 1) // place) * place
 
 
-def suggested_buy_limit(current_price: object, multiplier: object) -> int | None:
+def suggested_buy_limit(
+    starting_budget: object,
+    multiplier: object,
+    *,
+    align_digits: bool = False,
+) -> int | None:
     try:
-        amount = Decimal(str(current_price).replace(",", "").strip()) * Decimal(
+        amount = Decimal(str(starting_budget).replace(",", "").strip()) * Decimal(
             str(multiplier).replace(",", "").strip()
         )
     except (InvalidOperation, ValueError):
         return None
-    return round_up_to_leading_place(amount)
+    raw_amount = floor_money_to_won(amount)
+    if raw_amount is None:
+        return None
+    if align_digits:
+        from gui_main_budget_panel import round_money_to_two_significant_digits
+
+        return round_money_to_two_significant_digits(raw_amount)
+    return raw_amount
 
 
 class TimeComboWidget(QWidget):
@@ -750,26 +789,65 @@ class TimeComboWidget(QWidget):
 
 class ProgramFactoryResetConfirmDialog(QDialog):
     CONFIRMATION_TEXT = "전체초기화"
+    WARNING_TEXT = (
+        "프로그램을 완전초기화 합니다.\n"
+        "치명적인 손실을 초래할수 있습니다.\n"
+        '아래 입력창에 "전체초기화"를 입력하세요.'
+    )
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("프로그램 초기화 확인")
         self.setModal(True)
 
-        warning = QLabel(
-            "프로그램의 모든 종목, 운영 데이터 및 사용자 설정이 삭제되고\n"
-            "초기 상태로 돌아갑니다.\n"
-            "삭제된 데이터는 프로그램에서 복구할 수 없습니다.\n\n"
-            "계속하려면 아래에 '전체초기화'를 입력하십시오."
+        self.warning_label = QLabel(self.WARNING_TEXT)
+        self.warning_label.setWordWrap(True)
+        warning_metrics = self.warning_label.fontMetrics()
+        warning_width = max(
+            warning_metrics.horizontalAdvance(line)
+            for line in self.WARNING_TEXT.splitlines()
+        )
+        horizontal_margin = warning_metrics.horizontalAdvance("가") * 2
+        warning_icon_gap = warning_metrics.horizontalAdvance("가")
+        warning_icon_size = QApplication.style().pixelMetric(QStyle.PM_MessageBoxIconSize)
+        dialog_width = (
+            warning_width
+            + warning_icon_gap
+            + warning_icon_size
+            + (horizontal_margin * 2)
+        )
+        self.setMinimumSize(dialog_width, 210)
+        self.resize(dialog_width, 220)
+        self.warning_label.setFixedWidth(warning_width)
+        self.warning_icon_label = QLabel()
+        self.warning_icon_label.setObjectName("programFactoryResetWarningIcon")
+        self.warning_icon_label.setFixedSize(warning_icon_size, warning_icon_size)
+        self.warning_icon_label.setPixmap(
+            QApplication.style()
+            .standardIcon(QStyle.SP_MessageBoxWarning)
+            .pixmap(warning_icon_size, warning_icon_size)
         )
         self.confirmation_input = QLineEdit()
         self.confirmation_input.setObjectName("programFactoryResetConfirmationInput")
+        self.confirmation_input.setMinimumHeight(32)
+        input_width = self.confirmation_input.fontMetrics().horizontalAdvance("가" * 10) + 16
+        self.confirmation_input.setFixedWidth(input_width)
+        self.confirmation_input.setStyleSheet(
+            "QLineEdit, QLineEdit:focus {"
+            " border: none;"
+            " background-color: #FFFFFF;"
+            " padding: 0 8px;"
+            "}"
+        )
 
         buttons = QDialogButtonBox()
         self.reset_button = buttons.addButton("초기화", QDialogButtonBox.AcceptRole)
         self.cancel_button = buttons.addButton("취소", QDialogButtonBox.RejectRole)
         self.reset_button.setObjectName("programFactoryResetConfirmButton")
         self.reset_button.setEnabled(False)
+        self.reset_button.setMinimumWidth(110)
+        self.cancel_button.setMinimumWidth(110)
+        buttons.layout().setSpacing(18)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         self.confirmation_input.textChanged.connect(
@@ -777,8 +855,23 @@ class ProgramFactoryResetConfirmDialog(QDialog):
         )
 
         layout = QVBoxLayout(self)
-        layout.addWidget(warning)
-        layout.addWidget(self.confirmation_input)
+        layout.setContentsMargins(horizontal_margin, 20, horizontal_margin, 22)
+        layout.setSpacing(14)
+        warning_row = QHBoxLayout()
+        warning_row.setContentsMargins(0, 0, 0, 0)
+        warning_row.setSpacing(0)
+        warning_row.addWidget(self.warning_icon_label, 0, Qt.AlignVCenter)
+        warning_row.addSpacing(warning_icon_gap)
+        warning_row.addWidget(self.warning_label)
+        layout.addLayout(warning_row)
+        input_row = QHBoxLayout()
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(0)
+        input_row.addSpacing(warning_icon_size + warning_icon_gap)
+        input_row.addWidget(self.confirmation_input)
+        input_row.addStretch(1)
+        layout.addLayout(input_row)
+        layout.addSpacing(6)
         layout.addWidget(buttons)
         self.confirmation_input.setFocus()
 
@@ -902,6 +995,40 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.starting_amount_multiplier = self._make_short_line("1.5")
         self.limit_recommended_multiplier = self._make_short_line("100")
         self.limit_minimum_multiplier = self._make_short_line("25")
+        self.limit_digit_alignment_toggle = QPushButton()
+        self.limit_digit_alignment_toggle.setObjectName("stockLimitDigitAlignmentToggle")
+        self.limit_digit_alignment_toggle.setCheckable(True)
+        self.limit_digit_alignment_toggle.setToolTip("한도금액의 상위 두 자릿수를 맞춥니다")
+        self.limit_digit_alignment_toggle.setStyleSheet(
+            """
+            QPushButton#stockLimitDigitAlignmentToggle {
+                background-color: transparent;
+                color: #9a9a9a;
+                border: 1px solid #b8b8b8;
+                border-radius: 2px;
+                padding: 4px 4px;
+            }
+            QPushButton#stockLimitDigitAlignmentToggle:hover,
+            QPushButton#stockLimitDigitAlignmentToggle:pressed {
+                background-color: transparent;
+            }
+            QPushButton#stockLimitDigitAlignmentToggle:checked,
+            QPushButton#stockLimitDigitAlignmentToggle:checked:hover,
+            QPushButton#stockLimitDigitAlignmentToggle:checked:pressed {
+                background-color: transparent;
+                color: #000000;
+                border-color: #000000;
+            }
+            """
+        )
+        self.limit_digit_alignment_toggle.setText("자리맞춤 OFF")
+        self.limit_digit_alignment_toggle.ensurePolished()
+        self.limit_digit_alignment_toggle.setFixedWidth(
+            self.limit_digit_alignment_toggle.sizeHint().width()
+        )
+        self.limit_digit_alignment_toggle.toggled.connect(
+            self._stock_limit_digit_alignment_toggled
+        )
         self.registration_waiting = QCheckBox("대기")
         self.registration_excluded = QCheckBox("제외")
         self.registration_waiting.setObjectName("stockRegistrationWaitingCheck")
@@ -922,6 +1049,14 @@ class OperationEnvironmentSettingsDialog(QDialog):
         line = QLineEdit(default)
         line.setMinimumWidth(70)
         return line
+
+    def _update_stock_limit_digit_alignment_toggle_text(self) -> None:
+        state = "ON" if self.limit_digit_alignment_toggle.isChecked() else "OFF"
+        self.limit_digit_alignment_toggle.setText(f"자리맞춤 {state}")
+
+    def _stock_limit_digit_alignment_toggled(self, checked: bool) -> None:
+        self._update_stock_limit_digit_alignment_toggle_text()
+        set_stock_limit_digit_alignment_enabled(checked)
 
 
     def _make_time_edit(
@@ -1335,14 +1470,14 @@ class OperationEnvironmentSettingsDialog(QDialog):
         budget_content_wrap = QWidget()
         budget_content_layout = QHBoxLayout()
         budget_content_layout.setContentsMargins(0, 0, 0, 0)
-        budget_content_layout.setSpacing(32)
+        budget_content_layout.setSpacing(10)
 
         quantity_wrap = QWidget()
         quantity_layout = QHBoxLayout()
         quantity_layout.setContentsMargins(0, 0, 0, 0)
         quantity_layout.setSpacing(6)
         quantity_layout.addWidget(QLabel("■ 주수 :"))
-        self.starting_quantity.setFixedWidth(54)
+        self.starting_quantity.setFixedWidth(48)
         quantity_layout.addWidget(self.starting_quantity)
         quantity_wrap.setLayout(quantity_layout)
         budget_content_layout.addWidget(quantity_wrap)
@@ -1352,7 +1487,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
         amount_layout.setContentsMargins(0, 0, 0, 0)
         amount_layout.setSpacing(6)
         amount_layout.addWidget(QLabel("■ 금액 : 현재가 ×"))
-        self.starting_amount_multiplier.setFixedWidth(54)
+        self.starting_amount_multiplier.setFixedWidth(48)
         amount_layout.addWidget(self.starting_amount_multiplier)
         amount_wrap.setLayout(amount_layout)
         budget_content_layout.addWidget(amount_wrap)
@@ -1361,12 +1496,15 @@ class OperationEnvironmentSettingsDialog(QDialog):
         limit_layout = QHBoxLayout()
         limit_layout.setContentsMargins(0, 0, 0, 0)
         limit_layout.setSpacing(6)
-        limit_layout.addWidget(QLabel("■ 한도금액 : 현재가 × 권장"))
-        self.limit_recommended_multiplier.setFixedWidth(54)
+        limit_layout.addWidget(QLabel("■ 한도금액 : 시작예산 × 권장"))
+        self.limit_recommended_multiplier.setFixedWidth(48)
         limit_layout.addWidget(self.limit_recommended_multiplier)
         limit_layout.addWidget(QLabel("| 최소"))
-        self.limit_minimum_multiplier.setFixedWidth(54)
+        self.limit_minimum_multiplier.setFixedWidth(48)
         limit_layout.addWidget(self.limit_minimum_multiplier)
+        limit_layout.addSpacing(8)
+        self._update_stock_limit_digit_alignment_toggle_text()
+        limit_layout.addWidget(self.limit_digit_alignment_toggle)
         limit_wrap.setLayout(limit_layout)
         budget_content_layout.addWidget(limit_wrap)
         budget_content_layout.addStretch(1)
@@ -1435,6 +1573,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
 
     def _load_official_settings_defaults(self) -> None:
         self.policy = default_operation_policy()
+        set_stock_limit_digit_alignment_enabled(True)
         self.load_policy_to_widgets()
 
     def _select_registration_location(self, location: str) -> None:
@@ -1454,16 +1593,97 @@ class OperationEnvironmentSettingsDialog(QDialog):
             current = persistent_feature_owner(current)
         return None
 
+    def _main_window_owner(self) -> QWidget | None:
+        current: QWidget | None = persistent_feature_owner(self)
+        last: QWidget | None = current
+        while current is not None:
+            last = current
+            current = persistent_feature_owner(current)
+        return last
+
+    def _quiesce_for_program_factory_reset(self) -> dict[str, object]:
+        owner = self._main_window_owner()
+        token: dict[str, object] = {"owner": owner, "timers": []}
+        if owner is None:
+            return token
+        setattr(owner, "_factory_reset_in_progress", True)
+        timers: list[tuple[QTimer, bool]] = []
+        timer_owners: list[QWidget] = [owner]
+        application = QApplication.instance()
+        if application is not None:
+            for window in application.topLevelWidgets():
+                current: QWidget | None = window
+                while current is not None and current is not owner:
+                    current = persistent_feature_owner(current)
+                if current is owner and window not in timer_owners:
+                    timer_owners.append(window)
+        all_timers = {
+            timer
+            for timer_owner in timer_owners
+            for timer in timer_owner.findChildren(QTimer)
+        }
+        for timer in all_timers:
+            active = timer.isActive()
+            timers.append((timer, active))
+            if active:
+                timer.stop()
+        token["timers"] = timers
+        host = getattr(owner, "_main_monitoring_auto_trade_operation_host", None)
+        if host is not None:
+            setattr(host, "_factory_reset_quiesced", True)
+            trigger_queue = getattr(host, "_bar_commit_trigger_queue", None)
+            clear = getattr(trigger_queue, "clear", None)
+            if callable(clear):
+                clear()
+            market_data_host = getattr(host, "_market_data_host", None)
+            clear_market_data = getattr(market_data_host, "clear", None)
+            if callable(clear_market_data):
+                clear_market_data()
+        return token
+
+    @staticmethod
+    def _resume_after_program_factory_reset_failure(token: object) -> None:
+        state = token if isinstance(token, dict) else {}
+        owner = state.get("owner")
+        if owner is not None:
+            setattr(owner, "_factory_reset_in_progress", False)
+            host = getattr(owner, "_main_monitoring_auto_trade_operation_host", None)
+            if host is not None:
+                setattr(host, "_factory_reset_quiesced", False)
+        for timer, was_active in state.get("timers", []):
+            if was_active and not timer.isActive():
+                timer.start()
+
     def _request_program_factory_reset(self) -> None:
+        from program_factory_reset import (
+            execute_program_factory_reset,
+            validate_factory_reset_safety,
+        )
+
+        preview = validate_factory_reset_safety(PROJECT_ROOT, broker_connected=False)
+        self._last_factory_reset_preview = preview
+        if not preview.get("success"):
+            issues = [str(item) for item in preview.get("issues", []) if str(item).strip()]
+            QMessageBox.critical(
+                self,
+                "프로그램 초기화 불가",
+                "프로그램 초기화 대상을 확인하지 못했습니다.\n\n"
+                + "\n".join(f"- {item}" for item in issues[:8]),
+            )
+            return
+
         confirmation = ProgramFactoryResetConfirmDialog(self)
         dialog_result = confirmation.exec_()
         accepted = dialog_result == QDialog.Accepted
         confirmation_matched = (
             confirmation.confirmation_input.text() == confirmation.CONFIRMATION_TEXT
         )
+        if not accepted or not confirmation_matched:
+            return
+
         append_production_event(
             "OPERATOR_SETTING_DECISION",
-            result="ACCEPTED" if accepted else "CANCELLED",
+            result="ACCEPTED",
             source="gui_operation_environment.OperationEnvironmentSettingsDialog._request_program_factory_reset",
             target_type="APPLICATION_SETTINGS",
             target_name="프로그램 전체 초기화",
@@ -1473,37 +1693,16 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 "prompt_title": "프로그램 초기화 확인",
                 "prompt_summary": "프로그램 종목·운영 데이터·사용자 설정 초기화",
                 "offered_options": ["초기화", "취소"],
-                "selected_option": "초기화" if accepted else "취소",
-                "confirmation_matched": confirmation_matched,
+                "selected_option": "초기화",
+                "confirmation_matched": True,
             },
         )
-        if not accepted:
-            return
-
-        api = self._main_window_kiwoom_api()
-        is_connected = getattr(api, "is_connected", None)
-        if not callable(is_connected):
-            QMessageBox.warning(
-                self,
-                "프로그램 초기화 불가",
-                "키움 서버 연결 상태를 확인할 수 없습니다.",
-            )
-            return
-        try:
-            broker_connected = bool(is_connected())
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "프로그램 초기화 불가",
-                "키움 서버 연결 상태를 확인할 수 없습니다.",
-            )
-            return
-
-        from program_factory_reset import execute_program_factory_reset
 
         result = execute_program_factory_reset(
             PROJECT_ROOT,
-            broker_connected=broker_connected,
+            broker_connected=False,
+            quiesce=self._quiesce_for_program_factory_reset,
+            resume_after_failure=self._resume_after_program_factory_reset_failure,
         )
         if not result.get("success"):
             issues = [str(item) for item in result.get("issues", []) if str(item).strip()]
@@ -1580,6 +1779,12 @@ class OperationEnvironmentSettingsDialog(QDialog):
         self.limit_minimum_multiplier.setText(
             _plain_number_text(budget_defaults["limit_minimum_multiplier"])
         )
+        self.limit_digit_alignment_toggle.blockSignals(True)
+        self.limit_digit_alignment_toggle.setChecked(
+            stock_limit_digit_alignment_enabled()
+        )
+        self.limit_digit_alignment_toggle.blockSignals(False)
+        self._update_stock_limit_digit_alignment_toggle_text()
 
         registration = stock_registration_policy(self.policy)
         self._select_registration_location(registration["default_location"])
@@ -1732,6 +1937,9 @@ class OperationEnvironmentSettingsDialog(QDialog):
             return
         policy = self.build_policy_from_widgets(budget_defaults)
         before_policy = read_operation_policy()
+        self._starting_budget_defaults_changed = (
+            starting_budget_defaults(before_policy) != budget_defaults
+        )
         try:
             write_operation_policy(policy)
             saved_policy = read_operation_policy()

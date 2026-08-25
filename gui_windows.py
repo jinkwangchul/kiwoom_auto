@@ -24,6 +24,7 @@ from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic
 
 from PyQt5 import sip
 from PyQt5.QtCore import (
@@ -77,6 +78,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from gui_stock_name_tooltip import install_persistent_stock_name_tooltips
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1391,6 +1393,7 @@ from gui_main_table_loader import (
     ROUTINE_STOCK_PATH_ROLE,
     ROUTINE_STOCK_PROFIT_LED_ROLE,
     ROUTINE_STOCK_TEXT_OFFSET,
+    ROUTINE_STOCK_TOOLTIP_DATA_ROLE,
     ROUTINE_STOCK_VALUES_ROLE,
     routine_instance_separator_width,
     routine_aggregate_separator_width,
@@ -1400,9 +1403,11 @@ from gui_main_table_loader import (
     routine_aggregate_label_width,
     routine_aggregate_number_slot_width,
     routine_instance_number_widths,
+    main_refresh_market_information_only,
     main_refresh_pnl_only,
     main_group_instance_relation_id,
-    main_stock_default_reference_price,
+    main_stock_fresh_market_information_state,
+    main_stock_resolved_starting_budget,
     routine_instance_suggested_buy_limits,
     routine_stock_column_widths,
     routine_stock_position_value_widths,
@@ -1417,6 +1422,9 @@ from gui_main_table_loader import (
     main_load_running_stock_table,
     main_monitoring_table_font,
     main_monitoring_cell_font,
+    main_stock_row_tooltip_from_projection,
+    routine_instance_consumed_text,
+    stock_buy_limit_state,
 )
 from routine_tree_title_display import tree_title_text
 from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS
@@ -1512,13 +1520,12 @@ from event_journal_production import (
 )
 from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
-from gui_review_utils import current_price_from_state
 from gui_operation_environment import (
     default_buffer_response_policy,
-    effective_amount_starting_budget,
     read_buffer_response_policy,
     read_system_budget_policy,
     starting_budget_defaults,
+    stock_limit_digit_alignment_enabled,
     suggested_buy_limit,
     validate_buffer_response_policy,
     write_buffer_response_policy,
@@ -1529,7 +1536,6 @@ from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE,
     AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
-    InstanceStockSearchRegisterDialog,
     auto_trade_setting_badge_stylesheet,
     delete_routine_instance_with_existing_policy,
     get_group_dirs,
@@ -1539,6 +1545,7 @@ from gui_auto_trade_setting_window import (
     is_emergency_stopped_state,
     is_review_required_state,
     normalize_base_stock_single_routine_file,
+    open_instance_stock_search_register_dialog,
     open_routine_settings_dialog_for_owner,
     routine_display_name,
 )
@@ -1559,11 +1566,19 @@ from routine_instance_registry import (
 )
 from routine_instance_repository import RoutineInstanceRepository
 from stock_repository import now_text as stock_now_text
+from stock_repository import StockRepository
+from stock_buy_limit_provenance import (
+    BUY_LIMIT_SOURCE_MANUAL,
+    BUY_LIMIT_SOURCE_RECOMMENDED,
+    canonical_stock_buy_limit_values,
+    normalized_stock_buy_limit_source,
+)
 from gui_main_routine_selection import (
     routine_definition_enabled,
     routine_instance_checked,
 )
 from kiwoom_api import KiwoomApi
+from kiwoom_stock_library_service import KiwoomStockLibrarySyncService
 from operator_reconciliation_service import assess_startup_recovery
 from broker_holding_recorder import (
     resolve_account_holding_snapshot_failures,
@@ -1723,6 +1738,7 @@ MAIN_STOCK_METRIC_LAYOUT = {
         },
     ),
 }
+MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS = 100
 ROUTINE_STOCK_METRIC_SEPARATOR_GAP = int(
     MAIN_STOCK_METRIC_LAYOUT["separator_spacing"]
 )
@@ -1932,7 +1948,12 @@ def _routine_stock_metric_texts_legacy_unused(values: list[object], metrics_data
     return [text for text in texts if text]
 
 
-def _routine_stock_metric_texts(values: list[object], metrics_data: tuple[object, ...]) -> list[str]:
+def _routine_stock_metric_texts(
+    values: list[object],
+    metrics_data: tuple[object, ...],
+    *,
+    include_consumed: bool = False,
+) -> list[str]:
     if MAIN_STOCK_METRIC_LAYOUT_PREVIEW:
         return list(MAIN_STOCK_METRIC_MAX_TEXTS)
 
@@ -1956,6 +1977,15 @@ def _routine_stock_metric_texts(values: list[object], metrics_data: tuple[object
             texts.append(consumed_text)
     elif len(values) > consumed_index:
         texts.append(str(values[consumed_index] or "").strip())
+    elif include_consumed:
+        consumed_amount = getattr(metrics_data[0], "value2", 0) if metrics_data else 0
+        texts.append(
+            routine_instance_consumed_text(
+                consumed_amount=consumed_amount,
+                buy_limit_enabled=False,
+                buy_limit_amount=None,
+            )
+        )
     return [text for text in texts if text]
 
 
@@ -2346,6 +2376,13 @@ class _RoutineTreeInteractionController(QObject):
                                 event.accept()
                                 return True
                             return super().eventFilter(watched, event)
+                        if limit_rect.contains(event.pos()):
+                            self.window.cancel_routine_stock_buy_limit_single_click(
+                                suppress_release_row=index.row(),
+                            )
+                            self.window.handle_routine_stock_buy_limit_double_click(index.row())
+                            event.accept()
+                            return True
                         if not self.window._main_routine_initial_buy_badge_enabled():
                             return super().eventFilter(watched, event)
                         initial_buy_rect = self._stock_legacy_metric_rect(index, 1)
@@ -2356,13 +2393,6 @@ class _RoutineTreeInteractionController(QObject):
                             return True
                         if initial_buy_parts["value"].contains(event.pos()):
                             self.window.start_routine_stock_initial_buy_edit(index.row())
-                            event.accept()
-                            return True
-                        if limit_rect.contains(event.pos()):
-                            self.window.cancel_routine_stock_buy_limit_single_click(
-                                suppress_release_row=index.row(),
-                            )
-                            self.window.handle_routine_stock_buy_limit_double_click(index.row())
                             event.accept()
                             return True
                     return super().eventFilter(watched, event)
@@ -2506,6 +2536,33 @@ class _RoutineBuyLimitValueEditFilter(QObject):
             if event.type() == QEvent.FocusOut:
                 self.window.finish_routine_stock_initial_buy_edit(save=True)
         return super().eventFilter(watched, event)
+
+
+class _ClippedTextItemDelegate(QStyledItemDelegate):
+    """Clip overflowing text at the cell edge without drawing an ellipsis."""
+
+    def paint(self, painter, option, index) -> None:
+        clipped_option = QStyleOptionViewItem(option)
+        self.initStyleOption(clipped_option, index)
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        text = clipped_option.text
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText,
+            clipped_option,
+            option.widget,
+        )
+        clipped_option.text = ""
+        style.drawControl(QStyle.CE_ItemViewItem, clipped_option, painter, option.widget)
+        painter.save()
+        painter.setClipRect(text_rect, Qt.IntersectClip)
+        painter.setFont(option.font)
+        painter.setPen(
+            clipped_option.palette.highlightedText().color()
+            if option.state & QStyle.State_Selected
+            else clipped_option.palette.text().color()
+        )
+        painter.drawText(text_rect, int(clipped_option.displayAlignment), text)
+        painter.restore()
 
 
 class _RoutineTreeItemDelegate(QStyledItemDelegate):
@@ -2708,28 +2765,25 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         remainder_rect = text_rect.adjusted(code_width, 0, 0, 0)
                         painter.setFont(token_font)
                         painter.setPen(token_pen)
+                        painter.save()
+                        painter.setClipRect(remainder_rect, Qt.IntersectClip)
                         painter.drawText(
                             remainder_rect,
                             Qt.AlignLeft | Qt.AlignVCenter,
-                            painter.fontMetrics().elidedText(
-                                remainder,
-                                Qt.ElideRight,
-                                max(0, remainder_rect.width()),
-                            ),
+                            remainder,
                         )
+                        painter.restore()
                     else:
-                        elided = painter.fontMetrics().elidedText(
-                            text,
-                            Qt.ElideRight,
-                            max(0, text_rect.width()),
-                        )
                         painter.setFont(token_font)
                         painter.setPen(token_pen)
+                        painter.save()
+                        painter.setClipRect(text_rect, Qt.IntersectClip)
                         painter.drawText(
                             text_rect,
                             Qt.AlignLeft | Qt.AlignVCenter,
-                            elided,
+                            text,
                         )
+                        painter.restore()
                     continue
                 if column == 1:
                     initial_buy = index.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
@@ -2781,7 +2835,17 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                     painter.setFont(token_font)
                     painter.setPen(token_pen)
                     if column == 7:
-                        metric_texts = _routine_stock_metric_texts(list(values), tuple(metrics_data))
+                        metric_texts = _routine_stock_metric_texts(
+                            list(values),
+                            tuple(metrics_data),
+                            include_consumed=bool(
+                                getattr(
+                                    option.widget,
+                                    "_main_stock_limit_expanded",
+                                    False,
+                                )
+                            ),
+                        )
                         metric_foregrounds: list[QColor | None] = []
                         for metric_index in range(len(metric_texts)):
                             token_index = 7 + metric_index
@@ -3120,6 +3184,242 @@ def routine_dir_by_display_name() -> dict[str, Path]:
     return {routine_display_name(path): path for path in get_group_dirs()}
 
 
+class _MarketDataMonitoringWindow(QDialog):
+    """Read-only process-local Realtime and TR Governor diagnostics."""
+
+    REFRESH_INTERVAL_MS = 750
+    INITIAL_WIDTH = 620
+    INITIAL_HEIGHT = 680
+    MINIMUM_WIDTH = 550
+    MINIMUM_HEIGHT = 580
+    REALTIME_ROWS = (
+        ("price_signal", "가격신호"),
+        ("broker_connected", "Broker 연결"),
+        ("connection_epoch", "Connection Epoch"),
+        ("login_session_id", "Login Session"),
+        ("registration_active", "Realtime 등록"),
+        ("target_stock_count", "대상 종목"),
+        ("received_tick_count", "Tick 수신"),
+        ("processed_tick_count", "Tick 처리"),
+        ("tick_rate", "Tick/sec (관측)"),
+        ("queue", "Queue (현재 / 최대)"),
+        ("overflow_count", "Overflow"),
+        ("sequence", "Sequence (수신 / 처리)"),
+        ("latency", "처리 Latency (최근 / 최대)"),
+        ("data_quality", "Data Quality"),
+        ("last_received_at", "최근 Tick 수신"),
+        ("last_processed_at", "최근 Tick 처리"),
+    )
+    TR_ROWS = (
+        ("total_enqueued", "누적 Enqueue"),
+        ("total_dispatched", "누적 Dispatch"),
+        ("current_queue_depth", "현재 Queue"),
+        ("last_rqname", "최근 RQName"),
+        ("last_trcode", "최근 TRCode"),
+        ("last_dispatch_monotonic", "최근 Dispatch (monotonic ms)"),
+        ("dispatch_count_last_60s", "최근 60초 Dispatch"),
+        ("queue_wait", "Queue Wait (최근 / 최대)"),
+        ("timeout_count", "Timeout"),
+        ("stale_count", "Stale"),
+        ("error_count", "Error"),
+        ("last_error_reason", "최근 Error"),
+    )
+
+    def __init__(self, parent: QWidget, operation_host: object) -> None:
+        super().__init__(parent)
+        self._operation_host = operation_host
+        self._last_tick_rate_count: int | None = None
+        self._last_tick_rate_monotonic: float | None = None
+        self._value_labels: dict[str, QLabel] = {}
+        self._full_value_texts: dict[str, str] = {}
+        self._row_labels: dict[str, tuple[QLabel, QLabel]] = {}
+        self._row_minimum_height = self.fontMetrics().height() + 3
+        self.setObjectName("marketDataMonitoringWindow")
+        self.setWindowTitle("Realtime / TR 모니터링")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.addWidget(self._create_section("Realtime / 가격신호", self.REALTIME_ROWS))
+        root.addWidget(self._create_section("TR Governor", self.TR_ROWS))
+        compact_minimum_height = max(
+            self.MINIMUM_HEIGHT,
+            self.minimumSizeHint().height(),
+        )
+        self.setMinimumSize(self.MINIMUM_WIDTH, compact_minimum_height)
+        self.resize(
+            self.INITIAL_WIDTH,
+            max(self.INITIAL_HEIGHT, compact_minimum_height),
+        )
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(self.REFRESH_INTERVAL_MS)
+        self._refresh_timer.timeout.connect(self.refresh_snapshot)
+        self.refresh_snapshot()
+        self._refresh_timer.start()
+
+    def _create_section(
+        self,
+        title: str,
+        rows: tuple[tuple[str, str], ...],
+    ) -> QGroupBox:
+        box = QGroupBox(title)
+        layout = QGridLayout(box)
+        metrics = box.fontMetrics()
+        vertical_spacing = 0
+        layout.setContentsMargins(8, metrics.height(), 8, 4)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(vertical_spacing)
+        for row, (key, caption) in enumerate(rows):
+            caption_label = QLabel(caption)
+            value_label = QLabel("-")
+            caption_label.setMinimumHeight(self._row_minimum_height)
+            value_label.setMinimumHeight(self._row_minimum_height)
+            caption_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+            value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(caption_label, row, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(value_label, row, 1, Qt.AlignLeft | Qt.AlignVCenter)
+            self._value_labels[key] = value_label
+            self._row_labels[key] = (caption_label, value_label)
+        layout.setColumnStretch(1, 1)
+        return box
+
+    @staticmethod
+    def _display(value: object) -> str:
+        if value is None or str(value).strip() == "":
+            return "-"
+        return str(value)
+
+    def value_text(self, key: str) -> str:
+        label = self._value_labels.get(str(key))
+        return label.text() if label is not None else ""
+
+    def _set_value(self, key: str, value: object) -> None:
+        label = self._value_labels.get(key)
+        if label is not None:
+            self._full_value_texts[key] = self._display(value)
+            self._update_compact_value_label(key)
+
+    def _update_compact_value_label(self, key: str) -> None:
+        label = self._value_labels.get(key)
+        if label is None:
+            return
+        full_text = self._full_value_texts.get(key, "-")
+        available_width = max(0, label.contentsRect().width())
+        visible_text = label.fontMetrics().elidedText(
+            full_text,
+            Qt.ElideRight,
+            available_width,
+        )
+        label.setText(visible_text)
+        label.setToolTip(full_text if visible_text != full_text else "")
+
+    def _refresh_compact_value_labels(self) -> None:
+        for key in self._value_labels:
+            self._update_compact_value_label(key)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_compact_value_labels()
+
+    def refresh_snapshot(self, now_monotonic: float | None = None) -> None:
+        now = monotonic() if now_monotonic is None else float(now_monotonic)
+        market_getter = getattr(
+            self._operation_host,
+            "high_resolution_market_data_snapshot",
+            None,
+        )
+        tr_getter = getattr(
+            self._operation_host,
+            "tr_governor_metrics_snapshot",
+            None,
+        )
+        gate_getter = getattr(
+            self._operation_host,
+            "price_signal_observation_enabled",
+            None,
+        )
+        try:
+            market = market_getter() if callable(market_getter) else None
+        except Exception:
+            market = None
+        try:
+            tr_metrics = tr_getter() if callable(tr_getter) else None
+        except Exception:
+            tr_metrics = None
+        try:
+            gate_enabled = bool(gate_getter()) if callable(gate_getter) else False
+        except Exception:
+            gate_enabled = False
+
+        self._set_value("price_signal", "ON" if gate_enabled else "OFF")
+        received_count = int(getattr(market, "received_tick_count", 0) or 0)
+        tick_rate = "-"
+        if (
+            self._last_tick_rate_count is not None
+            and self._last_tick_rate_monotonic is not None
+        ):
+            elapsed = now - self._last_tick_rate_monotonic
+            if elapsed > 0:
+                delta = max(0, received_count - self._last_tick_rate_count)
+                tick_rate = f"{delta / elapsed:.1f}"
+        self._last_tick_rate_count = received_count
+        self._last_tick_rate_monotonic = now
+
+        self._set_value("broker_connected", "연결" if bool(getattr(market, "broker_connected", False)) else "미연결")
+        self._set_value("connection_epoch", getattr(market, "connection_epoch", None))
+        self._set_value("login_session_id", getattr(market, "login_session_id", None))
+        self._set_value("registration_active", "활성" if bool(getattr(market, "realtime_registration_active", False)) else "비활성")
+        self._set_value("target_stock_count", getattr(market, "realtime_target_stock_count", None))
+        self._set_value("received_tick_count", received_count)
+        self._set_value("processed_tick_count", getattr(market, "processed_tick_count", None))
+        self._set_value("tick_rate", tick_rate)
+        self._set_value(
+            "queue",
+            f"{int(getattr(market, 'current_queue_depth', 0) or 0)} / "
+            f"{int(getattr(market, 'queue_high_watermark', 0) or 0)}",
+        )
+        self._set_value("overflow_count", getattr(market, "overflow_count", None))
+        self._set_value(
+            "sequence",
+            f"{int(getattr(market, 'last_receive_sequence', 0) or 0)} / "
+            f"{int(getattr(market, 'last_processed_sequence', 0) or 0)}",
+        )
+        self._set_value(
+            "latency",
+            f"{float(getattr(market, 'last_processing_latency_ms', 0.0) or 0.0):.3f} ms / "
+            f"{float(getattr(market, 'max_processing_latency_ms', 0.0) or 0.0):.3f} ms",
+        )
+        self._set_value("data_quality", getattr(market, "data_quality", None))
+        self._set_value("last_received_at", getattr(market, "last_tick_received_at", None))
+        self._set_value("last_processed_at", getattr(market, "last_tick_processed_at", None))
+
+        for key in (
+            "total_enqueued",
+            "total_dispatched",
+            "current_queue_depth",
+            "last_rqname",
+            "last_trcode",
+            "last_dispatch_monotonic",
+            "dispatch_count_last_60s",
+            "timeout_count",
+            "stale_count",
+            "error_count",
+            "last_error_reason",
+        ):
+            self._set_value(key, getattr(tr_metrics, key, None))
+        self._set_value(
+            "queue_wait",
+            f"{float(getattr(tr_metrics, 'last_queue_wait_ms', 0.0) or 0.0):.3f} ms / "
+            f"{float(getattr(tr_metrics, 'max_queue_wait_ms', 0.0) or 0.0):.3f} ms",
+        )
+
+    def closeEvent(self, event) -> None:
+        self._refresh_timer.stop()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     """
     키움 자동매매 시스템 메인 윈도우
@@ -3129,8 +3429,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("키움 OpenAPI 자동매매 시스템 - v1.1 Windows GUI")
-        self.resize(2137, 720)
         self.setMinimumWidth(1680)
+        self.resize(self.minimumWidth(), 720)
         try:
             self.kiwoom_api = KiwoomApi(parent=self)
         except Exception as exc:
@@ -3153,6 +3453,11 @@ class MainWindow(QMainWindow):
                 authentication_required.connect(
                     self.on_kiwoom_account_authentication_required
                 )
+        self.stock_library_sync_service = (
+            KiwoomStockLibrarySyncService(self.kiwoom_api, parent=self)
+            if self.kiwoom_api is not None
+            else None
+        )
 
         self.login_status_label = QLabel("로그인 상태: 미연결")
         self.btn_kiwoom_login = QPushButton("키움 로그인")
@@ -3351,14 +3656,34 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
         self.btn_review_required = QPushButton("검토관리(0)")
+        self.btn_price_signal_observation = QPushButton("가격신호 OFF")
+        self.btn_market_data_monitoring = QPushButton("모니터링")
         self.btn_group_pack_register = QPushButton("그룹등록")
         self.btn_main_visible_early_close = QPushButton("조기마감")
         self.btn_exit = QPushButton("종료")
         self.btn_emergency_stop = _DoubleClickActionButton("긴급정지")
 
         self._setup_ui()
+        self._apply_main_control_window_width()
         self._connect_events()
         operation_host = self.main_monitoring_auto_trade_operation_host()
+        self._pending_main_market_information_codes: set[str] = set()
+        self._main_market_information_refresh_timer = QTimer(self)
+        self._main_market_information_refresh_timer.setSingleShot(True)
+        self._main_market_information_refresh_timer.setInterval(
+            MAIN_MARKET_INFORMATION_REFRESH_INTERVAL_MS
+        )
+        self._main_market_information_refresh_timer.timeout.connect(
+            self._refresh_main_market_information_rows
+        )
+        market_host_getter = getattr(operation_host, "market_data_host", None)
+        market_host = market_host_getter() if callable(market_host_getter) else None
+        market_data_observed = getattr(market_host, "market_data_observed", None)
+        if market_data_observed is not None and callable(
+            getattr(market_data_observed, "connect", None)
+        ):
+            market_data_observed.connect(self._on_main_market_data_observed)
+        self._update_main_price_signal_observation_button()
         operation_host.operation_cycle_completed.connect(
             self._on_main_operation_cycle_completed
         )
@@ -3431,6 +3756,7 @@ class MainWindow(QMainWindow):
 
         central.setLayout(main_layout)
         self.setCentralWidget(central)
+        self._main_dashboard_layout = main_layout
         self._apply_main_dashboard_style(central)
 
         self.statusBar().showMessage("준비 완료")
@@ -4138,6 +4464,16 @@ class MainWindow(QMainWindow):
             MainWindow._update_main_routine_filter_badges(self)
         MainWindow._style_main_top_action_buttons(self)
         routine_header_layout.addWidget(
+            self.btn_price_signal_observation,
+            0,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
+        routine_header_layout.addWidget(
+            self.btn_market_data_monitoring,
+            0,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
+        routine_header_layout.addWidget(
             self.btn_group_pack_register,
             0,
             Qt.AlignRight | Qt.AlignVCenter,
@@ -4152,6 +4488,10 @@ class MainWindow(QMainWindow):
         routine_content_layout.addWidget(self.routine_table, 1)
         routine_layout.addLayout(routine_content_layout)
         routine_box.setLayout(routine_layout)
+        self._main_table_area_layout = layout
+        self._main_routine_layout = routine_layout
+        self._main_routine_content_layout = routine_content_layout
+        self._main_routine_filter_badge_area = routine_filter_badge_area
 
         self._setup_running_stock_table()
         self.running_stock_table.setVisible(False)
@@ -4160,9 +4500,70 @@ class MainWindow(QMainWindow):
 
         return layout
 
+    @staticmethod
+    def _layout_horizontal_margins(layout) -> int:
+        margins = layout.contentsMargins()
+        return int(margins.left()) + int(margins.right())
+
+    def _main_control_window_required_width(self) -> int:
+        table = self.routine_table
+        font = table.font()
+        metrics = QFontMetrics(font)
+        column_widths = routine_stock_column_widths(font)
+        base_column_count = 7
+        base_metric_left = (
+            ROUTINE_STOCK_TEXT_OFFSET
+            + sum(column_widths[:base_column_count])
+            + routine_instance_separator_width(font) * (base_column_count - 1)
+        )
+        metric_slot_widths = _main_stock_metric_slot_widths(metrics)
+        metric_separator_width = max(1, metrics.horizontalAdvance("|"))
+        row_content_width = (
+            base_metric_left
+            + ROUTINE_STOCK_METRIC_SEPARATOR_GAP
+            + sum(metric_slot_widths)
+            + max(0, len(metric_slot_widths) - 1)
+            * (
+                ROUTINE_STOCK_METRIC_SEPARATOR_GAP * 2
+                + metric_separator_width
+            )
+        )
+        scrollbar_extent = max(
+            table.verticalScrollBar().sizeHint().width(),
+            table.style().pixelMetric(QStyle.PM_ScrollBarExtent, None, table),
+        )
+        row_right_margin = (
+            metrics.horizontalAdvance("0")
+            + metrics.horizontalAdvance("한")
+        )
+        table_width = (
+            row_content_width
+            + row_right_margin
+            + (table.frameWidth() * 2)
+            + scrollbar_extent
+        )
+        required_width = (
+            table_width
+            + self._main_routine_filter_badge_area.width()
+            + self._main_routine_content_layout.spacing()
+            + self._layout_horizontal_margins(self._main_routine_content_layout)
+            + self._layout_horizontal_margins(self._main_routine_layout)
+            + self._layout_horizontal_margins(self._main_table_area_layout)
+            + self._layout_horizontal_margins(self._main_dashboard_layout)
+        )
+        return max(int(self.minimumWidth()), int(required_width))
+
+    def _apply_main_control_window_width(self) -> None:
+        self.resize(self._main_control_window_required_width(), self.height())
+
     def _style_main_top_action_buttons(self) -> None:
         reference_button = getattr(self, "_main_routine_valid_button", None)
         for button, object_name in (
+            (
+                self.btn_price_signal_observation,
+                "mainPriceSignalObservationButton",
+            ),
+            (self.btn_market_data_monitoring, "mainMarketDataMonitoringButton"),
             (self.btn_group_pack_register, "mainGroupPackRegisterButton"),
             (self.btn_main_visible_early_close, "mainVisibleEarlyCloseButton"),
         ):
@@ -4897,6 +5298,22 @@ class MainWindow(QMainWindow):
         self.btn_exit.setObjectName("secondaryButton")
         return layout
 
+    def _main_stock_live_tooltip(self, index, fallback_text: str) -> str:
+        projection = index.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
+        if not isinstance(projection, dict):
+            return fallback_text
+        code = str(projection.get("stock_code", "") or "").strip()
+        host = self.main_monitoring_auto_trade_operation_host()
+        market_information = getattr(
+            host,
+            "monitoring_market_information_state",
+            None,
+        )
+        if not callable(market_information):
+            market_information = getattr(host, "high_resolution_market_state", None)
+        live_state = market_information(code) if code and callable(market_information) else None
+        return main_stock_row_tooltip_from_projection(projection, live_state)
+
     def _setup_routine_table(self) -> None:
         headers = list(ROUTINE_MONITORING_HEADERS)
 
@@ -4934,6 +5351,19 @@ class MainWindow(QMainWindow):
         self.routine_table._hovered_main_group_id = ""
         self._routine_tree_item_delegate = _RoutineTreeItemDelegate(self.routine_table)
         self.routine_table.setItemDelegateForColumn(0, self._routine_tree_item_delegate)
+        self._routine_stock_name_tooltip_filter = install_persistent_stock_name_tooltips(
+            self.routine_table,
+            {0},
+            accept_index=lambda index: str(
+                index.data(ROUTINE_ROW_KIND_ROLE) or ""
+            ) == ROUTINE_ROW_STOCK,
+            accept_position=lambda index, pos: (
+                _routine_stock_code_rect(self.routine_table, index).contains(pos)
+                or _routine_stock_name_rect(self.routine_table, index).contains(pos)
+            ),
+            tooltip_point_size=(self.routine_table.font().pointSizeF() * 1.1),
+            tooltip_resolver=self._main_stock_live_tooltip,
+        )
 
     def _apply_main_routine_table_height(
         self,
@@ -5015,6 +5445,20 @@ class MainWindow(QMainWindow):
         self.running_stock_table.setColumnWidth(7, 90)
         self.running_stock_table.setColumnWidth(8, 65)
         self.running_stock_table.setColumnWidth(9, 65)
+        self._running_stock_name_clip_delegate = _ClippedTextItemDelegate(
+            self.running_stock_table
+        )
+        self.running_stock_table.setItemDelegateForColumn(
+            1,
+            self._running_stock_name_clip_delegate,
+        )
+        self._running_stock_name_tooltip_filter = install_persistent_stock_name_tooltips(
+            self.running_stock_table,
+            {0, 1},
+            source_column=1,
+            tooltip_point_size=(self.running_stock_table.font().pointSizeF() * 1.1),
+            tooltip_resolver=self._main_stock_live_tooltip,
+        )
         self.running_stock_table.horizontalHeader().setSectionsClickable(True)
         self.running_stock_table.horizontalHeader().setSortIndicatorShown(True)
         self.running_stock_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -5171,6 +5615,12 @@ class MainWindow(QMainWindow):
         self.btn_emergency_stop.doubleClicked.connect(self.on_emergency_stop_clicked)
         self.btn_start.clicked.connect(self.start_global_auto_trades)
         self.btn_auto_trade_setting.clicked.connect(self.open_auto_trade_setting_window)
+        self.btn_price_signal_observation.clicked.connect(
+            self.toggle_price_signal_observation
+        )
+        self.btn_market_data_monitoring.clicked.connect(
+            self.open_market_data_monitoring_window
+        )
         self.btn_group_pack_register.clicked.connect(self.register_group_pack_from_file)
         self.btn_main_visible_early_close.clicked.connect(
             self.request_visible_monitoring_early_close
@@ -5338,6 +5788,112 @@ class MainWindow(QMainWindow):
             reconcile_main_window_buffer_response_cycle(self)
         )
         self.refresh_auto_trade_assignment_views()
+
+    def _on_main_market_data_observed(self, payload: object) -> None:
+        if getattr(self, "_main_window_closing", False) or not isinstance(payload, dict):
+            return
+        code = str(payload.get("stock_code", "") or "").strip().upper().lstrip("A")
+        if not code:
+            return
+        self._pending_main_market_information_codes.add(code)
+        if not self._main_market_information_refresh_timer.isActive():
+            self._main_market_information_refresh_timer.start()
+
+    def _refresh_main_market_information_rows(self) -> int:
+        stock_codes = tuple(self._pending_main_market_information_codes)
+        self._pending_main_market_information_codes.clear()
+        MainWindow._promote_waiting_stock_buy_limits(self, stock_codes)
+        return main_refresh_market_information_only(self, stock_codes)
+
+    def _promote_waiting_stock_buy_limits(
+        self,
+        stock_codes: tuple[str, ...],
+    ) -> int:
+        targets = {
+            str(code or "").strip().upper().lstrip("A")
+            for code in stock_codes
+            if str(code or "").strip()
+        }
+        if not targets:
+            return 0
+        promoted = 0
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            if item is None or item.data(ROUTINE_ROW_KIND_ROLE) != ROUTINE_ROW_STOCK:
+                continue
+            code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip().upper().lstrip("A")
+            if code not in targets:
+                continue
+            config_path = MainWindow._stock_config_path_for_routine_row(self, row)
+            if config_path is None:
+                continue
+            config = read_json_dict(config_path)
+            if not isinstance(config, dict):
+                config = {}
+            limit_state = stock_buy_limit_state(
+                enabled=bool(config.get("buy_limit_enabled", False)),
+                amount=config.get("buy_limit_amount"),
+            )
+            if limit_state not in {"WAITING", "CONFIGURED"}:
+                continue
+            if normalized_stock_buy_limit_source(config) != BUY_LIMIT_SOURCE_RECOMMENDED:
+                continue
+            session_key = MainWindow._stock_recommended_limit_session_key(
+                self,
+                config_path,
+            )
+            if session_key is None:
+                continue
+            refreshed_sessions = getattr(
+                self,
+                "_main_stock_recommended_limit_refreshed_sessions",
+                None,
+            )
+            if not isinstance(refreshed_sessions, set):
+                refreshed_sessions = set()
+                setattr(
+                    self,
+                    "_main_stock_recommended_limit_refreshed_sessions",
+                    refreshed_sessions,
+                )
+            if session_key in refreshed_sessions:
+                continue
+            recommended = MainWindow._stock_suggested_buy_limit(
+                config_path,
+                window=self,
+            )
+            if recommended is None or recommended <= 0:
+                continue
+            total_budget = _system_total_budget_amount()
+            if total_budget is not None and recommended > total_budget:
+                try:
+                    MainWindow._write_stock_buy_limit_config(
+                        config_path,
+                        enabled=False,
+                        amount=None,
+                        source=None,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                refreshed_sessions.add(session_key)
+                promoted += 1
+                continue
+            if (
+                config.get("buy_limit_amount") != recommended
+                or config.get("buy_limit_source") != BUY_LIMIT_SOURCE_RECOMMENDED
+            ):
+                try:
+                    MainWindow._write_stock_buy_limit_config(
+                        config_path,
+                        enabled=True,
+                        amount=recommended,
+                        source=BUY_LIMIT_SOURCE_RECOMMENDED,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                promoted += 1
+            refreshed_sessions.add(session_key)
+        return promoted
 
     def _production_recovery_status_result(self) -> dict[str, object]:
         context = production_recovery_registry.snapshot()
@@ -5891,6 +6447,19 @@ class MainWindow(QMainWindow):
             caller_name=caller_name,
         )
 
+    def global_operation_start_prerequisite(self, action_name: str) -> dict[str, object]:
+        if self.startup_recovery_session_ready(refresh=True):
+            return {"allowed": True, "reason": "GLOBAL_PREREQUISITE_READY"}
+        decision = self.production_recovery_gate_for_stock(
+            "__GLOBAL_OPERATION_START__",
+            caller_name=f"{str(action_name or '운영시작').strip()}_GLOBAL_PREREQUISITE",
+        )
+        return {
+            "allowed": False,
+            "reason": str(getattr(decision, "reason_code", "") or "RECOVERY_NOT_READY"),
+            "user_message": self.production_recovery_block_user_message(decision),
+        }
+
     def production_recovery_stock_is_review_required(self, stock_code: str) -> bool:
         return recovery_stock_is_review_required(stock_code)
 
@@ -6307,7 +6876,7 @@ class MainWindow(QMainWindow):
             return
 
         status = str(result.get("status", ""))
-        if status == "login_requested":
+        if status in {"login_requested", "login_in_progress"}:
             message = "로그인 요청됨"
             self._apply_kiwoom_login_button_state("LOGIN_IN_PROGRESS")
         elif result.get("connected"):
@@ -6333,6 +6902,15 @@ class MainWindow(QMainWindow):
             getattr(self, "_event_journal_kiwoom_connected", False)
         )
         message = str(state.get("message", "") or "")
+        login_identity = (
+            int(state.get("connection_epoch", 0) or 0),
+            str(state.get("login_session_id", "") or "").strip(),
+        )
+        new_authenticated_session = bool(
+            connected
+            and login_identity[1]
+            and getattr(self, "_handled_kiwoom_login_identity", None) != login_identity
+        )
         if connected:
             label_text = "로그인 상태: 연결됨"
             status_message = message or label_text
@@ -6346,8 +6924,11 @@ class MainWindow(QMainWindow):
         self.refresh_kiwoom_accounts()
         self.sync_account_funds_selection(connected=connected)
         if connected:
-            self.request_account_funds()
-            self.start_production_recovery()
+            if new_authenticated_session:
+                self.main_monitoring_auto_trade_operation_host().sync_monitoring_universe_for_current_session()
+                self.request_account_funds()
+                self.start_production_recovery()
+                QTimer.singleShot(0, self.start_stock_library_sync_for_current_session)
         else:
             MainWindow._clear_completed_recovery_handoff(self)
             self._account_authentication_states.clear()
@@ -6357,6 +6938,7 @@ class MainWindow(QMainWindow):
             self._production_recovery_identity = None
             self._production_recovery_parts = {}
             self._production_recovery_status_result()
+            self._handled_kiwoom_login_identity = None
         if connected and not previously_connected:
             append_production_event(
                 "LOGIN_SUCCEEDED",
@@ -6379,7 +6961,20 @@ class MainWindow(QMainWindow):
                 reason_code="LOGIN_STATE_DISCONNECTED",
             )
         self._event_journal_kiwoom_connected = connected
+        if new_authenticated_session:
+            self._handled_kiwoom_login_identity = login_identity
         self.statusBar().showMessage(status_message)
+
+    def start_stock_library_sync_for_current_session(self) -> bool:
+        service = getattr(self, "stock_library_sync_service", None)
+        start = getattr(service, "start_for_current_session", None)
+        if not callable(start):
+            return False
+        try:
+            return bool(start())
+        except Exception:
+            LOGGER.exception("Failed to schedule Kiwoom Stock Library sync")
+            return False
 
     def on_kiwoom_account_changed(self, _account_no: str = "") -> None:
         MainWindow._clear_completed_recovery_handoff(self)
@@ -7174,6 +7769,7 @@ class MainWindow(QMainWindow):
 
     def refresh_auto_trade_assignment_views(self) -> None:
         """Refresh monitoring and an already-open auto-trade settings window once."""
+        self.main_monitoring_auto_trade_operation_host().sync_monitoring_universe_for_current_session()
         self.refresh_all()
         window = getattr(self, "auto_trade_setting_window", None)
         if window is None:
@@ -7542,6 +8138,15 @@ class MainWindow(QMainWindow):
 
     def load_routine_table(self) -> None:
         main_load_routine_table(self)
+        stock_codes = tuple(
+            str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
+            for row in range(self.routine_table.rowCount())
+            for item in (self.routine_table.item(row, 0),)
+            if item is not None
+            and item.data(ROUTINE_ROW_KIND_ROLE) == ROUTINE_ROW_STOCK
+        )
+        if MainWindow._promote_waiting_stock_buy_limits(self, stock_codes):
+            main_refresh_market_information_only(self, stock_codes)
         self._install_routine_buy_limit_edit_filters()
 
     def load_running_stock_table(self) -> None:
@@ -7827,17 +8432,97 @@ class MainWindow(QMainWindow):
         *,
         enabled: bool,
         amount: int | None = None,
+        source: str | None = None,
     ) -> None:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
-        config["buy_limit_enabled"] = bool(enabled)
-        config["buy_limit_amount"] = int(amount) if enabled and amount is not None else None
+        enabled_value, amount_value, source_value = canonical_stock_buy_limit_values(
+            enabled=enabled,
+            amount=amount,
+            source=source,
+        )
+        config["buy_limit_enabled"] = enabled_value
+        config["buy_limit_amount"] = amount_value
+        config["buy_limit_source"] = source_value
         config["updated_at"] = stock_now_text()
         config_path.write_text(
             json.dumps(config, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        saved = read_json_dict(config_path)
+        if (
+            bool(saved.get("buy_limit_enabled", False)) != enabled_value
+            or saved.get("buy_limit_amount") != amount_value
+            or saved.get("buy_limit_source") != source_value
+        ):
+            raise RuntimeError("stock buy limit read-back verification failed")
+
+    def _recalculate_recommended_stock_buy_limits_for_starting_budget_change(
+        self,
+    ) -> int:
+        cache = getattr(self, "_main_stock_resolved_starting_budget_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+        changed = 0
+        total_budget = _system_total_budget_amount()
+        for stock in StockRepository(PROJECT_ROOT).list_current_registered_stocks():
+            config_path = PROJECT_ROOT / stock.stock_path / "config.json"
+            config = read_json_dict(config_path)
+            if not isinstance(config, dict) or not bool(
+                config.get("buy_limit_enabled", False)
+            ):
+                continue
+            if normalized_stock_buy_limit_source(config) != BUY_LIMIT_SOURCE_RECOMMENDED:
+                continue
+            recommended = self._stock_suggested_buy_limit(
+                config_path,
+                window=self,
+            )
+            if (
+                recommended is not None
+                and total_budget is not None
+                and recommended > total_budget
+            ):
+                try:
+                    self._write_stock_buy_limit_config(
+                        config_path,
+                        enabled=False,
+                        amount=None,
+                        source=None,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                changed += 1
+                continue
+            if recommended is not None and (
+                recommended <= 0
+                or total_budget is None
+                or recommended > total_budget
+            ):
+                continue
+            next_amount = int(recommended) if recommended is not None else None
+            session_key = MainWindow._stock_recommended_limit_session_key(
+                self,
+                config_path,
+            )
+            if config.get("buy_limit_amount") == next_amount and config.get(
+                "buy_limit_source"
+            ) == BUY_LIMIT_SOURCE_RECOMMENDED:
+                MainWindow._mark_stock_recommended_limit_session(self, session_key)
+                continue
+            try:
+                self._write_stock_buy_limit_config(
+                    config_path,
+                    enabled=True,
+                    amount=next_amount,
+                    source=BUY_LIMIT_SOURCE_RECOMMENDED,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            MainWindow._mark_stock_recommended_limit_session(self, session_key)
+            changed += 1
+        return changed
 
     @staticmethod
     def _write_stock_initial_buy_config(
@@ -7871,18 +8556,79 @@ class MainWindow(QMainWindow):
         return PROJECT_ROOT / stock_path / "config.json"
 
     @staticmethod
-    def _stock_current_price_for_config(config_path: Path) -> float | None:
-        state = read_json_dict(config_path.parent / "state.json")
-        return current_price_from_state(state if isinstance(state, dict) else {})
+    def _stock_projection_for_config_path(config_path: Path) -> dict[str, object]:
+        target_path = Path(config_path)
+        try:
+            stock_path = str(target_path.parent.relative_to(PROJECT_ROOT))
+        except ValueError:
+            stock_path = str(target_path.parent)
+        return {
+            "stock_path": stock_path,
+            "code": target_path.parent.name.partition("_")[0].strip(),
+            "name": target_path.parent.name.partition("_")[2].strip(),
+        }
 
     @staticmethod
-    def _stock_default_initial_buy_value(config_path: Path, mode: str) -> int:
+    def _stock_recommended_limit_session_key(
+        window,
+        config_path: Path,
+    ) -> tuple[str, int, str] | None:
+        projection = MainWindow._stock_projection_for_config_path(config_path)
+        fresh_state = main_stock_fresh_market_information_state(window, projection)
+        if fresh_state is None:
+            return None
+        return (
+            str(projection.get("stock_path", "") or ""),
+            int(getattr(fresh_state, "connection_epoch", 0) or 0),
+            str(getattr(fresh_state, "login_session_id", "") or "").strip(),
+        )
+
+    @staticmethod
+    def _mark_stock_recommended_limit_session(
+        window,
+        session_key: tuple[str, int, str] | None,
+    ) -> None:
+        if session_key is None:
+            return
+        refreshed_sessions = getattr(
+            window,
+            "_main_stock_recommended_limit_refreshed_sessions",
+            None,
+        )
+        if not isinstance(refreshed_sessions, set):
+            refreshed_sessions = set()
+            setattr(
+                window,
+                "_main_stock_recommended_limit_refreshed_sessions",
+                refreshed_sessions,
+            )
+        refreshed_sessions.add(session_key)
+
+    @staticmethod
+    def _stock_default_initial_buy_value(
+        config_path: Path,
+        mode: str,
+        *,
+        window=None,
+    ) -> int:
         defaults = starting_budget_defaults()
         if mode == "QUANTITY":
             return int(defaults["quantity"])
-        amount = effective_amount_starting_budget(
-            MainWindow._stock_current_price_for_config(config_path),
-            defaults["amount_multiplier"],
+        if window is None:
+            return 0
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        config = {
+            **config,
+            "trade_amount_type": "AMOUNT",
+            "buy_amount": 0,
+        }
+        amount = main_stock_resolved_starting_budget(
+            window,
+            MainWindow._stock_projection_for_config_path(config_path),
+            config,
+            policy={"starting_budget_defaults": defaults},
         )
         return int(amount or 0)
 
@@ -7898,23 +8644,21 @@ class MainWindow(QMainWindow):
         multiplier_key = (
             "limit_minimum_multiplier" if minimum else "limit_recommended_multiplier"
         )
-        reference_price = MainWindow._stock_current_price_for_config(target_path)
-        if window is not None:
-            try:
-                stock_path = str(target_path.parent.relative_to(PROJECT_ROOT))
-            except ValueError:
-                stock_path = str(target_path.parent)
-            try:
-                reference_price = main_stock_default_reference_price(
-                    window,
-                    {"stock_path": stock_path},
-                    reference_price,
-                )
-            except RuntimeError:
-                pass
+        config = read_json_dict(target_path)
+        if not isinstance(config, dict):
+            return None
+        if window is None:
+            return None
+        starting_budget = main_stock_resolved_starting_budget(
+            window,
+            MainWindow._stock_projection_for_config_path(target_path),
+            config,
+            policy={"starting_budget_defaults": defaults},
+        )
         return suggested_buy_limit(
-            reference_price,
+            starting_budget,
             defaults[multiplier_key],
+            align_digits=stock_limit_digit_alignment_enabled(),
         )
 
     def handle_routine_stock_operation_double_click(self, row: int) -> bool:
@@ -8073,7 +8817,11 @@ class MainWindow(QMainWindow):
             config = {}
         current_mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
         next_mode = "QUANTITY" if current_mode == "AMOUNT" else "AMOUNT"
-        next_value = self._stock_default_initial_buy_value(config_path, next_mode)
+        next_value = self._stock_default_initial_buy_value(
+            config_path,
+            next_mode,
+            window=self,
+        )
         self._write_stock_initial_buy_config(
             config_path,
             mode=next_mode,
@@ -8107,7 +8855,11 @@ class MainWindow(QMainWindow):
         value_text = str(
             configured_value
             if configured_value > 0
-            else self._stock_default_initial_buy_value(config_path, mode)
+            else self._stock_default_initial_buy_value(
+                config_path,
+                mode,
+                window=self,
+            )
         )
 
         self.finish_routine_stock_initial_buy_edit(save=True)
@@ -8151,13 +8903,62 @@ class MainWindow(QMainWindow):
         editor.deleteLater()
         self._routine_stock_initial_buy_edit_finishing = False
 
-        if not save or value is None:
+        if not save:
+            self.routine_table.viewport().update()
+            return
+        if mode == "QUANTITY" and value is None:
             self.routine_table.viewport().update()
             return
         if mode == "QUANTITY" and value < 1:
             self.routine_table.viewport().update()
             return
         config_path = Path(config_path_text)
+
+        if mode == "AMOUNT":
+            current_config = read_json_dict(config_path)
+            if not isinstance(current_config, dict):
+                current_config = {}
+            try:
+                previous_amount = int(current_config.get("buy_amount") or 0)
+            except (TypeError, ValueError):
+                previous_amount = 0
+            previous_amount = previous_amount if previous_amount > 0 else 0
+            default_amount = self._stock_default_initial_buy_value(
+                config_path,
+                "AMOUNT",
+                window=self,
+            )
+            default_amount = default_amount if default_amount > 0 else None
+
+            invalid = value is None or value <= 0 or (
+                default_amount is not None and value < default_amount
+            )
+            if invalid:
+                if default_amount is None:
+                    message = "시작예산 금액을 확인하세요."
+                else:
+                    message = (
+                        "시작예산은 현재 기본금액 "
+                        f"{default_amount:,}원 이상이어야 합니다."
+                    )
+                show_toast(self, message, duration_ms=2500)
+
+                # Keep a still-valid explicit amount.  If the setting changed
+                # underneath the editor and made it invalid, clear the
+                # override so the canonical Fresh/Default path is restored.
+                if (
+                    default_amount is not None
+                    and previous_amount > 0
+                    and previous_amount < default_amount
+                ):
+                    self._write_stock_initial_buy_config(
+                        config_path,
+                        mode="AMOUNT",
+                        value=0,
+                    )
+                self.load_routine_table()
+                return
+
         self._write_stock_initial_buy_config(
             config_path,
             mode=mode,
@@ -8195,11 +8996,12 @@ class MainWindow(QMainWindow):
         if config_path is None:
             return
         config = read_json_dict(config_path)
-        if not isinstance(config, dict) or not bool(
-            config.get("buy_limit_enabled", False)
-        ):
-            return
-        if self._stock_current_price_for_config(config_path) is None:
+        if not isinstance(config, dict):
+            config = {}
+        if stock_buy_limit_state(
+            enabled=bool(config.get("buy_limit_enabled", False)),
+            amount=config.get("buy_limit_amount"),
+        ) != "CONFIGURED":
             return
         item = self.routine_table.item(row, 0)
         stock_path = (
@@ -8243,7 +9045,12 @@ class MainWindow(QMainWindow):
                 self.start_routine_stock_buy_limit_edit(row)
                 return
 
-    def start_routine_stock_buy_limit_edit(self, row: int) -> None:
+    def start_routine_stock_buy_limit_edit(
+        self,
+        row: int,
+        *,
+        use_suggested_amount: bool = True,
+    ) -> None:
         item = self.routine_table.item(row, 0)
         stock_path = (
             str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
@@ -8256,9 +9063,6 @@ class MainWindow(QMainWindow):
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
-        if self._stock_current_price_for_config(config_path) is None:
-            return
-
         self.finish_routine_instance_buy_limit_edit(save=True)
         self.finish_routine_stock_buy_limit_edit(save=True)
 
@@ -8285,10 +9089,12 @@ class MainWindow(QMainWindow):
         configured_amount = self._parse_buy_limit_amount(
             str(config.get("buy_limit_amount") or "")
         )
-        suggested_amount = self._stock_suggested_buy_limit(
-            config_path,
-            window=self,
-        )
+        suggested_amount = None
+        if use_suggested_amount:
+            suggested_amount = self._stock_suggested_buy_limit(
+                config_path,
+                window=self,
+            )
         editor.setText(str(configured_amount or suggested_amount or ""))
         editor.setGeometry(editor_rect)
         editor.installEventFilter(self._routine_buy_limit_edit_filter)
@@ -8310,97 +9116,165 @@ class MainWindow(QMainWindow):
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
-        enabled = bool(config.get("buy_limit_enabled", False))
+        limit_state = stock_buy_limit_state(
+            enabled=bool(config.get("buy_limit_enabled", False)),
+            amount=config.get("buy_limit_amount"),
+        )
 
         self.finish_routine_instance_buy_limit_edit(save=True)
         self.finish_routine_stock_buy_limit_edit(save=False)
 
-        if enabled:
+        if limit_state in {"WAITING", "CONFIGURED"}:
             self._write_stock_buy_limit_config(
                 config_path,
                 enabled=False,
                 amount=None,
+                source=None,
             )
-        else:
-            recommended = self._stock_suggested_buy_limit(
-                config_path,
-                window=self,
-            )
-            total_budget = _system_total_budget_amount()
-            activate_limit = True
-            if (
-                recommended is not None
-                and total_budget is not None
-                and recommended > total_budget
-            ):
-                activate_limit = False
-                recommended = None
-            elif total_budget is None:
-                recommended = None
+            self.load_routine_table()
+            return
+
+        recommended = self._stock_suggested_buy_limit(
+            config_path,
+            window=self,
+        )
+        if recommended is None:
             self._write_stock_buy_limit_config(
                 config_path,
-                enabled=activate_limit,
-                amount=recommended,
+                enabled=True,
+                amount=None,
+                source=BUY_LIMIT_SOURCE_RECOMMENDED,
             )
-        self.load_routine_table()
-
-    def finish_routine_stock_buy_limit_edit(self, *, save: bool) -> None:
-        editor = self._routine_stock_buy_limit_editor
-        if editor is None or self._routine_stock_buy_limit_edit_finishing:
+            self.load_routine_table()
             return
-        self._routine_stock_buy_limit_edit_finishing = True
-        config_path_text = self._routine_stock_buy_limit_editor_config_path
-        amount = self._parse_buy_limit_amount(editor.text()) if save else None
-
-        self._routine_stock_buy_limit_editor = None
-        self._routine_stock_buy_limit_editor_config_path = ""
-        self.routine_table._editing_stock_buy_limit_path = ""
-        editor.hide()
-        editor.deleteLater()
-        self._routine_stock_buy_limit_edit_finishing = False
-        self.routine_table.viewport().update()
-
-        if not save:
-            return
-        config_path = Path(config_path_text)
-        if amount is None:
+        total_budget = _system_total_budget_amount()
+        if recommended <= 0 or total_budget is None:
             return
         minimum_amount = self._stock_suggested_buy_limit(
             config_path,
             minimum=True,
             window=self,
         )
-        if minimum_amount is None:
+        if minimum_amount is not None and minimum_amount > total_budget:
+            show_toast(
+                self,
+                "최소한도가 전체예산을 초과합니다.",
+                duration_ms=2500,
+            )
             return
+        if recommended > total_budget:
+            show_toast(
+                self,
+                "권장한도가 전체예산을 초과 합니다",
+                duration_ms=2500,
+            )
+            self.start_routine_stock_buy_limit_edit(
+                row,
+                use_suggested_amount=False,
+            )
+            return
+        self._write_stock_buy_limit_config(
+            config_path,
+            enabled=True,
+            amount=recommended,
+            source=BUY_LIMIT_SOURCE_RECOMMENDED,
+        )
+        self.load_routine_table()
+
+    def finish_routine_stock_buy_limit_edit(self, *, save: bool) -> None:
+        editor = self._routine_stock_buy_limit_editor
+        if editor is None or self._routine_stock_buy_limit_edit_finishing:
+            return
+        config_path_text = self._routine_stock_buy_limit_editor_config_path
+        amount = self._parse_buy_limit_amount(editor.text()) if save else None
+
+        def close_editor() -> None:
+            self._routine_stock_buy_limit_edit_finishing = True
+            self._routine_stock_buy_limit_editor = None
+            self._routine_stock_buy_limit_editor_config_path = ""
+            self.routine_table._editing_stock_buy_limit_path = ""
+            editor.hide()
+            editor.deleteLater()
+            self._routine_stock_buy_limit_edit_finishing = False
+            self.routine_table.viewport().update()
+
+        if not save:
+            close_editor()
+            return
+        config_path = Path(config_path_text)
+        if amount is None:
+            close_editor()
+            return
+        current_config = read_json_dict(config_path)
+        if not isinstance(current_config, dict):
+            current_config = {}
+        current_amount = self._parse_buy_limit_amount(
+            str(current_config.get("buy_limit_amount") or "")
+        )
+        had_configured_limit = (
+            stock_buy_limit_state(
+                enabled=bool(current_config.get("buy_limit_enabled", False)),
+                amount=current_config.get("buy_limit_amount"),
+            )
+            == "CONFIGURED"
+            and current_amount is not None
+        )
+
+        def restore_after_invalid_input() -> None:
+            close_editor()
+            if not had_configured_limit:
+                self._write_stock_buy_limit_config(
+                    config_path,
+                    enabled=False,
+                    amount=None,
+                    source=None,
+                )
+            self.load_routine_table()
+
+        if (
+            bool(current_config.get("buy_limit_enabled", False))
+            and current_amount == amount
+        ):
+            close_editor()
+            return
+        minimum_amount = self._stock_suggested_buy_limit(
+            config_path,
+            minimum=True,
+            window=self,
+        )
         total_budget = _system_total_budget_amount()
         if total_budget is None:
+            close_editor()
             return
         if amount > total_budget:
-            self._write_stock_buy_limit_config(
-                config_path,
-                enabled=False,
-                amount=None,
-            )
-            self.load_routine_table()
-            return
-        if amount < minimum_amount:
-            QMessageBox.warning(
+            show_toast(
                 self,
-                "종목 한도 변경",
-                f"종목 한도는 현재 최소 금액 {minimum_amount:,}원 이상이어야 합니다.",
+                "입력값이 전체예산을 초과합니다.",
+                duration_ms=2500,
             )
+            restore_after_invalid_input()
+            return
+        if minimum_amount is not None and amount < minimum_amount:
+            show_toast(
+                self,
+                f"종목 한도는 현재 최소 금액 {minimum_amount:,}원 이상이어야 합니다.",
+                duration_ms=2500,
+            )
+            restore_after_invalid_input()
             return
         try:
+            close_editor()
             self._write_stock_buy_limit_config(
                 config_path,
                 enabled=True,
                 amount=amount,
+                source=BUY_LIMIT_SOURCE_MANUAL,
             )
         except Exception as exc:
-            QMessageBox.warning(
+            show_toast(
                 self,
-                "종목 한도 변경",
                 f"종목 한도를 변경하지 못했습니다.\n{exc}",
+                duration_ms=2500,
             )
             return
         self.load_routine_table()
@@ -9335,6 +10209,15 @@ class MainWindow(QMainWindow):
             details={
                 "deleted_instance_ids": list(result.deleted_instance_ids),
                 "cleared_stock_codes": list(result.cleared_stock_codes),
+                "assignment_transitions": [
+                    {
+                        "stock_code": stock.code,
+                        "before_instance_id": stock.assigned_routine_instance_id,
+                        "after": "UNASSIGNED",
+                    }
+                    for stock in scope.stocks
+                    if stock.code in set(result.cleared_stock_codes)
+                ],
             },
         )
         self.refresh_auto_trade_assignment_views()
@@ -9544,11 +10427,10 @@ class MainWindow(QMainWindow):
             "instance_dir": str(instance_dir) if instance_dir else "",
             "display_name": str(instance.display_name),
         }
-        self.instance_stock_search_register_window = InstanceStockSearchRegisterDialog(
+        self.instance_stock_search_register_window = open_instance_stock_search_register_dialog(
             self,
-            instance_metadata=metadata,
+            metadata,
         )
-        self.instance_stock_search_register_window.show()
 
     def request_routine_definition_operation(
         self,
@@ -9900,6 +10782,48 @@ class MainWindow(QMainWindow):
             self._main_monitoring_auto_trade_operation_host = host
         return host
 
+    def _update_main_price_signal_observation_button(self) -> bool:
+        host = self.main_monitoring_auto_trade_operation_host()
+        enabled = bool(host.price_signal_observation_enabled())
+        self.btn_price_signal_observation.setText(
+            "가격신호 ON" if enabled else "가격신호 OFF"
+        )
+        return enabled
+
+    def toggle_price_signal_observation(self) -> bool:
+        host = self.main_monitoring_auto_trade_operation_host()
+        current = bool(host.price_signal_observation_enabled())
+        host.set_price_signal_observation_enabled(not current)
+        return self._update_main_price_signal_observation_button()
+
+    def open_market_data_monitoring_window(self) -> QDialog:
+        window = getattr(self, "market_data_monitoring_window", None)
+        if window is not None and sip.isdeleted(window):
+            self.market_data_monitoring_window = None
+            window = None
+        if window is None:
+            window = _MarketDataMonitoringWindow(
+                self,
+                self.main_monitoring_auto_trade_operation_host(),
+            )
+            window.setAttribute(Qt.WA_DeleteOnClose, True)
+            self.market_data_monitoring_window = window
+            window.destroyed.connect(
+                lambda _obj=None, target=window: (
+                    setattr(self, "market_data_monitoring_window", None)
+                    if getattr(self, "market_data_monitoring_window", None) is target
+                    else None
+                )
+            )
+        else:
+            window.refresh_snapshot()
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        return window
+
     def on_kiwoom_raw_chejan_received(self, raw_event: dict[str, object]) -> None:
         self.last_chejan_record_result = handle_kiwoom_raw_chejan_event(
             raw_event,
@@ -10059,6 +10983,9 @@ class MainWindow(QMainWindow):
             return
         self._main_window_closing = True
         MainWindow._clear_completed_recovery_handoff(self)
+        monitoring_window = getattr(self, "market_data_monitoring_window", None)
+        if monitoring_window is not None and not sip.isdeleted(monitoring_window):
+            monitoring_window.close()
         close_persistent_feature_windows(self)
         timer = getattr(self, "_pnl_refresh_timer", None)
         if timer is not None:
