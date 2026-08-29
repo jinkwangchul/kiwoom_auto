@@ -438,7 +438,11 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.assertEqual("\u25cf \uc6b4\uc601\uc815\uc9c0", self.window.btn_start.text())
         self.assertIn("color: #111827", self.window.btn_start.styleSheet())
-        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
+        self.assertIn(
+            "QPushButton:disabled {color: #111827;border-color: #D1D5DB;"
+            "background-color: #FFFFFF;",
+            self.window.btn_start.styleSheet(),
+        )
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_bottom_button_today_normal_ended_has_priority_over_emergency(self) -> None:
@@ -469,7 +473,26 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.assertEqual("\u25a0 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
         self.assertIn("color: #1D4ED8", self.window.btn_start.styleSheet())
-        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
+        self.assertIn(
+            "QPushButton {color: #1D4ED8;border: 1px solid #1D4ED8;"
+            "background-color: #FFFFFF;",
+            self.window.btn_start.styleSheet(),
+        )
+        self.assertIn(
+            "QPushButton:hover {color: #1D4ED8;border-color: #1D4ED8;"
+            "background-color: #F8FAFC;",
+            self.window.btn_start.styleSheet(),
+        )
+        self.assertIn(
+            "QPushButton:pressed {color: #1D4ED8;border-color: #1D4ED8;"
+            "background-color: #F8FAFC;",
+            self.window.btn_start.styleSheet(),
+        )
+        self.assertIn(
+            "QPushButton:disabled {color: #1D4ED8;border-color: #D1D5DB;"
+            "background-color: #FFFFFF;",
+            self.window.btn_start.styleSheet(),
+        )
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_bottom_button_today_running_and_closing_without_current_participant_uses_stopped(self) -> None:

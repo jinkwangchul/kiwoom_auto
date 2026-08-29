@@ -345,6 +345,8 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             main_monitoring_auto_trade_operation_host=MagicMock(
                 return_value=operation_host
             ),
+            _main_stock_resolved_starting_budget_cache={"stale": object()},
+            load_routine_table=MagicMock(),
             statusBar=MagicMock(return_value=status_bar),
         )
         payload = {
@@ -353,16 +355,25 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             "connection_epoch": 3,
             "login_session_id": "SESSION-3",
         }
+        scheduled: list[object] = []
         with (
-            patch.object(gui_windows.QTimer, "singleShot") as single_shot,
+            patch.object(
+                gui_windows.QTimer,
+                "singleShot",
+                side_effect=lambda _delay, callback: scheduled.append(callback),
+            ) as single_shot,
             patch.object(gui_windows, "append_production_event") as event,
         ):
             gui_windows.MainWindow.on_kiwoom_login_state_changed(window, payload)
             gui_windows.MainWindow.on_kiwoom_login_state_changed(window, payload)
+            self.assertEqual(1, len(scheduled))
+            scheduled.pop(0)()
         window.request_account_funds.assert_called_once_with()
         window.start_production_recovery.assert_called_once_with()
         operation_host.sync_monitoring_universe_for_current_session.assert_called_once_with()
-        single_shot.assert_called_once()
+        window.load_routine_table.assert_called_once_with()
+        self.assertEqual({}, window._main_stock_resolved_starting_budget_cache)
+        self.assertEqual(2, single_shot.call_count)
         event.assert_called_once()
 
 

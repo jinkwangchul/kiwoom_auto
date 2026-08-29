@@ -80,6 +80,11 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 from gui_stock_name_tooltip import install_persistent_stock_name_tooltips
+from gui_main_footer_status import (
+    OPERATOR_FOOTER_PRIORITY_HOLD_MS,
+    project_operator_footer_message,
+    should_defer_operator_footer_message,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3434,7 +3439,7 @@ class _MarketDataMonitoringWindow(QDialog):
 
 
 class RunningBudgetAdjustmentDialog(QDialog):
-    """Editor for a current-operation base-budget adjustment request."""
+    """Shared editor for a stock's base starting budget."""
 
     def __init__(
         self,
@@ -3444,18 +3449,31 @@ class RunningBudgetAdjustmentDialog(QDialog):
         stock_name: str,
         current_price: object,
         config: dict[str, object],
+        minimum_amount: object = None,
         pending_adjustment: dict[str, object] | None = None,
+        timing_selection_enabled: bool = True,
+        fresh_price_available: bool | None = None,
     ) -> None:
         super().__init__(owner)
         self.stock_code = str(stock_code or "").strip()
         self.stock_name = str(stock_name or "").strip()
         self.current_price = safe_float_value(current_price, 0.0)
+        self.fresh_price_available = (
+            self.current_price > 0
+            if fresh_price_available is None
+            else bool(fresh_price_available)
+        )
         self.config = config if isinstance(config, dict) else {}
+        resolved_minimum_amount = safe_int_value(minimum_amount, 0)
+        self.minimum_amount = (
+            resolved_minimum_amount if resolved_minimum_amount > 0 else None
+        )
         self.pending_adjustment = (
             dict(pending_adjustment)
             if isinstance(pending_adjustment, dict)
             else None
         )
+        self.timing_selection_enabled = bool(timing_selection_enabled)
         self.mode = (
             "AMOUNT"
             if str(self.config.get("trade_amount_type", "QUANTITY")).upper()
@@ -3600,8 +3618,14 @@ class RunningBudgetAdjustmentDialog(QDialog):
             if self.pending_adjustment is not None
             else ""
         )
-        self.immediate_checkbox.setChecked(pending_policy != "NEXT_CYCLE")
-        self.next_cycle_checkbox.setChecked(pending_policy == "NEXT_CYCLE")
+        self.immediate_checkbox.setChecked(
+            self.timing_selection_enabled and pending_policy != "NEXT_CYCLE"
+        )
+        self.next_cycle_checkbox.setChecked(
+            self.timing_selection_enabled and pending_policy == "NEXT_CYCLE"
+        )
+        self.immediate_checkbox.setEnabled(self.timing_selection_enabled)
+        self.next_cycle_checkbox.setEnabled(self.timing_selection_enabled)
         timing_row.setSpacing(36)
         timing_row.addWidget(self.immediate_checkbox)
         timing_row.addWidget(self.next_cycle_checkbox)
@@ -3622,8 +3646,10 @@ class RunningBudgetAdjustmentDialog(QDialog):
 
         self.validation_label = QLabel()
         self.validation_label.setStyleSheet("color: #B91C1C;")
+        self.validation_label.setAlignment(Qt.AlignCenter)
         self.validation_label.hide()
         root.addWidget(self.validation_label)
+        root.addSpacing(8)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("확인")
@@ -3631,7 +3657,7 @@ class RunningBudgetAdjustmentDialog(QDialog):
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
-        self._refresh_preview()
+        self._refresh_preview(validate=False)
 
     def _config_value(self, mode: str) -> int:
         key = "buy_amount" if mode == "AMOUNT" else "buy_qty"
@@ -3697,34 +3723,71 @@ class RunningBudgetAdjustmentDialog(QDialog):
         self._last_valid_value_text = formatted
         self._refresh_preview()
 
-    def _refresh_preview(self) -> None:
-        reference = self._reference_text(self._input_value())
+    def _refresh_preview(self, *, validate: bool = True) -> None:
+        value = self._input_value()
+        reference = self._reference_text(value)
         self.changed_reference_label.setText(f"/ {reference}")
+        if validate:
+            self._refresh_validation_message(value)
+
+    def _hide_validation_message(self) -> None:
         self.validation_label.clear()
         self.validation_label.hide()
 
+    def _show_validation_message(self, message: str) -> None:
+        self.validation_label.setText(str(message or ""))
+        self.validation_label.show()
+
+    def _show_minimum_amount_error(self) -> None:
+        if self.minimum_amount is None:
+            self._show_validation_message("시작예산 금액을 확인하세요.")
+            return
+        self._show_validation_message(
+            f"※ 입력 불가. 최소값은 {self.minimum_amount:,}원 이상입니다."
+        )
+
+    def _refresh_validation_message(self, value: int) -> None:
+        if (
+            self.mode == "AMOUNT"
+            and self.minimum_amount is not None
+            and value > 0
+            and value < self.minimum_amount
+        ):
+            self._show_minimum_amount_error()
+            return
+        self._hide_validation_message()
+
     def _validate_and_accept(self) -> None:
         value = self._input_value()
+        if not self.fresh_price_available:
+            return
         if value <= 0:
-            self.validation_label.setText("변경값을 입력하세요.")
-            self.validation_label.show()
+            self._show_validation_message("변경값을 입력하세요.")
             return
         if value > 99_999_999:
-            self.validation_label.setText("99,999,999까지 입력할 수 있습니다.")
-            self.validation_label.show()
+            self._show_validation_message("99,999,999까지 입력할 수 있습니다.")
             return
-        if not (
+        if self.mode == "AMOUNT":
+            if self.minimum_amount is None:
+                self._show_minimum_amount_error()
+                return
+            if value < self.minimum_amount:
+                self._show_minimum_amount_error()
+                return
+        if self.timing_selection_enabled and not (
             self.immediate_checkbox.isChecked()
             or self.next_cycle_checkbox.isChecked()
         ):
-            self.validation_label.setText("적용 시점을 선택하세요.")
-            self.validation_label.show()
+            self._show_validation_message("적용 시점을 선택하세요.")
             return
+        self._hide_validation_message()
         self.result = {
             "mode": self.mode,
             "value": value,
             "apply_timing": (
-                "IMMEDIATE"
+                "PRE_OPERATION"
+                if not self.timing_selection_enabled
+                else "IMMEDIATE"
                 if self.immediate_checkbox.isChecked()
                 else "NEXT_CYCLE"
             ),
@@ -3968,7 +4031,7 @@ class MainWindow(QMainWindow):
         self.btn_close_all_windows = QPushButton("모든창닫기")
         self.btn_close_all_windows.setObjectName("mainCloseAllWindowsButton")
         self.btn_log_view = QPushButton("이벤트")
-        self.btn_review_required = QPushButton("검토관리(0)")
+        self.btn_review_required = QPushButton()
         self.btn_price_signal_observation = QPushButton("가격신호 OFF")
         self.btn_market_data_monitoring = QPushButton("모니터링")
         self.btn_group_pack_register = QPushButton("그룹등록")
@@ -4072,6 +4135,7 @@ class MainWindow(QMainWindow):
         self._main_dashboard_layout = main_layout
         self._apply_main_dashboard_style(central)
 
+        self._bind_main_status_message_to_button_row()
         self.statusBar().showMessage("준비 완료")
 
     def _create_top_status_box(self) -> QGroupBox:
@@ -5000,12 +5064,21 @@ class MainWindow(QMainWindow):
             ("excluded", "제외"),
             ("review", "검토"),
         ):
-            badge = QPushButton()
+            badge = (
+                getattr(self, "btn_review_required", None)
+                if key == "review"
+                else None
+            )
+            if not isinstance(badge, QPushButton):
+                badge = QPushButton()
+                if key == "review":
+                    self.btn_review_required = badge
+            badge.setText("")
             badge.setObjectName("mainRoutineSummaryCountBadge")
             badge.setFixedSize(count_badge_width, badge_height)
             badge.setFocusPolicy(Qt.NoFocus)
             badge.setCursor(Qt.PointingHandCursor)
-            badge.setCheckable(True)
+            badge.setCheckable(key != "review")
             badge_layout = QHBoxLayout(badge)
             badge_layout.setContentsMargins(
                 badge_horizontal_padding,
@@ -5031,10 +5104,11 @@ class MainWindow(QMainWindow):
             layout.addWidget(badge)
             count_labels[key] = (label, value)
             count_buttons[key] = badge
-            badge.clicked.connect(
-                lambda checked=False, target_key=key:
-                self._activate_main_routine_summary_badge(target_key, bool(checked))
-            )
+            if key != "review":
+                badge.clicked.connect(
+                    lambda checked=False, target_key=key:
+                    self._activate_main_routine_summary_badge(target_key, bool(checked))
+                )
 
             if key == "stock":
                 stock_separator = create_summary_separator(
@@ -5062,6 +5136,7 @@ class MainWindow(QMainWindow):
         badge_snapshot = tuple(
             (str(key), str(label_text), max(0, int(value or 0)))
             for key, label_text, value in badges
+            if str(key) != "review"
         )
         if badge_snapshot == getattr(
             self,
@@ -5071,6 +5146,8 @@ class MainWindow(QMainWindow):
             return
         if isinstance(count_labels, dict) and isinstance(badges, tuple):
             for key, label_text, value in badges:
+                if str(key) == "review":
+                    continue
                 labels = count_labels.get(str(key))
                 if not isinstance(labels, tuple) or len(labels) != 2:
                     continue
@@ -5090,6 +5167,11 @@ class MainWindow(QMainWindow):
         checked: bool,
     ) -> None:
         clean_key = str(key or "").strip().lower()
+        if clean_key == "review":
+            opener = getattr(self, "open_review_required_window", None)
+            if callable(opener):
+                opener()
+            return
         if clean_key in {"group", "routine"}:
             MainWindow._assign_main_routine_stock_scope(self, "all", True)
             self._main_routine_excluded_only = False
@@ -5100,7 +5182,7 @@ class MainWindow(QMainWindow):
             self._assign_main_routine_stock_scope("all", True)
             self._set_main_routine_display_level("stock")
             return
-        if clean_key in {"operation", "waiting", "excluded", "review"}:
+        if clean_key in {"operation", "waiting", "excluded"}:
             self._set_main_routine_display_level("stock")
             self._set_main_routine_stock_scope(clean_key, checked)
 
@@ -5117,7 +5199,7 @@ class MainWindow(QMainWindow):
             "operation": level == "stock" and scope == "operation",
             "waiting": level == "stock" and scope == "waiting",
             "excluded": level == "stock" and scope == "excluded",
-            "review": level == "stock" and scope == "review",
+            "review": MainWindow._review_required_window_is_open(self),
         }
         for key, button in buttons.items():
             active = bool(active_by_key.get(key, False))
@@ -5142,6 +5224,13 @@ class MainWindow(QMainWindow):
                 f" color: {color}; border: none; background: transparent; padding: 0;"
                 "}"
             )
+
+    def _review_required_window_is_open(self) -> bool:
+        window = getattr(self, "review_required_window", None)
+        if window is None or sip.isdeleted(window):
+            return False
+        is_visible = getattr(window, "isVisible", None)
+        return bool(is_visible()) if callable(is_visible) else False
 
     def _create_routine_filter_badge_area(self) -> QWidget:
         badge_area = QWidget()
@@ -5474,7 +5563,7 @@ class MainWindow(QMainWindow):
             getattr(self, "_main_routine_stock_scope", "all") or "all"
         ).strip().lower()
         return scope if scope in {
-            "all", "normal", "operation", "waiting", "excluded", "review"
+            "all", "normal", "operation", "waiting", "excluded"
         } else "all"
 
     def _assign_main_routine_stock_scope(
@@ -5484,13 +5573,13 @@ class MainWindow(QMainWindow):
     ) -> None:
         clean_scope = str(scope or "").strip().lower()
         if clean_scope not in {
-            "all", "normal", "operation", "waiting", "excluded", "review"
+            "all", "normal", "operation", "waiting", "excluded"
         }:
             clean_scope = "all"
         current_scope = MainWindow._current_main_routine_stock_scope(self)
         if bool(enabled):
             target_scope = clean_scope
-        elif clean_scope in {"operation", "waiting", "excluded", "review"}:
+        elif clean_scope in {"operation", "waiting", "excluded"}:
             target_scope = "all"
         else:
             target_scope = clean_scope
@@ -5593,24 +5682,123 @@ class MainWindow(QMainWindow):
 
     def _create_button_area(self) -> QHBoxLayout:
         layout = QHBoxLayout()
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 0, 0, 6)
+        layout.setSpacing(0)
+
+        self.main_status_message_label = QLabel()
+        self.main_status_message_label.setObjectName("mainFooterStatusMessage")
+        self.main_status_message_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.main_status_message_label.setWordWrap(False)
+        self.main_status_message_label.setMinimumWidth(0)
+        self.main_status_message_label.setMinimumHeight(32)
+        self.main_status_message_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Fixed,
+        )
+        layout.addWidget(self.main_status_message_label, 6)
 
         buttons = [
             self.btn_start,
             self.btn_auto_trade_setting,
             self.btn_log_view,
-            self.btn_review_required,
             self.btn_close_all_windows,
             self.btn_exit,
         ]
 
+        layout.addStretch(1)
         for button in buttons:
             button.setProperty("mainBottomActionButton", True)
             button.setMinimumHeight(32)
-            layout.addWidget(button)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            layout.addWidget(button, 7)
+            layout.addStretch(1)
 
         self.btn_exit.setObjectName("secondaryButton")
         return layout
+
+    def _bind_main_status_message_to_button_row(self) -> None:
+        status_bar = self.statusBar()
+        self._main_footer_current_priority = 0
+        self._main_footer_priority_hold_until = 0.0
+        self._main_footer_deferred_raw_message = ""
+        self._main_footer_deferred_generation = 0
+        self._main_footer_suppressed_status_active = False
+        status_bar.messageChanged.connect(
+            lambda message: MainWindow._project_main_status_message(self, message)
+        )
+        MainWindow._project_main_status_message(self, status_bar.currentMessage())
+        status_bar.hide()
+
+    def _project_main_status_message(self, raw_message: object) -> None:
+        clean_message = str(raw_message or "").strip()
+        projection = project_operator_footer_message(clean_message)
+        if projection is None:
+            self._main_footer_suppressed_status_active = bool(clean_message)
+            return
+        if not clean_message and bool(
+            getattr(self, "_main_footer_suppressed_status_active", False)
+        ):
+            self._main_footer_suppressed_status_active = False
+            return
+        self._main_footer_suppressed_status_active = False
+
+        now = monotonic()
+        current_priority = int(getattr(self, "_main_footer_current_priority", 0) or 0)
+        hold_until = float(
+            getattr(self, "_main_footer_priority_hold_until", 0.0) or 0.0
+        )
+        if should_defer_operator_footer_message(
+            current_priority=current_priority,
+            incoming_priority=projection.priority,
+            hold_until=hold_until,
+            now=now,
+        ):
+            self._main_footer_deferred_raw_message = clean_message
+            self._main_footer_deferred_generation = int(
+                getattr(self, "_main_footer_deferred_generation", 0) or 0
+            ) + 1
+            generation = self._main_footer_deferred_generation
+            delay_ms = max(1, int((hold_until - now) * 1000) + 1)
+            QTimer.singleShot(
+                delay_ms,
+                lambda: MainWindow._flush_deferred_main_status_message(
+                    self,
+                    generation,
+                ),
+            )
+            return
+
+        MainWindow._apply_main_status_projection(self, projection)
+
+    def _apply_main_status_projection(self, projection) -> None:
+        self._main_footer_deferred_generation = int(
+            getattr(self, "_main_footer_deferred_generation", 0) or 0
+        ) + 1
+        self._main_footer_deferred_raw_message = ""
+        self._main_footer_current_priority = projection.priority
+        if projection.category in {"failure", "warning"}:
+            self._main_footer_priority_hold_until = (
+                monotonic() + (OPERATOR_FOOTER_PRIORITY_HOLD_MS / 1000.0)
+            )
+        else:
+            self._main_footer_priority_hold_until = 0.0
+        self.main_status_message_label.setText(projection.text)
+        self.main_status_message_label.setStyleSheet(
+            f"color: {projection.color}; background: transparent;"
+        )
+
+    def _flush_deferred_main_status_message(self, generation: int) -> None:
+        if sip.isdeleted(self):
+            return
+        if generation != int(
+            getattr(self, "_main_footer_deferred_generation", 0) or 0
+        ):
+            return
+        raw_message = str(
+            getattr(self, "_main_footer_deferred_raw_message", "") or ""
+        )
+        self._main_footer_priority_hold_until = 0.0
+        MainWindow._project_main_status_message(self, raw_message)
 
     def _main_stock_live_tooltip(self, index, fallback_text: str) -> str:
         projection = index.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
@@ -5880,8 +6068,9 @@ class MainWindow(QMainWindow):
                 background: #f8fafc;
                 color: #334155;
             }
-            QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"] {
-                background: #f8fafc;
+            QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"],
+            QWidget#mainDashboardRoot QPushButton#secondaryButton[mainBottomActionButton="true"] {
+                background: #ffffff;
             }
             QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"]:hover {
                 background: #f8fafc;
@@ -7257,6 +7446,17 @@ class MainWindow(QMainWindow):
             and login_identity[1]
             and getattr(self, "_handled_kiwoom_login_identity", None) != login_identity
         )
+        if new_authenticated_session:
+            authentication_states = getattr(
+                self,
+                "_account_authentication_states",
+                None,
+            )
+            if isinstance(authentication_states, dict):
+                authentication_states.clear()
+            query_states = getattr(self, "_account_query_states", None)
+            if isinstance(query_states, dict):
+                query_states.clear()
         if connected:
             label_text = "로그인 상태: 연결됨"
             status_message = message or label_text
@@ -7272,9 +7472,6 @@ class MainWindow(QMainWindow):
         if connected:
             if new_authenticated_session:
                 self.main_monitoring_auto_trade_operation_host().sync_monitoring_universe_for_current_session()
-                self.request_account_funds()
-                self.start_production_recovery()
-                QTimer.singleShot(0, self.start_stock_library_sync_for_current_session)
         else:
             MainWindow._clear_completed_recovery_handoff(self)
             self._account_authentication_states.clear()
@@ -7309,7 +7506,30 @@ class MainWindow(QMainWindow):
         self._event_journal_kiwoom_connected = connected
         if new_authenticated_session:
             self._handled_kiwoom_login_identity = login_identity
+        if connected != previously_connected or new_authenticated_session:
+            MainWindow._refresh_start_budget_displays_for_auth_state(self)
         self.statusBar().showMessage(status_message)
+        if new_authenticated_session:
+            QTimer.singleShot(
+                500,
+                lambda identity=login_identity: MainWindow._continue_login_after_pending_budget_projection(
+                    self,
+                    identity,
+                ),
+            )
+
+    def _continue_login_after_pending_budget_projection(
+        self,
+        login_identity: tuple[int, str],
+    ) -> None:
+        if (
+            getattr(self, "_handled_kiwoom_login_identity", None) != login_identity
+            or not bool(getattr(self, "_event_journal_kiwoom_connected", False))
+        ):
+            return
+        self.request_account_funds()
+        self.start_production_recovery()
+        QTimer.singleShot(0, self.start_stock_library_sync_for_current_session)
 
     def start_stock_library_sync_for_current_session(self) -> bool:
         service = getattr(self, "stock_library_sync_service", None)
@@ -7413,6 +7633,8 @@ class MainWindow(QMainWindow):
             )
             self._account_query_states[account] = ACCOUNT_FUNDS_FAILED
         self.refresh_account_authentication_ui()
+        if not account or account == str(self.selected_account_no() or "").strip():
+            MainWindow._refresh_start_budget_displays_for_auth_state(self)
 
     def open_current_account_authentication(self) -> None:
         account = self._displayed_active_account_no()
@@ -8010,6 +8232,11 @@ class MainWindow(QMainWindow):
             )
         except (AttributeError, RuntimeError):
             authentication_states = None
+        previous_authentication_state = (
+            authentication_states.get(account_id)
+            if isinstance(authentication_states, dict) and account_id
+            else None
+        )
         if isinstance(authentication_states, dict):
             if snapshot.status == ACCOUNT_FUNDS_READY and account_id:
                 authentication_states[account_id] = ACCOUNT_FUNDS_READY
@@ -8022,6 +8249,12 @@ class MainWindow(QMainWindow):
                 authentication_states[account_id] = (
                     ACCOUNT_AUTHENTICATION_REQUIRED
                 )
+        authentication_state_changed = bool(
+            isinstance(authentication_states, dict)
+            and account_id
+            and authentication_states.get(account_id)
+            != previous_authentication_state
+        )
         try:
             query_states = object.__getattribute__(self, "_account_query_states")
         except (AttributeError, RuntimeError):
@@ -8083,6 +8316,18 @@ class MainWindow(QMainWindow):
                 and identity.account_no == account_id
             ):
                 self._resume_limit_responses_after_recovery(identity)
+        if authentication_state_changed:
+            selected_account = str(self.selected_account_no() or "").strip()
+            if not selected_account or selected_account == account_id:
+                MainWindow._refresh_start_budget_displays_for_auth_state(self)
+
+    def _refresh_start_budget_displays_for_auth_state(self) -> None:
+        cache = getattr(self, "_main_stock_resolved_starting_budget_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+        load_routine_table = getattr(self, "load_routine_table", None)
+        if callable(load_routine_table):
+            load_routine_table()
 
     def refresh_all(self) -> None:
         self.load_routine_table()
@@ -8472,7 +8717,14 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "btn_review_required"):
             return
         count = self.review_required_stock_count()
-        self.btn_review_required.setText(f"검토관리({count})")
+        count_labels = getattr(self, "_main_routine_summary_count_labels", {})
+        labels = count_labels.get("review") if isinstance(count_labels, dict) else None
+        if isinstance(labels, tuple) and len(labels) == 2:
+            label, value_label = labels
+            label.setText("검토")
+            value_label.setText(str(max(0, int(count))))
+            return
+        self.btn_review_required.setText(f"검토 {max(0, int(count))}")
 
     def sort_main_routine_table_by_column(self, column: int) -> None:
         main_sort_routine_table_by_column(self, column)
@@ -8832,9 +9084,10 @@ class MainWindow(QMainWindow):
                 config_path,
                 window=self,
             )
+            if recommended is None:
+                continue
             if (
-                recommended is not None
-                and total_budget is not None
+                total_budget is not None
                 and recommended > total_budget
             ):
                 try:
@@ -8848,13 +9101,13 @@ class MainWindow(QMainWindow):
                     continue
                 changed += 1
                 continue
-            if recommended is not None and (
+            if (
                 recommended <= 0
                 or total_budget is None
                 or recommended > total_budget
             ):
                 continue
-            next_amount = int(recommended) if recommended is not None else None
+            next_amount = int(recommended)
             session_key = MainWindow._stock_recommended_limit_session_key(
                 self,
                 config_path,
@@ -8883,6 +9136,9 @@ class MainWindow(QMainWindow):
         *,
         mode: str,
         value: int,
+        apply_limit: bool = False,
+        adjusted_limit_amount: int | None = None,
+        running_adjustment_authorized: bool = False,
     ) -> dict[str, object]:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
@@ -8902,18 +9158,88 @@ class MainWindow(QMainWindow):
             next_config,
             current_state=read_json_dict(config_path.parent / "state.json"),
         )
-        if decision.get("allowed") is not True or decision.get("changed") is not True:
+        authorized_running_write = bool(
+            running_adjustment_authorized
+            and decision.get("current_running") is True
+        )
+        if (
+            bool(apply_limit)
+            and decision.get("current_running") is True
+            and not authorized_running_write
+        ):
+            return {
+                **decision,
+                "allowed": False,
+                "reason": "START_BUDGET_MUTATION_BLOCKED",
+            }
+        if decision.get("allowed") is not True and not authorized_running_write:
             return decision
+        if authorized_running_write:
+            decision = {
+                **decision,
+                "allowed": True,
+                "reason": "",
+                "running_adjustment_authorized": True,
+            }
+        limit_changed = False
+        if bool(apply_limit):
+            limit_amount = safe_int_value(adjusted_limit_amount, 0)
+            if limit_amount <= 0:
+                return {
+                    **decision,
+                    "allowed": False,
+                    "reason": "INVALID_ADJUSTED_LIMIT",
+                }
+            enabled_value, amount_value, source_value = canonical_stock_buy_limit_values(
+                enabled=True,
+                amount=limit_amount,
+                source=BUY_LIMIT_SOURCE_RECOMMENDED,
+            )
+            limit_changed = bool(
+                config.get("buy_limit_enabled") != enabled_value
+                or config.get("buy_limit_amount") != amount_value
+                or config.get("buy_limit_source") != source_value
+            )
+            next_config["buy_limit_enabled"] = enabled_value
+            next_config["buy_limit_amount"] = amount_value
+            next_config["buy_limit_source"] = source_value
+        if decision.get("changed") is not True and not limit_changed:
+            return {**decision, "limit_changed": False}
         next_config["updated_at"] = stock_now_text()
         config_path.write_text(
             json.dumps(next_config, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        return {**decision, "written": True}
+        return {
+            **decision,
+            "changed": bool(decision.get("changed")) or limit_changed,
+            "limit_changed": limit_changed,
+            "written": True,
+        }
 
     @staticmethod
     def _show_start_budget_mutation_blocked(window) -> None:
         show_toast(window, "운영중에는 시작예산을 변경할 수 없습니다.", duration_ms=2500)
+
+    @staticmethod
+    def _starting_budget_change_current_price(
+        window,
+        config_path: Path,
+    ) -> float | None:
+        fresh_state = main_stock_fresh_market_information_state(
+            window,
+            MainWindow._stock_projection_for_config_path(config_path),
+        )
+        current_price = safe_float_value(
+            getattr(fresh_state, "last_price", None)
+            if fresh_state is not None
+            else None,
+            0.0,
+        )
+        if current_price <= 0:
+            show_toast(window, "현재주가 수신 후 변경할 수 있습니다.")
+            return None
+        return current_price
 
     def _open_running_budget_adjustment_dialog(
         self,
@@ -8927,35 +9253,57 @@ class MainWindow(QMainWindow):
         stock_name = str(
             item.data(ROUTINE_STOCK_NAME_ROLE) if item is not None else ""
         ).strip()
+        current_price = MainWindow._starting_budget_change_current_price(
+            self,
+            config_path,
+        )
+        if current_price is None:
+            return
         state = read_json_dict(config_path.parent / "state.json")
-        projection = (
-            item.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
-            if item is not None
-            else {}
-        )
-        current_price = (
-            projection.get("current_price")
-            if isinstance(projection, dict)
-            else None
-        )
-        if safe_float_value(current_price, 0.0) <= 0:
-            current_price = state.get("current_price", state.get("last_price", 0))
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
-        display_config, display_projection = (
-            project_running_budget_adjustment_display_config(config, state)
+        opened_current_running = auto_trade_start_budget_current_running(
+            self,
+            stock_code,
+            config,
+            state,
         )
-        pending_adjustment = display_projection.get("adjustment")
+        if opened_current_running:
+            display_config, display_projection = (
+                project_running_budget_adjustment_display_config(config, state)
+            )
+            pending_adjustment = display_projection.get("adjustment")
+        else:
+            display_config = dict(config)
+            pending_adjustment = None
+        minimum_amount = None
+        if (
+            str(display_config.get("trade_amount_type") or "").strip().upper()
+            == "AMOUNT"
+        ):
+            budget_defaults = starting_budget_defaults()
+            resolved_minimum_amount = MainWindow._stock_default_initial_buy_value(
+                config_path,
+                "AMOUNT",
+                window=self,
+                defaults=budget_defaults,
+            )
+            minimum_amount = (
+                resolved_minimum_amount if resolved_minimum_amount > 0 else None
+            )
         dialog = RunningBudgetAdjustmentDialog(
             self,
             stock_code=stock_code,
             stock_name=stock_name,
             current_price=current_price,
             config=display_config,
+            minimum_amount=minimum_amount,
             pending_adjustment=(
                 pending_adjustment if isinstance(pending_adjustment, dict) else None
             ),
+            timing_selection_enabled=opened_current_running,
+            fresh_price_available=True,
         )
         self._running_budget_adjustment_dialog = dialog
         accepted = False
@@ -8971,12 +9319,13 @@ class MainWindow(QMainWindow):
 
         current_config = read_json_dict(config_path)
         current_state = read_json_dict(config_path.parent / "state.json")
-        if not auto_trade_start_budget_current_running(
+        current_running = auto_trade_start_budget_current_running(
             self,
             stock_code,
             current_config,
             current_state,
-        ):
+        )
+        if current_running != opened_current_running:
             show_toast(self, "운영 상태가 변경되어 기본예산 변경을 적용하지 않았습니다.")
             return
 
@@ -8994,50 +9343,99 @@ class MainWindow(QMainWindow):
         requested_value = safe_int_value(request.get("value"), 0)
         adjusted_limit_amount = None
         if bool(request.get("apply_limit", False)):
-            starting_budget = requested_value
-            if current_mode == "QUANTITY":
-                fresh_state = main_stock_fresh_market_information_state(
-                    self,
-                    self._stock_projection_for_config_path(config_path),
-                )
-                fresh_price = (
-                    getattr(fresh_state, "last_price", None)
-                    if fresh_state is not None
-                    else None
-                )
-                starting_budget = floor_money_to_won(
-                    safe_float_value(fresh_price, 0.0) * requested_value
-                )
-            defaults = starting_budget_defaults()
-            adjusted_limit_amount = suggested_buy_limit(
-                starting_budget,
-                defaults["limit_recommended_multiplier"],
-                align_digits=stock_limit_digit_alignment_enabled(),
+            adjusted_limit_amount = self._adjusted_buy_limit_for_start_budget(
+                config_path,
+                mode=current_mode,
+                value=requested_value,
             )
-            total_budget = _system_total_budget_amount()
-            if (
-                adjusted_limit_amount is None
-                or total_budget is None
-                or adjusted_limit_amount > total_budget
-            ):
+            if adjusted_limit_amount is None:
                 show_toast(self, "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.")
                 return
 
-        commit_result = commit_running_budget_adjustment(
-            config_path.parent,
-            stock_code=stock_code,
-            expected_mode=current_mode,
-            requested_value=requested_value,
-            apply_policy=request.get("apply_timing"),
-            apply_limit=bool(request.get("apply_limit", False)),
-            adjusted_limit_amount=adjusted_limit_amount,
-            requested_at=dialog.requested_at,
-        )
-        if commit_result.get("ok") is not True:
-            show_toast(self, "기본예산 변경 요청을 저장하지 못했습니다.")
-            return
+        if opened_current_running:
+            commit_result = commit_running_budget_adjustment(
+                config_path.parent,
+                stock_code=stock_code,
+                expected_mode=current_mode,
+                requested_value=requested_value,
+                apply_policy=request.get("apply_timing"),
+                apply_limit=bool(request.get("apply_limit", False)),
+                adjusted_limit_amount=adjusted_limit_amount,
+                requested_at=dialog.requested_at,
+            )
+            if commit_result.get("ok") is not True:
+                show_toast(self, "기본예산 변경 요청을 저장하지 못했습니다.")
+                return
+            write_result = self._write_stock_initial_buy_config(
+                config_path,
+                mode=current_mode,
+                value=requested_value,
+                apply_limit=bool(request.get("apply_limit", False)),
+                adjusted_limit_amount=adjusted_limit_amount,
+                running_adjustment_authorized=True,
+            )
+            if write_result.get("allowed") is not True:
+                show_toast(self, "기본예산 영구 설정을 저장하지 못했습니다.")
+                return
+            success_message = "기본예산 변경 요청을 저장했습니다."
+        else:
+            write_result = self._write_stock_initial_buy_config(
+                config_path,
+                mode=current_mode,
+                value=requested_value,
+                apply_limit=bool(request.get("apply_limit", False)),
+                adjusted_limit_amount=adjusted_limit_amount,
+            )
+            if write_result.get("allowed") is not True:
+                if write_result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
+                    show_toast(
+                        self,
+                        "운영 상태가 변경되어 기본예산 변경을 적용하지 않았습니다.",
+                    )
+                else:
+                    show_toast(self, "기본예산을 저장하지 못했습니다.")
+                return
+            success_message = "기본예산을 변경했습니다."
         self.load_routine_table()
-        show_toast(self, "기본예산 변경 요청을 저장했습니다.")
+        show_toast(self, success_message)
+
+    def _adjusted_buy_limit_for_start_budget(
+        self,
+        config_path: Path,
+        *,
+        mode: str,
+        value: int,
+    ) -> int | None:
+        starting_budget = max(0, safe_int_value(value, 0))
+        if str(mode or "").strip().upper() == "QUANTITY":
+            fresh_state = main_stock_fresh_market_information_state(
+                self,
+                self._stock_projection_for_config_path(config_path),
+            )
+            fresh_price = (
+                getattr(fresh_state, "last_price", None)
+                if fresh_state is not None
+                else None
+            )
+            starting_budget = floor_money_to_won(
+                safe_float_value(fresh_price, 0.0) * starting_budget
+            )
+        defaults = starting_budget_defaults()
+        if starting_budget <= 0:
+            return None
+        adjusted_limit_amount = suggested_buy_limit(
+            starting_budget,
+            defaults["limit_recommended_multiplier"],
+            align_digits=stock_limit_digit_alignment_enabled(),
+        )
+        total_budget = _system_total_budget_amount()
+        if (
+            adjusted_limit_amount is None
+            or total_budget is None
+            or adjusted_limit_amount > total_budget
+        ):
+            return None
+        return adjusted_limit_amount
 
     def _stock_start_budget_locked(self, config_path: Path) -> bool:
         target_path = Path(config_path)
@@ -9116,8 +9514,13 @@ class MainWindow(QMainWindow):
         mode: str,
         *,
         window=None,
+        defaults: dict[str, float | int] | None = None,
     ) -> int:
-        defaults = starting_budget_defaults()
+        defaults = (
+            dict(defaults)
+            if isinstance(defaults, dict)
+            else starting_budget_defaults()
+        )
         if mode == "QUANTITY":
             return int(defaults["quantity"])
         if window is None:
@@ -9317,8 +9720,10 @@ class MainWindow(QMainWindow):
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
+        if MainWindow._starting_budget_change_current_price(self, config_path) is None:
+            return
         if self._stock_start_budget_locked(config_path):
-            self._open_running_budget_adjustment_dialog(row, config_path)
+            self._show_start_budget_mutation_blocked(self)
             return
         self.finish_routine_stock_initial_buy_edit(save=True)
         config = read_json_dict(config_path)
@@ -9346,83 +9751,7 @@ class MainWindow(QMainWindow):
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
-        if self._stock_start_budget_locked(config_path):
-            self._open_running_budget_adjustment_dialog(row, config_path)
-            return
-        item = self.routine_table.item(row, 0)
-        stock_path = (
-            str(item.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
-            if item is not None
-            else ""
-        )
-        initial_buy_projection = (
-            item.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
-            if item is not None
-            else None
-        )
-        if isinstance(initial_buy_projection, dict):
-            mode = str(
-                initial_buy_projection.get("mode", "QUANTITY") or "QUANTITY"
-            ).upper()
-            if mode != "AMOUNT":
-                mode = "QUANTITY"
-            configured_value = safe_int_value(
-                initial_buy_projection.get("value"),
-                0,
-            )
-        else:
-            config = read_json_dict(config_path)
-            if not isinstance(config, dict):
-                config = {}
-            state = read_json_dict(config_path.parent / "state.json")
-            if not isinstance(state, dict):
-                state = {}
-            display_config, _display_evidence = (
-                project_running_budget_adjustment_display_config(config, state)
-            )
-            mode = str(
-                display_config.get("trade_amount_type", "QUANTITY") or ""
-            ).upper()
-            if mode != "AMOUNT":
-                mode = "QUANTITY"
-            value = (
-                display_config.get("buy_amount", 0)
-                if mode == "AMOUNT"
-                else display_config.get("buy_qty", 0)
-            )
-            configured_value = safe_int_value(value, 0)
-        value_text = str(
-            configured_value
-            if configured_value > 0
-            else self._stock_default_initial_buy_value(
-                config_path,
-                mode,
-                window=self,
-            )
-        )
-
-        self.finish_routine_stock_initial_buy_edit(save=True)
-        self.finish_routine_stock_buy_limit_edit(save=True)
-        editor_rect = self._routine_stock_initial_buy_value_rect(row)
-        if editor_rect.isNull():
-            return
-        editor = QLineEdit(self.routine_table.viewport())
-        editor.setObjectName("routineStockInitialBuyEditor")
-        _apply_routine_inline_edit_style(editor, self.routine_table)
-        editor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        editor.setText(value_text)
-        editor.setGeometry(editor_rect)
-        editor.installEventFilter(self._routine_buy_limit_edit_filter)
-        self.routine_table._editing_stock_initial_buy_path = stock_path
-        self.routine_table.viewport().update(
-            self.routine_table.visualRect(self.routine_table.model().index(row, 0))
-        )
-        editor.selectAll()
-        editor.show()
-        editor.setFocus(Qt.MouseFocusReason)
-        self._routine_stock_initial_buy_editor = editor
-        self._routine_stock_initial_buy_editor_config_path = str(config_path)
-        self._routine_stock_initial_buy_editor_mode = mode
+        self._open_running_budget_adjustment_dialog(row, config_path)
 
     def finish_routine_stock_initial_buy_edit(self, *, save: bool) -> None:
         editor = self._routine_stock_initial_buy_editor
@@ -11500,20 +11829,31 @@ class MainWindow(QMainWindow):
             window.show()
             window.raise_()
             window.activateWindow()
+            MainWindow._update_main_routine_summary_badge_styles(self)
             return
         window = GlobalReviewRequiredWindow(self)
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.review_required_window = window
+        window.finished.connect(
+            lambda _result=0: MainWindow._update_main_routine_summary_badge_styles(
+                self
+            )
+        )
         window.destroyed.connect(
-            lambda _obj=None, target=window: (
-                setattr(self, "review_required_window", None)
-                if getattr(self, "review_required_window", None) is target
-                else None
+            lambda _obj=None, target=window: MainWindow._on_review_required_window_destroyed(
+                self,
+                target,
             )
         )
         window.show()
         window.raise_()
         window.activateWindow()
+        MainWindow._update_main_routine_summary_badge_styles(self)
+
+    def _on_review_required_window_destroyed(self, target) -> None:
+        if getattr(self, "review_required_window", None) is target:
+            self.review_required_window = None
+        MainWindow._update_main_routine_summary_badge_styles(self)
 
     def open_event_record_window(self) -> None:
         open_event_record_prototype(self)

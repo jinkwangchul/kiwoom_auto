@@ -16,7 +16,9 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QLabel,
+    QMainWindow,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -58,7 +60,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
         collector.assert_called()
         self.assertEqual(4, count)
-        self.assertEqual("검토관리(4)", window.btn_review_required.text())
+        self.assertEqual("검토 4", window.btn_review_required.text())
 
     def test_review_required_button_shows_zero_when_collector_empty(self) -> None:
         window = SimpleNamespace(btn_review_required=QLabel())
@@ -73,7 +75,26 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         ):
             gui_windows.MainWindow.update_review_required_button_text(window)
 
-        self.assertEqual("검토관리(0)", window.btn_review_required.text())
+        self.assertEqual("검토 0", window.btn_review_required.text())
+
+    def test_review_required_count_updates_top_summary_labels(self) -> None:
+        label = QLabel("검토")
+        value = QLabel("0")
+        window = SimpleNamespace(
+            btn_review_required=QPushButton(),
+            _main_routine_summary_count_labels={"review": (label, value)},
+            review_required_stock_count=lambda: 3,
+        )
+
+        gui_windows.MainWindow.update_review_required_button_text(window)
+        gui_windows.MainWindow._update_main_routine_summary(
+            window,
+            {"count_badges": (("review", "검토", 99),)},
+        )
+
+        self.assertEqual("검토", label.text())
+        self.assertEqual("3", value.text())
+        self.assertEqual("", window.btn_review_required.text())
 
     def test_monitoring_bottom_button_order_starts_with_global_start(self) -> None:
         window = SimpleNamespace(
@@ -81,23 +102,238 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             btn_auto_trade_setting=QPushButton("자동매매설정"),
             btn_close_all_windows=QPushButton("모든창닫기"),
             btn_log_view=QPushButton("이벤트기록"),
-            btn_review_required=QPushButton("검토관리(0)"),
             btn_exit=QPushButton("종료"),
         )
 
         layout = gui_windows.MainWindow._create_button_area(window)
 
+        self.assertIs(window.main_status_message_label, layout.itemAt(0).widget())
         self.assertEqual(
             [
                 "▶ 운영시작",
                 "자동매매설정",
                 "이벤트기록",
-                "검토관리(0)",
                 "모든창닫기",
                 "종료",
             ],
-            [layout.itemAt(index).widget().text() for index in range(layout.count())],
+            [
+                widget.text()
+                for index in range(layout.count())
+                for widget in (layout.itemAt(index).widget(),)
+                if isinstance(widget, QPushButton)
+            ],
         )
+
+    def test_monitoring_bottom_buttons_use_expanded_equal_widths_and_bottom_margin(self) -> None:
+        buttons = [
+            QPushButton("▶ 운영시작"),
+            QPushButton("자동매매설정"),
+            QPushButton("이벤트"),
+            QPushButton("모든창닫기"),
+            QPushButton("종료"),
+        ]
+        window = SimpleNamespace(
+            btn_start=buttons[0],
+            btn_auto_trade_setting=buttons[1],
+            btn_log_view=buttons[2],
+            btn_close_all_windows=buttons[3],
+            btn_exit=buttons[4],
+        )
+        container = QWidget()
+        container.setLayout(gui_windows.MainWindow._create_button_area(window))
+        container.resize(1200, 52)
+        container.show()
+        self.app.processEvents()
+        try:
+            margins = container.layout().contentsMargins()
+            self.assertEqual(24, margins.left())
+            self.assertEqual(6, margins.bottom())
+            self.assertEqual(24, window.main_status_message_label.geometry().left())
+
+            widths = [button.width() for button in buttons]
+            old_equal_width = (container.contentsRect().width() - (8 * 4)) / 5
+            self.assertLessEqual(max(widths) - min(widths), 1)
+            self.assertGreater(widths[0] / old_equal_width, 0.73)
+            self.assertLess(widths[0] / old_equal_width, 0.78)
+            self.assertAlmostEqual(widths[0] / 147.0, 1.20, delta=0.03)
+
+            gaps = [
+                buttons[0].geometry().left()
+                - window.main_status_message_label.geometry().right()
+                - 1
+            ]
+            gaps.extend(
+                buttons[index + 1].geometry().left()
+                - buttons[index].geometry().right()
+                - 1
+                for index in range(len(buttons) - 1)
+            )
+            gaps.append(
+                container.contentsRect().right() - buttons[-1].geometry().right()
+            )
+            self.assertGreater(min(gaps), 8)
+            self.assertLessEqual(max(gaps) - min(gaps), 1)
+            self.assertTrue(all(button.height() == 32 for button in buttons))
+            top_gap = buttons[0].geometry().top() - container.contentsRect().top()
+            bottom_gap = (
+                container.contentsRect().bottom()
+                - buttons[0].geometry().bottom()
+            )
+            self.assertGreater(bottom_gap, top_gap)
+            self.assertGreaterEqual(bottom_gap, 6)
+            self.assertLessEqual(
+                abs(
+                    window.main_status_message_label.geometry().center().y()
+                    - buttons[0].geometry().center().y()
+                ),
+                1,
+            )
+
+            button_geometries = [button.geometry() for button in buttons]
+            window.main_status_message_label.setText("긴 운영 메시지 " * 40)
+            self.app.processEvents()
+            self.assertEqual(
+                button_geometries,
+                [button.geometry() for button in buttons],
+            )
+
+            for width in (900, 1440):
+                container.resize(width, 52)
+                self.app.processEvents()
+                resized_widths = [button.width() for button in buttons]
+                self.assertLessEqual(max(resized_widths) - min(resized_widths), 1)
+                self.assertGreater(
+                    buttons[0].geometry().left()
+                    - window.main_status_message_label.geometry().right(),
+                    1,
+                )
+        finally:
+            container.close()
+
+    def test_main_status_message_uses_hidden_status_bar_and_footer_label(self) -> None:
+        window = QMainWindow()
+        window.main_status_message_label = QLabel()
+
+        gui_windows.MainWindow._bind_main_status_message_to_button_row(window)
+        window.statusBar().showMessage("login succeeded")
+        self.app.processEvents()
+
+        self.assertTrue(window.statusBar().isHidden())
+        self.assertEqual("login succeeded", window.statusBar().currentMessage())
+        self.assertEqual("✓ 서버 연결 완료", window.main_status_message_label.text())
+        self.assertIn("color: #16A34A", window.main_status_message_label.styleSheet())
+        window.close()
+
+    def test_main_footer_keeps_failure_during_lower_priority_update(self) -> None:
+        window = QMainWindow()
+        window.main_status_message_label = QLabel()
+
+        gui_windows.MainWindow._bind_main_status_message_to_button_row(window)
+        window.statusBar().showMessage("server connection failed")
+        window.statusBar().showMessage("준비 완료")
+        self.app.processEvents()
+
+        self.assertEqual("✕ 서버 연결 실패", window.main_status_message_label.text())
+        self.assertEqual("준비 완료", window._main_footer_deferred_raw_message)
+        window._main_footer_deferred_generation += 1
+        window.close()
+
+    def test_internal_status_message_does_not_replace_or_clear_footer(self) -> None:
+        window = QMainWindow()
+        window.main_status_message_label = QLabel()
+
+        gui_windows.MainWindow._bind_main_status_message_to_button_row(window)
+        window.statusBar().showMessage("login succeeded")
+        window.statusBar().showMessage("REAL_READY manual preflight blocked")
+        window.statusBar().clearMessage()
+        self.app.processEvents()
+
+        self.assertEqual("✓ 서버 연결 완료", window.main_status_message_label.text())
+        window.close()
+
+    def test_monitoring_bottom_button_qss_uses_white_default_only_in_footer_scope(self) -> None:
+        root = QWidget()
+        root.setObjectName("mainDashboardRoot")
+
+        gui_windows.MainWindow._apply_main_dashboard_style(SimpleNamespace(), root)
+
+        compact_style = "".join(root.styleSheet().split()).lower()
+        self.assertIn(
+            'qwidget#maindashboardrootqpushbutton[mainbottomactionbutton="true"],'
+            'qwidget#maindashboardrootqpushbutton#secondarybutton'
+            '[mainbottomactionbutton="true"]{background:#ffffff;}',
+            compact_style,
+        )
+        self.assertIn(
+            'qwidget#maindashboardrootqpushbutton[mainbottomactionbutton="true"]:'
+            'hover{background:#f8fafc;}',
+            compact_style,
+        )
+        self.assertIn(
+            'qwidget#maindashboardrootqpushbutton[mainbottomactionbutton="true"]:'
+            'disabled{background:#f8fafc;}',
+            compact_style,
+        )
+        self.assertIn(
+            'qwidget#maindashboardrootqpushbutton{min-height:28px;padding:4px10px;'
+            'background:#eef2f7;',
+            compact_style,
+        )
+        root.close()
+
+    def test_review_manager_badge_is_green_only_while_single_window_is_open(self) -> None:
+        badge = QPushButton()
+        review_label = QLabel("검토", badge)
+        review_value = QLabel("0", badge)
+        window = SimpleNamespace(
+            btn_review_required=badge,
+            review_required_window=None,
+            review_required_stock_count=lambda: 3,
+            _main_routine_summary_count_labels={
+                "review": (review_label, review_value)
+            },
+            _main_routine_summary_count_buttons={"review": badge},
+            _main_routine_display_level="stock",
+            _main_routine_stock_scope="all",
+            _main_routine_excluded_only=False,
+        )
+        dialog = QDialog()
+        dialog.refresh_review_items = MagicMock()
+        gui_windows.MainWindow.update_review_required_button_text(window)
+        gui_windows.MainWindow._update_main_routine_summary_badge_styles(window)
+        self.assertEqual("3", review_value.text())
+        self.assertIn(
+            gui_windows.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+            badge.styleSheet(),
+        )
+
+        with patch.object(
+            gui_windows,
+            "GlobalReviewRequiredWindow",
+            return_value=dialog,
+        ) as window_factory:
+            gui_windows.MainWindow.open_review_required_window(window)
+            self.app.processEvents()
+            self.assertIn(
+                gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+                badge.styleSheet(),
+            )
+
+            gui_windows.MainWindow.open_review_required_window(window)
+            window_factory.assert_called_once_with(window)
+            dialog.refresh_review_items.assert_called_once_with()
+
+            dialog.close()
+            self.app.processEvents()
+            self.assertIn(
+                gui_windows.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+                badge.styleSheet(),
+            )
+            self.assertNotIn(
+                gui_windows.AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+                badge.styleSheet(),
+            )
+            self.assertEqual("3", review_value.text())
 
     def test_badge_click_selects_and_double_click_requests_action(self) -> None:
         on_click = MagicMock()

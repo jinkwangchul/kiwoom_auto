@@ -52,9 +52,11 @@ from state_policy import (
     validate_buy_time_range,
 )
 from gui_auto_trade_policy import (
+    auto_trade_setting_current_session_trade_started,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_trade_started,
 )
+from gui_stock_data import normalize_stock_code
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
     is_emergency_stopped_state,
@@ -77,6 +79,9 @@ EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
     }
 )
 OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
+OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE = (
+    "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
+)
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -127,6 +132,51 @@ def auto_trade_stock_operation_excluded(stock_dir: Path) -> bool:
     return is_operation_excluded(config)
 
 
+def auto_trade_operation_exclusion_mutation_decision(
+    window,
+    target: tuple[Path, str, str],
+    excluded: bool,
+) -> dict[str, object]:
+    """Block direct exclusion of a current-session running stock."""
+
+    stock_dir, code, _name = target
+    clean_code = normalize_stock_code(code)
+    current_running = False
+    running_getter = getattr(window, "running_registered_operation_targets", None)
+    running_targets: tuple[object, ...] | None = None
+    if callable(running_getter):
+        try:
+            running_targets = tuple(running_getter())
+        except Exception:
+            running_targets = None
+    if running_targets is not None:
+        target_path = Path(stock_dir).resolve()
+        current_running = any(
+            (
+                clean_code
+                and normalize_stock_code(running_code) == clean_code
+            )
+            or Path(running_dir).resolve() == target_path
+            for running_dir, running_code, _running_name in running_targets
+        )
+    else:
+        state = read_json_dict(Path(stock_dir) / "state.json")
+        current_running = auto_trade_setting_current_session_trade_started(
+            window,
+            auto_trade_setting_trade_started(state),
+            clean_code,
+        )
+
+    blocked = bool(excluded and current_running)
+    return {
+        "allowed": not blocked,
+        "reason": "CURRENT_RUNNING_OPERATION_EXCLUSION_BLOCKED" if blocked else "",
+        "stock_code": clean_code,
+        "current_running": current_running,
+        "excluded": bool(excluded),
+    }
+
+
 def set_auto_trade_stock_operation_excluded(stock_dir: Path, excluded: bool) -> bool:
     config_path = Path(stock_dir) / "config.json"
     config = read_json_dict(config_path)
@@ -156,6 +206,16 @@ def auto_trade_set_stock_operation_exclusion(
     stock_dir, code, name = target
     config_path = stock_dir / "config.json"
     config = read_json_dict(config_path) or default_config()
+    decision = auto_trade_operation_exclusion_mutation_decision(
+        window,
+        target,
+        excluded,
+    )
+    if decision.get("allowed") is not True:
+        status_message = getattr(window, "statusBarMessage", None)
+        if callable(status_message):
+            status_message(OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE)
+        return False
     exclusion_changed = is_operation_excluded(config) != bool(excluded)
     config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
     config["updated_at"] = now_text()

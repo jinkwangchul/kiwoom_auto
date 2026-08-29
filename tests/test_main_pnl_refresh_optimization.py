@@ -221,8 +221,8 @@ class MainPnlRefreshOptimizationTests(unittest.TestCase):
             )
             MainWindow._update_main_routine_summary(host, changed)
 
-        self.assertEqual(2, styles.call_count)
-        self.assertEqual(1, labels["review"][1].set_text_count)
+        self.assertEqual(1, styles.call_count)
+        self.assertEqual(0, labels["review"][1].set_text_count)
         self.assertEqual(1, labels["stock"][1].set_text_count)
 
     def test_stock_cell_set_data_runs_only_when_projected_pnl_changes(self) -> None:

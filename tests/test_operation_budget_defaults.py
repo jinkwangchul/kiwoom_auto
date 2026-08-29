@@ -293,20 +293,126 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )["value"],
         )
 
-    def test_amount_without_explicit_value_or_current_price_displays_waiting(self) -> None:
+    def test_amount_without_current_price_uses_persistent_or_unset_display(self) -> None:
         display = main_loader.stock_initial_buy_display(
             {"trade_amount_type": "AMOUNT", "buy_amount": 0},
             current_price=None,
         )
-        self.assertEqual("대기", display["value_text"])
+        self.assertEqual("-", display["value_text"])
         self.assertNotEqual("0원", display["value_text"])
 
         explicit = main_loader.stock_initial_buy_display(
             {"trade_amount_type": "AMOUNT", "buy_amount": 350_000},
             current_price=None,
         )
-        self.assertEqual("대기", explicit["value_text"])
+        self.assertEqual("350,000원", explicit["value_text"])
         self.assertEqual(350_000, explicit["value"])
+
+    def test_budget_waiting_display_is_limited_to_server_auth_pending(self) -> None:
+        connection = SimpleNamespace(value=False)
+        authentication_states: dict[str, str] = {}
+        fresh = SimpleNamespace(value=None)
+        operation_host = SimpleNamespace(
+            fresh_monitoring_market_information_state=lambda _code: fresh.value,
+        )
+        window = SimpleNamespace(
+            kiwoom_api=SimpleNamespace(is_connected=lambda: connection.value),
+            selected_account_no=lambda: "12345678",
+            _account_authentication_states=authentication_states,
+            main_monitoring_auto_trade_operation_host=lambda: operation_host,
+        )
+        stock = {
+            "code": "012210",
+            "name": "삼미금속",
+            "stock_path": "",
+            "config": {
+                "trade_amount_type": "AMOUNT",
+                "buy_amount": 350_000,
+                "buy_limit_enabled": True,
+                "buy_limit_amount": 900_000,
+            },
+            "state": {},
+        }
+
+        def display_values() -> tuple[str, str]:
+            initial_buy = main_loader.main_stock_resolved_initial_buy_display(
+                window,
+                stock,
+                stock["config"],
+            )
+            limit_text = main_loader._routine_tree_stock_metric_values(window, stock)[2]
+            return str(initial_buy["value_text"]), limit_text
+
+        self.assertEqual(main_loader.LOGIN_NOT_STARTED, main_loader.main_budget_display_auth_state(window))
+        self.assertEqual(("350,000원", "한도(900,000)"), display_values())
+
+        connection.value = True
+        self.assertEqual(main_loader.SERVER_AUTH_PENDING, main_loader.main_budget_display_auth_state(window))
+        self.assertEqual(("대기", "한도(대기)"), display_values())
+
+        authentication_states["12345678"] = "READY"
+        self.assertEqual(main_loader.SERVER_AUTH_COMPLETE, main_loader.main_budget_display_auth_state(window))
+        self.assertEqual(("대기", "한도(대기)"), display_values())
+
+        fresh.value = SimpleNamespace(
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            last_price=8_870,
+        )
+        self.assertEqual(("350,000원", "한도(900,000)"), display_values())
+
+        connection.value = False
+        authentication_states.clear()
+        fresh.value = None
+        self.assertEqual(("350,000원", "한도(900,000)"), display_values())
+        connection.value = True
+        self.assertEqual(("대기", "한도(대기)"), display_values())
+
+    def test_auth_complete_without_price_keeps_budget_values_waiting(self) -> None:
+        operation_host = SimpleNamespace(
+            fresh_monitoring_market_information_state=lambda _code: None,
+        )
+        window = SimpleNamespace(
+            kiwoom_api=SimpleNamespace(is_connected=lambda: True),
+            selected_account_no=lambda: "12345678",
+            _account_authentication_states={"12345678": "READY"},
+            main_monitoring_auto_trade_operation_host=lambda: operation_host,
+        )
+        stock = {
+            "code": "012210",
+            "name": "삼미금속",
+            "stock_path": "",
+            "config": {
+                "trade_amount_type": "AMOUNT",
+                "buy_amount": 0,
+                "buy_limit_enabled": True,
+                "buy_limit_amount": None,
+            },
+            "state": {},
+        }
+
+        initial_buy = main_loader.main_stock_resolved_initial_buy_display(
+            window,
+            stock,
+            stock["config"],
+        )
+        limit_text = main_loader._routine_tree_stock_metric_values(window, stock)[2]
+
+        self.assertEqual("대기", initial_buy["value_text"])
+        self.assertEqual("한도(대기)", limit_text)
+
+    def test_auth_state_refresh_clears_budget_cache_and_reloads_canonical_values(self) -> None:
+        cache = {"012210": {"amount": 350_000}}
+        reload_table = MagicMock()
+        window = SimpleNamespace(
+            _main_stock_resolved_starting_budget_cache=cache,
+            load_routine_table=reload_table,
+        )
+
+        gui_windows.MainWindow._refresh_start_budget_displays_for_auth_state(window)
+
+        self.assertEqual({}, cache)
+        reload_table.assert_called_once_with()
 
     def test_stock_starting_budget_amount_reuses_initial_budget_contract(self) -> None:
         policy = {
@@ -349,7 +455,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )
         )
 
-    def test_limit_waits_then_uses_first_current_price_without_fluctuation(self) -> None:
+    def test_limit_requires_price_then_uses_first_current_price_without_fluctuation(self) -> None:
         live = SimpleNamespace(value=None)
         operation_host = SimpleNamespace(
             fresh_monitoring_market_information_state=lambda _code: live.value,
@@ -388,7 +494,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )
             later_result = main_loader._routine_tree_stock_metric_values(window, stock)
 
-        self.assertEqual("한도(대기)", waiting_result[2])
+        self.assertEqual("한도(미설정)", waiting_result[2])
         self.assertEqual(6, len(waiting_result[0]))
         self.assertEqual("권장(1,200,000)", first_result[2])
         self.assertEqual(6, len(first_result[0]))
@@ -554,7 +660,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             self.assertEqual(270_000, minimum)
             self.assertEqual(config, json.loads(config_path.read_text(encoding="utf-8")))
 
-    def test_main_limit_suggestion_waits_without_fresh_price_even_for_configured_amount(self) -> None:
+    def test_prelogin_configured_amount_remains_visible_without_fresh_price(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             stock_dir = Path(temp_dir) / "012210_삼미금속"
             stock_dir.mkdir()
@@ -598,7 +704,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
             self.assertIsNone(recommended)
             self.assertIsNone(minimum)
-            self.assertEqual(("금액", "대기"), (display["badge"], display["value_text"]))
+            self.assertEqual(("금액", "350,000원"), (display["badge"], display["value_text"]))
             self.assertEqual(config, json.loads(config_path.read_text(encoding="utf-8")))
 
     def test_resolved_starting_budget_changes_only_for_setting_or_session_event(self) -> None:
@@ -1240,7 +1346,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host._routine_stock_buy_limit_editor.deleteLater()
             table.close()
 
-    def test_initial_budget_editor_opens_without_current_price(self) -> None:
+    def test_initial_budget_entry_opens_shared_dialog_without_current_price(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
@@ -1266,6 +1372,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host._stock_config_path_for_routine_row = MagicMock(
                 return_value=config_path
             )
+            host._open_running_budget_adjustment_dialog = MagicMock()
             host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
@@ -1275,12 +1382,20 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
             host.start_routine_stock_initial_buy_edit(0)
 
-            self.assertIsNotNone(host._routine_stock_initial_buy_editor)
-            self.assertEqual("350000", host._routine_stock_initial_buy_editor.text())
-            host._routine_stock_initial_buy_editor.deleteLater()
+            host._open_running_budget_adjustment_dialog.assert_called_once_with(
+                0,
+                config_path,
+            )
+            self.assertEqual(
+                [],
+                table.viewport().findChildren(
+                    QLineEdit,
+                    "routineStockInitialBuyEditor",
+                ),
+            )
             table.close()
 
-    def test_initial_budget_editor_uses_main_row_projection_when_available(self) -> None:
+    def test_initial_budget_projection_does_not_create_inline_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
@@ -1310,6 +1425,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host._stock_config_path_for_routine_row = MagicMock(
                 return_value=config_path
             )
+            host._open_running_budget_adjustment_dialog = MagicMock()
             host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
@@ -1319,12 +1435,20 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
             host.start_routine_stock_initial_buy_edit(0)
 
-            self.assertIsNotNone(host._routine_stock_initial_buy_editor)
-            self.assertEqual("60000", host._routine_stock_initial_buy_editor.text())
-            host._routine_stock_initial_buy_editor.deleteLater()
+            host._open_running_budget_adjustment_dialog.assert_called_once_with(
+                0,
+                config_path,
+            )
+            self.assertEqual(
+                [],
+                table.viewport().findChildren(
+                    QLineEdit,
+                    "routineStockInitialBuyEditor",
+                ),
+            )
             table.close()
 
-    def test_initial_quantity_editor_uses_main_row_projection_when_available(self) -> None:
+    def test_initial_quantity_projection_does_not_create_inline_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
@@ -1354,6 +1478,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host._stock_config_path_for_routine_row = MagicMock(
                 return_value=config_path
             )
+            host._open_running_budget_adjustment_dialog = MagicMock()
             host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
@@ -1363,10 +1488,17 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
             host.start_routine_stock_initial_buy_edit(0)
 
-            self.assertIsNotNone(host._routine_stock_initial_buy_editor)
-            self.assertEqual("10", host._routine_stock_initial_buy_editor.text())
-            self.assertEqual("QUANTITY", host._routine_stock_initial_buy_editor_mode)
-            host._routine_stock_initial_buy_editor.deleteLater()
+            host._open_running_budget_adjustment_dialog.assert_called_once_with(
+                0,
+                config_path,
+            )
+            self.assertEqual(
+                [],
+                table.viewport().findChildren(
+                    QLineEdit,
+                    "routineStockInitialBuyEditor",
+                ),
+            )
             table.close()
 
     def _initial_budget_finish_host(
@@ -1770,14 +1902,14 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
 
-        self.assertEqual((2, 0), (first, second))
+        self.assertEqual((1, 0), (first, second))
         self.assertEqual(800_000, recommended["buy_limit_amount"])
         self.assertEqual(BUY_LIMIT_SOURCE_RECOMMENDED, recommended["buy_limit_source"])
         self.assertEqual(600_000, manual["buy_limit_amount"])
         self.assertEqual(BUY_LIMIT_SOURCE_MANUAL, manual["buy_limit_source"])
         self.assertEqual(700_000, unknown["buy_limit_amount"])
         self.assertNotIn("buy_limit_source", unknown)
-        self.assertIsNone(waiting["buy_limit_amount"])
+        self.assertEqual(900_000, waiting["buy_limit_amount"])
         self.assertEqual(BUY_LIMIT_SOURCE_RECOMMENDED, waiting["buy_limit_source"])
         self.assertEqual({}, host._main_stock_resolved_starting_budget_cache)
         self.assertEqual([], host.kiwoom_api.method_calls)

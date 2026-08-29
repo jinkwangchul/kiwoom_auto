@@ -2252,7 +2252,10 @@ from gui_auto_trade_display import (
     SORT_ROLE,
     SortableTableWidgetItem,
 )
-from gui_auto_trade_policy import preserve_active_participant_start_budget_fields
+from gui_auto_trade_policy import (
+    START_BUDGET_PROTECTED_FIELDS,
+    preserve_active_participant_start_budget_fields,
+)
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_policy import (
     auto_trade_setting_ats_after_regular_blocked,
@@ -2350,11 +2353,13 @@ from gui_auto_trade_timer import (
 from gui_operation_ui_context import refresh_auto_trade_views
 from gui_auto_trade_status_ops import (
     OPERATION_EXCLUDED_CONFIG_KEY,
+    OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE,
     append_changelog,
     append_stock_log,
     auto_trade_apply_schedule_times_to_targets,
     auto_trade_clear_selected_stock_operation_exclusions,
     auto_trade_finalize_operation_mode_result,
+    auto_trade_operation_exclusion_mutation_decision,
     auto_trade_operation_policy_protected_status,
     auto_trade_recalculate_all_status_by_operation_policy,
     auto_trade_recalculate_stock_status_by_operation_policy,
@@ -3705,6 +3710,26 @@ class StockPolicyOverrideDialog(QDialog):
                 current_state=read_json_dict(self.stock_dir / "state.json"),
             )
         )
+        preserved_fields = tuple(
+            field
+            for field in START_BUDGET_PROTECTED_FIELDS
+            if current_config.get(field) != self.config.get(field)
+        )
+        for field in START_BUDGET_PROTECTED_FIELDS:
+            if field in current_config:
+                self.config[field] = current_config[field]
+            else:
+                self.config.pop(field, None)
+        if preserved_fields:
+            self._start_budget_preservation_result = {
+                **self._start_budget_preservation_result,
+                "canonical_fields_preserved": True,
+                "preserved_fields": preserved_fields,
+                "reason": str(
+                    self._start_budget_preservation_result.get("reason")
+                    or "START_BUDGET_CANONICAL_FIELDS_PRESERVED"
+                ),
+            }
         self.config["updated_at"] = now_text()
         self.config_path.write_text(
             json.dumps(self.config, ensure_ascii=False, indent=2) + "\n",
@@ -3803,17 +3828,18 @@ def handle_stock_name_operation_exclusion_double_click(
     host,
     target: tuple[Path, str, str],
 ) -> bool:
-    running_targets_getter = getattr(
+    stock_dir, _code, _name = target
+    config = read_json_dict(stock_dir / "config.json") or default_config()
+    requested_excluded = not is_operation_excluded(config)
+    decision = auto_trade_operation_exclusion_mutation_decision(
         host,
-        "running_registered_operation_targets",
-        None,
+        target,
+        requested_excluded,
     )
-    if callable(running_targets_getter) and running_targets_getter():
+    if decision.get("allowed") is not True:
         status_message = getattr(host, "statusBarMessage", None)
         if callable(status_message):
-            status_message(
-                "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
-            )
+            status_message(OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE)
         return False
     changed = bool(host.toggle_stock_operation_exclusion(target, refresh=False))
     if not changed:

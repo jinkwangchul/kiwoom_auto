@@ -381,20 +381,20 @@ def auto_trade_update_global_operation_button_state(window) -> None:
     global_emergency_stop = operation_state.get("emergency_stop") is True
     today_started = today_operation_start_evidence(operation_state)
     if running:
-        text, foreground, background, hover_background = (
-            "▶ 운영중", "#15803D", "#F8FAFC", "#F8FAFC"
+        text, foreground, background, hover_background, disabled_background = (
+            "▶ 운영중", "#15803D", "#FFFFFF", "#F8FAFC", "#FFFFFF"
         )
     elif today_started:
-        text, foreground, background, hover_background = (
-            "● 운영정지", "#111827", "#F8FAFC", "#F8FAFC"
+        text, foreground, background, hover_background, disabled_background = (
+            "● 운영정지", "#111827", "#FFFFFF", "#F8FAFC", "#FFFFFF"
         )
     elif global_emergency_stop:
-        text, foreground, background, hover_background = (
-            "긴급정지", "#991B1B", "#FEF2F2", "#FEF2F2"
+        text, foreground, background, hover_background, disabled_background = (
+            "긴급정지", "#991B1B", "#FFFFFF", "#FEF2F2", "#FEF2F2"
         )
     else:
-        text, foreground, background, hover_background = (
-            "■ 운영시작", "#1D4ED8", "#F8FAFC", "#F8FAFC"
+        text, foreground, background, hover_background, disabled_background = (
+            "■ 운영시작", "#1D4ED8", "#FFFFFF", "#F8FAFC", "#FFFFFF"
         )
 
     window.btn_start.setText(text)
@@ -418,7 +418,7 @@ def auto_trade_update_global_operation_button_state(window) -> None:
         "QPushButton:disabled {"
         f"color: {foreground};"
         "border-color: #D1D5DB;"
-        f"background-color: {background};"
+        f"background-color: {disabled_background};"
         "}"
     )
     window.btn_start.setEnabled(

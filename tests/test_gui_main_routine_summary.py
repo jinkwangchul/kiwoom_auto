@@ -96,7 +96,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            "그룹(2)  루틴(3)  종목(7)  운영(2)  대기(1)  제외(2)  검토(2)",
+            "그룹(2)  루틴(3)  종목(5)  운영(2)  대기(1)  제외(2)  검토(2)",
             projection["counts_text"],
         )
         self.assertEqual("수익(+60 / +5.45%)", projection["profit_text"])
@@ -104,7 +104,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             (
                 ("group", "그룹", 2),
                 ("routine", "루틴", 3),
-                ("stock", "종목", 7),
+                ("stock", "종목", 5),
                 ("operation", "운영", 2),
                 ("waiting", "대기", 1),
                 ("excluded", "제외", 2),
@@ -214,13 +214,13 @@ class MainRoutineSummaryTests(unittest.TestCase):
         )
         projection = updater.call_args.args[0]
         self.assertEqual(
-            {"group": 3, "routine": 4, "stock": 16},
+            {"group": 3, "routine": 4, "stock": 10},
             {
                 key: badge_values(projection)[key]
                 for key in ("group", "routine", "stock")
             },
         )
-        self.assertIn("그룹(3)  루틴(4)  종목(16)", projection["counts_text"])
+        self.assertIn("그룹(3)  루틴(4)  종목(10)", projection["counts_text"])
 
     def test_instance_counts_reuse_common_current_running_targets(self) -> None:
         instance = SimpleNamespace(instance_id="instance-a")
@@ -627,12 +627,14 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 {host._main_routine_summary_number_slot_width},
                 {value.width() for _label, value in count_labels.values()},
             )
-            self.assertTrue(all(badge.isCheckable() for badge in count_badges))
+            self.assertTrue(all(badge.isCheckable() for badge in count_badges[:-1]))
+            self.assertFalse(count_badges[-1].isCheckable())
             self.assertTrue(all(badge.focusPolicy() == Qt.NoFocus for badge in count_badges))
             group_label = count_labels["group"][0]
             valid_badge = host._main_routine_valid_button
             valid_separator = host._main_routine_summary_valid_separator
             review_badge = count_badges[-1]
+            self.assertIs(host.btn_review_required, review_badge)
             valid_x = valid_badge.mapTo(summary, valid_badge.rect().topLeft()).x()
             separator_x = valid_separator.mapTo(
                 summary,
@@ -805,7 +807,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_stock_scopes_project_all_current_stopped_excluded_and_review_rows(self) -> None:
+    def test_stock_scopes_exclude_review_rows_from_main_monitoring(self) -> None:
         records = [
             {"code": "000001", "name": "Running", "stock_path": "stocks/000001_Running"},
             {"code": "000002", "name": "Stopped", "stock_path": "stocks/000002_Stopped"},
@@ -862,13 +864,16 @@ class MainRoutineSummaryTests(unittest.TestCase):
 
         self.assertEqual(["000001", "000002"], codes(projected["normal"]))
         self.assertEqual(
-            ["000001", "000002", "000003", "000004"],
+            ["000001", "000002", "000003"],
             codes(projected["all"]),
         )
         self.assertEqual(["000001"], codes(projected["operation"]))
         self.assertEqual(["000002"], codes(projected["waiting"]))
         self.assertEqual(["000003"], codes(projected["excluded"]))
-        self.assertEqual(["000004"], codes(projected["review"]))
+        self.assertEqual(
+            ["000001", "000002", "000003"],
+            codes(projected["review"]),
+        )
         self.assertEqual(4, projected["all"]["registered"])
         self.assertEqual(1, projected["all"]["excluded"])
         self.assertEqual(1, projected["all"]["review"])
@@ -952,6 +957,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
             patch.object(gui_windows.MainWindow, "refresh_startup_recovery_status", return_value={}),
             patch.object(gui_windows.MainWindow, "refresh_all"),
+            patch.object(gui_windows.MainWindow, "open_review_required_window") as open_review,
         ):
             window = gui_windows.MainWindow()
         try:
@@ -1022,10 +1028,9 @@ class MainRoutineSummaryTests(unittest.TestCase):
             self.assertTrue(top["stock"].isChecked())
 
             top["review"].click()
-            self.assertEqual("review", window._main_routine_stock_scope)
-            self.assertTrue(top["review"].isChecked())
-            top["review"].click()
             self.assertEqual("all", window._main_routine_stock_scope)
+            self.assertFalse(top["review"].isChecked())
+            open_review.assert_called_once()
 
             top["operation"].click()
             self.assertEqual("operation", window._main_routine_stock_scope)
@@ -1079,7 +1084,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
                 patch.object(table_loader, "current_stock_trade_counts_by_code", return_value={}),
             ):
                 table_loader.main_load_routine_table(host)
-                collector.assert_called_once_with(window=host, stock_scope="review")
+                collector.assert_called_once_with(window=host, stock_scope="normal")
 
                 host._main_routine_stock_scope = "all"
                 host._main_routine_valid_only = False

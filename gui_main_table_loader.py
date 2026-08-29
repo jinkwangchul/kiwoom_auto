@@ -85,6 +85,7 @@ from gui_auto_trade_display import (
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_integrity import is_operation_excluded, is_review_required_state
 from gui_auto_trade_policy import (
+    auto_trade_start_budget_current_running,
     auto_trade_stock_operation_category,
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
@@ -121,6 +122,35 @@ ROUTINE_MONITORING_HEADERS = (
     "사용률",
     "수익률",
 )
+
+LOGIN_NOT_STARTED = "LOGIN_NOT_STARTED"
+SERVER_AUTH_PENDING = "SERVER_AUTH_PENDING"
+SERVER_AUTH_COMPLETE = "SERVER_AUTH_COMPLETE"
+
+
+def main_budget_display_auth_state(window) -> str:
+    api = getattr(window, "kiwoom_api", None)
+    is_connected = getattr(api, "is_connected", None)
+    try:
+        connected = callable(is_connected) and is_connected() is True
+    except Exception:
+        connected = False
+    if not connected:
+        return LOGIN_NOT_STARTED
+
+    account_getter = getattr(window, "selected_account_no", None)
+    try:
+        account = str(account_getter() if callable(account_getter) else "").strip()
+    except Exception:
+        account = ""
+    authentication_states = getattr(window, "_account_authentication_states", None)
+    if (
+        account
+        and isinstance(authentication_states, dict)
+        and str(authentication_states.get(account) or "").strip().upper() == "READY"
+    ):
+        return SERVER_AUTH_COMPLETE
+    return SERVER_AUTH_PENDING
 
 MAIN_MONITORING_TABLE_FONT_FAMILY = "Malgun Gothic"
 MAIN_MONITORING_CELL_FONT_FAMILY = "Gulim"
@@ -255,7 +285,7 @@ ROUTINE_AGGREGATE_LABELS = {
 }
 ROUTINE_AGGREGATE_NUMBER_SAMPLES = ("199", "999")
 ROUTINE_INSTANCE_AMOUNT_SAMPLES = {
-    "limit_amount": ("-99,999,999", "99,999,999", "미설정", "대기", "확인 필요"),
+    "limit_amount": ("-99,999,999", "99,999,999", "미설정", "대기"),
     "consumed_amount": ("99,999,999",),
     "consumed_rate": ("100.0%", "-"),
     "profit_amount": ("-99,999,999", "+99,999,999"),
@@ -710,17 +740,20 @@ def stock_initial_buy_display(
             "value_text": f"{value:,}주",
         }
     configured = safe_int_value(config.get("buy_amount"), 0)
-    suggested = effective_amount_starting_budget(
-        current_price,
-        defaults["amount_multiplier"],
+    suggested = (
+        None
+        if configured > 0
+        else effective_amount_starting_budget(
+            current_price,
+            defaults["amount_multiplier"],
+        )
     )
     value = configured if configured > 0 else int(suggested or 0)
-    waiting_for_price = suggested is None
     return {
         "mode": mode,
         "badge": "금액",
         "value": value,
-        "value_text": "대기" if waiting_for_price else f"{value:,}원",
+        "value_text": f"{value:,}원" if value > 0 else "-",
     }
 
 
@@ -844,7 +877,10 @@ def main_stock_resolved_initial_buy_display(
     policy: dict[str, object] | None = None,
 ) -> dict[str, object]:
     base = stock_initial_buy_display(config, current_price=None, policy=policy)
-    if base.get("mode") != "AMOUNT":
+    auth_state = main_budget_display_auth_state(window)
+    if auth_state == SERVER_AUTH_PENDING:
+        return {**base, "value_text": "대기"}
+    if auth_state == LOGIN_NOT_STARTED:
         return base
     amount = main_stock_resolved_starting_budget(
         window,
@@ -852,10 +888,14 @@ def main_stock_resolved_initial_buy_display(
         config,
         policy=policy,
     )
+    if amount is None:
+        return {**base, "value_text": "대기"}
+    if base.get("mode") != "AMOUNT":
+        return base
     return {
         **base,
-        "value": int(amount or 0),
-        "value_text": "대기" if amount is None else f"{amount:,}원",
+        "value": int(amount),
+        "value_text": f"{amount:,}원",
     }
 
 
@@ -1195,13 +1235,13 @@ def routine_instance_buy_limit_text(
     if not enabled:
         return "한도(미설정)"
     if amount is None:
-        return "한도(대기)"
+        return "한도(미설정)"
     try:
         limit_value = int(float(str(amount).replace(",", "").strip()))
     except (TypeError, ValueError):
-        return "한도(확인 필요)"
+        return "한도(미설정)"
     if limit_value <= 0:
-        return "한도(확인 필요)"
+        return "한도(미설정)"
     return f"한도({_format_plain_amount(limit_value)})"
 
 
@@ -1687,7 +1727,6 @@ def _instance_stock_counts(
         "operation",
         "waiting",
         "excluded",
-        "review",
         "all_non_review",
     }:
         if operation_excluded_only is True:
@@ -1764,9 +1803,7 @@ def _instance_stock_counts(
             else:
                 item["waiting"] += 1
         if clean_scope == "all":
-            include_stock_row = True
-        elif clean_scope == "review":
-            include_stock_row = review_required
+            include_stock_row = not review_required
         elif clean_scope == "excluded":
             include_stock_row = operation_excluded and not review_required
         elif clean_scope == "operation":
@@ -2020,7 +2057,7 @@ def _main_routine_summary_projection(
         for count in instance_counts.values()
     )
     displayed_stock_count = (
-        registered
+        max(0, registered - review)
         if stock_badge_count is None
         else max(0, int(stock_badge_count))
     )
@@ -2203,8 +2240,10 @@ def _main_routine_effective_stock_scope(window) -> str:
     ).strip().lower()
     if bool(getattr(window, "_main_routine_excluded_only", False)):
         stock_scope = "excluded"
+    if stock_scope == "review":
+        stock_scope = "all"
     if stock_scope not in {
-        "normal", "all", "operation", "waiting", "excluded", "review"
+        "normal", "all", "operation", "waiting", "excluded"
     }:
         stock_scope = "normal"
     if bool(getattr(window, "_main_routine_valid_only", False)) and stock_scope == "all":
@@ -2802,7 +2841,12 @@ def _routine_tree_stock_metric_values(
         if buy_limit_enabled
         else None
     )
-    if limit_state == "UNSET":
+    auth_state = main_budget_display_auth_state(window)
+    if auth_state == SERVER_AUTH_PENDING or (
+        auth_state == SERVER_AUTH_COMPLETE and starting_budget is None
+    ):
+        limit_text = "한도(대기)"
+    elif limit_state == "UNSET":
         limit_text = "한도(미설정)"
     elif limit_state == "CONFIGURED":
         limit_text = routine_instance_buy_limit_text(
@@ -2812,7 +2856,7 @@ def _routine_tree_stock_metric_values(
     elif suggested_limit is not None:
         limit_text = f"권장({_format_plain_amount(suggested_limit)})"
     else:
-        limit_text = "한도(대기)"
+        limit_text = "한도(미설정)"
     consumed_text = routine_instance_consumed_text(
         consumed_amount=holding_metric.value2,
         buy_limit_enabled=buy_limit_enabled,
@@ -2892,9 +2936,22 @@ def _routine_tree_stock_row(
     )
     if not isinstance(stock_state, dict):
         stock_state = {}
-    display_config, adjustment_display = (
-        project_running_budget_adjustment_display_config(stock_config, stock_state)
-    )
+    if auto_trade_start_budget_current_running(
+        window,
+        stock.get("code"),
+        stock_config,
+        stock_state,
+    ):
+        display_config, adjustment_display = (
+            project_running_budget_adjustment_display_config(stock_config, stock_state)
+        )
+    else:
+        display_config = dict(stock_config)
+        adjustment_display = {
+            "active": False,
+            "hydrated": False,
+            "reason": "NOT_CURRENT_RUNNING",
+        }
     (
         stock_metrics,
         stock_profit_led,
@@ -3261,10 +3318,13 @@ def main_load_routine_table(window) -> None:
             )
             child_relation_ids.append(relation_id)
             count = relation_counts.get(relation_id, _empty_instance_count())
-            buy_limit_text = routine_instance_buy_limit_text(
-                enabled=instance.buy_limit_enabled,
-                amount=instance.buy_limit_amount,
-            )
+            if main_budget_display_auth_state(window) == SERVER_AUTH_PENDING:
+                buy_limit_text = "한도(대기)"
+            else:
+                buy_limit_text = routine_instance_buy_limit_text(
+                    enabled=instance.buy_limit_enabled,
+                    amount=instance.buy_limit_amount,
+                )
             buy_limit_configured = routine_instance_buy_limit_configured(
                 enabled=instance.buy_limit_enabled,
                 amount=instance.buy_limit_amount,

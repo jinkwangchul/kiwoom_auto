@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QMenu,
     QStyle,
+    QStyleOptionMenuItem,
     QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
@@ -1392,6 +1393,53 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
         self.assertIsInstance(
             actions["menu"].style(),
             common_menu._MenuActionColorProxyStyle,
+        )
+        root.close()
+
+    def test_disabled_menu_text_overrides_semantic_color_and_hover_state(self) -> None:
+        root = QMenu()
+        actions = common_menu._add_early_close_menu(
+            root,
+            has_selection=True,
+            operation_policy={"early_close": {"method": "시장가"}},
+        )
+        early_close_action = actions["menu"].menuAction()
+        actions["menu"].setEnabled(False)
+
+        disabled_option = QStyleOptionMenuItem()
+        root.initStyleOption(disabled_option, early_close_action)
+        disabled_color = common_menu._menu_item_text_color(root, disabled_option)
+
+        self.assertEqual(
+            common_menu.CONTEXT_MENU_DISABLED_TEXT_COLOR.lower(),
+            disabled_color.name(),
+        )
+        self.assertNotEqual(
+            common_menu.CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR.lower(),
+            disabled_color.name(),
+        )
+
+        disabled_option.state |= QStyle.State_Selected
+        self.assertEqual(
+            common_menu.CONTEXT_MENU_DISABLED_TEXT_COLOR.lower(),
+            common_menu._menu_item_text_color(root, disabled_option).name(),
+        )
+
+        actions["menu"].setEnabled(True)
+        enabled_option = QStyleOptionMenuItem()
+        root.initStyleOption(enabled_option, early_close_action)
+        self.assertEqual(
+            common_menu.CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR.lower(),
+            common_menu._menu_item_text_color(root, enabled_option).name(),
+        )
+
+        plain_disabled_action = root.addAction("검토정지")
+        plain_disabled_action.setEnabled(False)
+        plain_disabled_option = QStyleOptionMenuItem()
+        root.initStyleOption(plain_disabled_option, plain_disabled_action)
+        self.assertEqual(
+            common_menu.CONTEXT_MENU_DISABLED_TEXT_COLOR.lower(),
+            common_menu._menu_item_text_color(root, plain_disabled_option).name(),
         )
         root.close()
 

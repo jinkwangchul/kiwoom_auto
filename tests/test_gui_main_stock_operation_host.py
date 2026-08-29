@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 import gui_auto_trade_context_menu as context_menu
 import gui_auto_trade_run_control as run_control
 import gui_auto_trade_timer
+import gui_main_stock_context_menu as main_context_menu
 import gui_windows
 from auto_trade_order_execution_boundary import AutoTradeOrderExecutionBoundary
 from gui_auto_trade_operation_host import AutoTradeOperationHost
@@ -188,6 +189,74 @@ class MainStockOperationHostTest(unittest.TestCase):
 
         self.assertNotIn("auto_trade_setting_window", source)
         self.assertIn("refresh_auto_trade_assignment_views", source)
+
+    def test_main_monitor_uses_excluded_management_policy_only_for_scheduled_excluded(self) -> None:
+        context_target = SimpleNamespace(
+            stock_dir=Path("stocks/005930_test"),
+            code="005930",
+            name="test",
+            routine_instance_id="instance-a",
+        )
+        table = Mock()
+        item = Mock()
+        item.row.return_value = 3
+        table.itemAt.return_value = item
+        table.viewport.return_value.mapToGlobal.return_value = QPoint()
+        window = SimpleNamespace(
+            routine_table=table,
+            open_routine_instance_stock_register_from_main_table=Mock(),
+        )
+
+        for selected_modes, operation_excluded, expected in (
+            ({"SCHEDULED"}, True, True),
+            ({"SCHEDULED"}, False, False),
+            ({"CONTINUOUS"}, True, False),
+        ):
+            with self.subTest(
+                selected_modes=selected_modes,
+                operation_excluded=operation_excluded,
+            ):
+                adapter = Mock()
+                adapter.selected_operation_mode_set.return_value = selected_modes
+                adapter.selected_stocks_are_operation_excluded.return_value = (
+                    operation_excluded
+                )
+                adapter.target_snapshot.return_value = [
+                    (context_target.stock_dir, context_target.code, context_target.name)
+                ]
+                with patch.object(
+                    main_context_menu,
+                    "_stock_target_for_row",
+                    return_value=context_target,
+                ), patch.object(
+                    main_context_menu,
+                    "ensure_main_monitoring_context_stock_selected",
+                ), patch.object(
+                    main_context_menu,
+                    "selected_main_monitoring_stock_targets",
+                    return_value=[context_target],
+                ), patch.object(
+                    main_context_menu,
+                    "MainMonitoringStockOperationAdapter",
+                    return_value=adapter,
+                ), patch.object(
+                    main_context_menu,
+                    "selected_emergency_context_state",
+                    return_value=(False, True),
+                ), patch.object(
+                    main_context_menu,
+                    "show_monitor_stock_context_menu",
+                ) as renderer:
+                    shown = main_context_menu.show_main_monitoring_stock_context_menu(
+                        window,
+                        QPoint(),
+                    )
+
+                self.assertTrue(shown)
+                self.assertIs(
+                    expected,
+                    renderer.call_args.kwargs["scheduled_excluded_management"],
+                )
 
     def test_operation_cycle_completion_uses_owner_view_synchronization(self) -> None:
         owner = SimpleNamespace(

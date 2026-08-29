@@ -877,6 +877,8 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
 
     adapter = MainMonitoringStockOperationAdapter(window, targets)
     window._main_monitoring_stock_operation_adapter = adapter
+    selected_modes = adapter.selected_operation_mode_set()
+    operation_excluded = adapter.selected_stocks_are_operation_excluded()
     _has_selected_provenance, has_non_emergency = selected_emergency_context_state(
         (target.stock_dir, target.code, target.name) for target in targets
     )
@@ -936,8 +938,11 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         window.routine_table.viewport().mapToGlobal(position),
         has_selection=True,
         callbacks=callbacks,
-        selected_modes=adapter.selected_operation_mode_set(),
-        operation_excluded=adapter.selected_stocks_are_operation_excluded(),
+        selected_modes=selected_modes,
+        operation_excluded=operation_excluded,
         selected_targets=adapter.target_snapshot(),
+        scheduled_excluded_management=(
+            operation_excluded and selected_modes == {"SCHEDULED"}
+        ),
     )
     return True

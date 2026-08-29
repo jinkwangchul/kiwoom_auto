@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFontMetrics, QValidator
@@ -121,6 +121,45 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             self.assertTrue(result["allowed"])
             self.assertEqual(10, self._read(path)["buy_qty"])
 
+    def test_pre_operation_writer_changes_limit_only_when_dialog_option_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._config_path(Path(temp_dir))
+            self._write(
+                path,
+                {
+                    "trade_amount_type": "AMOUNT",
+                    "buy_amount": 100_000,
+                    "buy_limit_enabled": True,
+                    "buy_limit_amount": 500_000,
+                    "buy_limit_source": "MANUAL",
+                },
+            )
+            owner = self._owner()
+
+            gui_windows.MainWindow._write_stock_initial_buy_config(
+                owner,
+                path,
+                mode="AMOUNT",
+                value=200_000,
+            )
+            unchecked = self._read(path)
+            self.assertEqual(500_000, unchecked["buy_limit_amount"])
+            self.assertEqual("MANUAL", unchecked["buy_limit_source"])
+
+            result = gui_windows.MainWindow._write_stock_initial_buy_config(
+                owner,
+                path,
+                mode="AMOUNT",
+                value=200_000,
+                apply_limit=True,
+                adjusted_limit_amount=800_000,
+            )
+            checked = self._read(path)
+            self.assertTrue(result["allowed"])
+            self.assertTrue(result["limit_changed"])
+            self.assertEqual(800_000, checked["buy_limit_amount"])
+            self.assertEqual("RECOMMENDED", checked["buy_limit_source"])
+
     def test_pre_session_participant_is_locked_without_time_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self._config_path(Path(temp_dir))
@@ -149,35 +188,37 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                 self.assertTrue(result["current_running"])
                 self.assertEqual(7, self._read(path)["buy_qty"])
 
-    def test_active_ui_blocks_mode_toggle_and_value_editor_entry(self) -> None:
+    def test_active_ui_blocks_mode_toggle_but_value_entry_uses_dialog(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self._config_path(Path(temp_dir))
             self._write(path, {"trade_amount_type": "QUANTITY", "buy_qty": 7})
             self._write_state(path)
-            hosts = []
-            for action in (
-                gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode,
-                gui_windows.MainWindow.start_routine_stock_initial_buy_edit,
-            ):
-                host = self._owner("005930")
-                host._main_routine_display_level = "stock"
-                host._main_routine_initial_buy_badge_enabled = lambda: True
-                host._stock_config_path_for_routine_row = lambda _row: path
-                host._stock_start_budget_locked = MethodType(
-                    gui_windows.MainWindow._stock_start_budget_locked, host
-                )
-                host._open_running_budget_adjustment_dialog = MagicMock()
-                host.finish_routine_stock_initial_buy_edit = MagicMock()
-                host._write_stock_initial_buy_config = MagicMock()
-                host.load_routine_table = MagicMock()
-                host.routine_table = SimpleNamespace(item=lambda _row, _column: None)
-                action(host, 0)
-                hosts.append(host)
+            host = self._owner("005930")
+            host._main_routine_display_level = "stock"
+            host._main_routine_initial_buy_badge_enabled = lambda: True
+            host._stock_config_path_for_routine_row = lambda _row: path
+            host._stock_start_budget_locked = MethodType(
+                gui_windows.MainWindow._stock_start_budget_locked, host
+            )
+            host._open_running_budget_adjustment_dialog = MagicMock()
+            host._show_start_budget_mutation_blocked = MagicMock()
+            host.finish_routine_stock_initial_buy_edit = MagicMock()
+            host._write_stock_initial_buy_config = MagicMock()
+            host.load_routine_table = MagicMock()
+            host.routine_table = SimpleNamespace(item=lambda _row, _column: None)
 
-            for host in hosts:
-                host._write_stock_initial_buy_config.assert_not_called()
-                host.finish_routine_stock_initial_buy_edit.assert_not_called()
-                host._open_running_budget_adjustment_dialog.assert_called_once()
+            with patch.object(
+                gui_windows.MainWindow,
+                "_starting_budget_change_current_price",
+                return_value=70_000,
+            ):
+                gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
+                gui_windows.MainWindow.start_routine_stock_initial_buy_edit(host, 0)
+
+            host._write_stock_initial_buy_config.assert_not_called()
+            host.finish_routine_stock_initial_buy_edit.assert_not_called()
+            host._show_start_budget_mutation_blocked.assert_called_once_with(host)
+            host._open_running_budget_adjustment_dialog.assert_called_once_with(0, path)
             self.assertEqual(7, self._read(path)["buy_qty"])
 
     def test_editor_open_before_start_is_blocked_at_enter_or_focusout_commit(self) -> None:
@@ -286,7 +327,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                     self.assertFalse(result["current_running"])
                     self.assertEqual(expected, self._read(path)[field])
 
-    def test_stale_full_config_is_not_preserved_after_operation_stop(self) -> None:
+    def test_stale_full_config_preserves_latest_budget_after_operation_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self._config_path(Path(temp_dir))
             self._write(
@@ -307,11 +348,14 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             StockPolicyOverrideDialog.write_config(dialog)
 
             saved = self._read(path)
-            self.assertEqual("AMOUNT", saved["trade_amount_type"])
-            self.assertEqual(10, saved["buy_qty"])
-            self.assertEqual(200000, saved["buy_amount"])
+            self.assertEqual("QUANTITY", saved["trade_amount_type"])
+            self.assertEqual(7, saved["buy_qty"])
+            self.assertEqual(100000, saved["buy_amount"])
             self.assertTrue(dialog._start_budget_preservation_result["allowed"])
             self.assertFalse(dialog._start_budget_preservation_result["current_running"])
+            self.assertTrue(
+                dialog._start_budget_preservation_result["canonical_fields_preserved"]
+            )
 
     def test_running_budget_dialog_previews_amount_and_keeps_fraction_light(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
@@ -320,6 +364,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             stock_name="005930 삼성전자 | 금액 15,000원 | 0.5주",
             current_price=30000,
             config={"trade_amount_type": "AMOUNT", "buy_amount": 15000},
+            minimum_amount=45_000,
         )
         self.addCleanup(dialog.deleteLater)
 
@@ -353,7 +398,16 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             (dialog.current_badge.width(), dialog.current_badge.height()),
         )
         self.assertIn(gui_windows.INITIAL_BUY_AMOUNT_COLOR, dialog.current_badge.styleSheet())
+        self.assertTrue(dialog.validation_label.isHidden())
+        self.assertEqual(Qt.AlignCenter, dialog.validation_label.alignment())
+        dialog.value_edit.setText("40000")
+        self.assertFalse(dialog.validation_label.isHidden())
+        self.assertEqual(
+            "※ 입력 불가. 최소값은 45,000원 이상입니다.",
+            dialog.validation_label.text(),
+        )
         dialog.value_edit.setText("50000")
+        self.assertTrue(dialog.validation_label.isHidden())
         self.assertIn("1.7주", dialog.changed_reference_label.text())
         self.assertIn(".7", dialog.changed_reference_label.text())
         self.assertNotIn("span", dialog.changed_reference_label.text().lower())
@@ -387,6 +441,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         dialog.value_edit.setText("52")
         self.assertIn("156,000원", dialog.changed_reference_label.text())
         self.assertFalse(hasattr(dialog, "mode_combo"))
+        self.assertTrue(dialog.validation_label.isHidden())
 
         label_texts = [label.text() for label in dialog.findChildren(gui_windows.QLabel)]
         self.assertNotIn("005930 삼성전자", label_texts)
@@ -399,6 +454,131 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.assertEqual("기본예산변경 | 005930 삼성전자", dialog.windowTitle())
         self.assertFalse(any("현재주가" in text for text in label_texts))
         self.assertFalse(any(text in {"변경", "현재 설정", "변경값 입력", "변경 후 참고"} for text in label_texts))
+
+    def test_non_running_dialog_keeps_timing_options_visible_but_disabled(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="005930",
+            stock_name="삼성전자",
+            current_price=3000,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 21},
+            timing_selection_enabled=False,
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertTrue(dialog.immediate_checkbox.isVisibleTo(dialog))
+        self.assertTrue(dialog.next_cycle_checkbox.isVisibleTo(dialog))
+        self.assertFalse(dialog.immediate_checkbox.isEnabled())
+        self.assertFalse(dialog.next_cycle_checkbox.isEnabled())
+        self.assertFalse(dialog.immediate_checkbox.isChecked())
+        self.assertFalse(dialog.next_cycle_checkbox.isChecked())
+        self.assertTrue(dialog.apply_limit_checkbox.isEnabled())
+        dialog.value_edit.setText("25")
+        dialog._validate_and_accept()
+        self.assertEqual("PRE_OPERATION", dialog.result["apply_timing"])
+        self.assertEqual(25, dialog.result["value"])
+
+    def test_amount_budget_requires_environment_minimum_amount(self) -> None:
+        for value in (4_000, 13_304):
+            with self.subTest(value=value):
+                dialog = RunningBudgetAdjustmentDialog(
+                    self.app.activeWindow(),
+                    stock_code="012210",
+                    stock_name="삼미금속",
+                    current_price=8_870,
+                    config={"trade_amount_type": "AMOUNT", "buy_amount": 30_000},
+                    minimum_amount=13_305,
+                )
+                self.addCleanup(dialog.deleteLater)
+                dialog.value_edit.setText(str(value))
+
+                dialog._validate_and_accept()
+
+                self.assertEqual({}, dialog.result)
+                self.assertEqual(
+                    "※ 입력 불가. 최소값은 13,305원 이상입니다.",
+                    dialog.validation_label.text(),
+                )
+
+    def test_amount_budget_minimum_accepts_all_application_timings(self) -> None:
+        cases = (
+            (False, False, 13_305, "PRE_OPERATION"),
+            (True, False, 13_305, "IMMEDIATE"),
+            (True, True, 13_306, "NEXT_CYCLE"),
+        )
+        for timing_enabled, next_cycle, value, expected_timing in cases:
+            with self.subTest(timing=expected_timing, value=value):
+                dialog = RunningBudgetAdjustmentDialog(
+                    self.app.activeWindow(),
+                    stock_code="012210",
+                    stock_name="삼미금속",
+                    current_price=8_870,
+                    config={"trade_amount_type": "AMOUNT", "buy_amount": 30_000},
+                    minimum_amount=13_305,
+                    timing_selection_enabled=timing_enabled,
+                )
+                self.addCleanup(dialog.deleteLater)
+                if next_cycle:
+                    dialog.next_cycle_checkbox.setChecked(True)
+                dialog.value_edit.setText(str(value))
+
+                dialog._validate_and_accept()
+
+                self.assertEqual(value, dialog.result["value"])
+                self.assertEqual(expected_timing, dialog.result["apply_timing"])
+
+    def test_amount_budget_fails_closed_without_resolved_environment_minimum(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="012210",
+            stock_name="삼미금속",
+            current_price=0,
+            config={"trade_amount_type": "AMOUNT", "buy_amount": 30_000},
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.value_edit.setText("30000")
+
+        dialog._validate_and_accept()
+
+        self.assertEqual({}, dialog.result)
+        self.assertTrue(dialog.validation_label.isHidden())
+        self.assertEqual("", dialog.validation_label.text())
+
+    def test_quantity_budget_requires_fresh_current_price(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="012210",
+            stock_name="삼미금속",
+            current_price=0,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 1},
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.value_edit.setText("2")
+
+        dialog._validate_and_accept()
+
+        self.assertEqual({}, dialog.result)
+        self.assertTrue(dialog.validation_label.isHidden())
+        self.assertEqual("", dialog.validation_label.text())
+
+    def test_quantity_budget_rejects_stale_display_price(self) -> None:
+        dialog = RunningBudgetAdjustmentDialog(
+            self.app.activeWindow(),
+            stock_code="012210",
+            stock_name="삼미금속",
+            current_price=8_870,
+            fresh_price_available=False,
+            config={"trade_amount_type": "QUANTITY", "buy_qty": 1},
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.value_edit.setText("2")
+
+        dialog._validate_and_accept()
+
+        self.assertEqual({}, dialog.result)
+        self.assertEqual("현재가 8,870원", dialog.current_price_label.text())
+        self.assertTrue(dialog.validation_label.isHidden())
+        self.assertEqual("", dialog.validation_label.text())
 
     def test_running_budget_dialog_rehydrates_pending_policy_and_limit_choice(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
@@ -428,6 +608,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             stock_name="삼성전자",
             current_price=30000,
             config={"trade_amount_type": "AMOUNT", "buy_amount": 15000},
+            minimum_amount=45_000,
         )
         self.addCleanup(dialog.deleteLater)
 
@@ -452,6 +633,14 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.assertTrue(dialog.immediate_checkbox.isChecked())
         self.assertFalse(dialog.next_cycle_checkbox.isChecked())
         self.assertTrue(dialog.validation_label.isHidden())
+        self.assertEqual(Qt.AlignCenter, dialog.validation_label.alignment())
+
+        dialog.value_edit.setText("40000")
+        self.assertFalse(dialog.validation_label.isHidden())
+        self.assertEqual(
+            "※ 입력 불가. 최소값은 45,000원 이상입니다.",
+            dialog.validation_label.text(),
+        )
 
         dialog.show()
         self.app.processEvents()
@@ -461,7 +650,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             dialog.apply_limit_checkbox.geometry().x(),
         )
         self.assertEqual(
-            9,
+            17 + dialog.validation_label.geometry().height(),
             buttons.geometry().y()
             - (
                 dialog.apply_limit_checkbox.geometry().y()
@@ -474,7 +663,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
         self.assertFalse(dialog.validation_label.isHidden())
         self.assertEqual("변경값을 입력하세요.", dialog.validation_label.text())
 
-    def test_running_budget_entry_routes_both_start_budget_regions_to_dialog(self) -> None:
+    def test_budget_mode_and_value_entries_route_separately(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self._config_path(Path(temp_dir))
             self._write(path, {"trade_amount_type": "QUANTITY", "buy_qty": 7})
@@ -482,22 +671,40 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             host._main_routine_display_level = "stock"
             host._main_routine_initial_buy_badge_enabled = lambda: True
             host._stock_config_path_for_routine_row = lambda _row: path
-            host._stock_start_budget_locked = lambda _path: True
+            host._stock_start_budget_locked = MagicMock(return_value=False)
             host._open_running_budget_adjustment_dialog = MagicMock()
             host.finish_routine_stock_initial_buy_edit = MagicMock()
+            host._stock_default_initial_buy_value = MagicMock(return_value=100_000)
+            host._write_stock_initial_buy_config = MagicMock(
+                return_value={"allowed": True}
+            )
+            host._show_start_budget_mutation_blocked = MagicMock()
             host.load_routine_table = MagicMock()
 
             table_item = MagicMock()
             host.routine_table = SimpleNamespace(item=lambda _row, _column: table_item)
-            for action in (
-                gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode,
-                gui_windows.MainWindow.start_routine_stock_initial_buy_edit,
+            with patch.object(
+                gui_windows.MainWindow,
+                "_starting_budget_change_current_price",
+                return_value=70_000,
             ):
-                action(host, 0)
+                gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
+                gui_windows.MainWindow.start_routine_stock_initial_buy_edit(host, 0)
 
-            self.assertEqual(2, host._open_running_budget_adjustment_dialog.call_count)
-            host.finish_routine_stock_initial_buy_edit.assert_not_called()
-            host.load_routine_table.assert_not_called()
+            host._open_running_budget_adjustment_dialog.assert_called_once_with(0, path)
+            host._stock_start_budget_locked.assert_called_once_with(path)
+            host._stock_default_initial_buy_value.assert_called_once_with(
+                path,
+                "AMOUNT",
+                window=host,
+            )
+            host._write_stock_initial_buy_config.assert_called_once_with(
+                path,
+                mode="AMOUNT",
+                value=100_000,
+            )
+            host.finish_routine_stock_initial_buy_edit.assert_called_once_with(save=True)
+            host.load_routine_table.assert_called_once()
 
     def test_ui_lock_releases_for_retained_stopped_participant(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

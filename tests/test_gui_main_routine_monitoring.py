@@ -1717,11 +1717,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
         self.assertEqual(
             routine_instance_buy_limit_text(enabled=True, amount=None),
-            "\uD55C\uB3C4(\uB300\uAE30)",
+            "\uD55C\uB3C4(\uBBF8\uC124\uC815)",
         )
         self.assertEqual(
             routine_instance_buy_limit_text(enabled=True, amount=0),
-            "\uD55C\uB3C4(\uD655\uC778 \uD544\uC694)",
+            "\uD55C\uB3C4(\uBBF8\uC124\uC815)",
         )
         self.assertEqual(
             routine_instance_consumed_text(
@@ -3432,7 +3432,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window = SimpleNamespace(
                 routine_table=table,
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                kiwoom_api=MagicMock(),
+                kiwoom_api=SimpleNamespace(is_connected=lambda: True),
+                selected_account_no=lambda: "12345678",
+                _account_authentication_states={"12345678": "READY"},
             )
             stock = {
                 "code": "012210",
@@ -3572,7 +3574,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertEqual("한도(1,100,000)", values[11])
                 operation_host.queue_order.assert_not_called()
                 operation_host.send_order.assert_not_called()
-                self.assertEqual([], window.kiwoom_api.method_calls)
 
             self.assertEqual(original_state, state_path.read_bytes())
             self.assertNotEqual(original_config, config_path.read_bytes())
@@ -3697,7 +3698,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             ),
         )
 
-    def test_unset_without_price_double_click_activates_waiting(self) -> None:
+    def test_unset_without_price_double_click_keeps_unset_display(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             stock_dir = Path(temp_dir) / "012210_삼미금속"
             stock_dir.mkdir()
@@ -3730,7 +3731,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 load_routine_table=MagicMock(),
                 start_routine_stock_buy_limit_edit=MagicMock(),
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                kiwoom_api=MagicMock(),
+                kiwoom_api=SimpleNamespace(is_connected=lambda: False),
             )
 
             gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
@@ -3761,12 +3762,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
             self.assertTrue(saved["buy_limit_enabled"])
             self.assertIsNone(saved["buy_limit_amount"])
-            self.assertEqual("한도(대기)", row["stock_values"][11])
+            self.assertEqual("한도(미설정)", row["stock_values"][11])
             self.assertEqual("WAITING", row["buy_limit_source"])
             window.start_routine_stock_buy_limit_edit.assert_not_called()
             operation_host.queue_order.assert_not_called()
             operation_host.send_order.assert_not_called()
-            self.assertEqual([], window.kiwoom_api.method_calls)
 
     def test_waiting_without_price_double_click_unsets_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3800,7 +3800,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 load_routine_table=MagicMock(),
                 start_routine_stock_buy_limit_edit=MagicMock(),
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                kiwoom_api=MagicMock(),
+                kiwoom_api=SimpleNamespace(is_connected=lambda: False),
             )
 
             gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
@@ -3836,7 +3836,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window.start_routine_stock_buy_limit_edit.assert_not_called()
             operation_host.queue_order.assert_not_called()
             operation_host.send_order.assert_not_called()
-            self.assertEqual([], window.kiwoom_api.method_calls)
 
     def test_stock_buy_limit_single_click_keeps_unset_limit_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4342,7 +4341,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual(1, quantity_config["buy_qty"])
             self.assertEqual(0, quantity_config["buy_amount"])
 
-    def test_stock_initial_buy_badge_interaction_is_stock_scope_only(self) -> None:
+    def test_stock_initial_buy_badge_interaction_opens_shared_dialog_in_stock_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
@@ -4359,6 +4358,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window._stock_config_path_for_routine_row = MagicMock(
                 return_value=config_path
             )
+            window._open_running_budget_adjustment_dialog = MagicMock()
             window.finish_routine_stock_initial_buy_edit = MagicMock()
             window.load_routine_table = MagicMock()
 
@@ -4376,14 +4376,16 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window._main_routine_display_level = "stock"
             window.toggle_routine_stock_initial_buy_mode(0)
 
-            changed = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("QUANTITY", changed["trade_amount_type"])
-            self.assertEqual(1, changed["buy_qty"])
+            unchanged = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual("AMOUNT", unchanged["trade_amount_type"])
+            self.assertEqual(20, unchanged["buy_qty"])
             window._stock_config_path_for_routine_row.assert_called_once_with(0)
-            window.finish_routine_stock_initial_buy_edit.assert_called_once_with(
-                save=True
+            window._open_running_budget_adjustment_dialog.assert_called_once_with(
+                0,
+                config_path,
             )
-            window.load_routine_table.assert_called_once_with()
+            window.finish_routine_stock_initial_buy_edit.assert_not_called()
+            window.load_routine_table.assert_not_called()
 
     def test_stock_buy_limit_editor_finish_writes_selected_stock_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

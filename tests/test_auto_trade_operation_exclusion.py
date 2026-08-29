@@ -160,6 +160,98 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             self.assertEqual("운영종목에서 제외됐습니다.", toast.call_args_list[0].args[1])
             self.assertEqual("운영종목으로 전환됐습니다.", toast.call_args_list[1].args[1])
 
+    def test_current_running_stock_cannot_bypass_operation_exclusion_mutation_guard(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temp:
+            stock_dir = self._stock_dir(temp)
+            config_path = stock_dir / "config.json"
+            state_path = stock_dir / "state.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        OPERATION_EXCLUDED_CONFIG_KEY: False,
+                        "operation_mode": "CONTINUOUS",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state_path.write_text(
+                json.dumps({"status": "RUNNING", "trade_enabled": True}),
+                encoding="utf-8",
+            )
+            before = config_path.read_bytes()
+            target = (stock_dir, "111111", "Test")
+            window = self._window()
+            window.running_registered_operation_targets = Mock(return_value=[target])
+
+            with (
+                patch("gui_auto_trade_status_ops.append_stock_log") as stock_log,
+                patch("gui_auto_trade_status_ops.append_changelog") as changelog,
+                patch("gui_auto_trade_status_ops.show_toast") as toast,
+            ):
+                changed = AutoTradeSettingWindow.set_stock_operation_exclusion(
+                    window,
+                    target,
+                    True,
+                )
+
+            self.assertFalse(changed)
+            self.assertEqual(before, config_path.read_bytes())
+            window.statusBarMessage.assert_called_once()
+            window.refresh_all.assert_not_called()
+            stock_log.assert_not_called()
+            changelog.assert_not_called()
+            toast.assert_not_called()
+
+    def test_stopped_stock_can_be_excluded_while_another_stock_is_running(self) -> None:
+        with TemporaryDirectory() as temp:
+            stock_dir = self._stock_dir(temp)
+            config_path = stock_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        OPERATION_EXCLUDED_CONFIG_KEY: False,
+                        "operation_mode": "CONTINUOUS",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps({"status": "STOPPED", "trade_enabled": False}),
+                encoding="utf-8",
+            )
+            target = (stock_dir, "111111", "Test")
+            window = self._window()
+            window.running_registered_operation_targets = Mock(
+                return_value=[(Path(temp) / "222222_Run", "222222", "Run")]
+            )
+
+            with (
+                patch("gui_auto_trade_status_ops.append_stock_log"),
+                patch("gui_auto_trade_status_ops.append_changelog"),
+                patch("gui_auto_trade_status_ops.show_toast"),
+            ):
+                changed = AutoTradeSettingWindow.set_stock_operation_exclusion(
+                    window,
+                    target,
+                    True,
+                )
+
+            self.assertTrue(changed)
+            self.assertTrue(
+                json.loads(config_path.read_text(encoding="utf-8"))[
+                    OPERATION_EXCLUDED_CONFIG_KEY
+                ]
+            )
+            window.refresh_all.assert_called_once_with()
+
     def test_clear_selected_operation_exclusions_uses_existing_config_path(self) -> None:
         with TemporaryDirectory() as temp:
             first_dir = self._stock_dir(temp)
@@ -371,7 +463,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             window.toggle_stock_operation_exclusion.assert_not_called()
             window.statusBarMessage.assert_called_once()
 
-    def test_running_double_click_keeps_excluded_config_and_state_unchanged(self) -> None:
+    def test_non_running_double_click_is_not_blocked_by_another_running_stock(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = self._stock_dir(temp)
             config_path = stock_dir / "config.json"
@@ -412,8 +504,11 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
             self.assertEqual(before_config, config_path.read_text(encoding="utf-8"))
             self.assertEqual(before_state, state_path.read_text(encoding="utf-8"))
-            window.toggle_stock_operation_exclusion.assert_not_called()
-            window.statusBarMessage.assert_called_once()
+            window.toggle_stock_operation_exclusion.assert_called_once_with(
+                target,
+                refresh=False,
+            )
+            window.statusBarMessage.assert_not_called()
 
     def test_toggle_operation_exclusion_does_not_toast_on_write_failure(self) -> None:
         with TemporaryDirectory() as temp:
@@ -965,6 +1060,86 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             _Menu.action_texts.index("운영제외"),
             _Menu.action_texts.index("등록해제"),
         )
+
+    def test_stock_context_menu_disables_set_exclusion_for_current_running_target(
+        self,
+    ) -> None:
+        class _Action:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.enabled = True
+
+            def setEnabled(self, enabled: bool) -> None:
+                self.enabled = bool(enabled)
+
+            def setText(self, text: str) -> None:
+                self.text = text
+
+            def setIcon(self, _icon) -> None:
+                pass
+
+            def setProperty(self, _name: str, _value: object) -> None:
+                pass
+
+        class _Menu:
+            set_exclusion_action = None
+
+            def __init__(self, _parent=None) -> None:
+                pass
+
+            def setToolTipsVisible(self, _visible: bool) -> None:
+                pass
+
+            def addAction(self, text: str) -> _Action:
+                action = _Action(text)
+                if text == "운영제외":
+                    _Menu.set_exclusion_action = action
+                return action
+
+            def addMenu(self, _text: str):
+                return _Menu()
+
+            def addSeparator(self) -> None:
+                pass
+
+            def setEnabled(self, _enabled: bool) -> None:
+                pass
+
+            def exec_(self, _pos):
+                return None
+
+        target = (Path("stocks/111111_Test"), "111111", "Test")
+        window = SimpleNamespace(
+            _stock_status_filter="running",
+            stock_table=SimpleNamespace(
+                itemAt=Mock(return_value=None),
+                viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
+            ),
+            ensure_context_row_selected=Mock(),
+            selected_stock_infos=Mock(return_value=[target]),
+            selected_operation_mode_set=Mock(return_value=set()),
+            current_selected_routine_row_metadata=Mock(return_value=None),
+            emergency_stop_selected_auto_trade_stocks=Mock(),
+            set_selected_stock_operation_exclusions=Mock(),
+            unregister_selected_auto_trade_stocks=Mock(),
+        )
+
+        with (
+            patch.object(gui_auto_trade_context_menu, "QMenu", _Menu),
+            patch.object(
+                gui_auto_trade_context_menu,
+                "auto_trade_operation_exclusion_mutation_decision",
+                return_value={"allowed": False, "current_running": True},
+            ),
+        ):
+            gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
+                window,
+                object(),
+            )
+
+        self.assertIsNotNone(_Menu.set_exclusion_action)
+        self.assertFalse(_Menu.set_exclusion_action.enabled)
+        window.set_selected_stock_operation_exclusions.assert_not_called()
 
     def test_stock_context_menu_running_view_dispatches_set_exclusion(self) -> None:
         class _Action:

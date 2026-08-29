@@ -45,6 +45,14 @@ def _positive_int(value: object) -> int | None:
     return parsed if 0 < parsed <= 99_999_999 else None
 
 
+def _nonnegative_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 0 <= parsed <= 99_999_999 else None
+
+
 def _session_identity(state: Mapping[str, object]) -> str:
     return str(state.get("trade_started_at") or "").strip()
 
@@ -79,6 +87,29 @@ def project_running_budget_adjustment_config(
 
     adjustment_state = str(adjustment.get("state") or "").strip().upper()
     if adjustment_state == STATE_WAIT_SELL:
+        previous_value = _nonnegative_int(adjustment.get("previous_value"))
+        if previous_value is not None:
+            mode = _mode(adjustment.get("mode"))
+            if mode != _mode(projected.get("trade_amount_type")):
+                return projected, {
+                    "active": True,
+                    "applied": False,
+                    "state": adjustment_state,
+                    "reason": "MODE_MISMATCH",
+                }
+            projected["buy_amount" if mode == "AMOUNT" else "buy_qty"] = previous_value
+            if bool(adjustment.get("apply_limit", False)):
+                previous_limit = adjustment.get("previous_limit")
+                if isinstance(previous_limit, dict):
+                    for key in (
+                        "buy_limit_enabled",
+                        "buy_limit_amount",
+                        "buy_limit_source",
+                    ):
+                        if key in previous_limit:
+                            projected[key] = previous_limit.get(key)
+                        else:
+                            projected.pop(key, None)
         return projected, {
             "active": True,
             "applied": False,
@@ -197,6 +228,9 @@ def commit_running_budget_adjustment(
     policy = str(apply_policy or "").strip().upper()
     limit_amount = _positive_int(adjusted_limit_amount) if apply_limit else None
     session_identity = _session_identity(state)
+    previous_value = _nonnegative_int(
+        config.get("buy_amount" if mode == "AMOUNT" else "buy_qty")
+    )
 
     if mode != _mode(config.get("trade_amount_type")):
         return {"ok": False, "reason": "MODE_CHANGED"}
@@ -204,6 +238,8 @@ def commit_running_budget_adjustment(
         return {"ok": False, "reason": "INVALID_REQUESTED_VALUE"}
     if policy not in _VALID_POLICIES:
         return {"ok": False, "reason": "INVALID_APPLY_POLICY"}
+    if previous_value is None:
+        return {"ok": False, "reason": "INVALID_CURRENT_VALUE"}
     if not bool(state.get("trade_enabled", False)) or not session_identity:
         return {"ok": False, "reason": "OPERATION_SESSION_NOT_ACTIVE"}
     if apply_limit and limit_amount is None:
@@ -212,11 +248,12 @@ def commit_running_budget_adjustment(
     timestamp = str(confirmed_at or "").strip() or _now_text()
     request_timestamp = str(requested_at or "").strip() or timestamp
     adjustment = {
-        "version": 1,
+        "version": 2,
         "request_id": uuid4().hex,
         "stock_code": str(stock_code or "").strip().upper().lstrip("A"),
         "mode": mode,
         "requested_value": value,
+        "previous_value": previous_value,
         "apply_policy": policy,
         "state": (
             STATE_WAIT_FIRST_BUY
@@ -225,6 +262,14 @@ def commit_running_budget_adjustment(
         ),
         "apply_limit": bool(apply_limit),
         "adjusted_limit_amount": limit_amount,
+        "previous_limit": {
+            key: config.get(key)
+            for key in (
+                "buy_limit_enabled",
+                "buy_limit_amount",
+                "buy_limit_source",
+            )
+        },
         "requested_at": request_timestamp,
         "confirmed_at": timestamp,
         "operation_session_started_at": session_identity,

@@ -113,7 +113,11 @@ class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
     def test_new_login_session_syncs_monitoring_before_recovery(self) -> None:
         events: list[str] = []
         owner, host = self._main_double(events)
-        with patch("gui_windows.QTimer.singleShot"), patch(
+        scheduled: list[object] = []
+        with patch(
+            "gui_windows.QTimer.singleShot",
+            side_effect=lambda _delay, callback: scheduled.append(callback),
+        ) as single_shot, patch(
             "gui_windows.append_production_event"
         ):
             MainWindow.on_kiwoom_login_state_changed(
@@ -124,9 +128,14 @@ class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
                     "login_session_id": "SESSION-7",
                 },
             )
+            self.assertEqual(["monitoring"], events)
+            self.assertEqual(1, len(scheduled))
+            self.assertEqual(500, single_shot.call_args.args[0])
+            scheduled.pop(0)()
 
         host.sync_monitoring_universe_for_current_session.assert_called_once_with()
         self.assertLess(events.index("monitoring"), events.index("recovery"))
+        self.assertLess(events.index("account_funds"), events.index("recovery"))
 
     def test_login_failure_never_registers_monitoring(self) -> None:
         events: list[str] = []

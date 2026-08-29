@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from typing import Callable, Iterable
 
 from PyQt5.QtCore import QEvent, QObject, Qt
@@ -26,6 +27,9 @@ from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_operation_excluded,
     is_review_required_state,
+)
+from gui_auto_trade_status_ops import (
+    auto_trade_operation_exclusion_mutation_decision,
 )
 from gui_ats_utils import (
     manual_ats_session_labels,
@@ -64,7 +68,16 @@ _INDIVIDUAL_LIQUIDATION_MINUTES = (
 
 CONTEXT_MENU_DANGER_TEXT_COLOR = "#DC2626"
 CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR = "#15803D"
+CONTEXT_MENU_DISABLED_TEXT_COLOR = "#AFB2B9"
 _MENU_TEXT_COLOR_PROPERTY = "menuTextColor"
+
+
+def _menu_item_text_color(widget: QMenu, option: QStyleOptionMenuItem) -> QColor:
+    if not bool(option.state & QStyle.State_Enabled):
+        return QColor(CONTEXT_MENU_DISABLED_TEXT_COLOR)
+    colors = getattr(widget, "_menu_action_text_colors", {})
+    color_text = colors.get(str(option.text or "")) if isinstance(colors, dict) else None
+    return QColor(str(color_text or ""))
 
 
 class _MenuActionColorProxyStyle(QProxyStyle):
@@ -76,9 +89,7 @@ class _MenuActionColorProxyStyle(QProxyStyle):
             and isinstance(option, QStyleOptionMenuItem)
             and isinstance(widget, QMenu)
         ):
-            colors = getattr(widget, "_menu_action_text_colors", {})
-            color_text = colors.get(str(option.text or "")) if isinstance(colors, dict) else None
-            color = QColor(str(color_text or ""))
+            color = _menu_item_text_color(widget, option)
             if color.isValid():
                 colored_option = QStyleOptionMenuItem(option)
                 palette = QPalette(colored_option.palette)
@@ -499,6 +510,7 @@ def _add_individual_liquidation_menu(
         has_selection and individual_method != "이월"
     )
     return {
+        "menu": individual_liquidation_menu,
         "market": action_individual_market,
         "current": action_individual_current,
         "carry": action_individual_carry,
@@ -678,11 +690,22 @@ def show_monitor_stock_context_menu(
     stock_register_enabled: bool | None = None,
     selected_targets: Iterable[tuple[object, str, str]] | None = None,
     selected_scope_emergency: bool | None = None,
+    scheduled_excluded_management: bool = False,
 ) -> None:
     """Show the monitoring stock-row profile with the shared menu form."""
 
     menu = _new_stock_context_menu(parent)
     operation_policy = _context_menu_operation_policy()
+    targets = list(selected_targets or [])
+    review_managed = has_selection and any(
+        is_review_required_state(read_json_dict(Path(stock_dir) / "state.json"))
+        for stock_dir, _code, _name in targets
+    )
+    excluded_management = bool(
+        scheduled_excluded_management
+        and operation_excluded
+        and not review_managed
+    )
 
     action_start = None
     if callbacks.start is not None:
@@ -707,7 +730,16 @@ def show_monitor_stock_context_menu(
         action_clear_exclusion.setEnabled(has_selection)
     elif exclusion_action == "set" and callbacks.set_operation_exclusion is not None:
         action_set_exclusion = menu.addAction("운영제외")
-        action_set_exclusion.setEnabled(has_selection)
+        exclusion_allowed = has_selection and all(
+            auto_trade_operation_exclusion_mutation_decision(
+                parent,
+                target,
+                True,
+            ).get("allowed")
+            is True
+            for target in targets
+        )
+        action_set_exclusion.setEnabled(exclusion_allowed)
 
     action_trade_permission = None
     if callbacks.toggle_trade_permission is not None:
@@ -775,9 +807,66 @@ def show_monitor_stock_context_menu(
         action_open_charts = menu.addAction("간이차트")
         action_open_charts.setEnabled(has_selection)
 
+    if review_managed:
+        for action in (
+            action_start,
+            action_emergency_stop,
+            action_set_exclusion,
+            action_clear_exclusion,
+            action_trade_permission,
+            action_stock_register,
+            action_open_charts,
+        ):
+            if action is not None:
+                action.setEnabled(False)
+        early_close["menu"].setEnabled(False)
+        individual["menu"].setEnabled(False)
+    elif excluded_management:
+        for action in (action_emergency_stop, action_stock_register):
+            if action is not None:
+                action.setEnabled(False)
+        early_close["menu"].setEnabled(False)
+        individual["menu"].setEnabled(False)
+
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
+    if review_managed:
+        review_allowed_actions = [
+            action_select_all,
+            action_clear_selection,
+            action_time_change,
+            action_time_reset,
+            action_unregister,
+        ]
+        if ats_settings is not None:
+            review_allowed_actions.extend(
+                action
+                for _key, _label, action in ats_settings["session_actions"]
+            )
+            review_allowed_actions.extend(
+                action
+                for _key, _label, action in ats_settings["method_actions"]
+            )
+            review_allowed_actions.extend(
+                (ats_settings["market"], ats_settings["current"])
+            )
+        if chosen not in review_allowed_actions:
+            return
+    elif excluded_management:
+        excluded_allowed_actions = [
+            action_start,
+            action_select_all,
+            action_clear_selection,
+            action_clear_exclusion,
+            action_trade_permission,
+            action_time_change,
+            action_time_reset,
+            action_unregister,
+            action_open_charts,
+        ]
+        if chosen not in excluded_allowed_actions:
+            return
     selected_option = ""
     decision_event_type = "OPERATOR_OPERATION_DECISION"
     if action_start is not None and chosen == action_start:
@@ -817,7 +906,6 @@ def show_monitor_stock_context_menu(
         selected_option = "ATS_LIQUIDATION_CURRENT"
 
     if selected_option:
-        targets = list(selected_targets or [])
         codes = [str(code or "").strip() for _path, code, _name in targets if str(code or "").strip()]
         names = [str(name or "").strip() for _path, _code, name in targets if str(name or "").strip()]
         correlation = {"stock_code": codes[0], "stock_name": names[0] if names else None} if len(codes) == 1 else {}
