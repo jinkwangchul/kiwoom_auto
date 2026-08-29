@@ -44,7 +44,17 @@ class RealtimeShadowTick:
     execution_time_raw: str
     current_price: int | float
     cumulative_volume: int | float | None
+    trade_volume_raw: int | float | None
+    trade_volume_abs: int | float | None
+    open_price: int | float | None
+    high_price: int | float | None
+    low_price: int | float | None
+    change_rate: int | float | None
+    previous_day_volume_rate: int | float | None
+    execution_strength: int | float | None
     received_at: str
+    received_monotonic: int | float
+    receive_sequence: int
     market_datetime: str
     minute_key: str
     connection_epoch: int
@@ -104,8 +114,17 @@ def normalize_realtime_shadow_tick(
     execution_time_raw: object,
     current_price_raw: object,
     cumulative_volume_raw: object,
+    trade_volume_raw: object,
+    open_price_raw: object = None,
+    high_price_raw: object = None,
+    low_price_raw: object = None,
+    change_rate_raw: object = None,
+    previous_day_volume_rate_raw: object = None,
+    execution_strength_raw: object = None,
     connection_epoch: object,
     login_session_id: object,
+    receive_sequence: object,
+    received_monotonic: object,
     received_at: datetime | None = None,
 ) -> RealtimeShadowTick | None:
     """Normalize one official 주식체결 event without mutating external state."""
@@ -137,6 +156,26 @@ def normalize_realtime_shadow_tick(
     session_id = str(login_session_id or "").strip()
     if epoch < 0 or not session_id:
         return None
+    try:
+        sequence = int(receive_sequence)
+    except (TypeError, ValueError):
+        return None
+    monotonic_value = _number(received_monotonic)
+    if sequence <= 0 or monotonic_value is None or monotonic_value < 0:
+        return None
+
+    signed_trade_volume = _number(
+        str(trade_volume_raw).replace(",", "").strip()
+        if trade_volume_raw not in (None, "")
+        else trade_volume_raw
+    )
+
+    def raw_number(value: object) -> int | float | None:
+        return _number(
+            str(value).replace(",", "").replace("%", "").strip()
+            if value not in (None, "")
+            else value
+        )
 
     normalized_price = int(price) if price.is_integer() else price
     return RealtimeShadowTick(
@@ -145,7 +184,19 @@ def normalize_realtime_shadow_tick(
         execution_time_raw=execution_time,
         current_price=normalized_price,
         cumulative_volume=_positive_number(cumulative_volume_raw),
+        trade_volume_raw=signed_trade_volume,
+        trade_volume_abs=(
+            abs(signed_trade_volume) if signed_trade_volume is not None else None
+        ),
+        open_price=_positive_number(open_price_raw),
+        high_price=_positive_number(high_price_raw),
+        low_price=_positive_number(low_price_raw),
+        change_rate=raw_number(change_rate_raw),
+        previous_day_volume_rate=raw_number(previous_day_volume_rate_raw),
+        execution_strength=raw_number(execution_strength_raw),
         received_at=observed_at.isoformat(timespec="microseconds"),
+        received_monotonic=monotonic_value,
+        receive_sequence=sequence,
         market_datetime=market_time.isoformat(timespec="seconds"),
         minute_key=market_time.strftime("%Y-%m-%d %H:%M"),
         connection_epoch=epoch,

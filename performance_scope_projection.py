@@ -89,6 +89,7 @@ class InstancePerformanceProjectionRow:
     observed_group_ids: tuple[str, ...]
     observed_group_name_snapshots: tuple[str, ...]
     aggregate: AggregateMetrics
+    performance_absence_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class GroupPerformanceProjectionRow:
     observed_instance_ids: tuple[str, ...]
     observed_instance_name_snapshots: tuple[str, ...]
     aggregate: AggregateMetrics
+    performance_absence_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -193,6 +195,9 @@ class PerformanceScopeProjection:
     ) -> None:
         self.aggregator = aggregator
         self.current_relations = current_relations
+        self._resolved_performance_episode_ids = (
+            aggregator.resolved_performance_episode_ids
+        )
 
     def project_stocks(self, scope: PerformanceScope | str) -> tuple[StockPerformanceProjectionRow, ...]:
         selected_scope = self._scope(scope)
@@ -202,15 +207,23 @@ class PerformanceScopeProjection:
             episodes = self.aggregator.snapshot.episodes_by_stock.get(stock_code, ())
             has_closed = any(not episode.is_open for episode in episodes)
             currently_assigned = bool(relation and relation.is_currently_assigned)
+            has_performance = bool(
+                self.aggregator.snapshot.events_by_stock.get(stock_code)
+            )
             if selected_scope == PerformanceScope.CURRENT and not currently_assigned:
                 continue
-            if selected_scope == PerformanceScope.PAST and not has_closed:
+            if selected_scope == PerformanceScope.PAST and (
+                currently_assigned or not has_performance
+            ):
+                continue
+            if selected_scope == PerformanceScope.ALL and not (
+                currently_assigned or has_performance
+            ):
                 continue
             reasons = self._stock_visibility_reasons(
                 selected_scope,
                 currently_assigned=currently_assigned,
-                has_closed=has_closed,
-                has_ledger=bool(self.aggregator.snapshot.events_by_stock.get(stock_code)),
+                has_ledger=has_performance,
             )
             rows.append(
                 StockPerformanceProjectionRow(
@@ -236,14 +249,27 @@ class PerformanceScopeProjection:
             for relation in self.current_relations.stocks_by_code.values()
             if relation.current_instance_id and relation.instance_exists
         }
-        historical_episodes = tuple(
+        assigned_episodes = tuple(
             episode
             for episode in self.aggregator.snapshot.episodes_by_id.values()
             if episode.ownership_kind == ASSIGNED and episode.instance_id
         )
-        historical_ids = {episode.instance_id for episode in historical_episodes}
-        ids = self._parent_ids(selected_scope, current_ids, historical_ids, historical_episodes, "instance_id")
-        rows = [self._instance_row(instance_id, selected_scope, current_ids, historical_episodes) for instance_id in ids]
+        historical_ids = {
+            episode.instance_id
+            for episode in assigned_episodes
+            if not episode.is_open
+            and episode.episode_id in self._resolved_performance_episode_ids
+        }
+        ids = self._parent_ids(selected_scope, current_ids, historical_ids)
+        rows = [
+            self._instance_row(
+                instance_id,
+                selected_scope,
+                current_ids,
+                assigned_episodes,
+            )
+            for instance_id in ids
+        ]
         return tuple(sorted(rows, key=lambda row: (self._row_name(row.observed_instance_name_snapshots), row.instance_id)))
 
     def project_groups(self, scope: PerformanceScope | str) -> tuple[GroupPerformanceProjectionRow, ...]:
@@ -253,14 +279,22 @@ class PerformanceScopeProjection:
             for relation in self.current_relations.stocks_by_code.values()
             if relation.current_instance_id and relation.instance_exists and relation.current_group_id
         }
-        historical_episodes = tuple(
+        assigned_episodes = tuple(
             episode
             for episode in self.aggregator.snapshot.episodes_by_id.values()
             if episode.ownership_kind == ASSIGNED and episode.group_id
         )
-        historical_ids = {episode.group_id for episode in historical_episodes}
-        ids = self._parent_ids(selected_scope, current_ids, historical_ids, historical_episodes, "group_id")
-        rows = [self._group_row(group_id, selected_scope, current_ids, historical_episodes) for group_id in ids]
+        historical_ids = {
+            episode.group_id
+            for episode in assigned_episodes
+            if not episode.is_open
+            and episode.episode_id in self._resolved_performance_episode_ids
+        }
+        ids = self._parent_ids(selected_scope, current_ids, historical_ids)
+        rows = [
+            self._group_row(group_id, selected_scope, current_ids, assigned_episodes)
+            for group_id in ids
+        ]
         return tuple(sorted(rows, key=lambda row: (self._row_name(row.observed_group_name_snapshots), row.group_id)))
 
     def project(self, scope: PerformanceScope | str, level: PerformanceLevel | str):
@@ -313,12 +347,20 @@ class PerformanceScopeProjection:
         episodes: tuple[AssignmentEpisode, ...],
     ) -> InstancePerformanceProjectionRow:
         identity_episodes = tuple(episode for episode in episodes if episode.instance_id == instance_id)
-        metric_episodes = self._filter_metric_episodes(identity_episodes, scope)
+        metric_episodes = self._parent_scope_episodes(identity_episodes, scope)
         current_names = (
             relation.current_instance_name
             for relation in self.current_relations.stocks_by_code.values()
             if relation.current_instance_id == instance_id
         )
+        aggregate = self.aggregator.aggregate_episode_scope(
+            episode.episode_id for episode in metric_episodes
+        )
+        current_stock_codes = {
+            relation.stock_code
+            for relation in self.current_relations.stocks_by_code.values()
+            if relation.current_instance_id == instance_id
+        }
         return InstancePerformanceProjectionRow(
             instance_id=instance_id,
             identity=instance_id,
@@ -332,7 +374,12 @@ class PerformanceScopeProjection:
             ),
             observed_group_ids=_snapshot_names(episode.group_id for episode in identity_episodes),
             observed_group_name_snapshots=_snapshot_names(episode.group_name_snapshot for episode in identity_episodes),
-            aggregate=self.aggregator.aggregate_episode_scope(episode.episode_id for episode in metric_episodes),
+            aggregate=aggregate,
+            performance_absence_reason=self._parent_performance_absence_reason(
+                identity_episodes,
+                aggregate,
+                current_stock_codes,
+            ),
         )
 
     def _group_row(
@@ -343,12 +390,20 @@ class PerformanceScopeProjection:
         episodes: tuple[AssignmentEpisode, ...],
     ) -> GroupPerformanceProjectionRow:
         identity_episodes = tuple(episode for episode in episodes if episode.group_id == group_id)
-        metric_episodes = self._filter_metric_episodes(identity_episodes, scope)
+        metric_episodes = self._parent_scope_episodes(identity_episodes, scope)
         current_names = (
             relation.current_group_name
             for relation in self.current_relations.stocks_by_code.values()
             if relation.current_group_id == group_id
         )
+        aggregate = self.aggregator.aggregate_episode_scope(
+            episode.episode_id for episode in metric_episodes
+        )
+        current_stock_codes = {
+            relation.stock_code
+            for relation in self.current_relations.stocks_by_code.values()
+            if relation.current_group_id == group_id
+        }
         return GroupPerformanceProjectionRow(
             group_id=group_id,
             identity=group_id,
@@ -362,7 +417,12 @@ class PerformanceScopeProjection:
             ),
             observed_instance_ids=_snapshot_names(episode.instance_id for episode in identity_episodes),
             observed_instance_name_snapshots=_snapshot_names(episode.instance_name_snapshot for episode in identity_episodes),
-            aggregate=self.aggregator.aggregate_episode_scope(episode.episode_id for episode in metric_episodes),
+            aggregate=aggregate,
+            performance_absence_reason=self._parent_performance_absence_reason(
+                identity_episodes,
+                aggregate,
+                current_stock_codes,
+            ),
         )
 
     def _current_consistency(
@@ -426,22 +486,56 @@ class PerformanceScopeProjection:
             return tuple(episode for episode in episodes if not episode.is_open)
         return episodes
 
+    def _parent_scope_episodes(
+        self,
+        episodes: tuple[AssignmentEpisode, ...],
+        scope: PerformanceScope,
+    ) -> tuple[AssignmentEpisode, ...]:
+        if scope == PerformanceScope.CURRENT:
+            return tuple(episode for episode in episodes if episode.is_open)
+        historical = tuple(
+            episode
+            for episode in episodes
+            if not episode.is_open
+            and episode.episode_id in self._resolved_performance_episode_ids
+        )
+        if scope == PerformanceScope.PAST:
+            return historical
+        return tuple(episode for episode in episodes if episode.is_open) + historical
+
+    def _parent_performance_absence_reason(
+        self,
+        identity_episodes: tuple[AssignmentEpisode, ...],
+        aggregate: AggregateMetrics,
+        current_stock_codes: set[str],
+    ) -> str | None:
+        if aggregate.event_count:
+            return None
+        all_identity = self.aggregator.aggregate_episode_scope(
+            episode.episode_id for episode in identity_episodes
+        )
+        if all_identity.event_count:
+            return "NO_PERFORMANCE_IN_SCOPE"
+        stock_codes = {
+            episode.stock_code for episode in identity_episodes
+        } | current_stock_codes
+        if any(
+            self.aggregator.snapshot.events_by_stock.get(stock_code)
+            for stock_code in stock_codes
+        ):
+            return "NO_RESOLVED_PERFORMANCE_OWNERSHIP"
+        return "NO_CANONICAL_PERFORMANCE_EVENTS"
+
     @staticmethod
     def _parent_ids(
         scope: PerformanceScope,
         current_ids: set[str],
         historical_ids: set[str],
-        episodes: tuple[AssignmentEpisode, ...],
-        field: str,
     ) -> tuple[str, ...]:
         if scope == PerformanceScope.CURRENT:
             values = current_ids
         elif scope == PerformanceScope.PAST:
-            values = {
-                _text(getattr(episode, field))
-                for episode in episodes
-                if not episode.is_open and _text(getattr(episode, field))
-            }
+            values = historical_ids
         else:
             values = current_ids | historical_ids
         return tuple(sorted(values))
@@ -451,24 +545,21 @@ class PerformanceScopeProjection:
         scope: PerformanceScope,
         *,
         currently_assigned: bool,
-        has_closed: bool,
         has_ledger: bool,
     ) -> tuple[str, ...]:
         if scope == PerformanceScope.CURRENT:
             return ("CURRENT_ASSIGNMENT",)
         if scope == PerformanceScope.PAST:
-            return ("CLOSED_EPISODE",)
+            return ("PERFORMANCE_LEDGER",)
         reasons: list[str] = []
         if currently_assigned:
             reasons.append("CURRENT_ASSIGNMENT")
-        if has_closed:
-            reasons.append("CLOSED_EPISODE")
         if has_ledger:
             reasons.append("PERFORMANCE_LEDGER")
         return tuple(reasons or ("KNOWN_STOCK",))
 
-    @staticmethod
     def _parent_visibility_reasons(
+        self,
         scope: PerformanceScope,
         is_current: bool,
         episodes: tuple[AssignmentEpisode, ...],
@@ -476,12 +567,16 @@ class PerformanceScopeProjection:
         if scope == PerformanceScope.CURRENT:
             return ("CURRENT_RELATION",)
         if scope == PerformanceScope.PAST:
-            return ("CLOSED_ASSIGNED_EPISODE",)
+            return ("HISTORICAL_PERFORMANCE",)
         reasons = []
         if is_current:
             reasons.append("CURRENT_RELATION")
-        if episodes:
-            reasons.append("ASSIGNED_EPISODE_HISTORY")
+        if any(
+            not episode.is_open
+            and episode.episode_id in self._resolved_performance_episode_ids
+            for episode in episodes
+        ):
+            reasons.append("HISTORICAL_PERFORMANCE")
         return tuple(reasons)
 
     @staticmethod

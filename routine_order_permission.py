@@ -7,7 +7,10 @@ from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
     is_review_required_state,
 )
-from gui_ats_utils import manual_ats_active_now
+from gui_ats_utils import (
+    auto_trade_operation_activation_phase,
+    manual_ats_active_now,
+)
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
@@ -139,6 +142,16 @@ def canonical_stock_trading_time_status(
                 runtime_state,
                 current,
             )
+            activation = auto_trade_operation_activation_phase(
+                config,
+                runtime_state,
+                now_dt=current,
+            )
+            regular_active = bool(
+                regular_active
+                and activation.get("operation_boundary_reached") is True
+                and activation.get("trade_window_started") is True
+            )
             return {
                 "evaluable": True,
                 "active": bool(regular_active or ats_active),
@@ -152,7 +165,16 @@ def canonical_stock_trading_time_status(
                 ),
             }
 
-        active = scheduled_status_for_now(config, current) == "RUNNING"
+        activation = auto_trade_operation_activation_phase(
+            config,
+            state if isinstance(state, dict) else {},
+            now_dt=current,
+        )
+        active = bool(
+            scheduled_status_for_now(config, current) == "RUNNING"
+            and activation.get("operation_boundary_reached") is True
+            and activation.get("trade_window_started") is True
+        )
         return {
             "evaluable": True,
             "active": active,

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from contextlib import ExitStack, nullcontext
+from datetime import date
+from types import SimpleNamespace
 import sys
 import tempfile
 import types
@@ -139,7 +142,9 @@ _install_pyqt5_import_stubs()
 
 import gui_auto_trade_setting_window as gui
 import gui_windows as main_gui
+import auto_trade_order_execution_boundary as execution_boundary
 from execution_runtime_file_schema import default_order_executions_data, default_order_locks_data
+from production_recovery_contract import ACCOUNT_COMPLETED, STOCK_RESTORED
 
 
 class _FakeWindow:
@@ -239,25 +244,59 @@ class _FakeApi:
 class _FakeAccountCombo:
     def __init__(self) -> None:
         self.items: list[str] = []
+        self.item_data: list[dict[object, object]] = []
         self.enabled = False
         self.current_index = -1
         self.signals_blocked = False
+
+    def hidePopup(self) -> None:
+        pass
 
     def blockSignals(self, value: bool) -> None:
         self.signals_blocked = value
 
     def clear(self) -> None:
         self.items = []
+        self.item_data = []
         self.current_index = -1
+
+    def addItem(self, text: str, user_data: object = None) -> None:
+        self.items.append(text)
+        self.item_data.append({main_gui.ACCOUNT_NO_ROLE: user_data})
 
     def addItems(self, items: list[str]) -> None:
         self.items.extend(items)
+        self.item_data.extend({main_gui.ACCOUNT_NO_ROLE: item} for item in items)
+
+    def count(self) -> int:
+        return len(self.items)
+
+    def setItemData(self, row: int, value: object, role: object = None) -> None:
+        if 0 <= row < len(self.item_data):
+            self.item_data[row][role] = value
+
+    def itemData(self, row: int, role: object = None) -> object:
+        if 0 <= row < len(self.item_data):
+            return self.item_data[row].get(role)
+        return None
+
+    def currentData(self, role: object = None) -> object:
+        return self.itemData(self.current_index, role)
+
+    def model(self):
+        return self
+
+    def item(self, row: int):
+        return None
 
     def setEnabled(self, value: bool) -> None:
         self.enabled = value
 
     def isEnabled(self) -> bool:
         return self.enabled
+
+    def currentIndex(self) -> int:
+        return self.current_index
 
     def setCurrentIndex(self, value: int) -> None:
         self.current_index = value
@@ -377,7 +416,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
         parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
         parent._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
-        window.parent = lambda: parent
+        self._bind_window_parent(window, parent)
         window.require_startup_recovery_session = mock.Mock(return_value=False)
 
         allowed = gui.startup_recovery_action_allowed(window, "Manual SendOrder")
@@ -446,22 +485,31 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 setattr(window, name, _FakeButton(name))
             window.has_selected_stock = mock.Mock(return_value=False)
             window.has_single_selected_stock = mock.Mock(return_value=False)
-            window.parent = lambda: Parent(ready)
+            parent = Parent(ready)
+            window._persistent_feature_owner_ref = lambda: parent
+            window.parent = lambda: parent
             window._last_execution_preview_result = {}
 
             registered = (
-                [Path("stocks/005930_삼성전자")]
+                [(Path("stocks/005930_삼성전자"), "005930", "삼성전자")]
                 if has_registered
                 else []
             )
             with mock.patch.object(
-                gui,
-                "all_registered_stock_dirs",
+                gui.AutoTradeSettingWindow,
+                "registered_operation_targets",
                 return_value=registered,
+            ), mock.patch.object(
+                gui.AutoTradeSettingWindow,
+                "running_registered_operation_targets",
+                return_value=[],
             ), mock.patch.object(
                 gui,
                 "read_operation_state",
                 return_value={},
+            ), mock.patch.dict(
+                gui.auto_trade_update_global_operation_button_state.__globals__,
+                {"read_operation_state": lambda: {}},
             ):
                 gui.AutoTradeSettingWindow.update_action_buttons(window)
 
@@ -516,11 +564,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window._last_execution_preview_result = None
         window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
         window.show_manual_queue_commit_result = lambda result: window.commit_reports.append(result)
-        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
-        parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"])
-        parent.account_combo = _FakeAccountCombo()
-        main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-        window.parent = lambda: parent
+        parent = self._prepare_parent_account()
+        self._bind_window_parent(window, parent)
         window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
         window.read_order_from_queue_by_id = lambda order_id, queue_path: {
             "ok": True,
@@ -538,6 +583,136 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "blocked_reasons": [],
         }
         return window
+
+    def _prepare_parent_account(
+        self,
+        *,
+        connected: bool = True,
+        accounts: list[str] | None = None,
+        selected_account: str = "12345678",
+        send_order_result: object = 0,
+        orderable_cash: int | None = 1_000_000,
+    ):
+        account_list = list(accounts if accounts is not None else [selected_account])
+        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent.kiwoom_api = _FakeApi(
+            connected=connected,
+            accounts=account_list,
+            send_order_result=send_order_result,
+        )
+        combo = _FakeAccountCombo()
+        parent.account_combo = combo
+        for account in account_list:
+            combo.addItem(account, account)
+            row = combo.count() - 1
+            combo.setItemData(row, account in account_list, main_gui.ACCOUNT_ACTIVE_ROLE)
+        combo.setEnabled(bool(account_list))
+        combo.setCurrentIndex(account_list.index(selected_account) if selected_account in account_list else -1)
+        parent.kiwoom_account_numbers = lambda: (
+            list(account_list) if parent.kiwoom_api.is_connected() else []
+        )
+        parent.selected_account_no = lambda: (
+            selected_account
+            if parent.kiwoom_api.is_connected() and selected_account in account_list
+            else ""
+        )
+        parent.current_orderable_cash_for_budget = lambda: (
+            orderable_cash
+            if parent.kiwoom_api.is_connected()
+            and selected_account in account_list
+            and orderable_cash is not None
+            else None
+        )
+        parent._account_authentication_states = {
+            selected_account: main_gui.ACCOUNT_FUNDS_READY
+        }
+        parent._account_query_states = {selected_account: main_gui.ACCOUNT_FUNDS_READY}
+        return parent
+
+    def _bind_window_parent(self, window, parent) -> None:
+        window._persistent_feature_owner_ref = lambda: parent
+        window.parent = lambda: parent
+        window.__dict__.pop("_order_execution_boundary", None)
+        window.order_execution_boundary().real_preflight_stock_config_for_order = (
+            lambda order: ({"real_trade_enabled": True}, "test_config")
+        )
+
+    def _write_broker_holding(
+        self,
+        broker_holdings_path: Path,
+        *,
+        account_no: str = "12345678",
+        code: str = "003550",
+        holding: int = 20,
+        available: int = 20,
+    ) -> None:
+        broker_holdings_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "updated_at": "now",
+                    "holdings": [
+                        {
+                            "account_no": account_no,
+                            "stock_code": code,
+                            "holding_quantity": holding,
+                            "available_quantity": available,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _patch_fresh_dispatch_evidence(
+        self,
+        *,
+        broker_holdings_path: Path | None = None,
+        total_budget: int = 1_000_000,
+        account_no: str = "12345678",
+        code: str = "003550",
+    ):
+        identity = SimpleNamespace(
+            account_no=account_no,
+            trading_day=date.today().isoformat(),
+        )
+        snapshot = SimpleNamespace(
+            account_status=ACCOUNT_COMPLETED,
+            identity=identity,
+            stocks=(
+                SimpleNamespace(
+                    stock_code=code,
+                    stock_status=STOCK_RESTORED,
+                    review_required=False,
+                ),
+            ),
+        )
+        stack = ExitStack()
+        stack.enter_context(
+            mock.patch.object(
+                execution_boundary.production_recovery_registry,
+                "snapshot",
+                return_value=snapshot,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                execution_boundary,
+                "read_system_total_budget_for_recalculation",
+                return_value=total_budget,
+            )
+        )
+        if broker_holdings_path is not None:
+            stack.enter_context(
+                mock.patch.object(
+                    execution_boundary,
+                    "BROKER_HOLDINGS_PATH",
+                    broker_holdings_path,
+                )
+            )
+        return stack
 
     def _window_for_execution_enable(self):
         window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
@@ -557,7 +732,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"])
         parent.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-        window.parent = lambda: parent
+        self._bind_window_parent(window, parent)
         window.order_execution_boundary().real_preflight_stock_config_for_order = lambda order: ({"real_trade_enabled": True}, "test_config")
         return window
 
@@ -614,8 +789,10 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             "code": "003550",
             "side": side,
             "quantity": 10,
+            "amount": 10000,
             "price": 1000,
             "order_type": "LIMIT",
+            "execution_intent": {"budget": 10000},
             "execution_request": {
                 "execution_id": "EXEC_1",
                 "order_id": "ORDER_1",
@@ -637,6 +814,10 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         }
 
     def _write_queue_for_send_order(self, queue_path, record: dict[str, object]) -> None:
+        Path(queue_path).with_name("positions.json").write_text(
+            json.dumps({"version": 1, "updated_at": "before", "positions": []}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         queue_path.write_text(
             json.dumps(
                 {
@@ -2050,6 +2231,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             context={
                 "manual_queue_write_confirmed": True,
                 "manual_runtime_queue_write_confirmed": True,
+                "event_journal_order": queue_write_preview["order_queued_record_preview"],
             },
             queue_commit_readiness_policy_result=mock.ANY,
             manual_queue_commit_after_runtime_confirmed=True,
@@ -2200,6 +2382,10 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path = runtime_dir / "order_queue.json"
             executions_path = runtime_dir / "order_executions.json"
             locks_path = runtime_dir / "order_locks.json"
+            (runtime_dir / "positions.json").write_text(
+                json.dumps({"version": 1, "updated_at": "before", "positions": []}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             (stock_dir / "config.json").write_text(
                 json.dumps({"real_trade_enabled": True}, ensure_ascii=False),
                 encoding="utf-8",
@@ -2228,11 +2414,32 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                                 "id": "ORDER_AUTO_1",
                                 "status": "EXECUTABLE",
                                 "source_signal_id": "SIG_AUTO_1",
+                                "account_no": "12345678",
                                 "code": "003550",
                                 "side": "BUY",
                                 "quantity": 3,
+                                "amount": 255000,
                                 "price": 85000,
                                 "order_type": "LIMIT",
+                                "execution_intent": {"budget": 255000},
+                                "execution_request": {
+                                    "execution_id": "EXEC_AUTO_1",
+                                    "order_id": "ORDER_AUTO_1",
+                                    "source_signal_id": "SIG_AUTO_1",
+                                    "request_hash": "b" * 64,
+                                    "guard_snapshot": {"account_no": "12345678"},
+                                    "request_preview": {
+                                        "account_no": "12345678",
+                                        "screen_no": "0101",
+                                        "side": "BUY",
+                                        "order_action": "NEW",
+                                        "code": "003550",
+                                        "quantity": 3,
+                                        "price": 85000,
+                                        "hoga": "LIMIT",
+                                        "original_order_no": "",
+                                    },
+                                },
                                 "order_intent": {"side": "BUY", "hoga": "LIMIT"},
                                 "approval_status": "APPROVED",
                                 "policy_status": "EXECUTABLE",
@@ -2252,11 +2459,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
             window.messages = []
             window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
-            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            parent.account_combo = _FakeAccountCombo()
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-            window.parent = lambda: parent
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.read_order_from_queue_by_id = (
                 lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
                     window,
@@ -2270,6 +2474,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui, "ORDER_EXECUTIONS_PATH", executions_path),
                 mock.patch.object(gui, "ORDER_LOCKS_PATH", locks_path),
+                self._patch_fresh_dispatch_evidence(),
                 mock.patch.object(
                     gui,
                     "load_group_scope",
@@ -2312,6 +2517,10 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path = runtime_dir / "order_queue.json"
             executions_path = runtime_dir / "order_executions.json"
             locks_path = runtime_dir / "order_locks.json"
+            (runtime_dir / "positions.json").write_text(
+                json.dumps({"version": 1, "updated_at": "before", "positions": []}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             executions_path.write_text(
                 json.dumps(default_order_executions_data(), ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -2348,11 +2557,32 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                                 "id": "ORDER_AUTO_1",
                                 "status": "EXECUTABLE",
                                 "source_signal_id": "SIG_AUTO_1",
+                                "account_no": "12345678",
                                 "code": "003550",
                                 "side": "BUY",
                                 "quantity": 3,
+                                "amount": 255000,
                                 "price": 85000,
                                 "order_type": "LIMIT",
+                                "execution_intent": {"budget": 255000},
+                                "execution_request": {
+                                    "execution_id": "EXEC_AUTO_1",
+                                    "order_id": "ORDER_AUTO_1",
+                                    "source_signal_id": "SIG_AUTO_1",
+                                    "request_hash": "c" * 64,
+                                    "guard_snapshot": {"account_no": "12345678"},
+                                    "request_preview": {
+                                        "account_no": "12345678",
+                                        "screen_no": "0101",
+                                        "side": "BUY",
+                                        "order_action": "NEW",
+                                        "code": "003550",
+                                        "quantity": 3,
+                                        "price": 85000,
+                                        "hoga": "LIMIT",
+                                        "original_order_no": "",
+                                    },
+                                },
                                 "order_intent": {"side": "BUY", "hoga": "LIMIT"},
                                 "approval_status": "APPROVED",
                                 "policy_status": "EXECUTABLE",
@@ -2374,7 +2604,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
             parent.account_combo = _FakeAccountCombo()
             main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-            window.parent = lambda: parent
+            self._bind_window_parent(window, parent)
             window.read_order_from_queue_by_id = (
                 lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
                     window,
@@ -2470,11 +2700,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
-            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            parent = self._prepare_parent_account(send_order_result=0)
             parent.kiwoom_api = ApiWithoutSendOrder()
-            parent.account_combo = _FakeAccountCombo()
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-            window.parent = lambda: parent
+            self._bind_window_parent(window, parent)
             window.current_selected_routine_dir = lambda: routine_dir
             window.read_order_from_queue_by_id = (
                 lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
@@ -2523,11 +2751,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
-            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            parent.account_combo = _FakeAccountCombo()
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
-            window.parent = lambda: parent
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.current_selected_routine_dir = lambda: routine_dir
             window.read_order_from_queue_by_id = (
                 lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
@@ -2557,6 +2782,114 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             self.assertEqual("final_send_gate", result["stage"])
             self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+
+    def test_auto_send_order_fresh_buy_stale_blocks_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order(side="BUY")
+            self._write_queue_for_send_order(queue_path, record)
+            routine_dir = gui.Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            parent = self._prepare_parent_account(orderable_cash=9_999)
+            self._bind_window_parent(window, parent)
+            window.current_selected_routine_dir = lambda: routine_dir
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
+                self._patch_fresh_dispatch_evidence(),
+            ):
+                result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
+                    window,
+                    "ORDER_QUEUED_ORDER_1",
+                    queue_path=queue_path,
+                )
+
+            self.assertEqual("fresh_dispatch_preflight", result["stage"])
+            self.assertIn("requested BUY exposure exceeds current orderable amount", result["blocked_reasons"])
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual("ORDER_QUEUED", data["orders"][0]["status"])
+
+    def test_auto_send_order_fresh_sell_normal_reaches_fake_send_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
+            record = self._order_queued_record_for_send_order(side="SELL")
+            self._write_queue_for_send_order(queue_path, record)
+            self._write_broker_holding(broker_holdings_path, holding=20, available=20)
+            routine_dir = gui.Path(tmp) / "routine"
+            stock_dir = routine_dir / "003550_LG"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(json.dumps({"real_trade_enabled": True}), encoding="utf-8")
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "real_trade_enabled": True,
+                        "signal_probe_only": False,
+                        "review_required": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
+            window.current_selected_routine_dir = lambda: routine_dir
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(
+                    gui,
+                    "load_group_scope",
+                    return_value=mock.Mock(all_group_stock_dirs=lambda: (stock_dir,)),
+                ),
+                self._patch_fresh_dispatch_evidence(broker_holdings_path=broker_holdings_path),
+            ):
+                result = gui.AutoTradeSettingWindow.send_order_for_order_queued_automatically(
+                    window,
+                    "ORDER_QUEUED_ORDER_1",
+                    queue_path=queue_path,
+                )
+
+            self.assertEqual("SEND_CALL_ACCEPTED", result["status"])
+            self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), result)
+            self.assertTrue(result["fresh_dispatch_preflight_result"]["fresh_dispatch_preflight"])
 
     def test_manual_queue_commit_failure_result_is_displayed(self) -> None:
         window = self._window_for_queue_commit()
@@ -2642,8 +2975,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             confirmation_previews = []
@@ -2667,6 +3000,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(),
             ):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
 
@@ -2711,8 +3045,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
@@ -2732,10 +3066,112 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
             self.assertEqual(
-                ["0101", "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
+                [request_preview["screen_no"], "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
                 list(parent.kiwoom_api.send_order_calls[0]),
             )
             self.assertEqual("SEND_CALL_ACCEPTED", window.send_order_reports[-1]["status"])
+
+    def test_manual_send_order_fresh_buy_stale_blocks_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            record = self._order_queued_record_for_send_order(side="BUY")
+            self._write_queue_for_send_order(queue_path, record)
+            window = self._window_for_queue_commit()
+            parent = self._prepare_parent_account(orderable_cash=9_999)
+            self._bind_window_parent(window, parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+            window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(),
+            ):
+                gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            result = window.send_order_reports[-1]
+            self.assertEqual("fresh_dispatch_preflight", result["stage"])
+            self.assertIn("requested BUY exposure exceeds current orderable amount", result["blocked_reasons"])
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual("ORDER_QUEUED", data["orders"][0]["status"])
+            self.assertEqual(10, data["orders"][0]["quantity"])
+
+    def test_manual_send_order_fresh_sell_stale_blocks_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
+            record = self._order_queued_record_for_send_order(side="SELL")
+            self._write_queue_for_send_order(queue_path, record)
+            self._write_broker_holding(broker_holdings_path, holding=10, available=5)
+            window = self._window_for_queue_commit()
+            parent = self._prepare_parent_account()
+            self._bind_window_parent(window, parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+            window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(broker_holdings_path=broker_holdings_path),
+            ):
+                gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
+
+            self.assertEqual(0, len(parent.kiwoom_api.send_order_calls))
+            result = window.send_order_reports[-1]
+            self.assertEqual("fresh_dispatch_preflight", result["stage"])
+            self.assertIn("requested SELL exceeds current sellable quantity", result["blocked_reasons"])
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual("ORDER_QUEUED", data["orders"][0]["status"])
+            self.assertEqual(10, data["orders"][0]["quantity"])
+
+    def test_manual_send_order_fresh_sell_normal_reaches_fake_send_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "order_queue.json"
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
+            record = self._order_queued_record_for_send_order(side="SELL")
+            self._write_queue_for_send_order(queue_path, record)
+            self._write_broker_holding(broker_holdings_path, holding=20, available=20)
+            window = self._window_for_queue_commit()
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
+            window.send_order_reports = []
+            window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
+            window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
+            window.read_order_from_queue_by_id = (
+                lambda current_order_id, current_queue_path: gui.AutoTradeSettingWindow.read_order_from_queue_by_id(
+                    window,
+                    current_order_id,
+                    current_queue_path,
+                )
+            )
+
+            with (
+                mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
+                mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(broker_holdings_path=broker_holdings_path),
+            ):
+                gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
+
+            self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
+            self.assertEqual("SEND_CALL_ACCEPTED", window.send_order_reports[-1]["status"])
+            self.assertTrue(window.send_order_reports[-1]["fresh_dispatch_preflight_result"]["fresh_dispatch_preflight"])
 
     def test_manual_cancel_open_order_creates_queued_cancel_and_sends_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2751,8 +3187,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_cancel_pending_order = lambda source_order, preview: True
@@ -2773,7 +3209,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
             self.assertEqual(
-                ["0101", "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
+                [gui.project_order_default_screen_no(), "BUY_CANCEL", "12345678", 3, "003550", 4, 0, "00", "987654"],
                 list(parent.kiwoom_api.send_order_calls[0]),
             )
             data = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -2799,8 +3235,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
 
@@ -2831,8 +3267,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
 
@@ -2865,8 +3301,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
 
@@ -2900,8 +3336,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             queue_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_cancel_pending_order = lambda source_order, preview: True
@@ -2937,8 +3373,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_modify_pending_order = lambda source_order, preview: True
@@ -2959,7 +3395,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
 
             self.assertEqual(1, len(parent.kiwoom_api.send_order_calls), window.send_order_reports)
             self.assertEqual(
-                ["0101", "SELL_MODIFY", "12345678", 6, "003550", 5, 1200, "00", "222333"],
+                [gui.project_order_default_screen_no(), "SELL_MODIFY", "12345678", 6, "003550", 5, 1200, "00", "222333"],
                 list(parent.kiwoom_api.send_order_calls[0]),
             )
             data = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -2974,8 +3410,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: False
@@ -3004,8 +3440,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
 
@@ -3041,8 +3477,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=False, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(connected=False, send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.read_order_from_queue_by_id = (
@@ -3071,8 +3507,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=0)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.read_order_from_queue_by_id = (
@@ -3101,8 +3537,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678", "87654321"], send_order_result=0)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(
+                accounts=["12345678", "87654321"],
+                selected_account="12345678",
+                send_order_result=0,
+            )
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.read_order_from_queue_by_id = (
@@ -3129,12 +3569,14 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
     def test_manual_send_order_nonzero_records_send_call_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             queue_path = Path(tmp) / "order_queue.json"
+            broker_holdings_path = Path(tmp) / "broker_holdings.json"
             record = self._order_queued_record_for_send_order(side="SELL")
             self._write_queue_for_send_order(queue_path, record)
+            self._write_broker_holding(broker_holdings_path, holding=20, available=20)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=-308)
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=-308)
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
@@ -3149,6 +3591,9 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(
+                    broker_holdings_path=broker_holdings_path
+                ),
             ):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
 
@@ -3164,8 +3609,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self._write_queue_for_send_order(queue_path, record)
             window = self._window_for_queue_commit()
             parent = window.parent()
-            parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=RuntimeError("boom"))
-            main_gui.MainWindow.refresh_kiwoom_accounts(parent)
+            parent = self._prepare_parent_account(send_order_result=RuntimeError("boom"))
+            self._bind_window_parent(window, parent)
             window.send_order_reports = []
             window.show_manual_send_order_result = lambda result: window.send_order_reports.append(result)
             window.confirm_manual_send_order = lambda order, call_preview, queue_path, queue_snapshot: True
@@ -3180,6 +3625,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             with (
                 mock.patch.object(gui, "ORDER_QUEUE_PATH", queue_path),
                 mock.patch.object(gui.QInputDialog, "getText", return_value=("ORDER_QUEUED_ORDER_1", True)),
+                self._patch_fresh_dispatch_evidence(),
             ):
                 gui.AutoTradeSettingWindow.send_order_for_order_queued_manually(window)
 
@@ -4363,7 +4809,6 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             self.assertTrue(result["recorded"], result)
             self.assertEqual("CONSISTENT", result["reconciliation_status"])
             self.assertEqual(1, len(json.loads(broker_holdings_path.read_text(encoding="utf-8"))["holdings"]))
-
 
 if __name__ == "__main__":
     unittest.main()

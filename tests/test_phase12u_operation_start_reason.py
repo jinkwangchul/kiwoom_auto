@@ -16,7 +16,12 @@ from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
 
 class _StartReasonWindow:
-    def __init__(self, targets):
+    def __init__(
+        self,
+        targets,
+        *,
+        recalculate_result=("changed", "STOPPED", "RUNNING"),
+    ):
         self.targets = list(targets)
         self.status_messages = []
         self._operation_start_batch_active = False
@@ -28,7 +33,7 @@ class _StartReasonWindow:
             repaint=MagicMock(),
         )
         self.recalculate_stock_status_by_operation_policy = MagicMock(
-            return_value=("failed", None, None)
+            return_value=recalculate_result
         )
 
     def selected_stock_infos(self):
@@ -48,6 +53,9 @@ class _StartReasonWindow:
 
     def statusBarMessage(self, message):
         self.status_messages.append(str(message))
+
+    def show_auto_trade_result_dialog(self, *_args):
+        return None
 
 
 def _write_target(root: Path, code: str, *, start: str = "09:00:00"):
@@ -82,7 +90,7 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
             run_control._start_failure_user_message([]),
         )
 
-    def test_all_structural_targets_outside_time_gets_time_message(self) -> None:
+    def test_all_structural_targets_outside_time_are_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _write_target(Path(temp_dir), "000001")
             window = _StartReasonWindow([target])
@@ -108,15 +116,17 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                     request_scope=run_control.START_REQUEST_MULTIPLE,
                 )
 
-            self.assertFalse(result["ok"])
+            self.assertTrue(result["ok"])
+            self.assertEqual(1, result["started_count"])
+            self.assertEqual((target,), result["time_eligible_targets"])
+            self.assertEqual((), result["time_blocked_targets"])
             self.assertEqual(
-                "현재는 매매 운영 시간이 아닙니다.",
-                result["user_message"],
+                ("000001",),
+                run_control.auto_trade_current_session_operation_participant_codes(
+                    window
+                ),
             )
-            self.assertEqual(("000001 테스트",), result["eligible"])
-            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
-            self.assertEqual((), result["time_eligible_targets"])
-            writer.assert_not_called()
+            writer.assert_called_once_with(participant_stock_codes=["000001"])
 
     def test_time_eligible_target_keeps_downstream_validation_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -130,7 +140,10 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                 json.dumps(outside_config),
                 encoding="utf-8",
             )
-            window = _StartReasonWindow([outside, inside])
+            window = _StartReasonWindow(
+                [outside, inside],
+                recalculate_result=("failed", None, None),
+            )
             with (
                 patch.object(run_control, "read_operation_state", return_value={}),
                 patch.object(
@@ -152,8 +165,8 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("운영 상태를 저장하지 못했습니다", str(result["user_message"]))
             self.assertNotIn("매매 운영 시간이 아닙니다", str(result["user_message"]))
-            self.assertEqual((inside,), result["time_eligible_targets"])
-            self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+            self.assertEqual((outside, inside), result["time_eligible_targets"])
+            self.assertEqual((), result["time_blocked_targets"])
             writer.assert_not_called()
 
     def test_schedule_helper_matches_guard_time_contract(self) -> None:
@@ -169,7 +182,7 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
         self.assertTrue(run_control.auto_trade_operation_time_allowed(config, now_dt=during))
         self.assertFalse(run_control.auto_trade_operation_time_allowed(config, now_dt=after))
 
-    def test_main_global_adapter_path_preserves_outside_time_reason(self) -> None:
+    def test_main_global_adapter_path_allows_outside_time_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _write_target(Path(temp_dir), "012210")
 
@@ -185,9 +198,26 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                         "excluded_review": (),
                     }
 
+                def pre_start_review_check(self, *_args, **_kwargs):
+                    return {}
+
+                def mark_review_required(self, *_args, **_kwargs):
+                    return False
+
+                def recalculate_stock_status_by_operation_policy(
+                    self, *_args, **_kwargs
+                ):
+                    return "changed", "STOPPED", "RUNNING"
+
+                def rebind_startup_recovery_after_trusted_runtime_update(self):
+                    return None
+
             class _Owner:
                 def __init__(self):
-                    self.routine_table = SimpleNamespace()
+                    self.routine_table = SimpleNamespace(
+                        viewport=lambda: SimpleNamespace(update=MagicMock()),
+                        repaint=MagicMock(),
+                    )
                     self.btn_start = SimpleNamespace(
                         setText=MagicMock(),
                         setStyleSheet=MagicMock(),
@@ -230,15 +260,17 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                 patch.object(run_control, "append_changelog"),
                 patch.object(run_control, "_show_start_failure_once"),
                 patch.object(run_control, "write_global_operation_running_state") as writer,
+                patch.object(
+                    monitoring_context_menu,
+                    "_show_monitoring_auto_trade_result_dialog",
+                ),
             ):
                 AutoTradeSettingWindow.start_selected_auto_trades(adapter)
 
-            self.assertEqual(
-                "현재는 매매 운영 시간이 아닙니다.",
-                result_holder["result"]["user_message"],
-            )
-            self.assertEqual(("012210 테스트",), result_holder["result"]["failed"])
-            writer.assert_not_called()
+            self.assertTrue(result_holder["result"]["ok"])
+            self.assertEqual(1, result_holder["result"]["started_count"])
+            self.assertEqual((), result_holder["result"]["time_blocked_targets"])
+            writer.assert_called_once_with(participant_stock_codes=["012210"])
 
 
 if __name__ == "__main__":

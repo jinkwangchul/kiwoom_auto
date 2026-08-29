@@ -11,7 +11,10 @@ from PyQt5.QtWidgets import QApplication, QWidget
 import gui_main_table_loader as loader
 import gui_windows
 from gui_routine_registry import GroupRecord
-from main_group_projection import build_main_group_projection
+from main_group_projection import (
+    build_main_group_projection,
+    projected_main_group_stock_targets,
+)
 from routine_instance_registry import RoutineInstanceRecord
 
 
@@ -245,6 +248,23 @@ class MainGroupProjectionTests(unittest.TestCase):
             )
 
         self.assertEqual((), projection)
+
+    def test_projected_stock_targets_exposes_only_assigned_projection_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            group = _group(root, "동전주")
+            instance = _instance("instance-a", group_id=group.group_id)
+            projection = build_main_group_projection(
+                [group],
+                [instance],
+                [
+                    _stock("000001", "동전주", "instance-a"),
+                    _stock("000002", "동전주", ""),
+                ],
+            )
+
+        targets = projected_main_group_stock_targets(projection)
+        self.assertEqual([(Path("stocks/000001_Stock"), "000001", "Stock 000001")], list(targets))
 
     def test_unknown_instance_id_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

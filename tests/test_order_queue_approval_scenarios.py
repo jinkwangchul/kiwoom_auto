@@ -6,16 +6,22 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import order_candidate_engine
 import order_approval_engine
+import order_manager
 import order_queue
 import operation_policy_gate
 import routine_signal_consumer
 import routine_signal_order_bridge
 import routine_signal_queue
+
+
+ACCOUNT = "12345678"
 
 
 class _FakeStockRepository:
@@ -89,25 +95,42 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self._write_json(self.stock_dir / "orders.json", {"orders": []})
         self._write_json(self.runtime_dir / "operation_state.json", {})
 
-    def _write_signal(self, *, signal: str, signal_id: str) -> None:
+    def _write_signal(
+        self,
+        *,
+        signal: str,
+        signal_id: str,
+        execution_intent: dict[str, object] | None = None,
+    ) -> None:
+        record = {
+            "id": signal_id,
+            "status": "PENDING",
+            "routine": "지표추종매매",
+            "code": "003550",
+            "name": "LG",
+            "signal": signal,
+            "reason": "test signal",
+            "tick_key": "unit-test",
+            "execution_enabled": False,
+        }
+        if execution_intent is not None:
+            record["execution_intent"] = execution_intent
         self._write_json(
             self.queue_path,
             {
                 "version": 1,
                 "updated_at": "",
-                "signals": [
-                    {
-                        "id": signal_id,
-                        "status": "PENDING",
-                        "routine": "지표추종매매",
-                        "code": "003550",
-                        "name": "LG",
-                        "signal": signal,
-                        "reason": "test signal",
-                        "tick_key": "unit-test",
-                        "execution_enabled": False,
-                    }
-                ],
+                "signals": [record],
+            },
+        )
+
+    def _write_signals(self, signals: list[dict[str, object]]) -> None:
+        self._write_json(
+            self.queue_path,
+            {
+                "version": 1,
+                "updated_at": "",
+                "signals": signals,
             },
         )
 
@@ -200,14 +223,47 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
 
     def test_sell_with_holding_keeps_execution_disabled(self) -> None:
         self._setup_stock(holding_qty=10)
+        self._write_json(
+            self.stock_dir / "state.json",
+            {
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "real_trade_enabled": True,
+                "signal_probe_only": False,
+                "holding_qty": 10,
+            },
+        )
+        self._write_json(
+            self.stock_dir / "config.json",
+            {
+                "routine": "지표추종매매",
+                "operation_mode": "CONTINUOUS",
+                "operation_start_time": "00:00",
+                "operation_end_time": "23:59",
+            },
+        )
+        self._write_json(
+            self.runtime_dir / "operation_state.json",
+            {
+                "operation_date": datetime.now().date().isoformat(),
+                "operation_status": "RUNNING",
+                "emergency_stop": False,
+            },
+        )
         self._write_signal(signal="SELL", signal_id="SIG_SELL_HOLDING")
 
-        result = self._consume()
+        with patch.object(
+            order_manager,
+            "current_datetime",
+            return_value=datetime.now().replace(hour=10, minute=0, second=0, microsecond=0),
+        ):
+            result = self._consume()
         order = self._single_order()
         signal = self._single_signal()
 
         self.assertEqual("CANDIDATE_READY", order.get("candidate_status"))
-        self.assertGreater(order.get("quantity"), 0)
+        self.assertEqual(10, order.get("quantity"))
+        self.assertEqual(10, order.get("quantity_estimated"))
         self.assertEqual("EXECUTABLE", order.get("status"))
         self.assertEqual("APPROVED", order.get("approval_status"))
         self.assertEqual("EXECUTABLE", order.get("policy_status"))
@@ -218,7 +274,7 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual(1, result["summary"]["policy_executable"])
         self.assertEqual(0, result["summary"]["policy_blocked"])
         self.assertEqual(0, result["summary"]["policy_errors"])
-        self.assertEqual("BLOCKED", signal.get("status"))
+        self.assertEqual("PREVIEWED", signal.get("status"))
         self.assertNotIn(order.get("status"), {"REAL_READY"})
         intent = order.get("order_intent", {})
         self.assertEqual("SELL", intent.get("side"))
@@ -232,11 +288,137 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual("SELL", provenance.get("signal"))
         self.assertTrue(provenance.get("unresolved"))
 
+    def test_consumer_scopes_pending_signals_to_execution_universe_codes(self) -> None:
+        self._setup_stock(holding_qty=10)
+        self._write_signals(
+            [
+                {
+                    "id": "SIG_ALLOWED",
+                    "status": "PENDING",
+                    "routine": "지표추종매매",
+                    "code": "003550",
+                    "name": "LG",
+                    "signal": "SELL",
+                    "reason": "allowed signal",
+                    "tick_key": "unit-test",
+                    "execution_enabled": False,
+                },
+                {
+                    "id": "SIG_OUT_OF_SCOPE",
+                    "status": "PENDING",
+                    "routine": "지표추종매매",
+                    "code": "005930",
+                    "name": "삼성전자",
+                    "signal": "SELL",
+                    "reason": "out of scope signal",
+                    "tick_key": "unit-test",
+                    "execution_enabled": False,
+                },
+            ]
+        )
+
+        result = routine_signal_consumer.consume_pending_routine_signals_dry_run(
+            limit=None,
+            mark_previewed=True,
+            write_order_queue=True,
+            apply_approval=True,
+            allowed_stock_codes=("003550",),
+        )
+
+        data = json.loads(self.order_queue_path.read_text(encoding="utf-8"))
+        orders = data.get("orders", [])
+        self.assertEqual(1, len(orders))
+        self.assertEqual("003550", orders[0].get("code"))
+        signals = json.loads(self.queue_path.read_text(encoding="utf-8"))["signals"]
+        by_id = {item["id"]: item for item in signals}
+        self.assertNotEqual("PENDING", by_id["SIG_ALLOWED"].get("status"))
+        self.assertEqual("PENDING", by_id["SIG_OUT_OF_SCOPE"].get("status"))
+        self.assertEqual(1, result["summary"]["signals_checked"])
+
     def test_buy_candidate_keeps_execution_disabled(self) -> None:
         self._setup_stock(holding_qty=0, entry_amount=1000)
-        self._write_signal(signal="BUY", signal_id="SIG_BUY")
+        self._write_json(
+            self.stock_dir / "state.json",
+            {
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "real_trade_enabled": True,
+                "holding_qty": 0,
+            },
+        )
+        self._write_json(
+            self.stock_dir / "config.json",
+            {
+                "routine": "지표추종매매",
+                "operation_mode": "CONTINUOUS",
+                "operation_start_time": "00:00",
+                "operation_end_time": "23:59",
+            },
+        )
+        self._write_json(
+            self.runtime_dir / "operation_state.json",
+            {
+                "operation_date": datetime.now().date().isoformat(),
+                "operation_status": "RUNNING",
+                "emergency_stop": False,
+            },
+        )
+        positions_path = self.runtime_dir / "positions.json"
+        self._write_json(positions_path, {"positions": []})
+        self._write_signal(
+            signal="BUY",
+            signal_id="SIG_BUY",
+            execution_intent={
+                "side": "BUY",
+                "buy_phase": "BASE",
+                "buy_round": 1,
+                "confirmed_previous_round": 0,
+                "quantity": 10,
+                "budget": 1000,
+                "price_basis": "CURRENT_PRICE",
+                "price": 100,
+                "hoga": "LIMIT",
+                "hoga_mode": "SINGLE",
+                "routine_type": "INDICATOR_FOLLOW",
+                "routine_instance_id": "ROUTINE-1",
+                "source_signal_id": "SIG_BUY",
+                "cycle_identity": "CYCLE-SIG-BUY",
+                "account_no": ACCOUNT,
+            },
+        )
 
-        result = self._consume()
+        recovery = SimpleNamespace(
+            account_status="COMPLETED",
+            identity=SimpleNamespace(
+                account_no=ACCOUNT,
+                trading_day=datetime.now().date().isoformat(),
+            ),
+            stocks=(
+                SimpleNamespace(
+                    stock_code="003550",
+                    stock_status="RESTORED",
+                    review_required=False,
+                ),
+            ),
+        )
+        with patch.object(
+            order_manager,
+            "current_datetime",
+            return_value=datetime.now().replace(hour=10, minute=0, second=0, microsecond=0),
+        ), patch.object(
+            operation_policy_gate,
+            "POSITIONS_PATH",
+            positions_path,
+        ), patch.object(
+            operation_policy_gate,
+            "read_system_total_budget_for_recalculation",
+            return_value=10_000,
+        ), patch.object(
+            operation_policy_gate.production_recovery_registry,
+            "snapshot",
+            return_value=recovery,
+        ):
+            result = self._consume()
         order = self._single_order()
         signal = self._single_signal()
 
@@ -253,19 +435,16 @@ class OrderQueueApprovalScenarioTests(unittest.TestCase):
         self.assertEqual(1, result["summary"]["policy_executable"])
         self.assertEqual(0, result["summary"]["policy_blocked"])
         self.assertEqual(0, result["summary"]["policy_errors"])
-        self.assertEqual("BLOCKED", signal.get("status"))
+        self.assertEqual("PREVIEWED", signal.get("status"))
         self.assertNotIn(order.get("status"), {"REAL_READY"})
         intent = order.get("order_intent", {})
         self.assertEqual("BUY", intent.get("side"))
-        self.assertEqual("order_candidate_engine", intent.get("source"))
-        self.assertEqual("entry_amount", intent.get("budget_source"))
-        self.assertEqual("latest_price", intent.get("price_basis"))
-        self.assertIsNone(intent.get("source_ui_path"))
-        self.assertTrue(intent.get("unresolved"))
+        self.assertEqual(ACCOUNT, order.get("account_no"))
+        self.assertEqual("execution_intent", order.get("budget_source"))
+        self.assertEqual("CURRENT_PRICE", order.get("price_basis"))
         provenance = order.get("order_provenance", {})
         self.assertEqual("SIG_BUY", provenance.get("source_signal_id"))
         self.assertEqual("BUY", provenance.get("signal"))
-        self.assertTrue(provenance.get("unresolved"))
 
     def test_policy_gate_failure_blocks_signal_status_update(self) -> None:
         self._setup_stock(holding_qty=10)

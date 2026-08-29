@@ -8,9 +8,10 @@ routine_signals.json, orders.json, state.json, or rules.json.
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from order_queue import signal_to_order_candidate
 from order_manager import handle_routine_signal_for_stock_dir
@@ -46,22 +47,73 @@ def _is_false(value: Any) -> bool:
     return str(value).strip().lower() in {"", "0", "false", "no", "n", "off"}
 
 
-def load_pending_routine_signals() -> list[dict[str, Any]]:
+def _allowed_texts(values: Iterable[Any] | None) -> set[str] | None:
+    if values is None:
+        return None
+    allowed = {str(value or "").strip() for value in values}
+    allowed.discard("")
+    return allowed
+
+
+def _signal_cutoffs(values: dict[Any, Any] | None) -> dict[str, str] | None:
+    if values is None:
+        return None
+    return {
+        _normalize_text(code): _normalize_text(cutoff)
+        for code, cutoff in values.items()
+        if _normalize_text(code)
+    }
+
+
+def _local_naive_datetime(value: Any) -> datetime | None:
+    text = _normalize_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _signal_is_after_cutoff(record: dict[str, Any], cutoff: str) -> bool:
+    created_at = _local_naive_datetime(record.get("created_at"))
+    boundary = _local_naive_datetime(cutoff)
+    return created_at is not None and boundary is not None and created_at > boundary
+
+
+def load_pending_routine_signals(
+    *,
+    allowed_stock_codes: Iterable[Any] | None = None,
+    signal_cutoff_by_stock_code: dict[Any, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Return PENDING BUY/SELL signals that are explicitly execution-disabled."""
     data = _read_json(SIGNAL_QUEUE_PATH, {"signals": []})
     signals = data.get("signals", []) if isinstance(data, dict) else []
     if not isinstance(signals, list):
         return []
 
+    allowed_codes = _allowed_texts(allowed_stock_codes)
+    signal_cutoffs = _signal_cutoffs(signal_cutoff_by_stock_code)
     pending: list[dict[str, Any]] = []
     for record in signals:
         if not isinstance(record, dict):
+            continue
+        stock_code = _normalize_text(record.get("code"))
+        if allowed_codes is not None and stock_code not in allowed_codes:
             continue
         if _normalize_upper(record.get("status")) != "PENDING":
             continue
         if _normalize_upper(record.get("signal")) not in VALID_SIGNALS:
             continue
         if not _is_false(record.get("execution_enabled")):
+            continue
+        if signal_cutoffs is not None and not _signal_is_after_cutoff(
+            record,
+            signal_cutoffs.get(stock_code, ""),
+        ):
             continue
         pending.append(record)
     return pending

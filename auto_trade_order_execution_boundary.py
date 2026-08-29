@@ -12,15 +12,28 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from account_auto_trade_budget_consumption import (
+    canonical_buy_candidate_amount,
+    project_account_auto_trade_budget_consumption,
+    project_system_total_budget_buy_admission,
+)
 from gui_auto_trade_integrity import is_emergency_stopped_state
+from gui_ats_utils import project_manual_ats_execution_order
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_close_routine_order_allowed,
 )
 from gui_auto_trade_runtime import parse_stock_folder_name
+from gui_operation_environment import read_system_total_budget_for_recalculation
 from runtime_io import read_json_dict
 from state_policy import real_trade_enabled
 from operation_policy_gate import read_operation_state
+from production_recovery_contract import (
+    ACCOUNT_COMPLETED,
+    STOCK_RESTORED,
+    normalize_stock_code,
+)
+from production_recovery_state_registry import production_recovery_registry
 from order_manager import (
     decide_routine_order_for_stock_dir,
     mark_routine_order_accepted_for_stock_dir,
@@ -59,6 +72,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
+BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
 ROUTINE_INSTANCE_REQUIRED_MESSAGE = "이 작업을 수행할 대상 루틴을 선택하세요."
 CANCEL_SIDE_SCOPE_ALL = "ALL"
 CANCEL_SIDE_SCOPE_BUY_ONLY = "BUY_ONLY"
@@ -309,6 +323,9 @@ class AutoTradeOrderExecutionContext:
     order_locks_path: Callable[[], Path]
     confirm_runtime_file_init: Callable[[Path, Path], bool] | None = None
     all_group_stock_dirs: Callable[[], list[Path]] | None = None
+    current_orderable_cash: Callable[[], int | None] | None = None
+    broker_holdings_path: Callable[[], Path] | None = None
+    fresh_current_price: Callable[[str], int | float | None] | None = None
 
 
 class AutoTradeOrderExecutionBoundary:
@@ -971,6 +988,324 @@ class AutoTradeOrderExecutionBoundary:
             "send_order_callable": send_order_callable,
         }
 
+    @staticmethod
+    def _positive_int(value: object, *, field: str) -> tuple[int | None, str]:
+        if isinstance(value, bool):
+            return None, f"{field} must be a positive integer"
+        try:
+            number = int(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None, f"{field} must be a positive integer"
+        if number <= 0:
+            return None, f"{field} must be a positive integer"
+        return number, ""
+
+    @staticmethod
+    def _nonnegative_int(value: object, *, field: str) -> tuple[int | None, str]:
+        if isinstance(value, bool):
+            return None, f"{field} must be a non-negative integer"
+        try:
+            number = int(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None, f"{field} must be a non-negative integer"
+        if number < 0:
+            return None, f"{field} must be a non-negative integer"
+        return number, ""
+
+    @staticmethod
+    def _order_request_preview(order: Mapping[str, object]) -> dict[str, object]:
+        execution_request = order.get("execution_request")
+        execution_request_dict = execution_request if isinstance(execution_request, dict) else {}
+        request_preview = execution_request_dict.get("request_preview")
+        return request_preview if isinstance(request_preview, dict) else {}
+
+    def _broker_holdings_path(self) -> Path:
+        callback = self._context.broker_holdings_path
+        if callable(callback):
+            try:
+                value = callback()
+                if isinstance(value, Path):
+                    return value
+            except Exception:
+                pass
+        return BROKER_HOLDINGS_PATH
+
+    def _current_orderable_cash(self) -> int | None:
+        callback = self._context.current_orderable_cash
+        if not callable(callback):
+            return None
+        try:
+            value = callback()
+        except Exception:
+            return None
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            amount = int(value)
+        except (TypeError, ValueError):
+            return None
+        return amount if amount >= 0 else None
+
+    def _load_queue_orders_for_fresh_preflight(self, queue_path: Path) -> tuple[list[dict[str, object]], str]:
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return [], f"fresh queue evidence unavailable: {exc}"
+        if not isinstance(data, dict):
+            return [], "fresh queue evidence unavailable: order_queue root must be an object"
+        orders = data.get("orders")
+        if not isinstance(orders, list) or any(not isinstance(item, dict) for item in orders):
+            return [], "fresh queue evidence unavailable: order_queue orders must contain only objects"
+        return [dict(item) for item in orders], ""
+
+    @staticmethod
+    def _same_order_identity(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+        for field in ("id", "order_id", "request_hash", "lock_id", "execution_id"):
+            left_value = str(left.get(field) or "").strip()
+            right_value = str(right.get(field) or "").strip()
+            if left_value and right_value and left_value == right_value:
+                return True
+        return False
+
+    def _fresh_sell_dispatch_preflight(
+        self,
+        order: dict[str, object],
+        environment: dict[str, object],
+    ) -> dict[str, object]:
+        request = self._order_request_preview(order)
+        qty, qty_reason = self._positive_int(
+            request.get("quantity", order.get("quantity")),
+            field="requested SELL quantity",
+        )
+        if qty is None:
+            return {"ok": False, "stage": "fresh_sell_quantity", "blocked_reasons": [qty_reason]}
+
+        account_no = str(environment.get("selected_account_no") or "").strip()
+        code = normalize_stock_code(request.get("code") or order.get("code"))
+        if not account_no:
+            return {"ok": False, "stage": "fresh_sell_account", "blocked_reasons": ["current account is unavailable"]}
+        if not code:
+            return {"ok": False, "stage": "fresh_sell_code", "blocked_reasons": ["current stock code is unavailable"]}
+
+        path = self._broker_holdings_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stage": "fresh_sell_holding_evidence",
+                "blocked_reasons": [f"fresh holding unavailable: {exc}"],
+                "broker_holdings_path": str(path),
+            }
+        if not isinstance(data, dict):
+            return {
+                "ok": False,
+                "stage": "fresh_sell_holding_evidence",
+                "blocked_reasons": ["fresh holding unavailable: broker holdings root must be an object"],
+                "broker_holdings_path": str(path),
+            }
+        holdings = data.get("holdings")
+        if not isinstance(holdings, list) or any(not isinstance(item, dict) for item in holdings):
+            return {
+                "ok": False,
+                "stage": "fresh_sell_holding_evidence",
+                "blocked_reasons": ["fresh holding unavailable: holdings must contain only objects"],
+                "broker_holdings_path": str(path),
+            }
+        matches = [
+            dict(item)
+            for item in holdings
+            if str(item.get("account_no") or "").strip() == account_no
+            and normalize_stock_code(item.get("stock_code") or item.get("code")) == code
+        ]
+        if len(matches) != 1:
+            reason = (
+                "fresh sellable quantity unavailable"
+                if not matches
+                else "broker/reconciliation unavailable: duplicate broker holding records"
+            )
+            return {
+                "ok": False,
+                "stage": "fresh_sell_holding_match",
+                "blocked_reasons": [reason],
+                "broker_holdings_path": str(path),
+                "match_count": len(matches),
+            }
+        holding = matches[0]
+        sellable, sellable_reason = self._nonnegative_int(
+            holding.get("available_quantity", holding.get("available_qty")),
+            field="fresh sellable quantity",
+        )
+        holding_qty, holding_reason = self._nonnegative_int(
+            holding.get("holding_quantity", holding.get("holding_qty")),
+            field="fresh holding quantity",
+        )
+        if sellable is None:
+            return {"ok": False, "stage": "fresh_sellable_quantity", "blocked_reasons": [sellable_reason], "broker_holdings_path": str(path)}
+        if holding_qty is None:
+            return {"ok": False, "stage": "fresh_holding_quantity", "blocked_reasons": [holding_reason], "broker_holdings_path": str(path)}
+        if sellable > holding_qty:
+            return {
+                "ok": False,
+                "stage": "fresh_sell_reconciliation",
+                "blocked_reasons": ["broker/reconciliation unavailable: sellable quantity exceeds holding quantity"],
+                "fresh_sellable_quantity": sellable,
+                "fresh_holding_quantity": holding_qty,
+            }
+        if qty > sellable:
+            return {
+                "ok": False,
+                "stage": "fresh_sell_quantity_exceeded",
+                "blocked_reasons": ["requested SELL exceeds current sellable quantity"],
+                "requested_quantity": qty,
+                "fresh_sellable_quantity": sellable,
+                "fresh_holding_quantity": holding_qty,
+            }
+        return {
+            "ok": True,
+            "stage": "fresh_sell_preflight_passed",
+            "blocked_reasons": [],
+            "requested_quantity": qty,
+            "fresh_sellable_quantity": sellable,
+            "fresh_holding_quantity": holding_qty,
+            "broker_holdings_path": str(path),
+        }
+
+    def _fresh_buy_dispatch_preflight(
+        self,
+        order: dict[str, object],
+        environment: dict[str, object],
+        queue_path: Path,
+    ) -> dict[str, object]:
+        request = self._order_request_preview(order)
+        qty, qty_reason = self._positive_int(
+            request.get("quantity", order.get("quantity")),
+            field="requested BUY quantity",
+        )
+        if qty is None:
+            return {"ok": False, "stage": "fresh_buy_quantity", "blocked_reasons": [qty_reason]}
+        try:
+            requested_exposure = canonical_buy_candidate_amount(order)
+        except ValueError as exc:
+            return {"ok": False, "stage": "fresh_buy_exposure", "blocked_reasons": [f"fresh BUY exposure unavailable: {exc}"]}
+
+        orderable_cash = self._current_orderable_cash()
+        if orderable_cash is None:
+            return {"ok": False, "stage": "fresh_buy_orderable_cash", "blocked_reasons": ["fresh orderable amount unavailable"]}
+        if requested_exposure > orderable_cash:
+            return {
+                "ok": False,
+                "stage": "fresh_buy_orderable_cash_exceeded",
+                "blocked_reasons": ["requested BUY exposure exceeds current orderable amount"],
+                "requested_buy_exposure": requested_exposure,
+                "fresh_orderable_cash": orderable_cash,
+            }
+
+        orders, queue_reason = self._load_queue_orders_for_fresh_preflight(queue_path)
+        if queue_reason:
+            return {"ok": False, "stage": "fresh_buy_queue_evidence", "blocked_reasons": [queue_reason]}
+        other_orders = [item for item in orders if not self._same_order_identity(item, order)]
+        account_no = str(environment.get("selected_account_no") or "").strip()
+        recovery = production_recovery_registry.snapshot()
+        identity = getattr(recovery, "identity", None)
+        recovery_ready = bool(
+            recovery is not None
+            and getattr(recovery, "account_status", None) == ACCOUNT_COMPLETED
+            and identity is not None
+            and str(getattr(identity, "account_no", "") or "").strip() == account_no
+            and str(getattr(identity, "trading_day", "") or "").strip()
+            == datetime.now().date().isoformat()
+        )
+        stocks = tuple(getattr(recovery, "stocks", ()) or ()) if recovery is not None else ()
+        reconciled_codes = {
+            str(getattr(stock, "stock_code", "") or "").strip()
+            for stock in stocks
+            if getattr(stock, "stock_status", None) == STOCK_RESTORED
+            and getattr(stock, "review_required", None) is False
+        }
+        order_code = normalize_stock_code(request.get("code") or order.get("code"))
+        if len(reconciled_codes) != len(stocks) or order_code not in reconciled_codes:
+            recovery_ready = False
+        consumption = project_account_auto_trade_budget_consumption(
+            account_no=account_no,
+            positions_path=queue_path.with_name("positions.json"),
+            order_queue_path=queue_path,
+            recovery_complete=recovery_ready,
+            reconciled_stock_codes=reconciled_codes,
+            order_records=other_orders,
+        )
+        if consumption.get("available") is not True:
+            return {
+                "ok": False,
+                "stage": "fresh_buy_budget_evidence",
+                "blocked_reasons": [str(consumption.get("reason") or "current budget evidence unavailable")],
+                "budget_consumption_result": consumption,
+            }
+        admission = project_system_total_budget_buy_admission(
+            total_budget=read_system_total_budget_for_recalculation(),
+            account_consumed_amount=consumption.get("consumed_amount"),
+            candidate_buy_amount=requested_exposure,
+        )
+        if admission.get("available") is not True:
+            return {
+                "ok": False,
+                "stage": "fresh_buy_budget_evidence",
+                "blocked_reasons": [str(admission.get("reason") or "current budget evidence unavailable")],
+                "budget_admission_result": admission,
+            }
+        if admission.get("admitted") is not True:
+            return {
+                "ok": False,
+                "stage": "fresh_buy_budget_exceeded",
+                "blocked_reasons": ["requested BUY exposure exceeds current budget capacity"],
+                "requested_buy_exposure": requested_exposure,
+                "fresh_orderable_cash": orderable_cash,
+                "budget_admission_result": admission,
+            }
+        return {
+            "ok": True,
+            "stage": "fresh_buy_preflight_passed",
+            "blocked_reasons": [],
+            "requested_buy_exposure": requested_exposure,
+            "fresh_orderable_cash": orderable_cash,
+            "budget_consumption_result": consumption,
+            "budget_admission_result": admission,
+        }
+
+    def evaluate_final_dispatch_fresh_preflight(
+        self,
+        order: dict[str, object],
+        environment: dict[str, object],
+        queue_path: Path,
+    ) -> dict[str, object]:
+        request = self._order_request_preview(order)
+        side = str(request.get("side") or order.get("side") or "").strip().upper()
+        action = str(request.get("order_action") or order.get("order_action") or "NEW").strip().upper()
+        if action != "NEW":
+            return {
+                "ok": True,
+                "stage": "fresh_preflight_skipped_non_new_order",
+                "blocked_reasons": [],
+                "side": side,
+                "order_action": action,
+                "fresh_dispatch_preflight": True,
+            }
+        if side == "SELL":
+            result = self._fresh_sell_dispatch_preflight(order, environment)
+        elif side == "BUY":
+            result = self._fresh_buy_dispatch_preflight(order, environment, queue_path)
+        else:
+            result = {
+                "ok": False,
+                "stage": "fresh_dispatch_side",
+                "blocked_reasons": ["fresh dispatch preflight side must be BUY or SELL"],
+                "side": side,
+            }
+        result["fresh_dispatch_preflight"] = result.get("ok") is True
+        result["side"] = side
+        result["order_action"] = action
+        return result
+
     def send_order_identity_from_record(self, record: dict[str, object]) -> dict[str, object]:
         return {
             "order_queued_id": str(record.get("id") or record.get("order_queued_id") or "").strip(),
@@ -1594,6 +1929,37 @@ class AutoTradeOrderExecutionBoundary:
             }
         return {"found": False, "state": {}, "config": {}, "stock_dir": "", "issues": ["runtime stock state is not found"]}
 
+    def project_ats_execution_order(
+        self,
+        order: dict[str, object],
+        *,
+        now_dt: datetime | None = None,
+    ) -> dict[str, object]:
+        runtime = self.auto_trade_runtime_state_for_order(order)
+        if runtime.get("found") is not True:
+            return {
+                "ok": False,
+                "applied": False,
+                "execution_method": None,
+                "order": deepcopy(order),
+                "reason_code": "ATS_RUNTIME_STATE_UNAVAILABLE",
+                "blocked_reasons": list(runtime.get("issues") or ["ATS_RUNTIME_STATE_UNAVAILABLE"]),
+            }
+        state = runtime.get("state")
+        config = runtime.get("config")
+        state_dict = state if isinstance(state, dict) else {}
+        config_dict = config if isinstance(config, dict) else {}
+        callback = self._context.fresh_current_price
+        result = project_manual_ats_execution_order(
+            order,
+            config_dict,
+            state_dict,
+            now_dt=now_dt,
+            current_price_getter=callback if callable(callback) else None,
+        )
+        result["stock_dir"] = str(runtime.get("stock_dir") or "")
+        return result
+
     def auto_trade_execution_block_reasons(self, order: dict[str, object]) -> list[str]:
         runtime = self.auto_trade_runtime_state_for_order(order)
         if runtime.get("found") is not True:
@@ -1882,6 +2248,29 @@ class AutoTradeOrderExecutionBoundary:
                 "final_send_gate_result": final_gate,
             }
 
+        fresh_preflight = self.evaluate_final_dispatch_fresh_preflight(
+            latest_order_for_execution,
+            latest_environment,
+            queue_path,
+        )
+        if fresh_preflight.get("ok") is not True:
+            return {
+                "status": "BLOCKED",
+                "stage": "fresh_dispatch_preflight",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(
+                    fresh_preflight.get("blocked_reasons")
+                    or ["fresh dispatch preflight blocked"]
+                ),
+                "fresh_dispatch_preflight_result": fresh_preflight,
+                "send_order_call_preview_result": call_preview,
+                "final_send_gate_result": final_gate,
+            }
+
         claim_token = f"AUTO_CLAIM_{uuid4().hex}"
         claim = claim_order_for_dispatch(
             queue_path,
@@ -1931,6 +2320,7 @@ class AutoTradeOrderExecutionBoundary:
         result["dispatch_claim_result"] = claim
         result["final_send_gate_result"] = final_gate
         result["send_order_call_preview_result"] = call_preview
+        result["fresh_dispatch_preflight_result"] = fresh_preflight
         return result
 
     def process_executable_order_for_auto_trade(
@@ -2016,7 +2406,25 @@ class AutoTradeOrderExecutionBoundary:
         real_ready_read = self.read_order_from_queue_by_id(order_id, queue_path)
         real_ready_order = real_ready_read.get("order") if isinstance(real_ready_read, dict) else {}
         real_ready_order_dict = real_ready_order if isinstance(real_ready_order, dict) else {}
-        execution_preview = preview_execution_for_real_ready_order(order_id, guard, queue_path)
+        ats_execution_method = self.project_ats_execution_order(real_ready_order_dict)
+        if ats_execution_method.get("ok") is not True:
+            return observed_execution({
+                "processed": False,
+                "stage": "ats_execution_method",
+                "order_id": order_id,
+                "blocked_reasons": list(ats_execution_method.get("blocked_reasons") or []),
+                "execution_enable_result": enable_result,
+                "real_preflight_result": preflight_result,
+                "ats_execution_method_result": ats_execution_method,
+            }, "FINAL_GUARD", False)
+        effective_order = ats_execution_method.get("order")
+        effective_order_dict = effective_order if isinstance(effective_order, dict) else real_ready_order_dict
+        execution_preview = preview_execution_for_real_ready_order(
+            order_id,
+            guard,
+            queue_path,
+            order_override=effective_order_dict,
+        )
         if execution_preview.get("ok") is not True:
             return observed_execution({
                 "processed": False,
@@ -2028,7 +2436,7 @@ class AutoTradeOrderExecutionBoundary:
             }, "FINAL_GUARD", False)
 
         runtime_commit = self.commit_execution_runtime_for_preview(
-            real_ready_order_dict,
+            effective_order_dict,
             guard,
             execution_preview,
             order_executions_path=self._context.order_executions_path(),
@@ -2148,7 +2556,7 @@ class AutoTradeOrderExecutionBoundary:
             order_queued_id,
             queue_path=queue_path,
             send_order_callable_override=send_order_callable_override,
-            source_order=real_ready_order_dict,
+            source_order=effective_order_dict,
         )
         return {
             "processed": send_order_result.get("queue_result_recorded") is True,
@@ -2158,6 +2566,7 @@ class AutoTradeOrderExecutionBoundary:
             "blocked_reasons": list(send_order_result.get("blocked_reasons") or send_order_result.get("issues") or []),
             "execution_enable_result": enable_result,
             "real_preflight_result": preflight_result,
+            "ats_execution_method_result": ats_execution_method,
             "execution_preview_result": execution_preview,
             "runtime_commit_result": runtime_commit,
             "queue_commit_readiness_policy_result": queue_commit_readiness,

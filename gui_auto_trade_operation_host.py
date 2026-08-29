@@ -41,7 +41,7 @@ from gui_review_utils import (
     safe_float_value,
     safe_int_value,
 )
-from gui_auto_trade_policy import auto_trade_setting_start_target_allowed
+from gui_auto_trade_policy import auto_trade_setting_start_target_decision
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
 from stock_repository import StockRepository
@@ -70,6 +70,8 @@ class AutoTradeOperationHost(QObject):
         self._last_time_policy_minute_key = ""
         self._operation_cycle_running = False
         self._shutting_down = False
+        self._factory_reset_quiesced = False
+        self._last_start_target_block_details = []
         self._order_execution_boundary = AutoTradeOrderExecutionBoundary(
             AutoTradeOrderExecutionContext(
                 kiwoom_connected=self._kiwoom_connected,
@@ -88,6 +90,18 @@ class AutoTradeOperationHost(QObject):
                 order_locks_path=lambda: ORDER_LOCKS_PATH,
                 confirm_runtime_file_init=None,
                 all_group_stock_dirs=all_group_stock_dirs,
+                current_orderable_cash=lambda: (
+                    self._owner.current_orderable_cash_for_budget()
+                    if callable(getattr(self._owner, "current_orderable_cash_for_budget", None))
+                    else None
+                ),
+                fresh_current_price=lambda stock_code: (
+                    getattr(
+                        self.fresh_monitoring_market_information_state(stock_code),
+                        "last_price",
+                        None,
+                    )
+                ),
             )
         )
         self._bar_commit_trigger_queue: deque[dict[str, object]] = deque()
@@ -117,7 +131,7 @@ class AutoTradeOperationHost(QObject):
 
     def start_after_recovery(self, identity) -> dict[str, object]:
         """Start the single durable operation loop after approved Recovery."""
-        if self._shutting_down:
+        if self._shutting_down or self._factory_reset_quiesced:
             return {
                 "started": False,
                 "reason_code": "OPERATION_HOST_SHUTTING_DOWN",
@@ -146,13 +160,26 @@ class AutoTradeOperationHost(QObject):
                     else {}
                 ),
             )
+        if result.get("started") is True:
+            try:
+                snapshot = project_execution_universe(self)
+                result["immediate_realtime_shadow_result"] = (
+                    self.sync_realtime_shadow_targets(snapshot)
+                )
+            except Exception as exc:
+                LOGGER.exception("Immediate realtime shadow sync failed")
+                result["immediate_realtime_shadow_result"] = {
+                    "ok": False,
+                    "changed": False,
+                    "active": False,
+                    "reason_code": "REALTIME_SHADOW_SYNC_FAILED",
+                    "error": str(exc),
+                }
         return result
 
     def stop_operation_timers(self) -> dict[str, object]:
         from production_recovery_timer_lifecycle import stop_recovery_bound_timers
 
-        if not self._shutting_down:
-            self._market_data_host.clear()
         result = stop_recovery_bound_timers((self._operation_timer,))
         if result.get("stopped") is True and int(result.get("stopped_count") or 0) > 0:
             append_production_event(
@@ -196,12 +223,12 @@ class AutoTradeOperationHost(QObject):
         return True
 
     def _on_market_data_comparison_completed(self, payload: object) -> None:
-        if not self._shutting_down and isinstance(payload, dict):
+        if not self._shutting_down and not self._factory_reset_quiesced and isinstance(payload, dict):
             event = dict(payload)
             QTimer.singleShot(0, lambda: self._emit_market_data_comparison(event))
 
     def _emit_market_data_comparison(self, payload: dict[str, object]) -> None:
-        if self._shutting_down:
+        if self._shutting_down or self._factory_reset_quiesced:
             return
         try:
             self.realtime_shadow_comparison_completed.emit(dict(payload))
@@ -210,7 +237,7 @@ class AutoTradeOperationHost(QObject):
 
     def _on_canonical_bar_ready_for_operation(self, payload: object) -> None:
         """Queue a normalized market-data event for the trading boundary."""
-        if self._shutting_down or not isinstance(payload, dict):
+        if self._shutting_down or self._factory_reset_quiesced or not isinstance(payload, dict):
             return
         required = (
             "stock_code",
@@ -242,11 +269,103 @@ class AutoTradeOperationHost(QObject):
         universe = snapshot or project_execution_universe(self)
         return self._market_data_host.sync_targets(universe)
 
+    def retire_time_ended_current_session_participants(
+        self,
+        *,
+        now_dt=None,
+    ) -> dict[str, object]:
+        """Own final-time participant retirement and execution-shadow cleanup."""
+
+        from gui_auto_trade_run_control import (
+            auto_trade_retire_time_ended_current_session_participants,
+        )
+
+        result = auto_trade_retire_time_ended_current_session_participants(
+            self,
+            now_dt=now_dt,
+            order_queue_path=ORDER_QUEUE_PATH,
+            order_executions_path=ORDER_EXECUTIONS_PATH,
+            order_locks_path=ORDER_LOCKS_PATH,
+        )
+        removed = tuple(result.get("removed", ()))
+        before = tuple(result.get("before", ()))
+        if not removed and before:
+            return result
+
+        snapshot = project_execution_universe(self)
+        result["execution_universe_snapshot"] = snapshot
+        try:
+            sync_result = self.sync_realtime_shadow_targets(snapshot)
+        except Exception as exc:
+            LOGGER.exception("Time-end execution shadow sync failed")
+            sync_result = {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_SHADOW_SYNC_FAILED",
+                "error": str(exc),
+            }
+        result["execution_shadow_sync_result"] = sync_result
+        if (
+            isinstance(sync_result, dict)
+            and sync_result.get("ok") is True
+            and not tuple(result.get("remaining", ()))
+        ):
+            result["operation_timer_stop_result"] = self.stop_operation_timers()
+        return result
+
+    def sync_monitoring_universe_for_current_session(self) -> dict[str, object]:
+        """Sync all current registered Stocks without evaluating operation readiness."""
+
+        try:
+            projection = StockRepository().realtime_monitoring_universe()
+            result = self._market_data_host.sync_monitoring_targets(
+                projection.target_stock_codes
+            )
+            response = dict(result) if isinstance(result, dict) else {}
+            response.update(
+                monitoring_target_stock_codes=projection.target_stock_codes,
+                unsupported_stock_codes=projection.unsupported_stock_codes,
+                source_record_count=projection.source_record_count,
+            )
+            return response
+        except Exception as exc:
+            LOGGER.exception("Realtime monitoring universe sync failed")
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_MONITORING_UNIVERSE_SYNC_FAILED",
+                "error": str(exc),
+            }
+
     def clear_realtime_shadow_registration(self) -> dict[str, object]:
         return self._market_data_host.clear()
 
     def market_data_mode_snapshot(self, stock_code: str):
         return self._market_data_host.mode_snapshot(stock_code)
+
+    def price_signal_observation_enabled(self) -> bool:
+        return self._market_data_host.price_signal_observation_enabled()
+
+    def set_price_signal_observation_enabled(self, enabled: object) -> bool:
+        return self._market_data_host.set_price_signal_observation_enabled(enabled)
+
+    def high_resolution_market_state(self, stock_code: str):
+        return self._market_data_host.high_resolution_market_state(stock_code)
+
+    def monitoring_market_information_state(self, stock_code: str):
+        return self._market_data_host.monitoring_market_information_state(stock_code)
+
+    def fresh_monitoring_market_information_state(self, stock_code: str):
+        return self._market_data_host.fresh_monitoring_market_information_state(stock_code)
+
+    def high_resolution_market_data_snapshot(self):
+        return self._market_data_host.high_resolution_market_data_snapshot()
+
+    def tr_governor_metrics_snapshot(self):
+        getter = getattr(self.kiwoom_api, "tr_governor_metrics_snapshot", None)
+        return getter() if callable(getter) else None
 
     def prepare_market_data_operation_cycle(self, snapshot, minute_key: str) -> dict[str, object]:
         return self._market_data_host.prepare_operation_cycle(snapshot, minute_key)
@@ -279,11 +398,11 @@ class AutoTradeOperationHost(QObject):
 
     def _drain_bar_commit_triggers(self) -> None:
         self._bar_commit_drain_scheduled = False
-        if self._bar_commit_drain_running or self._shutting_down:
+        if self._bar_commit_drain_running or self._shutting_down or self._factory_reset_quiesced:
             return
         self._bar_commit_drain_running = True
         try:
-            while self._bar_commit_trigger_queue and not self._shutting_down:
+            while self._bar_commit_trigger_queue and not self._shutting_down and not self._factory_reset_quiesced:
                 trigger = self._bar_commit_trigger_queue.popleft()
                 try:
                     result = self._process_bar_commit_trigger(trigger)
@@ -391,7 +510,7 @@ class AutoTradeOperationHost(QObject):
 
     def run_operation_cycle(self) -> dict[str, object]:
         """Run one operation cycle without depending on any window visibility."""
-        if self._shutting_down:
+        if self._shutting_down or self._factory_reset_quiesced:
             return {"processed": False, "reason_code": "OPERATION_HOST_SHUTTING_DOWN"}
         bind_bar_committed = getattr(self, "_bind_bar_committed_signal_once", None)
         if callable(bind_bar_committed):
@@ -478,7 +597,7 @@ class AutoTradeOperationHost(QObject):
 
     def complete_deferred_operation_cycle(self, result: dict[str, object]) -> None:
         """Emit the cycle boundary after asynchronous candle/signal work ends."""
-        if self._shutting_down or not isinstance(result, dict):
+        if self._shutting_down or self._factory_reset_quiesced or not isinstance(result, dict):
             return
         self.operation_cycle_completed.emit(dict(result))
 
@@ -610,17 +729,56 @@ class AutoTradeOperationHost(QObject):
     def split_start_targets(self, selected):
         targets = []
         skipped = []
+        block_details = []
         for stock_dir, code, name in selected:
             if self.start_target_is_review_isolated(stock_dir, code):
                 skipped.append(f"{code} {name}(검토종목)")
+                block_details.append(
+                    {
+                        "stock_code": str(code),
+                        "stock_name": str(name),
+                        "reason": "REVIEW_REQUIRED",
+                        "display_label": f"{code} {name}".strip(),
+                    }
+                )
                 continue
             state = read_json_dict(Path(stock_dir) / "state.json")
             status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-            if auto_trade_setting_start_target_allowed(self, state, code):
+            config = read_json_dict(Path(stock_dir) / "config.json")
+            decision = auto_trade_setting_start_target_decision(
+                self,
+                state,
+                code,
+                config=config,
+            )
+            if decision.get("allowed") is True:
                 targets.append((stock_dir, code, name))
             else:
                 skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
+                block_details.append(
+                    {
+                        "stock_code": str(code),
+                        "stock_name": str(name),
+                        "reason": str(decision.get("reason") or "NOT_STARTABLE"),
+                        "status": status,
+                        "operation_mode": str(
+                            decision.get("operation_mode") or ""
+                        ),
+                        "session_phase": dict(
+                            decision.get("session_phase") or {}
+                        ),
+                        "display_label": f"{code} {name}".strip(),
+                    }
+                )
+        self._last_start_target_block_details = block_details
         return targets, skipped
+
+    def start_target_block_details(self):
+        return tuple(
+            dict(item)
+            for item in self._last_start_target_block_details
+            if isinstance(item, dict)
+        )
 
     def pre_start_review_check(
         self,

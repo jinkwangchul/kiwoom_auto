@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import QWidget
 
 from candle_manager import commit_candles
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+import gui_main_table_loader as main_loader
 from gui_market_data_host import MarketDataHost
 from kiwoom_market_data_authority import REALTIME_AUTHORITY
 
@@ -34,12 +35,28 @@ class _Api:
     def __init__(self) -> None:
         self.bar_committed = _Signal()
         self.realtime_shadow_bar_completed = _Signal()
+        self.realtime_shadow_tick_received = _Signal()
         self.snapshot = SimpleNamespace(
             active=True,
             connection_epoch=7,
             login_session_id="SESSION-7",
             target_stock_codes=("005930",),
+            shadow_target_stock_codes=("005930",),
         )
+        self.sync_realtime_monitoring_registration = Mock(return_value={
+            "ok": True,
+            "active": True,
+            "snapshot": self.snapshot,
+        })
+        self.request_initial_market_snapshot = Mock(return_value={
+            "ok": True,
+            "status": "ENQUEUED",
+        })
+        self.sync_realtime_shadow_targets = Mock(return_value={
+            "ok": True,
+            "active": True,
+            "snapshot": self.snapshot,
+        })
         self.sync_realtime_shadow_registration = Mock(return_value={
             "ok": True,
             "active": True,
@@ -52,6 +69,14 @@ class _Api:
 
     def realtime_shadow_registration_snapshot(self):
         return self.snapshot
+
+    @staticmethod
+    def broker_session_snapshot():
+        return SimpleNamespace(
+            connected=True,
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+        )
 
 
 class _Owner(QObject):
@@ -97,6 +122,7 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.market._bind_kiwoom_signals_once()
         self.assertEqual(1, self.owner.kiwoom_api.bar_committed.connect_count)
         self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_bar_completed.connect_count)
+        self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_tick_received.connect_count)
         self.assertEqual(
             1,
             self.market.receivers(self.market.canonical_bar_ready_for_operation),
@@ -109,6 +135,520 @@ class MarketDataHostSeparationTests(unittest.TestCase):
         self.assertNotIn("QTimer(", source)
         self.assertNotIn("QWidget", source)
         self.assertNotIn("QDialog", source)
+
+    def test_raw_tick_callback_only_enqueues_until_scheduled_drain(self) -> None:
+        self._activate_raw_session()
+        scheduled = []
+        with patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ):
+            self.owner.kiwoom_api.realtime_shadow_tick_received.emit(
+                self._raw_tick_payload(sequence=100)
+            )
+            self.assertIsNone(self.market.high_resolution_market_state("005930"))
+            self.assertEqual(1, self.market.high_resolution_market_data_snapshot().current_queue_depth)
+            self.assertEqual(1, len(scheduled))
+            scheduled.pop(0)()
+
+        state = self.market.high_resolution_market_state("005930")
+        self.assertIsNotNone(state)
+        self.assertEqual(100, state.last_receive_sequence)
+
+    def test_raw_tick_fifo_order_is_preserved_without_coalescing(self) -> None:
+        self._activate_raw_session()
+        scheduled = []
+        with patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ), patch.object(
+            self.market,
+            "_process_raw_realtime_tick",
+            wraps=self.market._process_raw_realtime_tick,
+        ) as process:
+            for sequence in (100, 101, 102):
+                self.owner.kiwoom_api.realtime_shadow_tick_received.emit(
+                    self._raw_tick_payload(sequence=sequence, price=sequence)
+                )
+            self.assertEqual(1, len(scheduled))
+            scheduled.pop(0)()
+
+        self.assertEqual(
+            [100, 101, 102],
+            [call.args[0]["receive_sequence"] for call in process.call_args_list],
+        )
+        self.assertEqual(
+            102,
+            self.market.high_resolution_market_state("005930").last_price,
+        )
+
+    def test_raw_tick_state_is_independent_per_stock(self) -> None:
+        self._activate_raw_session()
+        self.market._process_raw_realtime_tick(
+            self._raw_tick_payload(stock_code="005930", sequence=100, price=70000)
+        )
+        self.market._process_raw_realtime_tick(
+            self._raw_tick_payload(stock_code="000660", sequence=101, price=210000)
+        )
+        self.market._process_raw_realtime_tick(
+            self._raw_tick_payload(stock_code="005930", sequence=102, price=70100)
+        )
+
+        samsung = self.market.high_resolution_market_state("005930")
+        hynix = self.market.high_resolution_market_state("000660")
+        self.assertEqual((70100, 102), (samsung.last_price, samsung.last_receive_sequence))
+        self.assertEqual((210000, 101), (hynix.last_price, hynix.last_receive_sequence))
+
+    def test_same_session_none_preserves_previous_optional_market_fields(self) -> None:
+        self._activate_raw_session()
+        first = self._raw_tick_payload(sequence=100)
+        first.update(
+            open_price=69000,
+            high_price=71000,
+            low_price=68000,
+            change_rate=1.25,
+            previous_day_volume_rate=-12.43,
+            execution_strength=117.2,
+        )
+        self.assertTrue(self.market._process_raw_realtime_tick(first))
+        second = self._raw_tick_payload(sequence=101, price=70100)
+        second.update(
+            open_price=None,
+            high_price=None,
+            low_price=None,
+            change_rate=None,
+            previous_day_volume_rate=None,
+            execution_strength=None,
+        )
+        self.assertTrue(self.market._process_raw_realtime_tick(second))
+
+        state = self.market.high_resolution_market_state("005930")
+        self.assertEqual((69000, 71000, 68000), (
+            state.open_price, state.high_price, state.low_price
+        ))
+        self.assertEqual((1.25, -12.43, 117.2), (
+            state.change_rate,
+            state.previous_day_volume_rate,
+            state.execution_strength,
+        ))
+
+    def test_monitoring_and_execution_target_sync_are_independent(self) -> None:
+        self.market.sync_monitoring_targets(("005930", "006400"))
+        self.owner.kiwoom_api.request_initial_market_snapshot.assert_called_once_with(
+            ("005930", "006400"),
+            callback=self.market._on_initial_market_snapshot_result,
+        )
+        self.owner.kiwoom_api.sync_realtime_monitoring_registration.assert_called_once_with(
+            ("005930", "006400")
+        )
+        self.market.sync_targets(SimpleNamespace(execution_stock_codes=("005930",)))
+        self.owner.kiwoom_api.sync_realtime_shadow_targets.assert_called_once_with(
+            ("005930",)
+        )
+
+    def test_snapshot_is_requested_once_per_target_per_session_before_realtime(self) -> None:
+        calls: list[str] = []
+        self.owner.kiwoom_api.request_initial_market_snapshot.side_effect = (
+            lambda *_args, **_kwargs: calls.append("snapshot")
+            or {"ok": True, "status": "ENQUEUED"}
+        )
+        self.owner.kiwoom_api.sync_realtime_monitoring_registration.side_effect = (
+            lambda _targets: calls.append("realtime")
+            or {"ok": True, "active": True, "snapshot": self.owner.kiwoom_api.snapshot}
+        )
+
+        self.market.sync_monitoring_targets(("005930",))
+        self.market.sync_monitoring_targets(("005930",))
+
+        self.assertEqual(["snapshot", "realtime", "realtime"], calls)
+        self.assertEqual(
+            1,
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_count,
+        )
+
+    def test_new_target_requests_snapshot_and_removed_target_rejects_pending_result(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        self.market.sync_monitoring_targets(("005930", "006400"))
+        self.assertEqual(
+            ("006400",),
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_args.args[0],
+        )
+
+        self.market.sync_monitoring_targets(("005930",))
+        self.market._on_initial_market_snapshot_result(
+            self._snapshot_result(stock_code="006400", current_price=65000)
+        )
+        self.assertIsNone(self.market.initial_market_snapshot_state("006400"))
+
+    def test_session_transition_still_drops_last_known_for_removed_target(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        self.market._on_initial_market_snapshot_result(self._snapshot_result())
+        self.assertEqual(
+            70_000,
+            self.market.monitoring_market_information_state("005930").last_price,
+        )
+        self.owner.kiwoom_api.snapshot.connection_epoch = 8
+        self.owner.kiwoom_api.snapshot.login_session_id = "SESSION-8"
+        self.owner.kiwoom_api.broker_session_snapshot = Mock(
+            return_value=SimpleNamespace(
+                connected=True,
+                connection_epoch=8,
+                login_session_id="SESSION-8",
+            )
+        )
+
+        self.market.sync_monitoring_targets(())
+
+        self.assertIsNone(self.market.monitoring_market_information_state("005930"))
+
+    def test_snapshot_populates_monitoring_projection_without_creating_a_tick(self) -> None:
+        observed: list[dict[str, object]] = []
+        self.market.market_data_observed.connect(observed.append)
+        self.market.sync_monitoring_targets(("005930",))
+        before = self.market.high_resolution_market_data_snapshot()
+        self.market._on_initial_market_snapshot_result(self._snapshot_result())
+        after = self.market.high_resolution_market_data_snapshot()
+        state = self.market.monitoring_market_information_state("005930")
+
+        self.assertEqual(70000, state.last_price)
+        self.assertEqual((69000, 71000, 68000), (
+            state.open_price, state.high_price, state.low_price
+        ))
+        self.assertEqual((1.25, -12.43, 117.2), (
+            state.change_rate,
+            state.previous_day_volume_rate,
+            state.execution_strength,
+        ))
+        self.assertEqual(
+            (before.received_tick_count, before.processed_tick_count),
+            (after.received_tick_count, after.processed_tick_count),
+        )
+        self.assertEqual(0, after.current_queue_depth)
+        self.assertIsNone(self.market.high_resolution_market_state("005930"))
+        self.assertTrue(all(source == "SNAPSHOT" for _field, source in state.field_sources))
+        self.assertEqual(
+            ("005930", "INITIAL_SNAPSHOT", 7, "SESSION-7"),
+            (
+                observed[-1]["stock_code"],
+                observed[-1]["source"],
+                observed[-1]["connection_epoch"],
+                observed[-1]["login_session_id"],
+            ),
+        )
+
+    def test_realtime_fields_override_snapshot_and_blank_fields_keep_snapshot(self) -> None:
+        observed: list[dict[str, object]] = []
+        self.market.market_data_observed.connect(observed.append)
+        self.market.sync_monitoring_targets(("005930",))
+        self.market._on_initial_market_snapshot_result(self._snapshot_result())
+        payload = self._raw_tick_payload(sequence=100, price=70100)
+        payload.update(
+            open_price=None,
+            high_price=71200,
+            low_price=None,
+            change_rate=1.5,
+            previous_day_volume_rate=None,
+            execution_strength=None,
+        )
+        self.assertTrue(self.market._process_raw_realtime_tick(payload))
+
+        state = self.market.monitoring_market_information_state("005930")
+        self.assertEqual((70100, 69000, 71200, 68000), (
+            state.last_price, state.open_price, state.high_price, state.low_price
+        ))
+        self.assertEqual((1.5, -12.43, 117.2), (
+            state.change_rate,
+            state.previous_day_volume_rate,
+            state.execution_strength,
+        ))
+        self.assertEqual(
+            {
+                "last_price": "REALTIME",
+                "open_price": "SNAPSHOT",
+                "high_price": "REALTIME",
+                "low_price": "SNAPSHOT",
+                "change_rate": "REALTIME",
+                "previous_day_volume_rate": "SNAPSHOT",
+                "execution_strength": "SNAPSHOT",
+            },
+            dict(state.field_sources),
+        )
+        self.assertEqual("REALTIME", observed[-1]["source"])
+
+    def test_high_resolution_state_rejects_stale_session_identity(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=100, price=70100)
+            )
+        )
+        self.market._realtime_shadow_session_identity = (8, "SESSION-8")
+
+        self.assertIsNone(self.market.high_resolution_market_state("005930"))
+
+    def test_late_snapshot_does_not_override_earlier_realtime(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        payload = self._raw_tick_payload(sequence=100, price=70100)
+        payload.update(high_price=71200)
+        self.assertTrue(self.market._process_raw_realtime_tick(payload))
+        self.market._on_initial_market_snapshot_result(
+            self._snapshot_result(current_price=70000, high_price=71000)
+        )
+
+        state = self.market.monitoring_market_information_state("005930")
+        self.assertEqual((70100, 71200), (state.last_price, state.high_price))
+
+    def test_reconnect_clears_old_snapshot_and_requests_current_targets_again(self) -> None:
+        self.market.sync_monitoring_targets(("005930",))
+        self.market._on_initial_market_snapshot_result(self._snapshot_result())
+        self.owner.kiwoom_api.snapshot.connection_epoch = 8
+        self.owner.kiwoom_api.snapshot.login_session_id = "SESSION-8"
+        self.owner.kiwoom_api.broker_session_snapshot = Mock(
+            return_value=SimpleNamespace(
+                connected=True,
+                connection_epoch=8,
+                login_session_id="SESSION-8",
+            )
+        )
+
+        self.market.sync_monitoring_targets(("005930",))
+
+        self.assertIsNone(self.market.initial_market_snapshot_state("005930"))
+        self.assertIsNone(
+            self.market.fresh_monitoring_market_information_state("005930")
+        )
+        last_known = self.market.monitoring_market_information_state("005930")
+        self.assertEqual(
+            (70000, 69000, 71000, 68000, 1.25, -12.43, 117.2),
+            (
+                last_known.last_price,
+                last_known.open_price,
+                last_known.high_price,
+                last_known.low_price,
+                last_known.change_rate,
+                last_known.previous_day_volume_rate,
+                last_known.execution_strength,
+            ),
+        )
+        display_window = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=lambda: SimpleNamespace(
+                monitoring_market_information_state=(
+                    self.market.monitoring_market_information_state
+                ),
+                fresh_monitoring_market_information_state=(
+                    self.market.fresh_monitoring_market_information_state
+                ),
+            )
+        )
+        self.assertEqual(
+            70_000,
+            main_loader.main_stock_current_price(
+                display_window,
+                {"code": "005930", "name": "삼성전자"},
+                {"holding_qty": 10},
+            ),
+        )
+        tooltip = main_loader.main_stock_row_tooltip_from_projection(
+            {
+                "market": "KOSPI",
+                "stock_code": "005930",
+                "stock_name": "삼성전자",
+                "operator_status": "대기",
+            },
+            last_known,
+        )
+        for expected in (
+            "현재가 70,000",
+            "시가 69,000",
+            "고가 71,000",
+            "저가 68,000",
+            "등락률 +1.25%",
+            "전일대비 -12.43%",
+            "체결강도 117.2",
+        ):
+            self.assertIn(expected, tooltip)
+        self.assertEqual(
+            2,
+            self.owner.kiwoom_api.request_initial_market_snapshot.call_count,
+        )
+
+        self.market._on_initial_market_snapshot_result(
+            self._snapshot_result(
+                current_price=72_000,
+                epoch=8,
+                session_id="SESSION-8",
+            )
+        )
+        fresh = self.market.fresh_monitoring_market_information_state("005930")
+        self.assertEqual((8, "SESSION-8", 72_000), (
+            fresh.connection_epoch,
+            fresh.login_session_id,
+            fresh.last_price,
+        ))
+
+    @staticmethod
+    def _snapshot_result(
+        *,
+        stock_code: str = "005930",
+        current_price: int = 70000,
+        high_price: int = 71000,
+        epoch: int = 7,
+        session_id: str = "SESSION-7",
+    ) -> dict[str, object]:
+        return {
+            "ok": True,
+            "type": "initial_market_snapshot",
+            "connection_epoch": epoch,
+            "login_session_id": session_id,
+            "snapshot_received_at": "2026-08-20T10:14:59+09:00",
+            "rows": [
+                {
+                    "stock_code": stock_code,
+                    "current_price": current_price,
+                    "open_price": 69000,
+                    "high_price": high_price,
+                    "low_price": 68000,
+                    "change_rate": 1.25,
+                    "previous_day_volume_rate": -12.43,
+                    "execution_strength": 117.2,
+                    "cumulative_volume": 123456,
+                }
+            ],
+        }
+
+    def test_stale_session_tick_does_not_mutate_current_state(self) -> None:
+        self.market._realtime_shadow_session_identity = (11, "SESSION-11")
+        current = self._raw_tick_payload(
+            sequence=200,
+            price=80000,
+            epoch=11,
+            session_id="SESSION-11",
+        )
+        self.assertTrue(self.market._process_raw_realtime_tick(current))
+        stale = self._raw_tick_payload(
+            sequence=201,
+            price=1,
+            epoch=10,
+            session_id="SESSION-10",
+        )
+        scheduled = []
+        with patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ):
+            self.owner.kiwoom_api.realtime_shadow_tick_received.emit(stale)
+            self.assertEqual(1, self.market.high_resolution_market_data_snapshot().current_queue_depth)
+            scheduled.pop(0)()
+
+        state = self.market.high_resolution_market_state("005930")
+        self.assertEqual((80000, 200), (state.last_price, state.last_receive_sequence))
+
+    def test_duplicate_or_older_sequence_does_not_regress_state(self) -> None:
+        self._activate_raw_session()
+        self.assertTrue(
+            self.market._process_raw_realtime_tick(
+                self._raw_tick_payload(sequence=100, price=70000)
+            )
+        )
+        for sequence in (99, 100):
+            self.assertFalse(
+                self.market._process_raw_realtime_tick(
+                    self._raw_tick_payload(sequence=sequence, price=1)
+                )
+            )
+
+        state = self.market.high_resolution_market_state("005930")
+        self.assertEqual((70000, 100), (state.last_price, state.last_receive_sequence))
+
+    def test_raw_tick_metrics_and_overflow_are_observable(self) -> None:
+        self._activate_raw_session()
+        self.market.MAX_RAW_TICK_QUEUE_DEPTH = 2
+        scheduled = []
+        with patch(
+            "gui_market_data_host.QTimer.singleShot",
+            side_effect=lambda _ms, callback: scheduled.append(callback),
+        ):
+            for sequence in (1, 2, 3):
+                self.owner.kiwoom_api.realtime_shadow_tick_received.emit(
+                    self._raw_tick_payload(sequence=sequence, price=sequence)
+                )
+            queued = self.market.high_resolution_market_data_snapshot()
+            self.assertEqual((3, 0), (queued.received_tick_count, queued.processed_tick_count))
+            self.assertEqual((2, 2), (queued.current_queue_depth, queued.queue_high_watermark))
+            self.assertEqual(1, queued.overflow_count)
+            self.assertEqual("UNCERTAIN", queued.data_quality)
+            scheduled.pop(0)()
+
+        drained = self.market.high_resolution_market_data_snapshot()
+        state = self.market.high_resolution_market_state("005930")
+        self.assertEqual((3, 2, 0), (
+            drained.received_tick_count,
+            drained.processed_tick_count,
+            drained.current_queue_depth,
+        ))
+        self.assertEqual((2, 2), (
+            state.last_receive_sequence,
+            state.processed_tick_count,
+        ))
+        self.assertEqual("UNCERTAIN", state.data_quality)
+
+    def test_raw_tick_snapshot_reports_registration_and_processing_latency(self) -> None:
+        self._activate_raw_session()
+        payload = self._raw_tick_payload(sequence=100)
+        with patch(
+            "gui_market_data_host.monotonic",
+            return_value=float(payload["received_monotonic"]) + 0.012,
+        ):
+            self.assertTrue(self.market._process_raw_realtime_tick(payload))
+
+        snapshot = self.market.high_resolution_market_data_snapshot()
+        self.assertTrue(snapshot.broker_connected)
+        self.assertTrue(snapshot.realtime_registration_active)
+        self.assertEqual(1, snapshot.realtime_target_stock_count)
+        self.assertAlmostEqual(12.0, snapshot.last_processing_latency_ms, places=6)
+        self.assertAlmostEqual(12.0, snapshot.max_processing_latency_ms, places=6)
+
+    def test_public_market_state_is_an_independent_immutable_snapshot(self) -> None:
+        self._activate_raw_session()
+        self.market._process_raw_realtime_tick(
+            self._raw_tick_payload(sequence=1, price=70000)
+        )
+        returned = self.market.high_resolution_market_state("005930")
+        object.__setattr__(returned, "last_price", 1)
+
+        self.assertEqual(
+            70000,
+            self.market.high_resolution_market_state("005930").last_price,
+        )
+
+    def _activate_raw_session(self) -> None:
+        self.market._realtime_shadow_session_identity = (7, "SESSION-7")
+
+    @staticmethod
+    def _raw_tick_payload(
+        *,
+        stock_code: str = "005930",
+        sequence: int = 1,
+        price: int = 70000,
+        epoch: int = 7,
+        session_id: str = "SESSION-7",
+    ) -> dict[str, object]:
+        return {
+            "stock_code": stock_code,
+            "real_type": "stock_execution",
+            "execution_time_raw": "101501",
+            "current_price": price,
+            "cumulative_volume": 123456,
+            "trade_volume_raw": 10,
+            "trade_volume_abs": 10,
+            "received_at": "2026-08-20T10:15:01.000001+09:00",
+            "received_monotonic": float(sequence),
+            "receive_sequence": sequence,
+            "market_datetime": "2026-08-20T10:15:01+09:00",
+            "minute_key": "2026-08-20 10:15",
+            "connection_epoch": epoch,
+            "login_session_id": session_id,
+        }
 
     def test_tr_owned_event_normalizes_but_manual_event_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

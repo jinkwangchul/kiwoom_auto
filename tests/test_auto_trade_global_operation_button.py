@@ -60,7 +60,7 @@ class _OperationButtonHarness(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.btn_start = QPushButton("▶ 운영시작", self)
+        self.btn_start = QPushButton("■ 운영시작", self)
         self.stock_table = QTableWidget(0, 2, self)
         self.status_messages: list[str] = []
         self._selected_stock_infos: list[tuple[Path, str, str]] = []
@@ -214,6 +214,18 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         )
         self.start_clock_patcher.start()
         self.addCleanup(self.start_clock_patcher.stop)
+        self.start_session_phase_patcher = patch(
+            "gui_auto_trade_policy.auto_trade_operation_session_phase",
+            return_value={
+                "evaluable": True,
+                "phase": "ACTIVE_SESSION",
+                "mode": "CONTINUOUS",
+                "active": True,
+                "future_session_exists": False,
+            },
+        )
+        self.start_session_phase_patcher.start()
+        self.addCleanup(self.start_session_phase_patcher.stop)
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -225,6 +237,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             for index in range(1, 13)
         ]
         self.window = _OperationButtonHarness()
+        self.window.registered_operation_targets = lambda: list(self.targets)
         self.addCleanup(self._dispose_window)
         self.registered_patcher = patch.object(
             run_control,
@@ -313,6 +326,105 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_operation_start_summary_uses_existing_toast_without_modal(self) -> None:
+        self.window.show_auto_trade_result_dialog = Mock()
+        result = {
+            "started_count": 1,
+            "blocked_count": 2,
+            "failed_count": 0,
+            "blocked_target_details": (
+                {
+                    "stock_code": "111111",
+                    "reason": "FINAL_SESSION_ENDED",
+                    "operation_mode": "SCHEDULED",
+                },
+                {
+                    "stock_code": "222222",
+                    "reason": "FINAL_SESSION_ENDED",
+                    "operation_mode": "SCHEDULED",
+                },
+            ),
+        }
+
+        with patch.object(run_control, "show_toast") as toast:
+            run_control._show_operation_start_summary_toast(self.window, result)
+
+        toast.assert_called_once_with(
+            parent=self.window,
+            message="대상종목 3  |  기운영중 0  |  운영시작 1  |  운영불가 2\n시간운영 종료 2",
+            duration_ms=3200,
+            position="center",
+        )
+        self.window.show_auto_trade_result_dialog.assert_not_called()
+
+    def test_all_running_operation_start_shows_fixed_summary_without_backend(self) -> None:
+        for target in self.targets[:5]:
+            self._write_state(target[0], status="RUNNING", trade_enabled=True)
+        self.window._selected_stock_infos = list(self.targets[:5])
+        before = {
+            target[0]: (target[0] / "state.json").read_bytes()
+            for target in self.targets[:5]
+        }
+
+        with (
+            patch.object(
+                self.window,
+                "running_registered_operation_targets",
+                return_value=list(self.targets[:5]),
+            ),
+            patch.object(run_control, "auto_trade_start_selected_auto_trades") as backend,
+            patch.object(run_control, "show_toast") as toast,
+        ):
+            result = run_control.auto_trade_start_selected_rows_auto_trades(self.window)
+
+        backend.assert_not_called()
+        toast.assert_called_once()
+        self.assertEqual(
+            "대상종목 5  |  기운영중 5  |  운영시작 0  |  운영불가 0",
+            toast.call_args.kwargs["message"],
+        )
+        self.assertEqual(before, {
+            target[0]: (target[0] / "state.json").read_bytes()
+            for target in self.targets[:5]
+        })
+        self.assertEqual(5, result["already_running_count"])
+        self.assertEqual(0, result["started_count"])
+
+    def test_global_all_running_operation_start_shows_fixed_summary_without_backend(self) -> None:
+        for target in self.targets[:5]:
+            self._write_state(target[0], status="RUNNING", trade_enabled=True)
+        before = {
+            target[0]: (target[0] / "state.json").read_bytes()
+            for target in self.targets[:5]
+        }
+
+        with (
+            patch.object(
+                self.window,
+                "running_registered_operation_targets",
+                return_value=list(self.targets[:5]),
+            ),
+            patch.object(
+                self.window,
+                "registered_operation_start_targets",
+                return_value=list(self.targets[:5]),
+            ),
+            patch.object(setting_window, "auto_trade_start_selected_auto_trades") as backend,
+            patch.object(run_control, "show_toast") as toast,
+        ):
+            self.window.start_selected_auto_trades()
+
+        backend.assert_not_called()
+        toast.assert_called_once()
+        self.assertEqual(
+            "대상종목 5  |  기운영중 5  |  운영시작 0  |  운영불가 0",
+            toast.call_args.kwargs["message"],
+        )
+        self.assertEqual(before, {
+            target[0]: (target[0] / "state.json").read_bytes()
+            for target in self.targets[:5]
+        })
+
     def test_bottom_button_shows_today_normal_ended_disabled(self) -> None:
         self._write_operation_state(
             {
@@ -324,7 +436,9 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.window.update_global_operation_button_state()
 
-        self.assertEqual("\uc6b4\uc601\uc885\ub8cc", self.window.btn_start.text())
+        self.assertEqual("\u25cf \uc6b4\uc601\uc815\uc9c0", self.window.btn_start.text())
+        self.assertIn("color: #111827", self.window.btn_start.styleSheet())
+        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_bottom_button_today_normal_ended_has_priority_over_emergency(self) -> None:
@@ -339,7 +453,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.window.update_global_operation_button_state()
 
-        self.assertEqual("\uc6b4\uc601\uc885\ub8cc", self.window.btn_start.text())
+        self.assertEqual("\u25cf \uc6b4\uc601\uc815\uc9c0", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_bottom_button_past_normal_ended_uses_existing_start_contract(self) -> None:
@@ -353,10 +467,12 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         self.window.update_global_operation_button_state()
 
-        self.assertEqual("\u25b6 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
+        self.assertEqual("\u25a0 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
+        self.assertIn("color: #1D4ED8", self.window.btn_start.styleSheet())
+        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
         self.assertTrue(self.window.btn_start.isEnabled())
 
-    def test_bottom_button_today_running_and_closing_restore_as_running(self) -> None:
+    def test_bottom_button_today_running_and_closing_without_current_participant_uses_stopped(self) -> None:
         for status in ("RUNNING", "CLOSING"):
             with self.subTest(status=status):
                 self._write_operation_state(
@@ -369,18 +485,41 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
                 self.window.update_global_operation_button_state()
 
-                self.assertEqual("\uc6b4\uc601\uc911", self.window.btn_start.text())
+                self.assertEqual("\u25cf \uc6b4\uc601\uc815\uc9c0", self.window.btn_start.text())
                 self.assertFalse(self.window.btn_start.isEnabled())
+
+    def test_bottom_button_current_participant_uses_running_even_when_global_state_is_empty(self) -> None:
+        self._write_state(
+            self.targets[0][0],
+            status="RUNNING",
+            trade_enabled=True,
+            trade_started_at="2026-08-26 09:01:00",
+        )
+        run_control.auto_trade_register_current_session_operation_participants(
+            self.window,
+            (self.targets[0][1],),
+        )
+
+        with (
+            patch.object(self.window, "registered_operation_targets", return_value=[self.targets[0]]),
+            patch.object(run_control, "read_operation_state", return_value={}),
+        ):
+            self.window.update_global_operation_button_state()
+
+        self.assertEqual("\u25b6 \uc6b4\uc601\uc911", self.window.btn_start.text())
+        self.assertIn("color: #15803D", self.window.btn_start.styleSheet())
+        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
+        self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_bottom_button_missing_or_corrupt_operation_state_uses_start_contract(self) -> None:
         self.operation_state_path.unlink()
         self.window.update_global_operation_button_state()
-        self.assertEqual("\u25b6 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
+        self.assertEqual("\u25a0 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
         self.operation_state_path.write_text("{", encoding="utf-8")
         self.window.update_global_operation_button_state()
-        self.assertEqual("\u25b6 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
+        self.assertEqual("\u25a0 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_global_start_is_blocked_when_today_normal_ended(self) -> None:
@@ -403,7 +542,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
         start_backend.assert_not_called()
         self.assertEqual(before, self.operation_state_path.read_text(encoding="utf-8"))
-        self.assertEqual("\uc6b4\uc601\uc885\ub8cc", self.window.btn_start.text())
+        self.assertEqual("\u25cf \uc6b4\uc601\uc815\uc9c0", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
         self.assertEqual(["오늘 운영이 종료되었습니다."], self.window.status_messages)
 
@@ -419,31 +558,42 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_bottom_button_keeps_existing_start_contract_when_global_latch_false(self) -> None:
-        with patch.object(
-            run_control,
-            "read_operation_state",
-            return_value={"emergency_stop": False},
+        with (
+            patch.object(self.window, "registered_operation_targets", return_value=[self.targets[0]]),
+            patch.object(
+                run_control,
+                "read_operation_state",
+                return_value={"emergency_stop": False},
+            ),
         ):
             self.window.update_global_operation_button_state()
 
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_bottom_button_keeps_existing_running_contract_when_global_latch_false(self) -> None:
-        self._write_state(self.targets[0][0], status="RUNNING", trade_enabled=True)
+        self._write_state(
+            self.targets[0][0],
+            status="RUNNING",
+            trade_enabled=True,
+            trade_started_at="2026-08-26 09:01:00",
+        )
         run_control.auto_trade_register_current_session_operation_participants(
             self.window,
             (self.targets[0][1],),
         )
 
-        with patch.object(
-            run_control,
-            "read_operation_state",
-            return_value={"emergency_stop": False},
+        with (
+            patch.object(self.window, "registered_operation_targets", return_value=[self.targets[0]]),
+            patch.object(
+                run_control,
+                "read_operation_state",
+                return_value={"emergency_stop": False},
+            ),
         ):
             self.window.update_global_operation_button_state()
 
-        self.assertEqual("운영중", self.window.btn_start.text())
+        self.assertEqual("▶ 운영중", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_stale_early_close_starts_then_rejects_current_session_rerun(self) -> None:
@@ -556,6 +706,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             self.targets[0][1]
         }
         adapter = monitoring_context_menu.MainMonitoringStockOperationAdapter(owner, [])
+        adapter.registered_operation_targets = lambda: list(self.targets)
         setting_button = QPushButton("▶ 운영시작", owner)
         setting_host = Mock()
         setting_host.btn_start = setting_button
@@ -572,11 +723,12 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             adapter.update_global_operation_button_state()
             run_control.auto_trade_update_global_operation_button_state(setting_host)
 
-        self.assertEqual("▶ 운영시작", owner.btn_start.text())
+        self.assertEqual("■ 운영시작", owner.btn_start.text())
         self.assertTrue(owner.btn_start.isEnabled())
         self.assertEqual(setting_button.text(), owner.btn_start.text())
         self.assertEqual(setting_button.isEnabled(), owner.btn_start.isEnabled())
         owner.startup_recovery_session_ready.assert_called_with(refresh=False)
+        setting_host.startup_recovery_session_ready.assert_called_with(refresh=False)
 
     def test_running_targets_exclude_operation_excluded_stock(self) -> None:
         stock_dir = self.targets[0][0]
@@ -606,7 +758,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             self.assertFalse(self.window.btn_start.isEnabled())
 
             self.window.update_global_operation_button_state()
-            self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+            self.assertEqual("■ 운영시작", self.window.btn_start.text())
             self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_bottom_button_returns_to_existing_contract_after_global_release(self) -> None:
@@ -623,7 +775,39 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
 
             self.window.update_global_operation_button_state()
 
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
+        self.assertTrue(self.window.btn_start.isEnabled())
+
+    def test_bottom_button_today_started_without_current_participant_shows_stopped(self) -> None:
+        with patch.object(
+            run_control,
+            "read_operation_state",
+            return_value={
+                "operation_date": setting_window.date.today().isoformat(),
+                "operation_status": "RUNNING",
+                "operation_participant_stock_codes": [self.targets[0][1]],
+            },
+        ):
+            self.window.update_global_operation_button_state()
+
+        self.assertEqual("● 운영정지", self.window.btn_start.text())
+        self.assertIn("background-color: #F8FAFC", self.window.btn_start.styleSheet())
+        self.assertFalse(self.window.btn_start.isEnabled())
+
+    def test_bottom_button_previous_day_stopped_returns_to_start(self) -> None:
+        with patch.object(
+            run_control,
+            "read_operation_state",
+            return_value={
+                "operation_date": "2000-01-01",
+                "operation_status": "RUNNING",
+                "operation_started_at": "2000-01-01 09:00:00",
+                "operation_participant_stock_codes": [self.targets[0][1]],
+            },
+        ):
+            self.window.update_global_operation_button_state()
+
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_bottom_button_ignores_per_stock_emergency_when_global_latch_false(self) -> None:
@@ -637,7 +821,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         ):
             self.window.update_global_operation_button_state()
 
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_selected_emergency_stop_does_not_change_bottom_button_without_global_latch(self) -> None:
@@ -663,7 +847,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 for target in self.targets
             )
         )
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
 
     def test_global_start_updates_button_to_running_disabled(self) -> None:
@@ -676,7 +860,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         ):
             self.window.btn_start.click()
 
-        self.assertEqual("\uc6b4\uc601\uc911", self.window.btn_start.text())
+        self.assertEqual("\u25b6 \uc6b4\uc601\uc911", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
         operation_state = read_json_dict(self.operation_state_path)
         self.assertEqual("2026-07-29", operation_state["operation_date"])
@@ -1036,7 +1220,12 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
     def test_global_start_with_all_targets_excluded_does_not_call_backend(self) -> None:
         for target in self.targets:
             self._write_operation_excluded(target[0], True)
-        self.window.update_global_operation_button_state()
+        with patch.object(
+            self.window,
+            "registered_operation_targets",
+            return_value=list(self.targets[:3]),
+        ):
+            self.window.update_global_operation_button_state()
 
         with patch.object(
             setting_window,
@@ -1045,7 +1234,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             self.window.btn_start.click()
 
         start_backend.assert_not_called()
-        self.assertEqual("\u25b6 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
+        self.assertEqual("\u25a0 \uc6b4\uc601\uc2dc\uc791", self.window.btn_start.text())
         self.assertTrue(self.window.btn_start.isEnabled())
         self.assertEqual(1, len(self.window.status_messages))
 
@@ -1103,9 +1292,8 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 "operation_excluded"
             )
         )
-        self.assertEqual("운영중", self.window.btn_start.text())
+        self.assertEqual("▶ 운영중", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
-        self.assertIn("정상 운영시작 되었습니다.", self.window.status_messages)
 
     def test_context_start_before_running_excludes_unselected_registered_targets(self) -> None:
         selected_targets = [self.targets[0], self.targets[2]]
@@ -1249,7 +1437,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 for target in start_backend.call_args.kwargs["selected_targets"]
             ],
         )
-        self.assertIn("정상 운영시작 되었습니다.", self.window.status_messages)
 
     def test_context_start_while_running_ignores_already_running_included_target(self) -> None:
         running_target = self.targets[0]
@@ -1284,9 +1471,12 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             before_untouched,
             read_json_dict(untouched_target[0] / "config.json"),
         )
-        self.assertIn("운영중인 종목입니다.", self.window.status_messages)
+        self.assertIn(
+            "선택한 종목이 모두 이미 운영 중입니다.",
+            self.window.status_messages,
+        )
 
-    def test_context_start_while_running_mixed_selection_does_not_partially_start(self) -> None:
+    def test_context_start_while_running_starts_only_additional_target(self) -> None:
         running_target = self.targets[0]
         add_target = self.targets[1]
         untouched_target = self.targets[2]
@@ -1307,25 +1497,34 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         self.window._selected_stock_infos = [running_target, add_target]
 
         with patch.object(
-            setting_window,
+            run_control,
             "auto_trade_start_selected_auto_trades",
+            return_value={"ok": True},
         ) as start_backend:
             self.window.start_selected_rows_auto_trades()
 
-        start_backend.assert_not_called()
+        start_backend.assert_called_once()
+        self.assertEqual(
+            [add_target[1]],
+            [
+                target[1]
+                for target in start_backend.call_args.kwargs["selected_targets"]
+            ],
+        )
         self.assertEqual(
             before_running,
             read_json_dict(running_target[0] / "config.json"),
         )
-        self.assertEqual(
-            before_add,
-            read_json_dict(add_target[0] / "config.json"),
+        self.assertTrue(before_add.get("operation_excluded"))
+        self.assertFalse(
+            read_json_dict(add_target[0] / "config.json").get(
+                "operation_excluded"
+            )
         )
         self.assertEqual(
             before_untouched,
             read_json_dict(untouched_target[0] / "config.json"),
         )
-        self.assertIn("운영중인 종목이 포함되어 있습니다.", self.window.status_messages)
 
     def test_direct_start_call_while_running_does_not_stop(self) -> None:
         for target in self.targets[:3]:
@@ -1350,13 +1549,19 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
                 target[0],
                 status="RUNNING",
                 trade_enabled=True,
+                trade_started_at="2026-08-26 09:01:00",
             )
         run_control.auto_trade_register_current_session_operation_participants(
             self.window,
             (target[1] for target in self.targets[:3]),
         )
-        self.window.update_global_operation_button_state()
-        self.assertEqual("\uc6b4\uc601\uc911", self.window.btn_start.text())
+        with patch.object(
+            self.window,
+            "registered_operation_targets",
+            return_value=list(self.targets[:3]),
+        ):
+            self.window.update_global_operation_button_state()
+        self.assertEqual("\u25b6 \uc6b4\uc601\uc911", self.window.btn_start.text())
         self.assertFalse(self.window.btn_start.isEnabled())
 
     def test_login_failure_shows_toast_and_keeps_start_button(self) -> None:
@@ -1370,7 +1575,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "로그인되어 있지 않습니다",
             toast.call_args.kwargs["message"],
         )
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
 
     def test_all_emergency_stopped_shows_contract_toast(self) -> None:
         for target in self.targets:
@@ -1389,7 +1594,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "모든 종목이 긴급정지 상태입니다.",
             toast.call_args.kwargs["message"],
         )
-        self.assertEqual("▶ 운영시작", self.window.btn_start.text())
+        self.assertEqual("■ 운영시작", self.window.btn_start.text())
 
     def test_context_emergency_stop_single_selected_stock_only(self) -> None:
         target = self.targets[0]

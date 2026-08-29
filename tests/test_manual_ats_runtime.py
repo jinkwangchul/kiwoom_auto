@@ -10,6 +10,8 @@ from unittest.mock import patch
 from manual_ats_runtime import (
     MANUAL_ATS_SELECTION_KEY,
     clear_manual_ats_runtime_selection,
+    manual_ats_runtime_execution_method,
+    manual_ats_runtime_execution_method_result,
     manual_ats_runtime_selected_keys,
     write_manual_ats_runtime_selection,
 )
@@ -21,6 +23,43 @@ from state_policy import manual_extra_session_enabled_now
 
 
 class ManualAtsRuntimeTest(unittest.TestCase):
+    def test_legacy_execution_method_defaults_to_routine_without_mutation(self) -> None:
+        state = {MANUAL_ATS_SELECTION_KEY: {"selected_sessions": ["extra1"]}}
+        before = json.dumps(state, sort_keys=True)
+        self.assertEqual("ROUTINE", manual_ats_runtime_execution_method(state))
+        self.assertEqual(before, json.dumps(state, sort_keys=True))
+
+    def test_execution_methods_round_trip_and_session_only_write_preserves_method(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = Path(temp)
+            state_path = stock / "state.json"
+            state_path.write_text('{"status":"STOPPED"}', encoding="utf-8")
+            for method in ("ROUTINE", "MARKET", "CURRENT_PRICE"):
+                with self.subTest(method=method):
+                    self.assertTrue(
+                        write_manual_ats_runtime_selection(
+                            stock,
+                            ["extra1"],
+                            execution_method=method,
+                        )
+                    )
+                    saved = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(method, manual_ats_runtime_execution_method(saved))
+                    self.assertTrue(
+                        write_manual_ats_runtime_selection(stock, ["extra2"])
+                    )
+                    preserved = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(method, manual_ats_runtime_execution_method(preserved))
+                    self.assertEqual(("extra2",), manual_ats_runtime_selected_keys(preserved))
+
+    def test_invalid_explicit_execution_method_is_not_silently_defaulted(self) -> None:
+        result = manual_ats_runtime_execution_method_result(
+            {MANUAL_ATS_SELECTION_KEY: {"execution_method": "BROKEN_VALUE"}}
+        )
+        self.assertIs(result["ok"], False)
+        self.assertIsNone(result["execution_method"])
+        self.assertEqual("INVALID_ATS_EXECUTION_METHOD", result["reason_code"])
+
     def test_environment_manual_extra_flags_do_not_apply_ats_to_stocks(self) -> None:
         self.assertFalse(
             manual_extra_session_enabled_now(

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ctypes
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import hashlib
 import os
@@ -33,6 +33,13 @@ from kiwoom_candle_adapter import (
 from kiwoom_trade_cost_diagnostic import record_trade_cost_chejan_diagnostic
 from production_recovery_contract import RecoverySessionIdentity, build_snapshot_part
 from event_journal_production import observe_production_exception
+from stock_library_master_diagnostics import build_master_code_diagnostic_projection
+from stock_code_contract import (
+    is_broker_action_stock_code,
+    is_valid_stock_code,
+    normalize_broker_stock_code,
+    normalize_stock_code,
+)
 from kiwoom_screen_allocator import (
     ACCOUNT_TR,
     MARKET_TR,
@@ -41,22 +48,49 @@ from kiwoom_screen_allocator import (
     ScreenAllocationError,
 )
 from kiwoom_realtime_fids import (
+    REALTIME_CHANGE_RATE_FID,
     REALTIME_CUMULATIVE_VOLUME_FID,
     REALTIME_CURRENT_PRICE_FID,
+    REALTIME_EXECUTION_STRENGTH_FID,
     REALTIME_EXECUTION_TIME_FID,
     REALTIME_EXECUTION_TYPE,
+    REALTIME_HIGH_PRICE_FID,
+    REALTIME_LOW_PRICE_FID,
+    REALTIME_OPEN_PRICE_FID,
+    REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID,
     REALTIME_SHADOW_FIDS,
+    REALTIME_TRADE_VOLUME_FID,
 )
 from kiwoom_realtime_shadow import (
     RealtimeShadowBar,
     RealtimeShadowBarBuilder,
     normalize_realtime_shadow_tick,
 )
+from kiwoom_initial_market_snapshot import (
+    OPTKWFID_MARKET_FIELDS,
+    normalize_optkwfid_market_row,
+)
 
 
 Opt10080Callback = Callable[[dict[str, Any]], None]
 RecoverySnapshotCallback = Callable[[dict[str, Any]], None]
 AccountFundsCallback = Callable[[dict[str, Any]], None]
+InitialMarketSnapshotCallback = Callable[[dict[str, Any]], None]
+StockRankingSnapshotCallback = Callable[[dict[str, Any]], None]
+
+
+def _decode_legacy_koa_text(value: object) -> str:
+    """Decode KOA_Functions text exposed as CP949 bytes in Latin-1 code points."""
+    text = str(value or "").strip()
+    if not text or any(ord(char) > 0xFF for char in text):
+        return text
+    try:
+        decoded = text.encode("latin-1").decode("cp949")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text
+    if any("\uac00" <= char <= "\ud7a3" for char in decoded):
+        return decoded
+    return text
 
 
 def _empty_candle_commit_projection() -> dict[str, Any]:
@@ -110,9 +144,27 @@ class RealtimeShadowRegistrationSnapshot:
     fid_list: tuple[int, ...]
     screen_batches: tuple[RealtimeShadowScreenBatch, ...]
     last_error: str
+    shadow_target_stock_codes: tuple[str, ...] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class TrGovernorMetricsSnapshot:
+    total_enqueued: int
+    total_dispatched: int
+    current_queue_depth: int
+    last_rqname: str
+    last_trcode: str
+    last_dispatch_monotonic: int | None
+    dispatch_count_last_60s: int
+    last_queue_wait_ms: float
+    max_queue_wait_ms: float
+    timeout_count: int
+    stale_count: int
+    error_count: int
+    last_error_reason: str
 
 
 def account_authentication_required_message(message: object) -> bool:
@@ -370,9 +422,102 @@ class KiwoomApi(QObject):
     RECOVERY_TR_TIMEOUT_MS = 15_000
     ACCOUNT_FUNDS_TR_TIMEOUT_MS = 15_000
     MINUTE_CANDLE_TR_TIMEOUT_MS = 10_000
+    INITIAL_MARKET_SNAPSHOT_TIMEOUT_MS = 15_000
+    INITIAL_MARKET_SNAPSHOT_BATCH_SIZE = 100
+    STOCK_RANKING_SNAPSHOT_TIMEOUT_MS = 15_000
+    STOCK_RANKING_LIMIT = 100
+    STOCK_RANKING_SPECS = {
+        "VOLUME_TOP": {
+            "trcode": "OPT10030",
+            "fields": (
+                "종목코드",
+                "종목명",
+                "현재가",
+                "등락률",
+                "거래량",
+                "거래금액",
+            ),
+            "inputs": (
+                ("시장구분", "000"),
+                ("정렬구분", "1"),
+                ("관리종목포함", "0"),
+                ("신용구분", "0"),
+                ("거래량구분", "0"),
+                ("가격구분", "0"),
+                ("거래대금구분", "0"),
+                ("장운영구분", "0"),
+                ("거래소구분", "1"),
+            ),
+        },
+        "VALUE_TOP": {
+            "trcode": "OPT10032",
+            "fields": (
+                "종목코드",
+                "종목명",
+                "현재가",
+                "등락률",
+                "현재거래량",
+                "거래대금",
+            ),
+            "inputs": (
+                ("시장구분", "000"),
+                ("관리종목포함", "1"),
+                ("거래소구분", "1"),
+            ),
+        },
+        "RISE_TOP": {
+            "trcode": "OPT10027",
+            "fields": (
+                "종목코드",
+                "종목명",
+                "현재가",
+                "등락률",
+                "현재거래량",
+                "체결강도",
+            ),
+            "inputs": (
+                ("시장구분", "000"),
+                ("정렬구분", "1"),
+                ("거래량조건", "0"),
+                ("종목조건", "0"),
+                ("신용조건", "0"),
+                ("상하한포함", "1"),
+                ("가격조건", "0"),
+                ("거래대금조건", "0"),
+                ("거래소구분", "1"),
+            ),
+        },
+        "FALL_TOP": {
+            "trcode": "OPT10027",
+            "fields": (
+                "종목코드",
+                "종목명",
+                "현재가",
+                "등락률",
+                "현재거래량",
+                "체결강도",
+            ),
+            "inputs": (
+                ("시장구분", "000"),
+                ("정렬구분", "3"),
+                ("거래량조건", "0"),
+                ("종목조건", "0"),
+                ("신용조건", "0"),
+                ("상하한포함", "1"),
+                ("가격조건", "0"),
+                ("거래대금조건", "0"),
+                ("거래소구분", "1"),
+            ),
+        },
+    }
     BROKER_CONNECTION_OBSERVATION_INTERVAL_MS = 5_000
     # Project-conservative pacing, aligned with auto_candle_refresh.REQUEST_SPACING_MS.
     TR_GOVERNOR_MIN_INTERVAL_MS = 1_000
+    MASTER_STOCK_MARKETS = (
+        ("KOSPI", "0"),
+        ("KOSDAQ", "10"),
+        ("NXT", "NXT"),
+    )
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -416,9 +561,21 @@ class KiwoomApi(QObject):
         self._tr_last_dispatch_monotonic_ms: int | None = None
         self._tr_governor_timer_scheduled = False
         self._tr_governor_dispatching = False
+        self._tr_governor_total_enqueued = 0
+        self._tr_governor_total_dispatched = 0
+        self._tr_governor_last_rqname = ""
+        self._tr_governor_last_trcode = ""
+        self._tr_governor_dispatch_history: deque[float] = deque(maxlen=4096)
+        self._tr_governor_last_queue_wait_ms = 0.0
+        self._tr_governor_max_queue_wait_ms = 0.0
+        self._tr_governor_timeout_count = 0
+        self._tr_governor_stale_count = 0
+        self._tr_governor_error_count = 0
+        self._tr_governor_last_error_reason = ""
         self._screen_allocator = KiwoomScreenAllocator()
         self._realtime_shadow_builder = RealtimeShadowBarBuilder()
         self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
+        self._realtime_receive_sequence = 0
 
         if QAxWidget is None:
             self._unavailable_reason = f"QAxContainer import failed: {_QAX_IMPORT_ERROR}"
@@ -508,18 +665,33 @@ class KiwoomApi(QObject):
             fid_list=tuple(REALTIME_SHADOW_FIDS),
             screen_batches=(),
             last_error=str(last_error or ""),
+            shadow_target_stock_codes=(),
         )
+
+    @staticmethod
+    def _registration_shadow_targets(
+        snapshot: RealtimeShadowRegistrationSnapshot,
+    ) -> tuple[str, ...]:
+        targets = getattr(snapshot, "shadow_target_stock_codes", None)
+        return tuple(snapshot.target_stock_codes if targets is None else targets)
 
     def _ensure_realtime_shadow_state(self) -> None:
         if not hasattr(self, "_screen_allocator"):
             self._screen_allocator = KiwoomScreenAllocator()
         if not hasattr(self, "_realtime_shadow_builder"):
             self._realtime_shadow_builder = RealtimeShadowBarBuilder()
+        if not hasattr(self, "_realtime_receive_sequence"):
+            self._realtime_receive_sequence = 0
         if not isinstance(
             getattr(self, "_realtime_shadow_registration", None),
             RealtimeShadowRegistrationSnapshot,
         ):
             self._realtime_shadow_registration = self._empty_realtime_shadow_snapshot()
+
+    def _next_realtime_receive_sequence(self) -> int:
+        self._ensure_realtime_shadow_state()
+        self._realtime_receive_sequence += 1
+        return self._realtime_receive_sequence
 
     def realtime_shadow_registration_snapshot(
         self,
@@ -541,7 +713,7 @@ class KiwoomApi(QObject):
             return {"ok": False, "changed": False, "reason_code": "INVALID_REALTIME_BAR"}
         if (
             not registration.active
-            or bar.stock_code not in registration.target_stock_codes
+            or bar.stock_code not in KiwoomApi._registration_shadow_targets(registration)
             or not session.connected
             or bar.connection_epoch != registration.connection_epoch
             or bar.login_session_id != registration.login_session_id
@@ -581,11 +753,11 @@ class KiwoomApi(QObject):
             self.bar_committed.emit(commit.notification.to_payload())
         return result
 
-    def sync_realtime_shadow_registration(
+    def sync_realtime_monitoring_registration(
         self,
         stock_codes: object,
     ) -> dict[str, Any]:
-        """Replace shadow-only registrations for the current broker session."""
+        """Replace Broker realtime registrations for the current monitoring set."""
 
         self._ensure_realtime_shadow_state()
         session = self.broker_session_snapshot()
@@ -607,7 +779,17 @@ class KiwoomApi(QObject):
             }
 
         candidates = stock_codes if isinstance(stock_codes, (list, tuple, set, frozenset)) else ()
-        targets = tuple(sorted({str(code or "").strip() for code in candidates if str(code or "").strip()}))
+        normalized_targets = {
+            normalize_stock_code(code)
+            for code in candidates
+            if normalize_stock_code(code)
+        }
+        unsupported_targets = tuple(
+            sorted(code for code in normalized_targets if not is_broker_action_stock_code(code))
+        )
+        targets = tuple(
+            sorted(code for code in normalized_targets if code not in unsupported_targets)
+        )
         current = self._realtime_shadow_registration
         if (
             current.active
@@ -621,9 +803,15 @@ class KiwoomApi(QObject):
                 "changed": False,
                 "active": True,
                 "reason_code": "REALTIME_SHADOW_UNCHANGED",
+                "unsupported_stock_codes": unsupported_targets,
                 "snapshot": current,
             }
 
+        preserved_shadow_targets = tuple(
+            code
+            for code in self._registration_shadow_targets(current)
+            if code in targets
+        )
         had_registration = bool(current.screen_batches)
         if had_registration:
             clear_result = self.clear_realtime_shadow_registration(
@@ -645,6 +833,7 @@ class KiwoomApi(QObject):
                 "changed": had_registration,
                 "active": False,
                 "reason_code": "REALTIME_SHADOW_EMPTY_TARGET",
+                "unsupported_stock_codes": unsupported_targets,
                 "snapshot": self._realtime_shadow_registration,
             }
 
@@ -699,14 +888,101 @@ class KiwoomApi(QObject):
             fid_list=tuple(REALTIME_SHADOW_FIDS),
             screen_batches=tuple(registered),
             last_error="",
+            shadow_target_stock_codes=preserved_shadow_targets,
         )
         return {
             "ok": True,
             "changed": True,
             "active": True,
             "reason_code": "REGISTER_CALL_RETURNED",
+            "unsupported_stock_codes": unsupported_targets,
             "snapshot": self._realtime_shadow_registration,
         }
+
+    def sync_realtime_shadow_targets(self, stock_codes: object) -> dict[str, Any]:
+        """Update the process-local Shadow eligibility set without Broker I/O."""
+
+        self._ensure_realtime_shadow_state()
+        candidates = (
+            stock_codes
+            if isinstance(stock_codes, (list, tuple, set, frozenset))
+            else ()
+        )
+        normalized = {
+            normalize_stock_code(code)
+            for code in candidates
+            if normalize_stock_code(code)
+        }
+        unsupported = tuple(
+            sorted(code for code in normalized if not is_broker_action_stock_code(code))
+        )
+        registered = set(self._realtime_shadow_registration.target_stock_codes)
+        targets = tuple(
+            sorted(
+                code
+                for code in normalized
+                if code not in unsupported and code in registered
+            )
+        )
+        current = self._realtime_shadow_registration
+        if self._registration_shadow_targets(current) == targets:
+            return {
+                "ok": True,
+                "changed": False,
+                "active": bool(current.active),
+                "reason_code": "REALTIME_SHADOW_TARGETS_UNCHANGED",
+                "unsupported_stock_codes": unsupported,
+                "snapshot": current,
+            }
+        self._realtime_shadow_builder.reset()
+        self._realtime_shadow_registration = replace(
+            current,
+            shadow_target_stock_codes=targets,
+        )
+        return {
+            "ok": True,
+            "changed": True,
+            "active": bool(current.active),
+            "reason_code": "REALTIME_SHADOW_TARGETS_UPDATED",
+            "unsupported_stock_codes": unsupported,
+            "snapshot": self._realtime_shadow_registration,
+        }
+
+    def sync_realtime_shadow_registration(
+        self,
+        stock_codes: object,
+    ) -> dict[str, Any]:
+        """Compatibility wrapper for callers that still request combined sync."""
+
+        candidates = (
+            stock_codes
+            if isinstance(stock_codes, (list, tuple, set, frozenset))
+            else ()
+        )
+        normalized = {
+            normalize_stock_code(code)
+            for code in candidates
+            if normalize_stock_code(code)
+        }
+        unsupported = tuple(
+            sorted(code for code in normalized if not is_broker_action_stock_code(code))
+        )
+        if unsupported:
+            return {
+                "ok": False,
+                "changed": False,
+                "active": bool(self._realtime_shadow_registration.active),
+                "reason_code": "BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED",
+                "unsupported_stock_codes": unsupported,
+                "snapshot": self._realtime_shadow_registration,
+            }
+        monitoring = self.sync_realtime_monitoring_registration(tuple(sorted(normalized)))
+        if monitoring.get("ok") is not True:
+            return monitoring
+        shadow = self.sync_realtime_shadow_targets(tuple(sorted(normalized)))
+        result = dict(monitoring)
+        result["snapshot"] = shadow.get("snapshot", monitoring.get("snapshot"))
+        return result
 
     def clear_realtime_shadow_registration(
         self,
@@ -922,6 +1198,7 @@ class KiwoomApi(QObject):
         current = self._pending_tr.pop(request_name, None)
         if current is not pending:
             return
+        self._record_tr_governor_stale()
         self._release_pending_tr_screen(request_name, pending)
         pending_type = pending.get("type")
         if pending_type == "account_funds":
@@ -958,6 +1235,31 @@ class KiwoomApi(QObject):
                 }
             )
             self._finish_callback(callback if callable(callback) else None, payload)
+            return
+        if pending_type == "initial_market_snapshot":
+            callback = pending.get("callback")
+            payload = self._stale_broker_session_error(request_name, pending)
+            payload.update(
+                {
+                    "type": "initial_market_snapshot",
+                    "stock_codes": list(pending.get("stock_codes") or ()),
+                    "rows": [],
+                }
+            )
+            self._finish_callback(callback if callable(callback) else None, payload)
+            return
+        if pending_type == "stock_ranking_snapshot":
+            callback = pending.get("callback")
+            payload = self._stale_broker_session_error(request_name, pending)
+            payload.update(
+                {
+                    "type": "stock_ranking_snapshot",
+                    "source": pending.get("source", ""),
+                    "trcode": pending.get("trcode", ""),
+                    "rows": [],
+                }
+            )
+            self._finish_callback(callback if callable(callback) else None, payload)
 
     def _ensure_tr_governor_state(self) -> None:
         if not hasattr(self, "_tr_request_queue"):
@@ -968,6 +1270,67 @@ class KiwoomApi(QObject):
             self._tr_governor_timer_scheduled = False
         if not hasattr(self, "_tr_governor_dispatching"):
             self._tr_governor_dispatching = False
+        if not hasattr(self, "_tr_governor_total_enqueued"):
+            self._tr_governor_total_enqueued = 0
+        if not hasattr(self, "_tr_governor_total_dispatched"):
+            self._tr_governor_total_dispatched = 0
+        if not hasattr(self, "_tr_governor_last_rqname"):
+            self._tr_governor_last_rqname = ""
+        if not hasattr(self, "_tr_governor_last_trcode"):
+            self._tr_governor_last_trcode = ""
+        if not hasattr(self, "_tr_governor_dispatch_history"):
+            self._tr_governor_dispatch_history = deque(maxlen=4096)
+        if not hasattr(self, "_tr_governor_last_queue_wait_ms"):
+            self._tr_governor_last_queue_wait_ms = 0.0
+        if not hasattr(self, "_tr_governor_max_queue_wait_ms"):
+            self._tr_governor_max_queue_wait_ms = 0.0
+        if not hasattr(self, "_tr_governor_timeout_count"):
+            self._tr_governor_timeout_count = 0
+        if not hasattr(self, "_tr_governor_stale_count"):
+            self._tr_governor_stale_count = 0
+        if not hasattr(self, "_tr_governor_error_count"):
+            self._tr_governor_error_count = 0
+        if not hasattr(self, "_tr_governor_last_error_reason"):
+            self._tr_governor_last_error_reason = ""
+
+    def _prune_tr_governor_dispatch_history(self, now: float) -> None:
+        history = self._tr_governor_dispatch_history
+        cutoff = float(now) - 60.0
+        while history and history[0] < cutoff:
+            history.popleft()
+
+    def _record_tr_governor_timeout(self) -> None:
+        self._ensure_tr_governor_state()
+        self._tr_governor_timeout_count += 1
+
+    def _record_tr_governor_stale(self) -> None:
+        self._ensure_tr_governor_state()
+        self._tr_governor_stale_count += 1
+
+    def _record_tr_governor_error(self, reason: object) -> None:
+        self._ensure_tr_governor_state()
+        self._tr_governor_error_count += 1
+        self._tr_governor_last_error_reason = str(reason or "").strip()
+
+    def tr_governor_metrics_snapshot(self) -> TrGovernorMetricsSnapshot:
+        self._ensure_tr_governor_state()
+        now = monotonic()
+        self._prune_tr_governor_dispatch_history(now)
+        return TrGovernorMetricsSnapshot(
+            total_enqueued=self._tr_governor_total_enqueued,
+            total_dispatched=self._tr_governor_total_dispatched,
+            current_queue_depth=len(self._tr_request_queue),
+            last_rqname=self._tr_governor_last_rqname,
+            last_trcode=self._tr_governor_last_trcode,
+            last_dispatch_monotonic=self._tr_last_dispatch_monotonic_ms,
+            dispatch_count_last_60s=len(self._tr_governor_dispatch_history),
+            last_queue_wait_ms=self._tr_governor_last_queue_wait_ms,
+            max_queue_wait_ms=self._tr_governor_max_queue_wait_ms,
+            timeout_count=self._tr_governor_timeout_count,
+            stale_count=self._tr_governor_stale_count,
+            error_count=self._tr_governor_error_count,
+            last_error_reason=self._tr_governor_last_error_reason,
+        )
 
     def _tr_governor_now_ms(self) -> int:
         return int(monotonic() * 1000)
@@ -998,6 +1361,8 @@ class KiwoomApi(QObject):
         pending: dict[str, Any],
         on_dispatched: Callable[[Any], None] | None = None,
         on_failed: Callable[[Any, str], dict[str, Any]] | None = None,
+        dispatch_kind: str = "COMM_RQ_DATA",
+        dispatch_payload: tuple[object, ...] = (),
     ) -> dict[str, Any]:
         self._ensure_tr_governor_state()
         request = {
@@ -1009,8 +1374,12 @@ class KiwoomApi(QObject):
             "pending": pending,
             "on_dispatched": on_dispatched,
             "on_failed": on_failed,
+            "dispatch_kind": str(dispatch_kind or "COMM_RQ_DATA"),
+            "dispatch_payload": tuple(dispatch_payload),
+            "metrics_enqueued_monotonic": monotonic(),
         }
         self._tr_request_queue.append(request)
+        self._tr_governor_total_enqueued += 1
         return self._drain_tr_governor()
 
     def _drain_tr_governor(self) -> dict[str, Any]:
@@ -1058,25 +1427,59 @@ class KiwoomApi(QObject):
             }
 
         try:
-            for field, value in request.get("inputs", ()):
-                self._control.dynamicCall(
-                    "SetInputValue(QString, QString)",
-                    str(field),
-                    str(value),
+            dispatch_kind = str(request.get("dispatch_kind") or "COMM_RQ_DATA")
+            if dispatch_kind == "COMM_KW_RQ_DATA":
+                stock_codes, stock_count, type_flag = request.get(
+                    "dispatch_payload", ("", 0, 0)
                 )
-            result = self._control.dynamicCall(
-                "CommRqData(QString, QString, int, QString)",
-                rqname,
-                str(request.get("trcode") or ""),
-                int(request.get("prev_next") or 0),
-                str(request.get("screen_no") or ""),
-            )
+                result = self._control.dynamicCall(
+                    "CommKwRqData(QString, bool, int, int, QString, QString)",
+                    str(stock_codes),
+                    False,
+                    int(stock_count),
+                    int(type_flag),
+                    rqname,
+                    str(request.get("screen_no") or ""),
+                )
+            else:
+                for field, value in request.get("inputs", ()):
+                    self._control.dynamicCall(
+                        "SetInputValue(QString, QString)",
+                        str(field),
+                        str(value),
+                    )
+                result = self._control.dynamicCall(
+                    "CommRqData(QString, QString, int, QString)",
+                    rqname,
+                    str(request.get("trcode") or ""),
+                    int(request.get("prev_next") or 0),
+                    str(request.get("screen_no") or ""),
+                )
             self._tr_last_dispatch_monotonic_ms = self._tr_governor_now_ms()
         except Exception as exc:
             result = -1
             error = str(exc)
         else:
             error = "CommRqData failed"
+
+        dispatched_at = monotonic()
+        raw_enqueued_at = request.get("metrics_enqueued_monotonic")
+        enqueued_at = (
+            dispatched_at
+            if raw_enqueued_at is None
+            else float(raw_enqueued_at)
+        )
+        queue_wait_ms = max(0.0, (dispatched_at - enqueued_at) * 1000.0)
+        self._tr_governor_total_dispatched += 1
+        self._tr_governor_last_rqname = rqname
+        self._tr_governor_last_trcode = str(request.get("trcode") or "")
+        self._tr_governor_last_queue_wait_ms = queue_wait_ms
+        self._tr_governor_max_queue_wait_ms = max(
+            self._tr_governor_max_queue_wait_ms,
+            queue_wait_ms,
+        )
+        self._tr_governor_dispatch_history.append(dispatched_at)
+        self._prune_tr_governor_dispatch_history(dispatched_at)
 
         if int(result or 0) == 0:
             on_dispatched = request.get("on_dispatched")
@@ -1089,6 +1492,7 @@ class KiwoomApi(QObject):
                 "result": result,
             }
 
+        self._record_tr_governor_error(error)
         on_failed = request.get("on_failed")
         if callable(on_failed):
             return on_failed(result, error)
@@ -1134,6 +1538,22 @@ class KiwoomApi(QObject):
         }
 
     def login(self) -> dict[str, Any]:
+        if bool(getattr(self, "_login_requested", False)):
+            return {
+                "ok": True,
+                "status": "login_in_progress",
+                "connected": False,
+                "message": "login already requested",
+            }
+        if bool(getattr(self, "_connected", False)) and str(
+            getattr(self, "_login_session_id", "") or ""
+        ):
+            return {
+                "ok": True,
+                "status": "already_connected",
+                "connected": True,
+                "message": "login already completed",
+            }
         if not self.is_available():
             self._login_requested = False
             self.last_login_error = None
@@ -1380,6 +1800,244 @@ class KiwoomApi(QObject):
             seen.add(account)
         return accounts
 
+    @staticmethod
+    def _normalize_master_code_list(raw_value: object) -> list[str]:
+        codes: list[str] = []
+        seen: set[str] = set()
+        for item in str(raw_value or "").split(";"):
+            code = normalize_stock_code(item)
+            if not code or code in seen:
+                continue
+            codes.append(code)
+            seen.add(code)
+        return codes
+
+    def _master_call_ready(self) -> tuple[bool, str]:
+        readiness = self.broker_readiness_snapshot()
+        return bool(readiness.broker_request_ready), str(readiness.reason or "")
+
+    def get_market_stock_codes(self, market_code: str) -> dict[str, Any]:
+        """Read one market code list through the existing connected OCX."""
+        clean_market = str(market_code or "").strip()
+        if clean_market not in {market_id for _name, market_id in self.MASTER_STOCK_MARKETS}:
+            return {
+                "ok": False,
+                "value": [],
+                "error": "unsupported market code",
+                "reason": "UNSUPPORTED_MARKET",
+            }
+        ready, reason = self._master_call_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "value": [],
+                "error": "broker request is not ready",
+                "reason": reason or "BROKER_REQUEST_NOT_READY",
+            }
+        try:
+            raw_value = self._control.dynamicCall(
+                "GetCodeListByMarket(QString)",
+                clean_market,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "value": [],
+                "error": str(exc),
+                "reason": "MASTER_MARKET_CALL_FAILED",
+            }
+        codes = self._normalize_master_code_list(raw_value)
+        diagnostic = build_master_code_diagnostic_projection(raw_value)
+        if not codes:
+            return {
+                "ok": False,
+                "value": [],
+                "diagnostic": diagnostic,
+                "error": "market code list is empty",
+                "reason": "MASTER_MARKET_EMPTY",
+            }
+        return {
+            "ok": True,
+            "value": codes,
+            "diagnostic": diagnostic,
+            "error": "",
+            "reason": "OK",
+        }
+
+    def get_master_stock_name(self, stock_code: str) -> dict[str, Any]:
+        """Read one stock name through the existing connected OCX."""
+        clean_code = normalize_stock_code(stock_code)
+        if not is_valid_stock_code(clean_code):
+            return {
+                "ok": False,
+                "value": "",
+                "error": "stock code is empty",
+                "reason": "INVALID_STOCK_CODE",
+            }
+        ready, reason = self._master_call_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "value": "",
+                "error": "broker request is not ready",
+                "reason": reason or "BROKER_REQUEST_NOT_READY",
+            }
+        try:
+            raw_value = self._control.dynamicCall(
+                "GetMasterCodeName(QString)",
+                clean_code,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "value": "",
+                "error": str(exc),
+                "reason": "MASTER_NAME_CALL_FAILED",
+            }
+        name = str(raw_value or "").strip()
+        if not name:
+            return {
+                "ok": False,
+                "value": "",
+                "error": "master stock name is empty",
+                "reason": "MASTER_NAME_EMPTY",
+            }
+        return {"ok": True, "value": name, "error": "", "reason": "OK"}
+
+    def _get_master_stock_text(
+        self,
+        stock_code: str,
+        *,
+        signature: str,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        clean_code = normalize_stock_code(stock_code)
+        if not is_valid_stock_code(clean_code):
+            return {
+                "ok": False,
+                "value": "",
+                "error": "stock code is invalid",
+                "reason": "INVALID_STOCK_CODE",
+            }
+        ready, reason = self._master_call_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "value": "",
+                "error": "broker request is not ready",
+                "reason": reason or "BROKER_REQUEST_NOT_READY",
+            }
+        try:
+            raw_value = self._control.dynamicCall(signature, clean_code)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "value": "",
+                "error": str(exc),
+                "reason": failure_reason,
+            }
+        value = str(raw_value or "").strip()
+        return {
+            "ok": True,
+            "value": value,
+            "error": "",
+            "reason": "OK" if value else "EMPTY",
+        }
+
+    def get_master_stock_state(self, stock_code: str) -> dict[str, Any]:
+        """Read the official master stock-state text without issuing a TR."""
+        return self._get_master_stock_text(
+            stock_code,
+            signature="GetMasterStockState(QString)",
+            failure_reason="MASTER_STOCK_STATE_CALL_FAILED",
+        )
+
+    def get_master_construction(self, stock_code: str) -> dict[str, Any]:
+        """Read the official master construction text without issuing a TR."""
+        return self._get_master_stock_text(
+            stock_code,
+            signature="GetMasterConstruction(QString)",
+            failure_reason="MASTER_CONSTRUCTION_CALL_FAILED",
+        )
+
+    def get_master_stock_info(self, stock_code: str) -> dict[str, Any]:
+        """Read official market/product classification evidence without a TR."""
+        clean_code = normalize_stock_code(stock_code)
+        if not is_valid_stock_code(clean_code):
+            return {
+                "ok": False,
+                "value": "",
+                "error": "stock code is invalid",
+                "reason": "INVALID_STOCK_CODE",
+            }
+        ready, reason = self._master_call_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "value": "",
+                "error": "broker request is not ready",
+                "reason": reason or "BROKER_REQUEST_NOT_READY",
+            }
+        try:
+            raw_value = self._control.dynamicCall(
+                "KOA_Functions(QString, QString)",
+                "GetMasterStockInfo",
+                clean_code,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "value": "",
+                "error": str(exc),
+                "reason": "MASTER_STOCK_INFO_CALL_FAILED",
+            }
+        value = _decode_legacy_koa_text(raw_value)
+        return {
+            "ok": True,
+            "value": value,
+            "error": "",
+            "reason": "OK" if value else "EMPTY",
+        }
+
+    def get_master_stock_market_kind(self, stock_code: str) -> dict[str, Any]:
+        """Read the official per-stock market kind from the connected OCX."""
+        clean_code = normalize_stock_code(stock_code)
+        if not is_valid_stock_code(clean_code):
+            return {
+                "ok": False,
+                "value": "",
+                "error": "stock code is invalid",
+                "reason": "INVALID_STOCK_CODE",
+            }
+        ready, reason = self._master_call_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "value": "",
+                "error": "broker request is not ready",
+                "reason": reason or "BROKER_REQUEST_NOT_READY",
+            }
+        try:
+            raw_value = self._control.dynamicCall(
+                "KOA_Functions(QString, QString)",
+                "GetStockMarketKind",
+                clean_code,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "value": "",
+                "error": str(exc),
+                "reason": "MASTER_STOCK_MARKET_KIND_CALL_FAILED",
+            }
+        value = str(raw_value or "").strip()
+        return {
+            "ok": bool(value),
+            "value": value,
+            "error": "" if value else "stock market kind is empty",
+            "reason": "OK" if value else "MASTER_STOCK_MARKET_KIND_EMPTY",
+        }
+
     def account_server_type(self) -> str:
         """Return the official login-server classification for UI projection."""
         if not self.is_available() or not self.is_connected():
@@ -1413,6 +2071,11 @@ class KiwoomApi(QObject):
         original_order_no: str,
     ) -> Any:
         """Call Kiwoom OpenAPI SendOrder once with the official 9 arguments."""
+        clean_code = normalize_stock_code(code)
+        if not clean_code:
+            raise ValueError("stock code is required")
+        if not is_broker_action_stock_code(clean_code):
+            raise ValueError("BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED")
         if not self.is_available():
             raise RuntimeError(self._unavailable_reason or "kiwoom api unavailable")
         if not self.is_connected():
@@ -1423,11 +2086,297 @@ class KiwoomApi(QObject):
             str(order_name or ""),
             str(account_no or ""),
             int(order_type),
-            str(code or ""),
+            clean_code,
             int(quantity),
             int(price),
             str(hoga or ""),
             str(original_order_no or ""),
+        )
+
+    def request_initial_market_snapshot(
+        self,
+        stock_codes: object,
+        *,
+        callback: InitialMarketSnapshotCallback | None = None,
+    ) -> dict[str, Any]:
+        """Enqueue one official OPTKWFID snapshot batch per 100 current Stocks."""
+
+        raw_codes = [stock_codes] if isinstance(stock_codes, str) else list(stock_codes or ())
+        targets = tuple(
+            sorted(
+                {
+                    code
+                    for item in raw_codes
+                    if (code := normalize_stock_code(item))
+                    and is_valid_stock_code(code)
+                }
+            )
+        )
+        if not targets:
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": True,
+                    "status": "EMPTY",
+                    "type": "initial_market_snapshot",
+                    "target_stock_codes": [],
+                    "batch_count": 0,
+                },
+            )
+        if not self.is_available() or not self.is_connected():
+            result = self._broker_request_not_ready_error()
+            result.update(type="initial_market_snapshot", target_stock_codes=list(targets))
+            return self._finish_callback(callback, result)
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result.update(type="initial_market_snapshot", target_stock_codes=list(targets))
+            return self._finish_callback(callback, result)
+
+        batch_results: list[dict[str, Any]] = []
+        for offset in range(0, len(targets), self.INITIAL_MARKET_SNAPSHOT_BATCH_SIZE):
+            batch = targets[offset : offset + self.INITIAL_MARKET_SNAPSHOT_BATCH_SIZE]
+            batch_index = offset // self.INITIAL_MARKET_SNAPSHOT_BATCH_SIZE
+            rqname = (
+                f"OPTKWFID_INITIAL_{batch_index}_"
+                f"{datetime.now().strftime('%H%M%S%f')}"
+            )
+            screen_no, claim_error = self._claim_tr_screen(
+                purpose=MARKET_TR,
+                rqname=rqname,
+                screen_no=None,
+                callback=callback,
+                failure_payload={
+                    "type": "initial_market_snapshot",
+                    "stock_codes": list(batch),
+                    "rows": [],
+                },
+            )
+            if screen_no is None:
+                batch_results.append(claim_error or {"ok": False, "rqname": rqname})
+                continue
+            pending = {
+                "type": "initial_market_snapshot",
+                "stock_codes": batch,
+                "screen_no": screen_no,
+                "callback": callback,
+                **request_identity,
+            }
+            self._pending_tr[rqname] = pending
+
+            def start_timeout(_result: Any, request_name: str = rqname) -> None:
+                QTimer.singleShot(
+                    self.INITIAL_MARKET_SNAPSHOT_TIMEOUT_MS,
+                    lambda name=request_name: self._expire_initial_market_snapshot(name),
+                )
+
+            def fail_request(
+                result: Any,
+                error: str,
+                request_name: str = rqname,
+            ) -> dict[str, Any]:
+                failed = self._pending_tr.pop(request_name, None)
+                self._release_pending_tr_screen(request_name, failed)
+                payload = {
+                    "ok": False,
+                    "type": "initial_market_snapshot",
+                    "stock_codes": list((failed or {}).get("stock_codes") or ()),
+                    "rqname": request_name,
+                    "trcode": "OPTKWFID",
+                    "rows": [],
+                    "result": result,
+                    "error": error,
+                }
+                return self._finish_callback(callback, payload)
+
+            batch_results.append(
+                self._submit_governed_tr_request(
+                    rqname=rqname,
+                    trcode="OPTKWFID",
+                    prev_next=0,
+                    screen_no=screen_no,
+                    inputs=(),
+                    pending=pending,
+                    on_dispatched=start_timeout,
+                    on_failed=fail_request,
+                    dispatch_kind="COMM_KW_RQ_DATA",
+                    dispatch_payload=(";".join(batch), len(batch), 0),
+                )
+            )
+
+        return {
+            "ok": bool(batch_results) and all(item.get("ok") for item in batch_results),
+            "status": "ENQUEUED",
+            "type": "initial_market_snapshot",
+            "target_stock_codes": list(targets),
+            "batch_count": len(batch_results),
+            "batches": batch_results,
+        }
+
+    def _expire_initial_market_snapshot(self, rqname: str) -> None:
+        pending = self._pending_tr.pop(str(rqname), None)
+        if not pending or pending.get("type") != "initial_market_snapshot":
+            return
+        self._record_tr_governor_timeout()
+        self._release_pending_tr_screen(str(rqname), pending)
+        callback = pending.get("callback")
+        self._finish_callback(
+            callback if callable(callback) else None,
+            {
+                "ok": False,
+                "type": "initial_market_snapshot",
+                "stock_codes": list(pending.get("stock_codes") or ()),
+                "rqname": str(rqname),
+                "trcode": "OPTKWFID",
+                "rows": [],
+                "error": "initial market snapshot request timed out",
+                "error_kind": "TIMEOUT",
+            },
+        )
+
+    def request_stock_ranking_snapshot(
+        self,
+        source: str,
+        *,
+        callback: StockRankingSnapshotCallback | None = None,
+    ) -> dict[str, Any]:
+        """Enqueue one governed KRX KOSPI+KOSDAQ ranking snapshot."""
+
+        clean_source = str(source or "").strip().upper()
+        spec = self.STOCK_RANKING_SPECS.get(clean_source)
+        if not isinstance(spec, dict):
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "type": "stock_ranking_snapshot",
+                    "source": clean_source,
+                    "rows": [],
+                    "error": "unsupported stock ranking source",
+                    "error_kind": "UNSUPPORTED_STOCK_RANKING_SOURCE",
+                },
+            )
+        if not self.is_available() or not self.is_connected():
+            result = self._broker_request_not_ready_error()
+            result.update(
+                type="stock_ranking_snapshot",
+                source=clean_source,
+                rows=[],
+            )
+            return self._finish_callback(callback, result)
+        request_identity = self._capture_broker_request_identity()
+        if request_identity is None:
+            result = self._broker_request_not_ready_error()
+            result.update(
+                type="stock_ranking_snapshot",
+                source=clean_source,
+                rows=[],
+            )
+            return self._finish_callback(callback, result)
+
+        trcode = str(spec.get("trcode") or "").strip().upper()
+        rqname = (
+            f"STOCK_RANKING_{clean_source}_"
+            f"{datetime.now().strftime('%H%M%S%f')}"
+        )
+        screen_no, claim_error = self._claim_tr_screen(
+            purpose=MARKET_TR,
+            rqname=rqname,
+            screen_no=None,
+            callback=callback,
+            failure_payload={
+                "type": "stock_ranking_snapshot",
+                "source": clean_source,
+                "trcode": trcode,
+                "rows": [],
+            },
+        )
+        if screen_no is None:
+            return claim_error or {
+                "ok": False,
+                "type": "stock_ranking_snapshot",
+                "source": clean_source,
+                "trcode": trcode,
+                "rows": [],
+            }
+
+        pending = {
+            "type": "stock_ranking_snapshot",
+            "source": clean_source,
+            "trcode": trcode,
+            "fields": tuple(spec.get("fields") or ()),
+            "screen_no": screen_no,
+            "callback": callback,
+            **request_identity,
+        }
+        self._pending_tr[rqname] = pending
+
+        def start_timeout(_result: Any, request_name: str = rqname) -> None:
+            QTimer.singleShot(
+                self.STOCK_RANKING_SNAPSHOT_TIMEOUT_MS,
+                lambda name=request_name: self._expire_stock_ranking_snapshot(name),
+            )
+
+        def fail_request(
+            result: Any,
+            error: str,
+            request_name: str = rqname,
+        ) -> dict[str, Any]:
+            failed = self._pending_tr.pop(request_name, None)
+            self._release_pending_tr_screen(request_name, failed)
+            payload = {
+                "ok": False,
+                "type": "stock_ranking_snapshot",
+                "source": clean_source,
+                "rqname": request_name,
+                "trcode": trcode,
+                "rows": [],
+                "result": result,
+                "error": error,
+            }
+            return self._finish_callback(callback, payload)
+
+        submit_result = self._submit_governed_tr_request(
+            rqname=rqname,
+            trcode=trcode,
+            prev_next=0,
+            screen_no=screen_no,
+            inputs=tuple(spec.get("inputs") or ()),
+            pending=pending,
+            on_dispatched=start_timeout,
+            on_failed=fail_request,
+        )
+        return {
+            "ok": bool(submit_result.get("ok")),
+            "status": "ENQUEUED",
+            "type": "stock_ranking_snapshot",
+            "source": clean_source,
+            "rqname": rqname,
+            "trcode": trcode,
+            "ranking_tr_count": 1,
+            "continuation_tr_count": 0,
+            "request": submit_result,
+        }
+
+    def _expire_stock_ranking_snapshot(self, rqname: str) -> None:
+        pending = self._pending_tr.pop(str(rqname), None)
+        if not pending or pending.get("type") != "stock_ranking_snapshot":
+            return
+        self._record_tr_governor_timeout()
+        self._release_pending_tr_screen(str(rqname), pending)
+        callback = pending.get("callback")
+        self._finish_callback(
+            callback if callable(callback) else None,
+            {
+                "ok": False,
+                "type": "stock_ranking_snapshot",
+                "source": pending.get("source", ""),
+                "rqname": str(rqname),
+                "trcode": pending.get("trcode", ""),
+                "rows": [],
+                "error": "stock ranking snapshot request timed out",
+                "error_kind": "TIMEOUT",
+            },
         )
 
     def request_minute_candles(
@@ -1441,11 +2390,21 @@ class KiwoomApi(QObject):
         callback: Opt10080Callback | None = None,
     ) -> dict[str, Any]:
         """Request opt10080 minute candles and save the response on receipt."""
-        clean_code = str(code or "").strip()
+        clean_code = normalize_stock_code(code)
         if not clean_code:
             return self._finish_callback(
                 callback,
                 {"ok": False, "error": "stock code is required"},
+            )
+        if not is_broker_action_stock_code(clean_code):
+            return self._finish_callback(
+                callback,
+                {
+                    "ok": False,
+                    "code": clean_code,
+                    "error": "broker support for this stock code is not confirmed",
+                    "reason_code": "BROKER_ALPHANUMERIC_STOCK_CODE_UNCONFIRMED",
+                },
             )
         if not self.is_available():
             return self._finish_callback(
@@ -1548,6 +2507,7 @@ class KiwoomApi(QObject):
         pending = self._pending_tr.pop(str(rqname), None)
         if not pending or pending.get("type") != "minute_candles":
             return
+        self._record_tr_governor_timeout()
         self._release_pending_tr_screen(str(rqname), pending)
         callback = pending.get("callback")
         self._finish_callback(
@@ -1748,6 +2708,7 @@ class KiwoomApi(QObject):
         self._account_funds_request_accounts.pop(str(rqname), None)
         if not pending or pending.get("type") != "account_funds":
             return
+        self._record_tr_governor_timeout()
         self._release_pending_tr_screen(str(rqname), pending)
         callback = pending.get("callback")
         self._finish_callback(
@@ -1907,6 +2868,7 @@ class KiwoomApi(QObject):
         pending = self._pending_tr.pop(str(rqname), None)
         if not pending or pending.get("type") != "recovery_snapshot":
             return
+        self._record_tr_governor_timeout()
         self._release_pending_tr_screen(str(rqname), pending)
         self._finish_recovery_snapshot(
             str(rqname),
@@ -1916,12 +2878,22 @@ class KiwoomApi(QObject):
         )
 
     def _on_event_connect(self, err_code: Any) -> None:
-        self._login_requested = False
-        self._stop_login_bootstrap_observation()
         try:
             code = int(err_code)
         except (TypeError, ValueError):
             code = -9999
+
+        if (
+            code == 0
+            and bool(getattr(self, "_connected", False))
+            and str(getattr(self, "_login_session_id", "") or "")
+        ):
+            self._login_requested = False
+            self._stop_login_bootstrap_observation()
+            return
+
+        self._login_requested = False
+        self._stop_login_bootstrap_observation()
 
         self.last_login_error = code
         if code == 0:
@@ -2002,7 +2974,7 @@ class KiwoomApi(QObject):
         self.raw_chejan_received.emit(raw_event)
 
     def _on_receive_real_data(self, *args: Any) -> None:
-        """Read the three verified 주식체결 FIDs into process-local shadow state."""
+        """Read the verified 주식체결 FIDs into process-local shadow state."""
 
         if len(args) < 2:
             return
@@ -2038,15 +3010,27 @@ class KiwoomApi(QObject):
                 execution_time_raw=values[REALTIME_EXECUTION_TIME_FID],
                 current_price_raw=values[REALTIME_CURRENT_PRICE_FID],
                 cumulative_volume_raw=values[REALTIME_CUMULATIVE_VOLUME_FID],
+                trade_volume_raw=values[REALTIME_TRADE_VOLUME_FID],
+                open_price_raw=values[REALTIME_OPEN_PRICE_FID],
+                high_price_raw=values[REALTIME_HIGH_PRICE_FID],
+                low_price_raw=values[REALTIME_LOW_PRICE_FID],
+                change_rate_raw=values[REALTIME_CHANGE_RATE_FID],
+                previous_day_volume_rate_raw=values[
+                    REALTIME_PREVIOUS_DAY_VOLUME_RATE_FID
+                ],
+                execution_strength_raw=values[REALTIME_EXECUTION_STRENGTH_FID],
                 connection_epoch=session.connection_epoch,
                 login_session_id=session.login_session_id,
+                receive_sequence=self._next_realtime_receive_sequence(),
+                received_monotonic=monotonic(),
             )
             if tick is None:
                 return
             self.realtime_shadow_tick_received.emit(tick.to_payload())
-            _status, completed = self._realtime_shadow_builder.accept_tick(tick)
-            if completed is not None:
-                self.realtime_shadow_bar_completed.emit(completed.to_payload())
+            if stock_code in self._registration_shadow_targets(registration):
+                _status, completed = self._realtime_shadow_builder.accept_tick(tick)
+                if completed is not None:
+                    self.realtime_shadow_bar_completed.emit(completed.to_payload())
         except Exception as exc:
             observe_production_exception(
                 type(exc),
@@ -2124,6 +3108,20 @@ class KiwoomApi(QObject):
         if pending.get("type") == "account_funds":
             self._on_receive_account_funds(request_name, str(trcode), pending)
             return
+        if pending.get("type") == "initial_market_snapshot":
+            self._on_receive_initial_market_snapshot(
+                request_name,
+                str(trcode),
+                pending,
+            )
+            return
+        if pending.get("type") == "stock_ranking_snapshot":
+            self._on_receive_stock_ranking_snapshot(
+                request_name,
+                str(trcode),
+                pending,
+            )
+            return
         pending = self._pending_tr.pop(request_name, None)
         if not pending or pending.get("type") != "minute_candles":
             return
@@ -2179,6 +3177,154 @@ class KiwoomApi(QObject):
                 **_empty_candle_commit_projection(),
             }
 
+        self._finish_callback(callback if callable(callback) else None, result)
+
+    def _on_receive_initial_market_snapshot(
+        self,
+        rqname: str,
+        trcode: str,
+        pending: dict[str, Any],
+    ) -> None:
+        current = self._pending_tr.pop(rqname, None)
+        if current is not pending:
+            return
+        self._release_pending_tr_screen(rqname, pending)
+        callback = pending.get("callback")
+        try:
+            raw_rows = self._read_tr_rows(trcode, rqname, OPTKWFID_MARKET_FIELDS)
+            rows = [
+                normalized.to_payload()
+                for row in raw_rows
+                if (normalized := normalize_optkwfid_market_row(row)) is not None
+            ]
+            result = {
+                "ok": True,
+                "type": "initial_market_snapshot",
+                "stock_codes": list(pending.get("stock_codes") or ()),
+                "rqname": rqname,
+                "trcode": trcode,
+                "rows": rows,
+                "rows_count": len(rows),
+                "snapshot_received_at": datetime.now().astimezone().isoformat(
+                    timespec="microseconds"
+                ),
+                "connection_epoch": pending.get("request_connection_epoch"),
+                "login_session_id": pending.get("request_login_session_id", ""),
+                "source": "SNAPSHOT",
+            }
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "type": "initial_market_snapshot",
+                "stock_codes": list(pending.get("stock_codes") or ()),
+                "rqname": rqname,
+                "trcode": trcode,
+                "rows": [],
+                "error": f"initial market snapshot parsing failed: {exc}",
+            }
+        self._finish_callback(callback if callable(callback) else None, result)
+
+    @staticmethod
+    def _ranking_number(value: object, *, absolute: bool = False) -> int | float | None:
+        text = str(value or "").replace(",", "").replace("%", "").strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return None
+        if absolute:
+            number = abs(number)
+        return int(number) if number.is_integer() else number
+
+    @classmethod
+    def _normalize_stock_ranking_row(
+        cls,
+        row: object,
+        *,
+        source: str,
+        rank: int,
+    ) -> dict[str, Any] | None:
+        if not isinstance(row, dict):
+            return None
+        stock_code = normalize_broker_stock_code(row.get("종목코드"))
+        if not is_valid_stock_code(stock_code):
+            return None
+        volume_field = "거래량" if source == "VOLUME_TOP" else "현재거래량"
+        trading_value_field = "거래금액" if source == "VOLUME_TOP" else "거래대금"
+        return {
+            "rank": int(rank),
+            "source": str(source),
+            "stock_code": stock_code,
+            "stock_name": str(row.get("종목명") or "").strip(),
+            "current_price": cls._ranking_number(row.get("현재가"), absolute=True),
+            "change_rate": cls._ranking_number(row.get("등락률")),
+            "execution_strength": cls._ranking_number(row.get("체결강도")),
+            "cumulative_volume": cls._ranking_number(row.get(volume_field)),
+            "cumulative_trading_value": cls._ranking_number(
+                row.get(trading_value_field)
+            ),
+        }
+
+    def _on_receive_stock_ranking_snapshot(
+        self,
+        rqname: str,
+        trcode: str,
+        pending: dict[str, Any],
+    ) -> None:
+        current = self._pending_tr.pop(rqname, None)
+        if current is not pending:
+            return
+        self._release_pending_tr_screen(rqname, pending)
+        callback = pending.get("callback")
+        source = str(pending.get("source") or "")
+        try:
+            raw_rows = self._read_tr_rows(
+                trcode,
+                rqname,
+                tuple(pending.get("fields") or ()),
+            )
+            rows = [
+                normalized
+                for rank, row in enumerate(
+                    raw_rows[: self.STOCK_RANKING_LIMIT],
+                    start=1,
+                )
+                if (
+                    normalized := self._normalize_stock_ranking_row(
+                        row,
+                        source=source,
+                        rank=rank,
+                    )
+                )
+                is not None
+            ]
+            result = {
+                "ok": True,
+                "type": "stock_ranking_snapshot",
+                "source": source,
+                "rqname": rqname,
+                "trcode": trcode,
+                "rows": rows,
+                "rows_count": len(rows),
+                "ranking_tr_count": 1,
+                "continuation_tr_count": 0,
+                "snapshot_received_at": datetime.now().astimezone().isoformat(
+                    timespec="microseconds"
+                ),
+                "connection_epoch": pending.get("request_connection_epoch"),
+                "login_session_id": pending.get("request_login_session_id", ""),
+            }
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "type": "stock_ranking_snapshot",
+                "source": source,
+                "rqname": rqname,
+                "trcode": trcode,
+                "rows": [],
+                "error": f"stock ranking snapshot parsing failed: {exc}",
+            }
         self._finish_callback(callback if callable(callback) else None, result)
 
     def _on_receive_account_funds(

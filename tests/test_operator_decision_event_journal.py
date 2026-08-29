@@ -225,6 +225,15 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
             patch.object(operation_environment, "ProgramFactoryResetConfirmDialog", _FactoryConfirmation),
             patch.object(operation_environment, "append_production_event") as factory_journal,
             patch.object(operation_environment.QMessageBox, "warning"),
+            patch.object(operation_environment.QMessageBox, "critical"),
+            patch(
+                "program_factory_reset.validate_factory_reset_safety",
+                return_value={"success": True, "issues": []},
+            ),
+            patch(
+                "program_factory_reset.execute_program_factory_reset",
+                return_value={"success": False, "issues": ["fixture"]},
+            ),
         ):
             _FactoryConfirmation.result = QDialog.Rejected
             _FactoryConfirmation.text = "비밀 원문"
@@ -234,8 +243,8 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
             operation_environment.OperationEnvironmentSettingsDialog._request_program_factory_reset(owner)
         event_text = repr([call.kwargs for call in factory_journal.call_args_list])
         self.assertNotIn("비밀 원문", event_text)
-        self.assertEqual(False, factory_journal.call_args_list[0].kwargs["details"]["confirmation_matched"])
-        self.assertEqual(True, factory_journal.call_args_list[1].kwargs["details"]["confirmation_matched"])
+        self.assertEqual(1, factory_journal.call_count)
+        self.assertEqual(True, factory_journal.call_args.kwargs["details"]["confirmation_matched"])
 
     def test_manual_cancel_modify_and_execution_approvals_are_correlated(self) -> None:
         host = QWidget()

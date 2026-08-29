@@ -20,7 +20,10 @@ from gui_order_utils import (
 )
 from confirmable_pnl_cycle_service import project_confirmable_cumulative_pnl
 from gui_config_utils import default_config
-from gui_main_table_loader import current_stock_trade_counts_by_code
+from gui_main_table_loader import (
+    _table_cell_elided_tooltip,
+    current_stock_trade_counts_by_code,
+)
 from gui_review_utils import (
     average_price_from_state,
     build_review_required_item,
@@ -31,7 +34,7 @@ from gui_auto_trade_runtime import (
     parse_stock_folder_name,
     assigned_stock_dirs_in_routine,
 )
-from gui_base_stock_service import read_base_stocks
+from gui_base_stock_service import normalize_stock_code, read_base_stocks
 from state_policy import (
     status_after_operation_mode_change,  # compatibility patch point; projection delegates below
     operation_text_and_color,
@@ -47,8 +50,11 @@ from gui_auto_trade_display import (
     confirmable_stock_profit_metric,
     auto_trade_setting_status_color,
     auto_trade_setting_status_sort_rank,
+    create_auto_trade_operation_item,
+    create_auto_trade_setting_activity_status_item,
     create_auto_trade_setting_status_item,
     create_auto_trade_status_item,
+    create_auto_trade_stock_name_item,
     profit_loss_value_color,
     routine_status_display_text,
     ratio_metric_text,
@@ -63,32 +69,28 @@ from gui_stock_instance_chart_window import (
     stock_instance_chart_is_open,
 )
 from gui_auto_trade_policy import (
+    auto_trade_operation_display,
     auto_trade_stock_operation_category,
-    auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_close_timestamp_later,
-    auto_trade_setting_early_close_metadata_is_stale,
     auto_trade_setting_early_close_progress_text,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_effective_liquidation_method,
     auto_trade_setting_has_close_progress_quantity,
     auto_trade_setting_is_after_regular_end,
-    auto_trade_setting_liquidation_active,
     auto_trade_setting_liquidation_completed_today,
     auto_trade_setting_liquidation_result_policy,
-    auto_trade_setting_liquidation_text,
     auto_trade_setting_mark_liquidation_result_for_display,
-    auto_trade_setting_method_text,
     auto_trade_setting_no_next_step_notice,
     auto_trade_setting_regular_end_seconds,
     auto_trade_setting_today_date_text,
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
+    auto_trade_setting_row_projection,
     clear_early_close_runtime_metadata_only,
     clear_auto_close_runtime_metadata,
     close_method_from_state_or_policy,
     compact_operation_time_range,
-    effective_liquidation_policy_for_config,
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
@@ -127,8 +129,6 @@ def refresh_auto_trade_chart_open_code_styles(window) -> None:
             item.setData(_CHART_OPEN_CODE_BASE_STYLE_ROLE, None)
     table.viewport().update()
 from gui_ats_utils import (
-    auto_trade_setting_regular_market_active_now,
-    manual_ats_active_now,
     manual_ats_enabled_labels,
     manual_ats_session_labels,
 )
@@ -155,21 +155,51 @@ def _selected_instance_stock_dirs(
     *,
     include_flat_stock_scope: bool = False,
 ) -> list[Path]:
-    if bool(getattr(window, "_all_stocks_scope_active", False)) or bool(
+    flat_scope_active_getter = getattr(
+        window,
+        "_left_flat_filter_scope_active",
+        None,
+    )
+    flat_filter_scope_active = bool(
+        flat_scope_active_getter()
+        if callable(flat_scope_active_getter)
+        else False
+    )
+    flat_scope_codes_getter = getattr(
+        window,
+        "_left_flat_filter_stock_codes",
+        None,
+    )
+    flat_scope_codes = (
+        {
+            normalize_stock_code(code)
+            for code in flat_scope_codes_getter()
+            if normalize_stock_code(code)
+        }
+        if flat_filter_scope_active and callable(flat_scope_codes_getter)
+        else set()
+    )
+    if flat_filter_scope_active:
+        if not flat_scope_codes:
+            return []
+        instance_ids_getter = None
+    elif bool(getattr(window, "_all_stocks_scope_active", False)) or bool(
         include_flat_stock_scope
     ):
         instance_ids_getter = getattr(window, "all_registered_instance_ids", None)
     else:
         instance_ids_getter = getattr(window, "current_selected_target_instance_ids", None)
-    if not callable(instance_ids_getter):
-        return []
-    target_instance_ids = {
-        str(instance_id or "").strip()
-        for instance_id in instance_ids_getter()
-        if str(instance_id or "").strip()
-    }
-    if not target_instance_ids:
-        return []
+    target_instance_ids: set[str] = set()
+    if not flat_filter_scope_active:
+        if not callable(instance_ids_getter):
+            return []
+        target_instance_ids = {
+            str(instance_id or "").strip()
+            for instance_id in instance_ids_getter()
+            if str(instance_id or "").strip()
+        }
+        if not target_instance_ids:
+            return []
 
     result: list[Path] = []
     seen: set[str] = set()
@@ -185,6 +215,9 @@ def _selected_instance_stock_dirs(
         else {}
     )
     for stock in stocks:
+        stock_code = normalize_stock_code(stock.get("code", ""))
+        if flat_filter_scope_active and stock_code not in flat_scope_codes:
+            continue
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if not stock_path:
             continue
@@ -202,9 +235,9 @@ def _selected_instance_stock_dirs(
             assigned_instance_id = str(
                 config.get("assigned_routine_instance_id", "") or ""
             ).strip()
-        if assigned_instance_id not in target_instance_ids:
+        if not flat_filter_scope_active and assigned_instance_id not in target_instance_ids:
             continue
-        stock_dir_text = str(stock_dir)
+        stock_dir_text = stock_code if flat_filter_scope_active else str(stock_dir)
         if stock_dir_text in seen:
             continue
         seen.add(stock_dir_text)
@@ -260,9 +293,10 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
 
         stock_dirs = _selected_instance_stock_dirs(
             window,
-            include_flat_stock_scope=(
-                str(getattr(window, "_routine_tree_display_level", "") or "")
-                == "stock"
+            # Flat population is an explicit ALL-scope projection.  The
+            # routine-tree display level does not change the selected scope.
+            include_flat_stock_scope=bool(
+                getattr(window, "_all_stocks_scope_active", False)
             ),
         )
         if not stock_dirs:
@@ -345,11 +379,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     state["status"] = "MONITORING"
                     state["trade_set_status"] = "WAIT_BUY"
 
-            # 정상 복귀/재시작/새 매매시작 이후 남은 조기마감 메타는
-            # persistence가 아니라 현재 표시 projection에서만 제외한다.
-            if auto_trade_setting_early_close_metadata_is_stale(state):
-                state = clear_early_close_runtime_metadata_only(dict(state))
-
             raw_status_for_cleanup = str(state.get("status", "")).strip().upper()
             close_runtime_active = auto_trade_setting_early_close_requested(state) or raw_status_for_cleanup in {
                 "AUTO_CLOSE",
@@ -400,16 +429,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 trade_started,
                 code,
             )
-            display_status = auto_trade_setting_display_status_for_current_session(
-                state,
-                config,
-                holding_qty=holding_qty,
-                buy_pending_qty=buy_pending_qty,
-                sell_pending_qty=sell_pending_qty,
-                current_session_trade_started=current_session_trade_started,
-                persisted_trade_started=trade_started,
-            )
-
             stock_status_filter = str(getattr(window, "_stock_status_filter", "all") or "all").strip().lower()
             stock_status_filter = {
                 "running": "operation",
@@ -446,7 +465,6 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                     buy_pending_qty,
                     sell_pending_qty,
                 )
-                display_status = auto_trade_setting_display_status(state.get("status", display_status))
             else:
                 liquidation_result_policy = "NONE"
 
@@ -464,64 +482,24 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                 trade_started,
                 code,
             )
-            method_text = auto_trade_setting_method_text(display_status, config, state)
-            liquidation_text = auto_trade_setting_liquidation_text(config, display_status, state)
-
-            if ats_labels:
-                regular_active_now = auto_trade_setting_regular_market_active_now()
-                ats_active_now = manual_ats_active_now(config, state)
-                after_regular_end = auto_trade_setting_is_after_regular_end()
-
-                # ATS는 정규장 외 거래가능시간 확장이다.
-                # - 정규장 안이면 기존 수동운영 판정을 유지한다.
-                # - 정규장 밖 + 선택 ATS 시간 밖이면 감시/대기.
-                # - 정규장 이후 ATS 시간 안이라도 조기마감/자동마감/일반 청산정책이 있으면 감시/대기.
-                # - 정규장 이후 ATS 시간 안이고 차단 조건이 없으면 매수/매도.
-                if not regular_active_now:
-                    if not ats_active_now:
-                        display_status = "감시/대기"
-                    elif after_regular_end:
-                        if auto_trade_setting_ats_after_regular_blocked(
-                            config,
-                            display_status,
-                            liquidation_text,
-                            state,
-                        ):
-                            display_status = "감시/대기"
-                        else:
-                            display_status = "매수/매도"
-                    else:
-                        # 장전 ATS는 수동운영 기본틀과 동일하게 거래 가능 시간이다.
-                        display_status = "매수/매도"
-
-                    method_text = auto_trade_setting_method_text(display_status, config, state)
-                    liquidation_text = auto_trade_setting_liquidation_text(config, display_status, state)
-
-            liquidation_active = auto_trade_setting_liquidation_active(config, holding_qty, display_status=display_status, state=state)
-            has_holding = holding_qty > 0
-            # 상태/방식/청산의 화면 활성 기준을 분리한다.
-            # - 현황 회색/시작 OFF: 상태/방식/청산 모두 비활성
-            # - 현황 녹색/주황/시작 ON + 감시/대기: 상태는 운용 상태로 보되, 방식은 아직 매매방식 미적용 상태이므로 비활성
-            # - 현황 녹색/주황/시작 ON + 매수/매도/자동마감/조기마감: 방식 활성
-            # - 청산은 기존 청산 규칙 + 운영중 + 보유수량 조건을 모두 만족할 때만 활성
-            status_cell_active = (
-                current_session_trade_started
-                and display_status not in ("긴급정지", "검토종목")
+            row_projection = auto_trade_setting_row_projection(
+                state,
+                config,
+                operation_category=operation_category,
+                holding_qty=holding_qty,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+                current_session_trade_started=current_session_trade_started,
+                persisted_trade_started=trade_started,
             )
-            method_cell_active = (
-                status_cell_active
-                and display_status not in ("감시/대기", "-", "")
-            )
-            liquidation_has_policy = str(liquidation_text).strip() not in ("", "-")
-            _liquidation_policy_for_style, liquidation_is_individual = (
-                effective_liquidation_policy_for_config(config, state)
-            )
-            liquidation_cell_active = (
-                current_session_trade_started
-                and has_holding
-                and liquidation_active
-                and liquidation_has_policy
-            )
+            display_status = str(row_projection["display_status"])
+            method_text = str(row_projection["method_text"])
+            liquidation_text = str(row_projection["liquidation_text"])
+            status_cell_active = bool(row_projection["status_cell_active"])
+            method_cell_active = bool(row_projection["method_cell_active"])
+            liquidation_cell_active = bool(row_projection["liquidation_cell_active"])
+            liquidation_has_policy = bool(row_projection["liquidation_has_policy"])
+            liquidation_is_individual = bool(row_projection["liquidation_is_individual"])
             current_price = current_price_from_state(state)
             holding_text, price_text, profit_text, pending_text, profit_amount, _profit_rate = (
                 stock_position_display_values(
@@ -575,14 +553,17 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             for col, value in enumerate(values):
                 if col == 1:
                     item = SortableTableWidgetItem(value)
-                    if trade_started:
-                        item.setToolTip("현재 운영 중입니다.")
-                    else:
-                        item.setToolTip("더블클릭하면 이 종목의 운영을 시작합니다.")
+                    item.setToolTip(
+                        _table_cell_elided_tooltip(
+                            window.stock_table,
+                            col,
+                            value,
+                        )
+                    )
                 elif col == 3:
                     item = create_auto_trade_situation_item(
                         state,
-                        current_session_trade_started,
+                        bool(row_projection["situation_active"]),
                         display_status,
                     )
                 elif col == 4:
@@ -637,6 +618,15 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
                         item,
                         review_required=review_required,
                         operation_excluded=operation_excluded,
+                    )
+                if review_required and col in {4, 5}:
+                    apply_auto_trade_setting_activity_style(item, False)
+                elif review_required and col == 6:
+                    apply_auto_trade_setting_liquidation_style(
+                        item,
+                        False,
+                        liquidation_has_policy,
+                        liquidation_is_individual,
                     )
 
                 if col in (0, 2, 3, 5, 6, 7, 8, 9, 10):

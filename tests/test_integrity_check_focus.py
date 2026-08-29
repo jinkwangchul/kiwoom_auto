@@ -573,6 +573,26 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         self.addCleanup(window.deleteLater)
         return window
 
+    def test_integrity_toast_fallback_uses_window_center(self) -> None:
+        window = self._window()
+        message = "로컬 무결성 검사 완료"
+
+        with (
+            mock.patch(
+                "gui_stock_register_window.persistent_feature_owner",
+                return_value=window,
+            ),
+            mock.patch("gui_stock_register_window.show_toast") as toast,
+        ):
+            window._show_integrity_toast(message)
+
+        toast.assert_called_once_with(
+            window,
+            message,
+            duration_ms=2500,
+            position="center",
+        )
+
     def _result(
         self,
         status: str,

@@ -18,6 +18,11 @@ import json
 from pathlib import Path
 
 from gui_routine_service import ensure_single_real_trade_routine_for_stock
+from gui_stock_data import load_stock_library as load_verified_runtime_stock_library
+from stock_code_contract import (
+    is_valid_stock_code as canonical_is_valid_stock_code,
+    normalize_stock_code as canonical_normalize_stock_code,
+)
 
 try:
     from stock_repository import repository as stock_repository_factory
@@ -36,59 +41,25 @@ def normalize_stock_code(code: str) -> str:
 
     주의:
     - 930 -> 000930 같은 zfill 보정은 금지한다.
-    - 사용자가 입력한 값이 그대로 6자리 숫자여야 한다.
+    - 사용자가 입력한 값이 canonical 6자리 영숫자여야 한다.
     """
-    return code.strip()
+    return canonical_normalize_stock_code(code)
 
 
 def is_valid_stock_code(code: str) -> bool:
     """
     종목코드 기본 형식 검증.
     """
-    return code.isdigit() and len(code) == 6 and code != "000000"
+    return canonical_is_valid_stock_code(code)
 
 
 def load_stock_library() -> list[dict[str, str]]:
     """
     stock_library.json 을 읽어 검색 등록용 종목 목록으로 변환한다.
 
-    현재 단계에서는 키움 OpenAPI 검색식 연동 전이므로
-    로컬 종목 라이브러리를 기준으로 종목명/종목코드/초성/부분코드 검색을 수행한다.
+    로그인 세션에서 검증 완료된 runtime Master Library만 사용한다.
     """
-    if not STOCK_LIBRARY_PATH.exists():
-        return []
-
-    try:
-        data = json.loads(STOCK_LIBRARY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-    if not isinstance(data, list):
-        return []
-
-    stocks: list[dict[str, str]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-
-        code = str(item.get("code", "")).strip()
-        name = str(item.get("name", "")).strip()
-        market = str(item.get("market", "")).strip()
-        chosung = str(item.get("chosung", "")).strip()
-
-        if not code or not name:
-            continue
-
-        stocks.append(
-            {
-                "code": code,
-                "name": name,
-                "market": market,
-                "chosung": chosung,
-            }
-        )
-
-    return stocks
+    return load_verified_runtime_stock_library()
 
 
 def find_library_stock_by_code(code: str) -> dict[str, str] | None:

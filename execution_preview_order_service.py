@@ -32,6 +32,8 @@ def preview_execution_for_real_ready_order(
     order_id: Any,
     guard: Any,
     queue_path: str | Path | None = None,
+    *,
+    order_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read a REAL_READY order by id and run execution preview for it."""
     read_result = read_real_ready_order_by_id(order_id, queue_path=queue_path)
@@ -48,7 +50,23 @@ def preview_execution_for_real_ready_order(
             "issues": blocked_reasons,
         }
 
-    preview_result = preview_execution_for_order(read_result.get("order"), guard)
+    preview_order = order_override if isinstance(order_override, dict) else read_result.get("order")
+    if isinstance(order_override, dict):
+        persisted_order = read_result.get("order")
+        persisted_id = str(persisted_order.get("id") or "") if isinstance(persisted_order, dict) else ""
+        if str(order_override.get("id") or "") != persisted_id:
+            blocked_reasons = ["order_override identity does not match REAL_READY order"]
+            return {
+                "ok": False,
+                "stage": STAGE,
+                "read_result": read_result,
+                "preview_result": None,
+                "blocked_stage": "order_override_identity",
+                "blocked_reason": blocked_reasons[0],
+                "blocked_reasons": blocked_reasons,
+                "issues": blocked_reasons,
+            }
+    preview_result = preview_execution_for_order(preview_order, guard)
     summary = preview_result.get("summary") if isinstance(preview_result.get("summary"), dict) else {}
     blocked_reasons = _as_reason_list(
         summary.get("blocked_reasons")

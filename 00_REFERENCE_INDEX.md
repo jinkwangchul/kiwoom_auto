@@ -1,8 +1,8 @@
 # 00 Reference Index
 
-최종 갱신: 2026-07-09
-갱신 기준 커밋: 6886a01
-Milestone: M5 Runtime Commit Boundary Complete
+최종 갱신: 2026-08-26
+갱신 기준 커밋: Local Working Tree
+Milestone: Stock Registration Original Contract Restoration
 
 이 문서는 프로젝트 문서 참조용 인덱스다. MASTER_SPEC 원본은 직접 수정하지 않으며,
 갱신은 `MASTER_SPEC_갱신자료_*.md` 후보 문서로 관리한다.
@@ -28,6 +28,7 @@ Milestone: M5 Runtime Commit Boundary Complete
 | 파일 | 주제 | 작성일 |
 |------|------|--------|
 | REFERENCE_EDITION_runtime_commit_boundary.md | Execution Preview Pipeline + Runtime Commit Boundary 통합본 | 2026-07-09 |
+| REFERENCE_EDITION_stock_registration_contract.md | 종목등록 운영중 허용 + 환경설정 등록위치 계약 | 2026-08-26 |
 
 ## 변경 이력 (Changelog)
 
@@ -36,6 +37,7 @@ Milestone: M5 Runtime Commit Boundary Complete
 ## 현재 Milestone
 
 - M5 Runtime Commit Boundary Complete
+- Stock Registration Original Contract Restoration
 - 검증: Runtime Commit Boundary 단일 테스트 14 tests OK / 전체 unittest 2858 tests OK / 보호 파일 변경 없음
 
 ## 금지선 요약

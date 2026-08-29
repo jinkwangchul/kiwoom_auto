@@ -465,6 +465,31 @@ class EventJournalFoundationTests(unittest.TestCase):
         self.assertTrue(result["write_failed"])
         self.assertFalse(result["appended"])
 
+    def test_35_routine_unassign_blocked_contract_is_setting_event(self) -> None:
+        self.assertEqual("SETTING", EVENT_TYPE_CATEGORIES["ROUTINE_UNASSIGN_BLOCKED"])
+        self.assertEqual("루틴 등록해제 차단", EVENT_TYPE_LABELS["ROUTINE_UNASSIGN_BLOCKED"])
+        rendered = render_summary(
+            "ROUTINE_UNASSIGN_BLOCKED",
+            {"stock_name": "삼성전자"},
+        )
+        self.assertTrue(rendered["rendered"])
+        self.assertEqual(
+            "삼성전자의 루틴 등록해제가 차단되었습니다.",
+            rendered["summary"],
+        )
+        result = self._append(
+            event_type="ROUTINE_UNASSIGN_BLOCKED",
+            severity="NOTICE",
+            result="BLOCKED",
+            template_args={"stock_name": "삼성전자"},
+            stock_code="005930",
+            stock_name="삼성전자",
+            reason_code="HOLDING_QTY",
+            details={"holding_qty": 3},
+        )
+        self.assertTrue(result["appended"])
+        self.assertEqual("SETTING", result["event"]["category"])
+
 
 if __name__ == "__main__":
     unittest.main()

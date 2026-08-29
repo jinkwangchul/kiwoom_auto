@@ -33,6 +33,9 @@ class _Api:
     def __init__(self) -> None:
         self.bar_committed = _Signal()
         self.realtime_shadow_bar_completed = _Signal()
+        self.realtime_shadow_tick_received = _Signal()
+        self.sync_realtime_monitoring_registration = Mock()
+        self.sync_realtime_shadow_targets = Mock()
         self.sync_realtime_shadow_registration = Mock()
         self.clear_realtime_shadow_registration = Mock(
             return_value={"ok": True, "changed": False, "active": False}
@@ -42,6 +45,7 @@ class _Api:
             connection_epoch=7,
             login_session_id="SESSION-7",
             target_stock_codes=("005930",),
+            shadow_target_stock_codes=("005930",),
             fid_list=tuple(REALTIME_SHADOW_FIDS),
             screen_batches=(),
             last_error="",
@@ -52,6 +56,9 @@ class _Api:
             "active": True,
             "snapshot": self.snapshot,
         }
+        self.sync_realtime_shadow_targets.return_value = dict(
+            self.sync_realtime_shadow_registration.return_value
+        )
 
     def realtime_shadow_registration_snapshot(self):
         return self.snapshot
@@ -111,15 +118,46 @@ class RealtimeShadowOperationHostTests(unittest.TestCase):
         self.host._bind_realtime_shadow_signals_once()
         self.host._bind_realtime_shadow_signals_once()
         self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_bar_completed.connect_count)
+        self.assertEqual(1, self.owner.kiwoom_api.realtime_shadow_tick_received.connect_count)
         self.assertEqual(1, self.owner.kiwoom_api.bar_committed.connect_count)
 
     def test_target_sync_uses_execution_ready_codes_only(self) -> None:
         snapshot = SimpleNamespace(execution_stock_codes=("005930", "006400"))
         result = self.host.sync_realtime_shadow_targets(snapshot)
-        self.owner.kiwoom_api.sync_realtime_shadow_registration.assert_called_once_with(
+        self.owner.kiwoom_api.sync_realtime_shadow_targets.assert_called_once_with(
             ("005930", "006400")
         )
         self.assertTrue(result["active"])
+
+    def test_price_signal_gate_and_market_snapshots_are_thin_forwarders(self) -> None:
+        self.assertFalse(self.host.price_signal_observation_enabled())
+        self.assertTrue(self.host.set_price_signal_observation_enabled(True))
+        state = object()
+        fresh_state = object()
+        snapshot = object()
+        with patch.object(
+            self.market,
+            "high_resolution_market_state",
+            return_value=state,
+        ) as state_getter, patch.object(
+            self.market,
+            "fresh_monitoring_market_information_state",
+            return_value=fresh_state,
+        ) as fresh_state_getter, patch.object(
+            self.market,
+            "high_resolution_market_data_snapshot",
+            return_value=snapshot,
+        ) as snapshot_getter:
+            self.assertIs(state, self.host.high_resolution_market_state("005930"))
+            self.assertIs(
+                fresh_state,
+                self.host.fresh_monitoring_market_information_state("005930"),
+            )
+            self.assertIs(snapshot, self.host.high_resolution_market_data_snapshot())
+
+        state_getter.assert_called_once_with("005930")
+        fresh_state_getter.assert_called_once_with("005930")
+        snapshot_getter.assert_called_once_with()
 
     def test_shadow_first_pends_then_later_canonical_commit_compares(self) -> None:
         scheduled = []

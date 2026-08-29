@@ -120,3 +120,31 @@ def build_main_group_projection(
             ProjectedMainGroup(group=group, instances=tuple(projected_instances))
         )
     return tuple(projected)
+
+
+def projected_main_group_stock_targets(
+    projection: Iterable[ProjectedMainGroup],
+    *,
+    project_root: Path | None = None,
+) -> tuple[tuple[Path, str, str], ...]:
+    """Return the explicit monitoring stock targets from a main-group projection."""
+
+    targets: list[tuple[Path, str, str]] = []
+    seen: set[str] = set()
+    for projected_group in projection:
+        for projected_instance in projected_group.instances:
+            for stock in projected_instance.stocks:
+                stock_path = str(stock.get("stock_path", "") or "").strip()
+                code = str(stock.get("code", "") or "").strip()
+                name = str(stock.get("name", "") or "").strip()
+                if not stock_path or not code or not name:
+                    continue
+                key = stock_path
+                if key in seen:
+                    continue
+                seen.add(key)
+                resolved_path = Path(stock_path)
+                if not resolved_path.is_absolute() and project_root is not None:
+                    resolved_path = Path(project_root) / resolved_path
+                targets.append((resolved_path, code, name))
+    return tuple(targets)

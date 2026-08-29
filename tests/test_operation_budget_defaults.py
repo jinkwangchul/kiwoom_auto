@@ -1280,6 +1280,95 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             host._routine_stock_initial_buy_editor.deleteLater()
             table.close()
 
+    def test_initial_budget_editor_uses_main_row_projection_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "AMOUNT",
+                        "buy_amount": 20_000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            table = QTableWidget(1, 1)
+            item = QTableWidgetItem()
+            item.setData(
+                gui_windows.ROUTINE_STOCK_PATH_ROLE,
+                "stocks/005930_test",
+            )
+            item.setData(
+                gui_windows.ROUTINE_STOCK_INITIAL_BUY_ROLE,
+                {"mode": "AMOUNT", "value": 60_000, "value_text": "60,000원"},
+            )
+            table.setItem(0, 0, item)
+            table._editing_stock_initial_buy_path = ""
+            host = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            host._main_routine_display_level = "stock"
+            host.routine_table = table
+            host._stock_config_path_for_routine_row = MagicMock(
+                return_value=config_path
+            )
+            host.finish_routine_stock_initial_buy_edit = MagicMock()
+            host.finish_routine_stock_buy_limit_edit = MagicMock()
+            host._routine_stock_initial_buy_value_rect = MagicMock(
+                return_value=QRect(10, 5, 120, 24)
+            )
+            host._routine_buy_limit_edit_filter = QObject()
+
+            host.start_routine_stock_initial_buy_edit(0)
+
+            self.assertIsNotNone(host._routine_stock_initial_buy_editor)
+            self.assertEqual("60000", host._routine_stock_initial_buy_editor.text())
+            host._routine_stock_initial_buy_editor.deleteLater()
+            table.close()
+
+    def test_initial_quantity_editor_uses_main_row_projection_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "trade_amount_type": "QUANTITY",
+                        "buy_qty": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            table = QTableWidget(1, 1)
+            item = QTableWidgetItem()
+            item.setData(
+                gui_windows.ROUTINE_STOCK_PATH_ROLE,
+                "stocks/005930_test",
+            )
+            item.setData(
+                gui_windows.ROUTINE_STOCK_INITIAL_BUY_ROLE,
+                {"mode": "QUANTITY", "value": 10, "value_text": "10주"},
+            )
+            table.setItem(0, 0, item)
+            table._editing_stock_initial_buy_path = ""
+            host = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
+            host._main_routine_display_level = "stock"
+            host.routine_table = table
+            host._stock_config_path_for_routine_row = MagicMock(
+                return_value=config_path
+            )
+            host.finish_routine_stock_initial_buy_edit = MagicMock()
+            host.finish_routine_stock_buy_limit_edit = MagicMock()
+            host._routine_stock_initial_buy_value_rect = MagicMock(
+                return_value=QRect(10, 5, 120, 24)
+            )
+            host._routine_buy_limit_edit_filter = QObject()
+
+            host.start_routine_stock_initial_buy_edit(0)
+
+            self.assertIsNotNone(host._routine_stock_initial_buy_editor)
+            self.assertEqual("10", host._routine_stock_initial_buy_editor.text())
+            self.assertEqual("QUANTITY", host._routine_stock_initial_buy_editor_mode)
+            host._routine_stock_initial_buy_editor.deleteLater()
+            table.close()
+
     def _initial_budget_finish_host(
         self,
         config_path: Path,
@@ -1350,7 +1439,13 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 default_amount=40_000,
             )
             host._write_stock_initial_buy_config = MagicMock(
-                side_effect=gui_windows.MainWindow._write_stock_initial_buy_config
+                side_effect=lambda *args, **kwargs: (
+                    gui_windows.MainWindow._write_stock_initial_buy_config(
+                        host,
+                        *args,
+                        **kwargs,
+                    )
+                )
             )
             with patch.object(gui_windows, "show_toast"):
                 gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(

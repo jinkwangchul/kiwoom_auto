@@ -143,13 +143,16 @@ class SameDayRestartGuardTest(unittest.TestCase):
             order_queue_path=self.queue_path,
         )
 
-    def test_scheduled_restart_uses_start_and_end_buy_boundary(self) -> None:
-        self.assertTrue(self.guard(now=datetime(2026, 8, 10, 13, 29, 59))["allowed"])
-        blocked = self.guard(now=datetime(2026, 8, 10, 13, 30, 0))
-        self.assertFalse(blocked["allowed"])
-        self.assertEqual("OUTSIDE_OPERATION_TIME", blocked["reason"])
+    def test_scheduled_restart_admission_is_independent_of_trade_window(self) -> None:
+        for now in (
+            datetime(2026, 8, 10, 8, 59, 59),
+            datetime(2026, 8, 10, 13, 29, 59),
+            datetime(2026, 8, 10, 13, 30, 0),
+        ):
+            with self.subTest(now=now.time()):
+                self.assertEqual("ALLOWED", self.guard(now=now)["reason"])
 
-    def test_manual_restart_uses_regular_session_not_1330_or_ats(self) -> None:
+    def test_manual_restart_admission_is_independent_of_regular_or_ats_window(self) -> None:
         config = dict(self.config)
         config.update(
             {
@@ -158,26 +161,25 @@ class SameDayRestartGuardTest(unittest.TestCase):
                 "ats_sessions": ["NXT"],
             }
         )
-        self.assertTrue(
-            self.guard(now=datetime(2026, 8, 10, 14, 0, 0), config=config)[
-                "allowed"
-            ]
-        )
-        blocked = self.guard(
-            now=datetime(2026, 8, 10, 15, 20, 0), config=config
-        )
-        self.assertFalse(blocked["allowed"])
-        self.assertEqual("OUTSIDE_OPERATION_TIME", blocked["reason"])
+        for now in (
+            datetime(2026, 8, 10, 8, 59, 59),
+            datetime(2026, 8, 10, 14, 0, 0),
+            datetime(2026, 8, 10, 15, 20, 0),
+        ):
+            with self.subTest(now=now.time()):
+                self.assertEqual(
+                    "ALLOWED",
+                    self.guard(now=now, config=config)["reason"],
+                )
 
-    def test_today_normal_ended_blocks_but_previous_day_does_not(self) -> None:
-        blocked = self.guard(
+    def test_today_normal_ended_does_not_block_per_stock_restart(self) -> None:
+        allowed = self.guard(
             operation_state={
                 "operation_date": "2026-08-10",
                 "operation_status": "NORMAL_ENDED",
             }
         )
-        self.assertFalse(blocked["allowed"])
-        self.assertEqual("NORMAL_ENDED", blocked["reason"])
+        self.assertTrue(allowed["allowed"])
 
         allowed = self.guard(
             operation_state={
@@ -186,6 +188,41 @@ class SameDayRestartGuardTest(unittest.TestCase):
             }
         )
         self.assertTrue(allowed["allowed"])
+
+    def test_manual_ats_restart_does_not_consult_order_time_status(self) -> None:
+        config = dict(self.config, operation_mode="CONTINUOUS")
+        state = dict(
+            self.state,
+            manual_ats_selection={"selected_sessions": ["extra1"]},
+        )
+        with patch.object(
+            run_control,
+            "canonical_stock_trading_time_status",
+            return_value={
+                "evaluable": True,
+                "active": True,
+                "mode": "CONTINUOUS",
+                "reason": "ACTIVE_ATS",
+            },
+        ) as time_status:
+            result = self.guard(config=config, state=state)
+
+        self.assertTrue(result["allowed"])
+        time_status.assert_not_called()
+
+        with patch.object(
+            run_control,
+            "canonical_stock_trading_time_status",
+            return_value={
+                "evaluable": True,
+                "active": False,
+                "mode": "CONTINUOUS",
+                "reason": "OUTSIDE_OPERATION_TIME",
+            },
+        ):
+            result = self.guard(config=config, state=state)
+        self.assertTrue(result["allowed"])
+        self.assertEqual("ALLOWED", result["reason"])
 
     def test_holding_and_side_pending_orders_block(self) -> None:
         holding = dict(self.state, holding_qty=1)
@@ -294,7 +331,7 @@ class SameDayRestartGuardTest(unittest.TestCase):
         self.assertEqual(1, window.state_write_count)
         global_write.assert_called_once()
 
-    def test_normal_ended_blocks_every_common_entry_source_without_state_write(self) -> None:
+    def test_normal_ended_blocks_global_button_but_allows_context_restart(self) -> None:
         (self.stock_dir / "config.json").write_text(
             json.dumps(self.config, ensure_ascii=False), encoding="utf-8"
         )
@@ -307,27 +344,46 @@ class SameDayRestartGuardTest(unittest.TestCase):
             "operation_status": "NORMAL_ENDED",
         }
 
-        for source in (
-            "auto_trade_global_start_button",
-            "auto_trade_context_menu",
-            "main_monitoring_window",
+        window = _StartWindow(target)
+        with (
+            patch.object(run_control, "current_datetime", return_value=self.NOW),
+            patch.object(run_control, "read_operation_state", return_value=ended),
+            patch.object(run_control, "write_global_operation_running_state") as write,
         ):
+            result = run_control.auto_trade_start_selected_auto_trades(
+                window,
+                request_scope=run_control.START_REQUEST_SINGLE,
+                source="auto_trade_global_start_button",
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual("NORMAL_ENDED", result["reason"])
+        self.assertEqual([], window.recalculate_calls)
+        write.assert_not_called()
+
+        for source in ("auto_trade_context_menu", "main_monitoring_window"):
             with self.subTest(source=source):
-                window = _StartWindow(target)
+                restart_window = _PersistingStartWindow(target)
+                (self.stock_dir / "state.json").write_text(
+                    json.dumps(self.state, ensure_ascii=False),
+                    encoding="utf-8",
+                )
                 with (
                     patch.object(run_control, "current_datetime", return_value=self.NOW),
+                    patch.object(run_control, "ORDER_QUEUE_PATH", self.queue_path),
                     patch.object(run_control, "read_operation_state", return_value=ended),
                     patch.object(run_control, "write_global_operation_running_state") as write,
+                    patch.object(run_control, "append_changelog"),
+                    patch.object(run_control, "append_production_event"),
+                    patch.object(status_ops, "append_stock_log"),
                 ):
                     result = run_control.auto_trade_start_selected_auto_trades(
-                        window,
+                        restart_window,
                         request_scope=run_control.START_REQUEST_SINGLE,
                         source=source,
                     )
-                self.assertFalse(result["ok"])
-                self.assertEqual("NORMAL_ENDED", result["reason"])
-                self.assertEqual([], window.recalculate_calls)
-                write.assert_not_called()
+                self.assertTrue(result["ok"])
+                self.assertEqual(1, len(restart_window.recalculate_calls))
+                write.assert_called_once()
 
     def test_multiple_targets_keep_partial_success_and_do_not_mutate_blocked_stock(self) -> None:
         first_target = (self.stock_dir, "005930", "삼성전자")

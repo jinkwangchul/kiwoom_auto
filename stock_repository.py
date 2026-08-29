@@ -35,6 +35,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from stock_code_contract import (
+    is_broker_action_stock_code,
+    is_valid_stock_code as canonical_is_valid_stock_code,
+    normalize_stock_code as canonical_normalize_stock_code,
+)
+from routine_instance_registry import load_persisted_routine_instances
+
 from event_journal_production import append_production_event
 
 
@@ -71,6 +78,15 @@ def _append_routine_changed(
     ]
     if not changes:
         return
+    before_instance_id = before.get("routine_instance_id", "")
+    after_instance_id = after.get("routine_instance_id", "")
+    operation = (
+        "UNASSIGN"
+        if before_instance_id and not after_instance_id
+        else "ASSIGN"
+        if not before_instance_id and after_instance_id
+        else "CHANGE"
+    )
     append_production_event(
         "ROUTINE_CHANGED",
         result="SUCCESS",
@@ -83,6 +99,15 @@ def _append_routine_changed(
         stock_name=str(name or "").strip(),
         routine=after.get("routine", ""),
         changes=changes,
+        operation=operation,
+        details={
+            "operation": operation,
+            "reason": "OPERATOR_REQUEST" if operation == "UNASSIGN" else "ASSIGNMENT_UPDATE",
+            "before_instance_id": before_instance_id or None,
+            "after_instance_id": after_instance_id or None,
+            "before_routine": before.get("routine", "") or None,
+            "after_routine": after.get("routine", "") or None,
+        },
     )
 
 
@@ -91,12 +116,11 @@ def now_text() -> str:
 
 
 def normalize_stock_code(code: str) -> str:
-    return str(code or "").strip()
+    return canonical_normalize_stock_code(code)
 
 
 def is_valid_stock_code(code: str) -> bool:
-    code = normalize_stock_code(code)
-    return code.isdigit() and len(code) == 6 and code != "000000"
+    return canonical_is_valid_stock_code(code)
 
 
 def safe_stock_folder_name(code: str, name: str) -> str:
@@ -159,6 +183,13 @@ class StockRecord:
             "routine_definition_id": self.routine_definition_id,
             "routine_type": self.routine_type,
         }
+
+
+@dataclass(frozen=True)
+class RealtimeMonitoringUniverseProjection:
+    target_stock_codes: tuple[str, ...]
+    unsupported_stock_codes: tuple[str, ...]
+    source_record_count: int
 
 
 class StockRepository:
@@ -387,6 +418,41 @@ class StockRepository:
     def list_stocks(self) -> list[StockRecord]:
         return self.list_from_central_stocks()
 
+    def list_current_registered_stocks(self) -> list[StockRecord]:
+        """Return Stocks whose current assignment names a persisted Instance."""
+
+        valid_instance_ids = {
+            str(instance.instance_id or "").strip()
+            for instance in load_persisted_routine_instances(project_root=self.project_root)
+            if str(instance.instance_id or "").strip()
+        }
+        return [
+            record
+            for record in self.list_stocks()
+            if str(record.assigned_routine_instance_id or "").strip()
+            in valid_instance_ids
+        ]
+
+    def realtime_monitoring_universe(self) -> RealtimeMonitoringUniverseProjection:
+        """Project current registered Stocks into a Broker-safe read-only target set."""
+
+        records = self.list_current_registered_stocks()
+        valid_codes = {
+            normalize_stock_code(record.code)
+            for record in records
+            if is_valid_stock_code(record.code)
+        }
+        unsupported = tuple(
+            sorted(code for code in valid_codes if not is_broker_action_stock_code(code))
+        )
+        return RealtimeMonitoringUniverseProjection(
+            target_stock_codes=tuple(
+                sorted(code for code in valid_codes if code not in unsupported)
+            ),
+            unsupported_stock_codes=unsupported,
+            source_record_count=len(records),
+        )
+
     def read_base_stocks_compatible(self) -> list[dict[str, Any]]:
         return [record.to_base_stock_dict() for record in self.list_stocks()]
 
@@ -521,6 +587,11 @@ class StockRepository:
             return False
         config_path = path / "config.json"
         config = read_json_dict(config_path)
+        current_instance_id = str(
+            config.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        if current_instance_id == clean_instance_id:
+            return True
         before_config = deepcopy(config)
         before_assignment = _routine_assignment(config)
         changed_at = now_text()
@@ -590,7 +661,10 @@ class StockRepository:
         - 기존 루틴폴더를 건드리지 않는다.
         - state/config/orders 기본 파일만 없을 때 생성한다.
         """
-        path = self.resolve_stock_dir(code, name)
+        clean_code = normalize_stock_code(code)
+        if not is_valid_stock_code(clean_code):
+            raise ValueError("stock code is invalid")
+        path = self.resolve_stock_dir(clean_code, name)
         path.mkdir(parents=True, exist_ok=True)
         (path / "logs").mkdir(exist_ok=True)
 

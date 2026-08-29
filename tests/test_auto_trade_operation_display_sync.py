@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QTableWidget
 
 import gui_auto_trade_ats_ops
+import gui_auto_trade_policy
 import gui_auto_trade_setting_window
 import gui_auto_trade_status_ops
 import gui_auto_trade_table_loader
@@ -224,8 +225,8 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
     def test_both_loaders_use_same_status_projection_helper(self) -> None:
         self.assertIs(
-            gui_auto_trade_table_loader.auto_trade_setting_display_status_for_current_session,
-            gui_main_table_loader.auto_trade_setting_display_status_for_current_session,
+            gui_auto_trade_table_loader.auto_trade_setting_row_projection,
+            gui_main_table_loader.auto_trade_setting_row_projection,
         )
 
     def test_settings_loader_delegates_status_projection_once(self) -> None:
@@ -235,8 +236,128 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
         self.assertEqual(
             1,
-            source.count("auto_trade_setting_display_status_for_current_session("),
+            source.count("auto_trade_setting_row_projection("),
         )
+
+    def test_settings_manual_ats_row_preserves_canonical_monitoring_status(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        _ = app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "012210_삼미금속"
+            stock_dir.mkdir()
+            (stock_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "operation_mode": "CONTINUOUS",
+                        "assigned_routine_instance_id": "instance-a",
+                        "real_trade_enabled": False,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "MONITORING",
+                        "trade_enabled": True,
+                        "trade_started_at": "2026-08-26 19:40:06",
+                        "manual_ats_selection": {"selected_sessions": ["extra2"]},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            main_owner = SimpleNamespace(
+                _current_session_operation_participant_stock_codes={"012210"},
+                startup_recovery_session_ready=lambda refresh=False: True,
+            )
+            window = SimpleNamespace(
+                stock_table=QTableWidget(),
+                _all_stocks_scope_active=True,
+                _stock_status_filter="all",
+                _stock_visual_order=[],
+                startup_recovery_session_ready=lambda refresh=False: True,
+                current_selected_routine_dir=lambda: None,
+                current_selected_routine_name=lambda: "",
+                capture_stock_table_view_state=lambda: (set(), 0),
+                restore_stock_table_view_state=lambda *_args: None,
+                update_selected_routine_status_bar=lambda: None,
+                all_registered_instance_ids=lambda: ["instance-a"],
+                update_action_buttons=lambda: None,
+            )
+            window.stock_table.setColumnCount(11)
+            stock = {
+                "code": "012210",
+                "name": "삼미금속",
+                "stock_path": str(stock_dir),
+                "assigned_routine_instance_id": "instance-a",
+            }
+
+            with (
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "read_base_stocks",
+                    return_value=[stock],
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "pending_order_side_quantities",
+                    return_value=(0, 0),
+                ),
+                patch.object(
+                    gui_auto_trade_table_loader,
+                    "manual_ats_enabled_labels",
+                    return_value=["장마감NTX"],
+                ),
+                patch.object(
+                    gui_auto_trade_policy,
+                    "persistent_feature_owner",
+                    side_effect=lambda value: main_owner if value is window else None,
+                ),
+                patch.object(
+                    gui_auto_trade_policy,
+                    "auto_trade_operation_session_phase",
+                    return_value={
+                        "evaluable": True,
+                        "phase": "BEFORE_FIRST_SESSION",
+                        "mode": "CONTINUOUS",
+                        "active": False,
+                        "active_sessions": (),
+                        "future_session_exists": True,
+                        "final_session_ended": False,
+                    },
+                ),
+                patch.object(
+                    gui_auto_trade_policy,
+                    "auto_trade_operation_activation_phase",
+                    return_value={
+                        "projection_phase": "PRE_OPERATION_BOUNDARY",
+                        "operation_boundary_reached": False,
+                        "actual_trading_session_active": False,
+                        "ats_session_active": False,
+                    },
+                ),
+            ):
+                gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(
+                    window
+                )
+
+            self.assertEqual("수동+ATS", window.stock_table.item(0, 2).text())
+            self.assertEqual(
+                "#16a34a",
+                _qcolor_name(window.stock_table.item(0, 3).foreground().color()),
+            )
+            self.assertEqual("감시/대기", window.stock_table.item(0, 4).text())
+            self.assertEqual(
+                "#2563eb",
+                _qcolor_name(window.stock_table.item(0, 4).foreground().color()),
+            )
+            self.assertEqual(
+                "#afb2b9",
+                _qcolor_name(window.stock_table.item(0, 5).foreground().color()),
+            )
 
     def test_monitoring_projection_and_emergency_ops_do_not_import_settings_window(self) -> None:
         self.assertNotIn(
@@ -413,9 +534,10 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             self.assertIsNotNone(status_item)
             self.assertEqual("#dc2626", _qcolor_name(situation_item.foreground().color()))
             self.assertEqual("#ff8c00", _qcolor_name(name_item.foreground().color()))
-            self.assertEqual("#ff8c00", _qcolor_name(status_item.foreground().color()))
+            self.assertEqual("감시/대기", status_item.text())
+            self.assertEqual("#afb2b9", _qcolor_name(status_item.foreground().color()))
 
-    def test_setting_status_sort_rank_separates_emergency_and_review(self) -> None:
+    def test_setting_inactive_buckets_share_monitoring_status_sort_rank(self) -> None:
         from gui_auto_trade_display import SORT_ROLE
 
         app = QApplication.instance() or QApplication([])
@@ -487,10 +609,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 status_item = window.stock_table.item(row, 4)
                 rank_by_status[status_item.text()] = status_item.data(SORT_ROLE)
 
-            self.assertEqual(0, rank_by_status["감시/대기"])
-            self.assertEqual(4, rank_by_status["긴급정지"])
-            self.assertEqual(5, rank_by_status["검토종목"])
-            self.assertNotEqual(rank_by_status["긴급정지"], rank_by_status["검토종목"])
+            self.assertEqual({"감시/대기": 0}, rank_by_status)
 
     def test_setting_trade_column_reuses_main_buy_sell_trade_counts(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -803,7 +922,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
             self.assertEqual(["000002", "000001"], codes(situation_asc))
             self.assertEqual(["000001", "000002"], codes(situation_desc))
             self.assertEqual(["000001", "000002"], codes(status_asc))
-            self.assertEqual(["000002", "000001"], codes(status_desc))
+            self.assertEqual(["000001", "000002"], codes(status_desc))
 
     def test_manual_and_scheduled_display_contract(self) -> None:
         continuous = {"operation_mode": "CONTINUOUS"}
@@ -1209,7 +1328,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
             self.assertEqual(before_text, state_path.read_text(encoding="utf-8"))
             self.assertEqual(original_state, read_json_dict(state_path))
-            self.assertEqual("매수/매도", window.stock_table.item(0, 4).text())
+            self.assertEqual("감시/대기", window.stock_table.item(0, 4).text())
 
     def test_stale_and_no_target_display_projection_is_runtime_read_only(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -1227,7 +1346,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     "operation_notice": "EARLY_CLOSE_WAITING",
                     "trade_started_at": "2026-08-10 11:00:00",
                 },
-                "매수/매도",
+                "감시/대기",
             ),
             (
                 "no-target",

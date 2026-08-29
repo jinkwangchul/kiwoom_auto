@@ -179,6 +179,42 @@ class AutomaticCandleRefreshTests(unittest.TestCase):
             self.assertEqual(result["skipped_by_limit"], 5)
             self.assertEqual(result["request_spacing_ms"], 1000)
 
+    def test_refresh_targets_prefers_registered_operation_targets_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            assigned = self._stock_dir(Path(temp), 1)
+            unassigned = self._stock_dir(Path(temp), 2)
+            calls: list[dict[str, object]] = []
+
+            class Api:
+                is_available = staticmethod(lambda: True)
+                is_connected = staticmethod(lambda: True)
+
+                @staticmethod
+                def request_minute_candles(code, _name, **kwargs):
+                    calls.append({"code": code, "name": _name, **kwargs})
+                    kwargs["callback"]({"ok": True, "rows_count": 1})
+                    return {"ok": True}
+
+            window = SimpleNamespace(
+                kiwoom_api=Api(),
+                registered_operation_targets=lambda: [
+                    (assigned, "000001", "Assigned"),
+                ],
+            )
+            with patch.object(
+                auto_candle_refresh,
+                "all_registered_stock_dirs",
+                return_value=[assigned, unassigned],
+            ), patch.object(
+                auto_candle_refresh.QTimer,
+                "singleShot",
+                side_effect=lambda _delay, callback: callback(),
+            ):
+                result = auto_candle_refresh.refresh_operation_candles(window, "2026-08-10 10:00")
+
+            self.assertTrue(result["accepted"])
+            self.assertEqual(["000001"], [call["code"] for call in calls])
+
     def test_operation_cycle_tail_does_not_repeat_batch_probe(self) -> None:
         host = Mock()
         host.startup_recovery_session_ready.return_value = True

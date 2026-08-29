@@ -147,17 +147,18 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             stock = _write_stock(root, "000001", "대상종목", "instance-a")
             group_before = (group / "group.json").read_bytes()
             config_before = (stock / "config.json").read_bytes()
+            _write_json(stock / "state.json", {"holding_qty": 1, "status": "STOPPED"})
 
             with patch.object(deletion, "load_persisted_routine_instances", return_value=[instance]):
                 scope = deletion.collect_group_deletion_scope(root, GROUP_A)
                 result = deletion.delete_group_completely(
                     root,
                     scope,
-                    can_unassign=lambda _code, _name: (False, "지표추종매매", ["보유 1"]),
+                    can_unassign=lambda _code, _name: (True, "지표추종매매", []),
                 )
 
             self.assertFalse(result.success)
-            self.assertEqual(("대상종목: 보유 1",), result.blocked_reasons)
+            self.assertEqual(("대상종목: 장기보유 1주",), result.blocked_reasons)
             self.assertEqual(group_before, (group / "group.json").read_bytes())
             self.assertEqual(config_before, (stock / "config.json").read_bytes())
             self.assertFalse(group_delete_pending(root, GROUP_A))

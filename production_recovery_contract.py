@@ -15,6 +15,8 @@ import hashlib
 import json
 from typing import Any, Iterable, Mapping
 
+from stock_code_contract import normalize_broker_stock_code
+
 
 ACCOUNT_NOT_STARTED = "NOT_STARTED"
 ACCOUNT_COLLECTING = "COLLECTING"
@@ -70,8 +72,7 @@ def _parse_trading_day(value: Any) -> str:
 
 
 def normalize_stock_code(value: Any) -> str:
-    text = _text(value).upper()
-    return text[1:] if text.startswith("A") else text
+    return normalize_broker_stock_code(value)
 
 
 def decimal_value(value: Any, *, absolute: bool = False) -> Decimal:

@@ -18,9 +18,12 @@ from gui_auto_trade_integrity import is_review_required_state
 from gui_operation_environment import read_review_policy
 from gui_order_utils import order_current_pending_qty, pending_order_side_quantities
 from stock_long_hold_policy import (
+    classify_termination_route,
     final_close_liquidation_method,
     has_active_individual_liquidation_request,
+    long_hold_excludes_holding_review,
 )
+from state_policy import normalize_operation_mode
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -333,6 +336,10 @@ def _evaluate_stock(
             reasons=[f"state read failed: {state_error}"],
             evidence=evidence,
         )
+    config, config_error = _read_json_object(
+        stock_dir / "config.json",
+        default={},
+    )
 
     status_text = _norm(state.get("status"))
     close_mode = _close_mode(state)
@@ -350,6 +357,14 @@ def _evaluate_stock(
         stock_dir,
         state,
     )
+    queue_records = _queue_records_for_stock(stock_code, queue_data)
+    operation_mode = normalize_operation_mode(config.get("operation_mode", "CONTINUOUS"))
+    termination_route = classify_termination_route(
+        state,
+        operation_mode=operation_mode,
+        final_session_ended=True,
+        queue_records=queue_records,
+    )
     evidence.update(
         {
             "status": status_text,
@@ -358,19 +373,15 @@ def _evaluate_stock(
             "active_order_ids": active_order_ids,
             "queue_reasons": queue_reasons,
             "evidence_errors": list(evidence_errors),
+            "operation_mode": operation_mode,
+            "termination_route": termination_route,
+            "config_error": config_error,
         }
     )
 
     conflict_reasons = list(holding_reasons) + list(queue_conflicts)
     if _is_review_required(state) and status_text in CLOSED_STOCK_STATUSES:
         conflict_reasons.append("closed status coexists with REVIEW_REQUIRED")
-    if (
-        status_text in CLOSED_STOCK_STATUSES
-        and holding_qty is not None
-        and holding_qty > 0
-        and not _explicit_carryover_done(state)
-    ):
-        conflict_reasons.append("closed status has positive durable holding quantity")
     if conflict_reasons:
         return _stock_result(
             stock_code,
@@ -422,10 +433,16 @@ def _evaluate_stock(
         # it can finish as intentional carry-over; without that explicit policy
         # the residual remains a Review-blocking result.
         if holding_qty is not None and holding_qty > 0:
-            if (
-                global_long_hold_enabled
-                and not has_active_individual_liquidation_request(state)
-                and not final_close_liquidation_method(state)
+            if long_hold_excludes_holding_review(
+                global_long_hold_enabled,
+                state,
+                holding_qty=holding_qty,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+                safety_issue=bool(conflict_reasons or evidence_errors or config_error),
+                operation_mode=operation_mode,
+                final_session_ended=True,
+                queue_records=queue_records,
             ):
                 return _stock_result(
                     stock_code,
@@ -468,7 +485,17 @@ def _evaluate_stock(
         if (
             holding_qty is not None
             and holding_qty > 0
-            and not global_long_hold_enabled
+            and not long_hold_excludes_holding_review(
+                global_long_hold_enabled,
+                state,
+                holding_qty=holding_qty,
+                buy_pending_qty=buy_pending_qty,
+                sell_pending_qty=sell_pending_qty,
+                safety_issue=bool(conflict_reasons or evidence_errors or config_error),
+                operation_mode=operation_mode,
+                final_session_ended=True,
+                queue_records=queue_records,
+            )
         ):
             return _stock_result(
                 stock_code,
@@ -712,6 +739,22 @@ def _active_queue_orders(
             active_ids.append(order_id or str(order.get("order_id") or "-"))
             reasons.append(f"order {order_id or '-'} has unresolved status={status}")
     return active_ids, reasons, conflicts
+
+
+def _queue_records_for_stock(
+    stock_code: str,
+    queue_data: dict[str, Any] | None,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(queue_data, dict):
+        return ()
+    orders = queue_data.get("orders")
+    if not isinstance(orders, list):
+        return ()
+    return tuple(
+        order
+        for order in orders
+        if isinstance(order, dict) and _order_code(order) == stock_code
+    )
 
 
 def _order_code(order: dict[str, Any]) -> str:

@@ -124,6 +124,42 @@ class ExecutionUniverseTest(unittest.TestCase):
                 self.assertFalse(auto_trade_signal_probe_only_active(window))
                 self.assertFalse(auto_trade_real_execution_active(window))
 
+    def test_registered_operation_targets_source_limits_execution_universe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assigned = _write_stock(
+                root,
+                "005930_Assigned",
+                state={
+                    "status": "RUNNING",
+                    "trade_enabled": True,
+                    "real_trade_enabled": True,
+                },
+            )
+            unassigned = _write_stock(
+                root,
+                "492500_Unassigned",
+                state={
+                    "status": "RUNNING",
+                    "trade_enabled": True,
+                    "real_trade_enabled": True,
+                },
+            )
+            window = SimpleNamespace(
+                registered_operation_targets=lambda: [(assigned, "005930", "Assigned")],
+                _current_session_operation_participant_stock_codes={"005930"},
+            )
+            window.startup_recovery_session_ready = lambda refresh=False: True
+
+            with patch(
+                "execution_universe.all_registered_stock_dirs",
+                return_value=[assigned, unassigned],
+            ):
+                snapshot = project_execution_universe(window)
+
+        self.assertEqual(("005930",), snapshot.execution_stock_codes)
+        self.assertEqual([assigned], [entry.stock_dir for entry in snapshot.entries])
+
 
 if __name__ == "__main__":
     unittest.main()

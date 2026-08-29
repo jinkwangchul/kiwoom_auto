@@ -786,52 +786,34 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         )
 
     def test_instance_clone_reuses_saved_rules_snapshot_and_unique_group(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            rules_path = Path(temp) / "rules.json"
-            source_rules = {"buy": {"enabled": True}, "settings": {"period": 5}}
-            rules_path.write_text(
-                json.dumps(source_rules, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            instance = SimpleNamespace(
-                instance_id="instance-b",
-                definition_id="definition-a",
-                display_name="동전주B",
-                rules_path=rules_path,
-            )
-            definition = SimpleNamespace(display_name="Definition A")
-            window = SimpleNamespace(
-                _routine_instance_ids_by_group={"group-a": ("instance-b",)},
-                _routine_group_records_by_id={
-                    "group-a": SimpleNamespace(display_name="동전주")
-                },
-            )
-            registered = SimpleNamespace(instance_id="instance-c")
-            with (
-                patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
-                patch.object(gui_windows, "routine_definition_by_id", return_value=definition),
-                patch(
-                    "gui_indicator_follow_routine_settings_dialog.register_routine_instance_snapshot",
-                    return_value=registered,
-                ) as clone_snapshot,
-            ):
-                self.assertTrue(
-                    gui_windows.MainWindow.clone_routine_instance_from_main_group(
-                        window,
-                        "group-a",
-                        "instance-b",
-                    )
+        group = SimpleNamespace(display_name="동전주")
+        window = SimpleNamespace(
+            _routine_instance_ids_by_group={"group-a": ("instance-b",)},
+            _routine_group_records_by_id={"group-a": group},
+        )
+        with patch.object(
+            gui_windows,
+            "clone_routine_instance_with_existing_policy",
+            return_value=True,
+        ) as clone_policy:
+            self.assertTrue(
+                gui_windows.MainWindow.clone_routine_instance_from_main_group(
+                    window,
+                    "group-a",
+                    "instance-b",
                 )
-
-            kwargs = clone_snapshot.call_args.kwargs
-            self.assertEqual("definition-a", kwargs["definition_id"])
-            self.assertEqual("group-a", kwargs["group_id"])
-            self.assertEqual("동전주", kwargs["group_display_name"])
-            self.assertEqual("동전주B", kwargs["source_instance_display_name"])
-            self.assertEqual(
-                {"success": True, "rules": source_rules, "error": ""},
-                kwargs["rules_provider"](),
             )
+
+        clone_policy.assert_called_once_with(
+            window,
+            {
+                "row_kind": "instance",
+                "group_id": "group-a",
+                "instance_id": "instance-b",
+            },
+            owning_group_ids={"group-a"},
+            group_record=group,
+        )
 
     def test_instance_clone_blocks_ambiguous_group_assignment(self) -> None:
         window = SimpleNamespace(
@@ -4336,7 +4318,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            writer_owner = SimpleNamespace(parent=lambda: None)
             gui_windows.MainWindow._write_stock_initial_buy_config(
+                writer_owner,
                 config_path,
                 mode="AMOUNT",
                 value=0,
@@ -4348,6 +4332,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual("keep", amount_config["unrelated"])
 
             gui_windows.MainWindow._write_stock_initial_buy_config(
+                writer_owner,
                 config_path,
                 mode="QUANTITY",
                 value=1,

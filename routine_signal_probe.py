@@ -11,9 +11,10 @@ STEP 6-B: 루틴 evaluate() 연결 확인용 안전 프로브 + 신호큐 저장
 
 중요 원칙:
 - 주문 실행 없음.
-- 예산 처리 없음.
+- 루틴별 예산 계산 없음.
 - 청산 처리 없음.
-- state.json / config.json / orders.json 수정 없음.
+- 표준 BUY/SELL에 따른 Runtime 예산조정 상태 전이만 허용.
+- config.json / orders.json 수정 없음.
 - GUI 상태 컬럼 변경 없음.
 """
 
@@ -42,6 +43,10 @@ from event_journal_production import (
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
 from order_candidate_engine import read_latest_price
+from running_budget_adjustment import (
+    project_running_budget_adjustment_config,
+    transition_running_budget_adjustment_for_signal,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -408,13 +413,17 @@ def probe_routine_for_stock(
                 "name": name,
             }
         else:
+            effective_stock_config, budget_adjustment_projection = (
+                project_running_budget_adjustment_config(stock_config, state)
+            )
             context = {
                 "routine": routine_name,
                 "code": code,
                 "name": name,
                 "stock_dir": str(stock_dir),
                 "state": state,
-                "stock_config": stock_config,
+                "stock_config": effective_stock_config,
+                "running_budget_adjustment": budget_adjustment_projection,
                 "candles": candles,
                 "probe_only": True,
                 "tick_key": tick_key,
@@ -536,6 +545,14 @@ def probe_routine_for_stock(
                 if isinstance(queue_result, dict):
                     result["queue_status"] = queue_result.get("status")
                     result["queue_id"] = queue_result.get("id", "")
+                    if queue_result.get("status") == "queued":
+                        result["running_budget_adjustment_transition"] = (
+                            transition_running_budget_adjustment_for_signal(
+                                stock_dir,
+                                signal=result.get("signal"),
+                                signal_id=queue_result.get("id"),
+                            )
+                        )
 
                 try:
                     from event_journal_trade_observer import observe_signal_created

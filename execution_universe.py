@@ -120,7 +120,20 @@ def project_execution_universe(
     participant_set = set(participant_stock_codes)
     global_ready, global_blockers = _global_readiness(window)
 
-    candidate_dirs = list(stock_dirs) if stock_dirs is not None else all_registered_stock_dirs()
+    if stock_dirs is not None:
+        candidate_dirs = list(stock_dirs)
+    else:
+        registered_getter = getattr(window, "registered_operation_targets", None)
+        if callable(registered_getter):
+            try:
+                registered_targets = registered_getter()
+                candidate_dirs = [
+                    Path(stock_dir) for stock_dir, _code, _name in registered_targets
+                ]
+            except TypeError:
+                candidate_dirs = all_registered_stock_dirs()
+        else:
+            candidate_dirs = all_registered_stock_dirs()
     entries: list[ExecutionUniverseEntry] = []
     execution_stock_codes: list[str] = []
 

@@ -119,7 +119,7 @@ class MainWindowCloseSafetyWarningTests(unittest.TestCase):
                 self.assertTrue(
                     window._main_exit_warning_required(datetime(2026, 8, 13, 10, 0))
                 )
-            scheduled.assert_called_once_with(config, datetime(2026, 8, 13, 10, 0))
+            scheduled.assert_not_called()
         finally:
             with patch.object(window, "_confirm_main_window_exit_if_required", return_value=True):
                 window.close()
@@ -153,12 +153,12 @@ class MainWindowCloseSafetyWarningTests(unittest.TestCase):
                 ) as ats_active,
             ):
                 self.assertTrue(window._main_exit_warning_required(now_dt))
-            ats_active.assert_called_once_with(config, state, now_dt)
+            ats_active.assert_not_called()
         finally:
             with patch.object(window, "_confirm_main_window_exit_if_required", return_value=True):
                 window.close()
 
-    def test_all_current_running_targets_outside_time_skip_warning(self) -> None:
+    def test_current_running_outside_time_still_requires_warning(self) -> None:
         window = self._create_window()
         try:
             with (
@@ -179,11 +179,12 @@ class MainWindowCloseSafetyWarningTests(unittest.TestCase):
                     routine_order_permission,
                     "scheduled_status_for_now",
                     return_value="MONITORING",
-                ),
+                ) as scheduled,
             ):
-                self.assertFalse(
+                self.assertTrue(
                     window._main_exit_warning_required(datetime(2026, 8, 13, 20, 0))
                 )
+            scheduled.assert_not_called()
         finally:
             with patch.object(window, "_confirm_main_window_exit_if_required", return_value=True):
                 window.close()

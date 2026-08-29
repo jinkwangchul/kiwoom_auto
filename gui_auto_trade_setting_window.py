@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
-from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QSize, QEvent, QSignalBlocker
+from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QItemSelectionModel, QRect, QSize, QEvent, QSignalBlocker, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
@@ -62,7 +62,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QHeaderView,
 )
-from event_journal_production import append_production_event
+from event_journal_production import append_production_event, observe_owner_failure_transition
 from routine_tree_title_display import (
     tree_title_slot_width,
     tree_title_text,
@@ -119,8 +119,18 @@ from gui_styles import (
     registered_stock_status_table_stylesheet,
 )
 from gui_toast import show_toast
+from gui_stock_name_tooltip import (
+    TOOLTIP_POINT_SIZE,
+    install_persistent_stock_name_tooltips,
+)
 from gui_common_utils import safe_int_value, sanitize_path_part
-from gui_stock_data import append_base_stock, active_routine_for_stock, stock_runtime_dir_for_routine
+from gui_stock_data import (
+    STOCK_LIBRARY_EMPTY_SOURCE,
+    append_base_stock,
+    active_routine_for_stock,
+    load_stock_library_snapshot,
+    stock_runtime_dir_for_routine,
+)
 from gui_stock_instance_chart_window import open_stock_instance_chart
 from gui_order_utils import (
     directional_value_color,
@@ -169,9 +179,13 @@ from gui_routine_assign_utils import (
 )
 from gui_routine_guard import routine_action_guard_info
 from gui_routine_policy import (
+    CURRENT_STOCK_RELATION,
+    HISTORICAL_STOCK_RELATION,
+    RoutineUnassignDecision,
     routine_action_reasons_for_stock,
     classify_routine_assign_targets,
     can_unassign_active_routine_from_stock,
+    routine_unassign_decision,
 )
 from runtime_io import (
     read_json_dict,
@@ -214,40 +228,189 @@ class _AutoTradeRoutineInstanceNameEdit(QLineEdit):
         super().focusOutEvent(event)
 
 
+class _NumericSnapshotTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = InstanceStockSearchRegisterDialog._snapshot_number(
+            self.data(Qt.UserRole)
+        )
+        right = InstanceStockSearchRegisterDialog._snapshot_number(
+            other.data(Qt.UserRole)
+        )
+        if left is None:
+            return right is None and self.text() < other.text()
+        if right is None:
+            return True
+        return left < right
+
+
 class InstanceStockSearchRegisterDialog(QDialog):
     """Instance-scoped stock search and one-stock registration window."""
+
+    RESULT_EVIDENCE_ROLE = Qt.UserRole + 1
+    CODE_COLUMN = 0
+    NAME_COLUMN = 1
+    MARKET_COLUMN = 2
+    REGISTRATION_STATUS_COLUMN = 3
+    CATEGORY_COLUMN = REGISTRATION_STATUS_COLUMN
+    INSTRUMENT_CLASSIFICATION_COLUMN = 4
+    AFTER_MARKET_COLUMN = 5
+    CURRENT_PRICE_COLUMN = 6
+    CHANGE_RATE_COLUMN = 7
+    EXECUTION_STRENGTH_COLUMN = 8
+    PREVIOUS_DAY_VOLUME_RATE_COLUMN = 9
+    TRADING_VALUE_COLUMN = 10
+    VOLUME_COLUMN = 11
+    MARKET_CAP_COLUMN = 12
+    STOCK_STATUS_COLUMN = 13
+    NUMERIC_SNAPSHOT_COLUMNS = frozenset(
+        {
+            CURRENT_PRICE_COLUMN,
+            CHANGE_RATE_COLUMN,
+            EXECUTION_STRENGTH_COLUMN,
+            PREVIOUS_DAY_VOLUME_RATE_COLUMN,
+            TRADING_VALUE_COLUMN,
+            VOLUME_COLUMN,
+            MARKET_CAP_COLUMN,
+        }
+    )
+    MARKET_TEXT_COLORS = {
+        "KOSPI": "#1E3A5F",
+        "코스닥": "#6B3E2E",
+    }
+    BASE_DIALOG_WIDTH = 520
+    STOCK_NAME_DISPLAY_CHARACTERS = 14
+    SEARCH_DISPLAY_CHARACTERS = 12
+    ROW_NUMBER_HORIZONTAL_PADDING = 1
+    TABLE_SEPARATOR_COLOR = "#EBEBEB"
+    RANKING_BADGE_HORIZONTAL_PADDING = 3
+    REGISTRATION_BADGE_INACTIVE_COLOR = "#4B5563"
+    RANKING_HIGHLIGHT_BACKGROUND_COLOR = "#EFF6FF"
+    RANKING_BADGES = (
+        ("VOLUME_TOP", "거래량"),
+        ("VALUE_TOP", "거래대금"),
+        ("RISE_TOP", "급상승"),
+        ("FALL_TOP", "급하락"),
+    )
+    RANKING_HIGHLIGHT_COLUMNS = {
+        "VOLUME_TOP": VOLUME_COLUMN,
+        "VALUE_TOP": TRADING_VALUE_COLUMN,
+        "RISE_TOP": CHANGE_RATE_COLUMN,
+        "FALL_TOP": CHANGE_RATE_COLUMN,
+    }
+    STOCK_STATUS_SINGLE_VALUES = (
+        "정상",
+        "관리",
+        "관리종목",
+        "거래정지",
+        "증거금100%",
+        "감리종목",
+        "투자유의종목",
+        "담보대출",
+        "액면분할",
+        "신용가능",
+        "투자주의",
+        "투자경고",
+        "투자위험",
+        "투자주의환기",
+        "투자주의환기종목",
+    )
+    closed = pyqtSignal()
 
     def __init__(
         self,
         parent: QWidget | None = None,
         *,
         instance_metadata: dict[str, object] | None = None,
+        stock_source: str = STOCK_LIBRARY_EMPTY_SOURCE,
+        kiwoom_api: object | None = None,
     ) -> None:
-        super().__init__(None)
+        super().__init__(parent)
         configure_persistent_feature_window(self, parent)
+        owner = persistent_feature_owner(self)
+        self.kiwoom_api = (
+            kiwoom_api
+            if kiwoom_api is not None
+            else getattr(owner, "kiwoom_api", None)
+        )
         self.instance_metadata = dict(instance_metadata or {})
+        # Search is intentionally local-only. Server Master collection is owned by
+        # the login-session sync service and never by dialog open/textChanged.
+        self.stock_source = str(stock_source or STOCK_LIBRARY_EMPTY_SOURCE)
         self.setWindowTitle(self._window_title())
-        self.resize(520, 420)
+        self.resize(self.BASE_DIALOG_WIDTH, 420)
 
         self.search_input = QLineEdit(self)
         self.search_input.setObjectName("instanceStockSearchInput")
         self.btn_search = QPushButton("검색", self)
         self.btn_search.setObjectName("instanceStockSearchButton")
+        self.btn_search.setAutoDefault(False)
+        self.btn_search.setDefault(False)
+        self.general_stock_button = QPushButton("일반종목", self)
+        self.general_stock_button.setObjectName("instanceStockGeneralVisibilityButton")
+        self.general_stock_button.setAutoDefault(False)
+        self.general_stock_button.setDefault(False)
+        self.general_stock_button.setCheckable(True)
+        self.general_stock_button.setChecked(False)
+        self.ranking_separator_label = QLabel("|", self)
+        self.ranking_separator_label.setObjectName("instanceStockRankingSeparatorLabel")
+        self.ranking_title_label = QLabel("TOP100 :", self)
+        self.ranking_title_label.setObjectName("instanceStockRankingTitleLabel")
+        self.ranking_title_label.setStyleSheet(
+            "QLabel#instanceStockRankingTitleLabel {"
+            " color: #111827;"
+            " font-weight: 700;"
+            "}"
+        )
+        self.ranking_title_label.setSizePolicy(
+            QSizePolicy.Fixed,
+            QSizePolicy.Preferred,
+        )
+        self.ranking_title_label.setFixedWidth(
+            self.ranking_title_label.sizeHint().width()
+        )
+        self.ranking_buttons: dict[str, QPushButton] = {}
+        for source, text in self.RANKING_BADGES:
+            button = QPushButton(text, self)
+            button.setObjectName(f"instanceStockRanking{source.title().replace('_', '')}")
+            button.setAutoDefault(False)
+            button.setDefault(False)
+            self.ranking_buttons[source] = button
         self.result_table = QTableWidget(self)
         self.result_table.setObjectName("instanceStockSearchResultTable")
         self.btn_register = QPushButton("등록", self)
         self.btn_register.setObjectName("instanceStockRegisterButton")
+        self.btn_register.setAutoDefault(False)
+        self.btn_register.setDefault(False)
         self.btn_close = QPushButton("닫기", self)
         self.btn_close.setObjectName("instanceStockRegisterCloseButton")
+        self.btn_close.setAutoDefault(False)
+        self.btn_close.setDefault(False)
         self._result_sort_column = -1
         self._result_sort_order = Qt.AscendingOrder
+        self._result_source = "SEARCH"
+        self._active_ranking_source = ""
+        self._search_generation = 0
+        self._search_stock_codes: set[str] = set()
+        self._market_snapshot_by_code: dict[str, dict[str, object]] = {}
+        self._market_snapshot_request_result: dict[str, object] = {}
+        self._last_market_snapshot_result: dict[str, object] = {}
+        self._ranking_request_result: dict[str, object] = {}
+        self._last_ranking_result: dict[str, object] = {}
 
         self._setup_ui()
-        self.search_input.textChanged.connect(self.search_stocks)
         self.search_input.returnPressed.connect(
             lambda: self.search_stocks(notify_empty=True)
         )
         self.btn_search.clicked.connect(lambda: self.search_stocks(notify_empty=True))
+        self.general_stock_button.toggled.connect(
+            self._on_general_stock_visibility_toggled
+        )
+        for source, button in self.ranking_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, ranking_source=source: (
+                    self.request_stock_ranking(ranking_source)
+                )
+            )
         self.result_table.itemDoubleClicked.connect(self.on_result_item_double_clicked)
         self.result_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_table.customContextMenuRequested.connect(
@@ -263,7 +426,23 @@ class InstanceStockSearchRegisterDialog(QDialog):
             lambda _checked=False: self.register_selected_result_rows()
         )
         self.btn_close.clicked.connect(self.close)
+        sync_service = getattr(owner, "stock_library_sync_service", None)
+        sync_finished = getattr(sync_service, "sync_finished", None)
+        if sync_finished is not None:
+            sync_finished.connect(self._on_stock_library_sync_finished)
         self.search_stocks()
+
+    def closeEvent(self, event) -> None:
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def _on_stock_library_sync_finished(self, result: object) -> None:
+        payload = result if isinstance(result, dict) else {}
+        if (
+            str(payload.get("state", "") or "") == "SUCCEEDED"
+            and self._result_source == "SEARCH"
+        ):
+            self.search_stocks()
 
     def _window_title(self) -> str:
         for key in ("instance_name", "display_name", "routine_name"):
@@ -274,21 +453,244 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     def _setup_ui(self) -> None:
         main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(5)
+        self._update_ranking_badge_styles()
+        self._update_general_stock_badge_style()
+        ranking_width = (
+            next(iter(self.ranking_buttons.values()))
+            .fontMetrics()
+            .horizontalAdvance("거래대금")
+            + (self.RANKING_BADGE_HORIZONTAL_PADDING * 2)
+            + 2
+        )
         search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("검색어", self))
+        search_label = QLabel("검색어", self)
+        search_layout.addWidget(search_label)
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(self.btn_search)
+        search_layout.addStretch(1)
+        general_width = (
+            self.general_stock_button.fontMetrics().horizontalAdvance("일반종목")
+            + (self.RANKING_BADGE_HORIZONTAL_PADDING * 2)
+            + 2
+        )
+        self.general_stock_button.setFixedWidth(general_width)
+        self.general_stock_button.setFixedHeight(AUTO_TRADE_SETTING_BADGE_HEIGHT)
+        self.general_stock_button.setCursor(Qt.PointingHandCursor)
+        search_layout.addWidget(self.general_stock_button, 0, Qt.AlignBottom)
+        search_layout.addSpacing(6)
+        search_layout.addWidget(self.ranking_separator_label, 0, Qt.AlignBottom)
+        search_layout.addSpacing(6)
+        search_layout.addWidget(self.ranking_title_label, 0, Qt.AlignBottom)
+        for index, (source, _text) in enumerate(self.RANKING_BADGES):
+            if index:
+                search_layout.addSpacing(4)
+            button = self.ranking_buttons[source]
+            button.setFixedWidth(ranking_width)
+            button.setFixedHeight(AUTO_TRADE_SETTING_BADGE_HEIGHT)
+            button.setCursor(Qt.PointingHandCursor)
+            search_layout.addWidget(button, 0, Qt.AlignBottom)
+        search_margin = self.search_input.style().pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.search_input,
+        ) + 1
+        self.search_input.setFixedWidth(
+            self.search_input.fontMetrics().horizontalAdvance(
+                "한" * self.SEARCH_DISPLAY_CHARACTERS
+            )
+            + (search_margin * 2)
+        )
+        self.search_input.setMinimumHeight(self.search_input.sizeHint().height() + 6)
+        self.search_input.setStyleSheet(
+            "QLineEdit#instanceStockSearchInput {"
+            "border: none;"
+            "padding: 3px 4px;"
+            "background: #FFFFFF;"
+            "}"
+            "QLineEdit#instanceStockSearchInput:focus {"
+            "border: none;"
+            "}"
+        )
 
-        self.result_table.setColumnCount(3)
-        self.result_table.setHorizontalHeaderLabels(["종목코드", "종목명", "분류"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.result_table.setColumnCount(14)
+        self.result_table.setHorizontalHeaderLabels(
+            [
+                "종목코드",
+                "종목명",
+                "시장",
+                "등록상태",
+                "분류",
+                "비고",
+                "현재주가",
+                "등락률",
+                "체결강도",
+                "전일대비",
+                "거래대금",
+                "거래량",
+                "시총",
+                "상태",
+            ]
+        )
+        header = self.result_table.horizontalHeader()
+        header.setObjectName("instanceStockSearchHorizontalHeader")
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.setDefaultAlignment(Qt.AlignCenter)
+        vertical_header = self.result_table.verticalHeader()
+        vertical_header.setObjectName("instanceStockSearchVerticalHeader")
+        vertical_header.setSectionResizeMode(QHeaderView.Fixed)
+        vertical_header.setSectionsMovable(False)
+        vertical_header.setDefaultAlignment(Qt.AlignCenter)
+        item_margin = self.result_table.style().pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.result_table,
+        ) + 1
+        section_border_width = self.result_table.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table,
+        ) if self.result_table.showGrid() else 0
+        name_column_width = (
+            self.result_table.fontMetrics().horizontalAdvance(
+                "한" * self.STOCK_NAME_DISPLAY_CHARACTERS
+            )
+            + (item_margin * 2)
+            + section_border_width
+        )
+        code_column_width = self._symmetric_text_column_width("0000000000")
+        code_text_width = self.result_table.fontMetrics().horizontalAdvance("000000")
+        code_horizontal_margin = max(
+            item_margin,
+            (code_column_width - section_border_width - code_text_width) // 2,
+        )
+        market_column_width = self._text_column_width_with_margin(
+            code_horizontal_margin,
+            "시장",
+            "KOSPI",
+            "코스닥",
+        )
+        category_column_width = self._text_column_width_with_margin(
+            code_horizontal_margin,
+            "등록상태",
+            "등록대기",
+            "검토관리",
+        )
+        instrument_classification_width = self._text_column_width_with_margin(
+            code_horizontal_margin,
+            "분류",
+            "일반종목",
+            "SPAC",
+            "REIT",
+        )
+        remarks_column_width = self._text_column_width_with_margin(
+            code_horizontal_margin,
+            "비고",
+            "NXT",
+        )
+        self.result_table.setColumnWidth(self.CODE_COLUMN, code_column_width)
+        self.result_table.setColumnWidth(self.NAME_COLUMN, name_column_width)
+        self.result_table.setColumnWidth(self.MARKET_COLUMN, market_column_width)
+        self.result_table.setColumnWidth(self.CATEGORY_COLUMN, category_column_width)
+        self.result_table.setColumnWidth(
+            self.INSTRUMENT_CLASSIFICATION_COLUMN,
+            instrument_classification_width,
+        )
+        self.result_table.setColumnWidth(self.AFTER_MARKET_COLUMN, remarks_column_width)
+        numeric_column_samples = {
+            self.CURRENT_PRICE_COLUMN: ("현재주가", "999,999,999"),
+            self.CHANGE_RATE_COLUMN: ("등락률", "+999.99%"),
+            self.EXECUTION_STRENGTH_COLUMN: ("체결강도", "999.99"),
+            self.PREVIOUS_DAY_VOLUME_RATE_COLUMN: ("전일대비", "+999.99%"),
+            self.TRADING_VALUE_COLUMN: ("거래대금", "99,999,999억", "9,999만원"),
+            self.VOLUME_COLUMN: ("거래량", "99,999,999주", "999.9억주"),
+            self.MARKET_CAP_COLUMN: ("시총", "99,999,999억"),
+        }
+        for column, samples in numeric_column_samples.items():
+            self.result_table.setColumnWidth(
+                column,
+                self._text_column_width(*samples),
+            )
+        self.result_table.setColumnWidth(
+            self.STOCK_STATUS_COLUMN,
+            self._text_column_width("상태", *self.STOCK_STATUS_SINGLE_VALUES)
+            + section_border_width,
+        )
+        for column in range(self.result_table.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+            header_item = self.result_table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setBackground(QBrush(QColor("#FFFFFF")))
+        self._stock_name_clip_delegate = ClippedTextItemDelegate(
+            self.result_table,
+            selected_text_color=QColor("#111827"),
+        )
+        self.result_table.setItemDelegateForColumn(1, self._stock_name_clip_delegate)
+        self._market_text_delegate = SelectedTextReadableDelegate(self.result_table)
+        self.result_table.setItemDelegateForColumn(
+            self.MARKET_COLUMN,
+            self._market_text_delegate,
+        )
+        self._stock_name_tooltip_filter = install_persistent_stock_name_tooltips(
+            self.result_table,
+            {self.NAME_COLUMN},
+        )
         self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.result_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.result_table.setSortingEnabled(False)
-        self.result_table.horizontalHeader().setSortIndicatorShown(True)
+        self.result_table.horizontalHeader().setSortIndicatorShown(False)
+        self.result_table.setAlternatingRowColors(False)
+        self.result_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.result_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        grid_line_color = self.TABLE_SEPARATOR_COLOR
         self.result_table.setStyleSheet(
+            f"""
+            QTableWidget#instanceStockSearchResultTable {{
+                gridline-color: {grid_line_color};
+                border: 1px solid {grid_line_color};
+                background: #FFFFFF;
+            }}
+            QTableWidget#instanceStockSearchResultTable::viewport {{
+                border: none;
+            }}
+            QTableWidget::item {{
+                padding-left: {item_margin}px;
+                padding-right: {item_margin}px;
+            }}
+            QHeaderView#instanceStockSearchHorizontalHeader::section {{
+                padding-left: {item_margin}px;
+                padding-right: {item_margin}px;
+                background: #FFFFFF;
+                border: none;
+                border-right: 1px solid {grid_line_color};
+                border-bottom: 1px solid {grid_line_color};
+            }}
+            QHeaderView#instanceStockSearchHorizontalHeader {{
+                background: #FFFFFF;
+                border: none;
+            }}
+            QHeaderView#instanceStockSearchVerticalHeader::section {{
+                padding-left: {self.ROW_NUMBER_HORIZONTAL_PADDING}px;
+                padding-right: {self.ROW_NUMBER_HORIZONTAL_PADDING}px;
+                background: #FFFFFF;
+                border: none;
+                border-right: 1px solid {grid_line_color};
+                border-bottom: 1px solid {grid_line_color};
+            }}
+            QHeaderView#instanceStockSearchVerticalHeader {{
+                background: #FFFFFF;
+                border: none;
+            }}
+            QTableCornerButton::section {{
+                border: none;
+                border-right: 1px solid {grid_line_color};
+                border-bottom: 1px solid {grid_line_color};
+            }}
             """
+            + """
             QTableWidget::item:selected {
                 background: #dbeafe;
                 color: #111827;
@@ -302,22 +704,244 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 color: #111827;
             }
             """
+            + f"QToolTip {{ font-size: {TOOLTIP_POINT_SIZE}pt; }}"
+        )
+        header.setStyleSheet(
+            f"QHeaderView::section {{"
+            f"background: #FFFFFF;"
+            f"border: none;"
+            f"border-right: 1px solid {grid_line_color};"
+            f"border-bottom: 1px solid {grid_line_color};"
+            f"}}"
+        )
+        self.result_table.verticalScrollBar().setStyleSheet(
+            "QScrollBar:vertical { border: none; margin: 0px; padding: 0px; }"
         )
 
         main_layout.addLayout(search_layout)
         main_layout.addWidget(self.result_table)
         button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 1, 0, 0)
         button_layout.addStretch(1)
         button_layout.addWidget(self.btn_register)
         button_layout.addWidget(self.btn_close)
         main_layout.addLayout(button_layout)
+        self._normalize_row_number_header_width()
+        self._normalize_dialog_width_to_result_table()
         self._update_register_button_enabled()
+
+    def _update_ranking_badge_styles(self) -> None:
+        active_source = str(
+            getattr(self, "_active_ranking_source", "") or ""
+        ).strip().upper()
+        for source, button in self.ranking_buttons.items():
+            color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if source == active_source
+                else self.REGISTRATION_BADGE_INACTIVE_COLOR
+            )
+            button.setStyleSheet(
+                auto_trade_setting_badge_stylesheet(
+                    "QPushButton",
+                    text_color=color,
+                    border_color=color,
+                )
+                + (
+                    "QPushButton, QPushButton:hover {"
+                    f" padding-left: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
+                    f" padding-right: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
+                    "}"
+                )
+            )
+
+    def _update_general_stock_badge_style(self) -> None:
+        color = (
+            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+            if self.general_stock_button.isChecked()
+            else self.REGISTRATION_BADGE_INACTIVE_COLOR
+        )
+        self.general_stock_button.setStyleSheet(
+            auto_trade_setting_badge_stylesheet(
+                "QPushButton",
+                text_color=color,
+                border_color=color,
+            )
+            + (
+                "QPushButton, QPushButton:hover {"
+                f" padding-left: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
+                f" padding-right: {self.RANKING_BADGE_HORIZONTAL_PADDING}px;"
+                "}"
+            )
+        )
+
+    def _on_general_stock_visibility_toggled(self, _checked: bool) -> None:
+        self._update_general_stock_badge_style()
+        self._apply_general_stock_visibility()
+
+    def _apply_general_stock_visibility(self) -> None:
+        general_only = self.general_stock_button.isChecked()
+        selection_model = self.result_table.selectionModel()
+        for row in range(self.result_table.rowCount()):
+            item = self.result_table.item(row, self.INSTRUMENT_CLASSIFICATION_COLUMN)
+            classification = str(item.data(Qt.UserRole) or "") if item is not None else ""
+            hide_row = general_only and classification != "일반종목"
+            if hide_row and selection_model is not None:
+                selection_model.select(
+                    self.result_table.model().index(row, self.CODE_COLUMN),
+                    QItemSelectionModel.Deselect | QItemSelectionModel.Rows,
+                )
+            self.result_table.setRowHidden(row, hide_row)
+        self._update_register_button_enabled()
+
+    @staticmethod
+    def _instrument_classification_display_text(value: object) -> str:
+        classification = str(value or "-").strip() or "-"
+        return "일반" if classification == "일반종목" else classification
+
+    def _update_ranking_column_highlight(self) -> None:
+        active_source = str(
+            getattr(self, "_active_ranking_source", "") or ""
+        ).strip().upper()
+        active_column = self.RANKING_HIGHLIGHT_COLUMNS.get(active_source, -1)
+        highlight_color = QColor(AUTO_TRADE_SETTING_AMBER_TEXT_COLOR)
+        highlight_background = QColor(self.RANKING_HIGHLIGHT_BACKGROUND_COLOR)
+        ranking_columns = set(self.RANKING_HIGHLIGHT_COLUMNS.values())
+        for column in ranking_columns:
+            foreground = (
+                QBrush(highlight_color) if column == active_column else QBrush()
+            )
+            header_background = QBrush(QColor("#FFFFFF"))
+            cell_background = (
+                QBrush(highlight_background) if column == active_column else QBrush()
+            )
+            header_item = self.result_table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setForeground(foreground)
+                header_item.setBackground(header_background)
+            for row in range(self.result_table.rowCount()):
+                item = self.result_table.item(row, column)
+                if item is not None:
+                    item.setForeground(foreground)
+                    item.setBackground(cell_background)
+
+    def _text_column_width(self, *samples: str) -> int:
+        style = self.result_table.style()
+        item_margin = style.pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.result_table,
+        ) + 1
+        header_margin = style.pixelMetric(
+            QStyle.PM_HeaderMargin,
+            None,
+            self.result_table.horizontalHeader(),
+        )
+        sort_indicator_width = style.pixelMetric(
+            QStyle.PM_SmallIconSize,
+            None,
+            self.result_table.horizontalHeader(),
+        )
+        metrics = self.result_table.fontMetrics()
+        item_width = max(metrics.horizontalAdvance(sample) for sample in samples) + (item_margin * 2)
+        header_width = metrics.horizontalAdvance(samples[0]) + (header_margin * 2) + sort_indicator_width
+        return max(item_width, header_width)
+
+    def _symmetric_text_column_width(self, *samples: str) -> int:
+        item_margin = self.result_table.style().pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.result_table,
+        ) + 1
+        section_border_width = self.result_table.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table,
+        ) if self.result_table.showGrid() else 0
+        text_width = max(
+            self.result_table.fontMetrics().horizontalAdvance(sample)
+            for sample in samples
+        )
+        return text_width + (item_margin * 2) + section_border_width
+
+    def _text_column_width_with_margin(
+        self,
+        horizontal_margin: int,
+        *samples: str,
+    ) -> int:
+        section_border_width = self.result_table.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table,
+        ) if self.result_table.showGrid() else 0
+        text_width = max(
+            self.result_table.fontMetrics().horizontalAdvance(sample)
+            for sample in samples
+        )
+        return text_width + (max(0, horizontal_margin) * 2) + section_border_width
+
+    def _normalize_row_number_header_width(self) -> None:
+        text_width = self.result_table.verticalHeader().fontMetrics().horizontalAdvance("999")
+        section_border_width = self.result_table.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table.verticalHeader(),
+        )
+        fixed_width = (
+            text_width
+            + (self.ROW_NUMBER_HORIZONTAL_PADDING * 2)
+            + section_border_width
+        )
+        self._fixed_row_number_header_width = fixed_width
+        self.result_table.verticalHeader().setFixedWidth(fixed_width)
+
+    def _result_table_required_width(self) -> int:
+        section_width = sum(
+            self.result_table.horizontalHeader().sectionSize(column)
+            for column in range(self.result_table.columnCount())
+        )
+        vertical_header = self.result_table.verticalHeader()
+        vertical_header_width = vertical_header.width()
+        return (
+            section_width
+            + vertical_header_width
+            + self.result_table.verticalScrollBar().sizeHint().width()
+            + (self.result_table.frameWidth() * 2)
+        )
+
+    def _normalize_dialog_width_to_result_table(self) -> None:
+        fixed_width = getattr(self, "_fixed_result_dialog_width", None)
+        if isinstance(fixed_width, int) and fixed_width > 0:
+            self.setFixedWidth(fixed_width)
+            return
+        margins = self.layout().contentsMargins()
+        required_width = (
+            self._result_table_required_width()
+            + margins.left()
+            + margins.right()
+        )
+        self._fixed_result_dialog_width = required_width
+        self.setFixedWidth(required_width)
 
     def _update_register_button_enabled(self) -> None:
         has_selection = bool(self.result_table.selectionModel().selectedRows())
         self.btn_register.setEnabled(has_selection)
 
     def search_stocks(self, *_args, notify_empty: bool = False) -> None:
+        self._search_generation += 1
+        search_generation = self._search_generation
+        self._result_source = "SEARCH"
+        self._active_ranking_source = ""
+        self._update_ranking_badge_styles()
+        self._update_ranking_column_highlight()
+        self._search_stock_codes = set()
+        self._market_snapshot_by_code = {}
+        self._market_snapshot_request_result = {}
+        self._last_market_snapshot_result = {}
+        self._ranking_request_result = {}
+        self._last_ranking_result = {}
+        library_snapshot = load_stock_library_snapshot()
+        self.stock_source = library_snapshot.source
+        library = [dict(item) for item in library_snapshot.records]
         keyword_text = self.search_input.text().strip().lower()
         keywords = [
             part.strip()
@@ -329,11 +953,9 @@ class InstanceStockSearchRegisterDialog(QDialog):
             self._update_register_button_enabled()
             return
 
-        matches: list[dict[str, str]] = []
+        matches: list[dict[str, object]] = []
         seen_codes: set[str] = set()
-        library = load_stock_library()
-
-        def stock_matches(stock: dict[str, str], keyword: str) -> bool:
+        def stock_matches(stock: dict[str, object], keyword: str) -> bool:
             searchable_values = [
                 str(stock.get("code", "") or "").strip().lower(),
                 str(stock.get("name", "") or "").strip().lower(),
@@ -348,26 +970,453 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 if not code or not name or code in seen_codes:
                     continue
                 if stock_matches(stock, keyword):
-                    matches.append({"code": code, "name": name})
+                    matches.append(
+                        {
+                            "code": code,
+                            "name": name,
+                            "market": str(stock.get("market", "") or "").strip(),
+                            "nxt_available": stock.get("nxt_available"),
+                            "status": stock.get("status"),
+                            "classification": stock.get("classification"),
+                        }
+                    )
                     seen_codes.add(code)
 
-        self.result_table.setSortingEnabled(False)
-        self.result_table.setRowCount(len(matches))
-        for row, stock in enumerate(matches):
-            values = (
-                stock["code"],
-                stock["name"],
-                self._classification_text(stock["code"], stock["name"]),
-            )
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignCenter if col == 0 else Qt.AlignLeft | Qt.AlignVCenter)
-                item.setData(Qt.UserRole, value)
-                self.result_table.setItem(row, col, item)
-        self._apply_result_sort()
-        self._update_register_button_enabled()
+        self._populate_result_table(matches, source="SEARCH")
+        self._request_market_snapshot(search_generation)
         if notify_empty and not matches:
             self._toast("검색 결과가 없습니다.")
+
+    def _populate_result_table(
+        self,
+        stocks: list[dict[str, object]],
+        *,
+        source: str,
+    ) -> None:
+        self.result_table.setSortingEnabled(False)
+        self.result_table.setRowCount(len(stocks))
+        self._search_stock_codes = set()
+        for row, stock in enumerate(stocks):
+            full_status_text = self._stock_status_full_text(stock.get("status"))
+            status_display_text = self._elided_stock_status_text(full_status_text)
+            instrument_classification = (
+                str(stock.get("classification", "") or "-").strip() or "-"
+            )
+            values = (
+                stock.get("code", ""),
+                stock.get("name", ""),
+                self._market_display_text(stock.get("market", "")),
+                self._classification_text(
+                    str(stock.get("code", "") or ""),
+                    str(stock.get("name", "") or ""),
+                ),
+                self._instrument_classification_display_text(
+                    instrument_classification
+                ),
+                "NXT" if stock.get("nxt_available") is True else "",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                status_display_text,
+            )
+            for col, value in enumerate(values):
+                item = (
+                    _NumericSnapshotTableWidgetItem(str(value))
+                    if col in self.NUMERIC_SNAPSHOT_COLUMNS
+                    else QTableWidgetItem(str(value))
+                )
+                item.setTextAlignment(
+                    self._stock_name_alignment(value)
+                    if col == self.NAME_COLUMN
+                    else Qt.AlignCenter
+                )
+                if col == self.NAME_COLUMN:
+                    item.setToolTip(self._stock_name_tooltip(value))
+                elif col == self.MARKET_COLUMN:
+                    color = self.MARKET_TEXT_COLORS.get(str(value or ""))
+                    if color:
+                        item.setForeground(QBrush(QColor(color)))
+                elif col == self.STOCK_STATUS_COLUMN:
+                    if full_status_text != "-":
+                        item.setToolTip(full_status_text)
+                item.setData(
+                    Qt.UserRole,
+                    (
+                        full_status_text
+                        if col == self.STOCK_STATUS_COLUMN
+                        else instrument_classification
+                        if col == self.INSTRUMENT_CLASSIFICATION_COLUMN
+                        else value
+                    ),
+                )
+                item.setData(self.RESULT_EVIDENCE_ROLE, source)
+                self.result_table.setItem(row, col, item)
+            code = normalize_stock_code(stock.get("code", ""))
+            if code:
+                self._search_stock_codes.add(code)
+            ranking_snapshot = stock.get("ranking_snapshot")
+            if isinstance(ranking_snapshot, dict):
+                self._market_snapshot_by_code[code] = dict(ranking_snapshot)
+                self._apply_market_snapshot_to_row(row, dict(ranking_snapshot))
+        self._apply_result_sort()
+        self._update_register_button_enabled()
+        self._update_ranking_column_highlight()
+        self._apply_general_stock_visibility()
+
+    def request_stock_ranking(self, source: str) -> None:
+        clean_source = str(source or "").strip().upper()
+        if clean_source not in {item[0] for item in self.RANKING_BADGES}:
+            return
+        self._search_generation += 1
+        request_generation = self._search_generation
+        self._result_source = clean_source
+        self._active_ranking_source = ""
+        self._update_ranking_badge_styles()
+        self._update_ranking_column_highlight()
+        self._search_stock_codes = set()
+        self._market_snapshot_by_code = {}
+        self._market_snapshot_request_result = {}
+        self._last_market_snapshot_result = {}
+        self._ranking_request_result = {}
+        self._last_ranking_result = {}
+        self.result_table.setRowCount(0)
+        self._update_register_button_enabled()
+
+        request = getattr(self.kiwoom_api, "request_stock_ranking_snapshot", None)
+        if not callable(request):
+            self._ranking_request_result = {
+                "ok": False,
+                "error": "stock ranking snapshot API is unavailable",
+            }
+            return
+        try:
+            result = request(
+                clean_source,
+                callback=lambda payload, generation=request_generation, expected=clean_source: (
+                    self._on_stock_ranking_result(generation, expected, payload)
+                ),
+            )
+        except Exception as exc:
+            self._ranking_request_result = {
+                "ok": False,
+                "error": str(exc),
+            }
+            return
+        self._ranking_request_result = (
+            dict(result) if isinstance(result, dict) else {"ok": False}
+        )
+
+    def _on_stock_ranking_result(
+        self,
+        request_generation: int,
+        expected_source: str,
+        result: object,
+    ) -> None:
+        if (
+            request_generation != self._search_generation
+            or expected_source != self._result_source
+            or sip.isdeleted(self)
+        ):
+            return
+        payload = dict(result) if isinstance(result, dict) else {}
+        self._last_ranking_result = payload
+        if payload.get("ok") is not True:
+            return
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return
+
+        library_snapshot = load_stock_library_snapshot()
+        self.stock_source = library_snapshot.source
+        library_by_code = {
+            normalize_stock_code(item.get("code", "")): dict(item)
+            for item in library_snapshot.records
+            if normalize_stock_code(item.get("code", ""))
+        }
+        stocks: list[dict[str, object]] = []
+        seen_codes: set[str] = set()
+        for raw_row in rows:
+            if not isinstance(raw_row, dict):
+                continue
+            code = normalize_stock_code(raw_row.get("stock_code", ""))
+            if not code or code in seen_codes:
+                continue
+            library_stock = library_by_code.get(code, {})
+            name = str(
+                raw_row.get("stock_name")
+                or library_stock.get("name")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            stocks.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "market": library_stock.get("market", ""),
+                    "nxt_available": library_stock.get("nxt_available"),
+                    "status": library_stock.get("status"),
+                    "classification": library_stock.get("classification"),
+                    "ranking_snapshot": dict(raw_row),
+                }
+            )
+            seen_codes.add(code)
+            if len(stocks) >= 100:
+                break
+
+        self._populate_result_table(stocks, source=expected_source)
+        if stocks:
+            self._active_ranking_source = expected_source
+            self._update_ranking_badge_styles()
+            self._update_ranking_column_highlight()
+        self._request_market_snapshot(request_generation)
+
+    def _request_market_snapshot(self, search_generation: int) -> None:
+        if not self._search_stock_codes:
+            return
+        request = getattr(self.kiwoom_api, "request_initial_market_snapshot", None)
+        if not callable(request):
+            return
+        try:
+            result = request(
+                tuple(sorted(self._search_stock_codes)),
+                callback=lambda payload, generation=search_generation: (
+                    self._on_market_snapshot_result(generation, payload)
+                ),
+            )
+        except Exception as exc:
+            self._market_snapshot_request_result = {
+                "ok": False,
+                "error": str(exc),
+            }
+            return
+        self._market_snapshot_request_result = (
+            dict(result) if isinstance(result, dict) else {"ok": False}
+        )
+
+    def _on_market_snapshot_result(
+        self,
+        search_generation: int,
+        result: object,
+    ) -> None:
+        if search_generation != self._search_generation or sip.isdeleted(self):
+            return
+        payload = dict(result) if isinstance(result, dict) else {}
+        self._last_market_snapshot_result = payload
+        if payload.get("ok") is not True:
+            return
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return
+
+        selected_codes = self._selected_result_stock_codes()
+        self.result_table.setSortingEnabled(False)
+        for raw_row in rows:
+            if not isinstance(raw_row, dict):
+                continue
+            code = normalize_stock_code(raw_row.get("stock_code", ""))
+            if code not in self._search_stock_codes:
+                continue
+            row = self._find_result_row_by_stock_code(code)
+            if row < 0:
+                continue
+            snapshot = dict(raw_row)
+            self._market_snapshot_by_code[code] = snapshot
+            self._apply_market_snapshot_to_row(row, snapshot)
+        self._apply_result_sort()
+        self._restore_result_selection(selected_codes)
+
+    def _apply_market_snapshot_to_row(
+        self,
+        row: int,
+        snapshot: dict[str, object],
+    ) -> None:
+        values = {
+            self.CURRENT_PRICE_COLUMN: (
+                snapshot.get("current_price"),
+                self._format_snapshot_integer(snapshot.get("current_price")),
+            ),
+            self.CHANGE_RATE_COLUMN: (
+                snapshot.get("change_rate"),
+                self._format_snapshot_percent(snapshot.get("change_rate")),
+            ),
+            self.EXECUTION_STRENGTH_COLUMN: (
+                snapshot.get("execution_strength"),
+                self._format_snapshot_decimal(snapshot.get("execution_strength")),
+            ),
+            self.PREVIOUS_DAY_VOLUME_RATE_COLUMN: (
+                snapshot.get("previous_day_volume_rate"),
+                self._format_snapshot_percent(
+                    snapshot.get("previous_day_volume_rate")
+                ),
+            ),
+            self.TRADING_VALUE_COLUMN: (
+                snapshot.get("cumulative_trading_value"),
+                self._format_snapshot_trading_value(
+                    snapshot.get("cumulative_trading_value")
+                ),
+            ),
+            self.VOLUME_COLUMN: (
+                snapshot.get("cumulative_volume"),
+                self._format_snapshot_volume(snapshot.get("cumulative_volume")),
+            ),
+            self.MARKET_CAP_COLUMN: (
+                snapshot.get("market_capitalization"),
+                self._format_snapshot_market_cap(
+                    snapshot.get("market_capitalization")
+                ),
+            ),
+        }
+        for column, (sort_value, display_text) in values.items():
+            item = self.result_table.item(row, column)
+            if item is None:
+                item = _NumericSnapshotTableWidgetItem()
+                self.result_table.setItem(row, column, item)
+            item.setText(display_text)
+            item.setData(Qt.UserRole, sort_value)
+            item.setTextAlignment(Qt.AlignCenter)
+
+    @staticmethod
+    def _snapshot_number(value: object) -> int | float | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return int(number) if number.is_integer() else number
+
+    @classmethod
+    def _format_snapshot_integer(cls, value: object) -> str:
+        number = cls._snapshot_number(value)
+        return "-" if number is None else f"{int(number):,}"
+
+    @staticmethod
+    def _compact_one_decimal(value: int | float) -> str:
+        return f"{float(value):.1f}".rstrip("0").rstrip(".")
+
+    @classmethod
+    def _format_snapshot_volume(cls, value: object) -> str:
+        """Format OPTKWFID FID 13, whose raw unit is one share."""
+        number = cls._snapshot_number(value)
+        if number is None:
+            return "-"
+        if number >= 100_000_000:
+            return f"{cls._compact_one_decimal(number / 100_000_000)}억주"
+        return f"{int(number):,}주"
+
+    @classmethod
+    def _format_snapshot_trading_value(cls, value: object) -> str:
+        """Format OPTKWFID FID 14, whose raw unit is one million won."""
+        number = cls._snapshot_number(value)
+        if number is None:
+            return "-"
+        if number >= 100:
+            return f"{int(number // 100):,}억"
+        manwon = number * 100
+        return f"{int(manwon):,}만원"
+
+    @classmethod
+    def _format_snapshot_market_cap(cls, value: object) -> str:
+        """Format OPTKWFID FID 311, whose raw unit is one hundred million won."""
+        number = cls._snapshot_number(value)
+        if number is None:
+            return "-"
+        if number >= 1:
+            return f"{int(number):,}억"
+        return f"{int(number * 10_000):,}만원"
+
+    @classmethod
+    def _format_snapshot_decimal(cls, value: object) -> str:
+        number = cls._snapshot_number(value)
+        return "-" if number is None else f"{float(number):.2f}"
+
+    @classmethod
+    def _format_snapshot_percent(cls, value: object) -> str:
+        number = cls._snapshot_number(value)
+        return "-" if number is None else format_signed_percent(number)
+
+    @staticmethod
+    def _stock_status_full_text(value: object) -> str:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            parts = [str(item or "").strip() for item in value]
+            text = " | ".join(part for part in parts if part)
+        else:
+            text = str(value or "").strip()
+        return text if text else "-"
+
+    def _stock_status_text_available_width(self) -> int:
+        item_margin = self.result_table.style().pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.result_table,
+        ) + 1
+        section_border_width = self.result_table.style().pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table,
+        ) if self.result_table.showGrid() else 0
+        return max(
+            0,
+            self.result_table.columnWidth(self.STOCK_STATUS_COLUMN)
+            - (item_margin * 2)
+            - section_border_width,
+        )
+
+    def _elided_stock_status_text(self, full_text: str) -> str:
+        text = str(full_text or "-")
+        metrics = self.result_table.fontMetrics()
+        available_width = self._stock_status_text_available_width()
+        if metrics.horizontalAdvance(text) <= available_width:
+            return text
+        suffix = "..."
+        prefix = text
+        while prefix and metrics.horizontalAdvance(prefix + suffix) > available_width:
+            prefix = prefix[:-1]
+        return prefix + suffix
+
+    @staticmethod
+    def _market_display_text(market: object) -> str:
+        return {
+            "KOSPI": "KOSPI",
+            "KOSDAQ": "코스닥",
+        }.get(str(market or "").strip().upper(), "")
+
+    def _stock_name_tooltip(self, stock_name: object) -> str:
+        text = str(stock_name or "")
+        style = self.result_table.style()
+        item_margin = style.pixelMetric(
+            QStyle.PM_FocusFrameHMargin,
+            None,
+            self.result_table,
+        ) + 1
+        section_border_width = style.pixelMetric(
+            QStyle.PM_DefaultFrameWidth,
+            None,
+            self.result_table,
+        ) if self.result_table.showGrid() else 0
+        available_width = max(
+            0,
+            self.result_table.columnWidth(self.NAME_COLUMN)
+            - (item_margin * 2)
+            - section_border_width,
+        )
+        return (
+            text
+            if self.result_table.fontMetrics().horizontalAdvance(text) > available_width
+            else ""
+        )
+
+    def _stock_name_alignment(self, stock_name: object) -> Qt.Alignment:
+        return (
+            Qt.AlignLeft | Qt.AlignVCenter
+            if self._stock_name_tooltip(stock_name)
+            else Qt.AlignCenter
+        )
 
     def on_result_header_clicked(self, column: int) -> None:
         if column == self._result_sort_column:
@@ -390,10 +1439,12 @@ class InstanceStockSearchRegisterDialog(QDialog):
             self._result_sort_column,
             self._result_sort_order,
         )
+        self.result_table.horizontalHeader().setSortIndicatorShown(False)
         self.result_table.sortItems(
             self._result_sort_column,
             self._result_sort_order,
         )
+        self._apply_general_stock_visibility()
 
     def _toast(self, message: str) -> None:
         show_toast(self, message)
@@ -508,8 +1559,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
         menu.exec_(self.result_table.viewport().mapToGlobal(pos))
 
     def _result_stock_at_row(self, row: int) -> tuple[str, str] | None:
-        code_item = self.result_table.item(row, 0)
-        name_item = self.result_table.item(row, 1)
+        code_item = self.result_table.item(row, self.CODE_COLUMN)
+        name_item = self.result_table.item(row, self.NAME_COLUMN)
         if code_item is None or name_item is None:
             return None
         code = normalize_stock_code(code_item.text())
@@ -587,7 +1638,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
     def _find_result_row_by_stock_code(self, code: str) -> int:
         target_code = normalize_stock_code(code)
         for row in range(self.result_table.rowCount()):
-            item = self.result_table.item(row, 0)
+            item = self.result_table.item(row, self.CODE_COLUMN)
             if item is None:
                 continue
             if normalize_stock_code(item.text()) == target_code:
@@ -600,7 +1651,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
         if selection_model is None:
             return selected_codes
         for index in selection_model.selectedRows():
-            item = self.result_table.item(index.row(), 0)
+            item = self.result_table.item(index.row(), self.CODE_COLUMN)
             if item is not None:
                 selected_codes.add(normalize_stock_code(item.text()))
         return selected_codes
@@ -624,13 +1675,13 @@ class InstanceStockSearchRegisterDialog(QDialog):
         stock_code, stock_name = stock
         selected_codes = self._selected_result_stock_codes()
         classification = self._classification_text(stock_code, stock_name)
-        item = self.result_table.item(row, 2)
+        item = self.result_table.item(row, self.CATEGORY_COLUMN)
         if item is None:
             item = QTableWidgetItem()
-            self.result_table.setItem(row, 2, item)
+            self.result_table.setItem(row, self.CATEGORY_COLUMN, item)
         item.setText(classification)
         item.setData(Qt.UserRole, classification)
-        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        item.setTextAlignment(Qt.AlignCenter)
         self._apply_result_sort()
         self._restore_result_selection(selected_codes)
         return True
@@ -705,6 +1756,9 @@ class InstanceStockSearchRegisterDialog(QDialog):
             and is_valid_stock_code(code)
         )
 
+    def _valid_result_stock(self, row: int, code: str, name: str) -> bool:
+        return self._valid_library_stock(code, name)
+
     def _assignment_block_reason(self, code: str, name: str) -> str:
         can_process, guard_info = routine_action_reasons_for_stock(
             code,
@@ -728,18 +1782,24 @@ class InstanceStockSearchRegisterDialog(QDialog):
         if needs_registration and not append_base_stock(code, name):
             return False
 
-        repo = StockRepository(PROJECT_ROOT)
-        if not update_base_stock_routine_instance(
+        from stock_assignment_registration_service import (
+            register_unassigned_stock_to_instance,
+        )
+
+        result = register_unassigned_stock_to_instance(
+            PROJECT_ROOT,
             code,
             name,
             instance_id=instance_id,
             instance_name=instance_name,
             definition_id=definition_id,
             routine_type=routine_type,
-        ):
+        )
+        if not result.success or not result.changed:
             return False
 
         try:
+            repo = StockRepository(PROJECT_ROOT)
             stock_dir = repo.ensure_stock_folder(code, name, routine=routine_type)
             ensure_single_real_trade_routine_for_stock(code, name, routine_type)
         except Exception:
@@ -772,7 +1832,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             ("blocked", "차단"),
             ("move_cancelled", "등록 취소"),
             ("failed", "처리불가"),
-            ("invalid", "처리불가"),
+            ("invalid", "검증실패"),
         )
         parts = [
             f"{label} {int(counts.get(key, 0))}건"
@@ -788,7 +1848,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         if not selected_rows:
             self._toast("등록할 종목을 선택하세요.")
             return False
-
         target = self._target_instance()
         if target is None:
             self._toast("대상 루틴 정보를 확인하지 못했습니다.")
@@ -815,7 +1874,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 counts["invalid"] += 1
                 continue
             code, name = result_stock
-            if not code or code in seen_codes or not self._valid_library_stock(code, name):
+            if not code or code in seen_codes or not self._valid_result_stock(row, code, name):
                 counts["invalid"] += 1
                 continue
             seen_codes.add(code)
@@ -837,10 +1896,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             if assigned_instance_id == instance_id:
                 counts["duplicate"] += 1
             elif assigned_instance_id:
-                if self._assignment_block_reason(code, name):
-                    counts["blocked"] += 1
-                else:
-                    move_targets.append((code, name))
+                counts["blocked"] += 1
             else:
                 new_targets.append((code, name, stock is None))
 
@@ -911,7 +1967,6 @@ class InstanceStockSearchRegisterDialog(QDialog):
         if result_stock is None:
             self._toast("처리할 종목을 확인하지 못했습니다.")
             return False
-
         code, name = result_stock
         target = self._target_instance()
         if target is None:
@@ -919,8 +1974,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
             return False
         instance_id, instance_name, definition_id, routine_type = target
 
-        if not self._valid_library_stock(code, name):
-            self._toast("종목 정보를 확인하지 못했습니다.")
+        if not self._valid_result_stock(row, code, name):
+            self._toast("선택한 종목의 등록 Evidence가 유효하지 않습니다.")
             return False
 
         stock = self._registered_stock(code)
@@ -953,21 +2008,8 @@ class InstanceStockSearchRegisterDialog(QDialog):
             return False
 
         if assigned_instance_id and assigned_instance_id != instance_id:
-            reason_text = self._assignment_block_reason(code, name)
-            if reason_text:
-                self._toast(reason_text)
-                return False
-            answer = QMessageBox.question(
-                self,
-                "종목등록",
-                "이 종목은 다른 루틴에 지정되어 있습니다.\n"
-                "현재 루틴으로 지정을 변경하시겠습니까?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                self._toast("등록 취소")
-                return False
+            self._toast("다른 루틴에 등록된 종목입니다. 기존 등록전환 경로를 사용하세요.")
+            return False
 
         newly_registered = False
         if stock is None:
@@ -994,6 +2036,83 @@ class InstanceStockSearchRegisterDialog(QDialog):
         else:
             self._toast("종목 지정이 완료됐습니다.")
         return True
+
+
+_INSTANCE_STOCK_SEARCH_DIALOGS: dict[str, InstanceStockSearchRegisterDialog] = {}
+
+
+def open_instance_stock_search_register_dialog(
+    owner: QWidget,
+    metadata: dict[str, object],
+    *,
+    owner_attribute: str = "instance_stock_search_register_window",
+    delete_on_close: bool = False,
+    finished_callback=None,
+) -> InstanceStockSearchRegisterDialog:
+    """Open one process-wide search dialog per target Instance."""
+    target_id = str(metadata.get("instance_id", "") or "").strip()
+    target_kind = str(metadata.get("target_kind", "") or "").strip()
+    target_key = target_id or f"kind:{target_kind or 'unassigned'}"
+    dialogs = _INSTANCE_STOCK_SEARCH_DIALOGS
+
+    existing = dialogs.get(target_key)
+    if existing is not None:
+        try:
+            if not sip.isdeleted(existing):
+                if existing.parentWidget() is not owner:
+                    existing.setParent(owner, existing.windowFlags() | Qt.Window)
+                setattr(owner, owner_attribute, existing)
+                owner_refs = getattr(existing, "_registration_dialog_owner_refs", [])
+                owner_ref = (owner, owner_attribute)
+                if owner_ref not in owner_refs:
+                    owner_refs.append(owner_ref)
+                existing._registration_dialog_owner_refs = owner_refs
+                if existing.isMinimized():
+                    existing.showNormal()
+                else:
+                    existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return existing
+        except RuntimeError:
+            pass
+        dialogs.pop(target_key, None)
+
+    dialog = InstanceStockSearchRegisterDialog(
+        owner,
+        instance_metadata=dict(metadata),
+    )
+    if delete_on_close:
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+    dialogs[target_key] = dialog
+    setattr(owner, owner_attribute, dialog)
+    dialog._registration_dialog_owner_refs = [(owner, owner_attribute)]
+    if callable(finished_callback):
+        dialog.finished.connect(finished_callback)
+
+    def clear_dialog(_obj=None, *, target=dialog, key=target_key) -> None:
+        if dialogs.get(key) is target:
+            dialogs.pop(key, None)
+        owner_refs = tuple(getattr(target, "_registration_dialog_owner_refs", ()))
+        for target_owner, attribute_name in owner_refs:
+            try:
+                if getattr(target_owner, attribute_name, None) is target:
+                    try:
+                        setattr(target_owner, attribute_name, None)
+                    except RuntimeError:
+                        continue
+            except RuntimeError:
+                continue
+        target._registration_dialog_owner_refs = []
+
+    dialog.destroyed.connect(clear_dialog)
+    closed_signal = getattr(dialog, "closed", None)
+    if closed_signal is not None:
+        closed_signal.connect(clear_dialog)
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog
 
 
 def auto_trade_register_historical_stock_to_original_instance(
@@ -1112,6 +2231,7 @@ from gui_ats_utils import (
     manual_ats_session_labels,
 )
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_AMBER_TEXT_COLOR,
     AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
     AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
@@ -1132,10 +2252,12 @@ from gui_auto_trade_display import (
     SORT_ROLE,
     SortableTableWidgetItem,
 )
+from gui_auto_trade_policy import preserve_active_participant_start_budget_fields
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_policy import (
     auto_trade_setting_ats_after_regular_blocked,
     auto_trade_setting_current_session_trade_started,
+    auto_trade_setting_start_target_decision,
     auto_trade_setting_trade_started,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_no_next_step_notice,
@@ -1179,7 +2301,7 @@ from gui_auto_trade_integrity import (
     operator_review_reason,
     auto_trade_setting_server_mismatch_detected,
 )
-from gui_stock_performance_window import open_stock_performance_prototype
+from gui_stock_performance_window import open_stock_performance
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
@@ -1213,8 +2335,10 @@ from gui_auto_trade_close import (
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
     auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_execution_method_state,
     auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
+    auto_trade_set_selected_manual_ats_execution_method,
     auto_trade_set_selected_manual_ats_flag,
 )
 from gui_auto_trade_timer import (
@@ -1246,6 +2370,7 @@ from gui_auto_trade_status_ops import (
     handle_auto_trade_operation_mode_double_click,
 )
 from gui_auto_trade_run_control import (
+    _show_operation_start_summary_toast,
     auto_trade_registered_operation_start_targets,
     auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
@@ -1274,6 +2399,7 @@ from gui_auto_trade_table_loader import (
 )
 from gui_routine_service import (
     ensure_single_real_trade_routine_for_stock,
+    set_stock_real_trade_enabled,
 )
 from gui_operation_environment import (
     OperationEnvironmentSettingsDialog,
@@ -1288,6 +2414,7 @@ from gui_review_required_window import (
 from gui_routine_registry import (
     get_group_dirs as registry_get_group_dirs,
     get_group_records,
+    group_record_by_id,
     routine_display_name as registry_routine_display_name,
     read_routine_budget,
 )
@@ -1360,6 +2487,7 @@ ROUTINE_TREE_STOCK_TITLE_DISPLAY_CHARS = 7
 ROUTINE_TREE_STOCK_TITLE_PREFIX_CHARS = 7
 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
 AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR = "#4B5563"
 AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = AUTO_TRADE_SETTING_BADGE_HEIGHT
 AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
 AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
@@ -1821,6 +2949,45 @@ class SelectedTextReadableDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
 
 
+class ClippedTextItemDelegate(QStyledItemDelegate):
+    """Clip overflowing text at the cell edge without drawing an ellipsis."""
+
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        selected_text_color: QColor | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.selected_text_color = selected_text_color
+
+    def paint(self, painter, option, index) -> None:
+        clipped_option = QStyleOptionViewItem(option)
+        self.initStyleOption(clipped_option, index)
+        style = option.widget.style() if option.widget is not None else QApplication.style()
+        text = clipped_option.text
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText,
+            clipped_option,
+            option.widget,
+        )
+        clipped_option.text = ""
+        style.drawControl(QStyle.CE_ItemViewItem, clipped_option, painter, option.widget)
+        painter.save()
+        painter.setClipRect(text_rect, Qt.IntersectClip)
+        painter.setFont(option.font)
+        if option.state & QStyle.State_Selected and self.selected_text_color is not None:
+            painter.setPen(self.selected_text_color)
+        else:
+            painter.setPen(
+                clipped_option.palette.highlightedText().color()
+                if option.state & QStyle.State_Selected
+                else clipped_option.palette.text().color()
+            )
+        painter.drawText(text_rect, int(clipped_option.displayAlignment), text)
+        painter.restore()
+
+
 class AutoTradeNotificationPopup(QFrame):
     """자동매매설정창 안에서 쓰는 버튼 없는 비모달 자동닫힘 알림."""
 
@@ -2264,6 +3431,16 @@ def _record_fill_and_position_from_chejan(
         return fill_result, position_result, None, reconciliation
 
     completed_steps.append("POSITION_UPDATE")
+    if _clean_runtime_text(position_result.get("position_stage")) == "later_cumulative_fill_already_applied":
+        reconciliation = mark_chejan_reconciliation_state(
+            ORDER_QUEUE_PATH,
+            chejan_result,
+            required=False,
+            completed_steps=completed_steps,
+            context=live_context,
+        )
+        return fill_result, position_result, None, reconciliation
+
     realized_pnl_result = None
     canonical_root = Path(FILLS_PATH).parent
     if canonical_root.name == "runtime":
@@ -2516,6 +3693,18 @@ class StockPolicyOverrideDialog(QDialog):
         self.memo.setPlainText(str(self.config.get("policy_override_memo", "")))
 
     def write_config(self) -> None:
+        current_config = read_json_dict(self.config_path)
+        if not isinstance(current_config, dict):
+            current_config = {}
+        self.config, self._start_budget_preservation_result = (
+            preserve_active_participant_start_budget_fields(
+                self,
+                self.code,
+                current_config,
+                self.config,
+                current_state=read_json_dict(self.stock_dir / "state.json"),
+            )
+        )
         self.config["updated_at"] = now_text()
         self.config_path.write_text(
             json.dumps(self.config, ensure_ascii=False, indent=2) + "\n",
@@ -2653,28 +3842,6 @@ def delete_routine_instance_with_existing_policy(
     if not instance_id:
         return
 
-    assigned_stocks: list[dict[str, object]] = []
-    for stock in read_base_stocks():
-        assigned_instance_id = str(
-            stock.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        stock_path = str(stock.get("stock_path", "") or "").strip()
-        if not assigned_instance_id and stock_path:
-            config = read_json_dict(PROJECT_ROOT / stock_path / "config.json")
-            assigned_instance_id = str(
-                config.get("assigned_routine_instance_id", "") or ""
-            ).strip()
-        if assigned_instance_id == instance_id:
-            assigned_stocks.append(stock)
-    if assigned_stocks:
-        QMessageBox.warning(
-            window,
-            "등록삭제",
-            "연결된 종목이 있는 루틴은 삭제할 수 없습니다.\n"
-            "매매루틴등록 창에서 종목의 루틴 연결을 먼저 해제하세요.",
-        )
-        return
-
     answer = QMessageBox.question(
         window,
         "등록삭제",
@@ -2685,15 +3852,136 @@ def delete_routine_instance_with_existing_policy(
     if answer != QMessageBox.Yes:
         return
 
-    result = RoutineInstanceRepository(PROJECT_ROOT).delete_instance(instance_id)
+    from routine_instance_deletion_service import (
+        collect_routine_instance_deletion_scope,
+        delete_routine_instance_completely,
+    )
+
+    try:
+        scope = collect_routine_instance_deletion_scope(PROJECT_ROOT, instance_id)
+        running_stock_dirs = [
+            stock_dir
+            for stock_dir, _code, _name in auto_trade_running_registered_operation_targets(window)
+        ]
+    except Exception as exc:
+        QMessageBox.warning(window, "등록삭제", str(exc))
+        return
+    result = delete_routine_instance_completely(
+        scope,
+        running_stock_dirs=running_stock_dirs,
+    )
     if not result.success:
+        reason = result.error
+        if result.blocked:
+            reason = "\n".join(block.message for block in result.blocked)
         QMessageBox.warning(
             window,
             "등록삭제",
-            result.error or "루틴 등록을 삭제하지 못했습니다.",
+            reason or "루틴 등록을 삭제하지 못했습니다.",
         )
         return
+    append_production_event(
+        "ROUTINE_INSTANCE_DELETED",
+        result="COMPLETED",
+        source="gui_auto_trade_setting_window.delete_routine_instance_with_existing_policy",
+        target_type="ROUTINE_INSTANCE",
+        target_id=instance_id,
+        target_name=instance_name,
+        details={
+            "unassigned_stock_codes": list(result.cleared_stock_codes),
+            "before_assignment": instance_id,
+            "after_assignment": "UNASSIGNED",
+        },
+    )
     window.refresh_all()
+
+
+def clone_routine_instance_with_existing_policy(
+    owner: QWidget,
+    metadata: dict[str, object],
+    *,
+    owning_group_ids: set[str] | None = None,
+    group_record: object | None = None,
+) -> bool:
+    """Clone one canonical RoutineInstance through the existing registration workflow."""
+    if str(metadata.get("row_kind", "") or "") != "instance":
+        return False
+
+    group_id = str(metadata.get("group_id", "") or "").strip()
+    instance_id = str(metadata.get("instance_id", "") or "").strip()
+    if not group_id or not instance_id:
+        QMessageBox.warning(owner, "루틴 복제", "복제할 루틴의 Group 귀속을 확인할 수 없습니다.")
+        return False
+
+    if owning_group_ids is not None:
+        normalized_group_ids = {
+            str(candidate or "").strip()
+            for candidate in owning_group_ids
+            if str(candidate or "").strip()
+        }
+        if normalized_group_ids != {group_id}:
+            QMessageBox.warning(
+                owner,
+                "루틴 복제",
+                "원본 루틴의 Group 귀속을 하나로 확인할 수 없어 복제할 수 없습니다.",
+            )
+            return False
+
+    instance = routine_instance_by_id(instance_id)
+    if instance is None:
+        QMessageBox.warning(owner, "루틴 복제", "복제할 루틴 설정을 확인할 수 없습니다.")
+        return False
+    if owning_group_ids is None:
+        instance_group_id = str(getattr(instance, "group_id", "") or "").strip()
+        if instance_group_id != group_id:
+            QMessageBox.warning(
+                owner,
+                "루틴 복제",
+                "원본 루틴의 Group 귀속을 하나로 확인할 수 없어 복제할 수 없습니다.",
+            )
+            return False
+
+    definition_id = str(getattr(instance, "definition_id", "") or "").strip()
+    definition = routine_definition_by_id(definition_id) if definition_id else None
+    rules_path = getattr(instance, "rules_path", None)
+    if definition is None or rules_path is None:
+        QMessageBox.warning(owner, "루틴 복제", "복제할 루틴 설정을 확인할 수 없습니다.")
+        return False
+
+    source_group = group_record if group_record is not None else group_record_by_id(group_id)
+    group_display_name = str(
+        getattr(source_group, "display_name", "") or ""
+    ).strip()
+    if not group_display_name:
+        QMessageBox.warning(owner, "루틴 복제", "원본 루틴의 Group을 확인할 수 없습니다.")
+        return False
+
+    def rules_provider() -> dict[str, object]:
+        try:
+            rules = json.loads(Path(rules_path).read_text(encoding="utf-8"))
+            if not isinstance(rules, dict):
+                raise ValueError("rules.json root must be an object")
+            return {"success": True, "rules": rules, "error": ""}
+        except Exception as exc:
+            return {"success": False, "rules": {}, "error": str(exc)}
+
+    from gui_indicator_follow_routine_settings_dialog import (
+        register_routine_instance_snapshot,
+    )
+
+    return register_routine_instance_snapshot(
+        owner,
+        definition_id=definition_id,
+        definition_display_name=str(
+            getattr(definition, "display_name", "") or ""
+        ).strip(),
+        group_id=group_id,
+        group_display_name=group_display_name,
+        source_instance_display_name=str(
+            getattr(instance, "display_name", "") or ""
+        ).strip(),
+        rules_provider=rules_provider,
+    ) is not None
 
 
 def open_routine_settings_dialog_for_owner(
@@ -3151,7 +4439,8 @@ class AutoTradeSettingWindow(QDialog):
         self.selected_routine_name_button.setFocusPolicy(Qt.NoFocus)
         self.selected_routine_name_button.setCursor(Qt.PointingHandCursor)
         self.selected_routine_name_button.setStyleSheet(
-            "QPushButton { background: transparent; border: none; color: #111827; "
+            "QPushButton { background: transparent; border: none; "
+            f"color: {AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR}; "
             "font-weight: 600; padding: 0 2px; text-align: left; }"
             "QPushButton:hover { color: #1D4ED8; }"
         )
@@ -3195,7 +4484,8 @@ class AutoTradeSettingWindow(QDialog):
             button.setFocusPolicy(Qt.NoFocus)
             button.setCursor(Qt.PointingHandCursor)
             button.setStyleSheet(
-                "QPushButton { background: transparent; border: none; color: #374151; padding: 0 2px; }"
+                "QPushButton { background: transparent; border: none; "
+                f"color: {AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR}; padding: 0 2px; }}"
                 "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
             )
             button.clicked.connect(lambda _checked=False, key=filter_key: self.set_stock_status_filter(key))
@@ -3241,10 +4531,12 @@ class AutoTradeSettingWindow(QDialog):
         all_stocks_scope_active = bool(
             getattr(self, "_all_stocks_scope_active", False)
         )
-        stock_display_scope_active = (
-            str(getattr(self, "_routine_tree_display_level", "") or "") == "stock"
+        all_stocks_badge_text_color = (
+            AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+            if all_stocks_scope_active
+            else AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
         )
-        all_stocks_badge_color = (
+        all_stocks_badge_border_color = (
             AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
             if all_stocks_scope_active
             else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
@@ -3254,14 +4546,14 @@ class AutoTradeSettingWindow(QDialog):
             all_stocks_button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
-                    text_color=all_stocks_badge_color,
-                    border_color=all_stocks_badge_color,
+                    text_color=all_stocks_badge_text_color,
+                    border_color=all_stocks_badge_border_color,
                 )
             )
-        if all_stocks_scope_active or stock_display_scope_active:
+        if all_stocks_scope_active:
             counts = (
-                self._stock_display_scope_summary()
-                if stock_display_scope_active
+                self._left_flat_filter_stock_scope_summary()
+                if self._left_flat_filter_scope_active()
                 else self._all_stocks_scope_summary()
             )
             self.selected_routine_signal_label.hide()
@@ -3288,6 +4580,7 @@ class AutoTradeSettingWindow(QDialog):
                 self.selected_routine_instance_count_badge.hide()
                 counts = {
                     "registered": 0,
+                    "normal": 0,
                     "operation_running": 0,
                     "waiting": 0,
                     "excluded": 0,
@@ -3300,52 +4593,29 @@ class AutoTradeSettingWindow(QDialog):
                     self.selected_routine_name_button.setText(str(metadata.get("instance_name", "") or "-"))
                     self.selected_routine_instance_count_badge.setText("")
                     self.selected_routine_instance_count_badge.hide()
-                    if row_kind == "stock":
-                        instance_id = str(metadata.get("instance_id", "") or "").strip()
-                        instance_counts = self._routine_instance_operation_counts().get(
-                            instance_id,
-                            {
-                                "registered": 0,
-                                "operation_running": 0,
-                                "waiting": 0,
-                                "excluded": 0,
-                                "review": 0,
-                            },
-                        )
-                        counts = {
-                            "registered": int(instance_counts.get("registered", 0) or 0),
-                            "operation_running": int(instance_counts.get("operation_running", 0) or 0),
-                            "waiting": int(instance_counts.get("waiting", 0) or 0),
-                            "excluded": int(instance_counts.get("excluded", 0) or 0),
-                            "review": int(instance_counts.get("review", instance_counts.get("error", 0)) or 0),
-                        }
-                    else:
-                        counts = None
+                    counts = self._stock_display_scope_summary()
                 else:
                     self.selected_routine_name_button.setText(str(metadata.get("definition_name", "") or "-"))
                     self.selected_routine_instance_count_badge.setText("")
                     self.selected_routine_instance_count_badge.hide()
-                    counts = None
-                if counts is None:
-                    counts = {
-                        "registered": int(metadata.get("registered", 0) or 0),
-                        "operation_running": int(metadata.get("operation_running", 0) or 0),
-                        "waiting": int(metadata.get("waiting", 0) or 0),
-                        "excluded": int(metadata.get("excluded", 0) or 0),
-                        "review": int(metadata.get("review", metadata.get("error", 0)) or 0),
-                    }
-        button_texts = {
-            "all": (
-                f"종목({counts['operation_running'] + counts['waiting']})"
-                if bool(
-                    getattr(
-                        self,
-                        "_selected_stock_normal_projection_active",
-                        False,
-                    )
+                    counts = self._stock_display_scope_summary()
+        projection_active = bool(
+            getattr(self, "_selected_stock_normal_projection_active", False)
+        )
+        stock_display_count = (
+            int(
+                counts.get(
+                    "normal",
+                    int(counts.get("operation_running", 0) or 0)
+                    + int(counts.get("waiting", 0) or 0),
                 )
-                else f"종목({counts['registered']})"
-            ),
+                or 0
+            )
+            if projection_active
+            else int(counts.get("registered", 0) or 0)
+        )
+        button_texts = {
+            "all": f"종목({stock_display_count})",
             "operation": f"운영({counts['operation_running']})",
             "waiting": f"대기({counts['waiting']})",
             "excluded": f"제외({counts['excluded']})",
@@ -3362,9 +4632,6 @@ class AutoTradeSettingWindow(QDialog):
         for key, button in self.selected_routine_status_buttons.items():
             button.setText(button_texts[key])
             is_active = key == current_filter
-            projection_active = bool(
-                getattr(self, "_selected_stock_normal_projection_active", False)
-            )
             active_color = (
                 CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR
                 if key == "all" and projection_active
@@ -3373,7 +4640,7 @@ class AutoTradeSettingWindow(QDialog):
             text_color = (
                 CONTEXT_MENU_EARLY_CLOSE_TEXT_COLOR
                 if key == "all" and projection_active
-                else active_color if is_active else "#374151"
+                else active_color if is_active else AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
             )
             button.setStyleSheet(
                 "QPushButton { background: transparent; border: none; "
@@ -3417,7 +4684,7 @@ class AutoTradeSettingWindow(QDialog):
         return summary
 
     def _stock_display_scope_summary(self) -> dict[str, int]:
-        """Summarize the full registered-stock scope for the flat Stock view."""
+        """Summarize the selected parent-instance stock scope."""
         summary = {
             "groups": 0,
             "routines": 0,
@@ -3428,6 +4695,9 @@ class AutoTradeSettingWindow(QDialog):
             "excluded": 0,
             "review": 0,
         }
+        target_instance_ids = self.current_selected_target_instance_ids()
+        if not target_instance_ids:
+            return summary
         snapshot = auto_trade_initial_read_snapshot(self)
         loaded_instances = (
             snapshot.get("instances", ())
@@ -3441,11 +4711,12 @@ class AutoTradeSettingWindow(QDialog):
         }
         counts_by_instance = self._routine_instance_operation_counts()
         group_ids: set[str] = set()
-        for instance_id, instance in instances.items():
+        for instance_id in target_instance_ids:
+            instance = instances.get(str(instance_id))
             counts = counts_by_instance.get(instance_id, {})
             if int(counts.get("registered", 0) or 0) <= 0:
                 continue
-            group_id = str(getattr(instance, "group_id", "") or "").strip()
+            group_id = str(getattr(instance, "group_id", "") or "").strip() if instance else ""
             if group_id:
                 group_ids.add(group_id)
             summary["routines"] += 1
@@ -3460,6 +4731,122 @@ class AutoTradeSettingWindow(QDialog):
                     )
                     or 0
                 )
+        summary["groups"] = len(group_ids)
+        return summary
+
+    def _left_flat_filter_scope_active(self) -> bool:
+        return (
+            bool(getattr(self, "_routine_tree_valid_only", False))
+            and str(
+                getattr(self, "_routine_tree_display_level", "") or ""
+            ).strip()
+            == "stock"
+            and str(
+                getattr(self, "_routine_tree_display_scope", "") or ""
+            ).strip()
+            in {"all", "current", "historical"}
+        )
+
+    def _right_stock_scope_mode(self) -> str:
+        return (
+            "FLAT_FILTER_SCOPE"
+            if self._left_flat_filter_scope_active()
+            else "HIERARCHICAL_SELECTION_SCOPE"
+        )
+
+    def _left_flat_filter_stock_codes(self) -> tuple[str, ...]:
+        if not self._left_flat_filter_scope_active():
+            return ()
+        codes: set[str] = set()
+        for row in range(self.routine_table.rowCount()):
+            item = self.routine_table.item(row, 0)
+            metadata = item.data(Qt.UserRole) if item is not None else None
+            if not isinstance(metadata, dict):
+                continue
+            if str(metadata.get("row_kind", "") or "") != "stock":
+                continue
+            code = normalize_stock_code(metadata.get("stock_code", ""))
+            if code:
+                codes.add(code)
+        return tuple(sorted(codes))
+
+    def _left_flat_filter_stock_scope_summary(self) -> dict[str, int]:
+        from gui_main_table_loader import _instance_stock_counts
+
+        summary = {
+            "groups": 0,
+            "routines": 0,
+            "registered": 0,
+            "normal": 0,
+            "operation_running": 0,
+            "waiting": 0,
+            "excluded": 0,
+            "review": 0,
+        }
+        target_codes = set(self._left_flat_filter_stock_codes())
+        if not target_codes:
+            return summary
+        snapshot = auto_trade_initial_read_snapshot(self)
+        stocks = (
+            snapshot.get("stocks", ())
+            if snapshot is not None
+            else read_base_stocks()
+        )
+        target_stock_paths = {
+            str(stock.get("stock_path", "") or "").strip()
+            for stock in stocks
+            if normalize_stock_code(stock.get("code", "")) in target_codes
+            and str(stock.get("stock_path", "") or "").strip()
+        }
+        if not target_stock_paths:
+            return summary
+        count_kwargs: dict[str, object] = {
+            "window": self,
+            "stock_paths": target_stock_paths,
+        }
+        if snapshot is not None:
+            count_kwargs["static_data"] = snapshot.get("count_static_data", {})
+            count_kwargs["state_by_stock_dir"] = {
+                stock_dir: data.get("state", {})
+                for stock_dir, data in snapshot.get(
+                    "stock_data_by_dir",
+                    {},
+                ).items()
+            }
+        counts_by_instance = _instance_stock_counts(**count_kwargs)
+        target_instance_ids = {
+            str(instance_id or "").strip()
+            for instance_id, counts in counts_by_instance.items()
+            if int(counts.get("registered", 0) or 0) > 0
+            and str(instance_id or "").strip()
+        }
+        for instance_id in target_instance_ids:
+            counts = counts_by_instance.get(instance_id, {})
+            for key in (
+                "registered",
+                "normal",
+                "operation_running",
+                "waiting",
+                "excluded",
+                "review",
+            ):
+                summary[key] += int(counts.get(key, 0) or 0)
+        loaded_instances = (
+            snapshot.get("instances", ())
+            if snapshot is not None
+            else load_persisted_routine_instances()
+        )
+        group_ids: set[str] = set()
+        for instance in loaded_instances:
+            instance_id = str(getattr(instance, "instance_id", "") or "").strip()
+            if instance_id not in target_instance_ids:
+                continue
+            summary["routines"] += 1
+            group_id = str(getattr(instance, "group_id", "") or "").strip()
+            definition_id = str(
+                getattr(instance, "definition_id", "") or ""
+            ).strip()
+            group_ids.add(group_id or f"definition:{definition_id}")
         summary["groups"] = len(group_ids)
         return summary
 
@@ -3644,6 +5031,8 @@ class AutoTradeSettingWindow(QDialog):
         vertical_header.setFixedWidth(40)
         self._stock_position_metric_delegate = StockPositionMetricDelegate(self.stock_table)
         self._stock_selected_text_delegate = SelectedTextReadableDelegate(self.stock_table)
+        self._stock_name_clip_delegate = ClippedTextItemDelegate(self.stock_table)
+        self.stock_table.setItemDelegateForColumn(1, self._stock_name_clip_delegate)
         for col in (2, 4, 5, 6):
             self.stock_table.setItemDelegateForColumn(
                 col,
@@ -3919,6 +5308,11 @@ class AutoTradeSettingWindow(QDialog):
         initial_refresh = bool(getattr(self, "_initializing_open_refresh", False))
         normalize_base_stock_single_routine_file()
         ensure_single_real_trade_routine_for_all_stocks()
+        from gui_main_table_loader import _invalidate_main_pnl_refresh_cache
+
+        # Config-backed exclusion is mutable; rebuild the aggregate input for
+        # this refresh so badges and row filters share the latest projection.
+        _invalidate_main_pnl_refresh_cache(self)
         if initial_refresh:
             self._auto_trade_initial_read_snapshot = (
                 self._build_initial_read_snapshot()
@@ -4254,7 +5648,7 @@ class AutoTradeSettingWindow(QDialog):
                 if stock_path and code:
                     targets.append((PROJECT_ROOT / stock_path, code, name))
             return targets
-        return auto_trade_registered_operation_targets()
+        return auto_trade_registered_operation_targets(self)
 
     def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_start_targets(self)
@@ -4445,6 +5839,12 @@ class AutoTradeSettingWindow(QDialog):
             selected,
         )
 
+    def selected_manual_ats_execution_method_state(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, object]:
+        return auto_trade_selected_manual_ats_execution_method_state(self, selected)
+
     def save_selected_manual_ats_state(
         self,
         ats_state: dict[str, bool],
@@ -4460,6 +5860,19 @@ class AutoTradeSettingWindow(QDialog):
 
     def set_selected_manual_ats_flag(self, flag_key: str, enabled: bool, label: str) -> None:
         auto_trade_set_selected_manual_ats_flag(self, flag_key, enabled, label)
+
+    def set_selected_manual_ats_execution_method(
+        self,
+        execution_method: str,
+        label: str,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, object]:
+        return auto_trade_set_selected_manual_ats_execution_method(
+            self,
+            execution_method,
+            label,
+            selected,
+        )
 
     def execute_selected_manual_ats_liquidation(
         self,
@@ -4491,6 +5904,61 @@ class AutoTradeSettingWindow(QDialog):
                 config = default_config()
             modes.add(normalize_operation_mode(config.get("operation_mode", "SCHEDULED")))
         return modes
+
+    def selected_trade_permission_context_label(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> str:
+        selected = selected if selected is not None else self.selected_stock_infos()
+        values = []
+        for stock_dir, _code, _name in selected:
+            config = read_json_dict(stock_dir / "config.json")
+            values.append(real_trade_enabled(config if config else default_config()))
+        return "감시전용 전환" if values and all(values) else "실주문 전환"
+
+    def toggle_selected_trade_permission(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, object]:
+        selected = selected if selected is not None else self.selected_stock_infos()
+        if not selected:
+            self.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
+            return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
+        target_enabled = self.selected_trade_permission_context_label(selected).startswith("실주문")
+        changed: list[str] = []
+        blocked: list[str] = []
+        for stock_dir, code, name in selected:
+            result = set_stock_real_trade_enabled(
+                self,
+                stock_dir,
+                code,
+                name,
+                target_enabled,
+            )
+            label = f"{code} {name}".strip()
+            if result.get("ok") is True:
+                if result.get("changed") is True:
+                    changed.append(label)
+            else:
+                blocked.append(f"{label}({result.get('reason') or 'BLOCKED'})")
+        if changed:
+            append_changelog(
+                "UPDATE",
+                "config.json",
+                f"거래권한 변경: {' / '.join(changed)} -> {'실주문' if target_enabled else '감시전용'}",
+            )
+            self.refresh_all()
+        message = f"거래권한 변경: {len(changed)}개"
+        if blocked:
+            message += f" / 차단 {len(blocked)}개"
+        self.statusBarMessage(message)
+        return {
+            "ok": bool(changed) and not blocked,
+            "changed": len(changed),
+            "blocked": len(blocked),
+            "target_real_trade_enabled": target_enabled,
+            "blocked_targets": tuple(blocked),
+        }
 
     def toggle_selected_manual_override_flag(self, flag_key: str, label: str) -> None:
         """수동운영 종목의 개별 수동시간 사용 여부를 즉시 전환한다.
@@ -4838,17 +6306,28 @@ class AutoTradeSettingWindow(QDialog):
         if projection_row is None or canonical_snapshot is None:
             reason = unavailable_reason or "CANONICAL_PERFORMANCE_NOT_RECORDED"
             tooltip = f"UNAVAILABLE\n사유: {reason}"
+            initial_zero_display = (
+                projection_row is None
+                and canonical_snapshot is not None
+                and not unavailable_reason
+            )
+            period_value = "0" if initial_zero_display else "-"
+            profit_amount = "0" if initial_zero_display else "-"
+            profit_rate = "0.00%" if initial_zero_display else "-"
+            average_amount = "0" if initial_zero_display else "-"
+            average_rate = "0.00%" if initial_zero_display else "-"
+            efficiency_value = "0.0" if initial_zero_display else "-"
             return {
-                "performance_period_text": "기간(-)",
-                "performance_profit_text": "수익(- / -)",
-                "performance_average_text": "평균(- / -)",
-                "performance_efficiency_text": "효율(-)",
-                "performance_period_value": "-",
-                "performance_profit_amount": "-",
-                "performance_profit_rate": "-",
-                "performance_average_amount": "-",
-                "performance_average_rate": "-",
-                "performance_efficiency_value": "-",
+                "performance_period_text": f"기간({period_value})",
+                "performance_profit_text": f"수익({profit_amount} / {profit_rate})",
+                "performance_average_text": f"평균({average_amount} / {average_rate})",
+                "performance_efficiency_text": f"효율({efficiency_value})",
+                "performance_period_value": period_value,
+                "performance_profit_amount": profit_amount,
+                "performance_profit_rate": profit_rate,
+                "performance_average_amount": average_amount,
+                "performance_average_rate": average_rate,
+                "performance_efficiency_value": efficiency_value,
                 "performance_period_sort_value": 0.0,
                 "performance_profit_sort_value": 0.0,
                 "performance_average_sort_value": 0.0,
@@ -4865,21 +6344,8 @@ class AutoTradeSettingWindow(QDialog):
             }
 
         metrics = canonical_snapshot.metric_result(projection_row)
-        aggregate = getattr(projection_row, "lifetime", None) or getattr(
-            projection_row,
-            "aggregate",
-        )
-        event_count = int(
-            getattr(
-                aggregate,
-                "event_count",
-                getattr(aggregate, "performance_event_count", 0),
-            )
-            or 0
-        )
-
         def _display(metric, formatter) -> str:
-            if event_count == 0 or metric.value is None:
+            if metric.value is None:
                 return "-"
             return formatter(metric.value)
 
@@ -4899,43 +6365,70 @@ class AutoTradeSettingWindow(QDialog):
             lambda value: f"{float(value):.1f}",
         )
 
+        aggregate = getattr(projection_row, "lifetime", None) or getattr(
+            projection_row,
+            "aggregate",
+            None,
+        )
+        initial_zero_display = (
+            aggregate is not None
+            and int(
+                getattr(
+                    aggregate,
+                    "event_count",
+                    getattr(aggregate, "performance_event_count", -1),
+                )
+            ) == 0
+            and metrics.period.status == MetricStatus.VALID_ZERO
+            and metrics.profit_amount.status == MetricStatus.VALID_ZERO
+        )
+        if initial_zero_display:
+            profit_rate = "0.00%"
+            average_amount = "0"
+            average_rate = "0.00%"
+            efficiency_value = "0.0"
+
         status_metrics = {
             "period": metrics.period,
             "profit": metrics.profit_amount,
             "average": metrics.average_amount,
             "efficiency": metrics.efficiency,
         }
-        if event_count == 0:
-            status_ranks = {key: 3 for key in status_metrics}
-            no_event_tooltip = "UNAVAILABLE\n사유: NO_CANONICAL_PERFORMANCE_EVENTS"
-            tooltips = {key: no_event_tooltip for key in status_metrics}
-        else:
-            status_ranks = {
-                key: self._canonical_metric_status_rank(metric.status)
-                for key, metric in status_metrics.items()
-            }
+        status_ranks = {
+            key: self._canonical_metric_status_rank(metric.status)
+            for key, metric in status_metrics.items()
+        }
+        tooltips = {
+            "period": self._canonical_metric_tooltip("기간", metrics.period),
+            "profit": "\n".join(
+                (
+                    self._canonical_metric_tooltip("수익 금액", metrics.profit_amount),
+                    self._canonical_metric_tooltip("수익률", metrics.profit_rate),
+                )
+            ),
+            "average": "\n".join(
+                (
+                    self._canonical_metric_tooltip("평균 금액", metrics.average_amount),
+                    self._canonical_metric_tooltip("평균 수익률", metrics.average_rate),
+                    (
+                        "기간 진단: "
+                        f"전체 {metrics.average_rate_diagnostics.period_count}, "
+                        f"유효 {metrics.average_rate_diagnostics.valid_rate_period_count}, "
+                        f"불완전 {metrics.average_rate_diagnostics.incomplete_rate_period_count}, "
+                        f"미정의 {metrics.average_rate_diagnostics.undefined_rate_period_count}"
+                    ),
+                )
+            ),
+            "efficiency": self._canonical_metric_tooltip("효율", metrics.efficiency),
+        }
+
+        absence_reason = str(
+            getattr(projection_row, "performance_absence_reason", "") or ""
+        ).strip()
+        if absence_reason:
+            diagnostic = "Parent 실적 진단: " + absence_reason
             tooltips = {
-                "period": self._canonical_metric_tooltip("기간", metrics.period),
-                "profit": "\n".join(
-                    (
-                        self._canonical_metric_tooltip("수익 금액", metrics.profit_amount),
-                        self._canonical_metric_tooltip("수익률", metrics.profit_rate),
-                    )
-                ),
-                "average": "\n".join(
-                    (
-                        self._canonical_metric_tooltip("평균 금액", metrics.average_amount),
-                        self._canonical_metric_tooltip("평균 수익률", metrics.average_rate),
-                        (
-                            "기간 진단: "
-                            f"전체 {metrics.average_rate_diagnostics.period_count}, "
-                            f"유효 {metrics.average_rate_diagnostics.valid_rate_period_count}, "
-                            f"불완전 {metrics.average_rate_diagnostics.incomplete_rate_period_count}, "
-                            f"미정의 {metrics.average_rate_diagnostics.undefined_rate_period_count}"
-                        ),
-                    )
-                ),
-                "efficiency": self._canonical_metric_tooltip("효율", metrics.efficiency),
+                key: f"{value}\n{diagnostic}" for key, value in tooltips.items()
             }
 
         mismatch_reasons = canonical_snapshot.current_relation_mismatch_reasons(
@@ -4954,16 +6447,16 @@ class AutoTradeSettingWindow(QDialog):
             "performance_profit_amount": profit_amount,
             "performance_profit_rate": profit_rate,
             "performance_profit_color": profit_loss_value_color(
-                metrics.profit_amount.value if event_count else None
+                metrics.profit_amount.value
             ),
             "performance_average_amount": average_amount,
             "performance_average_rate": average_rate,
             "performance_average_color": profit_loss_value_color(
-                metrics.average_amount.value if event_count else None
+                metrics.average_amount.value
             ),
             "performance_efficiency_value": efficiency_value,
             "performance_efficiency_color": directional_value_color(
-                metrics.efficiency.value if event_count else None
+                metrics.efficiency.value
             ),
             "performance_period_sort_value": float(metrics.period.sort_value or 0),
             "performance_profit_sort_value": float(metrics.profit_amount.sort_value or 0),
@@ -5306,10 +6799,25 @@ class AutoTradeSettingWindow(QDialog):
                     "instance_id": str(representative.get("instance_id", "") or ""),
                     "instance_name": str(representative.get("instance_name", "") or ""),
                     "stock_path": stock_path,
+                    "historical_instance_ids": tuple(
+                        sorted(
+                            {
+                                str(item.get("instance_id", "") or "").strip()
+                                for item in rows_for_code
+                                if bool(item.get("is_historical", False))
+                                and str(item.get("instance_id", "") or "").strip()
+                            }
+                        )
+                    ),
                     "tree_icon": (
                         "\u2713"
                         if any(not bool(item.get("is_historical", False)) for item in rows_for_code)
                         else "\u25aa"
+                    ),
+                    "stock_relation_kind": (
+                        CURRENT_STOCK_RELATION
+                        if any(not bool(item.get("is_historical", False)) for item in rows_for_code)
+                        else HISTORICAL_STOCK_RELATION
                     ),
                     "is_historical": not any(
                         not bool(item.get("is_historical", False))
@@ -5823,16 +7331,7 @@ class AutoTradeSettingWindow(QDialog):
             if is_definition or is_instance
             else ""
         )
-        canonical_identity_tooltip = str(
-            row_data.get("canonical_identity_tooltip", "") or ""
-        )
-        title_label.setToolTip(
-            "\n".join(
-                value
-                for value in (title_tooltip, canonical_identity_tooltip)
-                if value
-            )
-        )
+        title_label.setToolTip(title_tooltip)
         base_title_font = QFont(container.font())
         title_font = QFont(base_title_font)
         if not is_definition:
@@ -5972,6 +7471,7 @@ class AutoTradeSettingWindow(QDialog):
             label.setFixedWidth(width)
             label.setFocusPolicy(Qt.NoFocus)
             label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            label.setToolTip("")
             label.setStyleSheet(
                 f"background: transparent; color: {metric_color};"
             )
@@ -6028,9 +7528,7 @@ class AutoTradeSettingWindow(QDialog):
             metric_widget.setAttribute(Qt.WA_StyledBackground, True)
             metric_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             metric_widget.setStyleSheet("background: transparent;")
-            metric_widget.setToolTip(
-                str(row_data.get(f"performance_{key}_tooltip", "") or "")
-            )
+            metric_widget.setToolTip("")
             metric_layout = QHBoxLayout(metric_widget)
             metric_layout.setContentsMargins(0, 0, 0, 0)
             metric_layout.setSpacing(0)
@@ -6100,13 +7598,7 @@ class AutoTradeSettingWindow(QDialog):
             layout.addWidget(metric_widget, 0, Qt.AlignVCenter)
 
         layout.addStretch(1)
-        metric_tooltips = [
-            str(row_data.get(f"performance_{metric}_tooltip", "") or "").strip()
-            for metric in ("period", "profit", "average", "efficiency")
-        ]
-        container.setToolTip(
-            "\n\n".join(dict.fromkeys(value for value in metric_tooltips if value))
-        )
+        container.setToolTip("")
         container.setProperty("autoTradeSettingRoutineTreeRowKind", row_kind)
         try:
             can_install_event_filter = (
@@ -6315,26 +7807,33 @@ class AutoTradeSettingWindow(QDialog):
             valid_color = (
                 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                 if valid_only
+                else AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
+            )
+            valid_border_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if valid_only
                 else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
             )
             valid_button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
                     text_color=valid_color,
-                    border_color=valid_color,
+                    border_color=valid_border_color,
                 )
             )
 
         selected_level = str(getattr(self, "_routine_tree_display_level", "category") or "category")
         for level, button in getattr(self, "_routine_tree_display_level_buttons", {}).items():
-            color = AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
+            color = AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
+            border_color = AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
             if level == selected_level:
                 color = AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                border_color = AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
             button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
                     text_color=color,
-                    border_color=color,
+                    border_color=border_color,
                 )
             )
 
@@ -6358,13 +7857,18 @@ class AutoTradeSettingWindow(QDialog):
             color = (
                 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                 if scope_enabled and scope == selected_scope
+                else AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
+            )
+            border_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if scope_enabled and scope == selected_scope
                 else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
             )
             button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
                     text_color=color,
-                    border_color=color,
+                    border_color=border_color,
                 )
                 + disabled_style
             )
@@ -6383,16 +7887,21 @@ class AutoTradeSettingWindow(QDialog):
             color = (
                 AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
                 if enabled and criterion == selected_criterion
+                else AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR
+            )
+            border_color = (
+                AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR
+                if enabled and criterion == selected_criterion
                 else AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR
             )
             button.setStyleSheet(
                 auto_trade_setting_badge_stylesheet(
                     "QPushButton",
                     text_color=color,
-                    border_color=color,
+                    border_color=border_color,
                 )
                 + disabled_style
-        )
+            )
 
     def _set_routine_tree_valid_only(self, enabled: bool) -> None:
         previous_level = str(getattr(self, "_routine_tree_display_level", "") or "")
@@ -6428,6 +7937,8 @@ class AutoTradeSettingWindow(QDialog):
         else:
             self._apply_routine_tree_collapse_visibility()
             self.routine_table.viewport().update()
+        if current_level == "stock":
+            self.on_routine_selection_changed()
 
     def _routine_tree_scope_filter_available(self) -> bool:
         return (
@@ -6470,6 +7981,8 @@ class AutoTradeSettingWindow(QDialog):
         self.load_routine_table()
         scroll_bar.setValue(scroll_value)
         self._update_routine_tree_display_level_badges()
+        if display_level == "stock":
+            self.on_routine_selection_changed()
 
     def _refresh_routine_tree_display_state(self) -> None:
         display_level = str(
@@ -6641,6 +8154,8 @@ class AutoTradeSettingWindow(QDialog):
             self.load_routine_table()
         else:
             self._refresh_routine_tree_display_state()
+        if clean_level == "stock":
+            self.on_routine_selection_changed()
 
     def eventFilter(self, obj, event) -> bool:
         selected_stock_button = getattr(
@@ -7214,7 +8729,6 @@ class AutoTradeSettingWindow(QDialog):
                     is_current = bool(
                         current_relation
                         and current_relation.current_instance_id == instance_id
-                        and selected_scope in {"all", "current"}
                     )
                     canonical_stocks_by_instance.setdefault(instance_id, []).append(
                         {
@@ -7225,6 +8739,11 @@ class AutoTradeSettingWindow(QDialog):
                                 canonical_performance.stock_name(projected_stock)
                                 if projected_stock is not None
                                 else str(detail.get("stock_name", "") or code)
+                            ),
+                            "stock_relation_kind": (
+                                CURRENT_STOCK_RELATION
+                                if is_current
+                                else HISTORICAL_STOCK_RELATION
                             ),
                             "is_historical": not is_current,
                             "canonical_projection_row": projected_stock,
@@ -7547,7 +9066,19 @@ class AutoTradeSettingWindow(QDialog):
                 )
                 for stock_index, stock in enumerate(visible_stocks):
                     stock_name = str(stock.get("stock_name", "") or "").strip()
-                    is_historical = bool(stock.get("is_historical", False))
+                    relation_kind = str(
+                        stock.get("stock_relation_kind", "") or ""
+                    ).strip().upper()
+                    if relation_kind not in {
+                        CURRENT_STOCK_RELATION,
+                        HISTORICAL_STOCK_RELATION,
+                    }:
+                        relation_kind = (
+                            HISTORICAL_STOCK_RELATION
+                            if bool(stock.get("is_historical", False))
+                            else CURRENT_STOCK_RELATION
+                        )
+                    is_historical = relation_kind == HISTORICAL_STOCK_RELATION
                     stock_projection_row = stock.get("canonical_projection_row")
                     stock_performance = self._routine_tree_canonical_performance_texts(
                         stock_projection_row,
@@ -7577,6 +9108,7 @@ class AutoTradeSettingWindow(QDialog):
                             "stock_path": str(stock.get("stock_path", "") or ""),
                             "first_stock_for_instance": stock_index == 0,
                             "tree_icon": "\u25aa" if is_historical else "\u2713",
+                            "stock_relation_kind": relation_kind,
                             "is_historical": is_historical,
                             "is_development_fixture": bool(
                                 stock.get("is_development_fixture", False)
@@ -7664,6 +9196,11 @@ class AutoTradeSettingWindow(QDialog):
                             if stock_projection_row.is_currently_assigned
                             else "\u25aa"
                         ),
+                        "stock_relation_kind": (
+                            CURRENT_STOCK_RELATION
+                            if stock_projection_row.is_currently_assigned
+                            else HISTORICAL_STOCK_RELATION
+                        ),
                         "is_historical": not stock_projection_row.is_currently_assigned,
                         "canonical_identity_tooltip": canonical_performance.identity_tooltip(
                             stock_projection_row
@@ -7686,14 +9223,27 @@ class AutoTradeSettingWindow(QDialog):
                 if str(row.get("row_kind", "") or "") == "stock"
             ]
             stock_by_code: dict[str, dict[str, object]] = {}
+            historical_instance_ids_by_code: dict[str, set[str]] = {}
             for stock_row in stock_rows:
                 code = str(stock_row.get("stock_code", "") or "").strip()
+                if bool(stock_row.get("is_historical", False)):
+                    historical_instance_id = str(
+                        stock_row.get("instance_id", "") or ""
+                    ).strip()
+                    if historical_instance_id:
+                        historical_instance_ids_by_code.setdefault(code, set()).add(
+                            historical_instance_id
+                        )
                 existing = stock_by_code.get(code)
                 if existing is None or (
                     bool(existing.get("is_historical", False))
                     and not bool(stock_row.get("is_historical", False))
                 ):
                     stock_by_code[code] = stock_row
+            for code, stock_row in stock_by_code.items():
+                stock_row["historical_instance_ids"] = tuple(
+                    sorted(historical_instance_ids_by_code.get(code, set()))
+                )
             stock_rows = list(stock_by_code.values())
             rows = parent_rows + stock_rows
 
@@ -7786,17 +9336,7 @@ class AutoTradeSettingWindow(QDialog):
                     if row_kind in {"definition", "instance"}
                     else ""
                 )
-                canonical_tooltip = str(
-                    row_data.get("canonical_identity_tooltip", "") or ""
-                )
-                item.setData(
-                    Qt.ToolTipRole,
-                    "\n".join(
-                        value
-                        for value in (title_tooltip, canonical_tooltip)
-                        if value
-                    ),
-                )
+                item.setData(Qt.ToolTipRole, title_tooltip)
                 item.setData(SORT_ROLE, str(row_data["definition_name"]))
                 self.routine_table.setItem(row, 0, item)
                 row_widget = self._routine_tree_row_widget(
@@ -7964,6 +9504,14 @@ class AutoTradeSettingWindow(QDialog):
         def send_order_callable():
             return getattr(api_object(), "send_order", None)
 
+        def fresh_current_price(stock_code: str):
+            owner = persistent_feature_owner(self)
+            host_getter = getattr(owner, "main_monitoring_auto_trade_operation_host", None)
+            host = host_getter() if callable(host_getter) else None
+            state_getter = getattr(host, "fresh_monitoring_market_information_state", None)
+            state = state_getter(stock_code) if callable(state_getter) else None
+            return getattr(state, "last_price", None)
+
         context = AutoTradeOrderExecutionContext(
             kiwoom_connected=kiwoom_connected,
             account_numbers=account_numbers,
@@ -7988,6 +9536,18 @@ class AutoTradeSettingWindow(QDialog):
             all_group_stock_dirs=lambda: list(
                 load_group_scope().all_group_stock_dirs()
             ),
+            current_orderable_cash=lambda: (
+                persistent_feature_owner(self).current_orderable_cash_for_budget()
+                if callable(
+                    getattr(
+                        persistent_feature_owner(self),
+                        "current_orderable_cash_for_budget",
+                        None,
+                    )
+                )
+                else None
+            ),
+            fresh_current_price=fresh_current_price,
         )
         boundary = AutoTradeOrderExecutionBoundary(context)
         self._order_execution_boundary = boundary
@@ -8098,11 +9658,15 @@ class AutoTradeSettingWindow(QDialog):
         elif row_kind == "instance":
             menu = QMenu(self.routine_table)
             settings_action = menu.addAction("설정변경")
+            clone_action = menu.addAction("루틴복제")
             delete_action = menu.addAction("루틴삭제")
             rename_action = menu.addAction("이름변경")
             stock_register_action = menu.addAction("종목등록")
             settings_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.open_routine_instance_settings(target)
+            )
+            clone_action.triggered.connect(
+                lambda _checked=False, target=dict(metadata): self.clone_routine_instance(target)
             )
             delete_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.delete_routine_instance(target)
@@ -8115,33 +9679,39 @@ class AutoTradeSettingWindow(QDialog):
             )
         elif row_kind == "stock":
             menu = QMenu(self.routine_table)
+            menu.setToolTipsVisible(True)
             stock_register_action = menu.addAction("종목등록")
             unregister_action = menu.addAction("등록해제")
             menu.addSeparator()
             convert_action = menu.addAction("등록전환")
             hide_action = menu.addAction("표시삭제")
-            stock_register_target = self._routine_tree_instance_stock_register_metadata(
-                metadata.get("instance_id", "")
-            )
-            stock_register_action.setEnabled(stock_register_target is not None)
-            unregister_target = self._routine_tree_unregister_target_for_stock_row(metadata)
-            convert_action.setEnabled(
-                self._routine_tree_register_convert_enabled_for_stock_row(metadata)
-            )
-            unregister_action.setEnabled(unregister_target is not None)
-            hide_action.setEnabled(
-                self._routine_tree_hide_historical_display_enabled_for_stock_row(metadata)
-            )
+            context = self._routine_tree_stock_row_action_context(metadata)
+            actions = context["actions"]
+            register_decision = actions["register"]
+            unassign_decision = actions["unassign"]
+            convert_decision = actions["convert"]
+            hide_decision = actions["hide"]
+            stock_register_action.setEnabled(bool(register_decision["enabled"]))
+            unregister_action.setEnabled(bool(unassign_decision["enabled"]))
+            convert_action.setEnabled(bool(convert_decision["enabled"]))
+            hide_action.setEnabled(bool(hide_decision["enabled"]))
+            for action, decision in (
+                (stock_register_action, register_decision),
+                (unregister_action, unassign_decision),
+                (convert_action, convert_decision),
+                (hide_action, hide_decision),
+            ):
+                tooltip = str(decision.get("tooltip", "") or "")
+                if tooltip:
+                    action.setToolTip(tooltip)
             stock_register_action.triggered.connect(
-                lambda _checked=False, target=dict(stock_register_target or {}): self.open_instance_stock_search_register_window(target)
+                lambda _checked=False, target=dict(register_decision.get("target") or {}): self.open_instance_stock_search_register_window(target)
             )
             convert_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.convert_historical_stock_to_registered(target)
             )
             unregister_action.triggered.connect(
-                lambda _checked=False, unregister_target=dict(unregister_target or {}): self.unregister_routine_tree_stock(
-                    unregister_target
-                )
+                lambda _checked=False, target=dict(unassign_decision.get("target") or {}): self.unregister_routine_tree_stock(target)
             )
             hide_action.triggered.connect(
                 lambda _checked=False, target=dict(metadata): self.hide_historical_stock_display(target)
@@ -8167,35 +9737,178 @@ class AutoTradeSettingWindow(QDialog):
                 return dict(stock)
         return None
 
+    def _routine_tree_stock_relation_kind(
+        self,
+        metadata: dict[str, object],
+    ) -> str:
+        relation_kind = str(
+            metadata.get("stock_relation_kind", "") or ""
+        ).strip().upper()
+        if relation_kind in {CURRENT_STOCK_RELATION, HISTORICAL_STOCK_RELATION}:
+            return relation_kind
+        return (
+            HISTORICAL_STOCK_RELATION
+            if bool(metadata.get("is_historical", False))
+            else CURRENT_STOCK_RELATION
+        )
+
+    def _routine_tree_action_tooltip(
+        self,
+        title: str,
+        reasons: tuple[str, ...] | list[str],
+    ) -> str:
+        lines = [title]
+        lines.extend(f"- {reason}" for reason in reasons if str(reason or "").strip())
+        return "\n".join(lines)
+
+    def _routine_tree_stock_row_action_context(
+        self,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        relation_kind = self._routine_tree_stock_relation_kind(metadata)
+        code = normalize_stock_code(str(metadata.get("stock_code", "") or ""))
+        name = str(metadata.get("display_name", "") or "").strip()
+        row_instance_id = str(metadata.get("instance_id", "") or "").strip()
+        registered_stock = self._routine_tree_registered_stock_for_code(code) if code else None
+        current_instance_id = str(
+            (registered_stock or {}).get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        historical_instance_ids = tuple(
+            sorted(
+                {
+                    str(value or "").strip()
+                    for value in metadata.get("historical_instance_ids", ())
+                    if str(value or "").strip()
+                }
+            )
+        )
+        target_instance_ids = (
+            historical_instance_ids or ((row_instance_id,) if row_instance_id else ())
+            if relation_kind == HISTORICAL_STOCK_RELATION
+            else ((row_instance_id,) if row_instance_id else ())
+        )
+        row_instance = routine_instance_by_id(row_instance_id) if row_instance_id else None
+        register_target = self._routine_tree_instance_stock_register_metadata(row_instance_id)
+        register_reasons: list[str] = []
+        if len(target_instance_ids) > 1:
+            register_target = None
+            register_reasons.append("대상 Instance가 여러 개입니다. 루틴 보기에서 선택하세요.")
+        elif row_instance is None or register_target is None:
+            register_reasons.append("현재 존재하지 않는 과거 Instance입니다.")
+
+        unassign_decision = routine_unassign_decision(
+            code,
+            name,
+            row_instance_id=row_instance_id,
+            row_relation_kind=relation_kind,
+        )
+        convert_reasons: list[str] = []
+        convert_enabled = False
+        if relation_kind == CURRENT_STOCK_RELATION:
+            convert_reasons.append("현재 등록종목은 등록전환 대상이 아닙니다.")
+        elif len(target_instance_ids) > 1:
+            convert_reasons.append("대상 Instance가 여러 개입니다. 루틴 보기에서 선택하세요.")
+        elif row_instance is None:
+            convert_reasons.append("현재 존재하지 않는 과거 Instance입니다.")
+        elif current_instance_id:
+            current_instance = routine_instance_by_id(current_instance_id)
+            current_name = str(
+                getattr(current_instance, "display_name", "") or current_instance_id
+            ).strip()
+            convert_reasons.append(f"현재 '{current_name}' Instance에 등록되어 있습니다.")
+        elif self._routine_tree_stock_is_review_required(code, name):
+            convert_reasons.append("검토관리 대상입니다.")
+        else:
+            convert_enabled = bool(code and name and row_instance_id)
+
+        canonical_historical = bool(
+            relation_kind == HISTORICAL_STOCK_RELATION
+            and str(metadata.get("performance_source", "") or "").upper() == "CANONICAL"
+            and not bool(metadata.get("is_development_fixture", False))
+        )
+        hide_enabled = bool(
+            relation_kind == HISTORICAL_STOCK_RELATION
+            and code
+            and row_instance_id
+            and not canonical_historical
+        )
+        hide_reasons: list[str] = []
+        if relation_kind == CURRENT_STOCK_RELATION:
+            hide_reasons.append("표시삭제는 과거 종목 전용입니다.")
+        elif canonical_historical:
+            hide_reasons.append("Canonical 과거실적 표시삭제 계약이 아직 연결되지 않았습니다.")
+        elif not hide_enabled:
+            hide_reasons.append("표시삭제 대상을 확인할 수 없습니다.")
+
+        if relation_kind == HISTORICAL_STOCK_RELATION:
+            unassign_enabled = False
+            unassign_tooltip = "과거 종목은 현재 등록해제 대상이 아닙니다."
+        else:
+            unassign_enabled = bool(
+                unassign_decision.allowed
+                and row_instance is not None
+                and row_instance_id
+                and current_instance_id == row_instance_id
+            )
+            unassign_tooltip = (
+                ""
+                if unassign_enabled
+                else self._routine_tree_action_tooltip(
+                    "등록해제 불가",
+                    unassign_decision.user_reasons
+                    or ("현재 등록 Instance를 확인할 수 없습니다.",),
+                )
+            )
+        return {
+            "row_relation_kind": relation_kind,
+            "stock_code": code,
+            "stock_name": name,
+            "row_instance_id": row_instance_id,
+            "current_instance_id": current_instance_id,
+            "current_assignment_exists": bool(current_instance_id),
+            "row_instance_exists": row_instance is not None,
+            "review_required": self._routine_tree_stock_is_review_required(code, name) if code else False,
+            "unassign_decision": unassign_decision,
+            "actions": {
+                "register": {
+                    "enabled": register_target is not None,
+                    "tooltip": self._routine_tree_action_tooltip("종목등록 불가", register_reasons) if register_reasons else "",
+                    "target": register_target,
+                },
+                "unassign": {
+                    "enabled": unassign_enabled,
+                    "tooltip": unassign_tooltip,
+                    "target": {
+                        "row_kind": "stock",
+                        "stock_relation_kind": relation_kind,
+                        "stock_code": code,
+                        "stock_name": name,
+                        "display_name": name,
+                        "instance_id": row_instance_id,
+                        "instance_name": str(metadata.get("instance_name", "") or "").strip(),
+                        "definition_id": str(metadata.get("definition_id", "") or "").strip(),
+                        "definition_name": str(metadata.get("definition_name", "") or "").strip(),
+                    },
+                },
+                "convert": {
+                    "enabled": convert_enabled,
+                    "tooltip": self._routine_tree_action_tooltip("등록전환 불가", convert_reasons) if convert_reasons else "",
+                },
+                "hide": {
+                    "enabled": hide_enabled,
+                    "tooltip": self._routine_tree_action_tooltip("표시삭제 불가", hide_reasons) if hide_reasons else "",
+                },
+            },
+        }
+
     def _routine_tree_register_convert_enabled_for_stock_row(
         self,
         metadata: dict[str, object],
     ) -> bool:
         if str(metadata.get("row_kind", "") or "") != "stock":
             return False
-        if not bool(metadata.get("is_historical", False)):
-            return False
-
-        code = normalize_stock_code(str(metadata.get("stock_code", "") or ""))
-        name = str(metadata.get("display_name", "") or "").strip()
-        instance_id = str(metadata.get("instance_id", "") or "").strip()
-        if not code or not name or not instance_id:
-            return False
-        if self._routine_tree_stock_is_review_required(code, name):
-            return False
-
-        registered_stock = self._routine_tree_registered_stock_for_code(code)
-        if registered_stock is None:
-            return True
-        assigned_instance_id = str(
-            registered_stock.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        if assigned_instance_id:
-            return False
-        routines = registered_stock.get("routines", [])
-        if isinstance(routines, list):
-            return not bool(single_routine_list(routines))
-        return not bool(str(routines or "").strip())
+        context = self._routine_tree_stock_row_action_context(metadata)
+        return bool(context["actions"]["convert"]["enabled"])
 
     def _routine_tree_hide_historical_display_enabled_for_stock_row(
         self,
@@ -8203,12 +9916,8 @@ class AutoTradeSettingWindow(QDialog):
     ) -> bool:
         if str(metadata.get("row_kind", "") or "") != "stock":
             return False
-        if not bool(metadata.get("is_historical", False)):
-            return False
-        code = normalize_stock_code(str(metadata.get("stock_code", "") or ""))
-        name = str(metadata.get("display_name", "") or "").strip()
-        instance_id = str(metadata.get("instance_id", "") or "").strip()
-        return bool(code and name and instance_id)
+        context = self._routine_tree_stock_row_action_context(metadata)
+        return bool(context["actions"]["hide"]["enabled"])
 
     def _routine_tree_unregister_target_for_stock_row(
         self,
@@ -8216,68 +9925,175 @@ class AutoTradeSettingWindow(QDialog):
     ) -> dict[str, str] | None:
         if str(metadata.get("row_kind", "") or "") != "stock":
             return None
-        if bool(metadata.get("is_historical", False)):
+        context = self._routine_tree_stock_row_action_context(metadata)
+        if not bool(context["actions"]["unassign"]["enabled"]):
             return None
-
-        code = normalize_stock_code(str(metadata.get("stock_code", "") or ""))
-        name = str(metadata.get("display_name", "") or "").strip()
-        instance_id = str(metadata.get("instance_id", "") or "").strip()
-        if not code or not name or not instance_id:
-            return None
-        if self._routine_tree_stock_is_review_required(code, name):
-            return None
-
-        matched_stock = self._routine_tree_registered_stock_for_code(code)
-        if matched_stock is None:
-            return None
-        assigned_instance_id = str(
-            matched_stock.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        if assigned_instance_id != instance_id:
-            return None
-        routines = matched_stock.get("routines", [])
-        if isinstance(routines, list) and not single_routine_list(routines):
-            return None
-        if not isinstance(routines, list) and not str(routines or "").strip():
-            return None
-        can_unassign, _routine_name, _reasons = can_unassign_active_routine_from_stock(
-            code,
-            name,
-        )
-        if not can_unassign:
-            return None
-
         return {
-            "stock_code": code,
-            "stock_name": name,
-            "instance_id": instance_id,
+            "stock_code": str(context["stock_code"]),
+            "stock_name": str(context["stock_name"]),
+            "instance_id": str(context["row_instance_id"]),
             "instance_name": str(metadata.get("instance_name", "") or "").strip(),
             "definition_id": str(metadata.get("definition_id", "") or "").strip(),
             "definition_name": str(metadata.get("definition_name", "") or "").strip(),
         }
+
+    def _routine_unassign_event_details(
+        self,
+        decision: RoutineUnassignDecision,
+    ) -> dict[str, object]:
+        evidence = decision.evidence
+        return {
+            "reason_codes": list(decision.reason_codes),
+            "user_reasons": list(decision.user_reasons),
+            "raw_status": evidence.get("raw_status", ""),
+            "canonical_status_class": evidence.get("canonical_status_class", ""),
+            "holding_qty": evidence.get("holding_qty", 0),
+            "buy_pending_qty": evidence.get("buy_pending_qty", 0),
+            "sell_pending_qty": evidence.get("sell_pending_qty", 0),
+            "row_instance_id": evidence.get("row_instance_id", ""),
+            "current_instance_id": evidence.get("current_instance_id", ""),
+            "runtime_resolution": evidence.get("runtime_resolution", ""),
+            "diagnostic_class": decision.diagnostic_class,
+        }
+
+    def _record_routine_unassign_blocked(
+        self,
+        *,
+        code: str,
+        name: str,
+        decision: RoutineUnassignDecision,
+    ) -> None:
+        details = self._routine_unassign_event_details(decision)
+        append_production_event(
+            "ROUTINE_UNASSIGN_BLOCKED",
+            severity=(
+                "WARNING"
+                if decision.diagnostic_class == "INTEGRITY_BLOCK"
+                else "NOTICE"
+            ),
+            result="BLOCKED",
+            source="AUTO_TRADE_ROUTINE_TREE",
+            template_args={"stock_name": name or code},
+            target_type="STOCK",
+            target_id=code,
+            target_name=name,
+            stock_code=code,
+            stock_name=name,
+            routine=str(
+                decision.evidence.get("persisted_routine_fields", ("",))[0]
+                if decision.evidence.get("persisted_routine_fields")
+                else ""
+            ),
+            reason_code=decision.primary_reason_code,
+            reason_args={"reasons": list(decision.user_reasons)},
+            details=details,
+        )
+        if decision.diagnostic_class != "INTEGRITY_BLOCK":
+            return
+        signature = json.dumps(
+            {
+                "stock_code": code,
+                "reason_codes": list(decision.reason_codes),
+                "raw_status": details["raw_status"],
+                "row_instance_id": details["row_instance_id"],
+                "current_instance_id": details["current_instance_id"],
+                "runtime_resolution": details["runtime_resolution"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        observe_owner_failure_transition(
+            self,
+            f"routine-unassign-integrity:{code}",
+            active=True,
+            signature=signature,
+            event_type="INTEGRITY_WARNING",
+            severity="WARNING",
+            result="BLOCKED",
+            source="AUTO_TRADE_ROUTINE_TREE",
+            template_args={"target": name or code},
+            target_type="STOCK",
+            target_id=code,
+            target_name=name,
+            stock_code=code,
+            stock_name=name,
+            reason_code=decision.primary_reason_code,
+            details=details,
+        )
+
+    def _escalate_routine_unassign_review(
+        self,
+        *,
+        code: str,
+        name: str,
+        decision: RoutineUnassignDecision,
+    ) -> None:
+        if not decision.review_required:
+            return
+        try:
+            stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
+        except Exception:
+            return
+        if not Path(stock_dir).is_dir():
+            return
+        item = {
+            "review_reasons": list(decision.user_reasons),
+            "review_location": "루틴 등록해제 무결성 판정",
+        }
+        try:
+            self.mark_review_required(
+                Path(stock_dir),
+                code,
+                name,
+                item,
+                source="루틴 등록해제 무결성 판정",
+            )
+        except Exception:
+            LOGGER.warning(
+                "routine unassign review escalation failed: code=%s name=%s",
+                code,
+                name,
+                exc_info=True,
+            )
 
     def unregister_routine_tree_stock(
         self,
         target: dict[str, object],
     ) -> bool:
         code = normalize_stock_code(str(target.get("stock_code", "") or ""))
-        name = str(target.get("stock_name", "") or "").strip()
+        name = str(
+            target.get("stock_name", "") or target.get("display_name", "") or ""
+        ).strip()
         instance_id = str(target.get("instance_id", "") or "").strip()
         if not code or not name or not instance_id:
-            show_toast(self, "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
+            show_toast(self, "등록해제 불가\n- 현재 등록 Instance를 확인할 수 없습니다.")
             return False
-
-        current_target = self._routine_tree_unregister_target_for_stock_row(
-            {
-                "row_kind": "stock",
-                "stock_code": code,
-                "display_name": name,
-                "instance_id": instance_id,
-                "is_historical": False,
-            }
+        relation_kind = self._routine_tree_stock_relation_kind(target)
+        decision = routine_unassign_decision(
+            code,
+            name,
+            row_instance_id=instance_id,
+            row_relation_kind=relation_kind,
         )
-        if current_target is None:
-            show_toast(self, "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
+        if not decision.allowed:
+            if decision.event_required:
+                self._record_routine_unassign_blocked(
+                    code=code,
+                    name=name,
+                    decision=decision,
+                )
+            self._escalate_routine_unassign_review(
+                code=code,
+                name=name,
+                decision=decision,
+            )
+            show_toast(
+                self,
+                self._routine_tree_action_tooltip(
+                    "등록해제 불가",
+                    decision.user_reasons,
+                ),
+            )
             return False
 
         if not update_base_stock_routines(code, name, []):
@@ -8289,6 +10105,11 @@ class AutoTradeSettingWindow(QDialog):
         scroll_value = scroll_bar.value()
         self.refresh_all()
         scroll_bar.setValue(scroll_value)
+        observe_owner_failure_transition(
+            self,
+            f"routine-unassign-integrity:{code}",
+            active=False,
+        )
         show_toast(self, f"등록해제 1건 | {name}")
         return True
 
@@ -8296,6 +10117,13 @@ class AutoTradeSettingWindow(QDialog):
         self,
         metadata: dict[str, object],
     ) -> bool:
+        context = self._routine_tree_stock_row_action_context(metadata)
+        convert_decision = context["actions"]["convert"]
+        if not bool(convert_decision["enabled"]):
+            tooltip = str(convert_decision.get("tooltip", "") or "")
+            if tooltip:
+                show_toast(self, tooltip)
+            return False
         return auto_trade_register_historical_stock_to_original_instance(
             self,
             metadata,
@@ -8341,6 +10169,9 @@ class AutoTradeSettingWindow(QDialog):
         if str(metadata.get("row_kind", "") or "") != "instance":
             return
         self._open_routine_settings_dialog(metadata, registration=False)
+
+    def clone_routine_instance(self, metadata: dict[str, object]) -> bool:
+        return clone_routine_instance_with_existing_policy(self, metadata)
 
     def rename_routine_instance(self, metadata: dict[str, object]) -> None:
         if str(metadata.get("row_kind", "") or "") != "instance":
@@ -8446,17 +10277,20 @@ class AutoTradeSettingWindow(QDialog):
     ) -> None:
         if str(metadata.get("row_kind", "") or "") != "instance":
             return
-        self.instance_stock_search_register_window = InstanceStockSearchRegisterDialog(
+        self.instance_stock_search_register_window = open_instance_stock_search_register_dialog(
             self,
-            instance_metadata=dict(metadata),
+            dict(metadata),
         )
-        self.instance_stock_search_register_window.show()
 
     def hide_historical_stock_display(self, metadata: dict[str, object]) -> None:
-        if (
-            str(metadata.get("row_kind", "") or "") != "stock"
-            or not bool(metadata.get("is_historical", False))
-        ):
+        if str(metadata.get("row_kind", "") or "") != "stock":
+            return
+        context = self._routine_tree_stock_row_action_context(metadata)
+        hide_decision = context["actions"]["hide"]
+        if not bool(hide_decision["enabled"]):
+            tooltip = str(hide_decision.get("tooltip", "") or "")
+            if tooltip:
+                show_toast(self, tooltip)
             return
         instance_id = str(metadata.get("instance_id", "") or "").strip()
         stock_code = str(metadata.get("stock_code", "") or "").strip()
@@ -8495,9 +10329,25 @@ class AutoTradeSettingWindow(QDialog):
             return
         self.load_routine_table()
 
+    def _left_display_intent_owns_all_stock_scope(self) -> bool:
+        return self._left_flat_filter_scope_active()
+
     def on_routine_selection_changed(self) -> None:
-        if self.current_selected_routine_row_metadata() is not None:
-            self._all_stocks_scope_active = False
+        selected_metadata = self.current_selected_routine_row_metadata()
+        self._all_stocks_scope_active = bool(
+            self._left_display_intent_owns_all_stock_scope()
+            or (
+                selected_metadata is None
+                and str(
+                    getattr(self, "_routine_tree_display_level", "") or ""
+                ).strip()
+                == "stock"
+                and str(
+                    getattr(self, "_routine_tree_display_scope", "") or ""
+                ).strip()
+                == "all"
+            )
+        )
         self.update_selection_summary_panel()
         self.update_selected_routine_status_bar()
         self.load_selected_routine_stocks()
@@ -9772,7 +11622,7 @@ class AutoTradeSettingWindow(QDialog):
             context={
                 "manual_queue_write_confirmed": True,
                 "manual_runtime_queue_write_confirmed": True,
-                "event_journal_order": order_dict,
+                "event_journal_order": queue_write_preview.get("order_queued_record_preview"),
             },
             queue_commit_readiness_policy_result=queue_commit_readiness,
             manual_queue_commit_after_runtime_confirmed=True,
@@ -10550,6 +12400,34 @@ class AutoTradeSettingWindow(QDialog):
             self.statusBarMessage("Manual SendOrder blocked")
             return
 
+        fresh_preflight = AutoTradeSettingWindow.order_execution_boundary(
+            self
+        ).evaluate_final_dispatch_fresh_preflight(
+            latest_order_dict,
+            latest_environment,
+            queue_path,
+        )
+        if fresh_preflight.get("ok") is not True:
+            result = {
+                "status": "BLOCKED",
+                "stage": "fresh_dispatch_preflight",
+                "order_id": order_id,
+                "callable_executed": False,
+                "send_order_called": False,
+                "broker_api_called": False,
+                "actual_order_sent": False,
+                "blocked_reasons": list(
+                    fresh_preflight.get("blocked_reasons")
+                    or ["fresh dispatch preflight blocked"]
+                ),
+                "fresh_dispatch_preflight_result": fresh_preflight,
+                "send_order_call_preview_result": call_preview,
+                "final_send_gate_result": final_gate,
+            }
+            self.show_manual_send_order_result(result)
+            self.statusBarMessage("Manual SendOrder blocked")
+            return
+
         claim_token = f"GUI_CLAIM_{uuid4().hex}"
         claim = claim_order_for_dispatch(
             queue_path,
@@ -10602,6 +12480,7 @@ class AutoTradeSettingWindow(QDialog):
         result["dispatch_claim_result"] = claim
         result["final_send_gate_result"] = final_gate
         result["send_order_call_preview_result"] = call_preview
+        result["fresh_dispatch_preflight_result"] = fresh_preflight
         self.show_manual_send_order_result(result)
         status_text = "completed" if result.get("queue_result_recorded") else "blocked"
         self.statusBarMessage(f"Manual SendOrder {status_text}")
@@ -10821,8 +12700,7 @@ class AutoTradeSettingWindow(QDialog):
         self.operation_environment_settings_window = dialog
 
         def settings_saved() -> None:
-            self.statusBarMessage("환경설정 저장 완료")
-            self.refresh_all()
+            self._handle_operation_environment_settings_saved(dialog)
 
         dialog.accepted.connect(settings_saved)
         dialog.destroyed.connect(
@@ -10835,6 +12713,21 @@ class AutoTradeSettingWindow(QDialog):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _handle_operation_environment_settings_saved(self, dialog) -> None:
+        owner = persistent_feature_owner(self)
+        recalculate_limits = getattr(
+            owner,
+            "_recalculate_recommended_stock_buy_limits_for_starting_budget_change",
+            None,
+        )
+        if (
+            bool(getattr(dialog, "_starting_budget_defaults_changed", False))
+            and callable(recalculate_limits)
+        ):
+            recalculate_limits()
+        self.statusBarMessage("환경설정 저장 완료")
+        self.refresh_all()
 
     def open_stock_register_window(self) -> None:
         """관제창과 동일한 중앙 종목 등록 창을 연다."""
@@ -10934,19 +12827,57 @@ class AutoTradeSettingWindow(QDialog):
         """
         targets: list[tuple[Path, str, str]] = []
         skipped: list[str] = []
+        block_details: list[dict[str, object]] = []
 
         for stock_dir, code, name in selected:
             if self.start_target_is_review_isolated(stock_dir, code):
                 skipped.append(f"{code} {name}(검토종목)")
+                block_details.append(
+                    {
+                        "stock_code": str(code),
+                        "stock_name": str(name),
+                        "reason": "REVIEW_REQUIRED",
+                        "display_label": f"{code} {name}".strip(),
+                    }
+                )
                 continue
             state = read_json_dict(stock_dir / "state.json")
             status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-            if auto_trade_setting_start_target_allowed(self, state, code):
+            decision = auto_trade_setting_start_target_decision(
+                self,
+                state,
+                code,
+                config=read_json_dict(stock_dir / "config.json"),
+            )
+            if decision.get("allowed") is True:
                 targets.append((stock_dir, code, name))
             else:
                 skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
+                block_details.append(
+                    {
+                        "stock_code": str(code),
+                        "stock_name": str(name),
+                        "reason": str(decision.get("reason") or "NOT_STARTABLE"),
+                        "status": status,
+                        "operation_mode": str(
+                            decision.get("operation_mode") or ""
+                        ),
+                        "session_phase": dict(
+                            decision.get("session_phase") or {}
+                        ),
+                        "display_label": f"{code} {name}".strip(),
+                    }
+                )
 
+        self._last_start_target_block_details = block_details
         return targets, skipped
+
+    def start_target_block_details(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            dict(item)
+            for item in getattr(self, "_last_start_target_block_details", ())
+            if isinstance(item, dict)
+        )
 
     def show_auto_trade_result_dialog(self, title: str, heading: str, lines: list[str]) -> None:
         """복수 종목 처리 결과를 표시하는 공용 창."""
@@ -10986,22 +12917,57 @@ class AutoTradeSettingWindow(QDialog):
             self.update_global_operation_button_state()
             return
         running_targets = self.running_registered_operation_targets()
-        if running_targets:
-            self.update_global_operation_button_state()
-            return
         selected_targets = self.registered_operation_start_targets()
+        requested_targets = list(selected_targets)
+        running_keys = {
+            str(code or "").strip() or str(Path(stock_dir).resolve())
+            for stock_dir, code, _name in running_targets
+        }
+        selected_targets = [
+            target
+            for target in selected_targets
+            if (
+                str(target[1] or "").strip()
+                or str(Path(target[0]).resolve())
+            ) not in running_keys
+        ]
         if not selected_targets:
-            status_message = getattr(self, "statusBarMessage", None)
-            if callable(status_message):
-                status_message("운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요.")
+            if not running_targets:
+                status_message = getattr(self, "statusBarMessage", None)
+                if callable(status_message):
+                    status_message("운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요.")
+            else:
+                requested_targets = requested_targets or list(running_targets)
+                result = {
+                    "ok": False,
+                    "reason": "ALREADY_RUNNING",
+                    "user_message": "선택한 종목이 모두 이미 운영 중입니다.",
+                    "requested": tuple(
+                        f"{code} {name}".strip()
+                        for _stock_dir, code, name in requested_targets
+                    ),
+                    "requested_count": len(requested_targets),
+                    "completed": (),
+                    "blocked_target_details": (),
+                    "already_running_targets": tuple(running_targets),
+                    "blocked_count": 0,
+                    "already_running_count": len(running_targets),
+                    "started_count": 0,
+                    "failed_count": 0,
+                    "excluded_review_count": 0,
+                    "excluded_validation_count": 0,
+                }
+                _show_operation_start_summary_toast(self, result)
             self.update_global_operation_button_state()
             return
-        auto_trade_start_selected_auto_trades(
-            self,
-            request_scope="multiple",
-            selected_targets=selected_targets,
-            source="auto_trade_global_start_button",
-        )
+        start_kwargs = {
+            "request_scope": "multiple",
+            "selected_targets": selected_targets,
+            "source": "auto_trade_global_start_button",
+        }
+        if running_targets:
+            start_kwargs["already_running_targets"] = running_targets
+        auto_trade_start_selected_auto_trades(self, **start_kwargs)
         parent_refreshed = False
         parent_getter = getattr(self, "parent", None)
         parent = parent_getter() if callable(parent_getter) else None
@@ -11089,7 +13055,7 @@ class AutoTradeSettingWindow(QDialog):
         popup.show_message(message, timeout_ms)
 
     def open_stock_performance_window(self) -> None:
-        open_stock_performance_prototype(self)
+        open_stock_performance(self)
 
 def base_stock_routine_assignments() -> dict[tuple[str, str], set[str]]:
     """

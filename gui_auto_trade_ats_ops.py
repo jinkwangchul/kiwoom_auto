@@ -21,6 +21,7 @@ from gui_operation_ui_context import operation_dialog_parent
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import (
     manual_ats_active_now,
+    manual_ats_execution_method_label,
     manual_ats_session_labels,
 )
 from gui_auto_trade_policy import (
@@ -43,7 +44,9 @@ from event_journal_trade_observer import observe_manual_ats_liquidation_outcome
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
 from manual_ats_runtime import (
+    manual_ats_runtime_execution_method_result,
     manual_ats_runtime_selected_keys,
+    normalize_manual_ats_execution_method,
     write_manual_ats_runtime_selection,
 )
 from state_policy import normalize_operation_mode
@@ -53,6 +56,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
+_PRESERVE_ATS_EXECUTION_METHOD = object()
 
 
 def append_stock_log(stock_dir: Path, event_type: str, message: str) -> Path | None:
@@ -82,6 +86,44 @@ def auto_trade_selected_manual_ats_state(
         for key in result:
             result[key] = result[key] or key in sessions
     return result
+
+
+def auto_trade_selected_manual_ats_execution_method_state(
+    window,
+    selected: list[tuple[Path, str, str]] | None = None,
+) -> dict[str, object]:
+    targets = list(selected) if selected is not None else list(window.selected_stock_infos())
+    methods: set[str] = set()
+    invalid: list[str] = []
+    for stock_dir, code, _name in targets:
+        result = manual_ats_runtime_execution_method_result(
+            read_json_dict(stock_dir / "state.json")
+        )
+        if result.get("ok") is not True:
+            invalid.append(str(code or stock_dir.name))
+            continue
+        methods.add(str(result.get("execution_method") or "ROUTINE"))
+    if invalid:
+        reporter = getattr(window, "statusBarMessage", None)
+        if callable(reporter):
+            reporter(
+                "ATS 주문방식 설정 오류: INVALID_ATS_EXECUTION_METHOD / "
+                + ", ".join(invalid)
+            )
+        return {
+            "ok": False,
+            "execution_method": "",
+            "mixed": False,
+            "reason_code": "INVALID_ATS_EXECUTION_METHOD",
+            "invalid_targets": tuple(invalid),
+        }
+    method = next(iter(methods)) if len(methods) == 1 else ("ROUTINE" if not methods else "")
+    return {
+        "ok": True,
+        "execution_method": method,
+        "mixed": len(methods) > 1,
+        "reason_code": "ATS_EXECUTION_METHOD_UI_READY",
+    }
 
 
 def auto_trade_selected_manual_ats_liquidation_available(
@@ -145,6 +187,7 @@ def auto_trade_save_manual_ats_state_for_targets(
     selected: list[tuple[Path, str, str]],
     ats_state: dict[str, bool],
     editable_keys: tuple[str, ...] | None = None,
+    execution_method: object = _PRESERVE_ATS_EXECUTION_METHOD,
 ) -> dict[str, object]:
     """Apply ATS state to a fixed target snapshot through the existing writer."""
     targets = list(selected)
@@ -200,7 +243,10 @@ def auto_trade_save_manual_ats_state_for_targets(
             for key in all_keys
         }
 
-        if not write_manual_ats_runtime_selection(stock_dir, normalized):
+        write_kwargs = {}
+        if execution_method is not _PRESERVE_ATS_EXECUTION_METHOD:
+            write_kwargs["execution_method"] = execution_method
+        if not write_manual_ats_runtime_selection(stock_dir, normalized, **write_kwargs):
             target_results.append(
                 {
                     "stock_code": code,
@@ -222,6 +268,17 @@ def auto_trade_save_manual_ats_state_for_targets(
             for key in all_keys
             if (key in current_keys) != bool(normalized.get(key, False))
         ]
+        if execution_method is not _PRESERVE_ATS_EXECUTION_METHOD:
+            previous_method = manual_ats_runtime_execution_method_result(current_state)
+            normalized_method = normalize_manual_ats_execution_method(execution_method)
+            if previous_method.get("execution_method") != normalized_method:
+                changes.append(
+                    {
+                        "field_key": "manual_ats.execution_method",
+                        "before": previous_method.get("execution_method"),
+                        "after": normalized_method,
+                    }
+                )
         if changes:
             append_production_event(
                 "ATS_CHANGED",
@@ -299,6 +356,37 @@ def auto_trade_set_selected_manual_ats_flag(window, flag_key: str, enabled: bool
         (flag_key,),
     )
     window.statusBarMessage(f"ATS설정 변경 완료: {label} {'ON' if enabled else 'OFF'} / {changed_count}개")
+
+
+def auto_trade_set_selected_manual_ats_execution_method(
+    window,
+    execution_method: str,
+    label: str,
+    selected: list[tuple[Path, str, str]] | None = None,
+) -> dict[str, object]:
+    normalized = normalize_manual_ats_execution_method(execution_method)
+    if normalized is None:
+        result = {
+            "requested": 0,
+            "succeeded": 0,
+            "failed": 1,
+            "results": [],
+            "reason_code": "INVALID_ATS_EXECUTION_METHOD",
+        }
+        window.statusBarMessage("ATS 주문방식 저장 실패: INVALID_ATS_EXECUTION_METHOD")
+        return result
+    targets = list(selected) if selected is not None else list(window.selected_stock_infos())
+    result = auto_trade_save_manual_ats_state_for_targets(
+        window,
+        targets,
+        {},
+        editable_keys=(),
+        execution_method=normalized,
+    )
+    window.statusBarMessage(
+        f"ATS 주문방식 변경 완료: {label or manual_ats_execution_method_label(normalized)} / {result['succeeded']}개"
+    )
+    return result
 
 
 def _manual_ats_result_status(execution_result: dict[str, object]) -> str:

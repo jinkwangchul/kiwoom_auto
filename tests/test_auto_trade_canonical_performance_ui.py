@@ -8,7 +8,7 @@ from types import MethodType, SimpleNamespace
 import unittest
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget
 
 from assignment_episode_repository import (
     AssignmentEpisodeTarget,
@@ -193,9 +193,13 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
         snapshot = self.fixture()
         engine = snapshot.metrics
 
-        for scope in ("all", "current", "historical"):
+        for scope in ("all", "current"):
             stock = next(row for row in snapshot.stock_rows(scope) if row.stock_code == "005930")
             self.assertEqual(180, engine.calculate(stock.lifetime).profit_amount.value)
+        self.assertNotIn(
+            "005930",
+            {row.stock_code for row in snapshot.stock_rows("historical")},
+        )
 
         current_instances = {
             row.instance_id: engine.calculate(row.aggregate).profit_amount.value
@@ -250,7 +254,7 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
         self.assertEqual(40, snapshot.metrics.calculate(instance.aggregate).profit_amount.value)
         self.assertEqual(40, snapshot.metrics.calculate(group.aggregate).profit_amount.value)
 
-    def test_ui_payload_uses_canonical_status_values_and_no_event_unavailable(self) -> None:
+    def test_ui_payload_uses_canonical_status_values_including_valid_zero(self) -> None:
         snapshot = self.fixture()
         stock = next(row for row in snapshot.stock_rows("all") if row.stock_code == "005930")
         harness = SimpleNamespace(
@@ -286,10 +290,188 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
             empty_row,
             empty,
         )
-        self.assertEqual("-", empty_payload["performance_period_value"])
-        self.assertEqual("-", empty_payload["performance_profit_amount"])
-        self.assertIn("UNAVAILABLE", empty_payload["performance_profit_tooltip"])
-        self.assertEqual(3, empty_payload["performance_profit_sort_status_rank"])
+        self.assertEqual("0", empty_payload["performance_period_value"])
+        self.assertEqual("0", empty_payload["performance_profit_amount"])
+        self.assertEqual("0.00%", empty_payload["performance_profit_rate"])
+        self.assertEqual("0", empty_payload["performance_average_amount"])
+        self.assertEqual("0.00%", empty_payload["performance_average_rate"])
+        self.assertEqual("0.0", empty_payload["performance_efficiency_value"])
+        self.assertEqual("기간(0)", empty_payload["performance_period_text"])
+        self.assertEqual("수익(0 / 0.00%)", empty_payload["performance_profit_text"])
+        self.assertEqual("평균(0 / 0.00%)", empty_payload["performance_average_text"])
+        self.assertEqual("효율(0.0)", empty_payload["performance_efficiency_text"])
+        empty_metrics = empty.metric_result(empty_row)
+        self.assertEqual(MetricStatus.UNDEFINED, empty_metrics.profit_rate.status)
+        self.assertEqual(MetricStatus.UNDEFINED, empty_metrics.average_amount.status)
+        self.assertEqual(MetricStatus.UNAVAILABLE, empty_metrics.average_rate.status)
+        self.assertEqual(MetricStatus.UNAVAILABLE, empty_metrics.efficiency.status)
+        self.assertIn("VALID_ZERO", empty_payload["performance_profit_tooltip"])
+        self.assertIn("ZERO_REALIZED_COST_BASIS", empty_payload["performance_profit_tooltip"])
+        self.assertEqual(0, empty_payload["performance_profit_sort_status_rank"])
+
+        empty_parent = empty.instance_rows("current")[0]
+        empty_parent_payload = AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+            harness,
+            empty_parent,
+            empty,
+        )
+        self.assertEqual("기간(0)", empty_parent_payload["performance_period_text"])
+        self.assertEqual("수익(0 / 0.00%)", empty_parent_payload["performance_profit_text"])
+        self.assertEqual("평균(0 / 0.00%)", empty_parent_payload["performance_average_text"])
+        self.assertEqual("효율(0.0)", empty_parent_payload["performance_efficiency_text"])
+        self.assertIn(
+            "NO_CANONICAL_PERFORMANCE_EVENTS",
+            empty_parent_payload["performance_profit_tooltip"],
+        )
+
+        unavailable_payload = AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+            harness,
+            None,
+            None,
+        )
+        self.assertEqual("기간(-)", unavailable_payload["performance_period_text"])
+        self.assertEqual("수익(- / -)", unavailable_payload["performance_profit_text"])
+        self.assertEqual("평균(- / -)", unavailable_payload["performance_average_text"])
+        self.assertEqual("효율(-)", unavailable_payload["performance_efficiency_text"])
+
+    def test_zero_value_event_is_rendered_as_zero(self) -> None:
+        code = "005930"
+        self.open_unassigned(code, "2026-08-23T09:00:00+09:00")
+        episode = self.transition(
+            code,
+            self.target("A", "G", "Alpha", "Group"),
+            "2026-08-23T09:10:00+09:00",
+        )
+        self.append(
+            code,
+            episode.episode_id,
+            net=0,
+            gross=0,
+            cost=100,
+            trade_date="2026-08-23",
+        )
+        snapshot = build_canonical_performance_ui_snapshot(
+            self.root,
+            stocks=[SimpleNamespace(code=code, name="Samsung", assigned_routine_instance_id="A")],
+            instances=[SimpleNamespace(instance_id="A", group_id="G", display_name="Alpha")],
+            groups=[SimpleNamespace(group_id="G", display_name="Group")],
+        )
+        harness = SimpleNamespace(_canonical_performance_snapshot_error="")
+        harness._canonical_metric_status_rank = MethodType(
+            AutoTradeSettingWindow._canonical_metric_status_rank,
+            harness,
+        )
+        harness._canonical_metric_tooltip = MethodType(
+            AutoTradeSettingWindow._canonical_metric_tooltip,
+            harness,
+        )
+
+        payload = AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+            harness,
+            snapshot.stock_rows("current")[0],
+            snapshot,
+        )
+
+        self.assertEqual("1", payload["performance_period_value"])
+        self.assertEqual("0", payload["performance_profit_amount"])
+        self.assertEqual("0.00%", payload["performance_profit_rate"])
+        self.assertEqual("0", payload["performance_average_amount"])
+        self.assertEqual("0.00%", payload["performance_average_rate"])
+        self.assertIn("VALID_ZERO", payload["performance_profit_tooltip"])
+
+    def test_parent_diagnostic_payload_distinguishes_unresolved_ownership(self) -> None:
+        code = "003550"
+        self.open_unassigned(code, "2026-08-23T09:00:00+09:00")
+        episode = self.transition(
+            code,
+            self.target("A", "G", "Alpha", "Group"),
+            "2026-08-23T09:10:00+09:00",
+        )
+        self.append(
+            code,
+            episode.episode_id,
+            net=0,
+            gross=0,
+            cost=100,
+            trade_date="2026-08-23",
+            owner_id=OWNERSHIP_UNRESOLVED,
+        )
+        snapshot = build_canonical_performance_ui_snapshot(
+            self.root,
+            stocks=[SimpleNamespace(code=code, name="LG", assigned_routine_instance_id="A")],
+            instances=[SimpleNamespace(instance_id="A", group_id="G", display_name="Alpha")],
+            groups=[SimpleNamespace(group_id="G", display_name="Group")],
+        )
+        harness = SimpleNamespace(_canonical_performance_snapshot_error="")
+        harness._canonical_metric_status_rank = MethodType(
+            AutoTradeSettingWindow._canonical_metric_status_rank,
+            harness,
+        )
+        harness._canonical_metric_tooltip = MethodType(
+            AutoTradeSettingWindow._canonical_metric_tooltip,
+            harness,
+        )
+
+        parent = snapshot.instance_rows("current")[0]
+        payload = AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+            harness,
+            parent,
+            snapshot,
+        )
+
+        self.assertIn(
+            "NO_RESOLVED_PERFORMANCE_OWNERSHIP",
+            payload["performance_profit_tooltip"],
+        )
+
+    def test_parent_diagnostic_payload_distinguishes_performance_outside_current_scope(self) -> None:
+        code = "005930"
+        self.open_unassigned(code, "2026-08-20T09:00:00+09:00")
+        historical = self.transition(
+            code,
+            self.target("A", "G", "Alpha", "Group"),
+            "2026-08-20T09:10:00+09:00",
+        )
+        self.append(
+            code,
+            historical.episode_id,
+            net=10,
+            gross=10,
+            cost=100,
+            trade_date="2026-08-20",
+        )
+        self.transition(code, AssignmentEpisodeTarget.unassigned(), "2026-08-21T09:00:00+09:00")
+        self.transition(
+            code,
+            self.target("A", "G", "Alpha", "Group"),
+            "2026-08-22T09:00:00+09:00",
+        )
+        snapshot = build_canonical_performance_ui_snapshot(
+            self.root,
+            stocks=[SimpleNamespace(code=code, name="Samsung", assigned_routine_instance_id="A")],
+            instances=[SimpleNamespace(instance_id="A", group_id="G", display_name="Alpha")],
+            groups=[SimpleNamespace(group_id="G", display_name="Group")],
+        )
+        harness = SimpleNamespace(_canonical_performance_snapshot_error="")
+        harness._canonical_metric_status_rank = MethodType(
+            AutoTradeSettingWindow._canonical_metric_status_rank,
+            harness,
+        )
+        harness._canonical_metric_tooltip = MethodType(
+            AutoTradeSettingWindow._canonical_metric_tooltip,
+            harness,
+        )
+
+        payload = AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+            harness,
+            snapshot.instance_rows("current")[0],
+            snapshot,
+        )
+
+        self.assertIn(
+            "NO_PERFORMANCE_IN_SCOPE",
+            payload["performance_profit_tooltip"],
+        )
 
     def test_incomplete_net_is_not_displayed_as_zero(self) -> None:
         code = "005930"
@@ -326,7 +508,7 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
         self.assertEqual("-", payload["performance_profit_amount"])
         self.assertIn("NET_PNL_INCOMPLETE", payload["performance_profit_tooltip"])
 
-    def test_current_relation_mismatch_is_visible_on_stock_and_parent_tooltips(self) -> None:
+    def test_current_relation_mismatch_remains_in_internal_diagnostic_payload(self) -> None:
         code = "005930"
         self.open_unassigned(code, "2026-08-23T09:00:00+09:00")
         episode = self.transition(
@@ -363,7 +545,11 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
             instance,
             snapshot,
         )
-        self.assertEqual("-", payload["performance_profit_amount"])
+        self.assertEqual("0", payload["performance_profit_amount"])
+        self.assertIn(
+            "NO_RESOLVED_PERFORMANCE_OWNERSHIP",
+            payload["performance_profit_tooltip"],
+        )
         self.assertIn("INSTANCE_ID_MISMATCH", payload["performance_profit_tooltip"])
         self.assertIn("GROUP_ID_MISMATCH", payload["performance_profit_tooltip"])
 
@@ -460,6 +646,137 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
         self.assertEqual("A", instance_rows[0]["instance_id"])
         self.assertEqual("Alpha Old", instance_rows[0]["display_name"])
         self.assertEqual("+100", instance_rows[0]["performance_profit_amount"])
+        stock_rows = [
+            window.routine_table.item(row, 0).data(Qt.UserRole)
+            for row in range(window.routine_table.rowCount())
+            if not window.routine_table.isRowHidden(row)
+            and window.routine_table.item(row, 0).data(Qt.UserRole).get("row_kind") == "stock"
+        ]
+        self.assertEqual(1, len(stock_rows))
+        self.assertEqual("CURRENT", stock_rows[0]["stock_relation_kind"])
+        self.assertFalse(stock_rows[0]["is_historical"])
+        self.assertEqual("\u2713", stock_rows[0]["tree_icon"])
+
+    def test_tree_allows_historical_instances_but_flat_view_prefers_current(self) -> None:
+        from tests.test_auto_trade_setting_routine_tree import (
+            AutoTradeSettingRoutineTreeTest,
+        )
+
+        code = "005930"
+        self.open_unassigned(code, "2026-08-20T09:00:00+09:00")
+        episode_a = self.transition(
+            code,
+            self.target("A", "G1", "Alpha", "Group One"),
+            "2026-08-20T09:10:00+09:00",
+        )
+        self.append(code, episode_a.episode_id, net=10, gross=10, cost=100, trade_date="2026-08-20")
+        episode_b = self.transition(
+            code,
+            self.target("B", "G1", "Beta", "Group One"),
+            "2026-08-21T09:10:00+09:00",
+        )
+        self.append(code, episode_b.episode_id, net=20, gross=20, cost=200, trade_date="2026-08-21")
+        episode_c = self.transition(
+            code,
+            self.target("C", "G1", "Charlie", "Group One"),
+            "2026-08-22T09:10:00+09:00",
+        )
+        self.append(code, episode_c.episode_id, net=30, gross=30, cost=300, trade_date="2026-08-22")
+
+        definition = SimpleNamespace(
+            definition_id="indicator_follow",
+            display_name="Indicator Follow",
+            package_dir=str(self.root / "routines" / "indicator_follow"),
+        )
+        instances = [
+            SimpleNamespace(
+                instance_id=instance_id,
+                definition_id="indicator_follow",
+                group_id="G1",
+                display_name=display_name,
+                rules_path="",
+            )
+            for instance_id, display_name in (
+                ("A", "Alpha"),
+                ("B", "Beta"),
+                ("C", "Charlie"),
+            )
+        ]
+        groups = [
+            SimpleNamespace(
+                group_id="G1",
+                definition_id="indicator_follow",
+                display_name="Group One",
+                name="Group One",
+                path=self.root / "groups" / "G1",
+            )
+        ]
+        stocks = [
+            {
+                "code": code,
+                "name": "Samsung",
+                "stock_path": "stocks/005930_Samsung",
+                "assigned_routine_instance_id": "C",
+                "routines": [],
+            }
+        ]
+        snapshot = build_canonical_performance_ui_snapshot(
+            self.root,
+            stocks=stocks,
+            instances=instances,
+            groups=groups,
+        )
+        window = AutoTradeSettingRoutineTreeTest()._window_harness()
+        window._routine_tree_projected_instance_ids_override = None
+        window._routine_tree_display_level = "routine"
+        window._routine_tree_display_scope = "all"
+        window._routine_tree_valid_only = False
+        window._routine_instance_operation_counts = lambda: {
+            instance.instance_id: {"registered": 1, "normal": 1}
+            for instance in instances
+        }
+        window._auto_trade_initial_read_snapshot = {
+            "definitions": (definition,),
+            "instances": tuple(instances),
+            "groups": tuple(groups),
+            "stocks": tuple(stocks),
+            "canonical_performance": snapshot,
+            "canonical_performance_error": "",
+        }
+        window.load_routine_table()
+
+        hierarchical_rows = [
+            window.routine_table.item(row, 0).data(Qt.UserRole)
+            for row in range(window.routine_table.rowCount())
+            if not window.routine_table.isRowHidden(row)
+            and window.routine_table.item(row, 0).data(Qt.UserRole).get("row_kind") == "stock"
+        ]
+        self.assertEqual(
+            {("A", "HISTORICAL", "\u25aa"), ("B", "HISTORICAL", "\u25aa"), ("C", "CURRENT", "\u2713")},
+            {
+                (
+                    row["instance_id"],
+                    row["stock_relation_kind"],
+                    row["tree_icon"],
+                )
+                for row in hierarchical_rows
+            },
+        )
+
+        window._routine_tree_display_level = "stock"
+        window._routine_tree_valid_only = True
+        window.load_routine_table()
+        flat_rows = [
+            window.routine_table.item(row, 0).data(Qt.UserRole)
+            for row in range(window.routine_table.rowCount())
+            if not window.routine_table.isRowHidden(row)
+            and window.routine_table.item(row, 0).data(Qt.UserRole).get("row_kind") == "stock"
+        ]
+        self.assertEqual(1, len(flat_rows))
+        self.assertEqual("C", flat_rows[0]["instance_id"])
+        self.assertEqual("CURRENT", flat_rows[0]["stock_relation_kind"])
+        self.assertEqual(("A", "B"), flat_rows[0]["historical_instance_ids"])
+        self.assertEqual("\u2713", flat_rows[0]["tree_icon"])
 
     def test_non_zero_payload_reaches_existing_fixed_qt_labels(self) -> None:
         from tests.test_auto_trade_setting_routine_tree import (
@@ -496,7 +813,18 @@ class AutoTradeCanonicalPerformanceUiTests(unittest.TestCase):
         self.assertEqual("+180", profit.text())
         self.assertEqual("+10.00%", profit_rate.text())
         self.assertEqual("+60", average.text())
-        self.assertIn("VALID", widget.toolTip())
+        self.assertIn("VALID", payload["performance_profit_tooltip"])
+        self.assertEqual("", widget.toolTip())
+        for metric_name in ("Period", "Profit", "Average", "Efficiency"):
+            metric = widget.findChild(
+                QWidget,
+                f"autoTradeSettingRoutineTreePerformance{metric_name}",
+            )
+            self.assertIsNotNone(metric)
+            self.assertEqual("", metric.toolTip())
+            self.assertTrue(
+                all(label.toolTip() == "" for label in metric.findChildren(QLabel))
+            )
 
     def test_tree_read_path_no_longer_calls_legacy_performance_calculators(self) -> None:
         source = inspect.getsource(AutoTradeSettingWindow.load_routine_table)

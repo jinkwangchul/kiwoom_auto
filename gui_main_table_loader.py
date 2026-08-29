@@ -52,6 +52,7 @@ from gui_operation_environment import (
     suggested_buy_limit,
 )
 from runtime_io import read_json_dict
+from running_budget_adjustment import project_running_budget_adjustment_display_config
 from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
     RatioMetricDisplay,
@@ -88,17 +89,15 @@ from gui_auto_trade_policy import (
     auto_trade_setting_trade_started,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_display_status_for_current_session,
+    auto_trade_setting_row_projection,
 )
 from gui_auto_trade_policy import (
-    auto_trade_setting_liquidation_active,
-    auto_trade_setting_liquidation_text,
-    auto_trade_setting_method_text,
     auto_trade_operation_display,
-    effective_liquidation_policy_for_config,
 )
-from gui_base_stock_service import read_base_stocks
+from gui_base_stock_service import normalize_stock_code, read_base_stocks
 from gui_routine_registry import get_group_records
 from main_group_projection import build_main_group_projection
+from kiwoom_stock_library_service import master_status_tokens
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
@@ -456,10 +455,23 @@ def _stock_library_tooltip_metadata_by_code() -> dict[str, dict[str, object]]:
         str(record.get("code", "") or "").strip().upper().lstrip("A"): {
             "market": str(record.get("market", "") or "").strip().upper(),
             "nxt_available": record.get("nxt_available") is True,
+            "status": str(record.get("status", "") or "").strip(),
         }
         for record in records
         if isinstance(record, dict) and str(record.get("code", "") or "").strip()
     }
+
+
+def main_monitoring_stock_status_text(value: object) -> str:
+    """Project master status evidence for the Main monitoring tooltip only."""
+
+    visible_tokens = [
+        token
+        for token in master_status_tokens(value)
+        if not token.startswith("증거금")
+        and token not in {"담보대출", "신용가능"}
+    ]
+    return " | ".join(visible_tokens) or "-"
 
 
 def _stock_library_market_by_code() -> dict[str, str]:
@@ -477,7 +489,7 @@ def _main_stock_row_tooltip(
     *,
     nxt_available: bool = False,
     stock_state: dict[str, object] | None = None,
-    operator_status: object = None,
+    stock_status: object = None,
 ) -> str:
     state = stock_state if isinstance(stock_state, dict) else {}
 
@@ -513,8 +525,8 @@ def _main_stock_row_tooltip(
     market_text = str(market or "").strip().upper() or "-"
     code = str(stock_code or "").strip()
     name = str(stock_name or "").strip()
-    status_text = str(operator_status or "").strip() or "-"
-    first_line = [f"▪  {code} {name}", market_text, f"종목상태 {status_text}"]
+    status_text = main_monitoring_stock_status_text(stock_status)
+    first_line = [f"▪  {code} {name}", market_text, f"상태 {status_text}"]
     if nxt_available:
         first_line.append("NXT")
     second_line = [
@@ -524,8 +536,8 @@ def _main_stock_row_tooltip(
         f"저가 {price_text(state.get('low_price'))}",
     ]
     third_line = [
-        f"▪  등락율 {signed_percent_text('change_rate')}",
-        f"전일거래량 대비 {signed_percent_text('previous_day_volume_rate')}",
+        f"▪  등락률 {signed_percent_text('change_rate')}",
+        f"전일대비 {signed_percent_text('previous_day_volume_rate')}",
         f"체결강도 {strength_text()}",
     ]
     separator = "  |  "
@@ -566,7 +578,7 @@ def main_stock_row_tooltip_from_projection(
         current_price,
         nxt_available=bool(data.get("nxt_available") is True),
         stock_state=state,
-        operator_status=data.get("operator_status"),
+        stock_status=data.get("stock_status"),
     )
 
 
@@ -1690,6 +1702,7 @@ def _instance_stock_counts(
         else _main_pnl_refresh_static_cache(window)
     )
     dynamic_stocks: list[tuple[dict[str, object], dict[str, object]]] = []
+    seen_stock_identities: set[str] = set()
     for stock in static_cache["stocks"]:
         stock_dir = Path(stock["stock_dir"])
         state = (
@@ -1707,6 +1720,10 @@ def _instance_stock_counts(
         review_required = is_review_required_state(state)
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
+        stock_identity = normalize_stock_code(code) or stock_path
+        if stock_identity in seen_stock_identities:
+            continue
+        seen_stock_identities.add(stock_identity)
         item = counts.setdefault(
             instance_id,
             {
@@ -2416,25 +2433,29 @@ def _routine_tree_stock_display_values(
         trade_started,
         code,
     )
-    display_status = auto_trade_setting_display_status_for_current_session(
+    operation_category = auto_trade_stock_operation_category(
+        window,
+        stock_code=code,
+        persisted_trade_started=trade_started,
+        operation_excluded=is_operation_excluded(config),
+        review_required=is_review_required_state(state),
+    )
+    row_projection = auto_trade_setting_row_projection(
         state,
         config,
+        operation_category=operation_category,
         holding_qty=holding_qty,
         buy_pending_qty=buy_pending_qty,
         sell_pending_qty=sell_pending_qty,
         current_session_trade_started=current_session_trade_started,
         persisted_trade_started=trade_started,
     )
+    display_status = str(row_projection["display_status"])
     operation_display_text, _operation_color, _operation_tooltip, _ats_labels = (
         auto_trade_operation_display(config, state)
     )
-    method_text = auto_trade_setting_method_text(display_status, config, state)
-    liquidation_text = auto_trade_setting_liquidation_text(
-        config,
-        display_status,
-        state,
-        holding_qty=holding_qty,
-    )
+    method_text = str(row_projection["method_text"])
+    liquidation_text = str(row_projection["liquidation_text"])
     current_price = main_stock_current_price(window, stock, state)
     holding_text, price_text, profit_text, _pending_text, _profit_amount, _profit_rate = (
         stock_position_display_values(
@@ -2572,45 +2593,31 @@ def _routine_tree_stock_display_snapshots(
         trade_started,
         code,
     )
-    display_status = auto_trade_setting_display_status_for_current_session(
+    operation_category = auto_trade_stock_operation_category(
+        window,
+        stock_code=code,
+        persisted_trade_started=trade_started,
+        operation_excluded=is_operation_excluded(config),
+        review_required=is_review_required_state(state),
+    )
+    row_projection = auto_trade_setting_row_projection(
         state,
         config,
+        operation_category=operation_category,
         holding_qty=holding_qty,
         buy_pending_qty=buy_pending_qty,
         sell_pending_qty=sell_pending_qty,
         current_session_trade_started=current_session_trade_started,
         persisted_trade_started=trade_started,
     )
-    method_text = auto_trade_setting_method_text(display_status, config, state)
-    liquidation_text = auto_trade_setting_liquidation_text(
-        config,
-        display_status,
-        state,
-        holding_qty=holding_qty,
-    )
-    status_cell_active = (
-        current_session_trade_started
-        and display_status not in ("긴급정지", "검토종목")
-    )
-    method_cell_active = (
-        status_cell_active
-        and display_status not in ("감시/대기", "-", "")
-    )
-    liquidation_has_policy = str(liquidation_text).strip() not in ("", "-")
-    _liquidation_policy_for_style, liquidation_is_individual = (
-        effective_liquidation_policy_for_config(config, state)
-    )
-    liquidation_cell_active = (
-        current_session_trade_started
-        and holding_qty > 0
-        and auto_trade_setting_liquidation_active(
-            config,
-            holding_qty,
-            display_status=display_status,
-            state=state,
-        )
-        and liquidation_has_policy
-    )
+    display_status = str(row_projection["display_status"])
+    method_text = str(row_projection["method_text"])
+    liquidation_text = str(row_projection["liquidation_text"])
+    status_cell_active = bool(row_projection["status_cell_active"])
+    method_cell_active = bool(row_projection["method_cell_active"])
+    liquidation_has_policy = bool(row_projection["liquidation_has_policy"])
+    liquidation_is_individual = bool(row_projection["liquidation_is_individual"])
+    liquidation_cell_active = bool(row_projection["liquidation_cell_active"])
 
     tokens: list[dict[str, object]] = []
     name_item = create_auto_trade_stock_name_item(
@@ -2631,7 +2638,7 @@ def _routine_tree_stock_display_snapshots(
         _item_style_snapshot(
             create_auto_trade_situation_item(
                 state,
-                current_session_trade_started,
+                bool(row_projection["situation_active"]),
                 display_status,
             )
         )
@@ -2676,7 +2683,7 @@ def _routine_tree_stock_display_snapshots(
     review_required = is_review_required_state(state)
     operation_excluded = is_operation_excluded(config)
     if review_required or operation_excluded:
-        for token in tokens:
+        for token_index, token in enumerate(tokens):
             if not isinstance(token, dict):
                 continue
             style_item = SortableTableWidgetItem(str(token.get("text", "") or ""))
@@ -2686,6 +2693,15 @@ def _routine_tree_stock_display_snapshots(
                 review_required=review_required,
                 operation_excluded=operation_excluded,
             )
+            if review_required and token_index in {4, 5}:
+                apply_auto_trade_setting_activity_style(style_item, False)
+            elif review_required and token_index == 6:
+                apply_auto_trade_setting_liquidation_style(
+                    style_item,
+                    False,
+                    liquidation_has_policy,
+                    liquidation_is_individual,
+                )
             protected = _item_style_snapshot(style_item)
             token["foreground"] = protected.get("foreground", token.get("foreground"))
             token["background"] = protected.get("background", token.get("background"))
@@ -2699,6 +2715,7 @@ def _routine_tree_stock_metric_values(
     *,
     trade_counts: tuple[int, int] = (0, 0),
     total_budget: object = None,
+    config_override: dict[str, object] | None = None,
 ) -> tuple[tuple[object, ...], str, str, str | None, dict[str, object]]:
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
@@ -2748,12 +2765,14 @@ def _routine_tree_stock_metric_values(
         value1_sample="99",
         value2_sample="99",
     )
-    config: dict[str, object] = {}
-    if stock_dir is not None:
+    config: dict[str, object] = (
+        dict(config_override) if isinstance(config_override, dict) else {}
+    )
+    if not config and stock_dir is not None:
         loaded_config = read_json_dict(stock_dir / "config.json")
         if isinstance(loaded_config, dict):
             config = loaded_config
-    elif isinstance(stock.get("config"), dict):
+    elif not config and isinstance(stock.get("config"), dict):
         config = stock["config"]
     buy_limit_enabled = bool(config.get("buy_limit_enabled", False))
     buy_limit_amount = config.get("buy_limit_amount")
@@ -2855,9 +2874,27 @@ def _routine_tree_stock_row(
     )
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
-    stock_config = read_json_dict(stock_dir / "config.json") if stock_dir is not None else {}
+    stock_config = (
+        read_json_dict(stock_dir / "config.json")
+        if stock_dir is not None
+        else dict(stock.get("config"))
+        if isinstance(stock.get("config"), dict)
+        else {}
+    )
     if not isinstance(stock_config, dict) or not stock_config:
         stock_config = default_config()
+    stock_state = (
+        read_json_dict(stock_dir / "state.json")
+        if stock_dir is not None
+        else stock.get("state")
+        if isinstance(stock.get("state"), dict)
+        else {}
+    )
+    if not isinstance(stock_state, dict):
+        stock_state = {}
+    display_config, adjustment_display = (
+        project_running_budget_adjustment_display_config(stock_config, stock_state)
+    )
     (
         stock_metrics,
         stock_profit_led,
@@ -2869,6 +2906,7 @@ def _routine_tree_stock_row(
         stock,
         trade_counts=trade_counts,
         total_budget=total_budget,
+        config_override=display_config,
     )
     profit_metric = stock_metrics[2] if len(stock_metrics) > 2 else None
     if isinstance(profit_metric, RatioMetricDisplay) and len(stock_values) > 9:
@@ -2907,15 +2945,6 @@ def _routine_tree_stock_row(
         "method": stock_values[5] if len(stock_values) > 5 else "-",
         "liquidation": stock_values[6] if len(stock_values) > 6 else "-",
     }
-    stock_state = (
-        read_json_dict(stock_dir / "state.json")
-        if stock_dir is not None
-        else stock.get("state")
-        if isinstance(stock.get("state"), dict)
-        else {}
-    )
-    if not isinstance(stock_state, dict):
-        stock_state = {}
     operator_status = main_stock_operator_status(
         window,
         stock_code=stock.get("code"),
@@ -2937,8 +2966,9 @@ def _routine_tree_stock_row(
         "initial_buy": main_stock_resolved_initial_buy_display(
             window,
             stock,
-            stock_config,
+            display_config,
         ),
+        "running_budget_adjustment_display": adjustment_display,
         "stock_profit_led": stock_profit_led,
         "sort_metrics": sort_values,
         "column_sort_values": column_sort_values,
@@ -3278,6 +3308,7 @@ def main_load_routine_table(window) -> None:
                 stock_row["nxt_available"] = bool(
                     stock_metadata.get("nxt_available") is True
                 )
+                stock_row["stock_status"] = stock_metadata.get("status", "")
             operation_running_count = int(
                 count.get("operation_running", count.get("running", 0)) or 0
             )
@@ -3637,7 +3668,7 @@ def main_load_routine_table(window) -> None:
                         "current_price": row_data.get("current_price"),
                         "nxt_available": bool(row_data.get("nxt_available") is True),
                         "stock_state": dict(row_data.get("stock_state") or {}),
-                        "operator_status": row_data.get("operator_status", ""),
+                        "stock_status": row_data.get("stock_status", ""),
                     },
                 )
             item.setData(ROUTINE_STOCK_INITIAL_BUY_ROLE, row_data.get("initial_buy", {}))
@@ -3690,7 +3721,7 @@ def main_load_routine_table(window) -> None:
                             row_data.get("current_price"),
                             nxt_available=bool(row_data.get("nxt_available") is True),
                             stock_state=row_data.get("stock_state"),
-                            operator_status=row_data.get("operator_status"),
+                            stock_status=row_data.get("stock_status"),
                         )
                     )
             if row_data["kind"] == ROUTINE_ROW_CHILD:
@@ -3831,19 +3862,25 @@ def main_load_running_stock_table(window) -> None:
         avg_price = average_price_from_state(state)
         current_price = current_price_from_state(state)
         buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state) if stock_dir is not None else (0, 0)
-        display_status = auto_trade_setting_display_status_for_current_session(
+        operation_category = auto_trade_stock_operation_category(
+            window,
+            stock_code=code,
+            persisted_trade_started=trade_started,
+            operation_excluded=is_operation_excluded(config),
+            review_required=False,
+        )
+        row_projection = auto_trade_setting_row_projection(
             state,
             config,
+            operation_category=operation_category,
             holding_qty=holding_qty,
             buy_pending_qty=buy_pending_qty,
             sell_pending_qty=sell_pending_qty,
             current_session_trade_started=current_session_trade_started,
             persisted_trade_started=trade_started,
         )
-        status_cell_active = (
-            current_session_trade_started
-            and display_status not in ("긴급정지", "검토종목")
-        )
+        display_status = str(row_projection["display_status"])
+        status_cell_active = bool(row_projection["status_cell_active"])
         operator_status = main_stock_operator_status(
             window,
             stock_code=code,
@@ -3864,7 +3901,7 @@ def main_load_running_stock_table(window) -> None:
                 "operation": operation,
                 "config": config,
                 "state": state,
-                "trade_started": current_session_trade_started,
+                "trade_started": bool(row_projection["situation_active"]),
                 "status": display_status,
                 "operator_status": operator_status,
                 "status_cell_active": status_cell_active,
@@ -3873,6 +3910,7 @@ def main_load_running_stock_table(window) -> None:
                 "current_price": current_price,
                 "market": stock_metadata.get("market", ""),
                 "nxt_available": bool(stock_metadata.get("nxt_available") is True),
+                "stock_status": stock_metadata.get("status", ""),
                 "buy_pending": f"{buy_pending_qty:,}" if isinstance(buy_pending_qty, int) else str(buy_pending_qty),
                 "sell_pending": f"{sell_pending_qty:,}" if isinstance(sell_pending_qty, int) else str(sell_pending_qty),
             }
@@ -3900,7 +3938,7 @@ def main_load_running_stock_table(window) -> None:
             row.get("current_price"),
             nxt_available=bool(row.get("nxt_available") is True),
             stock_state=row.get("state"),
-            operator_status=row.get("operator_status"),
+            stock_status=row.get("stock_status"),
         )
 
         for col, value in enumerate(values):
@@ -3950,7 +3988,7 @@ def main_load_running_stock_table(window) -> None:
                         "current_price": row.get("current_price"),
                         "nxt_available": bool(row.get("nxt_available") is True),
                         "stock_state": dict(row.get("state") or {}),
-                        "operator_status": row.get("operator_status", ""),
+                        "stock_status": row.get("stock_status", ""),
                     },
                 )
             window.running_stock_table.setItem(row_index, col, item)

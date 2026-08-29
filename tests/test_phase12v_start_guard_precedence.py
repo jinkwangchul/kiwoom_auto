@@ -10,8 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import gui_auto_trade_run_control as run_control
+import gui_ats_utils as ats_utils
 import gui_auto_trade_setting_window as setting_window_module
 import gui_main_stock_context_menu as monitoring_context_menu
+import routine_order_permission as order_permission
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
 
@@ -167,7 +169,7 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
         window.recalculate_stock_status_by_operation_policy.assert_not_called()
         writer.assert_not_called()
 
-    def test_authenticated_outside_time_target_exists_keeps_time_message(self) -> None:
+    def test_authenticated_outside_time_target_starts_and_registers_participant(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _target(Path(temp_dir), "012210")
             window = _PrecedenceWindow([target])
@@ -177,10 +179,134 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 now=run_control.datetime(2026, 8, 25, 21, 0),
             )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual("현재는 매매 운영 시간이 아닙니다.", result["user_message"])
-        window.filter_start_targets_by_recovery.assert_not_called()
-        writer.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual((target,), result["time_eligible_targets"])
+        self.assertEqual((), result["time_blocked_targets"])
+        window.filter_start_targets_by_recovery.assert_called_once_with(
+            [target], action="운영시작"
+        )
+        self.assertEqual(
+            ("012210",),
+            run_control.auto_trade_current_session_operation_participant_codes(window),
+        )
+        writer.assert_called_once_with(participant_stock_codes=["012210"])
+        time_status = order_permission.canonical_stock_trading_time_status(
+            config={
+                "operation_mode": "SCHEDULED",
+                "start_time": "09:00:00",
+                "end_buy_time": "13:30:00",
+            },
+            state={},
+            now_dt=run_control.datetime(2026, 8, 25, 21, 0),
+        )
+        self.assertIs(time_status["active"], False)
+        self.assertEqual("OUTSIDE_OPERATION_TIME", time_status["reason"])
+
+    def test_pre_market_ats_active_start_allows_ats_order_time(self) -> None:
+        operation_policy = {
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:20:00",
+            },
+            "manual_operation": {"use_regular_market": True},
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = _target(Path(temp_dir), "012210", start="09:30:00")
+            config_path = target[0] / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["operation_mode"] = "CONTINUOUS"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            state_path = target[0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["manual_ats_selection"] = {
+                "selected_sessions": ["extra1"],
+                "execution_method": "MARKET",
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            window = _PrecedenceWindow([target])
+
+            result, writer = self._run(
+                window,
+                now=run_control.datetime(2026, 8, 25, 8, 10),
+            )
+            with patch.object(
+                ats_utils,
+                "read_operation_policy",
+                return_value=operation_policy,
+            ):
+                time_status = order_permission.canonical_stock_trading_time_status(
+                    config=config,
+                    state=state,
+                    now_dt=run_control.datetime(2026, 8, 25, 8, 10),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual(
+            ("012210",),
+            run_control.auto_trade_current_session_operation_participant_codes(window),
+        )
+        writer.assert_called_once_with(participant_stock_codes=["012210"])
+        self.assertIs(time_status["active"], True)
+        self.assertEqual("ACTIVE_ATS", time_status["reason"])
+
+    def test_future_ats_gap_start_succeeds_but_order_time_is_blocked(self) -> None:
+        operation_policy = {
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:20:00",
+            },
+            "manual_operation": {"use_regular_market": True},
+            "extra_sessions": [
+                {
+                    "enabled": True,
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = _target(Path(temp_dir), "012210", start="09:30:00")
+            config_path = target[0] / "config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["operation_mode"] = "CONTINUOUS"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            state_path = target[0] / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["manual_ats_selection"] = {
+                "selected_sessions": ["extra1"],
+                "execution_method": "MARKET",
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            window = _PrecedenceWindow([target])
+
+            result, _writer = self._run(
+                window,
+                now=run_control.datetime(2026, 8, 25, 7, 59, 59),
+            )
+            with patch.object(
+                ats_utils,
+                "read_operation_policy",
+                return_value=operation_policy,
+            ):
+                time_status = order_permission.canonical_stock_trading_time_status(
+                    config=config,
+                    state=state,
+                    now_dt=run_control.datetime(2026, 8, 25, 7, 59, 59),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["started_count"])
+        self.assertIs(time_status["active"], False)
+        self.assertEqual("OUTSIDE_OPERATION_TIME", time_status["reason"])
 
     def test_authenticated_no_structural_target_keeps_generic_message(self) -> None:
         window = _PrecedenceWindow([])
@@ -240,7 +366,7 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 Path(temp_dir),
                 "012210",
                 trade_amount_type="AMOUNT",
-                buy_amount=100_000,
+                buy_amount=0,
                 previous_close=100_000,
             )
             window = _PrecedenceWindow([target])
@@ -249,8 +375,8 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(
-            "초회 매수 금액이 최소 거래금액보다 작습니다.\n"
-            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오.",
+            "현재 세션의 가격 정보를 아직 확인하지 못해 시작금액을 확정할 수 없습니다.\n"
+            "시세 정보를 확인한 뒤 다시 시도하십시오.",
             result["user_message"],
         )
         window.recalculate_stock_status_by_operation_policy.assert_not_called()
@@ -315,7 +441,7 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
         window.split_start_targets.assert_not_called()
         writer.assert_not_called()
 
-    def test_partial_outside_time_runs_recovery_for_time_eligible_targets_only(self) -> None:
+    def test_mixed_trade_windows_all_reach_recovery_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             outside = _target(Path(temp_dir), "000001", start="18:00:00", end="19:00:00")
             inside = _target(Path(temp_dir), "000002")
@@ -324,11 +450,15 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
             result, _writer = self._run(window)
 
         self.assertTrue(result["ok"])
-        self.assertEqual([inside], window.filter_start_targets_by_recovery.call_args.args[0])
-        self.assertEqual(("000001 테스트",), result["time_blocked_targets"])
+        self.assertEqual(
+            [outside, inside],
+            window.filter_start_targets_by_recovery.call_args.args[0],
+        )
+        self.assertEqual((outside, inside), result["time_eligible_targets"])
+        self.assertEqual((), result["time_blocked_targets"])
         self.assertNotIn("매매 운영 시간이 아닙니다", result["user_message"])
 
-    def test_all_outside_time_does_not_call_recovery_or_fall_back_to_generic(self) -> None:
+    def test_all_outside_time_starts_after_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _target(Path(temp_dir), "012210")
             window = _PrecedenceWindow([target])
@@ -338,9 +468,13 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 now=run_control.datetime(2026, 8, 25, 21, 0),
             )
 
-        self.assertEqual("현재는 매매 운영 시간이 아닙니다.", result["user_message"])
-        self.assertEqual(("012210 테스트",), result["time_blocked_targets"])
-        window.filter_start_targets_by_recovery.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual((target,), result["time_eligible_targets"])
+        self.assertEqual((), result["time_blocked_targets"])
+        window.filter_start_targets_by_recovery.assert_called_once_with(
+            [target], action="운영시작"
+        )
         self.assertNotIn("검토관리와 자동매매 설정", result["user_message"])
 
     def test_main_global_caller_blocks_global_prerequisite_before_time(self) -> None:

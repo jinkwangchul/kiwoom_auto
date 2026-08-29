@@ -11,6 +11,8 @@ import json
 import shutil
 from pathlib import Path
 
+from stock_code_contract import is_valid_stock_code, normalize_stock_code
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -312,7 +314,8 @@ class GlobalReviewRequiredWindow(QDialog):
             else:
                 code, name = folder_name.strip(), folder_name.strip()
 
-            if not code or not code[:6].isdigit():
+            code = normalize_stock_code(code)
+            if not is_valid_stock_code(code):
                 continue
 
             state = read_json_dict(stock_dir / "state.json")

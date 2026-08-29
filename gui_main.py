@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 import traceback
 
+from PyQt5.QtGui import QCursor
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from event_journal_production import (
@@ -20,11 +21,15 @@ from event_journal_production import (
 from gui_windows import MainWindow
 
 
-def center_main_window_on_primary_screen(
+def center_main_window_on_active_screen(
     app: QApplication,
     window: MainWindow,
 ) -> bool:
-    screen = app.primaryScreen()
+    screen = app.screenAt(QCursor.pos())
+    if screen is None:
+        screen = window.screen()
+    if screen is None:
+        screen = app.primaryScreen()
     if screen is None:
         return False
 
@@ -41,7 +46,7 @@ def main() -> int:
     try:
         window = MainWindow()
         window.show()
-        center_main_window_on_primary_screen(app, window)
+        center_main_window_on_active_screen(app, window)
         return app.exec_()
 
     except Exception as exc:

@@ -363,14 +363,15 @@ class CanonicalPerformanceMetricIntegrationTests(unittest.TestCase):
         projection = PerformanceScopeProjection(aggregator, relations)
         stock_values = [
             self.engine.calculate(projection.project_stocks(scope)[0].lifetime).profit_amount.value
-            for scope in (PerformanceScope.ALL, PerformanceScope.CURRENT, PerformanceScope.PAST)
+            for scope in (PerformanceScope.ALL, PerformanceScope.CURRENT)
         ]
-        self.assertEqual([162, 162, 162], stock_values)
+        self.assertEqual([162, 162], stock_values)
         stock_average_rates = [
             self.engine.calculate(projection.project_stocks(scope)[0].lifetime).average_rate.value
-            for scope in (PerformanceScope.ALL, PerformanceScope.CURRENT, PerformanceScope.PAST)
+            for scope in (PerformanceScope.ALL, PerformanceScope.CURRENT)
         ]
-        self.assertEqual([9, 9, 9], stock_average_rates)
+        self.assertEqual([9, 9], stock_average_rates)
+        self.assertEqual((), projection.project_stocks(PerformanceScope.PAST))
 
         current_a = self.engine.calculate(projection.project_instances(PerformanceScope.CURRENT)[0].aggregate)
         past = {row.instance_id: self.engine.calculate(row.aggregate) for row in projection.project_instances(PerformanceScope.PAST)}

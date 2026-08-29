@@ -455,6 +455,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             sync_account_funds_selection=Mock(),
             request_account_funds=Mock(),
             start_production_recovery=Mock(),
+            start_stock_library_sync_for_current_session=Mock(),
             _account_authentication_states={},
             _account_query_states={},
             _stop_production_recovery_timers=Mock(),
@@ -465,7 +466,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
         )
         with patch.object(gui_windows, "append_production_event") as append, patch.object(
             gui_windows.production_recovery_registry, "invalidate"
-        ):
+        ), patch.object(gui_windows.QTimer, "singleShot") as single_shot:
             gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": True})
             gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": True})
             gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": False})
@@ -473,6 +474,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             ["LOGIN_SUCCEEDED", "CONNECTION_LOST"],
             [call.args[0] for call in append.call_args_list],
         )
+        self.assertEqual(2, single_shot.call_count)
 
         class Combo:
             def currentData(self, role):

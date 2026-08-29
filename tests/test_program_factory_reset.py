@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QPoint
-from PyQt5.QtWidgets import QApplication, QDialogButtonBox
+from PyQt5.QtCore import QPoint, QTimer
+from PyQt5.QtWidgets import QApplication, QDialogButtonBox, QWidget
 
 from gui_operation_environment import (
     OperationEnvironmentSettingsDialog,
@@ -21,10 +21,15 @@ from gui_operation_environment import (
 )
 import gui_operation_environment as operation_environment
 from program_factory_reset import (
+    build_factory_reset_preview,
     execute_program_factory_reset,
     factory_reset_manifest,
     validate_factory_reset_safety,
 )
+import program_factory_reset as factory_reset
+from logical_group_registry import LogicalGroupRepository
+from routine_instance_repository import RoutineInstanceRepository
+from stock_repository import StockRepository
 from startup_runtime_initializer import initialize_pristine_startup_runtime
 
 
@@ -44,18 +49,78 @@ class ProgramFactoryResetTests(unittest.TestCase):
             "routine_instances",
             "runtime",
             "archived_stocks",
+            "assignment_episodes",
+            "performance_ledger",
+            "migration_manifests",
+            "groups",
             "artifacts",
             "reports",
+            "logs",
             "routines",
             "_지표추종매매",
         ):
             (root / name).mkdir(parents=True, exist_ok=True)
 
         stock_dir = root / "stocks" / "000001_테스트"
-        _write_json(stock_dir / "config.json", {"code": "000001", "name": "테스트"})
-        _write_json(stock_dir / "state.json", {"status": "STOPPED", "holding_qty": 0})
-        _write_json(stock_dir / "orders.json", {"orders": []})
-        _write_json(root / "routine_instances" / "instance-1" / "instance.json", {"id": "instance-1"})
+        _write_json(
+            stock_dir / "config.json",
+            {
+                "code": "000001",
+                "name": "테스트",
+                "assigned_routine_instance_id": "instance-1",
+            },
+        )
+        _write_json(
+            stock_dir / "state.json",
+            {
+                "status": "RUNNING",
+                "holding_qty": 3,
+                "trade_enabled": True,
+                "review_required": True,
+            },
+        )
+        _write_json(stock_dir / "orders.json", {"orders": [{"status": "PENDING"}]})
+        unassigned_dir = root / "stocks" / "000002_미지정"
+        _write_json(unassigned_dir / "config.json", {"code": "000002", "name": "미지정"})
+        _write_json(unassigned_dir / "state.json", {"status": "REVIEW_REQUIRED", "holding_qty": 0})
+        _write_json(unassigned_dir / "orders.json", {"orders": []})
+
+        group_id = "11111111-1111-4111-8111-111111111111"
+        _write_json(
+            root / "groups" / group_id / "group.json",
+            {
+                "schema_version": "1.0",
+                "group_id": group_id,
+                "definition_id": "parent",
+                "base_name": "부모루틴",
+                "display_name": "부모루틴",
+                "slot": 0,
+                "created_at": "2026-08-23T00:00:00+09:00",
+            },
+        )
+        _write_json(
+            root / "groups" / "registry.json",
+            {
+                "schema_version": "1.0",
+                "mode": "logical",
+                "group_ids": [group_id],
+                "cutover_at": "2026-08-23T00:00:00+09:00",
+            },
+        )
+        _write_json(
+            root / "routine_instances" / "instance-1" / "instance.json",
+            {"instance_id": "instance-1", "group_id": group_id},
+        )
+        _write_json(
+            root / "assignment_episodes" / "000001" / "episodes.json",
+            {"episodes": [{"episode_id": "episode-1"}]},
+        )
+        _write_json(
+            root / "performance_ledger" / "000001" / "events.json",
+            {"events": [{"performance_event_id": "event-1"}]},
+        )
+        _write_json(root / "performance_ledger" / "000001" / "entry_lots.json", {"lots": [{}]})
+        _write_json(root / "migration_manifests" / "migration.json", {"applied": True})
         _write_json(root / "archived_stocks" / "old" / "state.json", {"status": "STOPPED"})
         (root / "artifacts" / "result.txt").write_text("generated", encoding="utf-8")
         (root / "reports" / "report.txt").write_text("generated", encoding="utf-8")
@@ -80,12 +145,56 @@ class ProgramFactoryResetTests(unittest.TestCase):
         self.assertTrue(initialized["initialized"])
         _write_json(
             root / "runtime" / "operation_state.json",
-            {"operation_status": "NORMAL_ENDED", "emergency_stop": False},
+            {"operation_status": "RUNNING", "emergency_stop": False},
         )
+        _write_json(root / "runtime" / "order_queue.json", {"orders": [{"status": "PENDING"}]})
+        _write_json(root / "runtime" / "order_locks.json", {"locks": [{"code": "000001"}]})
+        _write_json(root / "runtime" / "order_executions.json", {"executions": [{"status": "DISPATCHING"}]})
         (root / "runtime" / "routine_signal_probe.log").write_text("generated", encoding="utf-8")
+        _write_json(
+            root / "runtime" / "realized_pnl.json",
+            {"version": 1, "realizations": [{"realized_pnl": 1200}]},
+        )
+        (root / "runtime" / "stock_library.json").write_bytes(b'{"stocks":["000001"]}\n')
+        (root / "runtime" / "stock_library_meta.json").write_bytes(b'{"state":"READY"}\n')
 
     def test_confirmation_requires_exact_text(self) -> None:
         dialog = ProgramFactoryResetConfirmDialog()
+        self.assertEqual(
+            "프로그램을 완전초기화 합니다.\n"
+            "치명적인 손실을 초래할수 있습니다.\n"
+            '아래 입력창에 "전체초기화"를 입력하세요.',
+            dialog.warning_label.text(),
+        )
+        warning_width = max(
+            dialog.warning_label.fontMetrics().horizontalAdvance(line)
+            for line in dialog.WARNING_TEXT.splitlines()
+        )
+        horizontal_margin = dialog.warning_label.fontMetrics().horizontalAdvance("가") * 2
+        warning_icon_gap = dialog.warning_label.fontMetrics().horizontalAdvance("가")
+        warning_icon_width = dialog.warning_icon_label.width()
+        self.assertEqual(
+            warning_width + warning_icon_gap + warning_icon_width + (horizontal_margin * 2),
+            dialog.minimumWidth(),
+        )
+        self.assertEqual(warning_width, dialog.warning_label.width())
+        self.assertFalse(dialog.warning_icon_label.pixmap().isNull())
+        dialog.show()
+        self.app.processEvents()
+        self.assertLess(
+            dialog.warning_icon_label.geometry().left(),
+            dialog.warning_label.geometry().left(),
+        )
+        warning_text_x = dialog.warning_label.mapTo(dialog, QPoint(0, 0)).x()
+        confirmation_input_x = dialog.confirmation_input.mapTo(dialog, QPoint(0, 0)).x()
+        self.assertEqual(warning_text_x, confirmation_input_x)
+        self.assertGreaterEqual(dialog.minimumHeight(), 210)
+        self.assertGreaterEqual(dialog.confirmation_input.minimumHeight(), 32)
+        expected_input_width = dialog.confirmation_input.fontMetrics().horizontalAdvance("가" * 10) + 16
+        self.assertEqual(expected_input_width, dialog.confirmation_input.width())
+        self.assertIn("border: none", dialog.confirmation_input.styleSheet())
+        self.assertGreaterEqual(dialog.reset_button.minimumWidth(), 110)
+        self.assertGreaterEqual(dialog.cancel_button.minimumWidth(), 110)
         self.assertFalse(dialog.reset_button.isEnabled())
         for text in ("전체 초기화", "초기화", "전체초기화1", " 전체초기화", "전체초기화 "):
             dialog.confirmation_input.setText(text)
@@ -274,19 +383,35 @@ class ProgramFactoryResetTests(unittest.TestCase):
 
             self.assertEqual(before, policy_path.read_bytes())
 
-    def test_reset_clears_user_data_and_preserves_parent_resources(self) -> None:
+    def test_reset_clears_all_user_data_and_preserves_product_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self._project_fixture(root)
             parent_code = (root / "routines" / "부모루틴" / "routine.py").read_bytes()
             parent_rules = (root / "routines" / "부모루틴" / "rules.json").read_bytes()
+            library = (root / "runtime" / "stock_library.json").read_bytes()
+            library_meta = (root / "runtime" / "stock_library_meta.json").read_bytes()
 
-            result = execute_program_factory_reset(root, broker_connected=False)
+            result = execute_program_factory_reset(root, broker_connected=True)
 
             self.assertTrue(result["success"], result["issues"])
+            self.assertEqual(1, result["removed_groups"])
+            self.assertEqual(1, result["removed_instances"])
+            self.assertEqual(2, result["removed_stocks"])
+            self.assertEqual(1, result["removed_assignment_episodes"])
+            self.assertEqual(1, result["removed_performance_events"])
+            self.assertEqual(0, result["broker_orders_called"])
+            self.assertTrue(result["initialized_at"])
+            self.assertEqual([], list((root / "groups").iterdir()))
             self.assertEqual([], list((root / "stocks").iterdir()))
             self.assertEqual([], list((root / "routine_instances").iterdir()))
             self.assertEqual([], list((root / "archived_stocks").iterdir()))
+            self.assertEqual([], list((root / "assignment_episodes").iterdir()))
+            self.assertEqual([], list((root / "performance_ledger").iterdir()))
+            self.assertEqual([], list((root / "migration_manifests").iterdir()))
+            self.assertEqual([], LogicalGroupRepository(root).list_groups())
+            self.assertEqual([], RoutineInstanceRepository(root).list_instances())
+            self.assertEqual([], StockRepository(root).list_stocks())
             self.assertEqual([], list((root / "artifacts").iterdir()))
             self.assertEqual([], list((root / "reports").iterdir()))
             self.assertFalse((root / "invalid_items.log").exists())
@@ -297,6 +422,9 @@ class ProgramFactoryResetTests(unittest.TestCase):
             self.assertFalse((routine_dir / "approval_session.json").exists())
             self.assertFalse((routine_dir / "reports").exists())
             self.assertTrue((root / "_지표추종매매" / "budget.json").exists())
+            self.assertFalse((root / "runtime" / "realized_pnl.json").exists())
+            self.assertEqual(library, (root / "runtime" / "stock_library.json").read_bytes())
+            self.assertEqual(library_meta, (root / "runtime" / "stock_library_meta.json").read_bytes())
             self.assertEqual("history\n", (root / "PROJECT_CHANGELOG.txt").read_text(encoding="utf-8"))
 
             policy = json.loads((root / "operation_policy.json").read_text(encoding="utf-8"))
@@ -323,37 +451,166 @@ class ProgramFactoryResetTests(unittest.TestCase):
                     "order_executions.json",
                     "order_locks.json",
                     "routine_signals.json",
+                    "stock_library.json",
+                    "stock_library_meta.json",
                 },
                 runtime_files,
             )
 
-    def test_reset_is_blocked_before_any_change_when_unsafe(self) -> None:
+    def test_running_holding_review_and_pending_state_do_not_block_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self._project_fixture(root)
-            stock_state = root / "stocks" / "000001_테스트" / "state.json"
-            _write_json(stock_state, {"status": "RUNNING", "holding_qty": 1})
-
-            before = stock_state.read_bytes()
             result = execute_program_factory_reset(root, broker_connected=False)
 
-            self.assertFalse(result["success"])
-            self.assertEqual(before, stock_state.read_bytes())
-            self.assertTrue((root / "routine_instances" / "instance-1").exists())
+            self.assertTrue(result["success"], result["issues"])
+            self.assertEqual(0, result["broker_orders_called"])
+            self.assertEqual([], list((root / "stocks").iterdir()))
 
-    def test_connected_broker_blocks_reset(self) -> None:
+    def test_connected_broker_is_not_a_reset_guard(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self._project_fixture(root)
             result = validate_factory_reset_safety(root, broker_connected=True)
+            self.assertTrue(result["success"], result["issues"])
+
+    def test_failure_rolls_back_every_original_byte_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._project_fixture(root)
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            events: list[object] = []
+
+            def quiesce() -> str:
+                events.append("quiesced")
+                return "token"
+
+            def resume(token: object) -> None:
+                events.append(("resumed", token))
+
+            with patch.object(factory_reset, "_initialize_empty_state", side_effect=OSError("injected")):
+                result = execute_program_factory_reset(
+                    root,
+                    quiesce=quiesce,
+                    resume_after_failure=resume,
+                )
+
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
             self.assertFalse(result["success"])
-            self.assertIn("키움 서버 연결을 먼저 종료해 주세요.", result["issues"])
+            self.assertTrue(result["rollback_complete"])
+            self.assertEqual(before, after)
+            self.assertEqual(["quiesced", ("resumed", "token")], events)
+
+    def test_partial_staging_failure_restores_only_moved_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._project_fixture(root)
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            real_replace = factory_reset.os.replace
+            injected = False
+
+            def fail_second_target(source: object, destination: object) -> None:
+                nonlocal injected
+                if Path(source) == root / "routine_instances" and not injected:
+                    injected = True
+                    raise PermissionError("injected staging lock")
+                real_replace(source, destination)
+
+            with patch.object(factory_reset.os, "replace", side_effect=fail_second_target):
+                result = execute_program_factory_reset(root)
+
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertFalse(result["success"])
+            self.assertTrue(result["rollback_complete"])
+            self.assertEqual(before, after)
+            self.assertTrue((root / "groups" / "registry.json").exists())
+            self.assertTrue((root / "routine_instances" / "instance-1").exists())
+
+    def test_confirmation_cancel_does_not_call_reset_service(self) -> None:
+        dialog = OperationEnvironmentSettingsDialog()
+        with (
+            patch.object(ProgramFactoryResetConfirmDialog, "exec_", return_value=ProgramFactoryResetConfirmDialog.Rejected),
+            patch("program_factory_reset.execute_program_factory_reset") as execute_reset,
+            patch.object(operation_environment, "append_production_event") as append_event,
+        ):
+            dialog._request_program_factory_reset()
+        execute_reset.assert_not_called()
+        append_event.assert_not_called()
+        dialog.close()
+
+    def test_quiesce_stops_owner_timers_and_failure_resume_restores_them(self) -> None:
+        owner = QWidget()
+        owner_timer = QTimer(owner)
+        owner_timer.start(1000)
+
+        class _MarketDataHost:
+            def __init__(self) -> None:
+                self.cleared = 0
+
+            def clear(self) -> None:
+                self.cleared += 1
+
+        class _OperationHost:
+            def __init__(self) -> None:
+                self._factory_reset_quiesced = False
+                self._bar_commit_trigger_queue = [{"pending": True}]
+                self._market_data_host = _MarketDataHost()
+
+        host = _OperationHost()
+        owner._main_monitoring_auto_trade_operation_host = host
+        dialog = OperationEnvironmentSettingsDialog(owner)
+
+        token = dialog._quiesce_for_program_factory_reset()
+        self.assertFalse(owner_timer.isActive())
+        self.assertTrue(owner._factory_reset_in_progress)
+        self.assertTrue(host._factory_reset_quiesced)
+        self.assertEqual([], host._bar_commit_trigger_queue)
+        self.assertEqual(1, host._market_data_host.cleared)
+
+        dialog._resume_after_program_factory_reset_failure(token)
+        self.assertTrue(owner_timer.isActive())
+        self.assertFalse(owner._factory_reset_in_progress)
+        self.assertFalse(host._factory_reset_quiesced)
+        owner_timer.stop()
+        dialog.close()
+        owner.close()
+
+    def test_preview_is_read_only_and_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._project_fixture(root)
+            before = (root / "runtime" / "order_queue.json").read_bytes()
+            preview = build_factory_reset_preview(root)
+            self.assertEqual(1, preview["removed_groups"])
+            self.assertEqual(1, preview["removed_instances"])
+            self.assertEqual(2, preview["removed_stocks"])
+            self.assertEqual(before, (root / "runtime" / "order_queue.json").read_bytes())
 
     def test_manifest_is_explicit(self) -> None:
         manifest = factory_reset_manifest()
         self.assertIn("stocks", manifest["DELETE_CONTENTS"])
+        self.assertIn("groups", manifest["DELETE_CONTENTS"])
+        self.assertIn("assignment_episodes", manifest["DELETE_CONTENTS"])
+        self.assertIn("performance_ledger", manifest["DELETE_CONTENTS"])
         self.assertIn("operation_policy.json", manifest["RESET"])
         self.assertIn("routines", manifest["PRESERVE"])
+        self.assertIn("runtime/stock_library.json", manifest["PRESERVE"])
         self.assertNotIn("_등록확인폴더", manifest["PRESERVE"])
 
 

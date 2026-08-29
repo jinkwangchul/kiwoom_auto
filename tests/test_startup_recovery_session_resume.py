@@ -503,6 +503,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                         "real_trade_enabled": True,
                         "signal_probe_only": False,
                         "review_required": False,
+                        "ignore_signals_before": "2026-08-26 09:30:00",
                     }
                 ),
                 encoding="utf-8",
@@ -533,6 +534,10 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 mark_previewed=True,
                 write_order_queue=True,
                 apply_approval=True,
+                allowed_stock_codes=("003550",),
+                signal_cutoff_by_stock_code={
+                    "003550": "2026-08-26 09:30:00"
+                },
             )
             self.assertEqual([5], window.auto_execution_calls)
 

@@ -1404,7 +1404,6 @@ class StockRegisterWindow(QDialog):
         self._integrity_status_container = self._create_integrity_status_container()
 
         self.btn_search_register = QPushButton("검색등록")
-        self.btn_search_register.setEnabled(False)
         self.btn_search_register.setToolTip("검색 결과에서 선택한 종목을 등록합니다.")
         self.btn_manual_register = QPushButton("종목등록")
         self.btn_manual_register.setToolTip("종목명 또는 종목코드를 직접 입력하여 등록합니다.")
@@ -1862,6 +1861,7 @@ class StockRegisterWindow(QDialog):
 
     def _connect_events(self) -> None:
         self.btn_close.clicked.connect(self.close)
+        self.btn_search_register.clicked.connect(self.open_search_register_dialog)
         self.btn_manual_register.clicked.connect(self.open_manual_register_dialog)
         self.btn_stock_history.clicked.connect(self.open_selected_stock_history)
         self.btn_delete_stock.clicked.connect(self.delete_selected_stock)
@@ -1947,7 +1947,7 @@ class StockRegisterWindow(QDialog):
         if callable(popup):
             popup(message)
             return
-        show_toast(self, message, duration_ms=2500, position="bottom_right")
+        show_toast(self, message, duration_ms=2500, position="center")
 
     def _review_writer_callback(self):
         parent = persistent_feature_owner(self)
@@ -2711,20 +2711,12 @@ class StockRegisterWindow(QDialog):
         self.btn_stock_history.setEnabled(False)
         self._position_stock_performance_sort_badges()
     def open_search_register_dialog(self) -> None:
-        """
-        검색등록은 현재 검색 입력과 수동등록 경로로 통합되어 있다.
-        """
-        return
+        """검증된 runtime Master Library를 사용하는 등록 경로를 연다."""
+        from gui_auto_trade_setting_window import open_instance_stock_search_register_dialog
 
-    def open_manual_register_dialog(self) -> None:
-        """
-        종목등록 버튼에서 공식 검색등록 UI를 연다.
-        """
-        from gui_auto_trade_setting_window import InstanceStockSearchRegisterDialog
-
-        dialog = InstanceStockSearchRegisterDialog(
+        dialog = open_instance_stock_search_register_dialog(
             self,
-            instance_metadata={
+            {
                 "row_kind": "unassigned",
                 "target_kind": "unassigned",
                 "instance_id": "",
@@ -2732,20 +2724,31 @@ class StockRegisterWindow(QDialog):
                 "definition_id": "",
                 "definition_name": "등록대기",
             },
+            owner_attribute="search_register_window",
+            delete_on_close=True,
+            finished_callback=lambda _result: self.refresh_stock_table(),
         )
-        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.manual_register_window = dialog
-        dialog.finished.connect(lambda _result: self.refresh_stock_table())
-        dialog.destroyed.connect(
-            lambda _obj=None, target=dialog: (
-                setattr(self, "manual_register_window", None)
-                if getattr(self, "manual_register_window", None) is target
-                else None
-            )
+
+    def open_manual_register_dialog(self) -> None:
+        """
+        종목등록 버튼에서 공식 검색등록 UI를 연다.
+        """
+        from gui_auto_trade_setting_window import open_instance_stock_search_register_dialog
+
+        dialog = open_instance_stock_search_register_dialog(
+            self,
+            {
+                "row_kind": "unassigned",
+                "target_kind": "unassigned",
+                "instance_id": "",
+                "instance_name": "등록대기",
+                "definition_id": "",
+                "definition_name": "등록대기",
+            },
+            owner_attribute="manual_register_window",
+            delete_on_close=True,
+            finished_callback=lambda _result: self.refresh_stock_table(),
         )
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def is_duplicate_stock(self, code: str, name: str) -> bool:
         stocks = read_base_stocks()

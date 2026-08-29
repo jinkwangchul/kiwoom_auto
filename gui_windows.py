@@ -52,6 +52,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -1387,6 +1388,7 @@ from gui_main_table_loader import (
     ROUTINE_PROFIT_LED_SIZE,
     MAIN_STOCK_METRIC_LAYOUT_PREVIEW,
     ROUTINE_STOCK_CODE_ROLE,
+    ROUTINE_STOCK_NAME_ROLE,
     ROUTINE_STOCK_INITIAL_BUY_ROLE,
     ROUTINE_STOCK_DISPLAY_ROLE,
     ROUTINE_STOCK_METRICS_ROLE,
@@ -1467,6 +1469,7 @@ from gui_auto_trade_display import (
     profit_loss_value_color,
 )
 from gui_auto_trade_run_control import (
+    auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
     show_auto_trade_operation_failure_dialog,
 )
@@ -1479,8 +1482,12 @@ from group_pack_registration import register_group_pack
 from group_pack_packing import pack_group
 from gui_auto_trade_policy import (
     auto_trade_current_session_operation_participant_codes,
+    auto_trade_start_budget_current_running,
+    auto_trade_start_budget_mutation_decision,
     operation_policy_section,
 )
+from gui_review_utils import safe_float_value
+from gui_common_utils import safe_int_value
 from buffer_response_coordinator import (
     coordinate_main_window_buffer_response,
     main_window_buffer_response_integration_ready,
@@ -1522,6 +1529,7 @@ from runtime_io import read_json_dict
 from routine_order_permission import canonical_stock_trading_time_status
 from gui_operation_environment import (
     default_buffer_response_policy,
+    floor_money_to_won,
     read_buffer_response_policy,
     read_system_budget_policy,
     starting_budget_defaults,
@@ -1530,6 +1538,10 @@ from gui_operation_environment import (
     validate_buffer_response_policy,
     write_buffer_response_policy,
 )
+from running_budget_adjustment import (
+    commit_running_budget_adjustment,
+    project_running_budget_adjustment_display_config,
+)
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
@@ -1537,6 +1549,7 @@ from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     AutoTradeSettingWindow,
     auto_trade_setting_badge_stylesheet,
+    clone_routine_instance_with_existing_policy,
     delete_routine_instance_with_existing_policy,
     get_group_dirs,
     get_stock_dirs_in_routine,
@@ -3420,6 +3433,306 @@ class _MarketDataMonitoringWindow(QDialog):
         super().closeEvent(event)
 
 
+class RunningBudgetAdjustmentDialog(QDialog):
+    """Editor for a current-operation base-budget adjustment request."""
+
+    def __init__(
+        self,
+        owner: "MainWindow",
+        *,
+        stock_code: str,
+        stock_name: str,
+        current_price: object,
+        config: dict[str, object],
+        pending_adjustment: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(owner)
+        self.stock_code = str(stock_code or "").strip()
+        self.stock_name = str(stock_name or "").strip()
+        self.current_price = safe_float_value(current_price, 0.0)
+        self.config = config if isinstance(config, dict) else {}
+        self.pending_adjustment = (
+            dict(pending_adjustment)
+            if isinstance(pending_adjustment, dict)
+            else None
+        )
+        self.mode = (
+            "AMOUNT"
+            if str(self.config.get("trade_amount_type", "QUANTITY")).upper()
+            == "AMOUNT"
+            else "QUANTITY"
+        )
+        self.current_value = self._config_value(self.mode)
+        self.requested_at = stock_now_text()
+        self.result: dict[str, object] = {}
+
+        display_name = self.stock_name.split("|", 1)[0].strip()
+        if self.stock_code and display_name.startswith(self.stock_code):
+            display_name = display_name[len(self.stock_code) :].lstrip(" -")
+        self.display_stock_name = display_name
+        stock_identity = f"{self.stock_code} {display_name}".strip()
+        self.setWindowTitle(f"기본예산변경 | {stock_identity}".strip())
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self.resize(520, 210)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 12)
+        root.setSpacing(0)
+        root.setAlignment(Qt.AlignTop)
+
+        self.current_price_label = QLabel(self._current_price_text())
+        self.current_price_label.setAlignment(Qt.AlignCenter)
+        current_price_font = self.current_price_label.font()
+        current_price_font.setPointSizeF(
+            max(1.0, current_price_font.pointSizeF() * 2.0)
+        )
+        self.current_price_label.setFont(current_price_font)
+        root.addWidget(self.current_price_label)
+        root.addSpacing(9)
+
+        current_text = self._value_text(self.current_value)
+        mode_text = "금액" if self.mode == "AMOUNT" else "주수"
+        current_badge = QLabel(mode_text)
+        current_badge.setAlignment(Qt.AlignCenter)
+        current_badge.setFixedSize(
+            INITIAL_BUY_BADGE_WIDTH,
+            INITIAL_BUY_BADGE_HEIGHT,
+        )
+        current_badge.setFont(_initial_buy_badge_font())
+        badge_color = (
+            INITIAL_BUY_AMOUNT_COLOR
+            if self.mode == "AMOUNT"
+            else INITIAL_BUY_QUANTITY_COLOR
+        )
+        current_badge.setStyleSheet(
+            "QLabel {"
+            f"color: {badge_color};"
+            f"border: 1px solid {badge_color};"
+            "border-radius: 4px;"
+            "background: transparent;"
+            "padding: 0px;"
+            "}"
+        )
+        self.current_badge = current_badge
+
+        current_label = QLabel(current_text)
+        current_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.current_reference_label = QLabel()
+        self.current_reference_label.setText(self._reference_text(self.current_value))
+        current_box = QHBoxLayout()
+        current_box.setContentsMargins(0, 0, 0, 0)
+        current_box.setSpacing(4)
+        current_box.addWidget(current_label)
+        current_box.addWidget(QLabel("/"))
+        current_box.addWidget(self.current_reference_label)
+
+        self.value_edit = QLineEdit()
+        self.value_edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.value_edit.setPlaceholderText("숫자 입력")
+        self.value_edit.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(
+                    r"^(?=(?:[^0-9]*[0-9]){0,8}[^0-9]*$)[0-9,]{0,10}$"
+                    if self.mode == "AMOUNT"
+                    else r"[0-9]{0,8}"
+                ),
+                self.value_edit,
+            )
+        )
+        self.value_edit.setStyleSheet(
+            "QLineEdit {"
+            "border: 1px solid #CBD5E1;"
+            "border-radius: 3px;"
+            "background: #FFFFFF;"
+            "padding: 1px 5px;"
+            "}"
+            "QLineEdit:focus {"
+            "border: 1px solid #CBD5E1;"
+            "outline: none;"
+            "}"
+        )
+        input_width_text = "00,000,000" if self.mode == "AMOUNT" else "0000"
+        self.value_edit.setFixedWidth(
+            QFontMetrics(self.value_edit.font()).horizontalAdvance(input_width_text)
+            + 24
+        )
+        initial_value_text = (
+            f"{self.current_value:,}"
+            if self.mode == "AMOUNT" and self.current_value > 0
+            else str(self.current_value) if self.current_value > 0 else ""
+        )
+        self.value_edit.setText(initial_value_text)
+        self._last_valid_value_text = initial_value_text
+        self.value_edit.textChanged.connect(self._on_value_text_changed)
+        input_box = QWidget()
+        input_layout = QHBoxLayout(input_box)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(2)
+        input_layout.addWidget(self.value_edit)
+        input_layout.addWidget(QLabel(self._unit_text()))
+
+        self.changed_reference_label = QLabel()
+        budget_row = QHBoxLayout()
+        budget_row.setContentsMargins(0, 0, 0, 0)
+        budget_row.setSpacing(6)
+        budget_row.addStretch(1)
+        budget_row.addWidget(current_badge)
+        budget_row.addLayout(current_box)
+        budget_row.addWidget(QLabel("▷"))
+        budget_row.addWidget(input_box)
+        budget_row.addWidget(self.changed_reference_label)
+        budget_row.addStretch(1)
+        root.addLayout(budget_row)
+        root.addSpacing(10)
+
+        checkbox_indent = 24 + QFontMetrics(self.font()).horizontalAdvance("한")
+        timing_row = QHBoxLayout()
+        timing_row.setContentsMargins(checkbox_indent, 0, 0, 0)
+        self.immediate_checkbox = QCheckBox("즉시적용")
+        self.next_cycle_checkbox = QCheckBox("다음회차적용")
+        timing_group = QButtonGroup(self)
+        timing_group.setExclusive(True)
+        timing_group.addButton(self.immediate_checkbox)
+        timing_group.addButton(self.next_cycle_checkbox)
+        pending_policy = (
+            str(self.pending_adjustment.get("apply_policy") or "").strip().upper()
+            if self.pending_adjustment is not None
+            else ""
+        )
+        self.immediate_checkbox.setChecked(pending_policy != "NEXT_CYCLE")
+        self.next_cycle_checkbox.setChecked(pending_policy == "NEXT_CYCLE")
+        timing_row.setSpacing(36)
+        timing_row.addWidget(self.immediate_checkbox)
+        timing_row.addWidget(self.next_cycle_checkbox)
+        timing_row.addStretch(1)
+        root.addLayout(timing_row)
+        root.addSpacing(9)
+
+        self.apply_limit_checkbox = QCheckBox("한도금액에 새 설정값 적용")
+        self.apply_limit_checkbox.setChecked(
+            bool(self.pending_adjustment and self.pending_adjustment.get("apply_limit"))
+        )
+        limit_row = QHBoxLayout()
+        limit_row.setContentsMargins(checkbox_indent, 0, 0, 0)
+        limit_row.addWidget(self.apply_limit_checkbox)
+        limit_row.addStretch(1)
+        root.addLayout(limit_row)
+        root.addSpacing(9)
+
+        self.validation_label = QLabel()
+        self.validation_label.setStyleSheet("color: #B91C1C;")
+        self.validation_label.hide()
+        root.addWidget(self.validation_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("확인")
+        buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._refresh_preview()
+
+    def _config_value(self, mode: str) -> int:
+        key = "buy_amount" if mode == "AMOUNT" else "buy_qty"
+        try:
+            return max(0, int(self.config.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _value_text(self, value: int) -> str:
+        unit = "원" if self.mode == "AMOUNT" else "주"
+        return f"{value:,}{unit}"
+
+    def _current_price_text(self) -> str:
+        if self.current_price <= 0:
+            return "현재가 -"
+        return f"현재가 {self.current_price:,.0f}원"
+
+    def _unit_text(self) -> str:
+        return "원" if self.mode == "AMOUNT" else "주"
+
+    def _reference_text(self, value: int) -> str:
+        if value <= 0 or self.current_price <= 0:
+            return "-"
+        if self.mode == "AMOUNT":
+            shares = value / self.current_price
+            return f"{shares:.1f}주"
+        return f"{value * self.current_price:,.0f}원"
+
+    def _input_value(self) -> int:
+        raw = str(self.value_edit.text() or "")
+        digits = "".join(character for character in raw if character.isdigit())
+        try:
+            return int(digits or 0)
+        except ValueError:
+            return 0
+
+    def _on_value_text_changed(self, text: str) -> None:
+        raw_text = str(text)
+        raw_digits = "".join(character for character in raw_text if character.isdigit())
+        if len(raw_digits) > 8:
+            formatted = self._last_valid_value_text
+        elif self.mode == "AMOUNT":
+            formatted = f"{int(raw_digits):,}" if raw_digits else ""
+        else:
+            formatted = raw_digits
+        if formatted != text:
+            cursor_digits = sum(
+                character.isdigit()
+                for character in str(text)[: self.value_edit.cursorPosition()]
+            )
+            signals_were_blocked = self.value_edit.blockSignals(True)
+            try:
+                self.value_edit.setText(formatted)
+                cursor_position = 0
+                digits_seen = 0
+                while cursor_position < len(formatted) and digits_seen < cursor_digits:
+                    if formatted[cursor_position].isdigit():
+                        digits_seen += 1
+                    cursor_position += 1
+                self.value_edit.setCursorPosition(cursor_position)
+            finally:
+                self.value_edit.blockSignals(signals_were_blocked)
+        self._last_valid_value_text = formatted
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        reference = self._reference_text(self._input_value())
+        self.changed_reference_label.setText(f"/ {reference}")
+        self.validation_label.clear()
+        self.validation_label.hide()
+
+    def _validate_and_accept(self) -> None:
+        value = self._input_value()
+        if value <= 0:
+            self.validation_label.setText("변경값을 입력하세요.")
+            self.validation_label.show()
+            return
+        if value > 99_999_999:
+            self.validation_label.setText("99,999,999까지 입력할 수 있습니다.")
+            self.validation_label.show()
+            return
+        if not (
+            self.immediate_checkbox.isChecked()
+            or self.next_cycle_checkbox.isChecked()
+        ):
+            self.validation_label.setText("적용 시점을 선택하세요.")
+            self.validation_label.show()
+            return
+        self.result = {
+            "mode": self.mode,
+            "value": value,
+            "apply_timing": (
+                "IMMEDIATE"
+                if self.immediate_checkbox.isChecked()
+                else "NEXT_CYCLE"
+            ),
+            "apply_limit": self.apply_limit_checkbox.isChecked(),
+        }
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     """
     키움 자동매매 시스템 메인 윈도우
@@ -5292,6 +5605,7 @@ class MainWindow(QMainWindow):
         ]
 
         for button in buttons:
+            button.setProperty("mainBottomActionButton", True)
             button.setMinimumHeight(32)
             layout.addWidget(button)
 
@@ -5565,6 +5879,15 @@ class MainWindow(QMainWindow):
             QWidget#mainDashboardRoot QPushButton#secondaryButton {
                 background: #f8fafc;
                 color: #334155;
+            }
+            QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"] {
+                background: #f8fafc;
+            }
+            QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"]:hover {
+                background: #f8fafc;
+            }
+            QWidget#mainDashboardRoot QPushButton[mainBottomActionButton="true"]:disabled {
+                background: #f8fafc;
             }
             QWidget#mainDashboardRoot QWidget#mainRoutineFilterBadgeArea {
                 background: transparent;
@@ -6630,6 +6953,8 @@ class MainWindow(QMainWindow):
     ) -> dict[str, object]:
         eligible: list[tuple[Path, str, str]] = []
         excluded_review: list[str] = []
+        blocked_target_details: list[dict[str, object]] = []
+        first_blocked_decision = None
         for stock_dir, code, name in targets:
             decision = self.production_recovery_gate_for_stock(
                 code,
@@ -6640,21 +6965,42 @@ class MainWindow(QMainWindow):
                 continue
             if decision.reason_code == RECOVERY_STOCK_REVIEW_REQUIRED:
                 excluded_review.append(f"{code} {name}")
+                blocked_target_details.append(
+                    {
+                        "stock_code": str(code),
+                        "stock_name": str(name),
+                        "reason": str(decision.reason_code),
+                        "display_label": f"{code} {name}".strip(),
+                    }
+                )
                 continue
+            if first_blocked_decision is None:
+                first_blocked_decision = decision
+            blocked_target_details.append(
+                {
+                    "stock_code": str(code),
+                    "stock_name": str(name),
+                    "reason": str(decision.reason_code),
+                    "display_label": f"{code} {name}".strip(),
+                }
+            )
+        if first_blocked_decision is not None:
             return {
                 "allowed": False,
-                "reason": decision.reason_code,
+                "reason": first_blocked_decision.reason_code,
                 "user_message": self.production_recovery_block_user_message(
-                    decision
+                    first_blocked_decision
                 ),
                 "eligible": tuple(eligible),
                 "excluded_review": tuple(excluded_review),
+                "blocked_target_details": tuple(blocked_target_details),
             }
         return {
             "allowed": True,
             "reason": "RECOVERY_COMPLETED",
             "eligible": tuple(eligible),
             "excluded_review": tuple(excluded_review),
+            "blocked_target_details": tuple(blocked_target_details),
         }
 
     def refresh_startup_recovery_status(self) -> dict[str, object]:
@@ -7769,7 +8115,11 @@ class MainWindow(QMainWindow):
 
     def refresh_auto_trade_assignment_views(self) -> None:
         """Refresh monitoring and an already-open auto-trade settings window once."""
-        self.main_monitoring_auto_trade_operation_host().sync_monitoring_universe_for_current_session()
+        host_getter = getattr(self, "main_monitoring_auto_trade_operation_host", None)
+        host = host_getter() if callable(host_getter) else None
+        sync = getattr(host, "sync_monitoring_universe_for_current_session", None)
+        if callable(sync):
+            sync()
         self.refresh_all()
         window = getattr(self, "auto_trade_setting_window", None)
         if window is None:
@@ -8152,6 +8502,9 @@ class MainWindow(QMainWindow):
     def load_running_stock_table(self) -> None:
         main_load_running_stock_table(self)
 
+    def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
+        return auto_trade_registered_operation_targets(self)
+
     def all_runtime_stock_dirs(self) -> list[Path]:
         """Return canonical Group-assigned central stock runtime folders."""
         from group_scope import load_group_scope
@@ -8524,26 +8877,179 @@ class MainWindow(QMainWindow):
             changed += 1
         return changed
 
-    @staticmethod
     def _write_stock_initial_buy_config(
+        self,
         config_path: Path,
         *,
         mode: str,
         value: int,
-    ) -> None:
+    ) -> dict[str, object]:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
+        next_config = dict(config)
         normalized_mode = "AMOUNT" if str(mode).upper() == "AMOUNT" else "QUANTITY"
-        config["trade_amount_type"] = normalized_mode
+        next_config["trade_amount_type"] = normalized_mode
         if normalized_mode == "AMOUNT":
-            config["buy_amount"] = max(0, int(value))
+            next_config["buy_amount"] = max(0, int(value))
         else:
-            config["buy_qty"] = max(1, int(value))
-        config["updated_at"] = stock_now_text()
+            next_config["buy_qty"] = max(1, int(value))
+        stock_code = config_path.parent.name.partition("_")[0].strip()
+        decision = auto_trade_start_budget_mutation_decision(
+            self,
+            stock_code,
+            config,
+            next_config,
+            current_state=read_json_dict(config_path.parent / "state.json"),
+        )
+        if decision.get("allowed") is not True or decision.get("changed") is not True:
+            return decision
+        next_config["updated_at"] = stock_now_text()
         config_path.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(next_config, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+        )
+        return {**decision, "written": True}
+
+    @staticmethod
+    def _show_start_budget_mutation_blocked(window) -> None:
+        show_toast(window, "운영중에는 시작예산을 변경할 수 없습니다.", duration_ms=2500)
+
+    def _open_running_budget_adjustment_dialog(
+        self,
+        row: int,
+        config_path: Path,
+    ) -> None:
+        item = self.routine_table.item(row, 0)
+        stock_code = str(
+            item.data(ROUTINE_STOCK_CODE_ROLE) if item is not None else ""
+        ).strip()
+        stock_name = str(
+            item.data(ROUTINE_STOCK_NAME_ROLE) if item is not None else ""
+        ).strip()
+        state = read_json_dict(config_path.parent / "state.json")
+        projection = (
+            item.data(ROUTINE_STOCK_TOOLTIP_DATA_ROLE)
+            if item is not None
+            else {}
+        )
+        current_price = (
+            projection.get("current_price")
+            if isinstance(projection, dict)
+            else None
+        )
+        if safe_float_value(current_price, 0.0) <= 0:
+            current_price = state.get("current_price", state.get("last_price", 0))
+        config = read_json_dict(config_path)
+        if not isinstance(config, dict):
+            config = {}
+        display_config, display_projection = (
+            project_running_budget_adjustment_display_config(config, state)
+        )
+        pending_adjustment = display_projection.get("adjustment")
+        dialog = RunningBudgetAdjustmentDialog(
+            self,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            current_price=current_price,
+            config=display_config,
+            pending_adjustment=(
+                pending_adjustment if isinstance(pending_adjustment, dict) else None
+            ),
+        )
+        self._running_budget_adjustment_dialog = dialog
+        accepted = False
+        request: dict[str, object] = {}
+        try:
+            accepted = dialog.exec_() == QDialog.Accepted
+            request = dict(dialog.result)
+        finally:
+            self._running_budget_adjustment_dialog = None
+            dialog.deleteLater()
+        if not accepted or not request:
+            return
+
+        current_config = read_json_dict(config_path)
+        current_state = read_json_dict(config_path.parent / "state.json")
+        if not auto_trade_start_budget_current_running(
+            self,
+            stock_code,
+            current_config,
+            current_state,
+        ):
+            show_toast(self, "운영 상태가 변경되어 기본예산 변경을 적용하지 않았습니다.")
+            return
+
+        requested_mode = str(request.get("mode") or "").strip().upper()
+        current_mode = (
+            "AMOUNT"
+            if str(current_config.get("trade_amount_type") or "").strip().upper()
+            == "AMOUNT"
+            else "QUANTITY"
+        )
+        if requested_mode != current_mode:
+            show_toast(self, "예산 방식이 변경되어 기본예산 변경을 적용하지 않았습니다.")
+            return
+
+        requested_value = safe_int_value(request.get("value"), 0)
+        adjusted_limit_amount = None
+        if bool(request.get("apply_limit", False)):
+            starting_budget = requested_value
+            if current_mode == "QUANTITY":
+                fresh_state = main_stock_fresh_market_information_state(
+                    self,
+                    self._stock_projection_for_config_path(config_path),
+                )
+                fresh_price = (
+                    getattr(fresh_state, "last_price", None)
+                    if fresh_state is not None
+                    else None
+                )
+                starting_budget = floor_money_to_won(
+                    safe_float_value(fresh_price, 0.0) * requested_value
+                )
+            defaults = starting_budget_defaults()
+            adjusted_limit_amount = suggested_buy_limit(
+                starting_budget,
+                defaults["limit_recommended_multiplier"],
+                align_digits=stock_limit_digit_alignment_enabled(),
+            )
+            total_budget = _system_total_budget_amount()
+            if (
+                adjusted_limit_amount is None
+                or total_budget is None
+                or adjusted_limit_amount > total_budget
+            ):
+                show_toast(self, "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.")
+                return
+
+        commit_result = commit_running_budget_adjustment(
+            config_path.parent,
+            stock_code=stock_code,
+            expected_mode=current_mode,
+            requested_value=requested_value,
+            apply_policy=request.get("apply_timing"),
+            apply_limit=bool(request.get("apply_limit", False)),
+            adjusted_limit_amount=adjusted_limit_amount,
+            requested_at=dialog.requested_at,
+        )
+        if commit_result.get("ok") is not True:
+            show_toast(self, "기본예산 변경 요청을 저장하지 못했습니다.")
+            return
+        self.load_routine_table()
+        show_toast(self, "기본예산 변경 요청을 저장했습니다.")
+
+    def _stock_start_budget_locked(self, config_path: Path) -> bool:
+        target_path = Path(config_path)
+        stock_code = target_path.parent.name.partition("_")[0].strip()
+        config = read_json_dict(target_path)
+        if not isinstance(config, dict):
+            config = {}
+        return auto_trade_start_budget_current_running(
+            self,
+            stock_code,
+            config,
+            read_json_dict(target_path.parent / "state.json"),
         )
 
     def _stock_config_path_for_routine_row(self, row: int) -> Path | None:
@@ -8811,6 +9317,9 @@ class MainWindow(QMainWindow):
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
+        if self._stock_start_budget_locked(config_path):
+            self._open_running_budget_adjustment_dialog(row, config_path)
+            return
         self.finish_routine_stock_initial_buy_edit(save=True)
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
@@ -8822,15 +9331,23 @@ class MainWindow(QMainWindow):
             next_mode,
             window=self,
         )
-        self._write_stock_initial_buy_config(
+        result = self._write_stock_initial_buy_config(
             config_path,
             mode=next_mode,
             value=next_value,
         )
+        if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
+            self._show_start_budget_mutation_blocked(self)
         self.load_routine_table()
 
     def start_routine_stock_initial_buy_edit(self, row: int) -> None:
         if not self._main_routine_initial_buy_badge_enabled():
+            return
+        config_path = self._stock_config_path_for_routine_row(row)
+        if config_path is None:
+            return
+        if self._stock_start_budget_locked(config_path):
+            self._open_running_budget_adjustment_dialog(row, config_path)
             return
         item = self.routine_table.item(row, 0)
         stock_path = (
@@ -8838,20 +9355,42 @@ class MainWindow(QMainWindow):
             if item is not None
             else ""
         )
-        config_path = self._stock_config_path_for_routine_row(row)
-        if config_path is None:
-            return
-        config = read_json_dict(config_path)
-        if not isinstance(config, dict):
-            config = {}
-        mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
-        if mode != "AMOUNT":
-            mode = "QUANTITY"
-        value = config.get("buy_amount", 0) if mode == "AMOUNT" else config.get("buy_qty", 0)
-        try:
-            configured_value = int(value or 0)
-        except (TypeError, ValueError):
-            configured_value = 0
+        initial_buy_projection = (
+            item.data(ROUTINE_STOCK_INITIAL_BUY_ROLE)
+            if item is not None
+            else None
+        )
+        if isinstance(initial_buy_projection, dict):
+            mode = str(
+                initial_buy_projection.get("mode", "QUANTITY") or "QUANTITY"
+            ).upper()
+            if mode != "AMOUNT":
+                mode = "QUANTITY"
+            configured_value = safe_int_value(
+                initial_buy_projection.get("value"),
+                0,
+            )
+        else:
+            config = read_json_dict(config_path)
+            if not isinstance(config, dict):
+                config = {}
+            state = read_json_dict(config_path.parent / "state.json")
+            if not isinstance(state, dict):
+                state = {}
+            display_config, _display_evidence = (
+                project_running_budget_adjustment_display_config(config, state)
+            )
+            mode = str(
+                display_config.get("trade_amount_type", "QUANTITY") or ""
+            ).upper()
+            if mode != "AMOUNT":
+                mode = "QUANTITY"
+            value = (
+                display_config.get("buy_amount", 0)
+                if mode == "AMOUNT"
+                else display_config.get("buy_qty", 0)
+            )
+            configured_value = safe_int_value(value, 0)
         value_text = str(
             configured_value
             if configured_value > 0
@@ -8951,19 +9490,23 @@ class MainWindow(QMainWindow):
                     and previous_amount > 0
                     and previous_amount < default_amount
                 ):
-                    self._write_stock_initial_buy_config(
+                    result = self._write_stock_initial_buy_config(
                         config_path,
                         mode="AMOUNT",
                         value=0,
                     )
+                    if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
+                        self._show_start_budget_mutation_blocked(self)
                 self.load_routine_table()
                 return
 
-        self._write_stock_initial_buy_config(
+        result = self._write_stock_initial_buy_config(
             config_path,
             mode=mode,
             value=value,
         )
+        if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
+            self._show_start_budget_mutation_blocked(self)
         self.load_routine_table()
 
     def _routine_stock_buy_limit_value_rect(self, row: int) -> QRect:
@@ -9842,7 +10385,6 @@ class MainWindow(QMainWindow):
                 auto_trade_running_registered_operation_targets(self)
             )
         }
-        current_running_targets: list[MainMonitoringStockTarget] = []
         for stock_dir in projected_stock_dirs:
             code, separator, name = stock_dir.name.partition("_")
             if not separator or not code or not name:
@@ -9868,11 +10410,8 @@ class MainWindow(QMainWindow):
                 )
             ):
                 continue
-            operational_targets.append(target)
-            if str(stock_dir.resolve()) in current_running_stock_dirs:
-                current_running_targets.append(target)
-
-        any_running = bool(current_running_targets)
+            if str(stock_dir.resolve()) not in current_running_stock_dirs:
+                operational_targets.append(target)
 
         if not targets:
             result = {
@@ -9893,10 +10432,6 @@ class MainWindow(QMainWindow):
 
         if not operational_targets:
             self._reload_main_routine_table_preserving_view()
-            return
-
-        if any_running:
-            self.statusBar().showMessage("운영 중단은 긴급정지를 사용하십시오.")
             return
 
         adapter = MainMonitoringStockOperationAdapter(
@@ -9937,8 +10472,8 @@ class MainWindow(QMainWindow):
             )
         }
         running_after = any(
-            str(stock_dir.resolve()) in running_after_stock_dirs
-            for stock_dir in projected_stock_dirs
+            str(target.stock_dir.resolve()) in running_after_stock_dirs
+            for target in operational_targets
         )
         transition_succeeded = running_after
         self._reload_main_routine_table_preserving_view()
@@ -10099,50 +10634,19 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        instance = routine_instance_by_id(instance_id)
-        definition_id = str(getattr(instance, "definition_id", "") or "").strip()
-        definition = routine_definition_by_id(definition_id) if definition_id else None
-        rules_path = getattr(instance, "rules_path", None)
-        if instance is None or definition is None or rules_path is None:
-            QMessageBox.warning(self, "루틴 복제", "복제할 루틴 설정을 확인할 수 없습니다.")
-            return False
-
-        def rules_provider() -> dict[str, object]:
-            try:
-                rules = json.loads(Path(rules_path).read_text(encoding="utf-8"))
-                if not isinstance(rules, dict):
-                    raise ValueError("rules.json root must be an object")
-                return {"success": True, "rules": rules, "error": ""}
-            except Exception as exc:
-                return {"success": False, "rules": {}, "error": str(exc)}
-
-        from gui_indicator_follow_routine_settings_dialog import (
-            register_routine_instance_snapshot,
-        )
-
         group = getattr(self, "_routine_group_records_by_id", {}).get(group_id)
         if group is None:
             group = group_record_by_id(group_id)
-        group_display_name = str(
-            getattr(group, "display_name", "") or ""
-        ).strip()
-        if not group_display_name:
-            QMessageBox.warning(self, "루틴 복제", "원본 루틴의 Group을 확인할 수 없습니다.")
-            return False
-
-        return register_routine_instance_snapshot(
+        return clone_routine_instance_with_existing_policy(
             self,
-            definition_id=definition_id,
-            definition_display_name=str(
-                getattr(definition, "display_name", "") or ""
-            ).strip(),
-            group_id=group_id,
-            group_display_name=group_display_name,
-            source_instance_display_name=str(
-                getattr(instance, "display_name", "") or ""
-            ).strip(),
-            rules_provider=rules_provider,
-        ) is not None
+            {
+                "row_kind": "instance",
+                "group_id": group_id,
+                "instance_id": instance_id,
+            },
+            owning_group_ids=owning_group_ids,
+            group_record=group,
+        )
 
     def delete_routine_group_completely(
         self,
@@ -10913,7 +11417,7 @@ class MainWindow(QMainWindow):
             setattr(window, "last_chejan_record_result", self.last_chejan_record_result)
 
     def _main_exit_warning_required(self, now_dt: datetime | None = None) -> bool:
-        """Fail closed when a current-running stock can trade at the current time."""
+        """Warn when this GUI session has an active operation lifecycle."""
 
         try:
             running_targets = list(
@@ -10922,26 +11426,7 @@ class MainWindow(QMainWindow):
         except Exception:
             LOGGER.exception("Main exit current-running projection failed")
             return True
-        if not running_targets:
-            return False
-
-        current = now_dt or datetime.now()
-        for stock_dir, _code, _name in running_targets:
-            stock_path = Path(stock_dir)
-            config = read_json_dict(stock_path / "config.json")
-            state = read_json_dict(stock_path / "state.json")
-            if not config or not state:
-                return True
-            time_status = canonical_stock_trading_time_status(
-                config=config,
-                state=state,
-                now_dt=current,
-            )
-            if time_status.get("evaluable") is not True:
-                return True
-            if time_status.get("active") is True:
-                return True
-        return False
+        return bool(running_targets)
 
     def _confirm_main_window_exit_if_required(self) -> bool:
         if not self._main_exit_warning_required():

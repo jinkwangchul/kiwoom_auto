@@ -11,15 +11,24 @@ from unittest.mock import Mock, patch
 import gui_auto_trade_run_control as run_control
 import gui_auto_trade_status_ops as status_ops
 import gui_auto_trade_context_menu as context_menu
+import gui_ats_utils
 import operation_policy_gate
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
+from gui_auto_trade_operation_host import AutoTradeOperationHost
+from gui_auto_trade_policy import auto_trade_setting_start_target_decision
+from gui_main_stock_context_menu import (
+    MainMonitoringStockOperationAdapter,
+    MainMonitoringStockTarget,
+)
 from gui_auto_trade_run_control import (
     START_REQUEST_MULTIPLE,
     START_REQUEST_SINGLE,
     auto_trade_start_selected_auto_trades,
     initial_buy_start_validation,
+    operation_start_result_summary_toast_text,
     startup_recovery_operation_block_message,
 )
+from routine_order_permission import canonical_stock_trading_time_status
 
 
 class _Viewport:
@@ -388,7 +397,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
             with patch(
                 "gui_auto_trade_run_control.append_changelog"
             ) as append_changelog:
-                auto_trade_start_selected_auto_trades(window)
+                result = auto_trade_start_selected_auto_trades(window)
 
         self.assertEqual(2, len(window.recalculate_calls))
         self.assertEqual(
@@ -405,16 +414,514 @@ class AutoTradeStartContractTest(unittest.TestCase):
             )
         append_changelog.assert_called_once()
         window.rebind_startup_recovery_after_trusted_runtime_update.assert_called_once_with()
-        window.show_auto_trade_result_dialog.assert_called_once_with(
-            "운영시작 처리 완료",
-            "운영시작 결과",
-            [
-                "운영시작: 2개",
-                "기운영중: 0개",
-                "검토 대상 제외: 0개",
-                "검토관리 이동: 0개",
-                "실패: 0개",
-            ],
+        self.assertEqual(
+            "대상종목 2  |  기운영중 0  |  운영시작 2  |  운영불가 0",
+            result["summary_toast_message"],
+        )
+        window.show_auto_trade_result_dialog.assert_not_called()
+
+    def test_new_session_starts_stale_running_and_monitoring_targets_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            targets = [
+                self._stock(
+                    root,
+                    f"{index:06d}",
+                    f"종목{index}",
+                    "inst-a",
+                    "루틴 A",
+                )
+                for index in range(1, 6)
+            ]
+            for index, target in enumerate(targets):
+                (target[0] / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "MONITORING" if index == 2 else "RUNNING",
+                            "trade_enabled": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            window = _StartWindow(targets)
+            window._current_session_operation_participant_stock_codes = set()
+            window.startup_recovery_session_ready = lambda refresh=False: True
+            window.start_target_is_review_isolated = (
+                lambda _stock_dir, _code: False
+            )
+            window.split_start_targets = lambda selected: (
+                AutoTradeOperationHost.split_start_targets(window, selected)
+            )
+
+            with patch(
+                "gui_auto_trade_policy.auto_trade_operation_session_phase",
+                return_value={
+                    "evaluable": True,
+                    "phase": "ACTIVE_SESSION",
+                    "mode": "CONTINUOUS",
+                },
+            ):
+                result = auto_trade_start_selected_auto_trades(window)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(5, result["requested_count"])
+        self.assertEqual(5, len(result["eligible"]))
+        self.assertEqual(5, result["started_count"])
+        self.assertEqual(
+            [target[1] for target in targets],
+            [call[1] for call in window.recalculate_calls],
+        )
+        self.assertEqual(
+            {target[1] for target in targets},
+            window._current_session_operation_participant_stock_codes,
+        )
+
+    def test_scheduled_start_admission_distinguishes_pre_active_and_final_end(self) -> None:
+        window = _StartWindow([])
+        window._current_session_operation_participant_stock_codes = set()
+        config = {
+            "operation_mode": "SCHEDULED",
+            "start_time": "09:00:00",
+            "end_buy_time": "13:30:00",
+        }
+        state = {"status": "STOPPED", "trade_enabled": False}
+
+        operation_policy = {
+            "scheduled_operation": {
+                "default_start_time": "09:00:00",
+                "default_end_buy_time": "13:30:00",
+            },
+            "manual_operation": {"use_regular_market": True},
+            "regular_market": {
+                "start_time": "09:00:00",
+                "end_time": "15:20:00",
+            },
+        }
+
+        def ats_session(key: str) -> dict[str, object]:
+            return {
+                "extra1": {
+                    "enabled": True,
+                    "start_time": "08:00:00",
+                    "end_time": "08:50:00",
+                },
+                "extra2": {
+                    "enabled": True,
+                    "start_time": "15:40:00",
+                    "end_time": "19:50:00",
+                },
+            }.get(key, {})
+
+        with (
+            patch.object(
+                gui_ats_utils,
+                "read_operation_policy",
+                return_value=operation_policy,
+            ),
+            patch.object(
+                gui_ats_utils,
+                "manual_ats_session_definition",
+                side_effect=ats_session,
+            ),
+        ):
+            pre_start = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "002810",
+                config=config,
+                now_dt=datetime(2026, 8, 10, 8, 30, 0),
+            )
+            active = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "002810",
+                config=config,
+                now_dt=datetime(2026, 8, 10, 10, 0, 0),
+            )
+            final_end = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "002810",
+                config=config,
+                now_dt=datetime(2026, 8, 10, 13, 30, 0),
+            )
+            continuous_pre = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 8, 30, 0),
+            )
+            continuous_active = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 10, 0, 0),
+            )
+            continuous_final = auto_trade_setting_start_target_decision(
+                window,
+                state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 15, 21, 0),
+            )
+            ats_state = {
+                "status": "STOPPED",
+                "trade_enabled": False,
+                "manual_ats_selection": {"selected_sessions": ["extra2"]},
+            }
+            ats_gap = auto_trade_setting_start_target_decision(
+                window,
+                ats_state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 15, 30, 0),
+            )
+            ats_active = auto_trade_setting_start_target_decision(
+                window,
+                ats_state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 16, 0, 0),
+            )
+            ats_final = auto_trade_setting_start_target_decision(
+                window,
+                ats_state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 19, 51, 0),
+            )
+            premarket_state = {
+                "status": "STOPPED",
+                "trade_enabled": False,
+                "manual_ats_selection": {"selected_sessions": ["extra1"]},
+            }
+            premarket_gap = auto_trade_setting_start_target_decision(
+                window,
+                premarket_state,
+                "012210",
+                config={"operation_mode": "CONTINUOUS"},
+                now_dt=datetime(2026, 8, 10, 8, 55, 0),
+            )
+            gap_order_time = canonical_stock_trading_time_status(
+                config={"operation_mode": "CONTINUOUS"},
+                state=ats_state,
+                now_dt=datetime(2026, 8, 10, 15, 30, 0),
+            )
+
+        self.assertTrue(pre_start["allowed"])
+        self.assertEqual("BEFORE_FIRST_SESSION", pre_start["session_phase"]["phase"])
+        self.assertTrue(active["allowed"])
+        self.assertEqual("ACTIVE_SESSION", active["session_phase"]["phase"])
+        self.assertFalse(final_end["allowed"])
+        self.assertEqual("FINAL_SESSION_ENDED", final_end["reason"])
+        self.assertTrue(continuous_pre["allowed"])
+        self.assertEqual("BEFORE_FIRST_SESSION", continuous_pre["session_phase"]["phase"])
+        self.assertTrue(continuous_active["allowed"])
+        self.assertEqual("ACTIVE_SESSION", continuous_active["session_phase"]["phase"])
+        self.assertFalse(continuous_final["allowed"])
+        self.assertEqual("FINAL_SESSION_ENDED", continuous_final["reason"])
+        self.assertTrue(ats_gap["allowed"])
+        self.assertEqual("BETWEEN_SESSIONS", ats_gap["session_phase"]["phase"])
+        self.assertTrue(ats_active["allowed"])
+        self.assertEqual("ACTIVE_SESSION", ats_active["session_phase"]["phase"])
+        self.assertFalse(ats_final["allowed"])
+        self.assertEqual("FINAL_SESSION_ENDED", ats_final["reason"])
+        self.assertTrue(premarket_gap["allowed"])
+        self.assertEqual("BETWEEN_SESSIONS", premarket_gap["session_phase"]["phase"])
+        self.assertFalse(gap_order_time["active"])
+        self.assertEqual("OUTSIDE_OPERATION_TIME", gap_order_time["reason"])
+
+    def test_scheduled_final_end_partial_start_refreshes_before_result_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            specs = (
+                ("012210", "삼미금속", "CONTINUOUS"),
+                ("002810", "삼영무역", "SCHEDULED"),
+                ("005070", "코스모신소재", "SCHEDULED"),
+                ("063440", "SM Life Design", "SCHEDULED"),
+                ("130500", "GH신소재", "SCHEDULED"),
+            )
+            targets = []
+            for code, name, mode in specs:
+                target = self._stock(root, code, name, "inst-a", "루틴 A")
+                config_path = target[0] / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config.update(
+                    {
+                        "operation_mode": mode,
+                        "start_time": "09:00:00",
+                        "end_buy_time": "13:30:00",
+                    }
+                )
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                targets.append(target)
+
+            events: list[str] = []
+            window = _StartWindow(targets)
+            window._current_session_operation_participant_stock_codes = set()
+            window.start_target_is_review_isolated = lambda _stock_dir, _code: False
+            window.split_start_targets = lambda selected: (
+                AutoTradeOperationHost.split_start_targets(window, selected)
+            )
+            window.start_target_block_details = lambda: (
+                AutoTradeOperationHost.start_target_block_details(window)
+            )
+            window.refresh_auto_trade_assignment_views = Mock(
+                side_effect=lambda: events.append("refresh")
+            )
+            original_recalculate = window.recalculate_stock_status_by_operation_policy
+
+            def traced_recalculate(stock_dir, code, name, source, metadata):
+                events.append(f"state:{code}")
+                return original_recalculate(
+                    stock_dir,
+                    code,
+                    name,
+                    source,
+                    metadata,
+                )
+
+            window.recalculate_stock_status_by_operation_policy = traced_recalculate
+            original_register = (
+                run_control.auto_trade_register_current_session_operation_participants
+            )
+
+            def traced_register(owner, stock_codes):
+                events.append(f"participant:{','.join(stock_codes)}")
+                return original_register(owner, stock_codes)
+
+            def phase_for_mode(config, _state, *, now_dt=None):
+                mode = str(config.get("operation_mode") or "SCHEDULED").upper()
+                return {
+                    "evaluable": True,
+                    "phase": (
+                        "BETWEEN_SESSIONS"
+                        if mode == "CONTINUOUS"
+                        else "FINAL_SESSION_ENDED"
+                    ),
+                    "mode": mode,
+                    "future_session_exists": mode == "CONTINUOUS",
+                }
+
+            with (
+                patch(
+                    "gui_auto_trade_policy.auto_trade_operation_session_phase",
+                    side_effect=phase_for_mode,
+                ),
+                patch.object(
+                    run_control,
+                    "auto_trade_register_current_session_operation_participants",
+                    side_effect=traced_register,
+                ),
+                patch.object(
+                    run_control,
+                    "write_global_operation_running_state",
+                    side_effect=lambda **_kwargs: (
+                        events.append("global-state")
+                        or {"ok": True, "started_new_session": False}
+                    ),
+                ),
+                patch.object(
+                    run_control,
+                    "_start_operation_host_after_explicit_operation_start",
+                    side_effect=lambda _window: (
+                        events.append("operation-host")
+                        or {"started": True, "reason_code": "RECOVERY_TIMER_STARTED"}
+                    ),
+                ),
+                patch.object(
+                    run_control,
+                    "_show_operation_start_summary_toast",
+                    side_effect=lambda *_args: events.append("toast"),
+                ),
+            ):
+                result = auto_trade_start_selected_auto_trades(
+                    window,
+                    request_scope=START_REQUEST_MULTIPLE,
+                    selected_targets=targets,
+                    source="scheduled-final-end-test",
+                )
+
+        self.assertEqual(5, result["requested_count"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual(4, result["blocked_count"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(
+            ("FINAL_SESSION_ENDED",) * 4,
+            tuple(item["reason"] for item in result["blocked_target_details"]),
+        )
+        self.assertEqual(
+            {"012210"},
+            window._current_session_operation_participant_stock_codes,
+        )
+        self.assertEqual(["012210"], [call[1] for call in window.recalculate_calls])
+        self.assertLess(events.index("state:012210"), events.index("participant:012210"))
+        self.assertLess(events.index("participant:012210"), events.index("operation-host"))
+        self.assertLess(events.index("operation-host"), events.index("refresh"))
+        self.assertLess(events.index("refresh"), events.index("toast"))
+        window.refresh_auto_trade_assignment_views.assert_called_once_with()
+        window.show_auto_trade_result_dialog.assert_not_called()
+        self.assertEqual(
+            "대상종목 5  |  기운영중 0  |  운영시작 1  |  운영불가 4\n시간운영 종료 4",
+            operation_start_result_summary_toast_text(result),
+        )
+
+    def test_main_production_adapter_blocks_all_final_ended_targets_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            specs = (
+                ("012210", "삼미금속", "CONTINUOUS"),
+                ("002810", "삼영무역", ""),
+                ("005070", "코스모신소재", ""),
+                ("063440", "SM Life Design", ""),
+                ("130500", "GH신소재", ""),
+            )
+            stock_targets: list[tuple[Path, str, str]] = []
+            adapter_targets: list[MainMonitoringStockTarget] = []
+            for code, name, raw_mode in specs:
+                stock_dir, _code, _name = self._stock(
+                    root,
+                    code,
+                    name,
+                    "inst-a",
+                    "루틴 A",
+                )
+                config_path = stock_dir / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                if raw_mode:
+                    config["operation_mode"] = raw_mode
+                else:
+                    config.pop("operation_mode", None)
+                    config.update(
+                        {
+                            "start_time": "09:00:00",
+                            "end_buy_time": "13:30:00",
+                        }
+                    )
+                config_path.write_text(
+                    json.dumps(config, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                stock_targets.append((stock_dir, code, name))
+                adapter_targets.append(
+                    MainMonitoringStockTarget(
+                        stock_dir=stock_dir,
+                        code=code,
+                        name=name,
+                        routine_instance_id="inst-a",
+                    )
+                )
+
+            status_bar = SimpleNamespace(showMessage=Mock())
+            main = SimpleNamespace(
+                routine_table=_StockTable(),
+                btn_start=Mock(),
+                statusBar=lambda: status_bar,
+                startup_recovery_session_ready=lambda refresh=True: True,
+            )
+            host = AutoTradeOperationHost(main)
+            host._current_session_operation_participant_stock_codes = set()
+            main.main_monitoring_auto_trade_operation_host = lambda: host
+            adapter = MainMonitoringStockOperationAdapter(main, adapter_targets)
+            events: list[str] = []
+            adapter.running_registered_operation_targets = Mock(return_value=[])
+            adapter.refresh_auto_trade_assignment_views = Mock(
+                side_effect=lambda: events.append("refresh")
+            )
+            adapter.update_global_operation_button_state = Mock(
+                side_effect=lambda: events.append("button")
+            )
+            adapter.statusBarMessage = Mock()
+            adapter.show_auto_trade_result_dialog = Mock()
+            host.recalculate_stock_status_by_operation_policy = Mock()
+            state_before = {
+                stock_dir: (stock_dir / "state.json").read_bytes()
+                for stock_dir, _code, _name in stock_targets
+            }
+            operation_policy = {
+                "scheduled_operation": {
+                    "default_start_time": "09:00:00",
+                    "default_end_buy_time": "13:30:00",
+                },
+                "manual_operation": {"use_regular_market": True},
+                "regular_market": {
+                    "start_time": "09:00:00",
+                    "end_time": "15:20:00",
+                },
+            }
+
+            def fixed_production_phase(config, state, *, now_dt=None):
+                return gui_ats_utils.auto_trade_operation_session_phase(
+                    config,
+                    state,
+                    now_dt=datetime(2026, 8, 28, 16, 0, 0),
+                    operation_policy_reader=lambda: operation_policy,
+                    ats_session_reader=lambda _key: {},
+                )
+
+            with (
+                patch.object(run_control, "read_operation_state", return_value={}),
+                patch(
+                    "gui_auto_trade_policy.auto_trade_operation_session_phase",
+                    side_effect=fixed_production_phase,
+                ),
+                patch.object(
+                    run_control,
+                    "auto_trade_register_current_session_operation_participants",
+                ) as participant_writer,
+                patch.object(
+                    run_control,
+                    "write_global_operation_running_state",
+                ) as global_state_writer,
+                patch.object(
+                    run_control,
+                    "_start_operation_host_after_explicit_operation_start",
+                ) as operation_host_start,
+                patch.object(
+                    run_control,
+                    "_show_operation_start_summary_toast",
+                    side_effect=lambda *_args: events.append("toast"),
+                ),
+            ):
+                result = adapter.start_selected_auto_trades()
+
+            state_after = {
+                stock_dir: (stock_dir / "state.json").read_bytes()
+                for stock_dir, _code, _name in stock_targets
+            }
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(5, result["requested_count"])
+        self.assertEqual(0, result["eligible_count"])
+        self.assertEqual(0, result["started_count"])
+        self.assertEqual(5, result["blocked_count"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(
+            ("FINAL_SESSION_ENDED",) * 5,
+            tuple(item["reason"] for item in result["blocked_target_details"]),
+        )
+        self.assertEqual(
+            ("CONTINUOUS", "SCHEDULED", "SCHEDULED", "SCHEDULED", "SCHEDULED"),
+            tuple(item["operation_mode"] for item in result["blocked_target_details"]),
+        )
+        self.assertEqual(state_before, state_after)
+        self.assertEqual(set(), host._current_session_operation_participant_stock_codes)
+        host.recalculate_stock_status_by_operation_policy.assert_not_called()
+        participant_writer.assert_not_called()
+        global_state_writer.assert_not_called()
+        operation_host_start.assert_not_called()
+        self.assertLess(events.index("refresh"), events.index("button"))
+        self.assertLess(events.index("button"), events.index("toast"))
+        adapter.show_auto_trade_result_dialog.assert_not_called()
+        self.assertEqual(
+            "대상종목 5  |  기운영중 0  |  운영시작 0  |  운영불가 5\n수동운영 종료 1 · 시간운영 종료 4",
+            operation_start_result_summary_toast_text(result),
         )
 
     def test_missing_instance_assignment_is_reported_without_start(self) -> None:
@@ -472,8 +979,10 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertEqual(("111111 정상종목",), result["eligible"])
         self.assertEqual(1, len(result["completed"]))
         self.assertEqual(1, len(window.recalculate_calls))
-        self.assertEqual("운영 시작 1개 · 검토 제외 1개", result["user_message"])
+        self.assertIn("운영 시작 1개 · 검토 제외 1개", result["user_message"])
+        self.assertIn("검토관리 필요: 1종목", result["user_message"])
         window.statusBarMessage.assert_called_with(result["user_message"])
+        self.assertIn("운영시작 1", result["summary_toast_message"])
         window.show_auto_trade_result_dialog.assert_not_called()
 
     def test_one_review_stock_uses_single_message_before_recovery_gate(self) -> None:
@@ -669,29 +1178,35 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertEqual("QUANTITY", result["mode"])
 
-    def test_amount_basis_requires_previous_close_times_150_percent(self) -> None:
-        blocked = initial_buy_start_validation(
-            {"trade_amount_type": "AMOUNT", "buy_amount": 149_999},
-            {"previous_close": 100_000},
-        )
-        allowed = initial_buy_start_validation(
-            {"trade_amount_type": "AMOUNT", "buy_amount": 150_000},
-            {"previous_close": 100_000},
+    def test_amount_default_uses_resolved_starting_budget_without_previous_close(self) -> None:
+        result = initial_buy_start_validation(
+            {"trade_amount_type": "AMOUNT", "buy_amount": 0},
+            {},
+            resolved_starting_budget=150_000,
         )
 
-        self.assertFalse(blocked["allowed"])
-        self.assertEqual(150_000, blocked["minimum_amount"])
-        self.assertEqual("INITIAL_BUY_AMOUNT_BELOW_MINIMUM", blocked["reason"])
-        self.assertTrue(allowed["allowed"])
+        self.assertTrue(result["allowed"])
+        self.assertEqual(150_000, result["resolved_starting_budget"])
+        self.assertEqual("fresh_current_price", result["starting_budget_source"])
 
-    def test_amount_basis_without_previous_close_fails_closed(self) -> None:
+    def test_amount_explicit_value_does_not_require_previous_close(self) -> None:
         result = initial_buy_start_validation(
             {"trade_amount_type": "AMOUNT", "buy_amount": 1_000_000},
             {},
         )
 
+        self.assertTrue(result["allowed"])
+        self.assertEqual(1_000_000, result["resolved_starting_budget"])
+        self.assertEqual("explicit", result["starting_budget_source"])
+
+    def test_amount_default_without_fresh_price_fails_closed(self) -> None:
+        result = initial_buy_start_validation(
+            {"trade_amount_type": "AMOUNT", "buy_amount": 0},
+            {"previous_close": 100_000},
+        )
+
         self.assertFalse(result["allowed"])
-        self.assertEqual("PREVIOUS_CLOSE_UNAVAILABLE", result["reason"])
+        self.assertEqual("STARTING_BUDGET_UNRESOLVED", result["reason"])
 
     def test_amount_below_minimum_does_not_start_stock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -699,7 +1214,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
             stock = self._stock(root, "111111", "첫종목", "inst-a", "루틴 A")
             config_path = stock[0] / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({"trade_amount_type": "AMOUNT", "buy_amount": 100_000})
+            config.update({"trade_amount_type": "AMOUNT", "buy_amount": 0})
             config_path.write_text(
                 json.dumps(config, ensure_ascii=False),
                 encoding="utf-8",
@@ -722,8 +1237,8 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertEqual([], window.recalculate_calls)
         window.show_auto_trade_result_dialog.assert_not_called()
         self.assertEqual(
-            "초회 매수 금액이 최소 거래금액보다 작습니다.\n"
-            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오.",
+            "현재 세션의 가격 정보를 아직 확인하지 못해 시작금액을 확정할 수 없습니다.\n"
+            "시세 정보를 확인한 뒤 다시 시도하십시오.",
             result["user_message"],
         )
 
@@ -734,7 +1249,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
             blocked = self._stock(root, "222222", "설정미달", "inst-a", "루틴 A")
             config_path = blocked[0] / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({"trade_amount_type": "AMOUNT", "buy_amount": 100_000})
+            config.update({"trade_amount_type": "AMOUNT", "buy_amount": 0})
             config_path.write_text(
                 json.dumps(config, ensure_ascii=False),
                 encoding="utf-8",
@@ -762,7 +1277,10 @@ class AutoTradeStartContractTest(unittest.TestCase):
             result["user_message"],
         )
         window.statusBarMessage.assert_called_with(result["user_message"])
-        window.show_auto_trade_result_dialog.assert_not_called()
+        self.assertEqual(
+            "대상종목 2  |  기운영중 0  |  운영시작 1  |  운영불가 1",
+            result["summary_toast_message"],
+        )
         self.assertFalse(
             bool(getattr(window, "_last_operation_failure_dialog_shown", False))
         )
@@ -802,7 +1320,10 @@ class AutoTradeStartContractTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("multiple", result["request_scope"])
         self.assertEqual("운영 시작 1개", result["user_message"])
-        window.show_auto_trade_result_dialog.assert_called_once()
+        self.assertEqual(
+            "대상종목 1  |  기운영중 0  |  운영시작 1  |  운영불가 0",
+            result["summary_toast_message"],
+        )
 
     def test_single_review_target_names_stock_and_shows_one_dialog(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -913,16 +1434,10 @@ class AutoTradeStartContractTest(unittest.TestCase):
     def test_single_validation_failures_use_stock_specific_messages(self) -> None:
         scenarios = (
             (
-                "PREVIOUS_CLOSE_UNAVAILABLE",
-                {"trade_amount_type": "AMOUNT", "buy_amount": 1_000_000},
-                {},
-                "005930 삼성전자의 전일 종가를 확인할 수 없습니다.",
-            ),
-            (
-                "INITIAL_BUY_AMOUNT_BELOW_MINIMUM",
-                {"trade_amount_type": "AMOUNT", "buy_amount": 100_000},
+                "STARTING_BUDGET_UNRESOLVED",
+                {"trade_amount_type": "AMOUNT", "buy_amount": 0},
                 {"previous_close": 100_000},
-                "005930 삼성전자의 초회 매수 금액이 최소 거래금액보다 작습니다.",
+                "005930 삼성전자의 현재 세션 가격 정보를 아직 확인하지 못해 시작금액을 확정할 수 없습니다.",
             ),
             (
                 "INVALID_INITIAL_BUY_QUANTITY",

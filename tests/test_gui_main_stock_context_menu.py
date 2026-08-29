@@ -1198,6 +1198,7 @@ class MainMonitoringStockContextMenuTest(unittest.TestCase):
             extra_policy=None,
             show_error_dialog=True,
             show_result_toast=True,
+            show_confirmation=True,
         )
         profit_loss.assert_called_once_with(adapter)
         cancel.assert_called_once_with(adapter)

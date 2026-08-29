@@ -119,7 +119,18 @@ def _is_refresh_target(stock_dir: Path) -> bool:
     }
 
 
-def _refresh_targets() -> list[tuple[Path, str, str]]:
+def _refresh_targets(window: Any) -> list[tuple[Path, str, str]]:
+    registered_getter = getattr(window, "registered_operation_targets", None)
+    if callable(registered_getter):
+        try:
+            targets = [
+                (Path(stock_dir), str(code), str(name))
+                for stock_dir, code, name in registered_getter()
+                if str(stock_dir or "").strip()
+            ]
+        except Exception:
+            return []
+        return sorted(targets, key=lambda item: item[1])
     targets: list[tuple[Path, str, str]] = []
     for value in all_registered_stock_dirs():
         stock_dir = Path(value)
@@ -191,7 +202,7 @@ def refresh_operation_candles(
 
     as_of = parse_market_datetime(minute_key) or datetime.now(SEOUL_TIMEZONE)
     trade_date = as_of.date().isoformat()
-    targets, skipped_by_limit = _rotated_targets(window, _refresh_targets())
+    targets, skipped_by_limit = _rotated_targets(window, _refresh_targets(window))
     api = _api_from_host(window)
     request = getattr(api, "request_minute_candles", None)
     available = getattr(api, "is_available", None)

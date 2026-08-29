@@ -232,6 +232,15 @@ class CanonicalPerformanceAggregator:
             period_performance_facts=event_metrics.period_performance_facts,
         )
 
+    @property
+    def resolved_performance_episode_ids(self) -> frozenset[str]:
+        """Episodes that own at least one canonical Performance allocation."""
+        return frozenset(
+            fact.episode.episode_id
+            for fact in self._facts
+            if fact.episode is not None
+        )
+
     def aggregate_episode(self, episode_id: str) -> EpisodeAggregate | None:
         episode = self.snapshot.episodes_by_id.get(str(episode_id or "").strip())
         if episode is None:

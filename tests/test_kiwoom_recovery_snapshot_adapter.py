@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from datetime import datetime
 import importlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 from kiwoom_screen_allocator import (
     MARKET_TR,
@@ -831,6 +833,63 @@ class KiwoomRecoverySnapshotAdapterTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual("STALE_BROKER_SESSION", results[0]["error_kind"])
         self.assertNotIn(str(second["rqname"]), self.api._pending_tr)
+
+    def test_tr_governor_metrics_track_dispatch_wait_and_rolling_window(self) -> None:
+        self.api._tr_governor_now_ms = lambda: 10_000
+        with patch.object(
+            self.module,
+            "monotonic",
+            side_effect=(10.0, 10.25, 10.25),
+        ):
+            requested = self.api.request_minute_candles("005930")
+            snapshot = self.api.tr_governor_metrics_snapshot()
+
+        self.assertTrue(requested["ok"])
+        self.assertEqual(1, snapshot.total_enqueued)
+        self.assertEqual(1, snapshot.total_dispatched)
+        self.assertEqual(0, snapshot.current_queue_depth)
+        self.assertEqual(str(requested["rqname"]), snapshot.last_rqname)
+        self.assertEqual("opt10080", snapshot.last_trcode)
+        self.assertEqual(1, snapshot.dispatch_count_last_60s)
+        self.assertAlmostEqual(250.0, snapshot.last_queue_wait_ms, places=6)
+        self.assertAlmostEqual(250.0, snapshot.max_queue_wait_ms, places=6)
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.total_enqueued = 99
+
+        with patch.object(
+            self.module,
+            "monotonic",
+            return_value=70.251,
+        ):
+            expired = self.api.tr_governor_metrics_snapshot()
+        self.assertEqual(0, expired.dispatch_count_last_60s)
+        self.assertEqual(1, self.api.tr_governor_metrics_snapshot().total_enqueued)
+
+    def test_tr_governor_timeout_and_stale_are_counted_once(self) -> None:
+        requested = self.api.request_minute_candles("005930")
+        rqname = str(requested["rqname"])
+        self.api._expire_minute_candle_request(rqname)
+        self.api._expire_minute_candle_request(rqname)
+        self.assertEqual(1, self.api.tr_governor_metrics_snapshot().timeout_count)
+
+        stale = self.api.request_minute_candles("006400")
+        stale_rqname = str(stale["rqname"])
+        self.api._connection_epoch = 2
+        self.api._login_session_id = "KIWOOM_LOGIN_SESSION_RECONNECTED"
+        pending = self.api._pending_tr[stale_rqname]
+        self.api._finish_stale_pending_tr(stale_rqname, pending)
+        self.api._finish_stale_pending_tr(stale_rqname, pending)
+        self.assertEqual(1, self.api.tr_governor_metrics_snapshot().stale_count)
+
+    def test_tr_governor_dispatch_error_is_counted_once(self) -> None:
+        self.control.comm_rq_result = -202
+        result = self.api.request_minute_candles("005930")
+        metrics = self.api.tr_governor_metrics_snapshot()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(1, metrics.total_dispatched)
+        self.assertEqual(1, metrics.error_count)
+        self.assertEqual("CommRqData failed", metrics.last_error_reason)
 
     def test_reconnect_new_request_captures_new_session_identity(self) -> None:
         first = self.api.request_minute_candles("005930")

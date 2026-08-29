@@ -158,6 +158,8 @@ class StockContextMenuCallbacks:
     time_reset: Callable[[], None] | None = None
     ats_state: Callable[[], dict[str, bool]] | None = None
     ats_toggle: Callable[[str, bool, str], None] | None = None
+    ats_execution_method_state: Callable[[], dict[str, object]] | None = None
+    ats_execution_method_set: Callable[[str, str], None] | None = None
     ats_liquidation_available: Callable[[], bool] | None = None
     ats_liquidation: Callable[
         [str, dict[str, bool], tuple[str, ...], tuple[str, ...]],
@@ -165,6 +167,8 @@ class StockContextMenuCallbacks:
     ] | None = None
     set_operation_exclusion: Callable[[], None] | None = None
     clear_operation_exclusion: Callable[[], None] | None = None
+    trade_permission_label: Callable[[], str] | None = None
+    toggle_trade_permission: Callable[[], None] | None = None
 
 
 def open_selected_stock_instance_charts(
@@ -511,7 +515,9 @@ def _add_ats_settings_menu(
     has_selection: bool,
     state_getter: Callable[[], dict[str, bool]] | None,
     toggle: Callable[[str, bool, str], None] | None,
-    liquidation_available_getter: Callable[[], bool] | None,
+    execution_method_state_getter: Callable[[], dict[str, object]] | None = None,
+    execution_method_setter: Callable[[str, str], None] | None = None,
+    liquidation_available_getter: Callable[[], bool] | None = None,
 ):
     visible_keys = manual_ats_visible_session_keys()
     labels = manual_ats_session_labels()
@@ -529,6 +535,32 @@ def _add_ats_settings_menu(
         action.setProperty("atsSessionCurrent", selected)
         action.setProperty("atsSessionKey", key)
         session_actions.append((key, label, action))
+
+    ats_menu.addSeparator()
+    method_menu = ats_menu.addMenu("주문방식")
+    method_state_value = (
+        execution_method_state_getter()
+        if execution_method_state_getter is not None
+        else {"ok": True, "execution_method": "ROUTINE", "mixed": False}
+    )
+    method_state = dict(method_state_value) if isinstance(method_state_value, dict) else {}
+    current_method = str(method_state.get("execution_method") or "").strip().upper()
+    method_actions: list[tuple[str, str, object]] = []
+    for method_key, method_label in (
+        ("ROUTINE", "루틴"),
+        ("MARKET", "시장가"),
+        ("CURRENT_PRICE", "현재가"),
+    ):
+        action = method_menu.addAction(method_label)
+        selected = method_state.get("ok") is True and current_method == method_key
+        action.setIcon(_menu_status_icon(selected))
+        action.setProperty("atsExecutionMethod", method_key)
+        action.setProperty("atsExecutionMethodCurrent", selected)
+        method_actions.append((method_key, method_label, action))
+    if method_state.get("ok") is not True:
+        set_tool_tip = getattr(method_menu, "setToolTip", None)
+        if callable(set_tool_tip):
+            set_tool_tip("INVALID_ATS_EXECUTION_METHOD")
 
     ats_menu.addSeparator()
     action_market = ats_menu.addAction("시장가")
@@ -581,6 +613,10 @@ def _add_ats_settings_menu(
         "current_state": current_state,
         "session_actions": tuple(session_actions),
         "toggle_session": toggle_session,
+        "method_menu": method_menu,
+        "method_state": method_state,
+        "method_actions": tuple(method_actions),
+        "execution_method_setter": execution_method_setter,
         "market": action_market,
         "current": action_current,
     }
@@ -604,6 +640,13 @@ def _dispatch_ats_settings_action(
                 toggle_session(key, label)
             elif toggle is not None:
                 toggle(key, not bool(current_state.get(key, False)), label)
+            return True
+
+    for method_key, method_label, action in actions.get("method_actions", ()):
+        if chosen == action:
+            setter = actions.get("execution_method_setter")
+            if callable(setter):
+                setter(method_key, method_label)
             return True
 
     method = ""
@@ -666,6 +709,17 @@ def show_monitor_stock_context_menu(
         action_set_exclusion = menu.addAction("운영제외")
         action_set_exclusion.setEnabled(has_selection)
 
+    action_trade_permission = None
+    if callbacks.toggle_trade_permission is not None:
+        label_getter = callbacks.trade_permission_label
+        try:
+            permission_label = label_getter() if callable(label_getter) else ""
+        except Exception:
+            permission_label = ""
+        permission_label = str(permission_label or "").strip() or "거래권한 전환"
+        action_trade_permission = menu.addAction(permission_label)
+        action_trade_permission.setEnabled(has_selection)
+
     menu.addSeparator()
     early_close = _add_early_close_menu(
         menu,
@@ -695,6 +749,8 @@ def show_monitor_stock_context_menu(
             has_selection=has_selection,
             state_getter=callbacks.ats_state,
             toggle=callbacks.ats_toggle,
+            execution_method_state_getter=callbacks.ats_execution_method_state,
+            execution_method_setter=callbacks.ats_execution_method_set,
             liquidation_available_getter=callbacks.ats_liquidation_available,
         )
 
@@ -733,6 +789,9 @@ def show_monitor_stock_context_menu(
         decision_event_type = "OPERATOR_SETTING_DECISION"
     elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
         selected_option = "OPERATION_EXCLUSION_RELEASE"
+        decision_event_type = "OPERATOR_SETTING_DECISION"
+    elif action_trade_permission is not None and chosen == action_trade_permission:
+        selected_option = "TRADE_PERMISSION_TOGGLE"
         decision_event_type = "OPERATOR_SETTING_DECISION"
     elif chosen == early_close["routine"]:
         selected_option = "EARLY_CLOSE_ROUTINE"
@@ -780,6 +839,7 @@ def show_monitor_stock_context_menu(
                     "EMERGENCY_RELEASE",
                     "OPERATION_EXCLUDE",
                     "OPERATION_EXCLUSION_RELEASE",
+                    "TRADE_PERMISSION_TOGGLE",
                     "EARLY_CLOSE_ROUTINE",
                     "EARLY_CLOSE_MARKET",
                     "EARLY_CLOSE_CURRENT",
@@ -811,6 +871,8 @@ def show_monitor_stock_context_menu(
         callbacks.set_operation_exclusion()
     elif action_clear_exclusion is not None and chosen == action_clear_exclusion:
         callbacks.clear_operation_exclusion()
+    elif action_trade_permission is not None and chosen == action_trade_permission:
+        callbacks.toggle_trade_permission()
     elif action_unregister is not None and chosen == action_unregister:
         callbacks.unregister()
     elif action_open_charts is not None and chosen == action_open_charts:
@@ -914,6 +976,14 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
         time_reset=window_callback("reset_selected_schedule_to_global"),
         ats_state=lambda: window_callback("selected_manual_ats_state")(selected),
         ats_toggle=window_callback("set_selected_manual_ats_flag"),
+        ats_execution_method_state=lambda: window_callback(
+            "selected_manual_ats_execution_method_state"
+        )(selected),
+        ats_execution_method_set=lambda method, label: window_callback(
+            "set_selected_manual_ats_execution_method"
+        )(method, label, selected),
+        trade_permission_label=window_callback("selected_trade_permission_context_label"),
+        toggle_trade_permission=window_callback("toggle_selected_trade_permission"),
         ats_liquidation_available=lambda: (
             window_callback("selected_manual_ats_liquidation_available")(selected)
         ),

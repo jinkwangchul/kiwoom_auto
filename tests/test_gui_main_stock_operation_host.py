@@ -22,6 +22,11 @@ import gui_windows
 from auto_trade_order_execution_boundary import AutoTradeOrderExecutionBoundary
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
+from gui_auto_trade_run_control import (
+    _operation_start_resolved_starting_budget,
+    initial_buy_start_validation,
+)
+from gui_main_table_loader import main_stock_resolved_starting_budget
 from gui_main_stock_context_menu import MainMonitoringStockOperationAdapter
 
 
@@ -98,6 +103,8 @@ def _callbacks() -> context_menu.StockContextMenuCallbacks:
         open_charts=Mock(),
         time_change=Mock(),
         time_reset=Mock(),
+        trade_permission_label=Mock(return_value="감시전용 전환"),
+        toggle_trade_permission=Mock(),
     )
 
 
@@ -211,6 +218,113 @@ class MainStockOperationHostTest(unittest.TestCase):
             17,
         )
 
+    def test_monitor_adapter_forwards_main_operation_host_identity(self) -> None:
+        host = object()
+        owner = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+            routine_table=Mock(),
+        )
+        adapter = MainMonitoringStockOperationAdapter(owner, [])
+
+        self.assertIs(adapter.main_monitoring_auto_trade_operation_host(), host)
+        owner.main_monitoring_auto_trade_operation_host.assert_called_once_with()
+
+    def test_monitor_adapter_and_main_window_resolve_same_fresh_starting_budget(self) -> None:
+        fresh = SimpleNamespace(
+            connection_epoch=7,
+            login_session_id="SESSION-7",
+            last_price=12_855,
+        )
+        host = SimpleNamespace(
+            fresh_monitoring_market_information_state=Mock(return_value=fresh)
+        )
+        owner = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+            routine_table=Mock(),
+        )
+        adapter = MainMonitoringStockOperationAdapter(owner, [])
+        stock = {
+            "code": "012210",
+            "name": "삼미금속",
+            "stock_path": "stocks/012210_삼미금속",
+        }
+        config = {"trade_amount_type": "AMOUNT", "buy_amount": 0, "buy_qty": 4}
+
+        main_amount = main_stock_resolved_starting_budget(owner, stock, config)
+        start_amount = _operation_start_resolved_starting_budget(
+            adapter,
+            Path("stocks/012210_삼미금속"),
+            "012210",
+            "삼미금속",
+            config,
+        )
+        validation = initial_buy_start_validation(
+            config,
+            {},
+            resolved_starting_budget=start_amount,
+        )
+
+        self.assertEqual(main_amount, start_amount)
+        self.assertGreater(start_amount, 0)
+        self.assertTrue(validation["allowed"])
+        self.assertEqual("fresh_current_price", validation["starting_budget_source"])
+
+    def test_monitor_adapter_start_validation_still_fails_closed_without_fresh_price(self) -> None:
+        host = SimpleNamespace(
+            fresh_monitoring_market_information_state=Mock(return_value=None)
+        )
+        owner = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+            routine_table=Mock(),
+        )
+        adapter = MainMonitoringStockOperationAdapter(owner, [])
+        config = {"trade_amount_type": "AMOUNT", "buy_amount": 0, "buy_qty": 4}
+
+        start_amount = _operation_start_resolved_starting_budget(
+            adapter,
+            Path("stocks/012210_삼미금속"),
+            "012210",
+            "삼미금속",
+            config,
+        )
+        validation = initial_buy_start_validation(
+            config,
+            {},
+            resolved_starting_budget=start_amount,
+        )
+
+        self.assertIsNone(start_amount)
+        self.assertFalse(validation["allowed"])
+        self.assertEqual("STARTING_BUDGET_UNRESOLVED", validation["reason"])
+
+    def test_monitor_adapter_explicit_amount_does_not_depend_on_fresh_price(self) -> None:
+        host = SimpleNamespace(
+            fresh_monitoring_market_information_state=Mock(return_value=None)
+        )
+        owner = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+            routine_table=Mock(),
+        )
+        adapter = MainMonitoringStockOperationAdapter(owner, [])
+        config = {"trade_amount_type": "AMOUNT", "buy_amount": 1_000_000}
+
+        start_amount = _operation_start_resolved_starting_budget(
+            adapter,
+            Path("stocks/012210_삼미금속"),
+            "012210",
+            "삼미금속",
+            config,
+        )
+        validation = initial_buy_start_validation(
+            config,
+            {},
+            resolved_starting_budget=start_amount,
+        )
+
+        self.assertIsNone(start_amount)
+        self.assertTrue(validation["allowed"])
+        self.assertEqual("explicit", validation["starting_budget_source"])
+
     def test_main_window_host_factory_never_constructs_setting_window(self) -> None:
         owner = SimpleNamespace()
         with patch.object(gui_windows, "AutoTradeSettingWindow") as setting_window:
@@ -266,6 +380,159 @@ class MainStockOperationHostTest(unittest.TestCase):
         result = host.run_operation_cycle()
 
         self.assertEqual("OPERATION_CYCLE_REENTRY", result["reason_code"])
+
+    def test_recovery_start_syncs_realtime_targets_without_full_operation_cycle(self) -> None:
+        host = AutoTradeOperationHost(QObject())
+        identity = object()
+        snapshot = SimpleNamespace(execution_stock_codes=("005930",))
+        sync_result = {
+            "ok": True,
+            "changed": True,
+            "active": True,
+            "reason_code": "REGISTER_CALL_RETURNED",
+            "snapshot": object(),
+        }
+
+        with patch(
+            "production_recovery_timer_lifecycle.start_recovery_bound_timers",
+            return_value={
+                "started": True,
+                "started_count": 1,
+                "reason_code": "RECOVERY_TIMER_STARTED",
+            },
+        ) as timer_start, patch(
+            "gui_auto_trade_operation_host.project_execution_universe",
+            return_value=snapshot,
+        ) as projector, patch.object(
+            host,
+            "sync_realtime_shadow_targets",
+            return_value=sync_result,
+        ) as sync, patch.object(
+            host,
+            "run_operation_cycle",
+        ) as operation_cycle, patch(
+            "gui_auto_trade_operation_host.append_production_event",
+        ):
+            result = host.start_after_recovery(identity)
+
+        self.assertTrue(result["started"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual("RECOVERY_TIMER_STARTED", result["reason_code"])
+        timer_start.assert_called_once()
+        projector.assert_called_once_with(host)
+        sync.assert_called_once_with(snapshot)
+        operation_cycle.assert_not_called()
+        self.assertIs(sync_result, result["immediate_realtime_shadow_result"])
+        self.assertNotIn("immediate_operation_cycle_result", result)
+
+    def test_recovery_start_preserves_success_when_immediate_realtime_sync_fails(self) -> None:
+        host = AutoTradeOperationHost(QObject())
+        identity = object()
+
+        with patch(
+            "production_recovery_timer_lifecycle.start_recovery_bound_timers",
+            return_value={
+                "started": True,
+                "started_count": 1,
+                "reason_code": "RECOVERY_TIMER_STARTED",
+            },
+        ), patch(
+            "gui_auto_trade_operation_host.project_execution_universe",
+            return_value=SimpleNamespace(execution_stock_codes=("005930",)),
+        ), patch.object(
+            host,
+            "sync_realtime_shadow_targets",
+            side_effect=RuntimeError("sync failed"),
+        ), patch.object(
+            host,
+            "run_operation_cycle",
+        ) as operation_cycle, patch(
+            "gui_auto_trade_operation_host.LOGGER.exception",
+        ), patch(
+            "gui_auto_trade_operation_host.append_production_event",
+        ):
+            result = host.start_after_recovery(identity)
+
+        self.assertTrue(result["started"])
+        self.assertEqual(1, result["started_count"])
+        self.assertEqual("RECOVERY_TIMER_STARTED", result["reason_code"])
+        self.assertEqual(
+            "REALTIME_SHADOW_SYNC_FAILED",
+            result["immediate_realtime_shadow_result"]["reason_code"],
+        )
+        self.assertIn("sync failed", result["immediate_realtime_shadow_result"]["error"])
+        operation_cycle.assert_not_called()
+
+    def test_recovery_start_does_not_rebind_market_data_signals(self) -> None:
+        host = AutoTradeOperationHost(QObject())
+        identity = object()
+
+        with patch(
+            "production_recovery_timer_lifecycle.start_recovery_bound_timers",
+            return_value={
+                "started": True,
+                "started_count": 1,
+                "reason_code": "RECOVERY_TIMER_STARTED",
+            },
+        ), patch.object(
+            host,
+            "_bind_market_data_host_signals_once",
+        ) as bind_market, patch.object(
+            host,
+            "_bind_bar_committed_signal_once",
+        ) as bind_bar, patch.object(
+            host,
+            "_bind_realtime_shadow_signals_once",
+        ) as bind_shadow, patch.object(
+            host,
+            "sync_realtime_shadow_targets",
+            return_value={"ok": True, "active": False},
+        ), patch(
+            "gui_auto_trade_operation_host.project_execution_universe",
+            return_value=SimpleNamespace(execution_stock_codes=()),
+        ), patch(
+            "gui_auto_trade_operation_host.append_production_event",
+        ):
+            host.start_after_recovery(identity)
+
+        bind_market.assert_not_called()
+        bind_bar.assert_not_called()
+        bind_shadow.assert_not_called()
+
+    def test_recovery_start_has_no_signal_consumer_or_order_execution_side_effect(self) -> None:
+        host = AutoTradeOperationHost(QObject())
+        identity = object()
+
+        with patch(
+            "production_recovery_timer_lifecycle.start_recovery_bound_timers",
+            return_value={
+                "started": True,
+                "started_count": 1,
+                "reason_code": "RECOVERY_TIMER_STARTED",
+            },
+        ), patch(
+            "gui_auto_trade_operation_host.project_execution_universe",
+            return_value=SimpleNamespace(execution_stock_codes=("005930",)),
+        ), patch.object(
+            host,
+            "sync_realtime_shadow_targets",
+            return_value={"ok": True, "active": True},
+        ), patch.object(
+            host,
+            "auto_process_executable_orders_for_real_trade",
+        ) as auto_executor, patch.object(
+            host,
+            "send_order_for_order_queued_automatically",
+        ) as send_order, patch(
+            "gui_auto_trade_timer.consume_pending_routine_signals_dry_run",
+        ) as consumer, patch(
+            "gui_auto_trade_operation_host.append_production_event",
+        ):
+            host.start_after_recovery(identity)
+
+        consumer.assert_not_called()
+        auto_executor.assert_not_called()
+        send_order.assert_not_called()
 
     def test_operation_host_owns_one_timer_and_shutdown_stops_it(self) -> None:
         host = AutoTradeOperationHost(QObject())
@@ -373,6 +640,14 @@ class MainStockOperationHostTest(unittest.TestCase):
             return_value={"summary": {"signals_checked": 1, "approved": 1}},
         ) as consumer, patch.object(
             gui_auto_trade_timer,
+            "project_execution_universe",
+            return_value=SimpleNamespace(
+                entries=[
+                    SimpleNamespace(stock_code="003550", execution_ready=True),
+                ]
+            ),
+        ), patch.object(
+            gui_auto_trade_timer,
             "auto_trade_signal_probe_only_active",
             return_value=False,
         ), patch.object(
@@ -388,6 +663,8 @@ class MainStockOperationHostTest(unittest.TestCase):
             mark_previewed=True,
             write_order_queue=True,
             apply_approval=True,
+            allowed_stock_codes=("003550",),
+            signal_cutoff_by_stock_code={"003550": ""},
         )
         host.auto_process_executable_orders_for_real_trade.assert_called_once_with(
             limit=5
@@ -414,6 +691,7 @@ class MainStockOperationHostTest(unittest.TestCase):
                 "운영시작",
                 "전체선택",
                 "선택해제",
+                "감시전용 전환",
                 "시간변경",
                 "변경리셋",
                 "등록해제",
@@ -494,6 +772,9 @@ class MainStockOperationHostTest(unittest.TestCase):
                     (Path("stocks") / "005930_test", "005930", "test")
                 ]
                 settings_window.selected_operation_mode_set.return_value = modes
+                settings_window.selected_trade_permission_context_label.return_value = (
+                    "감시전용 전환"
+                )
                 context_menu.show_auto_trade_stock_context_menu(
                     settings_window,
                     QPoint(),
@@ -558,6 +839,8 @@ class MainStockOperationHostTest(unittest.TestCase):
             open_charts=Mock(),
             time_change=Mock(),
             time_reset=Mock(),
+            trade_permission_label=Mock(return_value="감시전용 전환"),
+            toggle_trade_permission=Mock(),
             stock_register=Mock(),
             unregister=Mock(),
         )
@@ -568,6 +851,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             "전체선택",
             "선택해제",
             "운영제외",
+            "감시전용 전환",
             "<separator>",
             "조기마감",
             "개별청산",
@@ -600,6 +884,9 @@ class MainStockOperationHostTest(unittest.TestCase):
                 (Path("stocks") / "005930_test", "005930", "test")
             ]
             settings_window.selected_operation_mode_set.return_value = {"SCHEDULED"}
+            settings_window.selected_trade_permission_context_label.return_value = (
+                "감시전용 전환"
+            )
             settings_window._stock_status_filter = "running"
             settings_window._all_stocks_scope_active = False
             settings_window.current_selected_routine_row_metadata.return_value = {
@@ -630,12 +917,66 @@ class MainStockOperationHostTest(unittest.TestCase):
             )
             host = AutoTradeOperationHost(Mock())
 
+            with patch(
+                "gui_auto_trade_policy.auto_trade_operation_session_phase",
+                return_value={
+                    "evaluable": True,
+                    "phase": "ACTIVE_SESSION",
+                    "mode": "SCHEDULED",
+                },
+            ):
+                targets, skipped = host.split_start_targets(
+                    [(stock_dir, "005930", "test")]
+                )
+
+        self.assertEqual([(stock_dir, "005930", "test")], targets)
+        self.assertEqual([], skipped)
+
+    def test_start_split_allows_stale_running_without_current_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_test"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                '{"status":"RUNNING","trade_enabled":true}',
+                encoding="utf-8",
+            )
+            host = AutoTradeOperationHost(Mock())
+            host._current_session_operation_participant_stock_codes = set()
+            host.startup_recovery_session_ready = lambda refresh=False: True
+
+            with patch(
+                "gui_auto_trade_policy.auto_trade_operation_session_phase",
+                return_value={
+                    "evaluable": True,
+                    "phase": "ACTIVE_SESSION",
+                    "mode": "SCHEDULED",
+                },
+            ):
+                targets, skipped = host.split_start_targets(
+                    [(stock_dir, "005930", "test")]
+                )
+
+        self.assertEqual([(stock_dir, "005930", "test")], targets)
+        self.assertEqual([], skipped)
+
+    def test_start_split_rejects_running_current_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stock_dir = Path(temp_dir) / "005930_test"
+            stock_dir.mkdir()
+            (stock_dir / "state.json").write_text(
+                '{"status":"RUNNING","trade_enabled":true}',
+                encoding="utf-8",
+            )
+            host = AutoTradeOperationHost(Mock())
+            host._current_session_operation_participant_stock_codes = {"005930"}
+            host.startup_recovery_session_ready = lambda refresh=False: True
+
             targets, skipped = host.split_start_targets(
                 [(stock_dir, "005930", "test")]
             )
 
-        self.assertEqual([(stock_dir, "005930", "test")], targets)
-        self.assertEqual([], skipped)
+        self.assertEqual([], targets)
+        self.assertEqual(1, len(skipped))
 
 
 if __name__ == "__main__":

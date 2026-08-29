@@ -14,6 +14,10 @@ from typing import Any, Callable
 from operation_close_completion_evaluator import (
     STATUS_CARRYOVER_DONE,
     STATUS_DONE,
+    STATUS_EVIDENCE_CONFLICT,
+    STATUS_HOLDING_REMAINS,
+    STATUS_PENDING_ORDER,
+    STATUS_UNKNOWN,
     evaluate_operation_close_completion,
 )
 from operation_policy_gate import write_global_operation_normal_ended_state
@@ -24,6 +28,10 @@ from event_journal_production import (
     observe_production_exception,
 )
 from confirmable_pnl_cycle_service import record_completion_boundaries
+from gui_auto_trade_integrity import operator_review_location, operator_review_reason
+from gui_auto_trade_runtime import now_text
+from runtime_stock_state_mutation import mutate_runtime_stock_state
+from stock_long_hold_policy import ROUTE_CLOSE_INTENT
 
 
 SOURCE_ORDER_FILL_STATE_COMMIT = "ORDER_FILL_STATE_COMMIT"
@@ -86,6 +94,28 @@ def check_global_close_completion_after_durable_update(
         active=False,
     )
 
+    immediate_review_results = _apply_immediate_residual_reviews(
+        evaluator_result,
+        source=clean_source,
+    )
+    if any(item.get("changed") is True for item in immediate_review_results):
+        try:
+            evaluator_result = evaluator(**evaluator_kwargs)
+        except Exception as exc:
+            return {
+                "checked": False,
+                "source": clean_source,
+                "check_failed": True,
+                "global_complete": False,
+                "evaluator_result": None,
+                "reasons": [str(exc)],
+                "normal_end_write": None,
+                "normal_end_write_failed": False,
+                "normal_ended_applied": False,
+                "operation_status_after": "",
+                "immediate_review_results": immediate_review_results,
+            }
+
     reasons = list(evaluator_result.get("reasons") or [])
     operation_status_after = str(evaluator_result.get("operation_status") or "").strip().upper()
     result = {
@@ -99,6 +129,7 @@ def check_global_close_completion_after_durable_update(
         "normal_end_write_failed": False,
         "normal_ended_applied": False,
         "operation_status_after": operation_status_after,
+        "immediate_review_results": immediate_review_results,
     }
     if not _normal_end_write_allowed(evaluator_result):
         return result
@@ -168,6 +199,100 @@ def check_global_close_completion_after_durable_update(
     )
     observe_pnl_cycle_boundaries(final_result["pnl_cycle_boundary_results"])
     return final_result
+
+
+def _apply_immediate_residual_reviews(
+    evaluator_result: dict[str, Any],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    """Persist terminal residual holdings through the existing stock-state writer."""
+
+    results: list[dict[str, Any]] = []
+    for item in evaluator_result.get("stock_results", ()):
+        if not isinstance(item, dict):
+            continue
+        item_status = str(item.get("status") or "").strip().upper()
+        reason_code_by_status = {
+            STATUS_HOLDING_REMAINS: "HOLDING_REMAINS",
+            STATUS_PENDING_ORDER: "PENDING_ORDER",
+            STATUS_EVIDENCE_CONFLICT: "EVIDENCE_CONFLICT",
+            STATUS_UNKNOWN: "EVIDENCE_CONFLICT",
+        }
+        reason_code = reason_code_by_status.get(item_status, "")
+        if not reason_code:
+            continue
+        evidence = item.get("evidence")
+        evidence = evidence if isinstance(evidence, dict) else {}
+        route = evidence.get("termination_route")
+        route = route if isinstance(route, dict) else {}
+        if route.get("route_completed") is not True:
+            continue
+        stock_dir = str(evidence.get("stock_dir") or "").strip()
+        if not stock_dir:
+            results.append(
+                {
+                    "stock_code": str(item.get("stock_code") or ""),
+                    "changed": False,
+                    "ok": False,
+                    "reason": "STOCK_DIRECTORY_UNAVAILABLE",
+                }
+            )
+            continue
+        results.append(
+            mark_end_of_operation_review_required(
+                stock_dir=stock_dir,
+                stock_code=str(item.get("stock_code") or ""),
+                reason_code=reason_code,
+                termination_route=route,
+                source=source,
+            )
+        )
+    return results
+
+
+def mark_end_of_operation_review_required(
+    *,
+    stock_dir: str | Path,
+    stock_code: str,
+    reason_code: str,
+    termination_route: dict[str, object] | None,
+    source: str,
+) -> dict[str, object]:
+    """Route terminal residuals through the existing canonical state writer."""
+
+    route = termination_route if isinstance(termination_route, dict) else {}
+    timestamp = now_text()
+    reason = operator_review_reason(reason_code)
+    route_name = str(route.get("route") or "UNKNOWN")
+    method = str(route.get("method") or "-")
+    route_source = str(route.get("source") or "-")
+    mutation = mutate_runtime_stock_state(
+        stock_dir,
+        "REVIEW_REQUIRED",
+        {
+            "review_required": True,
+            "review_status": "PENDING",
+            "review_location": operator_review_location("운영 종료"),
+            "review_reason": reason,
+            "review_detail": (
+                f"{reason_code} / route={route_name} / method={method} / "
+                f"route_source={route_source} / trigger={source}"
+            ),
+            "review_checked_at": timestamp,
+            "review_entered_at": timestamp,
+        },
+        updated_at=timestamp,
+        verify_readback=True,
+    )
+    return {
+        "stock_code": str(stock_code or ""),
+        "changed": mutation.ok,
+        "ok": mutation.ok,
+        "reason": mutation.reason,
+        "route": route_name,
+        "close_intent": route_name == ROUTE_CLOSE_INTENT,
+    }
 
 
 def check_global_close_completion_for_runtime_path(

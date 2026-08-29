@@ -451,11 +451,25 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             patch.object(run_control, "read_operation_state", return_value={}),
             patch.object(run_control, "auto_trade_start_selected_auto_trades") as backend,
         ):
+            backend.return_value = {
+                "ok": False,
+                "reason": "NO_STARTABLE_TARGETS",
+            }
             result = adapter.start_selected_auto_trades()
 
         self.assertFalse(result["ok"])
-        self.assertEqual("MIXED_RUNNING_SELECTION", result["reason"])
-        backend.assert_not_called()
+        self.assertEqual("NO_STARTABLE_TARGETS", result["reason"])
+        backend.assert_called_once_with(
+            adapter,
+            request_scope="multiple",
+            selected_targets=[
+                (inactive.stock_dir, inactive.code, inactive.name),
+            ],
+            source="auto_trade_context_menu",
+            already_running_targets=[
+                (running.stock_dir, running.code, running.name),
+            ],
+        )
         parent.close()
 
     def test_monitor_operation_adapter_requests_owner_view_synchronization(self) -> None:
@@ -542,14 +556,13 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             parent.btn_start = QPushButton("▶ 운영시작")
             parent.auto_trade_setting_window = None
             adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [])
+            adapter.registered_operation_targets = Mock(
+                return_value=[(included_dir, "005930", "Samsung")]
+            )
+            adapter.running_registered_operation_targets = Mock(return_value=[])
             adapter.update_global_operation_button_state = Mock()
 
             with (
-                patch.object(
-                    run_control,
-                    "all_registered_stock_dirs",
-                    return_value=[included_dir, excluded_dir],
-                ),
                 patch.object(setting_window, "read_operation_state", return_value={}),
                 patch.object(
                     setting_window,
@@ -632,34 +645,23 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         window = SimpleNamespace(
             selected_stock_infos=Mock(),
             update_global_operation_button_state=Mock(),
-        )
-        window.registered_operation_targets = lambda: (
-            gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
-        )
-        window.registered_operation_start_targets = lambda: (
-            gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
-        )
-        window.running_registered_operation_targets = lambda: (
-            gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
-        )
-        stock_dirs = [
-            Path("stocks/005930_삼성전자"),
-            Path("stocks/000660_SK하이닉스"),
-        ]
-
-        with (
-            patch(
-                "gui_auto_trade_run_control.all_registered_stock_dirs",
-                return_value=stock_dirs,
+            registered_operation_targets=Mock(
+                return_value=[
+                    (Path("stocks/005930_삼성전자"), "005930", "삼성전자"),
+                    (Path("stocks/000660_SK하이닉스"), "000660", "SK하이닉스"),
+                ]
             ),
-            patch(
-                "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
-            ) as start_backend,
-            patch(
-                "gui_auto_trade_run_control.auto_trade_stock_operation_excluded",
-                return_value=False,
+            registered_operation_start_targets=Mock(
+                return_value=[
+                    (Path("stocks/005930_삼성전자"), "005930", "삼성전자"),
+                    (Path("stocks/000660_SK하이닉스"), "000660", "SK하이닉스"),
+                ]
             ),
-        ):
+            running_registered_operation_targets=Mock(return_value=[]),
+        )
+        with patch(
+            "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
+        ) as start_backend:
             gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
 
         window.selected_stock_infos.assert_not_called()
@@ -694,26 +696,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 selected_stock_infos=Mock(),
                 update_global_operation_button_state=Mock(),
                 statusBarMessage=Mock(),
-            )
-            window.registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
-            )
-            window.registered_operation_start_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
-            )
-            window.running_registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
+                registered_operation_targets=Mock(
+                    return_value=[(included_dir, "005930", "Samsung")]
+                ),
+                registered_operation_start_targets=Mock(
+                    return_value=[(included_dir, "005930", "Samsung")]
+                ),
+                running_registered_operation_targets=Mock(return_value=[]),
             )
 
-            with (
-                patch(
-                    "gui_auto_trade_run_control.all_registered_stock_dirs",
-                    return_value=[included_dir, excluded_dir],
-                ),
-                patch(
-                    "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
-                ) as start_backend,
-            ):
+            with patch(
+                "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
+            ) as start_backend:
                 gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
 
             start_backend.assert_called_once()
@@ -747,30 +741,61 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 update_global_operation_button_state=Mock(),
                 startup_recovery_session_ready=Mock(return_value=True),
                 _current_session_operation_participant_stock_codes={"005930"},
-            )
-            window.registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
-            )
-            window.registered_operation_start_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.registered_operation_start_targets(window)
-            )
-            window.running_registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
+                registered_operation_targets=Mock(
+                    return_value=[(running_dir, "005930", "삼성전자")]
+                ),
+                registered_operation_start_targets=Mock(return_value=[]),
+                running_registered_operation_targets=Mock(
+                    return_value=[(running_dir, "005930", "삼성전자")]
+                ),
             )
 
-            with (
-                patch(
-                    "gui_auto_trade_run_control.all_registered_stock_dirs",
-                    return_value=[running_dir, stopped_dir],
-                ),
-                patch(
-                    "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
-                ) as start_backend,
-            ):
+            with patch(
+                "gui_auto_trade_setting_window.auto_trade_start_selected_auto_trades"
+            ) as start_backend:
                 gui_windows.AutoTradeSettingWindow.start_selected_auto_trades(window)
 
             start_backend.assert_not_called()
             window.update_global_operation_button_state.assert_called_once_with()
+
+    def test_auto_trade_setting_start_while_running_passes_only_inactive_targets(self) -> None:
+        running = (Path("stocks/000001_running"), "000001", "운영")
+        waiting = [
+            (Path(f"stocks/{code}_waiting"), code, name)
+            for code, name in (
+                ("000002", "대기2"),
+                ("000003", "대기3"),
+                ("000004", "대기4"),
+                ("000005", "대기5"),
+            )
+        ]
+        window = SimpleNamespace(
+            update_global_operation_button_state=Mock(),
+            registered_operation_start_targets=Mock(
+                return_value=[running, *waiting]
+            ),
+            running_registered_operation_targets=Mock(return_value=[running]),
+            parent=Mock(return_value=None),
+        )
+
+        with (
+            patch.object(setting_window, "read_operation_state", return_value={}),
+            patch.object(
+                setting_window,
+                "auto_trade_start_selected_auto_trades",
+                return_value={"ok": True},
+            ) as start_backend,
+        ):
+            setting_window.AutoTradeSettingWindow.start_selected_auto_trades(window)
+
+        start_backend.assert_called_once()
+        self.assertEqual(
+            ["000002", "000003", "000004", "000005"],
+            [
+                target[1]
+                for target in start_backend.call_args.kwargs["selected_targets"]
+            ],
+        )
 
     def test_global_start_button_stays_enabled_before_recovery_when_targets_exist(
         self,
@@ -819,51 +844,43 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 btn_start=MagicMock(),
                 startup_recovery_session_ready=Mock(return_value=True),
                 _current_session_operation_participant_stock_codes={"005930"},
-            )
-            window.registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.registered_operation_targets(window)
-            )
-            window.running_registered_operation_targets = lambda: (
-                gui_windows.AutoTradeSettingWindow.running_registered_operation_targets(window)
+                registered_operation_targets=Mock(
+                    return_value=[
+                        (running_dir, "005930", "삼성전자"),
+                        (stopped_dir, "000660", "SK하이닉스"),
+                    ]
+                ),
+                running_registered_operation_targets=Mock(
+                    return_value=[(running_dir, "005930", "삼성전자")]
+                ),
             )
 
-            with (
-                patch(
-                    "gui_auto_trade_run_control.all_registered_stock_dirs",
-                    return_value=[running_dir, stopped_dir],
-                ),
-                patch(
-                    "gui_auto_trade_run_control.read_operation_state",
-                    return_value={"emergency_stop": False, "operation_status": ""},
-                ),
+            with patch(
+                "gui_auto_trade_run_control.read_operation_state",
+                return_value={"emergency_stop": False, "operation_status": ""},
             ):
                 gui_windows.AutoTradeSettingWindow.update_global_operation_button_state(
                     window
                 )
 
-            window.btn_start.setText.assert_called_once_with("운영중")
+            window.btn_start.setText.assert_called_once_with("▶ 운영중")
             window.btn_start.setEnabled.assert_called_once_with(False)
 
             (running_dir / "state.json").write_text(
                 json.dumps({"status": "STOPPED", "trade_enabled": False}),
                 encoding="utf-8",
             )
+            window.running_registered_operation_targets.return_value = []
             window.btn_start.reset_mock()
-            with (
-                patch(
-                    "gui_auto_trade_run_control.all_registered_stock_dirs",
-                    return_value=[running_dir, stopped_dir],
-                ),
-                patch(
-                    "gui_auto_trade_run_control.read_operation_state",
-                    return_value={"emergency_stop": False, "operation_status": ""},
-                ),
+            with patch(
+                "gui_auto_trade_run_control.read_operation_state",
+                return_value={"emergency_stop": False, "operation_status": ""},
             ):
                 gui_windows.AutoTradeSettingWindow.update_global_operation_button_state(
                     window
                 )
 
-            window.btn_start.setText.assert_called_once_with("▶ 운영시작")
+            window.btn_start.setText.assert_called_once_with("■ 운영시작")
             window.btn_start.setEnabled.assert_called_once_with(True)
 
     def test_stock_name_double_click_toggles_operation_exclusion(self) -> None:
@@ -1272,8 +1289,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 display_name="테스트 루틴",
             )
             current_running = [
-                (stock_dirs[0], "000001", "현재운영1"),
-                (stock_dirs[1], "000002", "현재운영2"),
+                (stock_dir, code, name)
+                for stock_dir, (code, name, _persisted_running) in zip(
+                    stock_dirs,
+                    stock_specs,
+                )
             ]
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
@@ -1300,9 +1320,84 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     for stock_dir in stock_dirs
                 },
             )
-            self.assertIn(
-                "긴급정지",
-                status_bar.showMessage.call_args.args[0],
+            window._reload_main_routine_table_preserving_view.assert_called_once()
+            status_bar.showMessage.assert_not_called()
+
+    def test_running_instance_starts_only_inactive_targets(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dirs = []
+            for code, name, running in (
+                ("000001", "운영", True),
+                ("000002", "대기2", False),
+                ("000003", "대기3", False),
+                ("000004", "대기4", False),
+                ("000005", "대기5", False),
+            ):
+                stock_dir = root / f"{code}_{name}"
+                stock_dir.mkdir()
+                (stock_dir / "state.json").write_text(
+                    json.dumps(
+                        {
+                            "status": "RUNNING" if running else "STOPPED",
+                            "trade_enabled": running,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                stock_dirs.append(stock_dir)
+            before_running = (stock_dirs[0] / "state.json").read_text(
+                encoding="utf-8"
+            )
+            running_before = [(stock_dirs[0], "000001", "운영")]
+            running_after = [
+                (stock_dir, stock_dir.name.split("_", 1)[0], stock_dir.name.split("_", 1)[1])
+                for stock_dir in stock_dirs
+            ]
+            adapter = MagicMock()
+            adapter.start_selected_auto_trades.return_value = {
+                "ok": True,
+                "reason": "STARTED",
+            }
+            status_bar = MagicMock()
+            window = SimpleNamespace(
+                _routine_instance_stock_dirs=lambda _instance_id: stock_dirs,
+                _reload_main_routine_table_preserving_view=MagicMock(),
+                statusBar=lambda: status_bar,
+            )
+            instance = SimpleNamespace(
+                instance_id="instance-a",
+                display_name="테스트 루틴",
+            )
+
+            with (
+                patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
+                patch.object(
+                    gui_windows,
+                    "auto_trade_running_registered_operation_targets",
+                    side_effect=[running_before, running_after],
+                ),
+                patch.object(
+                    gui_windows,
+                    "MainMonitoringStockOperationAdapter",
+                    return_value=adapter,
+                ) as adapter_factory,
+            ):
+                gui_windows.MainWindow.toggle_routine_instance_operation(
+                    window,
+                    "instance-a",
+                )
+
+            adapter.start_selected_auto_trades.assert_called_once()
+            passed_targets = adapter_factory.call_args.args[1]
+            self.assertEqual(
+                ["000002", "000003", "000004", "000005"],
+                [target.code for target in passed_targets],
+            )
+            self.assertEqual(
+                before_running,
+                (stock_dirs[0] / "state.json").read_text(encoding="utf-8"),
             )
 
     def test_stale_running_instance_uses_start_direction(self) -> None:
@@ -1586,6 +1681,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_visible_early_close_button_reuses_top_summary_badge_font(self) -> None:
         window = SimpleNamespace()
+        window.btn_price_signal_observation = QPushButton("가격신호 OFF")
+        window.btn_market_data_monitoring = QPushButton("모니터링")
         window.btn_group_pack_register = QPushButton("그룹등록")
         window.btn_main_visible_early_close = QPushButton("조기마감")
         vertical_badge = QPushButton("보유")
@@ -1640,6 +1737,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             early_close_metrics.boundingRect("조기마감").height(),
         )
         self.assertEqual(28, window.btn_main_visible_early_close.minimumHeight())
+        self.assertEqual(28, window.btn_price_signal_observation.minimumHeight())
+        self.assertEqual(28, window.btn_market_data_monitoring.minimumHeight())
         self.assertEqual(28, window.btn_group_pack_register.minimumHeight())
         self.assertEqual(
             window.btn_main_visible_early_close.font(),
@@ -1649,12 +1748,82 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             "QPushButton#mainGroupPackRegisterButton",
             window.btn_group_pack_register.styleSheet(),
         )
-        self.assertIs(window.btn_group_pack_register, header_layout.itemAt(2).widget())
-        self.assertIs(window.btn_main_visible_early_close, header_layout.itemAt(3).widget())
+        self.assertEqual(
+            ["가격신호 OFF", "모니터링", "그룹등록", "조기마감"],
+            [header_layout.itemAt(index).widget().text() for index in range(2, 6)],
+        )
+        self.assertIs(window.btn_group_pack_register, header_layout.itemAt(4).widget())
+        self.assertIs(window.btn_main_visible_early_close, header_layout.itemAt(5).widget())
+        self.assertEqual(
+            "mainPriceSignalObservationButton",
+            window.btn_price_signal_observation.objectName(),
+        )
+        self.assertEqual(
+            "mainMarketDataMonitoringButton",
+            window.btn_market_data_monitoring.objectName(),
+        )
         self.assertIn(
             "color: #2563eb; font-weight: bold;",
             window.btn_main_visible_early_close.styleSheet(),
         )
+
+    def test_price_signal_header_toggle_uses_operation_host_as_only_state(self) -> None:
+        state = {"enabled": False}
+        host = SimpleNamespace(
+            price_signal_observation_enabled=Mock(
+                side_effect=lambda: state["enabled"]
+            ),
+            set_price_signal_observation_enabled=Mock(
+                side_effect=lambda enabled: state.update(enabled=bool(enabled))
+            ),
+        )
+        window = SimpleNamespace(
+            btn_price_signal_observation=QPushButton("가격신호 OFF"),
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+        )
+        window._update_main_price_signal_observation_button = lambda: (
+            gui_windows.MainWindow._update_main_price_signal_observation_button(window)
+        )
+
+        for expected in (True, False) * 6:
+            actual = gui_windows.MainWindow.toggle_price_signal_observation(window)
+            self.assertEqual(expected, actual)
+            self.assertEqual(
+                "가격신호 ON" if expected else "가격신호 OFF",
+                window.btn_price_signal_observation.text(),
+            )
+
+        self.assertEqual(12, host.set_price_signal_observation_enabled.call_count)
+        self.assertFalse(hasattr(window, "_price_signal_observation_enabled"))
+
+    def test_market_data_monitoring_entry_reuses_one_window(self) -> None:
+        monitoring_window = Mock()
+        monitoring_window.isMinimized.return_value = False
+        host = Mock()
+        window = SimpleNamespace(
+            market_data_monitoring_window=None,
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+        )
+
+        with patch.object(
+            gui_windows,
+            "_MarketDataMonitoringWindow",
+            return_value=monitoring_window,
+        ) as window_type, patch.object(
+            gui_windows.sip,
+            "isdeleted",
+            return_value=False,
+        ):
+            first = gui_windows.MainWindow.open_market_data_monitoring_window(window)
+            second = gui_windows.MainWindow.open_market_data_monitoring_window(window)
+
+        self.assertIs(monitoring_window, first)
+        self.assertIs(first, second)
+        window_type.assert_called_once_with(window, host)
+        monitoring_window.refresh_snapshot.assert_called_once_with()
+        self.assertEqual(2, monitoring_window.show.call_count)
+        self.assertEqual(2, monitoring_window.raise_.call_count)
+        self.assertEqual(2, monitoring_window.activateWindow.call_count)
 
     def test_group_pack_registration_cancel_has_no_side_effect(self) -> None:
         window = SimpleNamespace(refresh_auto_trade_assignment_views=Mock())

@@ -11,6 +11,7 @@ from typing import Final, Iterable
 from close_liquidation_transition_service import TransitionEvidence
 from execution_fill_recorder import read_execution_fill_records
 from execution_queue_writer import read_execution_queue_records
+from stock_code_contract import normalize_broker_stock_code
 
 
 PRESENT: Final = "PRESENT"
@@ -113,8 +114,7 @@ def _text(value: object) -> str:
 
 
 def _normalized_code(value: object) -> str:
-    text = _text(value).upper()
-    return text[1:] if text.startswith("A") and text[1:].isdigit() else text
+    return normalize_broker_stock_code(value)
 
 
 def _parse_datetime(value: object) -> datetime | None:

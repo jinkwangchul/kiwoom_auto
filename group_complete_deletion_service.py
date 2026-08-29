@@ -22,6 +22,7 @@ from runtime_io import read_json_dict
 from stock_repository import StockRecord, StockRepository
 from assignment_episode_repository import CanonicalAssignmentEpisodeRepository
 from assignment_episode_repository import AssignmentEpisodeTarget
+from routine_delete_policy import preview_delete_scope
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class GroupCompleteDeletionResult:
     success: bool
     error: str = ""
     blocked_reasons: tuple[str, ...] = ()
+    blocked_reason_codes: tuple[str, ...] = ()
     deleted_instance_ids: tuple[str, ...] = ()
     cleared_stock_codes: tuple[str, ...] = ()
 
@@ -108,23 +110,15 @@ def validate_group_deletion_safety(
     can_unassign: Callable[[str, str], tuple[bool, str, list[str]]],
     running_stock_dirs: Iterable[Path | str] = (),
 ) -> tuple[str, ...]:
-    running = {
-        str(Path(path).resolve(strict=False))
-        for path in running_stock_dirs
-    }
-    reasons: list[str] = []
-    for stock in scope.stocks:
-        stock_dir = Path(stock.stock_path)
-        if not stock_dir.is_absolute():
-            stock_dir = scope.project_root / stock_dir
-        if str(stock_dir.resolve(strict=False)) in running:
-            reasons.append(f"{stock.name}: 운영 중")
-            continue
-        allowed, _routine_name, stock_reasons = can_unassign(stock.code, stock.name)
-        if not allowed:
-            reason_text = ", ".join(str(reason) for reason in stock_reasons if str(reason))
-            reasons.append(f"{stock.name}: {reason_text or '관계 해제 불가'}")
-    return tuple(reasons)
+    del can_unassign  # Compatibility argument; deletion now owns one shared policy.
+    return tuple(
+        block.message
+        for block in preview_delete_scope(
+            scope.project_root,
+            scope.stocks,
+            running_stock_dirs=running_stock_dirs,
+        )
+    )
 
 
 def _restore_file(path: Path, payload: bytes | None) -> None:
@@ -182,13 +176,19 @@ def delete_group_completely(
     can_unassign: Callable[[str, str], tuple[bool, str, list[str]]],
     running_stock_dirs: Iterable[Path | str] = (),
 ) -> GroupCompleteDeletionResult:
-    blocked = validate_group_deletion_safety(
-        scope,
-        can_unassign=can_unassign,
+    del can_unassign  # Compatibility argument; deletion owns one shared policy.
+    blocked_items = preview_delete_scope(
+        scope.project_root,
+        scope.stocks,
         running_stock_dirs=running_stock_dirs,
     )
+    blocked = tuple(item.message for item in blocked_items)
     if blocked:
-        return GroupCompleteDeletionResult(False, blocked_reasons=blocked)
+        return GroupCompleteDeletionResult(
+            False,
+            blocked_reasons=blocked,
+            blocked_reason_codes=tuple(item.reason_code for item in blocked_items),
+        )
 
     root = Path(project_root).resolve(strict=False)
     marker = mark_group_delete_pending(root, scope.group_id)

@@ -8,7 +8,63 @@ operation policy and is supplied by callers; this module owns no writer.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
+
+from manual_ats_runtime import manual_ats_runtime_execution_method_result
+
+
+ROUTE_CLOSE_INTENT = "CLOSE_INTENT"
+ROUTE_CARRYOVER = "CARRYOVER"
+ROUTE_CONTINUOUS_NO_CLOSE = "CONTINUOUS_NO_CLOSE"
+ROUTE_ATS_FINAL_NO_TERMINATION = "ATS_FINAL_NO_TERMINATION"
+ROUTE_UNKNOWN = "UNKNOWN"
+
+_CLOSE_ACTIVE_STATUSES = {
+    "AUTO_CLOSE",
+    "AUTO_CLOSING",
+    "EARLY_CLOSE",
+    "EARLY_CLOSING",
+    "LIQUIDATION",
+    "LIQUIDATING",
+}
+_CLOSE_TERMINAL_STATUSES = {
+    "AUTO_CLOSED",
+    "EARLY_CLOSED",
+    "LIQUIDATED",
+    "CLOSED",
+    "DONE",
+}
+_DISPATCH_EVIDENCE_STATUSES = {
+    "SEND_CALL_ACCEPTED",
+    "SEND_CALL_REJECTED",
+    "SEND_CALL_UNCERTAIN",
+    "BROKER_ACCEPTED",
+    "PARTIALLY_FILLED",
+    "PARTIAL_FILLED",
+    "FILLED",
+    "REJECTED",
+    "FAILED",
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+}
+_TERMINAL_QUEUE_STATUSES = {
+    "FILLED",
+    "REJECTED",
+    "FAILED",
+    "CANCELED",
+    "CANCELLED",
+    "CANCEL_COMPLETE",
+    "EXPIRED",
+    "LOCAL_RESET",
+}
+_ATS_TERMINATION_EXECUTED_STATUSES = {
+    "SEND_CALL_ACCEPTED",
+    "SEND_CALL_REJECTED",
+    "SEND_CALL_UNCERTAIN",
+    "COMPLETED",
+}
+_ATS_TERMINATION_FAILED_STATUSES = {"FAILED", "ORDER_BLOCKED"}
 
 
 def normalized_close_method(value: object) -> str:
@@ -52,6 +108,245 @@ def has_active_individual_liquidation_request(
     return isinstance(request, dict) and str(
         request.get("status") or ""
     ).strip().upper() == "REQUESTED"
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _upper(value: object) -> str:
+    return _text(value).upper()
+
+
+def _normalized_operation_mode(value: object) -> str:
+    text = _upper(value)
+    if not text:
+        return "CONTINUOUS"
+    if text in {"CONTINUOUS", "MANUAL", "수동"}:
+        return "CONTINUOUS"
+    if text in {"SCHEDULED", "TIME", "시간"}:
+        return "SCHEDULED"
+    return text
+
+
+def _queue_route_evidence(
+    queue_records: Iterable[dict[str, Any]] | None,
+    *,
+    command_ids: set[str],
+) -> dict[str, object]:
+    statuses: list[str] = []
+    order_ids: list[str] = []
+    for record in queue_records or ():
+        if not isinstance(record, dict):
+            continue
+        source = _upper(record.get("source"))
+        reason = _upper(record.get("reason") or record.get("candidate_reason"))
+        source_signal_id = _text(record.get("source_signal_id"))
+        order_id = _text(record.get("id") or record.get("order_id"))
+        route_owned = (
+            source in {"OPERATION_COMMAND", "MANUAL_ATS_LIQUIDATION"}
+            or "LIQUIDATION" in reason
+            or order_id.startswith(("CLOSE_LIQUIDATION_", "ATS_LIQUIDATION_"))
+            or (source_signal_id and source_signal_id in command_ids)
+        )
+        if not route_owned:
+            continue
+        status = _upper(record.get("status") or record.get("order_status"))
+        if status:
+            statuses.append(status)
+        if order_id:
+            order_ids.append(order_id)
+    return {
+        "statuses": tuple(statuses),
+        "order_ids": tuple(order_ids),
+        "dispatch_evidence": any(
+            status in _DISPATCH_EVIDENCE_STATUSES for status in statuses
+        ),
+        "terminal_evidence": any(
+            status in _TERMINAL_QUEUE_STATUSES for status in statuses
+        ),
+    }
+
+
+def classify_termination_route(
+    state: dict[str, Any] | None,
+    *,
+    operation_mode: object = "",
+    final_session_ended: bool = False,
+    queue_records: Iterable[dict[str, Any]] | None = None,
+) -> dict[str, object]:
+    """Classify the actual end route without treating a method setting as execution."""
+
+    if not isinstance(state, dict):
+        return {
+            "route": ROUTE_UNKNOWN,
+            "method": "",
+            "source": "STATE_UNAVAILABLE",
+            "route_completed": False,
+            "actual_termination_executed": False,
+            "safety_issue": True,
+        }
+
+    mode = _normalized_operation_mode(operation_mode)
+    status = _upper(state.get("status"))
+    individual = state.get("individual_liquidation_request")
+    individual = individual if isinstance(individual, dict) else {}
+    ats_request = state.get("manual_ats_liquidation_request")
+    ats_request = ats_request if isinstance(ats_request, dict) else {}
+    individual_status = _upper(individual.get("status"))
+    ats_status = _upper(ats_request.get("status"))
+    command_ids = {
+        value
+        for value in (
+            _text(individual.get("command_id")),
+            _text(ats_request.get("command_id")),
+            _text(state.get("operation_command_id")),
+        )
+        if value
+    }
+    queue_evidence = _queue_route_evidence(
+        queue_records,
+        command_ids=command_ids,
+    )
+
+    ats_method = normalized_close_method(ats_request.get("sell_method"))
+    individual_method = normalized_close_method(individual.get("method"))
+    persisted_method = final_close_liquidation_method(state)
+    carryover_result = any(
+        _upper(state.get(key)) in {"CURRENT_CARRYOVER", "CARRYOVER_DONE"}
+        for key in (
+            "operation_notice",
+            "liquidation_result",
+            "liquidation_result_status",
+            "auto_close_result",
+            "early_close_result",
+            "close_result",
+        )
+    )
+    method = (
+        ats_method
+        or individual_method
+        or persisted_method
+        or ("CARRYOVER" if carryover_result else "")
+    )
+
+    completion_timestamp = next(
+        (
+            _text(state.get(key))
+            for key in (
+                "liquidation_completed_at",
+                "liquidation_finished_at",
+                "daily_liquidation_completed_at",
+                "ats_sell_completed_at",
+            )
+            if _text(state.get(key))
+        ),
+        "",
+    )
+    close_entry_evidence = bool(
+        individual
+        or _text(state.get("auto_close_requested_at"))
+        or _text(state.get("early_close_requested_at"))
+        or _text(state.get("liquidation_method"))
+        or _text(state.get("auto_close_method"))
+        or _text(state.get("early_close_method"))
+        or carryover_result
+        or status in _CLOSE_ACTIVE_STATUSES | _CLOSE_TERMINAL_STATUSES
+        or state.get("close_routine_final_sell_ordered") is True
+        or _text(state.get("close_routine_final_sell_ordered_at"))
+    )
+    ats_termination_evidence = bool(ats_request)
+    actual_execution = bool(
+        ats_status in _ATS_TERMINATION_EXECUTED_STATUSES
+        or queue_evidence["dispatch_evidence"]
+        or status in _CLOSE_TERMINAL_STATUSES
+        or completion_timestamp
+    )
+    route_completed = bool(
+        ats_status == "COMPLETED"
+        or queue_evidence["terminal_evidence"]
+        or status in _CLOSE_TERMINAL_STATUSES
+        or completion_timestamp
+    )
+
+    if ats_termination_evidence:
+        return {
+            "route": ROUTE_CLOSE_INTENT,
+            "method": ats_method,
+            "source": "MANUAL_ATS_LIQUIDATION_REQUEST",
+            "route_completed": route_completed,
+            "actual_termination_executed": actual_execution,
+            "safety_issue": ats_status in _ATS_TERMINATION_FAILED_STATUSES,
+            "request_status": ats_status,
+            "queue_evidence": queue_evidence,
+        }
+
+    if close_entry_evidence:
+        route = ROUTE_CARRYOVER if method == "CARRYOVER" else ROUTE_CLOSE_INTENT
+        return {
+            "route": route,
+            "method": method,
+            "source": (
+                "INDIVIDUAL_LIQUIDATION_REQUEST"
+                if individual
+                else "CLOSE_RUNTIME_EVIDENCE"
+            ),
+            "route_completed": bool(
+                route_completed or (route == ROUTE_CARRYOVER and final_session_ended)
+            ),
+            "actual_termination_executed": actual_execution,
+            "safety_issue": bool(individual_status and not individual_method),
+            "request_status": individual_status,
+            "queue_evidence": queue_evidence,
+        }
+
+    selection = state.get("manual_ats_selection")
+    selection = selection if isinstance(selection, dict) else {}
+    ats_sessions = tuple(
+        str(value or "").strip()
+        for value in selection.get("selected_sessions", ())
+        if str(value or "").strip()
+    ) if isinstance(selection.get("selected_sessions", ()), (list, tuple, set)) else ()
+    if mode == "CONTINUOUS" and ats_sessions and final_session_ended:
+        method_result = manual_ats_runtime_execution_method_result(state)
+        if method_result.get("ok") is not True:
+            return {
+                "route": ROUTE_UNKNOWN,
+                "method": "",
+                "source": "ATS_EXECUTION_METHOD_INVALID",
+                "route_completed": True,
+                "actual_termination_executed": False,
+                "safety_issue": True,
+                "method_result": method_result,
+            }
+        return {
+            "route": ROUTE_ATS_FINAL_NO_TERMINATION,
+            "method": str(method_result.get("execution_method") or "ROUTINE"),
+            "source": "ATS_FINAL_SESSION_WITHOUT_TERMINATION",
+            "route_completed": True,
+            "actual_termination_executed": False,
+            "safety_issue": False,
+            "method_result": method_result,
+        }
+
+    if mode == "CONTINUOUS":
+        return {
+            "route": ROUTE_CONTINUOUS_NO_CLOSE,
+            "method": "",
+            "source": "NO_CLOSE_RUNTIME_EVIDENCE",
+            "route_completed": bool(final_session_ended),
+            "actual_termination_executed": False,
+            "safety_issue": False,
+        }
+
+    return {
+        "route": ROUTE_UNKNOWN,
+        "method": method,
+        "source": "TERMINATION_ROUTE_UNPROVEN",
+        "route_completed": False,
+        "actual_termination_executed": False,
+        "safety_issue": True,
+    }
 
 
 def review_reason_is_holding_residual(state: dict[str, Any] | None) -> bool:
@@ -102,6 +397,9 @@ def is_normal_long_term_holding_route(
     buy_pending_qty: object,
     sell_pending_qty: object,
     safety_issue: bool,
+    operation_mode: object = "",
+    final_session_ended: bool = False,
+    queue_records: Iterable[dict[str, Any]] | None = None,
 ) -> bool:
     """Return whether Production evidence proves a normal holding route.
 
@@ -120,16 +418,6 @@ def is_normal_long_term_holding_route(
     except (TypeError, ValueError):
         return False
 
-    method = final_close_liquidation_method(state)
-    if has_active_individual_liquidation_request(state) and not method:
-        return False
-    if method in {"MARKET", "CURRENT_PRICE"}:
-        return False
-    if not method:
-        raw_status = str(state.get("status") or "").strip().upper()
-        if raw_status in {"AUTO_CLOSING", "EARLY_CLOSING", "LIQUIDATION", "LIQUIDATING"}:
-            return False
-
     for key in ("recovery_status", "reconciliation_status", "integrity_status"):
         if str(state.get(key) or "").strip().upper() in {
             "FAILED", "FAIL", "ERROR", "MISMATCH", "UNKNOWN", "UNSTABLE"
@@ -137,7 +425,23 @@ def is_normal_long_term_holding_route(
             return False
     if state.get("emergency_reason") or state.get("emergency_stopped_at"):
         return False
-    return review_reason_is_holding_residual(state)
+    route = classify_termination_route(
+        state,
+        operation_mode=operation_mode,
+        final_session_ended=final_session_ended,
+        queue_records=queue_records,
+    )
+    if route.get("safety_issue") is True:
+        return False
+    if route.get("route") not in {
+        ROUTE_CARRYOVER,
+        ROUTE_CONTINUOUS_NO_CLOSE,
+        ROUTE_ATS_FINAL_NO_TERMINATION,
+    }:
+        return False
+    if route.get("route_completed") is not True and not review_reason_is_holding_residual(state):
+        return False
+    return True
 
 
 def long_hold_excludes_holding_review(
@@ -148,6 +452,9 @@ def long_hold_excludes_holding_review(
     buy_pending_qty: object,
     sell_pending_qty: object,
     safety_issue: bool,
+    operation_mode: object = "",
+    final_session_ended: bool = False,
+    queue_records: Iterable[dict[str, Any]] | None = None,
 ) -> bool:
     """Apply the global policy only after the stock route is proven normal."""
     if global_policy_enabled is not True:
@@ -158,4 +465,7 @@ def long_hold_excludes_holding_review(
         buy_pending_qty=buy_pending_qty,
         sell_pending_qty=sell_pending_qty,
         safety_issue=safety_issue,
+        operation_mode=operation_mode,
+        final_session_ended=final_session_ended,
+        queue_records=queue_records,
     )

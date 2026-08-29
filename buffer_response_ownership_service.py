@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping
 
 from production_recovery_contract import normalize_stock_code
 from runtime_atomic_writer import STATUS_OK, write_json_atomic
+from stock_code_contract import is_valid_stock_code
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -128,8 +129,8 @@ def _canonical_order_id(value: object) -> str:
 
 def _canonical_stock_code(value: object, *, field: str) -> str:
     code = normalize_stock_code(value)
-    if len(code) != 6 or not code.isdigit():
-        raise ValueError(f"{field} must be a six-digit stock code")
+    if not is_valid_stock_code(code):
+        raise ValueError(f"{field} must be a canonical stock code")
     return code
 
 

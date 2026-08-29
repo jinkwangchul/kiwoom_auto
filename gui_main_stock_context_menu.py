@@ -49,8 +49,10 @@ from gui_main_emergency_ops import (
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
     auto_trade_save_selected_manual_ats_state,
+    auto_trade_selected_manual_ats_execution_method_state,
     auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
+    auto_trade_set_selected_manual_ats_execution_method,
     auto_trade_set_selected_manual_ats_flag,
 )
 from gui_auto_trade_context_menu import (
@@ -77,7 +79,9 @@ from runtime_io import read_json_dict
 from state_policy import (
     effective_schedule_times,
     normalize_operation_mode,
+    real_trade_enabled,
 )
+from gui_routine_service import set_stock_real_trade_enabled
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -402,7 +406,7 @@ class MainMonitoringStockOperationAdapter:
         )
 
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
-        return auto_trade_registered_operation_targets()
+        return auto_trade_registered_operation_targets(self._window)
 
     def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_start_targets(self)
@@ -418,6 +422,49 @@ class MainMonitoringStockOperationAdapter:
 
     def clear_selected_stock_operation_exclusions(self) -> None:
         auto_trade_clear_selected_stock_operation_exclusions(self)
+
+    def selected_trade_permission_context_label(self) -> str:
+        values = []
+        for stock_dir, _code, _name in self.selected_stock_infos():
+            config = read_json_dict(stock_dir / "config.json")
+            values.append(real_trade_enabled(config if config else default_config()))
+        return "감시전용 전환" if values and all(values) else "실주문 전환"
+
+    def toggle_selected_trade_permission(self) -> dict[str, object]:
+        selected = self.selected_stock_infos()
+        if not selected:
+            self.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
+            return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
+        target_enabled = self.selected_trade_permission_context_label().startswith("실주문")
+        changed: list[str] = []
+        blocked: list[str] = []
+        for stock_dir, code, name in selected:
+            result = set_stock_real_trade_enabled(
+                self,
+                stock_dir,
+                code,
+                name,
+                target_enabled,
+            )
+            label = f"{code} {name}".strip()
+            if result.get("ok") is True:
+                if result.get("changed") is True:
+                    changed.append(label)
+            else:
+                blocked.append(f"{label}({result.get('reason') or 'BLOCKED'})")
+        if changed:
+            self._window.refresh_all()
+        message = f"거래권한 변경: {len(changed)}개"
+        if blocked:
+            message += f" / 차단 {len(blocked)}개"
+        self.statusBarMessage(message)
+        return {
+            "ok": bool(changed) and not blocked,
+            "changed": len(changed),
+            "blocked": len(blocked),
+            "target_real_trade_enabled": target_enabled,
+            "blocked_targets": tuple(blocked),
+        }
 
     def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
         return execute_selected_emergency_stop(self, self.selected_stock_infos())
@@ -468,6 +515,9 @@ class MainMonitoringStockOperationAdapter:
 
     def _execution_host(self):
         return self._window.main_monitoring_auto_trade_operation_host()
+
+    def main_monitoring_auto_trade_operation_host(self):
+        return self._execution_host()
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         checker = getattr(self._window, "startup_recovery_session_ready", None)
@@ -569,6 +619,12 @@ class MainMonitoringStockOperationAdapter:
 
     def split_start_targets(self, selected):
         return self._execution_host().split_start_targets(selected)
+
+    def start_target_block_details(self):
+        getter = getattr(self._execution_host(), "start_target_block_details", None)
+        if not callable(getter):
+            return ()
+        return getter()
 
     def pre_start_review_check(self, *args, **kwargs):
         return self._execution_host().pre_start_review_check(*args, **kwargs)
@@ -687,6 +743,15 @@ class MainMonitoringStockOperationAdapter:
             selected if selected is not None else self.target_snapshot(),
         )
 
+    def selected_manual_ats_execution_method_state(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, object]:
+        return auto_trade_selected_manual_ats_execution_method_state(
+            self,
+            selected if selected is not None else self.target_snapshot(),
+        )
+
     def save_selected_manual_ats_state(
         self,
         ats_state: dict[str, bool],
@@ -711,6 +776,19 @@ class MainMonitoringStockOperationAdapter:
             flag_key,
             enabled,
             label,
+        )
+
+    def set_selected_manual_ats_execution_method(
+        self,
+        execution_method: str,
+        label: str,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> dict[str, object]:
+        return auto_trade_set_selected_manual_ats_execution_method(
+            self,
+            execution_method,
+            label,
+            selected if selected is not None else self.target_snapshot(),
         )
 
     def execute_selected_manual_ats_liquidation(
@@ -831,6 +909,10 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         time_reset=adapter.reset_selected_schedule_to_global,
         ats_state=adapter.selected_manual_ats_state,
         ats_toggle=adapter.set_selected_manual_ats_flag,
+        ats_execution_method_state=adapter.selected_manual_ats_execution_method_state,
+        ats_execution_method_set=adapter.set_selected_manual_ats_execution_method,
+        trade_permission_label=adapter.selected_trade_permission_context_label,
+        toggle_trade_permission=adapter.toggle_selected_trade_permission,
         ats_liquidation_available=(
             adapter.selected_manual_ats_liquidation_available
         ),

@@ -41,6 +41,9 @@ def default_config() -> dict[str, object]:
         "auto_start_time": "09:00",
         "operation_mode": "SCHEDULED",
         "real_trade_enabled": True,
+        "buy_limit_enabled": False,
+        "buy_limit_amount": None,
+        "buy_limit_source": None,
     }
 
 

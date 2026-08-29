@@ -312,11 +312,11 @@ class OperationCloseCompletionEvaluatorTests(unittest.TestCase):
 
         self.assertEqual({"111111": STATUS_CLOSE_NOT_STARTED}, self._statuses(self._evaluate()))
 
-    def test_closed_status_with_holding_conflict_is_evidence_conflict(self) -> None:
+    def test_closed_status_with_holding_is_terminal_residual(self) -> None:
         self._operation_state(["111111"])
         self._stock("111111", {"status": "AUTO_CLOSED", "holding_qty": 5})
 
-        self.assertEqual({"111111": STATUS_EVIDENCE_CONFLICT}, self._statuses(self._evaluate()))
+        self.assertEqual({"111111": STATUS_HOLDING_REMAINS}, self._statuses(self._evaluate()))
 
     def test_positions_and_broker_holdings_conflict_is_evidence_conflict(self) -> None:
         self._operation_state(["111111"])

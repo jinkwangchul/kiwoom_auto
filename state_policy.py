@@ -9,6 +9,7 @@ GUI 코드에서 상태 정책을 분리해 UI 수정과 기능 수정의 충돌
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,135 @@ FINAL_AUTO_TRADE_DISPLAY_STATUSES = (
     "긴급정지",
     "검토종목",
 )
+
+
+@dataclass(frozen=True)
+class CanonicalAutoTradeStatus:
+    raw_status: str
+    normalized_status: str
+    known: bool
+    display_status: str
+    status_class: str
+    is_emergency: bool
+    is_review_required: bool
+
+
+_AUTO_TRADE_STATUS_DISPLAY_MAP = {
+    "MONITORING": "감시/대기",
+    "WATCHING": "감시/대기",
+    "WATCH": "감시/대기",
+    "WATCH_BUY": "감시/대기",
+    "RUNNING": "매수/매도",
+    "BUY_SELL": "매수/매도",
+    "BUY": "매수/매도",
+    "SELL": "매수/매도",
+    "SELL_ONLY": "자동마감",
+    "WATCH_SELL": "자동마감",
+    "BUY_SUSPENDED": "자동마감",
+    "BUY_STOPPED": "자동마감",
+    "AUTO_CLOSE": "자동마감",
+    "AUTO_CLOSING": "자동마감",
+    "AUTO_CLOSED": "자동마감",
+    "EARLY_CLOSE": "조기마감",
+    "EARLY_CLOSING": "조기마감",
+    "EARLY_CLOSED": "조기마감",
+    "CLOSE_EARLY": "조기마감",
+    "FORCE_CLOSE": "조기마감",
+    "FORCE_LIQUIDATION": "조기마감",
+    "STOPPED": "감시/대기",
+    "STOP": "감시/대기",
+    "WAIT": "감시/대기",
+    "WAIT_BUY": "감시/대기",
+    "WAIT_SELL": "감시/대기",
+    "SCHEDULED": "감시/대기",
+    "STARTED": "매수/매도",
+    "AUTO": "매수/매도",
+    "TRADING": "매수/매도",
+    "BUYING": "매수/매도",
+    "SELLING": "매수/매도",
+    "EMERGENCY_STOPPED": "긴급정지",
+    "EMERGENCY_STOP": "긴급정지",
+    "EMERGENCY": "긴급정지",
+    "REVIEW_REQUIRED": "검토종목",
+    "REVIEW": "검토종목",
+    "PAUSED": "검토종목",
+    "ERROR": "검토종목",
+}
+
+_AUTO_TRADE_STATUS_CLASS = {
+    **{
+        status: "NORMAL_OPERATION"
+        for status in (
+            "MONITORING", "WATCHING", "WATCH", "WATCH_BUY", "RUNNING",
+            "BUY_SELL", "BUY", "SELL", "STOPPED", "STOP", "WAIT",
+            "WAIT_BUY", "WAIT_SELL", "SCHEDULED", "STARTED", "AUTO",
+            "TRADING", "BUYING", "SELLING",
+        )
+    },
+    **{
+        status: "CLOSE_OPERATION"
+        for status in (
+            "SELL_ONLY", "WATCH_SELL", "BUY_SUSPENDED", "BUY_STOPPED",
+            "AUTO_CLOSE", "AUTO_CLOSING", "AUTO_CLOSED", "EARLY_CLOSE",
+            "EARLY_CLOSING", "EARLY_CLOSED", "CLOSE_EARLY", "FORCE_CLOSE",
+            "FORCE_LIQUIDATION",
+        )
+    },
+    **{
+        status: "EMERGENCY"
+        for status in ("EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY")
+    },
+    **{
+        status: "REVIEW"
+        for status in ("REVIEW_REQUIRED", "REVIEW", "PAUSED", "ERROR")
+    },
+}
+
+
+def canonical_auto_trade_status(raw_status: object) -> CanonicalAutoTradeStatus:
+    raw_text = str(raw_status or "STOPPED").strip() or "STOPPED"
+    if raw_text == "감시/매도":
+        return CanonicalAutoTradeStatus(
+            raw_status=raw_text,
+            normalized_status="AUTO_CLOSE",
+            known=True,
+            display_status="자동마감",
+            status_class="CLOSE_OPERATION",
+            is_emergency=False,
+            is_review_required=False,
+        )
+    display_to_class = {
+        "감시/대기": "NORMAL_OPERATION",
+        "매수/매도": "NORMAL_OPERATION",
+        "자동마감": "CLOSE_OPERATION",
+        "조기마감": "CLOSE_OPERATION",
+        "긴급정지": "EMERGENCY",
+        "검토종목": "REVIEW",
+    }
+    if raw_text in display_to_class:
+        status_class = display_to_class[raw_text]
+        return CanonicalAutoTradeStatus(
+            raw_status=raw_text,
+            normalized_status=raw_text,
+            known=True,
+            display_status=raw_text,
+            status_class=status_class,
+            is_emergency=status_class == "EMERGENCY",
+            is_review_required=status_class == "REVIEW",
+        )
+
+    normalized = raw_text.upper()
+    known = normalized in _AUTO_TRADE_STATUS_DISPLAY_MAP
+    status_class = _AUTO_TRADE_STATUS_CLASS.get(normalized, "UNKNOWN")
+    return CanonicalAutoTradeStatus(
+        raw_status=raw_text,
+        normalized_status=normalized,
+        known=known,
+        display_status=_AUTO_TRADE_STATUS_DISPLAY_MAP.get(normalized, "검토종목"),
+        status_class=status_class,
+        is_emergency=status_class == "EMERGENCY",
+        is_review_required=status_class == "REVIEW",
+    )
 
 
 def auto_trade_status_display(raw_status: object) -> str:
@@ -57,63 +187,7 @@ def auto_trade_status_display(raw_status: object) -> str:
     if raw_text in FINAL_AUTO_TRADE_DISPLAY_STATUSES:
         return raw_text
 
-    status = raw_text.upper()
-    mapping = {
-        # 최신/정상 운영 상태
-        "MONITORING": "감시/대기",
-        "WATCHING": "감시/대기",
-        "WATCH": "감시/대기",
-        "WATCH_BUY": "감시/대기",
-        "RUNNING": "매수/매도",
-        "BUY_SELL": "매수/매도",
-        "BUY": "매수/매도",
-        "SELL": "매수/매도",
-
-        # 자동마감: v2.2 기준 마감상태 진입.
-        # 과거 SELL_ONLY 계열은 호환 표시명으로만 자동마감에 매핑한다.
-        # 신규 시간정책은 AUTO_CLOSE를 사용해 "매도만" 의미와 분리한다.
-        "SELL_ONLY": "자동마감",
-        "WATCH_SELL": "자동마감",
-        "BUY_SUSPENDED": "자동마감",
-        "BUY_STOPPED": "자동마감",
-        "AUTO_CLOSE": "자동마감",
-        "AUTO_CLOSING": "자동마감",
-        "AUTO_CLOSED": "자동마감",
-
-        # 조기마감/강제 청산 계열
-        "EARLY_CLOSE": "조기마감",
-        "EARLY_CLOSING": "조기마감",
-        "EARLY_CLOSED": "조기마감",
-        "CLOSE_EARLY": "조기마감",
-        "FORCE_CLOSE": "조기마감",
-        "FORCE_LIQUIDATION": "조기마감",
-
-        # 정지/대기 계열: 화면에서는 감시/대기로 통일
-        "STOPPED": "감시/대기",
-        "STOP": "감시/대기",
-        "WAIT": "감시/대기",
-        "WAIT_BUY": "감시/대기",
-        "WAIT_SELL": "감시/대기",
-        "SCHEDULED": "감시/대기",
-
-        # 실행 계열
-        "STARTED": "매수/매도",
-        "AUTO": "매수/매도",
-        "TRADING": "매수/매도",
-        "BUYING": "매수/매도",
-        "SELLING": "매수/매도",
-
-        # 위험/검토 계열
-        "EMERGENCY_STOPPED": "긴급정지",
-        "EMERGENCY_STOP": "긴급정지",
-        "EMERGENCY": "긴급정지",
-        "REVIEW_REQUIRED": "검토종목",
-        "REVIEW": "검토종목",
-        # 폐기된 persisted 입력은 현재 기능으로 해석하지 않고 fail-closed 표시한다.
-        "PAUSED": "검토종목",
-        "ERROR": "검토종목",
-    }
-    return mapping.get(status, "검토종목")
+    return canonical_auto_trade_status(raw_text).display_status
 
 
 def auto_trade_status_color(display_status: str) -> str:

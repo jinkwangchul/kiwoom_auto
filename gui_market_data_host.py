@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
@@ -36,6 +38,91 @@ from stock_repository import StockRepository
 
 ExecutionEntryProvider = Callable[[str], object | None]
 
+HIGH_RESOLUTION_DATA_NORMAL = "NORMAL"
+HIGH_RESOLUTION_DATA_UNCERTAIN = "UNCERTAIN"
+_PRICE_SIGNAL_OBSERVATION_GENERATION_KEY = "_price_signal_observation_generation"
+
+
+@dataclass(frozen=True)
+class HighResolutionMarketState:
+    stock_code: str
+    connection_epoch: int
+    login_session_id: str
+    last_execution_time_raw: str
+    last_market_datetime: str
+    last_price: int | float
+    last_trade_volume_raw: int | float | None
+    last_trade_volume_abs: int | float | None
+    last_cumulative_volume: int | float | None
+    last_receive_sequence: int
+    last_received_at: str
+    last_received_monotonic: int | float
+    received_tick_count: int
+    processed_tick_count: int
+    data_quality: str
+    open_price: int | float | None = None
+    high_price: int | float | None = None
+    low_price: int | float | None = None
+    change_rate: int | float | None = None
+    previous_day_volume_rate: int | float | None = None
+    execution_strength: int | float | None = None
+
+
+@dataclass(frozen=True)
+class InitialMarketSnapshotState:
+    stock_code: str
+    connection_epoch: int
+    login_session_id: str
+    current_price: int | float | None
+    open_price: int | float | None
+    high_price: int | float | None
+    low_price: int | float | None
+    change_rate: int | float | None
+    previous_day_volume_rate: int | float | None
+    execution_strength: int | float | None
+    cumulative_volume: int | float | None
+    received_at: str
+    source: str = "SNAPSHOT"
+
+
+@dataclass(frozen=True)
+class MonitoringMarketInformationState:
+    stock_code: str
+    connection_epoch: int
+    login_session_id: str
+    last_price: int | float | None
+    open_price: int | float | None
+    high_price: int | float | None
+    low_price: int | float | None
+    change_rate: int | float | None
+    previous_day_volume_rate: int | float | None
+    execution_strength: int | float | None
+    snapshot_received_at: str
+    realtime_received_at: str
+    field_sources: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class HighResolutionMarketDataSnapshot:
+    connection_epoch: int
+    login_session_id: str
+    broker_connected: bool
+    realtime_registration_active: bool
+    realtime_target_stock_count: int
+    received_tick_count: int
+    processed_tick_count: int
+    current_queue_depth: int
+    queue_high_watermark: int
+    overflow_count: int
+    last_receive_sequence: int
+    last_processed_sequence: int
+    last_tick_received_at: str
+    last_tick_processed_at: str
+    last_processing_latency_ms: float
+    max_processing_latency_ms: float
+    data_quality: str
+    realtime_shadow_target_stock_count: int = 0
+
 
 class MarketDataHost(QObject):
     """Own market-data state while sharing the application's single KiwoomApi."""
@@ -43,8 +130,17 @@ class MarketDataHost(QObject):
     canonical_bar_ready_for_operation = pyqtSignal(object)
     realtime_shadow_comparison_completed = pyqtSignal(object)
     market_data_observed = pyqtSignal(object)
+    high_resolution_price_observed = pyqtSignal(object)
 
     MAX_PENDING_SHADOW_COMPARISONS = 512
+    MAX_RAW_TICK_QUEUE_DEPTH = 512
+
+    @staticmethod
+    def _registration_shadow_targets(registration: object) -> tuple[str, ...]:
+        targets = getattr(registration, "shadow_target_stock_codes", None)
+        if targets is None:
+            targets = getattr(registration, "target_stock_codes", ())
+        return tuple(targets or ())
 
     def __init__(
         self,
@@ -64,6 +160,36 @@ class MarketDataHost(QObject):
         self._canonical_drain_running = False
         self._last_ready_commit_identity_by_stock: dict[str, str] = {}
 
+        self._raw_tick_queue: deque[dict[str, object]] = deque()
+        self._raw_tick_drain_scheduled = False
+        self._raw_tick_drain_running = False
+        self._high_resolution_market_states: dict[
+            str, HighResolutionMarketState
+        ] = {}
+        self._initial_market_snapshot_states: dict[
+            str, InitialMarketSnapshotState
+        ] = {}
+        self._monitoring_target_stock_codes: tuple[str, ...] = ()
+        self._initial_snapshot_requested_stock_codes: set[str] = set()
+        self._raw_tick_received_count_by_stock: dict[str, int] = {}
+        self._raw_tick_processed_count_by_stock: dict[str, int] = {}
+        self._raw_tick_uncertain_stock_codes: set[str] = set()
+        self._raw_tick_received_count = 0
+        self._raw_tick_processed_count = 0
+        self._raw_tick_queue_high_watermark = 0
+        self._raw_tick_overflow_count = 0
+        self._raw_tick_last_receive_sequence = 0
+        self._raw_tick_last_processed_sequence = 0
+        self._raw_tick_last_received_at = ""
+        self._raw_tick_last_processed_at = ""
+        self._raw_tick_last_processing_latency_ms = 0.0
+        self._raw_tick_max_processing_latency_ms = 0.0
+        self._price_signal_observation_enabled = False
+        self._price_signal_observation_generation = 0
+        self._last_known_market_information_states: dict[
+            str, MonitoringMarketInformationState
+        ] = {}
+
         self._realtime_shadow_trigger_queue: deque[dict[str, object]] = deque()
         self._realtime_shadow_retry_codes: set[str] = set()
         self._realtime_shadow_drain_scheduled = False
@@ -82,6 +208,7 @@ class MarketDataHost(QObject):
 
         self._bar_committed_signal_bound = False
         self._realtime_shadow_signal_bound = False
+        self._raw_realtime_tick_signal_bound = False
         self._bind_kiwoom_signals_once()
 
     def _bind_kiwoom_signals_once(self) -> bool:
@@ -105,13 +232,31 @@ class MarketDataHost(QObject):
                     self._observe_exception(exc, "bind_realtime_shadow")
                 else:
                     self._realtime_shadow_signal_bound = True
-        return self._bar_committed_signal_bound and self._realtime_shadow_signal_bound
+        if not self._raw_realtime_tick_signal_bound:
+            signal = getattr(self.kiwoom_api, "realtime_shadow_tick_received", None)
+            connect = getattr(signal, "connect", None)
+            if callable(connect):
+                try:
+                    connect(self._on_realtime_shadow_tick_received)
+                except Exception as exc:
+                    self._observe_exception(exc, "bind_realtime_tick")
+                else:
+                    self._raw_realtime_tick_signal_bound = True
+        return bool(
+            self._bar_committed_signal_bound
+            and self._realtime_shadow_signal_bound
+            and self._raw_realtime_tick_signal_bound
+        )
 
     def sync_targets(self, snapshot) -> dict[str, object]:
-        """Sync registration to the execution-ready codes supplied by OperationHost."""
+        """Sync only Shadow/authority targets supplied by the execution universe."""
         try:
             target_codes = tuple(getattr(snapshot, "execution_stock_codes", ()))
-            sync = getattr(self.kiwoom_api, "sync_realtime_shadow_registration", None)
+            sync = getattr(self.kiwoom_api, "sync_realtime_shadow_targets", None)
+            if not callable(sync):
+                # Compatibility for older test doubles; Production KiwoomApi owns
+                # the split local-target method.
+                sync = getattr(self.kiwoom_api, "sync_realtime_shadow_registration", None)
             if not callable(sync):
                 return {
                     "ok": False,
@@ -152,6 +297,143 @@ class MarketDataHost(QObject):
                 "error": str(exc),
             }
 
+    def sync_monitoring_targets(self, stock_codes: object) -> dict[str, object]:
+        """Sync the Broker registration set independently of execution readiness."""
+
+        sync = getattr(self.kiwoom_api, "sync_realtime_monitoring_registration", None)
+        if not callable(sync):
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_MONITORING_API_UNAVAILABLE",
+            }
+        try:
+            targets = tuple(
+                sorted(
+                    {
+                        str(code or "").strip()
+                        for code in (stock_codes or ())
+                        if str(code or "").strip()
+                    }
+                )
+            )
+            previous_targets = set(self._monitoring_target_stock_codes)
+            session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
+            session = session_getter() if callable(session_getter) else None
+            requested_identity = (
+                int(getattr(session, "connection_epoch", 0) or 0),
+                str(getattr(session, "login_session_id", "") or ""),
+            )
+            if (
+                requested_identity[1]
+                and requested_identity != self._realtime_shadow_session_identity
+            ):
+                self._clear_session_state()
+                self._market_data_authority.ensure_session(*requested_identity)
+                self._realtime_shadow_session_identity = requested_identity
+
+            removed = previous_targets.difference(targets)
+            for code in removed:
+                self._initial_market_snapshot_states.pop(code, None)
+                self._initial_snapshot_requested_stock_codes.discard(code)
+                self._high_resolution_market_states.pop(code, None)
+                self._raw_tick_received_count_by_stock.pop(code, None)
+                self._raw_tick_processed_count_by_stock.pop(code, None)
+                self._raw_tick_uncertain_stock_codes.discard(code)
+                self._last_known_market_information_states.pop(code, None)
+            self._monitoring_target_stock_codes = targets
+
+            snapshot_result: dict[str, object] | None = None
+            new_snapshot_codes = tuple(
+                code
+                for code in targets
+                if code not in self._initial_snapshot_requested_stock_codes
+            )
+            request_snapshot = getattr(
+                self.kiwoom_api,
+                "request_initial_market_snapshot",
+                None,
+            )
+            if requested_identity[1] and new_snapshot_codes and callable(request_snapshot):
+                self._initial_snapshot_requested_stock_codes.update(new_snapshot_codes)
+                snapshot_result = request_snapshot(
+                    new_snapshot_codes,
+                    callback=self._on_initial_market_snapshot_result,
+                )
+
+            result = sync(targets)
+            registration = result.get("snapshot") if isinstance(result, dict) else None
+            identity = (
+                int(getattr(registration, "connection_epoch", 0) or 0),
+                str(getattr(registration, "login_session_id", "") or ""),
+            )
+            if identity != self._realtime_shadow_session_identity:
+                self._clear_session_state()
+                self._market_data_authority.ensure_session(*identity)
+                self._realtime_shadow_session_identity = identity
+                self._monitoring_target_stock_codes = targets
+            if isinstance(result, dict):
+                projection = dict(result)
+                projection["initial_snapshot"] = snapshot_result
+                return projection
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_MONITORING_RESULT_MALFORMED",
+            }
+        except Exception as exc:
+            self._observe_exception(exc, "sync_monitoring_targets")
+            return {
+                "ok": False,
+                "changed": False,
+                "active": False,
+                "reason_code": "REALTIME_MONITORING_SYNC_FAILED",
+                "error": str(exc),
+            }
+
+    def _on_initial_market_snapshot_result(self, result: dict[str, object]) -> None:
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return
+        identity = (
+            int(result.get("connection_epoch") or 0),
+            str(result.get("login_session_id") or "").strip(),
+        )
+        if identity != self._realtime_shadow_session_identity:
+            return
+        received_at = str(result.get("snapshot_received_at") or "").strip()
+        rows = result.get("rows") if isinstance(result.get("rows"), list) else ()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stock_code = str(row.get("stock_code") or "").strip()
+            if stock_code not in self._monitoring_target_stock_codes:
+                continue
+            self._initial_market_snapshot_states[stock_code] = InitialMarketSnapshotState(
+                stock_code=stock_code,
+                connection_epoch=identity[0],
+                login_session_id=identity[1],
+                current_price=row.get("current_price"),
+                open_price=row.get("open_price"),
+                high_price=row.get("high_price"),
+                low_price=row.get("low_price"),
+                change_rate=row.get("change_rate"),
+                previous_day_volume_rate=row.get("previous_day_volume_rate"),
+                execution_strength=row.get("execution_strength"),
+                cumulative_volume=row.get("cumulative_volume"),
+                received_at=received_at,
+            )
+            self._remember_current_session_market_information(stock_code)
+            self.market_data_observed.emit(
+                {
+                    "stock_code": stock_code,
+                    "source": "INITIAL_SNAPSHOT",
+                    "connection_epoch": identity[0],
+                    "login_session_id": identity[1],
+                }
+            )
+
     def prepare_operation_cycle(self, snapshot, minute_key: str) -> dict[str, object]:
         """Promote eligible stocks only at the supplied operation-cycle boundary."""
         registration_getter = getattr(
@@ -176,7 +458,7 @@ class MarketDataHost(QObject):
             state = self._market_data_authority.snapshot(code)
             readiness_valid = bool(
                 getattr(registration, "active", False)
-                and code in getattr(registration, "target_stock_codes", ())
+                and code in self._registration_shadow_targets(registration)
                 and identity == self._realtime_shadow_session_identity
                 and (code, state.reconciliation_minute) not in self._pending_reconciliations
             )
@@ -307,6 +589,190 @@ class MarketDataHost(QObject):
     def mode_snapshot(self, stock_code: str):
         return self._market_data_authority.snapshot(stock_code)
 
+    def high_resolution_market_state(
+        self,
+        stock_code: str,
+    ) -> HighResolutionMarketState | None:
+        code = str(stock_code or "").strip()
+        state = self._high_resolution_market_states.get(code)
+        if state is None:
+            return None
+        if (
+            state.connection_epoch,
+            state.login_session_id,
+        ) != self._realtime_shadow_session_identity:
+            return None
+        return replace(
+            state,
+            received_tick_count=self._raw_tick_received_count_by_stock.get(code, 0),
+            processed_tick_count=self._raw_tick_processed_count_by_stock.get(code, 0),
+            data_quality=(
+                HIGH_RESOLUTION_DATA_UNCERTAIN
+                if code in self._raw_tick_uncertain_stock_codes
+                else state.data_quality
+            ),
+        )
+
+    def initial_market_snapshot_state(
+        self,
+        stock_code: str,
+    ) -> InitialMarketSnapshotState | None:
+        state = self._initial_market_snapshot_states.get(str(stock_code or "").strip())
+        if state is None:
+            return None
+        if (
+            state.connection_epoch,
+            state.login_session_id,
+        ) != self._realtime_shadow_session_identity:
+            return None
+        return state
+
+    def _current_session_market_information_state(
+        self,
+        stock_code: str,
+    ) -> MonitoringMarketInformationState | None:
+        code = str(stock_code or "").strip()
+        snapshot = self.initial_market_snapshot_state(code)
+        realtime = self.high_resolution_market_state(code)
+        if snapshot is None and realtime is None:
+            return None
+
+        def select(field: str, realtime_field: str | None = None):
+            realtime_value = (
+                getattr(realtime, realtime_field or field, None)
+                if realtime is not None
+                else None
+            )
+            if realtime_value is not None:
+                return realtime_value, "REALTIME"
+            snapshot_value = getattr(snapshot, field, None) if snapshot is not None else None
+            if snapshot_value is not None:
+                return snapshot_value, "SNAPSHOT"
+            return None, "UNAVAILABLE"
+
+        values: dict[str, object] = {}
+        sources: list[tuple[str, str]] = []
+        for field, realtime_field in (
+            ("last_price", "last_price"),
+            ("open_price", None),
+            ("high_price", None),
+            ("low_price", None),
+            ("change_rate", None),
+            ("previous_day_volume_rate", None),
+            ("execution_strength", None),
+        ):
+            snapshot_field = "current_price" if field == "last_price" else field
+            value, source = select(snapshot_field, realtime_field)
+            values[field] = value
+            sources.append((field, source))
+        identity = self._realtime_shadow_session_identity
+        return MonitoringMarketInformationState(
+            stock_code=code,
+            connection_epoch=identity[0],
+            login_session_id=identity[1],
+            last_price=values["last_price"],
+            open_price=values["open_price"],
+            high_price=values["high_price"],
+            low_price=values["low_price"],
+            change_rate=values["change_rate"],
+            previous_day_volume_rate=values["previous_day_volume_rate"],
+            execution_strength=values["execution_strength"],
+            snapshot_received_at=(snapshot.received_at if snapshot is not None else ""),
+            realtime_received_at=(
+                realtime.last_received_at if realtime is not None else ""
+            ),
+            field_sources=tuple(sources),
+        )
+
+    def _remember_current_session_market_information(self, stock_code: str) -> None:
+        state = self._current_session_market_information_state(stock_code)
+        if state is not None:
+            self._last_known_market_information_states[state.stock_code] = state
+
+    def fresh_monitoring_market_information_state(
+        self,
+        stock_code: str,
+    ) -> MonitoringMarketInformationState | None:
+        return self._current_session_market_information_state(stock_code)
+
+    def monitoring_market_information_state(
+        self,
+        stock_code: str,
+    ) -> MonitoringMarketInformationState | None:
+        code = str(stock_code or "").strip()
+        current = self._current_session_market_information_state(code)
+        if current is not None:
+            self._last_known_market_information_states[code] = current
+            return current
+        return self._last_known_market_information_states.get(code)
+
+    def price_signal_observation_enabled(self) -> bool:
+        return self._price_signal_observation_enabled
+
+    def set_price_signal_observation_enabled(self, enabled: object) -> bool:
+        requested = bool(enabled)
+        if requested != self._price_signal_observation_enabled:
+            self._price_signal_observation_enabled = requested
+            self._price_signal_observation_generation += 1
+        return self._price_signal_observation_enabled
+
+    def high_resolution_market_data_snapshot(
+        self,
+    ) -> HighResolutionMarketDataSnapshot:
+        epoch, session_id = self._realtime_shadow_session_identity
+        registration_getter = getattr(
+            self.kiwoom_api,
+            "realtime_shadow_registration_snapshot",
+            None,
+        )
+        broker_session_getter = getattr(
+            self.kiwoom_api,
+            "broker_session_snapshot",
+            None,
+        )
+        try:
+            registration = (
+                registration_getter() if callable(registration_getter) else None
+            )
+        except Exception:
+            registration = None
+        try:
+            broker_session = (
+                broker_session_getter() if callable(broker_session_getter) else None
+            )
+        except Exception:
+            broker_session = None
+        return HighResolutionMarketDataSnapshot(
+            connection_epoch=epoch,
+            login_session_id=session_id,
+            broker_connected=bool(getattr(broker_session, "connected", False)),
+            realtime_registration_active=bool(
+                getattr(registration, "active", False)
+            ),
+            realtime_target_stock_count=len(
+                tuple(getattr(registration, "target_stock_codes", ()) or ())
+            ),
+            received_tick_count=self._raw_tick_received_count,
+            processed_tick_count=self._raw_tick_processed_count,
+            current_queue_depth=len(self._raw_tick_queue),
+            queue_high_watermark=self._raw_tick_queue_high_watermark,
+            overflow_count=self._raw_tick_overflow_count,
+            last_receive_sequence=self._raw_tick_last_receive_sequence,
+            last_processed_sequence=self._raw_tick_last_processed_sequence,
+            last_tick_received_at=self._raw_tick_last_received_at,
+            last_tick_processed_at=self._raw_tick_last_processed_at,
+            last_processing_latency_ms=self._raw_tick_last_processing_latency_ms,
+            max_processing_latency_ms=self._raw_tick_max_processing_latency_ms,
+            data_quality=(
+                HIGH_RESOLUTION_DATA_UNCERTAIN
+                if self._raw_tick_overflow_count
+                else HIGH_RESOLUTION_DATA_NORMAL
+            ),
+            realtime_shadow_target_stock_count=len(
+                self._registration_shadow_targets(registration)
+            ),
+        )
+
     def clear(self) -> dict[str, object]:
         clear = getattr(self.kiwoom_api, "clear_realtime_shadow_registration", None)
         self._clear_all_state()
@@ -334,19 +800,242 @@ class MarketDataHost(QObject):
         return self.clear()
 
     def _clear_session_state(self) -> None:
+        cleared_stock_codes = tuple(
+            dict.fromkeys(
+                (*self._initial_market_snapshot_states, *self._high_resolution_market_states)
+            )
+        )
+        for stock_code in cleared_stock_codes:
+            self._remember_current_session_market_information(stock_code)
         self._operation_candle_requests.clear()
         self._canonical_event_queue.clear()
         self._last_ready_commit_identity_by_stock.clear()
+        self._raw_tick_queue.clear()
+        self._high_resolution_market_states.clear()
+        self._initial_market_snapshot_states.clear()
+        self._monitoring_target_stock_codes = ()
+        self._initial_snapshot_requested_stock_codes.clear()
+        self._raw_tick_received_count_by_stock.clear()
+        self._raw_tick_processed_count_by_stock.clear()
+        self._raw_tick_uncertain_stock_codes.clear()
         self._pending_shadow_comparisons.clear()
         self._realtime_shadow_trigger_queue.clear()
         self._realtime_shadow_retry_codes.clear()
         self._pending_reconciliations.clear()
         self._reconciliation_shadow_bars.clear()
+        for stock_code in cleared_stock_codes:
+            self.market_data_observed.emit(
+                {
+                    "stock_code": stock_code,
+                    "source": "SESSION_CLEARED",
+                }
+            )
 
     def _clear_all_state(self) -> None:
         self._clear_session_state()
+        self._last_known_market_information_states.clear()
+        self._raw_tick_received_count = 0
+        self._raw_tick_processed_count = 0
+        self._raw_tick_queue_high_watermark = 0
+        self._raw_tick_overflow_count = 0
+        self._raw_tick_last_receive_sequence = 0
+        self._raw_tick_last_processed_sequence = 0
+        self._raw_tick_last_received_at = ""
+        self._raw_tick_last_processed_at = ""
+        self._raw_tick_last_processing_latency_ms = 0.0
+        self._raw_tick_max_processing_latency_ms = 0.0
         self._market_data_authority.reset()
         self._realtime_shadow_session_identity = (0, "")
+
+    @staticmethod
+    def _raw_realtime_tick_minimally_valid(payload: dict[str, object]) -> bool:
+        required_text = (
+            "stock_code",
+            "execution_time_raw",
+            "received_at",
+            "market_datetime",
+            "login_session_id",
+        )
+        if any(not str(payload.get(field) or "").strip() for field in required_text):
+            return False
+        if payload.get("current_price") in (None, ""):
+            return False
+        try:
+            sequence = int(payload.get("receive_sequence"))
+            epoch = int(payload.get("connection_epoch"))
+            received_monotonic = float(payload.get("received_monotonic"))
+        except (TypeError, ValueError):
+            return False
+        return sequence > 0 and epoch >= 0 and received_monotonic >= 0
+
+    def _on_realtime_shadow_tick_received(self, payload: object) -> None:
+        """Queue one normalized raw tick outside the broker callback stack."""
+        if self._shutting_down or not isinstance(payload, dict):
+            return
+        if not self._raw_realtime_tick_minimally_valid(payload):
+            return
+
+        event = dict(payload)
+        event[_PRICE_SIGNAL_OBSERVATION_GENERATION_KEY] = (
+            self._price_signal_observation_generation
+            if self._price_signal_observation_enabled
+            else -1
+        )
+        stock_code = str(event["stock_code"]).strip()
+        sequence = int(event["receive_sequence"])
+        identity = (
+            int(event["connection_epoch"]),
+            str(event["login_session_id"]).strip(),
+        )
+        self._raw_tick_received_count += 1
+        self._raw_tick_last_receive_sequence = sequence
+        self._raw_tick_last_received_at = str(event["received_at"])
+        if identity == self._realtime_shadow_session_identity:
+            self._raw_tick_received_count_by_stock[stock_code] = (
+                self._raw_tick_received_count_by_stock.get(stock_code, 0) + 1
+            )
+
+        if len(self._raw_tick_queue) >= self.MAX_RAW_TICK_QUEUE_DEPTH:
+            # Preserve the queued FIFO sequence and reject the newest event explicitly.
+            self._raw_tick_overflow_count += 1
+            if identity == self._realtime_shadow_session_identity:
+                self._raw_tick_uncertain_stock_codes.add(stock_code)
+            self._schedule_raw_realtime_tick_drain()
+            return
+
+        self._raw_tick_queue.append(event)
+        self._raw_tick_queue_high_watermark = max(
+            self._raw_tick_queue_high_watermark,
+            len(self._raw_tick_queue),
+        )
+        self._schedule_raw_realtime_tick_drain()
+
+    def _schedule_raw_realtime_tick_drain(self) -> None:
+        if self._raw_tick_drain_scheduled or self._raw_tick_drain_running:
+            return
+        self._raw_tick_drain_scheduled = True
+        QTimer.singleShot(0, self._drain_raw_realtime_ticks)
+
+    def _drain_raw_realtime_ticks(self) -> None:
+        self._raw_tick_drain_scheduled = False
+        if self._shutting_down or self._raw_tick_drain_running:
+            return
+        self._raw_tick_drain_running = True
+        try:
+            while self._raw_tick_queue and not self._shutting_down:
+                payload = self._raw_tick_queue.popleft()
+                try:
+                    self._process_raw_realtime_tick(payload)
+                except Exception as exc:
+                    self._observe_exception(
+                        exc,
+                        "process_raw_realtime_tick",
+                        stock_code=str(payload.get("stock_code") or ""),
+                    )
+        finally:
+            self._raw_tick_drain_running = False
+            if self._raw_tick_queue and not self._raw_tick_drain_scheduled:
+                self._schedule_raw_realtime_tick_drain()
+
+    def _process_raw_realtime_tick(self, payload: dict[str, object]) -> bool:
+        stock_code = str(payload.get("stock_code") or "").strip()
+        identity = (
+            int(payload.get("connection_epoch") or 0),
+            str(payload.get("login_session_id") or "").strip(),
+        )
+        if identity != self._realtime_shadow_session_identity:
+            return False
+
+        sequence = int(payload.get("receive_sequence") or 0)
+        current = self._high_resolution_market_states.get(stock_code)
+        if current is not None and sequence <= current.last_receive_sequence:
+            return False
+
+        self._raw_tick_processed_count += 1
+        self._raw_tick_processed_count_by_stock[stock_code] = (
+            self._raw_tick_processed_count_by_stock.get(stock_code, 0) + 1
+        )
+        processed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+        self._raw_tick_last_processed_sequence = sequence
+        self._raw_tick_last_processed_at = processed_at
+        self._high_resolution_market_states[stock_code] = HighResolutionMarketState(
+            stock_code=stock_code,
+            connection_epoch=identity[0],
+            login_session_id=identity[1],
+            last_execution_time_raw=str(payload.get("execution_time_raw") or ""),
+            last_market_datetime=str(payload.get("market_datetime") or ""),
+            last_price=payload["current_price"],
+            last_trade_volume_raw=payload.get("trade_volume_raw"),
+            last_trade_volume_abs=payload.get("trade_volume_abs"),
+            last_cumulative_volume=payload.get("cumulative_volume"),
+            last_receive_sequence=sequence,
+            last_received_at=str(payload.get("received_at") or ""),
+            last_received_monotonic=payload["received_monotonic"],
+            received_tick_count=self._raw_tick_received_count_by_stock.get(stock_code, 0),
+            processed_tick_count=self._raw_tick_processed_count_by_stock[stock_code],
+            data_quality=(
+                HIGH_RESOLUTION_DATA_UNCERTAIN
+                if stock_code in self._raw_tick_uncertain_stock_codes
+                else HIGH_RESOLUTION_DATA_NORMAL
+            ),
+            open_price=(
+                payload.get("open_price")
+                if payload.get("open_price") is not None
+                else getattr(current, "open_price", None)
+            ),
+            high_price=(
+                payload.get("high_price")
+                if payload.get("high_price") is not None
+                else getattr(current, "high_price", None)
+            ),
+            low_price=(
+                payload.get("low_price")
+                if payload.get("low_price") is not None
+                else getattr(current, "low_price", None)
+            ),
+            change_rate=(
+                payload.get("change_rate")
+                if payload.get("change_rate") is not None
+                else getattr(current, "change_rate", None)
+            ),
+            previous_day_volume_rate=(
+                payload.get("previous_day_volume_rate")
+                if payload.get("previous_day_volume_rate") is not None
+                else getattr(current, "previous_day_volume_rate", None)
+            ),
+            execution_strength=(
+                payload.get("execution_strength")
+                if payload.get("execution_strength") is not None
+                else getattr(current, "execution_strength", None)
+            ),
+        )
+        self._remember_current_session_market_information(stock_code)
+        processing_latency_ms = max(
+            0.0,
+            (monotonic() - float(payload["received_monotonic"])) * 1000.0,
+        )
+        self._raw_tick_last_processing_latency_ms = processing_latency_ms
+        self._raw_tick_max_processing_latency_ms = max(
+            self._raw_tick_max_processing_latency_ms,
+            processing_latency_ms,
+        )
+        self.market_data_observed.emit(
+            {
+                "stock_code": stock_code,
+                "source": "REALTIME",
+                "connection_epoch": identity[0],
+                "login_session_id": identity[1],
+            }
+        )
+        if (
+            self._price_signal_observation_enabled
+            and payload.get(_PRICE_SIGNAL_OBSERVATION_GENERATION_KEY)
+            == self._price_signal_observation_generation
+        ):
+            observation = self.high_resolution_market_state(stock_code)
+            if observation is not None:
+                self.high_resolution_price_observed.emit(observation)
+        return True
 
     def _on_bar_committed(self, payload: object) -> None:
         """Validate minimally and queue outside the broker callback stack."""
@@ -490,7 +1179,7 @@ class MarketDataHost(QObject):
             self._market_data_authority.mode(code) == REALTIME_PRIMARY
             and self._market_data_authority.authority(code, minute) == REALTIME_AUTHORITY
             and getattr(registration, "active", False)
-            and code in getattr(registration, "target_stock_codes", ())
+            and code in self._registration_shadow_targets(registration)
             and int(event.get("connection_epoch") or -1)
             == getattr(registration, "connection_epoch", -2)
             and str(event.get("login_session_id") or "")
@@ -602,7 +1291,7 @@ class MarketDataHost(QObject):
         snapshot = snapshot_getter()
         return bool(
             getattr(snapshot, "active", False)
-            and bar.stock_code in getattr(snapshot, "target_stock_codes", ())
+            and bar.stock_code in self._registration_shadow_targets(snapshot)
             and bar.connection_epoch == getattr(snapshot, "connection_epoch", -1)
             and bar.login_session_id == getattr(snapshot, "login_session_id", "")
         )

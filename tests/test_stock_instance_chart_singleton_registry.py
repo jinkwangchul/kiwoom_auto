@@ -56,6 +56,15 @@ def _projection(stock_code: str, trade_date: str) -> dict[str, object]:
 class _OperationHost(QObject):
     operation_cycle_completed = pyqtSignal(object)
 
+    def price_signal_observation_enabled(self) -> bool:
+        return False
+
+    def high_resolution_market_state(self, _stock_code: str):
+        return None
+
+    def high_resolution_market_data_snapshot(self):
+        return None
+
 
 def _entry_parent(table_name: str, stock_code: str, host: QObject | None = None):
     parent = QDialog()
@@ -622,6 +631,32 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
             self.assertEqual(before_cycle + 1, len(calls))
             self.assertTrue(first._operation_cycle_refresh_connected)
         owner.close()
+
+    def test_opening_same_stock_for_different_trade_date_replaces_existing_window(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def provider(stock_code: str, trade_date: str) -> dict[str, object]:
+            calls.append((stock_code, trade_date))
+            return _projection(stock_code, trade_date)
+
+        with patch.object(
+            chart_window, "project_stock_instance_day", side_effect=provider
+        ), patch.object(
+            chart_window, "_today_trade_date", return_value="2026-08-11"
+        ):
+            first = open_stock_instance_chart("005930", "2026-08-11")
+            second = open_stock_instance_chart("005930", "2026-08-10")
+
+        self.assertIsNot(first, second)
+        self.assertFalse(first.isVisible())
+        self.assertTrue(second.isVisible())
+        self.assertEqual(
+            [("005930", "2026-08-11"), ("005930", "2026-08-10")],
+            calls,
+        )
+        self.assertIs(second, chart_window._OPEN_STOCK_INSTANCE_CHARTS["005930"])
+        first.close()
+        second.close()
 
 
 if __name__ == "__main__":

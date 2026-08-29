@@ -20,6 +20,10 @@ from gui_stock_data import (
 )
 from runtime_io import read_json_dict
 from state_policy import real_trade_enabled
+from gui_auto_trade_policy import (
+    auto_trade_current_session_operation_participant_codes,
+    auto_trade_setting_trade_started,
+)
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -83,7 +87,7 @@ def ensure_single_real_trade_routine_for_stock(
                 break
 
     if not selected_routine:
-        selected_routine = assigned_names[0]
+        return ""
 
     for routine_name, stock_dir in assigned:
         config = read_json_dict(stock_dir / "config.json") or default_config()
@@ -94,3 +98,115 @@ def ensure_single_real_trade_routine_for_stock(
             write_stock_config(stock_dir, config)
 
     return selected_routine
+
+
+_TRADE_PERMISSION_BLOCKED_STATUSES = {
+    "RUNNING",
+    "SELL_ONLY",
+    "AUTO_CLOSE",
+    "AUTO_CLOSING",
+    "AUTO_CLOSED",
+    "EARLY_CLOSE",
+    "EARLY_CLOSING",
+    "EARLY_CLOSED",
+    "REVIEW_REQUIRED",
+    "REVIEW",
+    "EMERGENCY_STOPPED",
+    "EMERGENCY_STOP",
+    "EMERGENCY",
+}
+
+
+def _trade_permission_change_block_reason(
+    window,
+    stock_dir: Path,
+    code: str,
+) -> str:
+    state = read_json_dict(stock_dir / "state.json")
+    if not isinstance(state, dict):
+        state = {}
+    if str(code or "").strip() in auto_trade_current_session_operation_participant_codes(window):
+        return "CURRENT_SESSION_PARTICIPANT"
+    if auto_trade_setting_trade_started(state):
+        return "TRADE_STARTED"
+    status = str(state.get("status", "") or "").strip().upper()
+    if status in _TRADE_PERMISSION_BLOCKED_STATUSES:
+        return f"STATUS_{status}"
+    return ""
+
+
+def set_stock_real_trade_enabled(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    enabled: bool,
+) -> dict[str, object]:
+    """Persist the existing real-trade permission field while the stock is stopped."""
+
+    stock_dir = Path(stock_dir)
+    reason = _trade_permission_change_block_reason(window, stock_dir, code)
+    if reason:
+        return {
+            "ok": False,
+            "changed": False,
+            "reason": reason,
+            "code": code,
+            "name": name,
+        }
+
+    config = read_json_dict(stock_dir / "config.json")
+    if not isinstance(config, dict) or not config:
+        return {
+            "ok": False,
+            "changed": False,
+            "reason": "CONFIG_MISSING",
+            "code": code,
+            "name": name,
+        }
+
+    requested = bool(enabled)
+    before = real_trade_enabled(config)
+    if before == requested and config.get("real_trade_enabled") is requested:
+        return {
+            "ok": True,
+            "changed": False,
+            "reason": "UNCHANGED",
+            "code": code,
+            "name": name,
+            "real_trade_enabled": requested,
+        }
+
+    next_config = dict(config)
+    next_config["real_trade_enabled"] = requested
+    next_config["real_trade_policy_updated_at"] = now_text()
+    next_config["updated_at"] = now_text()
+    write_stock_config(stock_dir, next_config)
+
+    if requested:
+        routine_name = str(
+            next_config.get("routine_instance_name")
+            or next_config.get("routine")
+            or next_config.get("routine_name")
+            or ""
+        ).strip()
+        ensure_single_real_trade_routine_for_stock(code, name, routine_name or None)
+
+    saved = read_json_dict(stock_dir / "config.json")
+    if real_trade_enabled(saved) is not requested:
+        return {
+            "ok": False,
+            "changed": False,
+            "reason": "READ_BACK_FAILED",
+            "code": code,
+            "name": name,
+        }
+
+    return {
+        "ok": True,
+        "changed": before != requested or config.get("real_trade_enabled") is not requested,
+        "reason": "UPDATED",
+        "code": code,
+        "name": name,
+        "real_trade_enabled": requested,
+    }

@@ -60,6 +60,7 @@ def _realtime_api() -> KiwoomApi:
     api._screen_allocator = KiwoomScreenAllocator()
     api._realtime_shadow_builder = RealtimeShadowBarBuilder()
     api._realtime_shadow_registration = api._empty_realtime_shadow_snapshot()
+    api._realtime_receive_sequence = 0
     api.realtime_shadow_tick_received = _Signal()
     api.realtime_shadow_bar_completed = _Signal()
     api.login_state_changed = _Signal()

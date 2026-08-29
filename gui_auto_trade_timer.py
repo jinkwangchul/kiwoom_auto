@@ -21,6 +21,8 @@ from execution_universe import (
     ExecutionUniverseSnapshot,
     project_execution_universe,
 )
+from gui_operation_ui_context import refresh_auto_trade_views
+from runtime_io import read_json_dict
 
 try:
     from routine_signal_probe import probe_all_enabled_routine_stocks_once
@@ -159,11 +161,33 @@ def _process_pending_signal_pipeline(
     ):
         return signal_result
 
+    allowed_stock_codes = tuple(
+        entry.stock_code for entry in snapshot.entries if entry.execution_ready
+    )
+    if not allowed_stock_codes:
+        return signal_result
+
+    signal_cutoff_by_stock_code: dict[str, str] = {}
+    for entry in snapshot.entries:
+        if not entry.execution_ready:
+            continue
+        stock_dir = getattr(entry, "stock_dir", None)
+        state = (
+            read_json_dict(Path(stock_dir) / "state.json")
+            if stock_dir is not None
+            else {}
+        )
+        signal_cutoff_by_stock_code[entry.stock_code] = str(
+            state.get("ignore_signals_before", "") or ""
+        ).strip()
+
     consumer_result = consume_pending_routine_signals_dry_run(
         limit=5,
         mark_previewed=True,
         write_order_queue=True,
         apply_approval=True,
+        allowed_stock_codes=allowed_stock_codes,
+        signal_cutoff_by_stock_code=signal_cutoff_by_stock_code,
     )
     summary = consumer_result.get("summary", {}) if isinstance(consumer_result, dict) else {}
     checked = int(summary.get("signals_checked", 0) or 0)
@@ -335,17 +359,75 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
     if callable(rebind_recovery):
         rebind_recovery()
 
+    retirement_result: dict[str, object] = {}
+    retire_time_ended = getattr(
+        window,
+        "retire_time_ended_current_session_participants",
+        None,
+    )
+    if callable(retire_time_ended):
+        try:
+            retired = retire_time_ended(now_dt=datetime.now())
+            if isinstance(retired, dict):
+                retirement_result = dict(retired)
+        except Exception as exc:
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="participant_retirement",
+                operation="retire_time_ended_current_session_participants",
+                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                target_type="OPERATION",
+                target_id="time_end_participant_retirement",
+                target_name="거래시간 종료 참가자 정리",
+                reason_code="PARTICIPANT_RETIREMENT_FAILED",
+                owner=window,
+                failure_scope="time_end_participant_retirement",
+            )
+            retirement_result = {
+                "removed": (),
+                "reason_code": "PARTICIPANT_RETIREMENT_FAILED",
+                "error": str(exc),
+            }
+    if tuple(retirement_result.get("removed", ())):
+        try:
+            refresh_auto_trade_views(window)
+        except Exception as exc:
+            observe_production_exception(
+                type(exc),
+                exc,
+                exc.__traceback__,
+                component="participant_retirement",
+                operation="refresh_auto_trade_views",
+                source="gui_auto_trade_timer.auto_trade_run_operation_cycle",
+                target_type="OPERATION",
+                target_id="time_end_participant_retirement",
+                target_name="거래시간 종료 참가자 화면 갱신",
+                reason_code="PARTICIPANT_RETIREMENT_UI_REFRESH_FAILED",
+                owner=window,
+                failure_scope="participant_retirement_ui_refresh",
+            )
+
     realtime_shadow_result: dict[str, object] = {}
     market_data_cycle_result: dict[str, object] = {}
     market_data_getter = getattr(window, "market_data_host", None)
     market_data_host = market_data_getter() if callable(market_data_getter) else None
+    execution_universe_snapshot = retirement_result.get(
+        "execution_universe_snapshot"
+    )
     try:
-        execution_universe_snapshot = project_execution_universe(window)
-        sync_targets = getattr(market_data_host, "sync_targets", None)
-        if callable(sync_targets):
-            synced = sync_targets(execution_universe_snapshot)
-            if isinstance(synced, dict):
-                realtime_shadow_result = dict(synced)
+        if not isinstance(execution_universe_snapshot, ExecutionUniverseSnapshot):
+            execution_universe_snapshot = project_execution_universe(window)
+        retirement_sync = retirement_result.get("execution_shadow_sync_result")
+        if isinstance(retirement_sync, dict):
+            realtime_shadow_result = dict(retirement_sync)
+        else:
+            sync_targets = getattr(market_data_host, "sync_targets", None)
+            if callable(sync_targets):
+                synced = sync_targets(execution_universe_snapshot)
+                if isinstance(synced, dict):
+                    realtime_shadow_result = dict(synced)
     except Exception as exc:
         observe_production_exception(
             type(exc),
@@ -433,6 +515,7 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
             "minute_key": minute_key,
             "changed": changed_count,
             "failed": failed_count,
+            "participant_retirement_result": dict(retirement_result),
             "close_processed": close_processed,
             "close_blocked": close_blocked,
             "realtime_shadow_result": dict(realtime_shadow_result),

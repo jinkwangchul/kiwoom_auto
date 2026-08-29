@@ -29,8 +29,20 @@ from state_policy import (
 
 from gui_operation_environment import read_operation_policy
 from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
+from gui_auto_trade_integrity import is_operation_excluded
 from gui_auto_trade_runtime import now_text
-from gui_ats_utils import manual_ats_enabled_labels
+from gui_ats_utils import (
+    ats_execution_method_active_for_phase,
+    auto_trade_operation_activation_phase,
+    auto_trade_operation_session_phase,
+    auto_trade_setting_regular_market_active_now,
+    manual_ats_active_now,
+    manual_ats_execution_method_label,
+    manual_ats_enabled_labels,
+)
+from manual_ats_runtime import manual_ats_runtime_execution_method_result
+from stock_code_contract import normalize_stock_code
+from gui_window_policy import persistent_feature_owner
 from operation_command_service import (
     INDIVIDUAL_LIQUIDATION_REQUEST_KEY,
     INDIVIDUAL_LIQUIDATION_STATUS_REQUESTED,
@@ -105,6 +117,11 @@ def auto_trade_setting_trade_started(state: dict[str, object]) -> bool:
 _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR = (
     "_current_session_operation_participant_stock_codes"
 )
+START_BUDGET_PROTECTED_FIELDS = (
+    "trade_amount_type",
+    "buy_qty",
+    "buy_amount",
+)
 
 
 def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
@@ -120,10 +137,32 @@ def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
         seen.add(id(current))
         contexts.append(current)
 
-        owner = getattr(current, "_owner", None)
+        try:
+            logical_owner = persistent_feature_owner(current)
+        except Exception:
+            logical_owner = None
+        if logical_owner is not None and logical_owner is not current:
+            pending.append(logical_owner)
+        try:
+            owner = getattr(current, "_owner", None)
+        except Exception:
+            owner = None
         if owner is not None:
             pending.append(owner)
-        parent_getter = getattr(current, "parent", None)
+        for linked_attr in (
+            "auto_trade_setting_window",
+            "_main_monitoring_auto_trade_operation_host",
+        ):
+            try:
+                linked = getattr(current, linked_attr, None)
+            except Exception:
+                linked = None
+            if linked is not None:
+                pending.append(linked)
+        try:
+            parent_getter = getattr(current, "parent", None)
+        except Exception:
+            parent_getter = None
         if callable(parent_getter):
             try:
                 parent = parent_getter()
@@ -145,9 +184,9 @@ def auto_trade_register_current_session_operation_participants(
     """
 
     normalized = {
-        str(code or "").strip()
+        normalize_stock_code(code)
         for code in stock_codes
-        if str(code or "").strip()
+        if normalize_stock_code(code)
     }
     if not normalized:
         return ()
@@ -170,14 +209,57 @@ def auto_trade_register_current_session_operation_participants(
     return tuple(sorted(normalized))
 
 
+def auto_trade_retire_current_session_operation_participants(
+    window,
+    stock_codes: Iterable[object],
+) -> dict[str, tuple[str, ...]]:
+    """Remove explicit operation participation from this process only."""
+
+    requested = tuple(
+        sorted(
+            {
+                normalize_stock_code(code)
+                for code in stock_codes
+                if normalize_stock_code(code)
+            }
+        )
+    )
+    before = auto_trade_current_session_operation_participant_codes(window)
+    requested_set = set(requested)
+    removed = tuple(code for code in before if code in requested_set)
+    remaining = tuple(code for code in before if code not in requested_set)
+
+    if removed:
+        remaining_set = set(remaining)
+        for context in _auto_trade_operation_session_contexts(window):
+            try:
+                setattr(
+                    context,
+                    _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
+                    set(remaining_set),
+                )
+            except Exception:
+                continue
+
+    return {
+        "before": before,
+        "requested": requested,
+        "removed": removed,
+        "remaining": remaining,
+    }
+
+
 def auto_trade_current_session_operation_participant_codes(window) -> tuple[str, ...]:
     participants: set[str] = set()
     for context in _auto_trade_operation_session_contexts(window):
-        values = getattr(
-            context,
-            _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
-            None,
-        )
+        try:
+            values = getattr(
+                context,
+                _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
+                None,
+            )
+        except Exception:
+            values = None
         if not isinstance(values, (set, frozenset, tuple, list)):
             continue
         participants.update(
@@ -186,6 +268,106 @@ def auto_trade_current_session_operation_participant_codes(window) -> tuple[str,
             if str(code or "").strip()
         )
     return tuple(sorted(participants))
+
+
+def auto_trade_start_budget_mutation_decision(
+    window,
+    stock_code: object,
+    current_config: dict[str, object],
+    requested_config: dict[str, object],
+    *,
+    current_state: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Decide whether protected starting-budget fields may be persisted."""
+
+    current = current_config if isinstance(current_config, dict) else {}
+    requested = requested_config if isinstance(requested_config, dict) else {}
+    changed_fields = tuple(
+        field
+        for field in START_BUDGET_PROTECTED_FIELDS
+        if current.get(field) != requested.get(field)
+    )
+    clean_code = normalize_stock_code(stock_code)
+    participant = bool(
+        clean_code
+        and clean_code
+        in auto_trade_current_session_operation_participant_codes(window)
+    )
+    current_running = auto_trade_start_budget_current_running(
+        window,
+        clean_code,
+        current,
+        current_state,
+    )
+    blocked = bool(changed_fields and current_running)
+    return {
+        "allowed": not blocked,
+        "changed": bool(changed_fields),
+        "changed_fields": changed_fields,
+        "current_session_participant": participant,
+        "current_running": current_running,
+        "reason": "START_BUDGET_MUTATION_BLOCKED" if blocked else "",
+        "stock_code": clean_code,
+    }
+
+
+def auto_trade_start_budget_current_running(
+    window,
+    stock_code: object,
+    current_config: dict[str, object],
+    current_state: dict[str, object] | None,
+) -> bool:
+    """Apply the canonical per-stock running meaning to start-budget locking."""
+
+    clean_code = normalize_stock_code(stock_code)
+    config = current_config if isinstance(current_config, dict) else {}
+    state = current_state if isinstance(current_state, dict) else {}
+    if not clean_code or is_operation_excluded(config):
+        return False
+
+    running_owner = window
+    for context in _auto_trade_operation_session_contexts(window):
+        try:
+            checker = getattr(context, "startup_recovery_session_ready", None)
+        except Exception:
+            checker = None
+        if callable(checker):
+            running_owner = context
+            break
+    return auto_trade_setting_current_session_trade_started(
+        running_owner,
+        auto_trade_setting_trade_started(state),
+        clean_code,
+    )
+
+
+def preserve_active_participant_start_budget_fields(
+    window,
+    stock_code: object,
+    current_config: dict[str, object],
+    requested_config: dict[str, object],
+    *,
+    current_state: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Preserve protected disk values when a running stock rejects a stale save."""
+
+    current = current_config if isinstance(current_config, dict) else {}
+    requested = dict(requested_config) if isinstance(requested_config, dict) else {}
+    decision = auto_trade_start_budget_mutation_decision(
+        window,
+        stock_code,
+        current,
+        requested,
+        current_state=current_state,
+    )
+    if decision.get("allowed") is True:
+        return requested, decision
+    for field in START_BUDGET_PROTECTED_FIELDS:
+        if field in current:
+            requested[field] = current[field]
+        else:
+            requested.pop(field, None)
+    return requested, decision
 
 
 def auto_trade_setting_current_session_trade_started(
@@ -295,6 +477,179 @@ def auto_trade_setting_display_status_for_current_session(
     )
 
 
+def auto_trade_setting_row_projection(
+    state: dict[str, object],
+    config: dict[str, object],
+    *,
+    operation_category: object,
+    holding_qty: int,
+    buy_pending_qty: object = 0,
+    sell_pending_qty: object = 0,
+    current_session_trade_started: bool,
+    persisted_trade_started: bool | None = None,
+    now_dt: datetime | None = None,
+) -> dict[str, object]:
+    """Project shared status/method/liquidation cells without mutating runtime.
+
+    The operator-facing bucket owns whether the row is inactive. Internal review,
+    exclusion, permission, and lifecycle state remain unchanged.
+    """
+
+    runtime_state = state if isinstance(state, dict) else {}
+    stock_config = config if isinstance(config, dict) else {}
+    category = str(operation_category or "waiting").strip().lower() or "waiting"
+    inactive_bucket = category in {"waiting", "review", "excluded"}
+    session_phase = auto_trade_operation_session_phase(
+        stock_config,
+        runtime_state,
+        now_dt=now_dt,
+    )
+    activation_phase = auto_trade_operation_activation_phase(
+        stock_config,
+        runtime_state,
+        now_dt=now_dt,
+        session_phase=session_phase,
+        operation_policy_reader=read_operation_policy,
+    )
+    projection_phase = str(
+        activation_phase.get("projection_phase") or "SESSION_EVIDENCE_INVALID"
+    )
+    between_sessions = False
+    normal_operation = False
+
+    if inactive_bucket:
+        display_status = auto_trade_setting_display_status("감시/대기")
+    else:
+        display_status = auto_trade_setting_display_status_for_current_session(
+            runtime_state,
+            stock_config,
+            holding_qty=holding_qty,
+            buy_pending_qty=buy_pending_qty,
+            sell_pending_qty=sell_pending_qty,
+            current_session_trade_started=current_session_trade_started,
+            persisted_trade_started=persisted_trade_started,
+        )
+
+        # Order permission remains fail-closed. The active CONTINUOUS row is a
+        # lifecycle projection and must not be demoted only because real trading
+        # permission is disabled.
+        raw_status = str(runtime_state.get("status", "STOPPED") or "STOPPED").strip().upper()
+        trade_started = (
+            auto_trade_setting_trade_started(runtime_state)
+            if persisted_trade_started is None
+            else bool(persisted_trade_started)
+        )
+        normal_operation = (
+            current_session_trade_started
+            and trade_started
+            and raw_status not in {"STOPPED", "STOP", "MANUAL_STOPPED"}
+            and not auto_trade_setting_should_preserve_raw_status(runtime_state, raw_status)
+            and not auto_trade_setting_no_next_step_notice(runtime_state)
+            and not auto_trade_setting_liquidation_phase_active(
+                stock_config,
+                holding_qty,
+                state=runtime_state,
+            )
+            and not auto_trade_setting_early_close_requested(runtime_state)
+        )
+        if normal_operation:
+            phase_name = str(session_phase.get("phase", "") or "").strip().upper()
+            between_sessions = phase_name == "BETWEEN_SESSIONS"
+            if projection_phase == "ACTIVE_SESSION":
+                display_status = auto_trade_setting_display_status("매수/매도")
+            elif projection_phase in {
+                "PRE_OPERATION_BOUNDARY",
+                "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
+                "INTER_SESSION_NON_TRADING_GAP",
+                "FINAL_END",
+            }:
+                display_status = auto_trade_setting_display_status("감시/대기")
+
+    method_text = "루틴" if inactive_bucket else auto_trade_setting_method_text(
+        display_status,
+        stock_config,
+        runtime_state,
+    )
+    ats_method_active = bool(
+        not inactive_bucket
+        and normal_operation
+        and activation_phase.get("ats_session_active") is True
+    )
+    if ats_method_active:
+        method_result = manual_ats_runtime_execution_method_result(runtime_state)
+        if method_result.get("ok") is True:
+            method_text = manual_ats_execution_method_label(
+                method_result.get("execution_method")
+            ) or "루틴"
+    liquidation_text = auto_trade_setting_liquidation_text(
+        stock_config,
+        display_status,
+        runtime_state,
+        holding_qty=holding_qty,
+    )
+    if ats_method_active:
+        liquidation_text = "-"
+    liquidation_has_policy = str(liquidation_text).strip() not in {"", "-"}
+    _liquidation_policy, liquidation_is_individual = (
+        effective_liquidation_policy_for_config(stock_config, runtime_state)
+    )
+
+    status_cell_active = bool(
+        not inactive_bucket
+        and current_session_trade_started
+        and display_status not in {"긴급정지", "검토종목"}
+    )
+    controls_active = bool(
+        normal_operation
+        and projection_phase in {
+            "WAITING_FOR_TRADE_WINDOW_AFTER_OPERATION_BOUNDARY",
+            "ACTIVE_SESSION",
+        }
+    )
+    if normal_operation:
+        method_cell_active = bool(status_cell_active and controls_active)
+        liquidation_cell_active = bool(
+            method_cell_active and not ats_method_active and liquidation_has_policy
+        )
+    else:
+        method_cell_active = bool(
+            status_cell_active and display_status not in {"감시/대기", "-", ""}
+        )
+        liquidation_cell_active = bool(
+            method_cell_active
+            and holding_qty > 0
+            and auto_trade_setting_liquidation_active(
+                stock_config,
+                holding_qty,
+                display_status=display_status,
+                state=runtime_state,
+            )
+            and liquidation_has_policy
+        )
+    return {
+        "operation_category": category,
+        "session_phase": str(session_phase.get("phase", "") or ""),
+        "projection_phase": projection_phase,
+        "between_sessions": between_sessions,
+        "situation_active": bool(current_session_trade_started),
+        "operation_boundary_reached": bool(
+            activation_phase.get("operation_boundary_reached")
+        ),
+        "trade_window_active": bool(
+            activation_phase.get("actual_trading_session_active")
+        ),
+        "ats_session_active": bool(activation_phase.get("ats_session_active")),
+        "display_status": display_status,
+        "method_text": method_text,
+        "liquidation_text": liquidation_text,
+        "status_cell_active": status_cell_active,
+        "method_cell_active": method_cell_active,
+        "liquidation_cell_active": liquidation_cell_active,
+        "liquidation_has_policy": liquidation_has_policy,
+        "liquidation_is_individual": liquidation_is_individual,
+    }
+
+
 def auto_trade_setting_should_preserve_raw_status(state: dict[str, object], status: object) -> bool:
     """시간정책 자동 재판정에서 그대로 유지할 상태인지 판단한다.
 
@@ -352,27 +707,119 @@ _EARLY_CLOSE_STATUS_VALUES = frozenset(
 )
 
 
-def auto_trade_setting_start_target_allowed(
+def auto_trade_setting_start_target_decision(
     window,
     state: dict[str, object],
     stock_code: object,
-) -> bool:
-    """Return whether an explicit current-session start may classify the target."""
+    *,
+    config: dict[str, object] | None = None,
+    now_dt: datetime | None = None,
+) -> dict[str, object]:
+    """Classify one explicit current-session Operation Start target."""
+    start_config = config if isinstance(config, dict) else {}
+    effective_mode = normalize_operation_mode(
+        start_config.get("operation_mode", "SCHEDULED")
+    )
     persisted_started = auto_trade_setting_trade_started(state)
     if auto_trade_setting_current_session_trade_started(
         window,
         persisted_started,
         stock_code,
     ):
-        return False
+        return {
+            "allowed": False,
+            "reason": "ALREADY_RUNNING",
+            "session_phase": {},
+            "operation_mode": effective_mode,
+        }
+
+    session_phase: dict[str, object] = {}
+    try:
+        session_phase = auto_trade_operation_session_phase(
+            start_config,
+            state or {},
+            now_dt=now_dt,
+        )
+    except Exception:
+        session_phase = {}
+    if str(session_phase.get("phase") or "").strip().upper() == "FINAL_SESSION_ENDED":
+        return {
+            "allowed": False,
+            "reason": "FINAL_SESSION_ENDED",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
 
     raw_status = str((state or {}).get("status", "STOPPED")).strip().upper()
     raw_status = raw_status or "STOPPED"
+    if raw_status == "RUNNING":
+        clean_stock_code = normalize_stock_code(stock_code)
+        current_participants = set(
+            auto_trade_current_session_operation_participant_codes(window)
+        )
+        allowed = bool(
+            persisted_started
+            and clean_stock_code
+            and clean_stock_code not in current_participants
+        )
+        return {
+            "allowed": allowed,
+            "reason": "" if allowed else "NOT_STARTABLE",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
     if raw_status in _OPERATION_START_ALLOWED_STATUSES:
-        return True
+        return {
+            "allowed": True,
+            "reason": "",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
     if raw_status in _EARLY_CLOSE_STATUS_VALUES:
-        return not auto_trade_setting_should_preserve_raw_status(state, raw_status)
-    return False
+        allowed = not auto_trade_setting_should_preserve_raw_status(state, raw_status)
+        return {
+            "allowed": allowed,
+            "reason": "" if allowed else "CLOSE_LIQUIDATION_ACTIVE",
+            "session_phase": session_phase,
+            "operation_mode": effective_mode,
+        }
+    reason = (
+        "CLOSE_LIQUIDATION_ACTIVE"
+        if raw_status
+        in {
+            "AUTO_CLOSE",
+            "AUTO_CLOSING",
+            "LIQUIDATION",
+            "LIQUIDATING",
+        }
+        else "NOT_STARTABLE"
+    )
+    return {
+        "allowed": False,
+        "reason": reason,
+        "session_phase": session_phase,
+        "operation_mode": effective_mode,
+    }
+
+
+def auto_trade_setting_start_target_allowed(
+    window,
+    state: dict[str, object],
+    stock_code: object,
+    *,
+    config: dict[str, object] | None = None,
+    now_dt: datetime | None = None,
+) -> bool:
+    """Return whether an explicit current-session start may classify the target."""
+    return bool(
+        auto_trade_setting_start_target_decision(
+            window,
+            state,
+            stock_code,
+            config=config,
+            now_dt=now_dt,
+        ).get("allowed")
+    )
 
 
 def auto_trade_setting_no_next_step_notice(state: dict[str, object] | None) -> bool:

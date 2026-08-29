@@ -7,7 +7,6 @@ gui_auto_trade_run_control.py
 
 from __future__ import annotations
 
-import math
 import re
 import logging
 from pathlib import Path
@@ -19,7 +18,9 @@ from PyQt5.QtWidgets import (
 )
 
 from gui_toast import show_toast
+from gui_common_utils import safe_int_value
 from gui_operation_ui_context import refresh_auto_trade_views
+from gui_operation_environment import read_operation_policy, read_review_policy
 from event_journal_production import (
     append_production_event,
     observe_owner_failure_transition,
@@ -33,7 +34,9 @@ from gui_auto_trade_integrity import (
     restart_initial_review_reason_for_stock,
 )
 from gui_auto_trade_policy import (
+    auto_trade_current_session_operation_participant_codes,
     auto_trade_register_current_session_operation_participants,
+    auto_trade_retire_current_session_operation_participants,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_trade_started,
@@ -44,12 +47,23 @@ from gui_auto_trade_status_ops import (
     auto_trade_stock_operation_excluded,
     set_auto_trade_stock_operation_excluded,
 )
-from gui_order_utils import order_current_pending_qty
+from gui_base_stock_service import read_base_stocks
+from gui_order_utils import order_current_pending_qty, pending_order_side_quantities
 from gui_review_utils import review_required_for_start
 from execution_queue_writer import read_execution_queue_records
+from execution_runtime_reader import read_order_executions, read_order_locks
 from operation_close_completion_evaluator import (
     ACTIVE_QUEUE_STATUSES,
     CLOSED_QUEUE_STATUSES,
+    STATUS_DONE,
+    evaluate_operation_close_completion,
+)
+from operation_close_completion_check_service import (
+    mark_end_of_operation_review_required,
+)
+from stock_long_hold_policy import (
+    classify_termination_route,
+    long_hold_excludes_holding_review,
 )
 from operation_policy_gate import (
     is_emergency_stop,
@@ -61,12 +75,21 @@ from state_policy import (
     real_trade_enabled,
     trade_permission_display,
     auto_trade_status_display,
-    effective_schedule_times,
-    in_regular_manual_session,
     normalize_operation_mode,
-    seconds_from_hhmmss,
     status_after_operation_mode_change,
 )
+from routine_order_permission import canonical_stock_trading_time_status
+from gui_ats_utils import (
+    auto_trade_operation_session_phase,
+    manual_ats_session_definition,
+)
+from gui_routine_registry import get_group_records
+from main_group_projection import (
+    build_main_group_projection,
+    projected_main_group_stock_targets,
+)
+from gui_main_table_loader import main_stock_resolved_starting_budget
+from routine_instance_registry import load_persisted_routine_instances
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -75,6 +98,8 @@ LOGGER = logging.getLogger(__name__)
 START_REQUEST_SINGLE = "single"
 START_REQUEST_MULTIPLE = "multiple"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
+ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
+ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
 
 _P3_OPERATION_START_RUNTIME_REASONS = frozenset(
     {
@@ -112,6 +137,27 @@ _LIQUIDATION_REQUEST_TERMINAL_STATUSES = {
     "ORDER_BLOCKED",
 }
 
+_TERMINAL_EXECUTION_STATUSES = {
+    "BROKER_RESULT_RECORDED",
+    "COMPLETED",
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "REJECTED",
+    "FAILED",
+    "EXPIRED",
+    "LOCAL_RESET",
+}
+_TERMINAL_LOCK_STATUSES = {
+    "RELEASED",
+    "COMPLETED",
+    "CANCELED",
+    "CANCELLED",
+    "FAILED",
+    "EXPIRED",
+    "LOCAL_RESET",
+}
+
 
 def today_global_operation_status(operation_state: dict[str, object]) -> str:
     if not isinstance(operation_state, dict):
@@ -122,7 +168,38 @@ def today_global_operation_status(operation_state: dict[str, object]) -> str:
     return str(operation_state.get("operation_status") or "").strip().upper()
 
 
-def auto_trade_registered_operation_targets() -> list[tuple[Path, str, str]]:
+def today_operation_start_evidence(operation_state: dict[str, object]) -> bool:
+    if not isinstance(operation_state, dict):
+        return False
+    today = date.today().isoformat()
+    if str(operation_state.get("operation_date") or "").strip() != today:
+        return False
+    status = today_global_operation_status(operation_state)
+    if status in {"RUNNING", "CLOSING", "NORMAL_ENDED"}:
+        return True
+    started_at = str(operation_state.get("operation_started_at") or "").strip()
+    if started_at.startswith(today):
+        return True
+    participants = operation_state.get("operation_participant_stock_codes")
+    return isinstance(participants, list) and bool(participants)
+
+
+def auto_trade_registered_operation_targets(window=None) -> list[tuple[Path, str, str]]:
+    if window is not None:
+        try:
+            projection = build_main_group_projection(
+                get_group_records(),
+                load_persisted_routine_instances(),
+                read_base_stocks(),
+            )
+            return list(
+                projected_main_group_stock_targets(
+                    projection,
+                    project_root=PROJECT_ROOT,
+                )
+            )
+        except Exception:
+            return []
     targets: list[tuple[Path, str, str]] = []
     for stock_dir in all_registered_stock_dirs():
         code, name = parse_stock_folder_name(stock_dir.name)
@@ -229,7 +306,7 @@ def auto_trade_registered_operation_start_targets(window=None) -> list[tuple[Pat
     registered = (
         list(target_getter())
         if callable(target_getter)
-        else auto_trade_registered_operation_targets()
+        else auto_trade_registered_operation_targets(window)
     )
     return [
         target
@@ -252,7 +329,7 @@ def auto_trade_running_registered_operation_targets(
         if registered_targets is not None
         else list(target_getter())
         if callable(target_getter)
-        else auto_trade_registered_operation_targets()
+        else auto_trade_registered_operation_targets(window)
     )
     for target in registered:
         preloaded_snapshot = (
@@ -291,7 +368,7 @@ def auto_trade_update_global_operation_button_state(window) -> None:
     registered = (
         list(registered_getter())
         if callable(registered_getter)
-        else auto_trade_registered_operation_targets()
+        else auto_trade_registered_operation_targets(window)
     )
     running = (
         list(running_getter())
@@ -301,23 +378,23 @@ def auto_trade_update_global_operation_button_state(window) -> None:
     operation_state = read_operation_state()
     operation_status = today_global_operation_status(operation_state)
     global_normal_ended = operation_status == "NORMAL_ENDED"
-    global_running = operation_status in {"RUNNING", "CLOSING"}
     global_emergency_stop = operation_state.get("emergency_stop") is True
-    if global_normal_ended:
+    today_started = today_operation_start_evidence(operation_state)
+    if running:
         text, foreground, background, hover_background = (
-            "운영종료", "#374151", "#F3F4F6", "#F3F4F6"
+            "▶ 운영중", "#15803D", "#F8FAFC", "#F8FAFC"
+        )
+    elif today_started:
+        text, foreground, background, hover_background = (
+            "● 운영정지", "#111827", "#F8FAFC", "#F8FAFC"
         )
     elif global_emergency_stop:
         text, foreground, background, hover_background = (
             "긴급정지", "#991B1B", "#FEF2F2", "#FEF2F2"
         )
-    elif running or global_running:
-        text, foreground, background, hover_background = (
-            "운영중", "#374151", "#F3F4F6", "#F3F4F6"
-        )
     else:
         text, foreground, background, hover_background = (
-            "▶ 운영시작", "#15803D", "#F0FDF4", "#DCFCE7"
+            "■ 운영시작", "#1D4ED8", "#F8FAFC", "#F8FAFC"
         )
 
     window.btn_start.setText(text)
@@ -339,17 +416,17 @@ def auto_trade_update_global_operation_button_state(window) -> None:
         f"background-color: {hover_background};"
         "}"
         "QPushButton:disabled {"
-        "color: #9CA3AF;"
+        f"color: {foreground};"
         "border-color: #D1D5DB;"
-        "background-color: #F3F4F6;"
+        f"background-color: {background};"
         "}"
     )
     window.btn_start.setEnabled(
         bool(registered)
         and not bool(running)
-        and not global_running
         and not global_emergency_stop
         and not global_normal_ended
+        and not today_started
     )
 
 
@@ -564,6 +641,423 @@ def _active_queue_reason(
     return ""
 
 
+def _queue_records_for_stock(
+    stock_code: str,
+    order_queue_path: str | Path,
+) -> tuple[dict[str, object], ...]:
+    snapshot = read_execution_queue_records(Path(order_queue_path))
+    if snapshot.get("ok") is not True:
+        return ()
+    expected_code = _normalized_stock_code(stock_code)
+    return tuple(
+        record
+        for record in snapshot.get("records", ())
+        if isinstance(record, dict)
+        and _queue_record_stock_code(record) == expected_code
+    )
+
+
+def auto_trade_final_session_phase(
+    config: dict[str, object],
+    state: dict[str, object],
+    *,
+    now_dt: datetime | None = None,
+) -> dict[str, object]:
+    """Classify today's real trading windows without using UI status text."""
+    return auto_trade_operation_session_phase(
+        config,
+        state,
+        now_dt=now_dt or current_datetime(),
+        operation_policy_reader=read_operation_policy,
+        ats_session_reader=manual_ats_session_definition,
+    )
+
+
+def _active_execution_runtime_reason(
+    stock_code: str,
+    *,
+    order_executions_path: str | Path,
+    order_locks_path: str | Path,
+) -> str:
+    expected_code = _normalized_stock_code(stock_code)
+    executions = read_order_executions(order_executions_path)
+    if executions.get("ok") is not True:
+        return "EXECUTION_RUNTIME_DAMAGED"
+    execution_data = executions.get("data")
+    for record in execution_data.get("executions", ()) if isinstance(execution_data, dict) else ():
+        if not isinstance(record, dict):
+            return "EXECUTION_RUNTIME_DAMAGED"
+        if _queue_record_stock_code(record) != expected_code:
+            continue
+        status = str(record.get("status") or "").strip().upper()
+        if status not in _TERMINAL_EXECUTION_STATUSES:
+            return "UNRESOLVED_EXECUTION"
+
+    locks = read_order_locks(order_locks_path)
+    if locks.get("ok") is not True:
+        return "ORDER_LOCK_RUNTIME_DAMAGED"
+    lock_data = locks.get("data")
+    for record in lock_data.get("locks", ()) if isinstance(lock_data, dict) else ():
+        if not isinstance(record, dict):
+            return "ORDER_LOCK_RUNTIME_DAMAGED"
+        if _queue_record_stock_code(record) != expected_code:
+            continue
+        status = str(record.get("status") or "").strip().upper()
+        if status not in _TERMINAL_LOCK_STATUSES:
+            return "ACTIVE_ORDER_LOCK"
+    return ""
+
+
+def auto_trade_time_end_retirement_eligibility(
+    *,
+    stock_dir: str | Path,
+    stock_code: str,
+    config: dict[str, object],
+    state: dict[str, object],
+    operation_state: dict[str, object],
+    now_dt: datetime | None = None,
+    order_queue_path: str | Path = ORDER_QUEUE_PATH,
+    order_executions_path: str | Path = ORDER_EXECUTIONS_PATH,
+    order_locks_path: str | Path = ORDER_LOCKS_PATH,
+    close_completion_status: object = "",
+) -> dict[str, object]:
+    """Fail-closed read-only eligibility for normal final-time retirement."""
+
+    current = now_dt or current_datetime()
+    phase = auto_trade_final_session_phase(config, state, now_dt=current)
+    blockers: list[str] = []
+    if phase.get("evaluable") is not True:
+        blockers.append(str(phase.get("phase") or "SESSION_EVIDENCE_INVALID"))
+    elif phase.get("final_session_ended") is not True:
+        blockers.append(str(phase.get("phase") or "SESSION_NOT_FINAL"))
+
+    if is_emergency_stop(operation_state):
+        blockers.append("GLOBAL_EMERGENCY_STOP")
+    operation_date = str(operation_state.get("operation_date") or "").strip()
+    operation_status = str(operation_state.get("operation_status") or "").strip().upper()
+    if operation_date != current.date().isoformat() or operation_status not in {
+        "RUNNING",
+        "CLOSING",
+        "NORMAL_ENDED",
+    }:
+        blockers.append("OPERATION_SESSION_EVIDENCE_UNRESOLVED")
+    if is_emergency_stopped_state(state):
+        blockers.append("EMERGENCY_STOPPED")
+    if is_review_required_state(state):
+        blockers.append("REVIEW_REQUIRED")
+
+    review_needed, _review_reason, details = restart_initial_review_reason_for_stock(
+        Path(stock_dir), state
+    )
+    holding_qty = details.get("holding_qty")
+    holding_present = isinstance(holding_qty, int) and holding_qty > 0
+    position_mismatch = (
+        holding_qty in (0, None)
+        and (
+            details.get("holding_amount") not in (0, 0.0, None)
+            or details.get("avg_price") not in (0, 0.0, None)
+        )
+    )
+    if position_mismatch:
+        blockers.append("HOLDING_OR_POSITION_UNRESOLVED")
+    for side, value in (
+        ("BUY", details.get("buy_pending_qty")),
+        ("SELL", details.get("sell_pending_qty")),
+    ):
+        if value == "?":
+            blockers.append("PENDING_ORDER_UNKNOWN")
+        elif isinstance(value, int) and value > 0:
+            blockers.append(f"PENDING_{side}")
+    if review_needed and not holding_present and not any(
+        reason in blockers
+        for reason in (
+            "HOLDING_OR_POSITION_UNRESOLVED",
+            "PENDING_ORDER_UNKNOWN",
+            "PENDING_BUY",
+            "PENDING_SELL",
+        )
+    ):
+        blockers.append("RUNTIME_EVIDENCE_INCONSISTENT")
+
+    queue_reason = _active_queue_reason(stock_code, order_queue_path)
+    if queue_reason:
+        blockers.append(queue_reason)
+    execution_reason = _active_execution_runtime_reason(
+        stock_code,
+        order_executions_path=order_executions_path,
+        order_locks_path=order_locks_path,
+    )
+    if execution_reason:
+        blockers.append(execution_reason)
+    close_completion_status = str(close_completion_status or "").strip().upper()
+    close_completion_done = (
+        close_completion_status == STATUS_DONE and holding_qty == 0
+    )
+    close_active = _active_close_or_liquidation(state, current)
+    if close_active and not close_completion_done:
+        blockers.append("CLOSE_LIQUIDATION_ACTIVE")
+
+    queue_records = _queue_records_for_stock(stock_code, order_queue_path)
+    route = classify_termination_route(
+        state,
+        operation_mode=normalize_operation_mode(config.get("operation_mode", "SCHEDULED")),
+        final_session_ended=phase.get("final_session_ended") is True,
+        queue_records=queue_records,
+    )
+    long_hold_enabled = bool(
+        read_review_policy().get("long_term_holding_enabled", False)
+    )
+    pending_or_runtime_issue = any(
+        reason in blockers
+        for reason in (
+            "PENDING_ORDER_UNKNOWN",
+            "PENDING_BUY",
+            "PENDING_SELL",
+            "PENDING_ORDER",
+            "PENDING_CANCEL",
+            "RUNTIME_DAMAGED",
+            "EXECUTION_RUNTIME_DAMAGED",
+            "UNRESOLVED_EXECUTION",
+            "ORDER_LOCK_RUNTIME_DAMAGED",
+            "ACTIVE_ORDER_LOCK",
+        )
+    )
+    long_hold_allowed = holding_present and long_hold_excludes_holding_review(
+        long_hold_enabled,
+        state,
+        holding_qty=int(holding_qty),
+        buy_pending_qty=details.get("buy_pending_qty"),
+        sell_pending_qty=details.get("sell_pending_qty"),
+        safety_issue=(
+            position_mismatch
+            or pending_or_runtime_issue
+            or is_emergency_stopped_state(state)
+            or is_emergency_stop(operation_state)
+            or route.get("safety_issue") is True
+        ),
+        operation_mode=normalize_operation_mode(config.get("operation_mode", "SCHEDULED")),
+        final_session_ended=phase.get("final_session_ended") is True,
+        queue_records=queue_records,
+    )
+    review_required = False
+    terminal_safety_issue = bool(
+        route.get("route_completed") is True
+        and (
+            pending_or_runtime_issue
+            or position_mismatch
+            or route.get("safety_issue") is True
+        )
+    )
+    if terminal_safety_issue:
+        blockers = [
+            reason for reason in blockers if reason != "CLOSE_LIQUIDATION_ACTIVE"
+        ]
+        blockers.append("END_OF_OPERATION_SAFETY_REVIEW_REQUIRED")
+        review_required = True
+    if holding_present:
+        if long_hold_allowed:
+            blockers = [
+                reason
+                for reason in blockers
+                if reason not in {
+                    "HOLDING_OR_POSITION_UNRESOLVED",
+                    "RUNTIME_EVIDENCE_INCONSISTENT",
+                    "CLOSE_LIQUIDATION_ACTIVE",
+                }
+            ]
+        elif not terminal_safety_issue and (
+            route.get("route_completed") is True
+            and not pending_or_runtime_issue
+        ):
+            blockers = [
+                reason for reason in blockers if reason != "CLOSE_LIQUIDATION_ACTIVE"
+            ]
+            blockers.append("END_OF_OPERATION_RESIDUAL_REVIEW_REQUIRED")
+            review_required = True
+        else:
+            blockers.append("HOLDING_OR_POSITION_UNRESOLVED")
+
+    unique_blockers = tuple(dict.fromkeys(blockers))
+    return {
+        "eligible": not unique_blockers,
+        "stock_code": _normalized_stock_code(stock_code),
+        "phase": phase,
+        "blockers": unique_blockers,
+        "holding_qty": holding_qty,
+        "long_term_holding_enabled": long_hold_enabled,
+        "long_hold_allowed": long_hold_allowed,
+        "review_required": review_required,
+        "termination_route": route,
+        "close_completion_status": close_completion_status,
+        "close_completion_done": close_completion_done,
+    }
+
+
+def _time_end_close_completion_status_by_stock(
+    targets: dict[str, tuple[Path, str]],
+    *,
+    operation_state: dict[str, object],
+    now_dt: datetime,
+    order_queue_path: str | Path,
+) -> tuple[dict[str, str], dict[str, object]]:
+    """Read existing durable close evidence without applying global completion."""
+
+    operation_status = str(
+        operation_state.get("operation_status") or ""
+    ).strip().upper()
+    if operation_status != "CLOSING" or not targets:
+        return {}, {
+            "evaluated": False,
+            "reason_code": "GLOBAL_OPERATION_NOT_CLOSING",
+        }
+
+    runtime_dir = Path(order_queue_path).resolve().parent
+    stock_parents = {
+        stock_dir.resolve().parent for stock_dir, _name in targets.values()
+    }
+    stocks_dir = (
+        next(iter(stock_parents))
+        if len(stock_parents) == 1
+        else PROJECT_ROOT / "stocks"
+    )
+    policy_root = stocks_dir.parent if stocks_dir.name == "stocks" else stocks_dir
+    try:
+        result = evaluate_operation_close_completion(
+            today=now_dt.date().isoformat(),
+            operation_state_path=runtime_dir / "operation_state.json",
+            stocks_dir=stocks_dir,
+            order_queue_path=Path(order_queue_path),
+            positions_path=runtime_dir / "positions.json",
+            broker_holdings_path=runtime_dir / "broker_holdings.json",
+            operation_policy_path=policy_root / "operation_policy.json",
+        )
+    except Exception as exc:
+        LOGGER.exception("Time-end close completion evidence read failed")
+        return {}, {
+            "evaluated": False,
+            "reason_code": "CLOSE_COMPLETION_EVIDENCE_UNAVAILABLE",
+            "error": str(exc),
+        }
+
+    statuses = {
+        _normalized_stock_code(item.get("stock_code")): str(
+            item.get("status") or ""
+        ).strip().upper()
+        for item in result.get("stock_results", ())
+        if isinstance(item, dict) and _normalized_stock_code(item.get("stock_code"))
+    }
+    return statuses, dict(result)
+
+
+def auto_trade_retire_time_ended_current_session_participants(
+    window,
+    *,
+    now_dt: datetime | None = None,
+    order_queue_path: str | Path = ORDER_QUEUE_PATH,
+    order_executions_path: str | Path = ORDER_EXECUTIONS_PATH,
+    order_locks_path: str | Path = ORDER_LOCKS_PATH,
+) -> dict[str, object]:
+    """Evaluate and retire only obligation-free final-time participants."""
+
+    before = auto_trade_current_session_operation_participant_codes(window)
+    targets = {
+        _normalized_stock_code(code): (Path(stock_dir), str(name or ""))
+        for stock_dir, code, name in auto_trade_registered_operation_targets(window)
+        if _normalized_stock_code(code)
+    }
+    operation_state = read_operation_state()
+    current = now_dt or current_datetime()
+    close_completion_statuses, close_completion_evidence = (
+        _time_end_close_completion_status_by_stock(
+            targets,
+            operation_state=operation_state,
+            now_dt=current,
+            order_queue_path=order_queue_path,
+        )
+    )
+    evaluations: list[dict[str, object]] = []
+    requested: list[str] = []
+    for code in before:
+        target = targets.get(_normalized_stock_code(code))
+        if target is None:
+            evaluations.append(
+                {
+                    "eligible": False,
+                    "stock_code": code,
+                    "blockers": ("REGISTERED_TARGET_UNAVAILABLE",),
+                }
+            )
+            continue
+        stock_dir, _name = target
+        config = read_json_dict(stock_dir / "config.json")
+        state = read_json_dict(stock_dir / "state.json")
+        if not config or not state:
+            evaluations.append(
+                {
+                    "eligible": False,
+                    "stock_code": code,
+                    "blockers": ("RUNTIME_DAMAGED",),
+                }
+            )
+            continue
+        evaluation = auto_trade_time_end_retirement_eligibility(
+            stock_dir=stock_dir,
+            stock_code=code,
+            config=config,
+            state=state,
+            operation_state=operation_state,
+            now_dt=current,
+            order_queue_path=order_queue_path,
+            order_executions_path=order_executions_path,
+            order_locks_path=order_locks_path,
+            close_completion_status=close_completion_statuses.get(
+                _normalized_stock_code(code),
+                "",
+            ),
+        )
+        if evaluation.get("review_required") is True:
+            blockers = tuple(evaluation.get("blockers", ()))
+            review_reason = (
+                "PENDING_ORDER"
+                if any("PENDING" in str(reason) for reason in blockers)
+                else "EVIDENCE_CONFLICT"
+                if "END_OF_OPERATION_SAFETY_REVIEW_REQUIRED" in blockers
+                else "HOLDING_REMAINS"
+            )
+            review_result = mark_end_of_operation_review_required(
+                stock_dir=stock_dir,
+                stock_code=code,
+                reason_code=review_reason,
+                termination_route=evaluation.get("termination_route"),
+                source="TIME_END_PARTICIPANT_RETIREMENT",
+            )
+            marked = review_result.get("ok") is True
+            review_blockers = (
+                blockers if marked else (*blockers, "REVIEW_STATE_SAVE_FAILED")
+            )
+            evaluation = {
+                **evaluation,
+                "review_marked": marked,
+                "review_result": review_result,
+                "eligible": False,
+                "blockers": tuple(dict.fromkeys(review_blockers)),
+            }
+        evaluations.append(evaluation)
+        if evaluation.get("eligible") is True:
+            requested.append(code)
+
+    retirement = auto_trade_retire_current_session_operation_participants(
+        window,
+        requested,
+    )
+    return {
+        **retirement,
+        "evaluations": tuple(evaluations),
+        "close_completion_evidence": close_completion_evidence,
+        "persisted_operation_state_changed": False,
+    }
+
+
 def auto_trade_same_day_restart_guard(
     *,
     stock_dir: str | Path,
@@ -580,17 +1074,12 @@ def auto_trade_same_day_restart_guard(
     def blocked(reason: str) -> dict[str, object]:
         return {"allowed": False, "reason": reason}
 
-    if _today_normal_ended(operation_state, current):
-        return blocked("NORMAL_ENDED")
     if is_emergency_stop(operation_state):
         return blocked("GLOBAL_EMERGENCY_STOP")
     if is_emergency_stopped_state(state):
         return blocked("EMERGENCY_STOPPED")
     if is_review_required_state(state):
         return blocked("REVIEW_REQUIRED")
-
-    if not auto_trade_operation_time_allowed(config, now_dt=current):
-        return blocked("OUTSIDE_OPERATION_TIME")
 
     review_needed, _review_reason, details = restart_initial_review_reason_for_stock(
         Path(stock_dir), state
@@ -620,18 +1109,20 @@ def auto_trade_same_day_restart_guard(
 def auto_trade_operation_time_allowed(
     config: dict[str, object],
     *,
+    state: dict[str, object] | None = None,
     now_dt: datetime | None = None,
 ) -> bool:
-    """Return whether the target's persisted operation schedule allows a start."""
+    """Return whether the target is currently inside its actual trading window.
+
+    Operation Start admission intentionally does not use this projection.
+    """
     current = now_dt or current_datetime()
-    mode = normalize_operation_mode(config.get("operation_mode", "SCHEDULED"))
-    if mode == "CONTINUOUS":
-        return in_regular_manual_session(current)
-    start_time, end_buy_time, _custom = effective_schedule_times(config)
-    current_seconds = current.hour * 3600 + current.minute * 60 + current.second
-    start_seconds = seconds_from_hhmmss(start_time, "09:00:00")
-    end_seconds = seconds_from_hhmmss(end_buy_time, "13:30:00")
-    return start_seconds <= current_seconds < end_seconds
+    time_status = canonical_stock_trading_time_status(
+        config=config,
+        state=state or {},
+        now_dt=current,
+    )
+    return time_status.get("active") is True
 
 
 def startup_recovery_operation_block_message(action: str, reason: str = "") -> str:
@@ -823,11 +1314,21 @@ def _start_failure_user_message(
     all_review: bool = False,
     all_already_running: bool = False,
     time_eligible_targets: bool = False,
+    blocked_target_details: tuple[dict[str, object], ...] = (),
+    already_running_targets: tuple[tuple[Path, str, str], ...] = (),
 ) -> str:
+    if all_emergency:
+        return "모든 종목이 긴급정지 상태입니다."
+    grouped_message = _blocked_target_groups_message(
+        blocked_target_details,
+        already_running_targets=already_running_targets,
+    )
+    if grouped_message:
+        return grouped_message
     reasons = {str(item or "").strip() for item in failure_reasons if str(item or "").strip()}
     if time_eligible_targets:
         reasons.discard("OUTSIDE_OPERATION_TIME")
-    if all_emergency or (
+    if (
         reasons
         and reasons <= {"EMERGENCY_STOPPED", "EMERGENCY_STOP", "EMERGENCY"}
     ):
@@ -839,15 +1340,10 @@ def _start_failure_user_message(
         )
     if all_already_running:
         return "선택한 루틴은 이미 운영 중입니다."
-    if reasons and reasons <= {"PREVIOUS_CLOSE_UNAVAILABLE"}:
+    if reasons and reasons <= {"STARTING_BUDGET_UNRESOLVED"}:
         return (
-            "전일 종가를 확인할 수 없어 초회 매수 금액을 검증할 수 없습니다.\n"
+            "현재 세션의 가격 정보를 아직 확인하지 못해 시작금액을 확정할 수 없습니다.\n"
             "시세 정보를 확인한 뒤 다시 시도하십시오."
-        )
-    if reasons and reasons <= {"INITIAL_BUY_AMOUNT_BELOW_MINIMUM"}:
-        return (
-            "초회 매수 금액이 최소 거래금액보다 작습니다.\n"
-            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오."
         )
     if reasons and reasons <= {"INVALID_INITIAL_BUY_QUANTITY"}:
         return (
@@ -895,6 +1391,207 @@ def _start_failure_user_message(
         "현재 운영을 시작할 수 있는 종목이 없습니다.\n"
         "검토관리와 자동매매 설정을 확인하십시오."
     )
+
+
+_START_BLOCK_REASON_LABELS = {
+    "FINAL_SESSION_ENDED": "시간운영 종료",
+    "TIME_OPERATION_FINAL_END": "시간운영 종료",
+    "REVIEW_REQUIRED": "검토관리 필요",
+    "RECOVERY_NOT_READY": "복구 준비 미완료",
+    "RECOVERY_STOCK_PENDING": "복구 준비 미완료",
+    "RECOVERY_STOCK_FAILED": "복구 실패",
+    "RECOVERY_STOCK_REVIEW_REQUIRED": "복구 검토 필요",
+    "EMERGENCY_STOPPED": "긴급정지",
+    "CLOSE_LIQUIDATION_ACTIVE": "마감/청산 진행",
+    "ALREADY_RUNNING": "이미 운영중",
+}
+
+_START_BLOCK_REASON_SUMMARY_LABELS = {
+    "REVIEW_REQUIRED": "검토관리",
+    "RECOVERY_NOT_READY": "복구 미완료",
+    "RECOVERY_STOCK_PENDING": "복구 미완료",
+    "RECOVERY_STOCK_FAILED": "복구 실패",
+    "RECOVERY_STOCK_REVIEW_REQUIRED": "복구 검토",
+}
+
+
+def _blocked_target_groups_message(
+    blocked_target_details: tuple[dict[str, object], ...] | list[dict[str, object]],
+    *,
+    already_running_targets: tuple[tuple[Path, str, str], ...] = (),
+) -> str:
+    groups: dict[tuple[str, str], list[str]] = {}
+    for detail in blocked_target_details or ():
+        if not isinstance(detail, dict):
+            continue
+        reason = str(detail.get("reason") or "").strip() or "NOT_STARTABLE"
+        operation_mode = ""
+        if reason in {"FINAL_SESSION_ENDED", "TIME_OPERATION_FINAL_END"}:
+            operation_mode = normalize_operation_mode(
+                detail.get("operation_mode", "SCHEDULED")
+            )
+        label = str(detail.get("display_label") or "").strip()
+        if not label:
+            label = " ".join(
+                part
+                for part in (
+                    str(detail.get("stock_code") or "").strip(),
+                    str(detail.get("stock_name") or "").strip(),
+                )
+                if part
+            )
+        if label:
+            key = (reason, operation_mode)
+            groups.setdefault(key, [])
+            if label not in groups[key]:
+                groups[key].append(label)
+
+    lines: list[str] = []
+    if already_running_targets:
+        lines.append(f"운영중 유지: {len(already_running_targets)}종목")
+    for (reason, operation_mode), labels in groups.items():
+        title = (
+            "수동운영 최종 세션 종료"
+            if reason in {"FINAL_SESSION_ENDED", "TIME_OPERATION_FINAL_END"}
+            and operation_mode == "CONTINUOUS"
+            else _START_BLOCK_REASON_LABELS.get(reason, "운영 시작 불가")
+        )
+        lines.append(f"{title}: {len(labels)}종목")
+        lines.extend(f"- {label}" for label in labels)
+    return "\n".join(lines)
+
+
+def _blocked_target_reason_counts(
+    blocked_target_details: tuple[dict[str, object], ...] | list[dict[str, object]],
+) -> tuple[tuple[str, int], ...]:
+    groups: dict[tuple[str, str], set[str]] = {}
+    for index, detail in enumerate(blocked_target_details or ()):
+        if not isinstance(detail, dict):
+            continue
+        reason = str(detail.get("reason") or "").strip() or "NOT_STARTABLE"
+        operation_mode = ""
+        if reason in {"FINAL_SESSION_ENDED", "TIME_OPERATION_FINAL_END"}:
+            operation_mode = normalize_operation_mode(
+                detail.get("operation_mode", "SCHEDULED")
+            )
+        identity = str(detail.get("display_label") or "").strip()
+        if not identity:
+            identity = str(detail.get("stock_code") or "").strip()
+        if not identity:
+            identity = f"detail:{index}"
+        groups.setdefault((reason, operation_mode), set()).add(identity)
+
+    summaries: dict[str, int] = {}
+    for (reason, operation_mode), identities in groups.items():
+        if reason in {"FINAL_SESSION_ENDED", "TIME_OPERATION_FINAL_END"}:
+            title = (
+                "수동운영 종료"
+                if operation_mode == "CONTINUOUS"
+                else "시간운영 종료"
+            )
+        else:
+            title = _START_BLOCK_REASON_SUMMARY_LABELS.get(
+                reason,
+                _START_BLOCK_REASON_LABELS.get(reason, "운영 시작 불가"),
+            )
+        summaries[title] = summaries.get(title, 0) + len(identities)
+    return tuple(summaries.items())
+
+
+def operation_start_result_summary_toast_text(result: dict[str, object]) -> str:
+    """Project an existing batch result into the fixed four-field summary."""
+
+    blocked_target_details = tuple(
+        detail
+        for detail in result.get("blocked_target_details", ()) or ()
+        if isinstance(detail, dict)
+    )
+    already_running_targets = tuple(result.get("already_running_targets", ()) or ())
+    completed_targets = tuple(result.get("completed", ()) or ())
+    failed_targets = tuple(result.get("failed", ()) or ())
+    started_count = safe_int_value(
+        result.get("started_count"),
+        len(completed_targets),
+    )
+    blocked_count = safe_int_value(
+        result.get("blocked_count"),
+        len(blocked_target_details),
+    )
+    failed_count = safe_int_value(
+        result.get("failed_count"),
+        len(failed_targets),
+    )
+    already_running_count = safe_int_value(
+        result.get("already_running_count"),
+        len(already_running_targets),
+    )
+
+    requested_targets = tuple(result.get("requested", ()) or ())
+    target_count = safe_int_value(
+        result.get("requested_count"),
+        len(requested_targets)
+        or started_count + already_running_count + blocked_count + failed_count,
+    )
+    unavailable_count = max(0, target_count - already_running_count - started_count)
+    parts = [
+        f"대상종목 {target_count}",
+        f"기운영중 {already_running_count}",
+        f"운영시작 {started_count}",
+        f"운영불가 {unavailable_count}",
+    ]
+
+    reason_counts = _blocked_target_reason_counts(blocked_target_details)
+    if not reason_counts:
+        return "  |  ".join(parts)
+    reason_line = " · ".join(f"{title} {count}" for title, count in reason_counts)
+    return f"{'  |  '.join(parts)}\n{reason_line}"
+
+
+
+def _show_operation_start_summary_toast(
+    window,
+    result: dict[str, object],
+) -> None:
+    """Show the canonical multi-start result without a completion dialog."""
+
+    message = operation_start_result_summary_toast_text(result)
+    result["summary_toast_message"] = message
+    _record_operation_start_p3_result(window, result)
+    status_message = getattr(window, "statusBarMessage", None)
+    has_partial_result = any(
+        safe_int_value(result.get(key), 0)
+        for key in (
+            "blocked_count",
+            "already_running_count",
+            "excluded_review_count",
+            "excluded_validation_count",
+            "failed_count",
+        )
+    )
+    if has_partial_result and callable(status_message):
+        status_message(str(result.get("user_message") or message))
+
+    parent_getter = getattr(window, "operation_message_parent", None)
+    parent = parent_getter() if callable(parent_getter) else window
+    if not isinstance(parent, QWidget):
+        return
+    show_toast(
+        parent=parent,
+        message=message,
+        duration_ms=3200 if "\n" in message else 2000,
+        position="center",
+    )
+
+
+def _start_target_block_details(window) -> tuple[dict[str, object], ...]:
+    getter = getattr(window, "start_target_block_details", None)
+    if not callable(getter):
+        return ()
+    try:
+        details = getter()
+    except Exception:
+        return ()
+    return tuple(dict(item) for item in details or () if isinstance(item, dict))
 
 
 def _all_start_targets_emergency_stopped(
@@ -952,15 +1649,10 @@ def _single_start_failure_user_message(
             f"{label}의 필수 운영 설정이 완료되지 않았습니다.\n"
             "자동매매 설정을 확인한 뒤 다시 시도하십시오."
         )
-    if reason == "PREVIOUS_CLOSE_UNAVAILABLE":
+    if reason == "STARTING_BUDGET_UNRESOLVED":
         return (
-            f"{label}의 전일 종가를 확인할 수 없습니다.\n"
+            f"{label}의 현재 세션 가격 정보를 아직 확인하지 못해 시작금액을 확정할 수 없습니다.\n"
             "시세 정보를 확인한 뒤 다시 시도하십시오."
-        )
-    if reason == "INITIAL_BUY_AMOUNT_BELOW_MINIMUM":
-        return (
-            f"{label}의 초회 매수 금액이 최소 거래금액보다 작습니다.\n"
-            "전일 종가의 150% 이상으로 설정한 뒤 다시 시도하십시오."
         )
     if reason == "INVALID_INITIAL_BUY_QUANTITY":
         return (
@@ -993,6 +1685,8 @@ def _single_start_failure_user_message(
         )
     if reason == "NORMAL_ENDED":
         return "오늘의 정상 운영이 이미 종료되었습니다.\n다음 거래일에 운영을 시작하십시오."
+    if reason in {"FINAL_SESSION_ENDED", "TIME_OPERATION_FINAL_END"}:
+        return f"{subject} 시간운영 종료로 운영을 시작할 수 없습니다."
     if reason == "OUTSIDE_OPERATION_TIME":
         return f"{subject} 현재 운영시작 가능 시간이 아닙니다."
     if reason == "HOLDING_EXISTS":
@@ -1147,21 +1841,39 @@ def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _positive_price(source: dict[str, object], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        value = source.get(key)
-        try:
-            price = abs(float(str(value).replace(",", "").strip()))
-        except (TypeError, ValueError):
-            continue
-        if price > 0:
-            return price
-    return None
+def _positive_int_amount(value: object) -> int | None:
+    try:
+        amount = int(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return amount if amount > 0 else None
+
+
+def _operation_start_resolved_starting_budget(
+    window,
+    stock_dir: Path,
+    code: str,
+    name: str,
+    config: dict[str, object],
+) -> int | None:
+    stock = {
+        "code": str(code or "").strip(),
+        "name": str(name or "").strip(),
+        "stock_path": str(Path(stock_dir)),
+    }
+    try:
+        amount = main_stock_resolved_starting_budget(window, stock, config)
+    except Exception:
+        LOGGER.exception("시작금액 resolved budget 확인 실패: %s %s", code, name)
+        return None
+    return _positive_int_amount(amount)
 
 
 def initial_buy_start_validation(
     config: dict[str, object],
     state: dict[str, object],
+    *,
+    resolved_starting_budget: object = None,
 ) -> dict[str, object]:
     mode = str(config.get("trade_amount_type", "QUANTITY") or "").strip().upper()
     if mode in {"QUANTITY", "QTY", "SHARES", "SHARE", "주수"}:
@@ -1176,49 +1888,38 @@ def initial_buy_start_validation(
             "configured_value": quantity,
         }
 
-    previous_close = _positive_price(
-        state,
-        (
-            "previous_close",
-            "prev_close",
-            "yesterday_close",
-            "previous_close_price",
-        ),
-    )
-    if previous_close is None:
-        previous_close = _positive_price(
-            config,
-            (
-                "previous_close",
-                "prev_close",
-                "yesterday_close",
-                "previous_close_price",
-            ),
-        )
-    if previous_close is None:
-        return {
-            "allowed": False,
-            "reason": "PREVIOUS_CLOSE_UNAVAILABLE",
-            "mode": "AMOUNT",
-            "configured_value": max(0, int(config.get("buy_amount", 0) or 0)),
-        }
-
     try:
         configured_amount = max(0, int(config.get("buy_amount", 0) or 0))
     except (TypeError, ValueError):
         configured_amount = 0
-    minimum_amount = int(math.ceil(previous_close * 1.5))
+    if configured_amount > 0:
+        return {
+            "allowed": True,
+            "reason": "",
+            "mode": "AMOUNT",
+            "configured_value": configured_amount,
+            "resolved_starting_budget": configured_amount,
+            "starting_budget_source": "explicit",
+        }
+
+    resolved_amount = _positive_int_amount(resolved_starting_budget)
+    if resolved_amount is None:
+        return {
+            "allowed": False,
+            "reason": "STARTING_BUDGET_UNRESOLVED",
+            "mode": "AMOUNT",
+            "configured_value": configured_amount,
+            "resolved_starting_budget": None,
+            "starting_budget_source": "fresh_current_price",
+        }
+
     return {
-        "allowed": configured_amount >= minimum_amount,
-        "reason": (
-            ""
-            if configured_amount >= minimum_amount
-            else "INITIAL_BUY_AMOUNT_BELOW_MINIMUM"
-        ),
+        "allowed": True,
+        "reason": "",
         "mode": "AMOUNT",
         "configured_value": configured_amount,
-        "previous_close": previous_close,
-        "minimum_amount": minimum_amount,
+        "resolved_starting_budget": resolved_amount,
+        "starting_budget_source": "fresh_current_price",
     }
 
 
@@ -1365,6 +2066,7 @@ def auto_trade_start_selected_auto_trades(
     request_scope: str = START_REQUEST_MULTIPLE,
     selected_targets: list[tuple[Path, str, str]] | None = None,
     source: str = "",
+    already_running_targets: list[tuple[Path, str, str]] | tuple[tuple[Path, str, str], ...] = (),
 ) -> dict[str, object]:
     setattr(window, "_last_operation_failure_dialog_shown", False)
     request_scope = (
@@ -1414,13 +2116,33 @@ def auto_trade_start_selected_auto_trades(
         unique_selected.append((Path(stock_dir), str(code), str(name)))
     selected = unique_selected
 
+    unique_running: list[tuple[Path, str, str]] = []
+    running_keys: set[str] = set()
+    for stock_dir, code, name in already_running_targets or ():
+        key = str(code or "").strip() or str(Path(stock_dir).resolve())
+        if key in running_keys:
+            continue
+        running_keys.add(key)
+        unique_running.append((Path(stock_dir), str(code), str(name)))
+    already_running_targets = tuple(unique_running)
+    reporting_selected = list(already_running_targets) + list(selected)
+    start_request_context_targets = (
+        reporting_selected if already_running_targets else selected
+    )
+
     if request_scope == START_REQUEST_SINGLE and len(selected) != 1:
         request_scope = START_REQUEST_MULTIPLE
 
     operation_state = read_operation_state()
     request_now = current_datetime()
-    if _today_normal_ended(operation_state, request_now):
-        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+    start_source = str(source or "").strip()
+    per_stock_restart_source = start_source in {
+        "auto_trade_context_menu",
+        "main_monitoring_window",
+        "auto_trade_status_indicator",
+    }
+    if not per_stock_restart_source and _today_normal_ended(operation_state, request_now):
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in reporting_selected)
         result = {
             "ok": False,
             "reason": "NORMAL_ENDED",
@@ -1449,7 +2171,7 @@ def auto_trade_start_selected_auto_trades(
         _apply_start_request_context(
             result,
             request_scope=request_scope,
-            selected=selected,
+            selected=start_request_context_targets,
             request_source=source,
             global_failure=True,
         )
@@ -1457,7 +2179,7 @@ def auto_trade_start_selected_auto_trades(
         return result
 
     if is_emergency_stop(operation_state):
-        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in reporting_selected)
         result = {
             "ok": False,
             "reason": "GLOBAL_EMERGENCY_STOP",
@@ -1497,7 +2219,7 @@ def auto_trade_start_selected_auto_trades(
         action="운영시작",
     )
     if global_prerequisite is not None:
-        requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+        requested = tuple(f"{code} {name}" for _stock_dir, code, name in reporting_selected)
         reason = str(global_prerequisite.get("reason") or "GLOBAL_PREREQUISITE_NOT_READY")
         result = {
             "ok": False,
@@ -1552,10 +2274,11 @@ def auto_trade_start_selected_auto_trades(
         _show_start_failure_once(window, result)
         return result
 
-    requested = tuple(f"{code} {name}" for _stock_dir, code, name in selected)
+    requested = tuple(f"{code} {name}" for _stock_dir, code, name in reporting_selected)
     review_checker = getattr(window, "start_target_is_review_isolated", None)
     candidate_targets: list[tuple[Path, str, str]] = []
     excluded_review: list[str] = []
+    blocked_target_details: list[dict[str, object]] = []
     for stock_dir, code, name in selected:
         isolated = (
             bool(review_checker(stock_dir, code))
@@ -1564,11 +2287,21 @@ def auto_trade_start_selected_auto_trades(
         )
         if isolated:
             excluded_review.append(f"{code} {name}")
+            blocked_target_details.append(
+                {
+                    "stock_code": str(code),
+                    "stock_name": str(name),
+                    "reason": "REVIEW_REQUIRED",
+                    "display_label": f"{code} {name}".strip(),
+                }
+            )
         else:
             candidate_targets.append((stock_dir, code, name))
 
     try:
         start_targets, skipped = window.split_start_targets(candidate_targets)
+        blocked_target_details.extend(_start_target_block_details(window))
+        blocked_target_details = tuple(blocked_target_details)
     except Exception:
         LOGGER.exception("운영 시작 대상 분류 실패")
         result = {
@@ -1579,6 +2312,7 @@ def auto_trade_start_selected_auto_trades(
                 "화면을 새로고침한 뒤 다시 시도하십시오."
             ),
             "requested": requested,
+            "requested_count": len(requested),
             "excluded_review": tuple(excluded_review),
             "eligible": (),
             "completed": (),
@@ -1614,74 +2348,77 @@ def auto_trade_start_selected_auto_trades(
                 all_emergency=_all_start_targets_emergency_stopped(selected),
                 all_review=all_review,
                 all_already_running=all_already_running,
+                blocked_target_details=blocked_target_details,
+                already_running_targets=already_running_targets,
             ),
             "requested": requested,
+            "requested_count": len(requested),
             "excluded_review": tuple(excluded_review),
             "eligible": (),
             "completed": (),
             "blocked_validation": (),
             "failed": (),
             "skipped": tuple(skipped),
+            "blocked_target_details": blocked_target_details,
+            "already_running_targets": already_running_targets,
+            "blocked_count": len(blocked_target_details),
+            "already_running_count": len(already_running_targets),
+            "eligible_count": 0,
+            "started_count": 0,
+            "excluded_review_count": len(excluded_review),
+            "excluded_validation_count": 0,
+            "failed_count": 0,
+            "global_failure_reason": "",
+            "internal_reason": tuple(
+                dict.fromkeys(
+                    str(detail.get("reason") or "NOT_STARTABLE")
+                    for detail in blocked_target_details
+                )
+            ),
+            "time_eligible_targets": (),
+            "time_blocked_targets": tuple(
+                str(detail.get("display_label") or "").strip()
+                for detail in blocked_target_details
+                if str(detail.get("display_label") or "").strip()
+            ),
+            "operation": "START",
         }
         _apply_start_request_context(
             result,
             request_scope=request_scope,
-            selected=selected,
+            selected=start_request_context_targets,
             request_source=source,
             stock_failure_reason=(
                 "REVIEW_REQUIRED"
                 if all_review
-                else ("ALREADY_RUNNING" if all_already_running else "NOT_STARTABLE")
+                else (
+                    "ALREADY_RUNNING"
+                    if all_already_running
+                    else str(
+                        blocked_target_details[0].get("reason")
+                        if len(blocked_target_details) == 1
+                        else "NOT_STARTABLE"
+                    )
+                )
             ),
         )
-        _show_start_failure_once(window, result)
+        try:
+            refresh_auto_trade_views(window)
+            window.stock_table.viewport().update()
+            window.stock_table.repaint()
+        except Exception:
+            LOGGER.exception("운영 시작 차단 후 화면 새로고침 실패")
+        _refresh_start_button_state(window)
+        if request_scope != START_REQUEST_SINGLE and blocked_target_details:
+            _show_operation_start_summary_toast(window, result)
+        else:
+            _show_start_failure_once(window, result)
         return result
 
-    time_eligible_targets: list[tuple[Path, str, str]] = []
+    # Operation Start establishes participation and may run before or between
+    # actual trading sessions. Order permission owns the fail-closed time gate.
+    time_eligible_targets: list[tuple[Path, str, str]] = list(start_targets)
     time_blocked_targets: list[str] = []
-    time_pending_validation: list[tuple[Path, str, str]] = []
-    for target in start_targets:
-        stock_dir, code, name = target
-        config_path = stock_dir / "config.json"
-        state_path = stock_dir / "state.json"
-        config = read_json_dict(config_path)
-        state = read_json_dict(state_path)
-        if not config_path.exists() or not config or not state_path.exists() or not state:
-            time_pending_validation.append(target)
-            continue
-        if not auto_trade_operation_time_allowed(config, now_dt=request_now):
-            time_blocked_targets.append(f"{code} {name}")
-            continue
-        time_eligible_targets.append(target)
-
-    start_targets = time_eligible_targets + time_pending_validation
-    if not start_targets and time_blocked_targets:
-        result = {
-            "ok": False,
-            "reason": "NO_STARTABLE_TARGETS",
-            "user_message": _start_failure_user_message(
-                ["OUTSIDE_OPERATION_TIME"],
-            ),
-            "requested": requested,
-            "excluded_review": tuple(excluded_review),
-            "eligible": tuple(time_blocked_targets),
-            "completed": (),
-            "blocked_validation": (),
-            "failed": tuple(time_blocked_targets),
-            "skipped": tuple(skipped),
-            "time_eligible_targets": (),
-            "time_blocked_targets": tuple(time_blocked_targets),
-        }
-        _apply_start_request_context(
-            result,
-            request_scope=request_scope,
-            selected=selected,
-            request_source=source,
-            stock_failure_reason="OUTSIDE_OPERATION_TIME",
-            global_failure=True,
-        )
-        _show_start_failure_once(window, result)
-        return result
 
     recovery_filter = getattr(window, "filter_start_targets_by_recovery", None)
     if callable(recovery_filter):
@@ -1711,14 +2448,28 @@ def auto_trade_start_selected_auto_trades(
                 request_source=source,
                 global_failure=True,
             )
-            _show_start_failure_once(window, result)
+            if request_scope != START_REQUEST_SINGLE and blocked_target_details:
+                _show_operation_start_summary_toast(window, result)
+            else:
+                _show_start_failure_once(window, result)
             return result
         excluded_review.extend(
             str(item)
             for item in recovery_result.get("excluded_review", ())
             if str(item) and str(item) not in excluded_review
         )
+        recovery_block_details = tuple(
+            dict(item)
+            for item in recovery_result.get("blocked_target_details", ())
+            if isinstance(item, dict)
+        )
+        if recovery_block_details:
+            blocked_target_details = tuple(blocked_target_details) + recovery_block_details
         if recovery_result.get("allowed") is not True:
+            grouped_recovery_message = _blocked_target_groups_message(
+                blocked_target_details,
+                already_running_targets=already_running_targets,
+            )
             result = {
                 "ok": False,
                 "reason": str(
@@ -1727,7 +2478,9 @@ def auto_trade_start_selected_auto_trades(
                     or "RECOVERY_NOT_READY"
                 ),
                 "user_message": str(
-                    recovery_result.get("user_message") or ""
+                    grouped_recovery_message
+                    or recovery_result.get("user_message")
+                    or ""
                 ).strip(),
                 "requested": requested,
                 "excluded_review": tuple(excluded_review),
@@ -1736,6 +2489,10 @@ def auto_trade_start_selected_auto_trades(
                 "blocked_validation": (),
                 "failed": (),
                 "skipped": tuple(skipped),
+                "blocked_target_details": tuple(blocked_target_details),
+                "already_running_targets": already_running_targets,
+                "blocked_count": len(blocked_target_details),
+                "already_running_count": len(already_running_targets),
             }
             recovery_reason = str(result["reason"])
             _apply_start_request_context(
@@ -1746,7 +2503,10 @@ def auto_trade_start_selected_auto_trades(
                 stock_failure_reason=recovery_reason,
                 global_failure=not recovery_reason.startswith("RECOVERY_STOCK_"),
             )
-            _show_start_failure_once(window, result)
+            if request_scope != START_REQUEST_SINGLE and blocked_target_details:
+                _show_operation_start_summary_toast(window, result)
+            else:
+                _show_start_failure_once(window, result)
             return result
         start_targets = list(recovery_result.get("eligible", ()))
     else:
@@ -1792,25 +2552,35 @@ def auto_trade_start_selected_auto_trades(
                 all_emergency=_all_start_targets_emergency_stopped(selected),
                 all_review=bool(excluded_review),
                 time_eligible_targets=bool(time_eligible_targets),
+                blocked_target_details=blocked_target_details,
+                already_running_targets=already_running_targets,
             ),
             "requested": requested,
+            "requested_count": len(requested),
             "excluded_review": tuple(excluded_review),
             "eligible": (),
             "completed": (),
             "blocked_validation": (),
             "failed": (),
             "skipped": tuple(skipped),
+            "blocked_target_details": blocked_target_details,
+            "already_running_targets": already_running_targets,
+            "blocked_count": len(blocked_target_details),
+            "already_running_count": len(already_running_targets),
             "time_eligible_targets": tuple(time_eligible_targets),
             "time_blocked_targets": tuple(time_blocked_targets),
         }
         _apply_start_request_context(
             result,
             request_scope=request_scope,
-            selected=selected,
+            selected=start_request_context_targets,
             request_source=source,
             stock_failure_reason="REVIEW_REQUIRED",
         )
-        _show_start_failure_once(window, result)
+        if request_scope != START_REQUEST_SINGLE and blocked_target_details:
+            _show_operation_start_summary_toast(window, result)
+        else:
+            _show_start_failure_once(window, result)
         return result
 
     eligible = tuple(f"{code} {name}" for _stock_dir, code, name in start_targets)
@@ -1862,7 +2632,18 @@ def auto_trade_start_selected_auto_trades(
             failure_reasons.append("RUNTIME_DAMAGED")
             continue
         try:
-            validation = initial_buy_start_validation(config, state)
+            resolved_starting_budget = _operation_start_resolved_starting_budget(
+                window,
+                stock_dir,
+                code,
+                name,
+                config,
+            )
+            validation = initial_buy_start_validation(
+                config,
+                state,
+                resolved_starting_budget=resolved_starting_budget,
+            )
         except Exception:
             LOGGER.exception("초회 매수 기준 검증 실패: %s %s", code, name)
             failed.append(f"{code} {name}")
@@ -2013,12 +2794,6 @@ def auto_trade_start_selected_auto_trades(
         except Exception:
             LOGGER.exception("운영 시작 결과 로그 기록 실패")
 
-    try:
-        refresh_auto_trade_views(window)
-        window.stock_table.viewport().update()
-        window.stock_table.repaint()
-    except Exception:
-        LOGGER.exception("운영 시작 후 화면 새로고침 실패")
     if completed or review_required:
         rebind_recovery = getattr(
             window,
@@ -2028,13 +2803,10 @@ def auto_trade_start_selected_auto_trades(
         if callable(rebind_recovery):
             rebind_recovery()
 
-    result_lines = [
-        f"운영시작: {len(completed)}개",
-        f"기운영중: {len(skipped)}개",
-        f"검토 대상 제외: {len(excluded_review)}개",
-        f"검토관리 이동: {len(review_required)}개",
-        f"실패: {len(failed)}개",
-    ]
+    grouped_result_message = _blocked_target_groups_message(
+        blocked_target_details,
+        already_running_targets=already_running_targets,
+    )
 
     excluded_review_count = len(excluded_review) + len(review_required)
     excluded_validation_count = len(validation_blocked)
@@ -2054,10 +2826,15 @@ def auto_trade_start_selected_auto_trades(
         "review_required": tuple(review_required),
         "failed": tuple(failed),
         "skipped": tuple(skipped),
+        "blocked_target_details": blocked_target_details,
+        "already_running_targets": already_running_targets,
+        "blocked_count": len(blocked_target_details),
+        "already_running_count": len(already_running_targets),
         "time_eligible_targets": tuple(time_eligible_targets),
         "time_blocked_targets": tuple(time_blocked_targets),
         "operation": "START",
         "requested_count": len(requested),
+        "eligible_count": len(eligible),
         "started_count": len(completed),
         "excluded_review_count": excluded_review_count,
         "excluded_validation_count": excluded_validation_count,
@@ -2095,10 +2872,17 @@ def auto_trade_start_selected_auto_trades(
         result["operation_host_start_result"] = (
             _start_operation_host_after_explicit_operation_start(window)
         )
+    try:
+        refresh_auto_trade_views(window)
+        window.stock_table.viewport().update()
+        window.stock_table.repaint()
+    except Exception:
+        LOGGER.exception("운영 시작 후 화면 새로고침 실패")
+    _refresh_start_button_state(window)
     _apply_start_request_context(
         result,
         request_scope=request_scope,
-        selected=selected,
+        selected=start_request_context_targets,
         request_source=source,
         stock_failure_reason=(failure_reasons[0] if failure_reasons else ""),
     )
@@ -2125,10 +2909,6 @@ def auto_trade_start_selected_auto_trades(
             reason_code="GLOBAL_OPERATION_STATE_WRITE_FAILED",
             details={"stage": "operation_start_global_state_write"},
         )
-        if result.get("operation_state_write_failed"):
-            result_lines.append(
-                "전역 운영 상태 기록 실패: 종목 시작 상태는 유지됩니다."
-            )
         if request_scope != START_REQUEST_SINGLE:
             result["user_message"] = _start_result_summary(
                 started_count=len(completed),
@@ -2136,6 +2916,10 @@ def auto_trade_start_selected_auto_trades(
                 excluded_validation_count=excluded_validation_count,
                 failed_count=non_validation_failed_count,
             )
+            if grouped_result_message:
+                result["user_message"] = (
+                    f"{result['user_message']}\n\n{grouped_result_message}"
+                )
         result["user_action"] = ""
         if request_scope == START_REQUEST_SINGLE:
             window.statusBarMessage(str(result["user_message"]))
@@ -2143,18 +2927,12 @@ def auto_trade_start_selected_auto_trades(
                 window.statusBarMessage(
                     "전역 운영 상태 기록에 실패했습니다. 로그를 확인하십시오."
                 )
-        elif excluded_review_count or excluded_validation_count or non_validation_failed_count or skipped:
-            window.statusBarMessage(str(result["user_message"]))
+        else:
+            _show_operation_start_summary_toast(window, result)
             if result.get("operation_state_write_failed"):
                 window.statusBarMessage(
                     "전역 운영 상태 기록에 실패했습니다. 로그를 확인하십시오."
                 )
-        else:
-            window.show_auto_trade_result_dialog(
-                "운영시작 처리 완료",
-                "운영시작 결과",
-                result_lines,
-            )
     else:
         if request_scope != START_REQUEST_SINGLE:
             result["user_message"] = _start_failure_user_message(
@@ -2162,6 +2940,8 @@ def auto_trade_start_selected_auto_trades(
                 all_emergency=_all_start_targets_emergency_stopped(selected),
                 all_review=bool(review_required) and not failed,
                 time_eligible_targets=bool(time_eligible_targets),
+                blocked_target_details=blocked_target_details,
+                already_running_targets=already_running_targets,
             )
         result["user_action"] = str(result["user_message"]).splitlines()[-1]
         result["global_failure_reason"] = str(result["reason"])
@@ -2219,10 +2999,7 @@ def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | No
                     continue
                 set_auto_trade_stock_operation_excluded(stock_dir, True)
             refresh_auto_trade_views(window)
-            status_message = getattr(window, "statusBarMessage", None)
-            if callable(status_message):
-                status_message("정상 운영시작 되었습니다.")
-        window.update_global_operation_button_state()
+        _refresh_start_button_state(window)
         return result
 
     selected_running: list[tuple[Path, str, str]] = []
@@ -2236,16 +3013,28 @@ def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | No
             selected_inactive.append(target)
 
     if selected_running and not selected_inactive:
-        status_message = getattr(window, "statusBarMessage", None)
-        if callable(status_message):
-            status_message("운영중인 종목입니다.")
-        return {"ok": False, "reason": "ALREADY_RUNNING"}
-
-    if selected_running and selected_inactive:
-        status_message = getattr(window, "statusBarMessage", None)
-        if callable(status_message):
-            status_message("운영중인 종목이 포함되어 있습니다.")
-        return {"ok": False, "reason": "MIXED_RUNNING_SELECTION"}
+        result = {
+            "ok": False,
+            "reason": "ALREADY_RUNNING",
+            "user_message": "선택한 종목이 모두 이미 운영 중입니다.",
+            "requested": tuple(
+                f"{code} {name}".strip()
+                for _stock_dir, code, name in selected_targets
+            ),
+            "requested_count": len(selected_targets),
+            "completed": (),
+            "blocked_target_details": (),
+            "already_running_targets": tuple(selected_running),
+            "blocked_count": 0,
+            "already_running_count": len(selected_running),
+            "started_count": 0,
+            "failed_count": 0,
+            "excluded_review_count": 0,
+            "excluded_validation_count": 0,
+        }
+        _show_operation_start_summary_toast(window, result)
+        _refresh_start_button_state(window)
+        return result
 
     start_targets: list[tuple[Path, str, str]] = []
     for target in selected_inactive:
@@ -2266,13 +3055,25 @@ def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | No
         request_scope="multiple",
         selected_targets=start_targets,
         source="auto_trade_context_menu",
+        already_running_targets=selected_running,
     )
-    if result.get("ok") is True:
-        status_message = getattr(window, "statusBarMessage", None)
-        if callable(status_message):
-            status_message("정상 운영시작 되었습니다.")
-    window.update_global_operation_button_state()
+    _refresh_start_button_state(window)
     return result
+
+
+def _refresh_start_button_state(window) -> None:
+    updater = getattr(window, "update_global_operation_button_state", None)
+    if not callable(updater):
+        return
+    owner = getattr(window, "_window", window)
+    try:
+        getattr(owner, "btn_start")
+    except Exception:
+        return
+    try:
+        updater()
+    except Exception:
+        LOGGER.exception("운영시작 후 전역 버튼 상태 갱신 실패")
 
 
 def auto_trade_start_status_indicator(

@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from stock_code_contract import is_valid_stock_code as canonical_is_valid_stock_code
+
 from gui_auto_trade_integrity import auto_trade_setting_data_inconsistency_reasons
 
 try:
@@ -75,7 +77,7 @@ def normalize_routine_name(value: object) -> str:
 
 
 def is_valid_stock_code(code: str) -> bool:
-    return code.isdigit() and len(code) == 6 and code != "000000"
+    return canonical_is_valid_stock_code(code)
 def read_json_safely(path: Path) -> tuple[bool, object | None, str]:
     try:
         return True, json.loads(path.read_text(encoding="utf-8")), ""
@@ -565,7 +567,7 @@ def run_local_stock_integrity_check(project_root: Path) -> dict[str, object]:
                 _standard_issue(
                     issue_code="STOCK_CODE_FORMAT",
                     message=f"Invalid stock code: {code}",
-                    recommended_action="Use a six-digit numeric stock code other than 000000.",
+                    recommended_action="Use a canonical six-character uppercase alphanumeric stock code.",
                     source_path=stock_dir,
                     project_root=root,
                     stock_code=stock_code,

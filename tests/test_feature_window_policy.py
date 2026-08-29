@@ -147,7 +147,7 @@ class FeatureWindowPolicyTests(unittest.TestCase):
         from gui_operation_environment import OperationEnvironmentSettingsDialog
         from gui_order_status_window import OrderStatusWindow
         from gui_review_required_window import GlobalReviewRequiredWindow
-        from gui_stock_performance_window import StockPerformancePrototypeWindow
+        from gui_stock_performance_window import StockPerformanceWindow
         from gui_stock_register_window import StockRegisterWindow
 
         owner = QMainWindow()
@@ -168,7 +168,7 @@ class FeatureWindowPolicyTests(unittest.TestCase):
                 OrderStatusWindow(stock_dir, "routine", "005930", "Samsung", owner),
                 GlobalReviewRequiredWindow(owner),
                 StockRegisterWindow(owner),
-                StockPerformancePrototypeWindow(owner),
+                StockPerformanceWindow(owner),
                 OperationEnvironmentSettingsDialog(owner),
                 EventRecordPrototypeWindow(owner),
             ]

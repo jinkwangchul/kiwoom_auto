@@ -6,6 +6,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from stock_code_contract import is_broker_action_stock_code
+
 
 STATUS_SAFE = "SEND_ORDER_SAFE"
 STATUS_BLOCKED = "BLOCKED"
@@ -132,6 +134,8 @@ def _validate_params(params: dict[str, Any]) -> str | None:
 
     if params.get("order_type") not in VALID_ORDER_TYPES:
         return "send_order_params.order_type is invalid"
+    if not is_broker_action_stock_code(params.get("code")):
+        return "send_order_params.code broker support is unconfirmed"
     if _text(params.get("hoga")) not in VALID_HOGAS:
         return "send_order_params.hoga is invalid"
     if not _positive_number(params.get("quantity")):

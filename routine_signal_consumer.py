@@ -10,7 +10,7 @@ but it never mutates orders.json, calls an executor, or sends an order.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterable
 
 from routine_signal_order_bridge import (
     dry_run_order_manager_for_signal_with_payload_preview,
@@ -398,9 +398,14 @@ def consume_pending_routine_signals_dry_run(
     mark_previewed: bool = False,
     write_order_queue: bool = False,
     apply_approval: bool = False,
+    allowed_stock_codes: Iterable[Any] | None = None,
+    signal_cutoff_by_stock_code: dict[Any, Any] | None = None,
 ) -> dict[str, Any]:
     """Consume pending routine signals in memory with OrderManager + payload preview."""
-    signals = load_pending_routine_signals()
+    signals = load_pending_routine_signals(
+        allowed_stock_codes=allowed_stock_codes,
+        signal_cutoff_by_stock_code=signal_cutoff_by_stock_code,
+    )
     clean_limit = _clean_limit(limit)
     if clean_limit is not None:
         signals = signals[:clean_limit]

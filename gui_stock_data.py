@@ -12,8 +12,15 @@ gui_stock_data.py
 from __future__ import annotations
 
 import json
+import hashlib
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from stock_code_contract import (
+    is_valid_stock_code as canonical_is_valid_stock_code,
+    normalize_stock_code as canonical_normalize_stock_code,
+)
 
 try:
     from stock_repository import repository as stock_repository_factory
@@ -24,50 +31,105 @@ except Exception:
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
 STOCK_LIBRARY_PATH = PROJECT_ROOT / "stock_library.json"
+RUNTIME_STOCK_LIBRARY_PATH = PROJECT_ROOT / "runtime" / "stock_library.json"
+RUNTIME_STOCK_LIBRARY_META_PATH = PROJECT_ROOT / "runtime" / "stock_library_meta.json"
+
+STOCK_LIBRARY_NOT_SYNCED = "NOT_SYNCED"
+STOCK_LIBRARY_SYNCING = "SYNCING"
+STOCK_LIBRARY_READY = "READY"
+STOCK_LIBRARY_FAILED = "FAILED"
+STOCK_LIBRARY_RUNTIME_SOURCE = "RUNTIME_LIBRARY"
+STOCK_LIBRARY_EMPTY_SOURCE = "EMPTY"
+
+
+@dataclass(frozen=True)
+class StockLibraryLoadSnapshot:
+    state: str
+    source: str
+    records: tuple[dict[str, object], ...]
+    reason: str = ""
 
 
 def normalize_stock_code(code: str) -> str:
     """
     종목코드는 자동 보정하지 않고 앞뒤 공백만 제거한다.
     """
-    return str(code).strip()
+    return canonical_normalize_stock_code(code)
 
 
 def is_valid_stock_code(code: str) -> bool:
     """
     종목코드 기본 형식 검증.
     """
-    code_text = str(code).strip()
-    return code_text.isdigit() and len(code_text) == 6 and code_text != "000000"
+    return canonical_is_valid_stock_code(code)
 
 
-def load_stock_library() -> list[dict[str, str]]:
-    """
-    stock_library.json 을 읽어 검색 등록용 종목 목록으로 변환한다.
-    """
-    if not STOCK_LIBRARY_PATH.exists():
-        return []
-
+def _read_stock_library(path: Path, *, strict: bool) -> list[dict[str, object]] | None:
+    if not path.exists():
+        return None
     try:
-        data = json.loads(STOCK_LIBRARY_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return None
+    if not isinstance(data, list) or (strict and not data):
+        return None
 
-    if not isinstance(data, list):
-        return []
-
-    stocks: list[dict[str, str]] = []
+    stocks: list[dict[str, object]] = []
+    seen_codes: set[str] = set()
     for item in data:
         if not isinstance(item, dict):
+            if strict:
+                return None
             continue
 
-        code = str(item.get("code", "")).strip()
+        code = normalize_stock_code(item.get("code", ""))
         name = str(item.get("name", "")).strip()
         market = str(item.get("market", "")).strip()
         chosung = str(item.get("chosung", "")).strip()
+        nxt_available = item.get("nxt_available")
+        status_fields: dict[str, str] = {}
+        for field_name in (
+            "status",
+            "master_stock_state",
+            "master_construction",
+            "master_stock_info",
+            "master_stock_market_kind",
+            "classification",
+        ):
+            raw_value = item.get(field_name, "")
+            if raw_value is None:
+                raw_value = ""
+            if not isinstance(raw_value, str):
+                if strict:
+                    return None
+                raw_value = str(raw_value)
+            status_fields[field_name] = raw_value.strip()
+        if status_fields["classification"] not in {
+            "",
+            "-",
+            "일반종목",
+            "ETF",
+            "ETN",
+            "SPAC",
+            "REIT",
+            "기타",
+        }:
+            if strict:
+                return None
+            status_fields["classification"] = "-"
+        if nxt_available is not True and nxt_available is not False and nxt_available is not None:
+            if strict:
+                return None
+            nxt_available = None
 
-        if not code or not name:
+        if not is_valid_stock_code(code) or not name:
+            if strict:
+                return None
             continue
+        if strict and market not in {"KOSPI", "KOSDAQ"}:
+            return None
+        if strict and (not chosung or code in seen_codes):
+            return None
 
         stocks.append(
             {
@@ -75,14 +137,81 @@ def load_stock_library() -> list[dict[str, str]]:
                 "name": name,
                 "market": market,
                 "chosung": chosung,
+                "nxt_available": nxt_available,
+                **status_fields,
             }
         )
+        seen_codes.add(code)
 
-    return stocks
+    return stocks if stocks or not strict else None
+
+
+def _read_stock_library_metadata(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_stock_library_snapshot(project_root: Path | None = None) -> StockLibraryLoadSnapshot:
+    """Load only a verified runtime Master Library and expose its sync state."""
+    if project_root is None:
+        runtime_path = RUNTIME_STOCK_LIBRARY_PATH
+        metadata_path = RUNTIME_STOCK_LIBRARY_META_PATH
+    else:
+        root = Path(project_root)
+        runtime_path = root / "runtime" / "stock_library.json"
+        metadata_path = root / "runtime" / "stock_library_meta.json"
+
+    metadata = _read_stock_library_metadata(metadata_path)
+    sync_state = str(metadata.get("sync_state", "") or "").strip().upper()
+    if sync_state in {STOCK_LIBRARY_SYNCING, STOCK_LIBRARY_FAILED}:
+        return StockLibraryLoadSnapshot(
+            sync_state,
+            STOCK_LIBRARY_EMPTY_SOURCE,
+            (),
+            str(metadata.get("reason_code", "") or sync_state),
+        )
+    if sync_state != STOCK_LIBRARY_READY:
+        state = STOCK_LIBRARY_NOT_SYNCED if not sync_state else STOCK_LIBRARY_FAILED
+        return StockLibraryLoadSnapshot(
+            state,
+            STOCK_LIBRARY_EMPTY_SOURCE,
+            (),
+            "RUNTIME_SYNC_STATE_UNAVAILABLE" if not sync_state else "RUNTIME_SYNC_STATE_INVALID",
+        )
+
+    runtime_records = _read_stock_library(runtime_path, strict=True)
+    if runtime_records is None:
+        state = STOCK_LIBRARY_FAILED if runtime_path.exists() else STOCK_LIBRARY_NOT_SYNCED
+        return StockLibraryLoadSnapshot(state, STOCK_LIBRARY_EMPTY_SOURCE, (), "RUNTIME_CACHE_UNAVAILABLE")
+    expected_count = int(metadata.get("final_count", -1) or -1)
+    expected_hash = str(metadata.get("content_sha256", "") or "").strip().lower()
+    actual_hash = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+    if expected_count != len(runtime_records) or not expected_hash or expected_hash != actual_hash:
+        return StockLibraryLoadSnapshot(
+            STOCK_LIBRARY_FAILED,
+            STOCK_LIBRARY_EMPTY_SOURCE,
+            (),
+            "RUNTIME_CACHE_VERIFICATION_FAILED",
+        )
+    return StockLibraryLoadSnapshot(
+        STOCK_LIBRARY_READY,
+        STOCK_LIBRARY_RUNTIME_SOURCE,
+        tuple(runtime_records),
+    )
+
+
+def load_stock_library(project_root: Path | None = None) -> list[dict[str, object]]:
+    """Return the verified runtime Master Library; bundled fallback is fail-closed."""
+    return [dict(item) for item in load_stock_library_snapshot(project_root).records]
 
 
 
-def find_library_stock_by_code(code: str) -> dict[str, str] | None:
+def find_library_stock_by_code(code: str) -> dict[str, object] | None:
     """
     종목코드 기준으로 stock_library.json 의 종목을 찾는다.
     """

@@ -61,6 +61,7 @@ from gui_window_policy import (
 BUY_COLOR = QColor("#DC2626")
 SELL_COLOR = QColor("#2563EB")
 LINE_COLOR = QColor("#2F6BFF")
+LIVE_PRICE_COLOR = QColor("#059669")
 CHART_OPEN_STOCK_CODE_COLOR = "#2563EB"
 BASE_CHART_START_TIME = "09:00:00"
 BASE_CHART_END_TIME = "15:30:00"
@@ -914,6 +915,8 @@ class StockInstanceCloseChart(QWidget):
         self.close_series: list[tuple[datetime, float]] = []
         self.buy_series: list[tuple[datetime, float]] = []
         self.sell_series: list[tuple[datetime, float]] = []
+        self.live_price_point: tuple[datetime, float] | None = None
+        self.live_price_data_quality = ""
         self.fixed_time_range: tuple[datetime, datetime] | None = None
         self.visible_time_ranges: list[tuple[datetime, datetime]] = []
         self.timeframe_minutes: int | None = None
@@ -1009,6 +1012,37 @@ class StockInstanceCloseChart(QWidget):
         self.empty_message = str(empty_message or "표시할 기준봉 데이터가 없습니다.")
         self.update()
 
+    def set_live_price_projection(
+        self,
+        market_datetime: Any,
+        price: Any,
+        *,
+        data_quality: object = "NORMAL",
+    ) -> bool:
+        parsed_time = parse_market_datetime(market_datetime)
+        parsed_price = _finite_number(price)
+        if parsed_time is None or parsed_price is None or parsed_price <= 0:
+            return self.clear_live_price_projection()
+        projected = (parsed_time, parsed_price)
+        quality = str(data_quality or "").strip().upper() or "NORMAL"
+        if (
+            self.live_price_point == projected
+            and self.live_price_data_quality == quality
+        ):
+            return False
+        self.live_price_point = projected
+        self.live_price_data_quality = quality
+        self.update()
+        return True
+
+    def clear_live_price_projection(self) -> bool:
+        if self.live_price_point is None and not self.live_price_data_quality:
+            return False
+        self.live_price_point = None
+        self.live_price_data_quality = ""
+        self.update()
+        return True
+
     def _line_segments(self) -> list[list[tuple[datetime, float]]]:
         if not self.close_series:
             return []
@@ -1046,11 +1080,15 @@ class StockInstanceCloseChart(QWidget):
 
     def _scale_values(self) -> tuple[datetime, datetime, float, float] | None:
         time_range = self._time_range()
-        if not self.close_series or time_range is None:
+        if time_range is None:
             return None
         values = [value for _bar_time, value in self.close_series]
         values.extend(value for _bar_time, value in self.buy_series)
         values.extend(value for _bar_time, value in self.sell_series)
+        if self.live_price_point is not None:
+            values.append(self.live_price_point[1])
+        if not values:
+            return None
         low = min(values)
         high = max(values)
         if high == low:
@@ -1203,6 +1241,40 @@ class StockInstanceCloseChart(QWidget):
         )
         painter.setFont(self.font())
 
+    def _draw_live_price_projection(
+        self,
+        painter: QPainter,
+        plot: QRectF,
+    ) -> None:
+        if self.live_price_point is None:
+            return
+        market_datetime, price = self.live_price_point
+        point = self.position_for(market_datetime, price, plot)
+        if point is None or not plot.adjusted(-1, -1, 1, 1).contains(point):
+            return
+        painter.setPen(QPen(LIVE_PRICE_COLOR, 2))
+        painter.setBrush(self.palette().base())
+        painter.drawEllipse(point, 4.5, 4.5)
+        label = f"실시간 {self._price_text(price)}"
+        if self.live_price_data_quality == "UNCERTAIN":
+            label += " (UNCERTAIN)"
+        label_font = QFont(painter.font())
+        label_font.setPointSize(max(7, label_font.pointSize() - 1))
+        label_font.setWeight(QFont.Medium)
+        painter.setFont(label_font)
+        label_width = QFontMetrics(label_font).horizontalAdvance(label) + 8
+        label_height = QFontMetrics(label_font).height() + 2
+        x = min(point.x() + 8, plot.right() - label_width)
+        x = max(plot.left(), x)
+        y = max(plot.top(), point.y() - label_height - 6)
+        painter.setPen(LIVE_PRICE_COLOR)
+        painter.drawText(
+            QRectF(x, y, label_width, label_height),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            label,
+        )
+        painter.setFont(self.font())
+
     def paintEvent(self, _event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1281,6 +1353,7 @@ class StockInstanceCloseChart(QWidget):
                     SELL_COLOR,
                     above=False,
                 )
+        self._draw_live_price_projection(painter, plot)
 
 class StockInstanceChartWindow(QDialog):
     """Read-only common window backed only by project_stock_instance_day()."""
@@ -1307,6 +1380,8 @@ class StockInstanceChartWindow(QDialog):
         self._operation_cycle_signal = None
         self._operation_cycle_signal_owner = None
         self._operation_cycle_refresh_connected = False
+        self._live_price_operation_host = None
+        self._live_price_refresh_timer: QTimer | None = None
         self._operation_command_in_progress = False
         self._stock_operation_adapter = None
         self._title_stock_name = _stock_name_from_repository(self.stock_code)
@@ -1333,6 +1408,115 @@ class StockInstanceChartWindow(QDialog):
         self._setup_ui()
         self.refresh_projection()
         self._connect_operation_cycle_refresh()
+        self._start_live_price_refresh()
+
+    LIVE_PRICE_REFRESH_INTERVAL_MS = 333
+
+    def _find_live_price_operation_host(self):
+        current = persistent_feature_owner(self)
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            host = getattr(
+                current,
+                "_main_monitoring_auto_trade_operation_host",
+                None,
+            )
+            if host is None:
+                host_getter = getattr(
+                    current,
+                    "main_monitoring_auto_trade_operation_host",
+                    None,
+                )
+                if callable(host_getter):
+                    try:
+                        host = host_getter()
+                    except Exception:
+                        host = None
+            if all(
+                callable(getattr(host, method_name, None))
+                for method_name in (
+                    "price_signal_observation_enabled",
+                    "high_resolution_market_state",
+                    "high_resolution_market_data_snapshot",
+                )
+            ):
+                return host
+            parent_getter = getattr(current, "parent", None)
+            current = parent_getter() if callable(parent_getter) else None
+        return None
+
+    def _start_live_price_refresh(self) -> None:
+        if self.trade_date != _today_trade_date():
+            return
+        host = self._find_live_price_operation_host()
+        if host is None:
+            return
+        self._live_price_operation_host = host
+        timer = QTimer(self)
+        timer.setObjectName("stockInstanceChartLivePriceRefreshTimer")
+        timer.setInterval(self.LIVE_PRICE_REFRESH_INTERVAL_MS)
+        timer.timeout.connect(self.refresh_live_price_projection)
+        self._live_price_refresh_timer = timer
+        self.refresh_live_price_projection()
+        timer.start()
+
+    def _clear_live_price_projection(self) -> bool:
+        clear = getattr(self.chart, "clear_live_price_projection", None)
+        return bool(clear()) if callable(clear) else False
+
+    def refresh_live_price_projection(self) -> bool:
+        """Refresh only the UI live marker from process-local market state."""
+
+        if self.trade_date != _today_trade_date():
+            return self._clear_live_price_projection()
+        host = self._live_price_operation_host
+        if host is None:
+            return self._clear_live_price_projection()
+        try:
+            if not bool(host.price_signal_observation_enabled()):
+                return self._clear_live_price_projection()
+            snapshot = host.high_resolution_market_data_snapshot()
+            state = host.high_resolution_market_state(self.stock_code)
+        except Exception:
+            return self._clear_live_price_projection()
+        if state is None or snapshot is None:
+            return self._clear_live_price_projection()
+        if str(getattr(state, "stock_code", "") or "").strip() != self.stock_code:
+            return self._clear_live_price_projection()
+        if not bool(getattr(snapshot, "broker_connected", False)):
+            return self._clear_live_price_projection()
+        state_identity = (
+            int(getattr(state, "connection_epoch", 0) or 0),
+            str(getattr(state, "login_session_id", "") or "").strip(),
+        )
+        snapshot_identity = (
+            int(getattr(snapshot, "connection_epoch", 0) or 0),
+            str(getattr(snapshot, "login_session_id", "") or "").strip(),
+        )
+        if not state_identity[1] or state_identity != snapshot_identity:
+            return self._clear_live_price_projection()
+        market_datetime = parse_market_datetime(
+            getattr(state, "last_market_datetime", None)
+        )
+        if (
+            market_datetime is None
+            or market_datetime.date().isoformat() != self.trade_date
+        ):
+            return self._clear_live_price_projection()
+        price = _finite_number(getattr(state, "last_price", None))
+        if price is None or price <= 0:
+            return self._clear_live_price_projection()
+        apply_live = getattr(self.chart, "set_live_price_projection", None)
+        if not callable(apply_live):
+            return False
+        return bool(
+            apply_live(
+                market_datetime,
+                price,
+                data_quality=getattr(state, "data_quality", "NORMAL"),
+            )
+        )
 
     def _find_operation_cycle_signal(self):
         current = persistent_feature_owner(self)
@@ -1399,6 +1583,11 @@ class StockInstanceChartWindow(QDialog):
             self._disconnect_operation_cycle_refresh()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        live_timer = self._live_price_refresh_timer
+        if live_timer is not None:
+            live_timer.stop()
+        self._live_price_refresh_timer = None
+        self._live_price_operation_host = None
         self._disconnect_operation_cycle_refresh()
         owner = persistent_feature_owner(self)
         if _OPEN_STOCK_INSTANCE_CHARTS.get(self.stock_code) is self:
@@ -2000,24 +2189,31 @@ def open_stock_instance_chart(
 ) -> StockInstanceChartWindow:
     """Open or foreground the single live common chart for ``stock_code``."""
     registry_key = str(stock_code or "").strip()
+    requested_trade_date = str(trade_date or _today_trade_date()).strip()
     existing = _OPEN_STOCK_INSTANCE_CHARTS.get(registry_key)
     if existing is not None:
         try:
             reusable = not sip.isdeleted(existing) and existing.isVisible()
         except RuntimeError:
             reusable = False
-        if reusable:
+        existing_trade_date = str(getattr(existing, "trade_date", "") or "").strip()
+        if reusable and existing_trade_date == requested_trade_date:
             existing.show()
             existing.raise_()
             existing.activateWindow()
             existing.refresh_projection()
             _refresh_chart_open_code_views(parent or persistent_feature_owner(existing))
             return existing
+        if reusable:
+            try:
+                existing.close()
+            except Exception:
+                pass
         _OPEN_STOCK_INSTANCE_CHARTS.pop(registry_key, None)
 
     dialog = StockInstanceChartWindow(
         stock_code=registry_key,
-        trade_date=trade_date,
+        trade_date=requested_trade_date,
         parent=parent,
     )
     dialog.setAttribute(Qt.WA_DeleteOnClose, True)

@@ -16,15 +16,25 @@ from kiwoom_realtime_shadow import (
 )
 
 
-def _tick(time_text: str, price: object, volume: object):
+def _tick(
+    time_text: str,
+    price: object,
+    volume: object,
+    trade_volume: object = "+1",
+    *,
+    sequence: int = 1,
+):
     return normalize_realtime_shadow_tick(
         stock_code="005930",
         real_type="주식체결",
         execution_time_raw=time_text,
         current_price_raw=price,
         cumulative_volume_raw=volume,
+        trade_volume_raw=trade_volume,
         connection_epoch=7,
         login_session_id="SESSION-7",
+        receive_sequence=sequence,
+        received_monotonic=123.5,
         received_at=datetime(2026, 8, 20, 10, 0, tzinfo=SEOUL_TIMEZONE),
     )
 
@@ -55,9 +65,26 @@ class RealtimeShadowBarTests(unittest.TestCase):
         self.assertIsNotNone(tick)
         self.assertEqual(1234, tick.current_price)
         self.assertEqual(9876, tick.cumulative_volume)
+        self.assertEqual(1, tick.trade_volume_raw)
+        self.assertEqual(1, tick.trade_volume_abs)
+        self.assertEqual(1, tick.receive_sequence)
+        self.assertEqual(123.5, tick.received_monotonic)
         self.assertEqual("2026-08-20 10:15", tick.minute_key)
         self.assertIsNone(_tick("1015", "100", "1"))
         self.assertIsNone(_tick("101501", "bad", "1"))
+
+    def test_trade_volume_keeps_sign_and_invalid_value_is_not_zero(self) -> None:
+        buy = _tick("101501", 100, 1000, "+123")
+        sell = _tick("101501", 100, 1000, "-123")
+        invalid = _tick("101501", 100, 1000, "bad")
+        blank = _tick("101501", 100, 1000, "")
+
+        self.assertEqual((123, 123), (buy.trade_volume_raw, buy.trade_volume_abs))
+        self.assertEqual((-123, 123), (sell.trade_volume_raw, sell.trade_volume_abs))
+        self.assertIsNone(invalid.trade_volume_raw)
+        self.assertIsNone(invalid.trade_volume_abs)
+        self.assertIsNone(blank.trade_volume_raw)
+        self.assertIsNone(blank.trade_volume_abs)
 
     def test_same_minute_ohlc_and_rollover_finalize_exactly_once(self) -> None:
         builder = RealtimeShadowBarBuilder()

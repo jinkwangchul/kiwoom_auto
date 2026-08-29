@@ -149,11 +149,10 @@ class PerformanceScopeProjectionTests(unittest.TestCase):
 
         all_row = projection.project_stocks(PerformanceScope.ALL)[0]
         current_row = projection.project_stocks(PerformanceScope.CURRENT)[0]
-        past_row = projection.project_stocks(PerformanceScope.PAST)[0]
 
         self.assertEqual(180, all_row.lifetime.gross_pnl)
         self.assertEqual(all_row.lifetime, current_row.lifetime)
-        self.assertEqual(all_row.lifetime, past_row.lifetime)
+        self.assertEqual((), projection.project_stocks(PerformanceScope.PAST))
         self.assertEqual("STOCK_LIFETIME", current_row.metric_scope)
         self.assertTrue(current_row.current_relation_consistency.consistent)
 
@@ -249,7 +248,7 @@ class PerformanceScopeProjectionTests(unittest.TestCase):
         self.assertFalse(reconciliation.instance_reconciled)
         self.assertFalse(reconciliation.group_reconciled)
 
-    def test_zero_event_current_and_historical_rows_remain_visible_with_zero_metrics(self) -> None:
+    def test_zero_event_current_rows_remain_but_assignment_only_history_is_hidden(self) -> None:
         a1 = self.transition(self.target("A", "G1", "Alpha", "Group One"), T1)
         self.transition(self.target("B", "G2", "Beta", "Group Two"), T2)
         projection = self.projection(
@@ -260,8 +259,28 @@ class PerformanceScopeProjectionTests(unittest.TestCase):
 
         self.assertEqual(0, projection.project_stocks("CURRENT")[0].lifetime.gross_pnl)
         self.assertEqual({"B": 0}, {row.instance_id: row.aggregate.gross_pnl for row in projection.project_instances("CURRENT")})
-        self.assertEqual({"A": 0}, {row.instance_id: row.aggregate.gross_pnl for row in projection.project_instances("PAST")})
+        self.assertEqual((), projection.project_instances("PAST"))
+        self.assertEqual((), projection.project_groups("PAST"))
+        self.assertEqual({"B"}, {row.instance_id for row in projection.project_instances("ALL")})
+        self.assertEqual({"G2"}, {row.group_id for row in projection.project_groups("ALL")})
+        self.assertEqual(
+            "NO_CANONICAL_PERFORMANCE_EVENTS",
+            projection.project_instances("CURRENT")[0].performance_absence_reason,
+        )
         self.assertEqual(0, projection.aggregator.aggregate_episode(a1.episode_id).gross_pnl)
+
+    def test_unassigned_closed_episode_without_performance_is_not_a_stock_row(self) -> None:
+        self.transition(self.target("A", "G1", "Alpha", "Group One"), T1)
+        self.transition(AssignmentEpisodeTarget.unassigned(), T2)
+        projection = self.projection(
+            [self.stock("")],
+            [self.instance("A", "G1")],
+            [self.group("G1")],
+        )
+
+        self.assertEqual((), projection.project_stocks("CURRENT"))
+        self.assertEqual((), projection.project_stocks("PAST"))
+        self.assertEqual((), projection.project_stocks("ALL"))
 
     def test_ledger_only_stock_is_known_in_all_without_fake_parent_or_current_visibility(self) -> None:
         other_code = "000660"
@@ -305,9 +324,41 @@ class PerformanceScopeProjectionTests(unittest.TestCase):
         self.assertEqual(40, all_rows[other_code].lifetime.gross_pnl)
         self.assertEqual(("PERFORMANCE_LEDGER",), all_rows[other_code].visibility_reasons)
         self.assertEqual((), projection.project_stocks("CURRENT"))
-        self.assertEqual((), projection.project_stocks("PAST"))
+        self.assertEqual((other_code,), tuple(row.stock_code for row in projection.project_stocks("PAST")))
         self.assertEqual((), projection.project_instances("ALL"))
         self.assertEqual((), projection.project_groups("ALL"))
+
+    def test_unresolved_event_is_stock_evidence_but_not_parent_evidence(self) -> None:
+        a1 = self.transition(self.target("A", "G1", "Alpha", "Group One"), T1)
+        self.append(a1.episode_id, 0, entry_episode_id=OWNERSHIP_UNRESOLVED)
+        projection = self.projection(
+            [self.stock("A")],
+            [self.instance("A", "G1")],
+            [self.group("G1")],
+        )
+
+        self.assertEqual((CODE,), tuple(row.stock_code for row in projection.project_stocks("ALL")))
+        instance = projection.project_instances("ALL")[0]
+        group = projection.project_groups("ALL")[0]
+        self.assertEqual(0, instance.aggregate.event_count)
+        self.assertEqual("NO_RESOLVED_PERFORMANCE_OWNERSHIP", instance.performance_absence_reason)
+        self.assertEqual("NO_RESOLVED_PERFORMANCE_OWNERSHIP", group.performance_absence_reason)
+
+    def test_current_parent_reports_performance_outside_current_scope(self) -> None:
+        a1 = self.transition(self.target("A", "G1", "Alpha", "Group One"), T1)
+        self.append(a1.episode_id, 100)
+        self.transition(AssignmentEpisodeTarget.unassigned(), T2)
+        self.transition(self.target("A", "G1", "Alpha", "Group One"), T3)
+        projection = self.projection(
+            [self.stock("A")],
+            [self.instance("A", "G1")],
+            [self.group("G1")],
+        )
+
+        current = projection.project_instances("CURRENT")[0]
+        self.assertEqual(0, current.aggregate.event_count)
+        self.assertEqual("NO_PERFORMANCE_IN_SCOPE", current.performance_absence_reason)
+        self.assertIsNone(projection.project_instances("ALL")[0].performance_absence_reason)
 
     def test_scope_reconciliation_and_generic_project_api(self) -> None:
         _, _, _, projection = self.a_to_b_to_a_fixture()

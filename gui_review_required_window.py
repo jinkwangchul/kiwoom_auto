@@ -943,6 +943,7 @@ def collect_global_review_required_rows(
         )
         if snapshot_data:
             state = dict(snapshot_data.get("state", {}))
+            config = dict(snapshot_data.get("config", {}))
             state_issue_reason = str(
                 snapshot_data.get("state_issue_reason", "") or ""
             )
@@ -950,6 +951,7 @@ def collect_global_review_required_rows(
             state, state_issue_reason = _read_central_review_state(
                 stock_dir / "state.json"
             )
+            config = read_json_dict(stock_dir / "config.json")
         routine_name = str(
             routine_name_source or state.get("review_routine", "") or "-"
         ).strip() or "-"
@@ -980,6 +982,7 @@ def collect_global_review_required_rows(
             safety_issue = bool(
                 auto_trade_setting_data_inconsistency_reasons(state)
                 or auto_trade_setting_server_mismatch_detected(state)
+                or not config
             )
             if long_hold_excludes_holding_review(
                 global_long_hold_enabled,
@@ -988,6 +991,7 @@ def collect_global_review_required_rows(
                 buy_pending_qty=buy_pending_qty,
                 sell_pending_qty=sell_pending_qty,
                 safety_issue=safety_issue,
+                operation_mode=config.get("operation_mode", ""),
             ):
                 continue
             review_location_source = state.get("review_location", "") or REVIEW_UNKNOWN_TEXT
