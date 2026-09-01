@@ -8,7 +8,6 @@ UI 창에 직접 의존하지 않는다.
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 from gui_common_utils import safe_int_value
@@ -242,50 +241,6 @@ def build_review_required_item(
         "review_status": str(state.get("review_status", "PENDING") or "PENDING"),
         "orders_count": len(orders),
     }
-
-
-def review_reason_summary(item: dict[str, object]) -> str:
-    """
-    검토관리창 표의 사유 컬럼에 표시할 짧고 명확한 요약 문구를 만든다.
-
-    상세 사유는 state.json 의 review_reason 과 하단 상세 영역에 유지하고,
-    표에서는 한눈에 위험 요소를 읽을 수 있도록 O/X 형태로 표시한다.
-    """
-    pending_text = "미체결O" if bool(item.get("pending_exists")) else "미체결X"
-    current_text = "현재가O" if item.get("current_price") is not None else "현재가X"
-
-    tokens = [pending_text, current_text]
-
-    holding_qty = safe_int_value(item.get("holding_qty"), 0)
-    avg_price = safe_float_value(
-        item.get("avg_price", item.get("average_price", item.get("broker_average_price"))),
-        0.0,
-    )
-    if holding_qty > 0 and avg_price <= 0:
-        tokens.append("평단오류")
-
-    return " / ".join(tokens)
-
-
-def compact_time_text(value: object) -> str:
-    """검토관리창 표에서 시각 값을 HH:MM:SS 중심으로 짧게 표시한다."""
-    text = str(value or "").strip()
-    if not text:
-        return "-"
-
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(text[:19], fmt).strftime("%H:%M:%S")
-        except Exception:
-            pass
-
-    if len(text) >= 19 and text[10] in (" ", "T"):
-        return text[11:19]
-
-    if len(text) >= 8 and text[2:3] == ":" and text[5:6] == ":":
-        return text[:8]
-
-    return text
 
 
 def review_required_for_start(item: dict[str, object]) -> bool:

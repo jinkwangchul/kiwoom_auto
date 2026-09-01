@@ -302,8 +302,6 @@ class AutoTradeGuiE2ESyncTest(unittest.TestCase):
             status_bar = SimpleNamespace(showMessage=Mock())
             main = SimpleNamespace(
                 all_runtime_stock_dirs=lambda: [stock_dir],
-                routine_name_for_stock_dir=lambda _stock_dir: "루틴",
-                production_recovery_stock_is_review_required=lambda _code: True,
                 refresh_auto_trade_assignment_views=Mock(),
                 statusBar=lambda: status_bar,
             )

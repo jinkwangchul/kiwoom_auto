@@ -11,8 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import gui_auto_trade_run_control as run_control
 import gui_main_stock_context_menu as monitoring_context_menu
-import gui_auto_trade_setting_window as setting_window_module
-from gui_auto_trade_setting_window import AutoTradeSettingWindow
+from gui_auto_trade_operation_host import AutoTradeOperationHost
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class _StartReasonWindow:
@@ -35,6 +35,7 @@ class _StartReasonWindow:
         self.recalculate_stock_status_by_operation_policy = MagicMock(
             return_value=recalculate_result
         )
+        attach_participant_owner(self)
 
     def selected_stock_infos(self):
         return list(self.targets)
@@ -186,7 +187,10 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = _write_target(Path(temp_dir), "012210")
 
-            class _Host:
+            class _Host(AutoTradeOperationHost):
+                def __init__(self):
+                    super().__init__(None)
+
                 def split_start_targets(self, selected):
                     return list(selected), []
 
@@ -225,6 +229,7 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                     )
                     self.refresh_all = MagicMock()
                     self._host = _Host()
+                    self._main_monitoring_auto_trade_operation_host = self._host
 
                 def main_monitoring_auto_trade_operation_host(self):
                     return self._host
@@ -241,9 +246,10 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                 [SimpleNamespace(stock_dir=target[0], code=target[1], name=target[2], routine_instance_id="instance-1")],
             )
             result_holder = {}
+            start_backend = run_control.auto_trade_start_selected_auto_trades
 
             def invoke_backend(window, **kwargs):
-                result = run_control.auto_trade_start_selected_auto_trades(window, **kwargs)
+                result = start_backend(window, **kwargs)
                 result_holder["result"] = result
                 return result
 
@@ -253,19 +259,21 @@ class Phase12UOperationStartReasonTest(unittest.TestCase):
                 patch.object(run_control, "auto_trade_stock_operation_excluded", return_value=False),
                 patch.object(run_control, "read_operation_state", return_value={}),
                 patch.object(run_control, "current_datetime", return_value=run_control.datetime(2026, 8, 25, 20, 38)),
-                patch.object(setting_window_module, "_today_global_operation_status", return_value=""),
-                patch.object(setting_window_module, "read_operation_state", return_value={}),
-                patch.object(setting_window_module, "auto_trade_start_selected_auto_trades", side_effect=invoke_backend),
+                patch.object(run_control, "auto_trade_start_selected_auto_trades", side_effect=invoke_backend),
                 patch.object(run_control, "refresh_auto_trade_views"),
                 patch.object(run_control, "append_changelog"),
                 patch.object(run_control, "_show_start_failure_once"),
+                patch.object(run_control, "_show_operation_start_summary_toast"),
                 patch.object(run_control, "write_global_operation_running_state") as writer,
-                patch.object(
-                    monitoring_context_menu,
-                    "_show_monitoring_auto_trade_result_dialog",
-                ),
             ):
-                AutoTradeSettingWindow.start_selected_auto_trades(adapter)
+                run_control.execute_operation_start_command(
+                    adapter,
+                    run_control.OperationStartCommandRequest(
+                        intent=run_control.OperationStartIntent.FULL_START,
+                        source="auto_trade_global_start_button",
+                    ),
+                    operation_state_reader=lambda: {},
+                )
 
             self.assertTrue(result_holder["result"]["ok"])
             self.assertEqual(1, result_holder["result"]["started_count"])

@@ -20,6 +20,7 @@ import gui_main
 import gui_windows
 import kiwoom_api
 import routine_signal_probe
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
@@ -142,6 +143,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
     def test_operation_cycle_final_exception_keeps_result(self) -> None:
         fake = SimpleNamespace(
             _shutting_down=False,
+            _factory_reset_quiesced=False,
             _operation_cycle_running=False,
             operation_cycle_completed=SimpleNamespace(emit=Mock()),
             statusBarMessage=Mock(),
@@ -158,6 +160,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
 
     def test_signal_cycle_failure_transition_dedupes_and_resets(self) -> None:
         owner = SimpleNamespace(statusBarMessage=Mock())
+        attach_participant_owner(owner)
 
         def fail_probe(*_args, **_kwargs):
             raise RuntimeError("probe failed")
@@ -179,6 +182,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
 
     def test_final_consumer_and_policy_failures_use_transition_boundaries(self) -> None:
         owner = SimpleNamespace(statusBarMessage=Mock())
+        attach_participant_owner(owner)
         with patch.object(
             operation_timer,
             "probe_all_enabled_routine_stocks_once",
@@ -201,6 +205,20 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
                     "approved": 0,
                 }
             },
+        ), patch.object(
+            operation_timer,
+            "project_execution_universe",
+            return_value=SimpleNamespace(
+                entries=(
+                    SimpleNamespace(
+                        stock_code="111111",
+                        stock_dir=None,
+                        execution_ready=True,
+                        signal_probe_only=True,
+                        real_trade_enabled=False,
+                    ),
+                )
+            ),
         ), patch.object(operation_timer, "observe_owner_failure_transition") as transition:
             operation_timer._auto_trade_run_signal_cycle(owner, "2026-08-16 09:00")
         consumer_calls = [
@@ -219,6 +237,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             rebind_startup_recovery_after_trusted_runtime_update=Mock(),
             statusBarMessage=Mock(),
         )
+        attach_participant_owner(cycle_owner)
         with patch.object(
             operation_timer,
             "auto_trade_continue_pending_close_liquidations",
@@ -227,14 +246,6 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             operation_timer,
             "auto_trade_continue_pending_manual_ats_liquidations",
             return_value={"processed": 0, "failed": 0},
-        ), patch.object(
-            operation_timer,
-            "refresh_operation_candles",
-            None,
-        ), patch.object(
-            operation_timer,
-            "_CANDLE_REFRESH_IMPORT_ERROR",
-            None,
         ), patch.object(
             operation_timer,
             "_auto_trade_run_signal_cycle",
@@ -259,6 +270,13 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             statusBarMessage=Mock(),
             complete_deferred_operation_cycle=Mock(),
         )
+        attach_participant_owner(owner)
+        refresh_operation_candles = Mock(side_effect=RuntimeError("refresh failed"))
+        owner.market_data_host = Mock(
+            return_value=SimpleNamespace(
+                refresh_operation_candles=refresh_operation_candles,
+            )
+        )
         with patch.object(
             operation_timer,
             "auto_trade_continue_pending_close_liquidations",
@@ -271,10 +289,6 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             operation_timer,
             "_auto_trade_run_signal_cycle",
             return_value={},
-        ), patch.object(
-            operation_timer,
-            "refresh_operation_candles",
-            side_effect=RuntimeError("refresh failed"),
         ), patch.object(operation_timer, "observe_production_exception") as observer:
             result = operation_timer.auto_trade_run_operation_cycle(owner)
         self.assertTrue(result["processed"])
@@ -284,11 +298,12 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
         owner._last_time_policy_minute_key = ""
         callback_box = {}
 
-        def defer_refresh(_window, _minute_key, *, on_complete):
+        def defer_refresh(_minute_key, *, on_complete):
             callback_box["callback"] = on_complete
             return {"accepted": True, "completed": False}
 
         owner.complete_deferred_operation_cycle.side_effect = RuntimeError("notify failed")
+        refresh_operation_candles.side_effect = defer_refresh
         with patch.object(
             operation_timer,
             "auto_trade_continue_pending_close_liquidations",
@@ -301,10 +316,6 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             operation_timer,
             "_auto_trade_run_signal_cycle",
             return_value={},
-        ), patch.object(
-            operation_timer,
-            "refresh_operation_candles",
-            side_effect=defer_refresh,
         ), patch.object(operation_timer, "observe_production_exception") as observer:
             pending = operation_timer.auto_trade_run_operation_cycle(owner)
             callback_box["callback"](
@@ -324,11 +335,16 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             statusBarMessage=Mock(),
             complete_deferred_operation_cycle=Mock(),
         )
+        attach_participant_owner(owner)
         callback_box = {}
 
-        def defer_refresh(_window, _minute_key, *, on_complete):
+        def defer_refresh(_minute_key, *, on_complete):
             callback_box["callback"] = on_complete
             return {"accepted": True, "completed": False}
+
+        owner.market_data_host = Mock(
+            return_value=SimpleNamespace(refresh_operation_candles=defer_refresh)
+        )
 
         with patch.object(
             operation_timer,
@@ -342,10 +358,6 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             operation_timer,
             "_auto_trade_run_signal_cycle",
             return_value={},
-        ), patch.object(
-            operation_timer,
-            "refresh_operation_candles",
-            side_effect=defer_refresh,
         ), patch.object(operation_timer, "observe_owner_failure_transition") as transition:
             operation_timer.auto_trade_run_operation_cycle(owner)
             callback_box["callback"](
@@ -392,7 +404,7 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             patch.object(routine_signal_probe, "_load_candles_from_stock_dir", return_value=[]),
             patch.object(routine_signal_probe, "_load_instance_rules", return_value={}),
             patch.object(routine_signal_probe, "completed_timeframe_candles", return_value=[]),
-            patch.object(routine_signal_probe, "read_latest_price", return_value=None),
+            patch.object(routine_signal_probe, "read_reference_price", return_value=None),
             patch.object(routine_signal_probe, "_default_decision_trace_observer", return_value=None),
             patch.object(routine_signal_probe, "_append_log"),
         )
@@ -462,13 +474,32 @@ class GlobalDiagnosticObserverPhase3Test(unittest.TestCase):
             _production_recovery_identity=None,
             _production_recovery_parts={},
             _production_recovery_status_result=Mock(),
+            _handled_kiwoom_login_identity=None,
+            _event_journal_kiwoom_connected=False,
+            main_monitoring_auto_trade_operation_host=Mock(
+                return_value=SimpleNamespace(
+                    sync_monitoring_universe_for_current_session=Mock(),
+                )
+            ),
             statusBar=lambda: status_bar,
         )
         with patch.object(gui_windows, "append_production_event") as append, patch.object(
             gui_windows.production_recovery_registry, "invalidate"
-        ), patch.object(gui_windows.QTimer, "singleShot") as single_shot:
-            gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": True})
-            gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": True})
+        ), patch.object(
+            gui_windows.MainWindow,
+            "_refresh_start_budget_displays_for_auth_state",
+        ), patch.object(
+            gui_windows.QTimer,
+            "singleShot",
+            side_effect=lambda _delay, callback: callback(),
+        ) as single_shot:
+            connected_state = {
+                "connected": True,
+                "connection_epoch": 1,
+                "login_session_id": "session-1",
+            }
+            gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, connected_state)
+            gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, connected_state)
             gui_windows.MainWindow.on_kiwoom_login_state_changed(fake, {"connected": False})
         self.assertEqual(
             ["LOGIN_SUCCEEDED", "CONNECTION_LOST"],

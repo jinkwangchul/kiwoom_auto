@@ -15,6 +15,8 @@ from logical_group_registry import LogicalGroupRepository
 
 GROUP_A = "11111111-1111-4111-8111-111111111111"
 GROUP_B = "22222222-2222-4222-8222-222222222222"
+INSTANCE_A = "33333333-3333-4333-8333-333333333333"
+INSTANCE_B = "44444444-4444-4444-8444-444444444444"
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -29,7 +31,7 @@ def _write_group(root: Path, group_id: str, name: str, slot: int) -> Path:
         {
             "schema_version": "1.0",
             "group_id": group_id,
-            "definition_id": "definition-a",
+            "definition_id": "definition_a",
             "base_name": "지표추종매매",
             "display_name": name,
             "slot": slot,
@@ -47,10 +49,43 @@ def _promote(root: Path, *group_ids: str) -> None:
 
 
 def _write_instance(root: Path, instance_id: str, group_id: str) -> SimpleNamespace:
+    routine_dir = root / "routines" / "definition-a"
+    _write_json(
+        routine_dir / "routine.json",
+        {
+            "schema_version": "1.0",
+            "definition_id": "definition_a",
+            "name": "지표추종매매",
+            "entry_file": "routine.py",
+            "rules_file": "rules.json",
+            "enabled": True,
+        },
+    )
+    (routine_dir / "routine.py").write_text("", encoding="utf-8")
     instance_dir = root / "routine_instances" / instance_id
-    _write_json(instance_dir / "instance.json", {"instance_id": instance_id, "group_id": group_id})
+    _write_json(
+        instance_dir / "instance.json",
+        {
+            "schema_version": "1.0",
+            "instance_id": instance_id,
+            "definition_id": "definition_a",
+            "display_name": f"인스턴스-{instance_id[:4]}",
+            "enabled": False,
+            "buy_limit_enabled": False,
+            "buy_limit_amount": None,
+            "rules_file": "rules.json",
+            "created_at": "2026-08-22T09:30:00+09:00",
+            "updated_at": "2026-08-22T09:30:00+09:00",
+            "group_id": group_id,
+        },
+    )
     _write_json(instance_dir / "rules.json", {"instance": instance_id})
-    return SimpleNamespace(instance_id=instance_id, group_id=group_id)
+    return SimpleNamespace(
+        instance_id=instance_id,
+        group_id=group_id,
+        definition_id="definition_a",
+        display_name=f"인스턴스-{instance_id[:4]}",
+    )
 
 
 def _write_stock(root: Path, code: str, name: str, instance_id: str) -> Path:
@@ -76,8 +111,8 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             _promote(root, GROUP_A)
             definition = root / "routines" / "definition-a"
             _write_json(definition / "routine.json", {"definition_id": "definition-a"})
-            instance = _write_instance(root, "instance-a", GROUP_A)
-            stock = _write_stock(root, "000001", "대상종목", "instance-a")
+            instance = _write_instance(root, INSTANCE_A, GROUP_A)
+            stock = _write_stock(root, "000001", "대상종목", INSTANCE_A)
 
             with (
                 patch.object(deletion, "load_persisted_routine_instances", return_value=[instance]),
@@ -92,7 +127,7 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
 
             self.assertTrue(result.success, result.error)
             self.assertFalse(group.exists())
-            self.assertFalse((root / "routine_instances" / "instance-a").exists())
+            self.assertFalse((root / "routine_instances" / INSTANCE_A).exists())
             self.assertTrue(stock.exists())
             config = json.loads((stock / "config.json").read_text(encoding="utf-8"))
             self.assertEqual([], config["routines"])
@@ -109,10 +144,10 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             target_group = _write_group(root, GROUP_A, "지표추종매매", 0)
             other_group = _write_group(root, GROUP_B, "지표추종매매_1", 1)
             _promote(root, GROUP_A, GROUP_B)
-            target_instance = _write_instance(root, "instance-a", GROUP_A)
-            other_instance = _write_instance(root, "instance-b", GROUP_B)
-            target_stock = _write_stock(root, "000001", "대상종목", "instance-a")
-            other_stock = _write_stock(root, "000002", "다른종목", "instance-b")
+            target_instance = _write_instance(root, INSTANCE_A, GROUP_A)
+            other_instance = _write_instance(root, INSTANCE_B, GROUP_B)
+            target_stock = _write_stock(root, "000001", "대상종목", INSTANCE_A)
+            other_stock = _write_stock(root, "000002", "다른종목", INSTANCE_B)
 
             with (
                 patch.object(
@@ -132,8 +167,8 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             self.assertTrue(result.success, result.error)
             self.assertFalse(target_group.exists())
             self.assertTrue(other_group.exists())
-            self.assertFalse((root / "routine_instances" / "instance-a").exists())
-            self.assertTrue((root / "routine_instances" / "instance-b").exists())
+            self.assertFalse((root / "routine_instances" / INSTANCE_A).exists())
+            self.assertTrue((root / "routine_instances" / INSTANCE_B).exists())
             self.assertEqual("keep-000001", json.loads((target_stock / "config.json").read_text(encoding="utf-8"))["sentinel"])
             self.assertEqual("keep-000002", json.loads((other_stock / "config.json").read_text(encoding="utf-8"))["sentinel"])
             self.assertEqual([GROUP_B], [group.group_id for group in scan_group_records(project_root=root)])
@@ -143,11 +178,21 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             root = Path(temp)
             group = _write_group(root, GROUP_A, "지표추종매매", 0)
             _promote(root, GROUP_A)
-            instance = _write_instance(root, "instance-a", GROUP_A)
-            stock = _write_stock(root, "000001", "대상종목", "instance-a")
+            instance = _write_instance(root, INSTANCE_A, GROUP_A)
+            stock = _write_stock(root, "000001", "대상종목", INSTANCE_A)
             group_before = (group / "group.json").read_bytes()
             config_before = (stock / "config.json").read_bytes()
-            _write_json(stock / "state.json", {"holding_qty": 1, "status": "STOPPED"})
+            _write_json(
+                stock / "state.json",
+                {
+                    "holding_qty": 1,
+                    "holding_amount": 100,
+                    "avg_price": 100,
+                    "pending_order": False,
+                    "status": "STOPPED",
+                    "trade_enabled": False,
+                },
+            )
 
             with patch.object(deletion, "load_persisted_routine_instances", return_value=[instance]):
                 scope = deletion.collect_group_deletion_scope(root, GROUP_A)
@@ -168,13 +213,17 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             root = Path(temp)
             group = _write_group(root, GROUP_A, "지표추종매매", 0)
             _promote(root, GROUP_A)
-            instance = _write_instance(root, "instance-a", GROUP_A)
-            stock = _write_stock(root, "000001", "대상종목", "instance-a")
+            instance = _write_instance(root, INSTANCE_A, GROUP_A)
+            stock = _write_stock(root, "000001", "대상종목", INSTANCE_A)
             config_before = (stock / "config.json").read_bytes()
 
             with (
                 patch.object(deletion, "load_persisted_routine_instances", return_value=[instance]),
-                patch.object(deletion.StockRepository, "update_stock_routine", return_value=False),
+                patch.object(
+                    deletion,
+                    "unassign_stock_routine",
+                    return_value=SimpleNamespace(ok=False),
+                ),
             ):
                 scope = deletion.collect_group_deletion_scope(root, GROUP_A)
                 result = deletion.delete_group_completely(
@@ -185,7 +234,7 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
 
             self.assertFalse(result.success)
             self.assertTrue(group.exists())
-            self.assertTrue((root / "routine_instances" / "instance-a").exists())
+            self.assertTrue((root / "routine_instances" / INSTANCE_A).exists())
             self.assertEqual(config_before, (stock / "config.json").read_bytes())
             self.assertFalse(group_delete_pending(root, GROUP_A))
 
@@ -194,21 +243,17 @@ class GroupCompleteDeletionServiceTests(unittest.TestCase):
             root = Path(temp)
             _write_group(root, GROUP_A, "지표추종매매", 0)
             _promote(root, GROUP_A)
-            instance = _write_instance(root, "instance-a", GROUP_A)
-            stock = _write_stock(root, "000001", "대상종목", "instance-a")
+            instance = _write_instance(root, INSTANCE_A, GROUP_A)
+            stock = _write_stock(root, "000001", "대상종목", INSTANCE_A)
             config_path = stock / "config.json"
 
-            def corrupt_then_fail(_repository, _code, _name, _routines):
+            def corrupt_then_fail(_project_root, _code, _name, _routines, **_kwargs):
                 config_path.write_text("{}\n", encoding="utf-8")
-                return False
+                return SimpleNamespace(ok=False)
 
             with (
                 patch.object(deletion, "load_persisted_routine_instances", return_value=[instance]),
-                patch.object(
-                    deletion.StockRepository,
-                    "update_stock_routine",
-                    new=corrupt_then_fail,
-                ),
+                patch.object(deletion, "unassign_stock_routine", new=corrupt_then_fail),
                 patch.object(deletion, "_restore_file", side_effect=OSError("rollback failed")),
             ):
                 scope = deletion.collect_group_deletion_scope(root, GROUP_A)

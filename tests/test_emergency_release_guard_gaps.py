@@ -29,19 +29,14 @@ class _ReleaseWindow:
         self,
         *,
         recovery_ready: bool = True,
-        recovery_review_required: bool = False,
         recovery_decision: object | None = None,
     ) -> None:
         self.recovery_ready = recovery_ready
-        self.recovery_review_required = recovery_review_required
         self.recovery_decision = recovery_decision
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         del refresh
         return self.recovery_ready
-
-    def production_recovery_stock_is_review_required(self, _code: str) -> bool:
-        return self.recovery_review_required
 
     def production_recovery_gate_for_stock(self, _code: str, *, caller_name: str):
         del caller_name

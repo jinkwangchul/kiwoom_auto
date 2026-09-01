@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 import hashlib
 import json
 from pathlib import Path
@@ -100,8 +102,7 @@ class SendOrderResultRecorderV1Test(unittest.TestCase):
             self.assertEqual("ORDER_RECORD_V1", record["order_id"])
             self.assertEqual("SEND_ORDER_RESULT_RECORDED", record["status"])
 
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_manual_confirmation_false_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,7 +185,7 @@ class SendOrderResultRecorderV1Test(unittest.TestCase):
 
         self.assertEqual("INVALID", result["status"])
         self.assertIn("project runtime/order_executions.json is not allowed", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_record_path_guard_violation_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -235,8 +236,7 @@ class SendOrderResultRecorderV1Test(unittest.TestCase):
             self.assertEqual("RECORDED", result["status"])
             self.assertFalse(result["queue_write"])
             self.assertFalse(result["chejan_called"])
-            self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-            self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+            assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

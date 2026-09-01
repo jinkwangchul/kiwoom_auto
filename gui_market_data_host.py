@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
@@ -13,7 +14,11 @@ from typing import Any, Callable
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 from candle_manager import canonical_candle_content_hash, load_candles
-from candle_timeframe_aggregation import candle_market_datetime
+from candle_timeframe_aggregation import (
+    SEOUL_TIMEZONE,
+    candle_market_datetime,
+    parse_market_datetime,
+)
 from event_journal_production import observe_production_exception
 from kiwoom_market_data_authority import (
     MarketDataAuthority,
@@ -692,8 +697,57 @@ class MarketDataHost(QObject):
     def fresh_monitoring_market_information_state(
         self,
         stock_code: str,
+        *,
+        now_dt: datetime | None = None,
     ) -> MonitoringMarketInformationState | None:
-        return self._current_session_market_information_state(stock_code)
+        """Return today's connected-session realtime quote for price actions."""
+
+        session_getter = getattr(self.kiwoom_api, "broker_session_snapshot", None)
+        if not callable(session_getter):
+            return None
+        try:
+            broker_session = session_getter()
+            broker_identity = (
+                int(getattr(broker_session, "connection_epoch", 0) or 0),
+                str(getattr(broker_session, "login_session_id", "") or "").strip(),
+            )
+        except Exception:
+            return None
+        if (
+            getattr(broker_session, "connected", False) is not True
+            or not broker_identity[1]
+            or broker_identity != self._realtime_shadow_session_identity
+        ):
+            return None
+
+        realtime = self.high_resolution_market_state(stock_code)
+        if realtime is None or (
+            realtime.connection_epoch,
+            realtime.login_session_id,
+        ) != broker_identity:
+            return None
+        try:
+            price = float(realtime.last_price)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(realtime.last_price, bool) or not isfinite(price) or price <= 0:
+            return None
+
+        market_datetime = parse_market_datetime(realtime.last_market_datetime)
+        if market_datetime is None:
+            return None
+        current = now_dt or datetime.now(SEOUL_TIMEZONE)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=SEOUL_TIMEZONE)
+        else:
+            current = current.astimezone(SEOUL_TIMEZONE)
+        if market_datetime.date() != current.date():
+            return None
+
+        state = self._current_session_market_information_state(stock_code)
+        if state is None or dict(state.field_sources).get("last_price") != "REALTIME":
+            return None
+        return state
 
     def monitoring_market_information_state(
         self,

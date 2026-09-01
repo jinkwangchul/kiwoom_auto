@@ -16,6 +16,7 @@ from gui_auto_trade_timer import (
     auto_trade_real_execution_active,
     auto_trade_signal_probe_only_active,
 )
+from tests.participant_owner_fixture import attach_participant_owner, participant_owner
 
 
 def _write_stock(
@@ -52,7 +53,7 @@ class ExecutionUniverseTest(unittest.TestCase):
                 },
             )
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes=set()
+                _main_monitoring_auto_trade_operation_host=participant_owner()
             )
             window.startup_recovery_session_ready = lambda refresh=False: True
 
@@ -78,7 +79,7 @@ class ExecutionUniverseTest(unittest.TestCase):
                 },
             )
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={"005930"}
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"})
             )
             window.startup_recovery_session_ready = lambda refresh=False: False
 
@@ -105,7 +106,7 @@ class ExecutionUniverseTest(unittest.TestCase):
                 },
             )
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={"005930"}
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"})
             )
             window.startup_recovery_session_ready = lambda refresh=False: True
 
@@ -116,7 +117,7 @@ class ExecutionUniverseTest(unittest.TestCase):
                 self.assertTrue(auto_trade_signal_probe_only_active(window))
                 self.assertFalse(auto_trade_real_execution_active(window))
 
-            window._current_session_operation_participant_stock_codes = set()
+            attach_participant_owner(window)
             with patch(
                 "execution_universe.all_registered_stock_dirs",
                 return_value=[stock_dir],
@@ -147,7 +148,7 @@ class ExecutionUniverseTest(unittest.TestCase):
             )
             window = SimpleNamespace(
                 registered_operation_targets=lambda: [(assigned, "005930", "Assigned")],
-                _current_session_operation_participant_stock_codes={"005930"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"}),
             )
             window.startup_recovery_session_ready = lambda refresh=False: True
 

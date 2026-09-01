@@ -23,6 +23,7 @@ from stock_long_hold_policy import (
     classify_termination_route,
     long_hold_excludes_holding_review,
 )
+from tests.participant_owner_fixture import participant_owner
 
 
 TODAY = "2026-08-26"
@@ -301,7 +302,7 @@ class ImmediateReviewAndRetirementTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"}
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"})
         )
 
         def mark_review(**kwargs):
@@ -379,7 +380,7 @@ class ImmediateReviewAndRetirementTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
         )
         with (
             patch.object(
@@ -449,7 +450,7 @@ class ImmediateReviewAndRetirementTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
         )
         with (
             patch.object(
@@ -500,7 +501,7 @@ class ImmediateReviewAndRetirementTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
         )
 
         def session(key: str) -> dict[str, object]:

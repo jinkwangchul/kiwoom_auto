@@ -46,7 +46,16 @@ from gui_auto_trade_display import (
     profit_loss_value_color,
 )
 from gui_order_utils import DIRECTIONAL_NEUTRAL_COLOR, format_signed_money, format_signed_percent
-from stock_instance_day_projection import project_stock_instance_day
+from stock_code_contract import normalize_stock_code
+from stock_instance_day_projection import (
+    CHART_PROJECTION_NO_DAY_DATA,
+    CHART_PROJECTION_NOT_READY,
+    CHART_PROJECTION_REFRESH_FAILED,
+    CHART_PROJECTION_RULES_UNAVAILABLE,
+    CHART_PROJECTION_STALE_REJECTED,
+    CHART_PROJECTION_VALID,
+    project_stock_instance_day,
+)
 from pnl_ui_refresh import (
     PNL_REFRESH_INTERVAL_MS,
     project_current_stock_pnl,
@@ -427,11 +436,13 @@ def _refresh_chart_open_code_views(owner: QWidget | None = None) -> None:
         try:
             if sip.isdeleted(settings_window):
                 continue
-            from gui_auto_trade_table_loader import (
-                refresh_auto_trade_chart_open_code_styles,
+            refresh_styles = getattr(
+                settings_window,
+                "refresh_stock_instance_chart_open_code_styles",
+                None,
             )
-
-            refresh_auto_trade_chart_open_code_styles(settings_window)
+            if callable(refresh_styles):
+                refresh_styles()
         except (AttributeError, RuntimeError, TypeError):
             continue
 
@@ -796,15 +807,6 @@ def project_stock_operation_header_display(
         return _fallback_stock_operation_header_display(owner)
 
 
-def project_stock_operation_header_values(
-    stock_code: str,
-    owner: QWidget | None = None,
-) -> tuple[str, str, str]:
-    """Backward-compatible text-only view of the official header projection."""
-
-    return project_stock_operation_header_display(stock_code, owner).values
-
-
 def _auto_trade_setting_badge_font(owner: QWidget | None = None) -> QFont:
     """Resolve the font inherited by the visible Settings badges."""
 
@@ -931,15 +933,18 @@ class StockInstanceCloseChart(QWidget):
     ) -> list[tuple[datetime, float]]:
         if not isinstance(records, list):
             return []
-        series: list[tuple[datetime, float]] = []
+        by_timestamp: dict[datetime, float] = {}
         for record in records:
             if not isinstance(record, dict):
                 continue
             bar_time = parse_market_datetime(record.get(time_key))
             value = _finite_number(record.get(value_key))
-            if bar_time is not None and value is not None:
-                series.append((bar_time, value))
-        return sorted(series, key=lambda item: item[0])
+            if bar_time is None or value is None or value <= 0:
+                continue
+            # Canonical candles are already unique, but a defensive last-valid
+            # projection keeps duplicate timestamps from creating vertical lines.
+            by_timestamp[bar_time] = value
+        return sorted(by_timestamp.items(), key=lambda item: item[0])
 
     def set_projection(
         self,
@@ -1046,18 +1051,32 @@ class StockInstanceCloseChart(QWidget):
     def _line_segments(self) -> list[list[tuple[datetime, float]]]:
         if not self.close_series:
             return []
-        if self.timeframe_minutes is None:
-            return [list(self.close_series)]
-        maximum_gap = timedelta(minutes=self.timeframe_minutes)
+
+        session_ranges = list(self.visible_time_ranges)
+        if not session_ranges and self.fixed_time_range is not None:
+            session_ranges = [self.fixed_time_range]
+
+        def session_index(bar_time: datetime) -> int:
+            for index, (start, end) in enumerate(session_ranges):
+                if start <= bar_time <= end:
+                    return index
+            return -1
+
         segments: list[list[tuple[datetime, float]]] = []
         current: list[tuple[datetime, float]] = []
         previous_time: datetime | None = None
+        previous_session = -1
         for item in self.close_series:
-            if previous_time is not None and item[0] - previous_time > maximum_gap:
+            item_session = session_index(item[0])
+            if previous_time is not None and (
+                item[0].date() != previous_time.date()
+                or item_session != previous_session
+            ):
                 segments.append(current)
                 current = []
             current.append(item)
             previous_time = item[0]
+            previous_session = item_session
         if current:
             segments.append(current)
         return segments
@@ -1377,13 +1396,20 @@ class StockInstanceChartWindow(QDialog):
         self.trade_date = str(trade_date or _today_trade_date()).strip()
         self._projection_provider = projection_provider or project_stock_instance_day
         self.last_projection: dict[str, Any] = {}
+        self.last_refresh_status = ""
+        self._last_valid_projection_identity: tuple[str, str, int | None] | None = None
         self._operation_cycle_signal = None
         self._operation_cycle_signal_owner = None
         self._operation_cycle_refresh_connected = False
+        self._bar_committed_signal = None
+        self._bar_committed_signal_owner = None
+        self._bar_committed_refresh_connected = False
+        self._bar_committed_refresh_pending = False
         self._live_price_operation_host = None
         self._live_price_refresh_timer: QTimer | None = None
         self._operation_command_in_progress = False
         self._stock_operation_adapter = None
+        self._stock_operation_executor = None
         self._title_stock_name = _stock_name_from_repository(self.stock_code)
         self._title_instance_name = ""
         self._title_operation = ""
@@ -1408,6 +1434,7 @@ class StockInstanceChartWindow(QDialog):
         self._setup_ui()
         self.refresh_projection()
         self._connect_operation_cycle_refresh()
+        self._connect_bar_committed_refresh()
         self._start_live_price_refresh()
 
     LIVE_PRICE_REFRESH_INTERVAL_MS = 333
@@ -1571,6 +1598,71 @@ class StockInstanceChartWindow(QDialog):
         self._operation_cycle_signal_owner = None
         self._operation_cycle_refresh_connected = False
 
+    def _find_bar_committed_signal(self):
+        current = persistent_feature_owner(self)
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            api = getattr(current, "kiwoom_api", None)
+            signal = getattr(api, "bar_committed", None)
+            if signal is not None and callable(getattr(signal, "connect", None)):
+                self._bar_committed_signal_owner = api
+                return signal
+            parent_getter = getattr(current, "parent", None)
+            current = parent_getter() if callable(parent_getter) else None
+        return None
+
+    def _connect_bar_committed_refresh(self) -> None:
+        if self.trade_date != _today_trade_date():
+            return
+        signal = self._find_bar_committed_signal()
+        if signal is None:
+            return
+        try:
+            signal.connect(self._on_bar_committed)
+        except (RuntimeError, TypeError):
+            return
+        self._bar_committed_signal = signal
+        self._bar_committed_refresh_connected = True
+
+    def _disconnect_bar_committed_refresh(self) -> None:
+        signal = self._bar_committed_signal
+        if signal is not None and self._bar_committed_refresh_connected:
+            try:
+                signal.disconnect(self._on_bar_committed)
+            except (RuntimeError, TypeError):
+                pass
+        self._bar_committed_signal = None
+        self._bar_committed_signal_owner = None
+        self._bar_committed_refresh_connected = False
+        self._bar_committed_refresh_pending = False
+
+    def _on_bar_committed(self, payload: object) -> None:
+        if self.trade_date != _today_trade_date():
+            self._disconnect_bar_committed_refresh()
+            return
+        if not isinstance(payload, dict) or payload.get("event_type") != "BAR_COMMITTED":
+            return
+        if normalize_stock_code(payload.get("stock_code")) != normalize_stock_code(
+            self.stock_code
+        ):
+            return
+        if str(payload.get("trade_date") or "").strip() != self.trade_date:
+            return
+        if self._bar_committed_refresh_pending:
+            return
+        self._bar_committed_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_after_bar_committed)
+
+    def _refresh_after_bar_committed(self) -> None:
+        self._bar_committed_refresh_pending = False
+        if not self._bar_committed_refresh_connected:
+            return
+        try:
+            self.refresh_projection(preserve_pnl_if_same_bar=True)
+        except RuntimeError:
+            self._disconnect_bar_committed_refresh()
+
     def _on_operation_cycle_completed(self, result: dict[str, Any]) -> None:
         if self.trade_date != _today_trade_date():
             self._disconnect_operation_cycle_refresh()
@@ -1589,6 +1681,7 @@ class StockInstanceChartWindow(QDialog):
         self._live_price_refresh_timer = None
         self._live_price_operation_host = None
         self._disconnect_operation_cycle_refresh()
+        self._disconnect_bar_committed_refresh()
         owner = persistent_feature_owner(self)
         if _OPEN_STOCK_INSTANCE_CHARTS.get(self.stock_code) is self:
             _OPEN_STOCK_INSTANCE_CHARTS.pop(self.stock_code, None)
@@ -1845,23 +1938,19 @@ class StockInstanceChartWindow(QDialog):
         context = self._operation_stock_context()
         if main_window is None or context is None:
             return None
-        from gui_main_stock_context_menu import (
-            MainMonitoringStockOperationAdapter,
-            MainMonitoringStockTarget,
-        )
-
-        stock_dir, code, name, instance_id = context
-        adapter = MainMonitoringStockOperationAdapter(
+        build_adapter = getattr(
             main_window,
-            [
-                MainMonitoringStockTarget(
-                    stock_dir=stock_dir,
-                    code=code,
-                    name=name,
-                    routine_instance_id=instance_id,
-                )
-            ],
-            request_scope="single",
+            "_build_stock_instance_chart_operation_adapter",
+            None,
+        )
+        if not callable(build_adapter):
+            return None
+        stock_dir, code, name, instance_id = context
+        adapter = build_adapter(
+            stock_dir,
+            code,
+            name,
+            instance_id,
         )
         self._stock_operation_adapter = adapter
         return adapter
@@ -1917,18 +2006,32 @@ class StockInstanceChartWindow(QDialog):
         self._operation_command_in_progress = True
         self._update_operation_button_state()
         try:
+            main_window = self._main_monitoring_window()
+            execute_operation = getattr(
+                main_window,
+                "_execute_stock_instance_chart_operation",
+                None,
+            )
+            if not callable(execute_operation):
+                execute_operation = self._stock_operation_executor
+            if not callable(execute_operation):
+                return
             result: dict[str, object] | None = None
             if operation == "early_close":
-                result = adapter.apply_selected_early_close(
+                result = execute_operation(
+                    adapter,
                     "루틴",
                     source="간이차트",
+                    selected=adapter.selected_stock_infos(),
                     show_error_dialog=False,
                     show_result_toast=False,
                 )
             elif operation == "immediate_liquidation":
-                result = adapter.apply_selected_early_close(
+                result = execute_operation(
+                    adapter,
                     "시장가",
                     source="간이차트",
+                    selected=adapter.selected_stock_infos(),
                     show_error_dialog=False,
                     show_result_toast=False,
                 )
@@ -1974,6 +2077,134 @@ class StockInstanceChartWindow(QDialog):
             for issue in issues
         )
 
+    @staticmethod
+    def _projection_has_valid_candle(data: dict[str, Any]) -> bool:
+        candles = data.get("candles", [])
+        if not isinstance(candles, list):
+            return False
+        return any(
+            isinstance(candle, dict)
+            and parse_market_datetime(candle.get("bar_time")) is not None
+            and (close := _finite_number(candle.get("close"))) is not None
+            and close > 0
+            for candle in candles
+        )
+
+    @classmethod
+    def _projection_has_renderable_candle(cls, data: dict[str, Any]) -> bool:
+        trade_date = str(data.get("trade_date") or "").strip()
+        _start, _end, visible_ranges = cls._chart_display_time_range(
+            trade_date,
+            data.get("ats_session_ranges", []),
+        )
+        if not visible_ranges:
+            return False
+        candles = data.get("candles", [])
+        if not isinstance(candles, list):
+            return False
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+            bar_time = parse_market_datetime(candle.get("bar_time"))
+            close = _finite_number(candle.get("close"))
+            if bar_time is None or close is None or close <= 0:
+                continue
+            if any(start <= bar_time <= end for start, end in visible_ranges):
+                return True
+        return False
+
+    @classmethod
+    def _projection_refresh_status(cls, data: dict[str, Any]) -> str:
+        known = {
+            CHART_PROJECTION_VALID,
+            CHART_PROJECTION_NO_DAY_DATA,
+            CHART_PROJECTION_NOT_READY,
+            CHART_PROJECTION_RULES_UNAVAILABLE,
+            CHART_PROJECTION_REFRESH_FAILED,
+            CHART_PROJECTION_STALE_REJECTED,
+        }
+        requested = str(data.get("projection_status") or "").strip().upper()
+        if cls._malformed_projection(data) or not isinstance(data.get("candles", []), list):
+            return CHART_PROJECTION_REFRESH_FAILED
+        if requested == CHART_PROJECTION_VALID:
+            if cls._projection_has_renderable_candle(data):
+                return CHART_PROJECTION_VALID
+            return (
+                CHART_PROJECTION_STALE_REJECTED
+                if cls._projection_has_valid_candle(data)
+                else CHART_PROJECTION_NOT_READY
+            )
+        if requested in known:
+            return requested
+        if cls._projection_has_renderable_candle(data):
+            return CHART_PROJECTION_VALID
+        if cls._projection_has_valid_candle(data):
+            return CHART_PROJECTION_STALE_REJECTED
+        if not str(data.get("instance_id") or "").strip():
+            return CHART_PROJECTION_RULES_UNAVAILABLE
+        diagnostics = data.get("diagnostics", {})
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        return (
+            CHART_PROJECTION_NOT_READY
+            if _nonnegative_count(diagnostics.get("raw_candle_count"), 0) > 0
+            else CHART_PROJECTION_NO_DAY_DATA
+        )
+
+    @staticmethod
+    def _projection_identity(
+        data: dict[str, Any],
+    ) -> tuple[str, str, int | None]:
+        raw_bar_minutes = data.get("bar_minutes")
+        bar_minutes = (
+            int(raw_bar_minutes)
+            if isinstance(raw_bar_minutes, int)
+            and not isinstance(raw_bar_minutes, bool)
+            and raw_bar_minutes > 0
+            else None
+        )
+        return (
+            str(data.get("trade_date") or "").strip(),
+            str(data.get("instance_id") or "").strip(),
+            bar_minutes,
+        )
+
+    @staticmethod
+    def _preserved_series_notice(status: str) -> str:
+        return {
+            CHART_PROJECTION_NO_DAY_DATA: "당일 기준봉 데이터가 없어 이전 그래프를 유지합니다.",
+            CHART_PROJECTION_NOT_READY: "새 기준봉 데이터가 준비되지 않아 이전 그래프를 유지합니다.",
+            CHART_PROJECTION_RULES_UNAVAILABLE: "루틴 기준봉을 확인할 수 없어 이전 그래프를 유지합니다.",
+            CHART_PROJECTION_STALE_REJECTED: "이전 세션 데이터가 거부되어 기존 그래프를 유지합니다.",
+        }.get(
+            status,
+            "차트 데이터를 갱신하지 못해 이전 그래프를 유지합니다.",
+        )
+
+    def _can_preserve_last_valid_projection(
+        self,
+        requested_identity: tuple[str, str, int | None] | None,
+    ) -> bool:
+        return bool(
+            self.chart.close_series
+            and self._last_valid_projection_identity is not None
+            and requested_identity == self._last_valid_projection_identity
+        )
+
+    def _apply_unavailable_projection(
+        self,
+        data: dict[str, Any],
+        status: str,
+    ) -> None:
+        self.last_refresh_status = status
+        if self._can_preserve_last_valid_projection(
+            self._projection_identity(data)
+        ):
+            self.notice_label.setText(self._preserved_series_notice(status))
+            self._update_operation_button_state()
+            return
+        self._apply_projection(data)
+        self.last_refresh_status = status
+
     def _empty_chart_message(self, data: dict[str, Any]) -> str:
         diagnostics = data.get("diagnostics", {})
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
@@ -2018,6 +2249,7 @@ class StockInstanceChartWindow(QDialog):
 
     def _apply_projection(self, data: dict[str, Any]) -> None:
         self.last_projection = data
+        self.last_refresh_status = self._projection_refresh_status(data)
         stock_name = str(data.get("stock_name") or "").strip()
         stock_code = str(data.get("stock_code") or self.stock_code).strip()
         if stock_name:
@@ -2070,6 +2302,10 @@ class StockInstanceChartWindow(QDialog):
             visible_time_ranges=visible_time_ranges,
             timeframe_minutes=bar_minutes,
         )
+        if self.last_refresh_status == CHART_PROJECTION_VALID and self.chart.close_series:
+            self._last_valid_projection_identity = self._projection_identity(data)
+        else:
+            self._last_valid_projection_identity = None
         buy_fallback = len(buy_markers) if isinstance(buy_markers, list) else 0
         sell_fallback = len(sell_markers) if isinstance(sell_markers, list) else 0
         buy_count = _nonnegative_count(data.get("buy_signal_count"), buy_fallback)
@@ -2104,6 +2340,19 @@ class StockInstanceChartWindow(QDialog):
             self.chart.update()
 
     def _apply_projection_error(self) -> None:
+        self.last_refresh_status = CHART_PROJECTION_REFRESH_FAILED
+        last_context_identity = self._projection_identity(self.last_projection)
+        requested_identity = (
+            self.trade_date,
+            last_context_identity[1],
+            last_context_identity[2],
+        )
+        if self._can_preserve_last_valid_projection(requested_identity):
+            self.notice_label.setText(
+                self._preserved_series_notice(CHART_PROJECTION_REFRESH_FAILED)
+            )
+            self._update_operation_button_state()
+            return
         self.last_projection = {}
         for label in self.info_labels.values():
             label.setText("-")
@@ -2123,6 +2372,7 @@ class StockInstanceChartWindow(QDialog):
             x_range_end=x_range_end,
             visible_time_ranges=visible_time_ranges,
         )
+        self._last_valid_projection_identity = None
         self.setWindowTitle(
             _build_window_title(
                 stock_code=self.stock_code,
@@ -2152,6 +2402,10 @@ class StockInstanceChartWindow(QDialog):
             return
         if not isinstance(projected, dict):
             self._apply_projection_error()
+            return
+        refresh_status = self._projection_refresh_status(projected)
+        if refresh_status != CHART_PROJECTION_VALID:
+            self._apply_unavailable_projection(projected, refresh_status)
             return
         if (
             preserve_pnl_if_same_bar

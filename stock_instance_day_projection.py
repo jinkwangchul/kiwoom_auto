@@ -43,6 +43,13 @@ from stock_repository import StockRepository
 PROJECT_ROOT = Path(__file__).resolve().parent
 _PNL_SNAPSHOT_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
+CHART_PROJECTION_VALID = "VALID"
+CHART_PROJECTION_NO_DAY_DATA = "NO_DAY_DATA"
+CHART_PROJECTION_NOT_READY = "NOT_READY"
+CHART_PROJECTION_RULES_UNAVAILABLE = "RULES_UNAVAILABLE"
+CHART_PROJECTION_REFRESH_FAILED = "REFRESH_FAILED"
+CHART_PROJECTION_STALE_REJECTED = "STALE_REJECTED"
+
 
 def _finite_number(value: Any) -> float | None:
     if isinstance(value, bool):
@@ -684,6 +691,25 @@ def project_stock_instance_day(
     diagnostics["completed_candle_count"] = len(candles)
     diagnostics["completed_input_hash"] = market_window_hash(candles) if candles else ""
 
+    malformed_or_failed = any(
+        "MALFORMED" in str(issue).upper()
+        or "CORRUPT" in str(issue).upper()
+        or "PROJECTION_ERROR" in str(issue).upper()
+        or str(issue).upper() == "STOCK_NOT_FOUND"
+        for issue in diagnostics["issues"]
+    )
+    if malformed_or_failed:
+        projection_status = CHART_PROJECTION_REFRESH_FAILED
+    elif not instance_id or not rules:
+        projection_status = CHART_PROJECTION_RULES_UNAVAILABLE
+    elif candles:
+        projection_status = CHART_PROJECTION_VALID
+    elif raw_day:
+        projection_status = CHART_PROJECTION_NOT_READY
+    else:
+        projection_status = CHART_PROJECTION_NO_DAY_DATA
+    diagnostics["projection_status"] = projection_status
+
     signal_records = _read_signal_records(root / "runtime" / "routine_signals.json")
     markers: list[dict[str, Any]] = []
     for record in signal_records:
@@ -760,6 +786,7 @@ def project_stock_instance_day(
         "stock_code": str(stock_code or "").strip(),
         "stock_name": str(config.get("name") or stock_dir.name.split("_", 1)[-1] if stock_dir.exists() else ""),
         "trade_date": str(trade_date or ""),
+        "projection_status": projection_status,
         "instance_id": instance_id,
         "instance_name": instance_name,
         "bar_minutes": bar_minutes,

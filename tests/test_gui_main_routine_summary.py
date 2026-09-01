@@ -23,6 +23,7 @@ import gui_main_table_loader as table_loader
 import gui_windows
 from gui_auto_trade_display import profit_loss_value_color
 from gui_windows import MainWindow
+from tests.participant_owner_fixture import attach_participant_owner, participant_owner
 
 
 class MainRoutineSummaryTests(unittest.TestCase):
@@ -252,7 +253,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         ):
             counts = table_loader._instance_stock_counts(
                 window=SimpleNamespace(
-                    _current_session_operation_participant_stock_codes={"000001"},
+                    _main_monitoring_auto_trade_operation_host=participant_owner({"000001"}),
                 ),
             )
 
@@ -396,16 +397,19 @@ class MainRoutineSummaryTests(unittest.TestCase):
             SimpleNamespace(
                 instance_id="instance-a",
                 definition_id="definition-a",
+                group_id="group-a",
                 display_name="A",
             ),
             SimpleNamespace(
                 instance_id="instance-b",
                 definition_id="definition-a",
+                group_id="group-a",
                 display_name="B",
             ),
             SimpleNamespace(
                 instance_id="instance-c",
                 definition_id="definition-a",
+                group_id="group-a",
                 display_name="C",
             ),
         ]
@@ -446,11 +450,11 @@ class MainRoutineSummaryTests(unittest.TestCase):
         }
         relation_scopes = []
 
-        def relation_counts(_window, projection, stock_scope):
+        def relation_counts(_window, projection, stock_scope, **_kwargs):
             relation_scopes.append(stock_scope)
             self.assertEqual(1, len(projection))
             self.assertEqual(
-                ["instance-a", "instance-b"],
+                ["instance-a", "instance-b", "instance-c"],
                 [item.instance_id for item in projection[0].instances],
             )
             return {
@@ -490,7 +494,13 @@ class MainRoutineSummaryTests(unittest.TestCase):
             patch.object(
                 table_loader,
                 "get_group_records",
-                return_value=[SimpleNamespace(name="Group A", path=Path("groups/a"))],
+                return_value=[
+                    SimpleNamespace(
+                        group_id="group-a",
+                        name="Group A",
+                        path=Path("groups/a"),
+                    )
+                ],
             ),
             patch.object(
                 table_loader,
@@ -828,8 +838,8 @@ class MainRoutineSummaryTests(unittest.TestCase):
         }
         states = {
             "000001_Running": {"trade_enabled": True},
-            "000002_Stopped": {},
-            "000003_Excluded": {},
+            "000002_Stopped": {"status": "STOPPED"},
+            "000003_Excluded": {"status": "STOPPED"},
             "000004_Review": {"review_required": True, "review_status": "PENDING"},
         }
 
@@ -847,7 +857,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
             ),
         ):
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={"000001"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"000001"}),
             )
             projected = {
                 scope: table_loader._instance_stock_counts(
@@ -878,7 +888,7 @@ class MainRoutineSummaryTests(unittest.TestCase):
         self.assertEqual(1, projected["all"]["excluded"])
         self.assertEqual(1, projected["all"]["review"])
 
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         with (
             patch.object(table_loader, "read_base_stocks", return_value=records),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
@@ -943,7 +953,13 @@ class MainRoutineSummaryTests(unittest.TestCase):
             ["000004 Review", "-", "수동", "-", "검토종목", "루틴", "-"],
         )
         self.assertTrue(tokens)
-        self.assertTrue(all(token["foreground"] == "#ff8c00" for token in tokens))
+        self.assertTrue(
+            all(token["foreground"] == "#ff8c00" for token in tokens[:4])
+        )
+        self.assertEqual(
+            ["#afb2b9", "#afb2b9", "#9ca3af"],
+            [token["foreground"] for token in tokens[4:]],
+        )
         self.assertTrue(all("검토관리" in token["tooltip"] for token in tokens))
 
     def test_summary_badges_keep_existing_display_and_scope_state_without_profit_badge(self) -> None:

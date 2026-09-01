@@ -266,7 +266,7 @@ class RoutineSignalProbeTimeframeIntegrationTests(unittest.TestCase):
         rules = {"bar": {"bar_minutes": 5}}
         with patch.object(routine_signal_probe, "_load_instance_rules", return_value=rules), patch.object(
             routine_signal_probe, "_append_log"
-        ), patch.object(routine_signal_probe, "read_latest_price", return_value=None):
+        ), patch.object(routine_signal_probe, "read_reference_price", return_value=None):
             result = routine_signal_probe.probe_routine_for_stock(
                 CapturingRoutine,
                 "test",

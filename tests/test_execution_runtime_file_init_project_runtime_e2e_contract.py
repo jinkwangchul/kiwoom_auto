@@ -18,9 +18,11 @@ from execution_runtime_file_schema import (
     default_order_locks_data,
 )
 from execution_runtime_reader import read_order_executions, read_order_locks
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    patch_project_runtime_classifiers,
+    write_json,
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -31,15 +33,28 @@ def _sha256(path: Path) -> str | None:
 
 class ExecutionRuntimeFileInitProjectRuntimeE2EContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.order_executions_path = ROOT / "runtime" / "order_executions.json"
-        self.order_locks_path = ROOT / "runtime" / "order_locks.json"
-        self.order_queue_path = ROOT / "runtime" / "order_queue.json"
+        self.layout = TemporaryProjectRoot()
+        self.order_executions_path = self.layout.runtime / "order_executions.json"
+        self.order_locks_path = self.layout.runtime / "order_locks.json"
+        self.order_queue_path = self.layout.runtime / "order_queue.json"
+        write_json(self.order_queue_path, {"orders": []})
+        write_json(self.layout.routines / "fixture" / "rules.json", {"fixture": True})
+        self.runtime_classifier_patches = patch_project_runtime_classifiers(
+            self.layout.runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_commit_service",
+                "execution_runtime_file_init_open_policy",
+            ),
+        )
         self.created_paths: list[Path] = []
 
     def tearDown(self) -> None:
         for path in self.created_paths:
             if path.exists():
                 path.unlink()
+        self.runtime_classifier_patches.close()
+        self.layout.cleanup()
 
     def _project_orchestrator(self) -> dict:
         preview = build_execution_runtime_file_init_preview(
@@ -118,7 +133,7 @@ class ExecutionRuntimeFileInitProjectRuntimeE2EContractTest(unittest.TestCase):
             return
 
         before_order_queue = _sha256(self.order_queue_path)
-        before_rules = {str(path): _sha256(path) for path in (ROOT / "routines").glob("**/rules.json")}
+        before_rules = {str(path): _sha256(path) for path in self.layout.routines.glob("**/rules.json")}
         orchestrator = self._project_orchestrator()
 
         try:
@@ -136,7 +151,7 @@ class ExecutionRuntimeFileInitProjectRuntimeE2EContractTest(unittest.TestCase):
             self.assertEqual(default_order_executions_data(), read_order_executions(self.order_executions_path)["data"])
             self.assertEqual(default_order_locks_data(), read_order_locks(self.order_locks_path)["data"])
             self.assertEqual(before_order_queue, _sha256(self.order_queue_path))
-            self.assertEqual(before_rules, {str(path): _sha256(path) for path in (ROOT / "routines").glob("**/rules.json")})
+            self.assertEqual(before_rules, {str(path): _sha256(path) for path in self.layout.routines.glob("**/rules.json")})
         finally:
             for path in self.created_paths:
                 if path.exists():

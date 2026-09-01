@@ -11,9 +11,33 @@ from event_journal_reader import EventJournalReader
 from event_journal_writer import EventJournalWriter
 import event_journal_production as production
 import gui_auto_trade_operation_host as operation_host_module
+from gui_auto_trade_integrity import inspect_stock_review_state
 import gui_auto_trade_setting_window as setting_window_module
 import gui_auto_trade_status_ops as status_ops_module
 import gui_main_emergency_ops as emergency_module
+from runtime_io import read_json_dict
+from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
+
+
+class _OperationExclusionOwner(operation_host_module.QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self._main_monitoring_auto_trade_operation_host = (
+            operation_host_module.AutoTradeOperationHost(self)
+        )
+        self.status_messages: list[str] = []
+        self.refresh_count = 0
+
+    def main_monitoring_auto_trade_operation_host(
+        self,
+    ) -> operation_host_module.AutoTradeOperationHost:
+        return self._main_monitoring_auto_trade_operation_host
+
+    def statusBarMessage(self, message: str) -> None:
+        self.status_messages.append(str(message))
+
+    def refresh_all(self) -> None:
+        self.refresh_count += 1
 
 
 class EventJournalProductionConnectionTest(unittest.TestCase):
@@ -157,37 +181,88 @@ class EventJournalProductionConnectionTest(unittest.TestCase):
         append.assert_not_called()
 
     def test_operation_exclusion_records_one_event_only_after_state_change(self) -> None:
-        class Host:
-            def statusBarMessage(self, *_args):
-                pass
-
-            def refresh_all(self):
-                pass
-
-        stock_dir = Path(self.temp.name) / "005930_삼성전자"
-        stock_dir.mkdir(parents=True)
-        (stock_dir / "config.json").write_text(
-            '{"operation_excluded": false}\n', encoding="utf-8"
+        layout = TemporaryProjectRoot(prefix="event_journal_exclusion_")
+        self.addCleanup(layout.cleanup)
+        stock_dir = create_stock_fixture(
+            layout,
+            code="005930",
+            name="Samsung",
+            config={"operation_mode": "SCHEDULED"},
+            state={},
+            orders=[],
         )
-        target = (stock_dir, "005930", "삼성전자")
+        config_path = stock_dir / "config.json"
+        inspection = inspect_stock_review_state(stock_dir)
+        self.assertFalse(inspection.review_required)
+        self.assertTrue(inspection.state_valid)
+        self.assertEqual("CLEAR", inspection.reason_code)
+        self.assertFalse(read_json_dict(config_path)["operation_excluded"])
+
+        owner = _OperationExclusionOwner()
+        operation_host = owner.main_monitoring_auto_trade_operation_host()
+        self.addCleanup(operation_host.shutdown)
+        self.assertEqual(
+            (),
+            operation_host.current_session_operation_participant_stock_codes(),
+        )
+
+        target = (stock_dir, "005930", "Samsung")
+        write_results = []
+        event_config_snapshots: list[dict[str, object]] = []
+        canonical_patch = status_ops_module._patch_auto_trade_stock_operation_excluded
+
+        def capture_write(*args, **kwargs):
+            result = canonical_patch(*args, **kwargs)
+            write_results.append(result)
+            return result
+
+        def capture_event(*_args, **_kwargs):
+            event_config_snapshots.append(read_json_dict(config_path))
+            return {"appended": True}
+
         with (
             patch.object(status_ops_module, "append_stock_log"),
             patch.object(status_ops_module, "append_changelog"),
             patch.object(status_ops_module, "show_toast"),
-            patch.object(status_ops_module, "append_production_event") as append,
+            patch.object(
+                status_ops_module,
+                "_patch_auto_trade_stock_operation_excluded",
+                side_effect=capture_write,
+            ) as patch_exclusion,
+            patch.object(
+                status_ops_module,
+                "append_production_event",
+                side_effect=capture_event,
+            ) as append,
         ):
             self.assertTrue(
                 setting_window_module.AutoTradeSettingWindow.set_stock_operation_exclusion(
-                    Host(), target, True
+                    owner, target, True
                 )
             )
+            self.assertTrue(read_json_dict(config_path)["operation_excluded"])
             self.assertTrue(
                 setting_window_module.AutoTradeSettingWindow.set_stock_operation_exclusion(
-                    Host(), target, True
+                    owner, target, True
                 )
             )
+        patch_exclusion.assert_called_once()
+        self.assertEqual(1, len(write_results))
+        self.assertTrue(write_results[0].ok)
+        self.assertTrue(write_results[0].changed)
+        self.assertTrue(write_results[0].read_back_verified)
         append.assert_called_once()
         self.assertEqual("OPERATION_EXCLUDED", append.call_args.args[0])
+        self.assertEqual("COMPLETED", append.call_args.kwargs["result"])
+        self.assertEqual("005930", append.call_args.kwargs["stock_code"])
+        self.assertEqual(
+            "AutoTradeSettingWindow.set_stock_operation_exclusion",
+            append.call_args.kwargs["source"],
+        )
+        self.assertEqual(1, len(event_config_snapshots))
+        self.assertTrue(event_config_snapshots[0]["operation_excluded"])
+        self.assertTrue(read_json_dict(config_path)["operation_excluded"])
+        self.assertEqual(1, owner.refresh_count)
 
     def test_global_emergency_event_is_after_writer_success_and_skips_noop(self) -> None:
         class StatusBar:

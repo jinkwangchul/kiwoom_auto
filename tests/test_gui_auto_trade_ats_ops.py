@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from PyQt5.QtWidgets import QMessageBox
 
 import gui_auto_trade_ats_ops as ats_ops
 from manual_ats_runtime import write_manual_ats_runtime_selection
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class GuiAutoTradeAtsOpsTest(unittest.TestCase):
@@ -43,6 +45,7 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
             target = [(stock_dir, "005930", "삼성전자")]
             window = MagicMock()
             window.selected_stock_infos.return_value = target
+            attach_participant_owner(window, {"005930"})
 
             def session_definition(key: str) -> dict[str, object]:
                 return {
@@ -263,20 +266,34 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
 
     def test_submenu_toggle_edits_only_the_clicked_visible_session(self) -> None:
         window = MagicMock()
+        selected = [(Path("stocks/005930_Test"), "005930", "Test")]
+        window.selected_stock_infos.return_value = selected
         current = {"extra1": False, "extra2": True, "extra3": True}
-        window.selected_manual_ats_state.return_value = dict(current)
-        window.save_selected_manual_ats_state.return_value = 2
 
-        ats_ops.auto_trade_set_selected_manual_ats_flag(
+        with (
+            patch.object(
+                ats_ops,
+                "auto_trade_selected_manual_ats_state",
+                return_value=dict(current),
+            ) as read_state,
+            patch.object(
+                ats_ops,
+                "auto_trade_save_selected_manual_ats_state",
+                return_value=2,
+            ) as save_state,
+        ):
+            ats_ops.auto_trade_set_selected_manual_ats_flag(
+                window,
+                "extra1",
+                True,
+                "ATS 장전",
+            )
+
+        read_state.assert_called_once_with(window, selected)
+        save_state.assert_called_once_with(
             window,
-            "extra1",
-            True,
-            "ATS 장전",
-        )
-
-        window.save_selected_manual_ats_state.assert_called_once_with(
             {"extra1": True, "extra2": True, "extra3": True},
-            None,
+            selected,
             ("extra1",),
         )
         window.statusBarMessage.assert_called_once_with(
@@ -302,8 +319,6 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
             selected = [(stock_dir, "005930", "삼성전자")]
             window.selected_stock_infos.return_value = selected
             window.capture_stock_table_view_state.return_value = (set(), 0)
-            window.current_runtime_file_signature.return_value = ()
-
             self.assertEqual(
                 {"extra1": False, "extra2": False, "extra3": False},
                 ats_ops.auto_trade_selected_manual_ats_state(window, selected),
@@ -379,7 +394,6 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         ]
         window.selected_stock_infos.return_value = selected
         window.capture_stock_table_view_state.return_value = (set(), 0)
-        window.current_runtime_file_signature.return_value = ("runtime",)
         window.process_executable_order_for_auto_trade.return_value = {
             "blocked_reasons": [],
             "send_order_result": {"send_call_accepted": True},
@@ -464,7 +478,6 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         ]
         window.save_selected_manual_ats_state.return_value = 1
         window.capture_stock_table_view_state.return_value = (["C:/temp/005930"], 7)
-        window.current_runtime_file_signature.return_value = ("runtime",)
         window.process_executable_order_for_auto_trade.return_value = {
             "processed": True,
             "stage": "send_order",
@@ -561,8 +574,12 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         with (
             patch.object(
                 ats_ops,
-                "ensure_manual_ats_liquidation_request",
-                return_value={"ok": True},
+                "execute_manual_ats_liquidation_request_command",
+                return_value=SimpleNamespace(
+                    ok=True,
+                    reason_code="",
+                    operation_result={"ok": True},
+                ),
             ),
             patch.object(ats_ops, "read_json_dict", return_value={}),
             patch.object(
@@ -624,8 +641,12 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         with (
             patch.object(
                 ats_ops,
-                "ensure_manual_ats_liquidation_request",
-                return_value={"ok": True},
+                "execute_manual_ats_liquidation_request_command",
+                return_value=SimpleNamespace(
+                    ok=True,
+                    reason_code="",
+                    operation_result={"ok": True},
+                ),
             ),
             patch.object(ats_ops, "read_json_dict", return_value={}),
             patch.object(ats_ops, "OperationCommandService", return_value=command_service),
@@ -664,8 +685,12 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
         with (
             patch.object(
                 ats_ops,
-                "ensure_manual_ats_liquidation_request",
-                return_value={"ok": True},
+                "execute_manual_ats_liquidation_request_command",
+                return_value=SimpleNamespace(
+                    ok=True,
+                    reason_code="",
+                    operation_result={"ok": True},
+                ),
             ),
             patch.object(ats_ops, "read_json_dict", return_value={}),
             patch.object(
@@ -691,7 +716,6 @@ class GuiAutoTradeAtsOpsTest(unittest.TestCase):
             (Path("C:/temp/C"), "000003", "C"),
         ]
         window.capture_stock_table_view_state.return_value = (set(), 0)
-        window.current_runtime_file_signature.return_value = ("runtime",)
         previews = [
             {"ok": True, "code": code, "name": name, "stock_dir": str(path)}
             for path, code, name in selected

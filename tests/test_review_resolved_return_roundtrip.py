@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -248,9 +249,35 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
                 stack.enter_context(
                     patch.object(emergency_ops, "observe_owner_failure_transition")
                 )
+
+                def unassign_stock(
+                    _owner,
+                    _project_root,
+                    code,
+                    name,
+                    *,
+                    expected_instance_id,
+                    intent,
+                ):
+                    self.assertEqual(
+                        emergency_ops.ASSIGNMENT_INTENT_REVIEW_RESOLUTION_UNASSIGN,
+                        intent,
+                    )
+                    config_path = stock_dir / "config.json"
+                    config = read_json_dict(config_path)
+                    config["assigned_routine_instance_id"] = ""
+                    config["routines"] = []
+                    config_path.write_text(
+                        json.dumps(config, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    return SimpleNamespace(ok=True, reason_code="UPDATED")
+
                 update_routines = stack.enter_context(
                     patch.object(
-                        emergency_ops, "update_base_stock_routines", return_value=True
+                        emergency_ops,
+                        "execute_assignment_unassign",
+                        side_effect=unassign_stock,
                     )
                 )
                 result = emergency_ops.normalize_review_emergency_target(
@@ -271,7 +298,9 @@ class ReviewResolvedReturnGuiRoundtripTests(unittest.TestCase):
                 self.assertEqual("", saved["active_routine"])
                 self.assertEqual("", saved["routine_name"])
                 self.assertFalse(_active_close_or_liquidation(saved, datetime.now()))
-                update_routines.assert_called_once_with("323410", "TEST", [])
+                update_routines.assert_called_once()
+                self.assertEqual(("323410", "TEST"), update_routines.call_args.args[2:])
+                self.assertEqual("", update_routines.call_args.kwargs["expected_instance_id"])
 
     def test_restore_keeps_nonterminal_notice_clear_behavior(self):
         with TemporaryDirectory() as root:

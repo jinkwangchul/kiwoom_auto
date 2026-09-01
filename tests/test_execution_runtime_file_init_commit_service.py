@@ -20,9 +20,11 @@ from execution_runtime_file_init_open_policy import evaluate_execution_runtime_f
 from execution_runtime_file_init_preview import build_execution_runtime_file_init_preview
 from execution_runtime_file_schema import default_order_executions_data
 from execution_runtime_reader import read_order_executions, read_order_locks
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    patch_project_runtime_classifiers,
+    write_json,
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -33,13 +35,24 @@ def _sha256(path: Path) -> str | None:
 
 class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.temp_root = Path(self.tmp.name)
+        self.layout = TemporaryProjectRoot()
+        self.temp_root = self.layout.root / "temp-runtime"
+        self.temp_root.mkdir()
+        self.project_runtime = self.layout.runtime
         self.order_executions_path = self.temp_root / "order_executions.json"
         self.order_locks_path = self.temp_root / "order_locks.json"
+        self.runtime_classifier_patches = patch_project_runtime_classifiers(
+            self.project_runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_commit_service",
+                "execution_runtime_file_init_open_policy",
+            ),
+        )
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        self.runtime_classifier_patches.close()
+        self.layout.cleanup()
 
     def _orchestrator(
         self,
@@ -71,8 +84,8 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
 
     def _project_orchestrator(self) -> dict:
         return self._orchestrator(
-            order_executions_path=ROOT / "runtime" / "order_executions.json",
-            order_locks_path=ROOT / "runtime" / "order_locks.json",
+            order_executions_path=self.project_runtime / "order_executions.json",
+            order_locks_path=self.project_runtime / "order_locks.json",
             allow_project_runtime_path=True,
             manual_project_runtime_path_confirmed=True,
         )
@@ -122,8 +135,8 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
 
         self.assertEqual("BLOCKED", result["status"])
         self.assertIn("PROJECT_RUNTIME_PATH_BLOCKED", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertFalse((self.project_runtime / "order_executions.json").exists())
+        self.assertFalse((self.project_runtime / "order_locks.json").exists())
 
     def test_project_runtime_open_policy_ready_missing_project_commit_confirmation_blocked(self) -> None:
         orchestrator = self._project_orchestrator()
@@ -135,8 +148,8 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
 
         self.assertEqual("BLOCKED", result["status"])
         self.assertIn("MANUAL_PROJECT_RUNTIME_FILE_INIT_COMMIT_CONFIRMATION_REQUIRED", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertFalse((self.project_runtime / "order_executions.json").exists())
+        self.assertFalse((self.project_runtime / "order_locks.json").exists())
 
     def test_project_runtime_open_policy_blocked_invalid_skipped(self) -> None:
         orchestrator = self._project_orchestrator()
@@ -166,12 +179,12 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
         self.assertEqual("BLOCKED", blocked["status"])
         self.assertEqual("INVALID", invalid["status"])
         self.assertEqual("SKIPPED", skipped["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertFalse((self.project_runtime / "order_executions.json").exists())
+        self.assertFalse((self.project_runtime / "order_locks.json").exists())
 
     def test_project_runtime_open_policy_ready_committed_and_read_back_verified(self) -> None:
-        order_executions_path = ROOT / "runtime" / "order_executions.json"
-        order_locks_path = ROOT / "runtime" / "order_locks.json"
+        order_executions_path = self.project_runtime / "order_executions.json"
+        order_locks_path = self.project_runtime / "order_locks.json"
         self.assertFalse(order_executions_path.exists())
         self.assertFalse(order_locks_path.exists())
         orchestrator = self._project_orchestrator()
@@ -197,8 +210,8 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
                     path.unlink()
 
     def test_project_runtime_valid_existing_file_creates_only_missing_file_after_open_policy(self) -> None:
-        order_executions_path = ROOT / "runtime" / "order_executions.json"
-        order_locks_path = ROOT / "runtime" / "order_locks.json"
+        order_executions_path = self.project_runtime / "order_executions.json"
+        order_locks_path = self.project_runtime / "order_locks.json"
         self.assertFalse(order_executions_path.exists())
         self.assertFalse(order_locks_path.exists())
         orchestrator = self._project_orchestrator()
@@ -282,20 +295,21 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
         self.assertEqual("COMMITTED", result["status"])
         self.assertEqual(2, replace.call_count)
 
-    def test_actual_runtime_and_rules_hash_unchanged(self) -> None:
+    def test_temp_runtime_and_rules_hash_unchanged(self) -> None:
+        write_json(self.layout.routines / "fixture" / "rules.json", {"fixture": True})
         runtime_paths = [
-            ROOT / "runtime" / "order_queue.json",
-            ROOT / "runtime" / "order_executions.json",
-            ROOT / "runtime" / "order_locks.json",
+            self.project_runtime / "order_queue.json",
+            self.project_runtime / "order_executions.json",
+            self.project_runtime / "order_locks.json",
         ]
-        rules_paths = list((ROOT / "routines").glob("**/rules.json"))
+        rules_paths = list(self.layout.routines.glob("**/rules.json"))
         before_runtime = {str(path): _sha256(path) for path in runtime_paths}
         before_rules = {str(path): _sha256(path) for path in rules_paths}
 
         self._commit(self._orchestrator())
         project_orchestrator = self._orchestrator(
-            order_executions_path=ROOT / "runtime" / "order_executions.json",
-            order_locks_path=ROOT / "runtime" / "order_locks.json",
+            order_executions_path=self.project_runtime / "order_executions.json",
+            order_locks_path=self.project_runtime / "order_locks.json",
             allow_project_runtime_path=True,
             manual_project_runtime_path_confirmed=True,
         )
@@ -303,8 +317,8 @@ class ExecutionRuntimeFileInitCommitServiceTest(unittest.TestCase):
 
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
         self.assertEqual(before_rules, {str(path): _sha256(path) for path in rules_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        self.assertFalse((self.project_runtime / "order_executions.json").exists())
+        self.assertFalse((self.project_runtime / "order_locks.json").exists())
 
 
 if __name__ == "__main__":

@@ -53,6 +53,10 @@ from gui_styles import (
 )
 from gui_table_utils import next_sort_order
 from gui_toast import show_toast
+from gui_operation_ui_context import (
+    refresh_auto_trade_views,
+    sync_auto_trade_monitoring_universe,
+)
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
@@ -64,6 +68,7 @@ from gui_operation_environment import (
 from account_funds_foundation import READY as ACCOUNT_FUNDS_READY
 from event_journal_production import append_production_event
 from runtime_io import read_json_dict
+from assignment_episode_linkage import unassign_stock_routine
 from stock_repository import (
     repository as stock_repository_factory,
     safe_stock_folder_name,
@@ -72,9 +77,10 @@ from group_scope import load_group_scope
 from stock_long_hold_policy import long_hold_excludes_holding_review
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_integrity import (
+    inspect_review_state_path,
+    inspect_stock_review_state,
     is_emergency_stopped_state as _common_is_emergency_stopped_state,
     is_review_required_state as _common_is_review_required_state,
-    read_review_state_with_issue,
     operator_review_location,
     operator_review_reason,
 )
@@ -439,9 +445,6 @@ def get_group_dirs() -> list[Path]:
         return []
 
 
-def get_routine_dirs() -> list[Path]:
-    """Compatibility wrapper for historical Group-path callers."""
-    return get_group_dirs()
 
 
 def routine_display_name(routine_dir: Path) -> str:
@@ -484,15 +487,12 @@ def is_review_required_state(state: dict[str, object] | None) -> bool:
 
 def is_review_required_stock_dir(stock_dir: Path) -> bool:
     """runtime 폴더 기준 검토관리 전용 종목 여부."""
-    try:
-        state = read_json_dict(stock_dir / "state.json")
-    except Exception:
-        return False
-    return is_review_required_state(state)
+    return inspect_stock_review_state(stock_dir).review_required
 
 
 def _read_central_review_state(state_path: Path) -> tuple[dict[str, object], str]:
-    return read_review_state_with_issue(state_path)
+    inspection = inspect_review_state_path(state_path)
+    return inspection.state, inspection.issue_reason
 
 
 def _review_display_status_for_collected_row(
@@ -688,7 +688,13 @@ def append_review_force_reset_event(
     )
 
 
-def update_base_stock_routines(code: str, name: str, routines: list[str]) -> bool:
+def update_base_stock_routines(
+    code: str,
+    name: str,
+    routines: list[str],
+    *,
+    expected_instance_id: str | None = None,
+) -> bool:
     """
     중앙 stocks/config.json 기준으로 종목의 루틴 연결을 갱신한다.
 
@@ -696,7 +702,14 @@ def update_base_stock_routines(code: str, name: str, routines: list[str]) -> boo
     """
     try:
         repo = stock_repository_factory()
-        return repo.update_stock_routine(code, name, routines)
+        return unassign_stock_routine(
+            repo.project_root,
+            code,
+            name,
+            routines,
+            expected_instance_id=expected_instance_id,
+            stock_repository=repo,
+        ).ok
     except Exception:
         return False
 
@@ -2027,17 +2040,10 @@ class GlobalReviewRequiredWindow(QDialog):
 
     def _refresh_after_review_action(self) -> None:
         self.load_review_items()
-        parent = persistent_feature_owner(self)
-        if hasattr(parent, "refresh_all"):
-            try:
-                parent.refresh_all()
-            except Exception:
-                pass
-        elif hasattr(parent, "refresh_auto_trade_assignment_views"):
-            try:
-                parent.refresh_auto_trade_assignment_views()
-            except Exception:
-                pass
+        try:
+            refresh_auto_trade_views(persistent_feature_owner(self))
+        except Exception:
+            pass
 
     def return_selected_items_to_auto_list(self) -> None:
         """검토관리 종목을 원래 루틴에 남긴 채 감시/대기 상태로 복귀한다."""
@@ -2134,6 +2140,7 @@ class GlobalReviewRequiredWindow(QDialog):
 
         if changed:
             append_changelog("UPDATE", "기초종목.txt/state.json", f"검토관리 미지정 전환: {changed}개")
+            sync_auto_trade_monitoring_universe(self)
         self._refresh_after_review_action()
 
         unavailable = len(blocked) + failed
@@ -2263,6 +2270,8 @@ class GlobalReviewRequiredWindow(QDialog):
                 )
                 failed += 1
 
+        if deleted:
+            sync_auto_trade_monitoring_universe(self)
         self._refresh_after_review_action()
 
         message = f"강제초기화 완료: {deleted}개"

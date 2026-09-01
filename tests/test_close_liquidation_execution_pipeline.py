@@ -70,6 +70,8 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
 
             self.assertFalse(send_call_only["attempted"])
             self.assertTrue(accepted["marked"], accepted)
+            self.assertTrue(accepted["changed"], accepted)
+            self.assertTrue(accepted["read_back_verified"], accepted)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertTrue(saved["close_routine_final_sell_ordered"])
             self.assertEqual("kiwoom_chejan", saved["close_routine_final_sell_source"])
@@ -108,6 +110,9 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
     def test_market_and_current_price_build_existing_sell_candidate_shape(self):
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp))
+            market_price_reader = Mock(
+                side_effect=AssertionError("MARKET must not read price")
+            )
             market = build_close_liquidation_candidate_preview(
                 stock,
                 "005930",
@@ -117,6 +122,7 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                 requested_at="2026-07-27 13:30:00",
                 routine_instance_id="routine-instance-1",
                 reason="EARLY_CLOSE",
+                current_price_reader=market_price_reader,
             )
             current = build_close_liquidation_candidate_preview(
                 stock,
@@ -127,16 +133,39 @@ class CloseLiquidationExecutionPipelineTest(unittest.TestCase):
                 requested_at="2026-07-27 13:31:00",
                 routine_instance_id="routine-instance-1",
                 reason="INDIVIDUAL_LIQUIDATION",
-                latest_price_reader=lambda _code, _name: 72500,
+                current_price_reader=lambda _code, _name: 72500,
             )
 
         self.assertTrue(market["ok"])
         self.assertEqual(market["order_candidate"]["side"], "SELL")
         self.assertEqual(market["order_candidate"]["hoga"], "MARKET")
         self.assertEqual(market["order_candidate"]["quantity"], 3)
+        self.assertEqual(market["order_candidate"]["price_basis"], "MARKET")
+        market_price_reader.assert_not_called()
         self.assertTrue(current["ok"])
         self.assertEqual(current["order_candidate"]["hoga"], "CURRENT_PRICE")
         self.assertEqual(current["order_candidate"]["price"], 72500)
+        self.assertEqual(current["order_candidate"]["price_basis"], "CURRENT_PRICE")
+
+    def test_current_price_requires_actionable_reader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            preview = build_close_liquidation_candidate_preview(
+                stock,
+                "005930",
+                "Samsung",
+                "CURRENT_PRICE",
+                command_id="command-current-missing",
+                requested_at="2026-07-27 13:31:00",
+                routine_instance_id="routine-instance-1",
+                reason="INDIVIDUAL_LIQUIDATION",
+            )
+
+        self.assertFalse(preview["ok"])
+        self.assertIn(
+            "current-price liquidation requires an actionable current price",
+            preview["blocked_reasons"],
+        )
 
     def test_commit_reuses_approval_candidate_and_policy_pipeline(self):
         preview = {

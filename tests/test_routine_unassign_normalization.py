@@ -184,7 +184,7 @@ class RoutineUnassignNormalizationTests(unittest.TestCase):
         self.assertTrue(decision.review_required)
         self.assertEqual(before, self.state_path.read_bytes())
 
-    def test_current_instance_and_legacy_relation_mismatch_are_integrity_blocks(self) -> None:
+    def test_current_instance_mismatch_blocks_but_display_alias_drift_does_not(self) -> None:
         mismatch = policy.routine_unassign_decision(
             "005930",
             "삼성전자",
@@ -196,8 +196,9 @@ class RoutineUnassignNormalizationTests(unittest.TestCase):
 
         self.write_config(active_routine="다른루틴")
         legacy = self.decision()
-        self.assertIn("ROUTINE_RELATION_MISMATCH", legacy.reason_codes)
-        self.assertEqual("INTEGRITY_BLOCK", legacy.diagnostic_class)
+        self.assertTrue(legacy.allowed)
+        self.assertNotIn("ROUTINE_RELATION_MISMATCH", legacy.reason_codes)
+        self.assertIn("legacy routine fields disagree", legacy.evidence["relation_issues"])
 
         self.write_config(
             routine="다른루틴",
@@ -207,7 +208,8 @@ class RoutineUnassignNormalizationTests(unittest.TestCase):
             routines=["다른루틴"],
         )
         consistent_but_wrong = self.decision()
-        self.assertIn("ROUTINE_RELATION_MISMATCH", consistent_but_wrong.reason_codes)
+        self.assertTrue(consistent_but_wrong.allowed)
+        self.assertNotIn("ROUTINE_RELATION_MISMATCH", consistent_but_wrong.reason_codes)
         self.assertIn(
             "legacy routine value does not match assigned instance definition",
             consistent_but_wrong.evidence["relation_issues"],

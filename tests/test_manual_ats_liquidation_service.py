@@ -76,6 +76,9 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
     def test_market_preview_uses_actual_holding_and_zero_price(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock = self._stock(Path(temp))
+            current_price_reader = MagicMock(
+                side_effect=AssertionError("MARKET must not read price")
+            )
             with patch(
                 "manual_ats_liquidation_service.manual_ats_session_definition",
                 side_effect=self._session,
@@ -88,7 +91,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     "시장가",
                     now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
                     command_id="ats-market-1",
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=current_price_reader,
                 )
 
         self.assertTrue(preview["ok"])
@@ -97,6 +100,8 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
         self.assertEqual(0, preview["price"])
         self.assertEqual("SELL", preview["order_candidate"]["side"])
         self.assertEqual("MARKET", preview["order_candidate"]["order_intent"]["hoga"])
+        self.assertEqual("MARKET", preview["order_candidate"]["price_basis"])
+        current_price_reader.assert_not_called()
 
     def test_current_price_preview_uses_limit_hoga_and_current_price(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -112,16 +117,39 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     ["extra1"],
                     "현재가",
                     now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=lambda _code, _name: 72500,
                 )
 
         self.assertTrue(preview["ok"])
         self.assertEqual(METHOD_CURRENT_PRICE, preview["sell_method"])
         self.assertEqual(72500, preview["price"])
         self.assertEqual("CURRENT_PRICE", preview["order_candidate"]["order_intent"]["hoga"])
+        self.assertEqual("CURRENT_PRICE", preview["order_candidate"]["price_basis"])
         mapped = map_order_hoga_preview(preview["order_candidate"])
         self.assertEqual("LIMIT", mapped["hoga"])
         self.assertFalse(mapped["unresolved"])
+
+    def test_current_price_preview_requires_actionable_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            stock = self._stock(Path(temp))
+            with patch(
+                "manual_ats_liquidation_service.manual_ats_session_definition",
+                side_effect=self._session,
+            ):
+                preview = build_manual_ats_liquidation_preview(
+                    stock,
+                    "005930",
+                    "삼성전자",
+                    ["extra1"],
+                    "현재가",
+                    now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
+                )
+
+        self.assertFalse(preview["ok"])
+        self.assertIn(
+            "current-price liquidation requires an actionable current price",
+            preview["blocked_reasons"],
+        )
 
     def test_reconciled_holding_override_replaces_stale_state_quantity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -138,7 +166,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     "시장가",
                     now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
                     holding_qty_override=70,
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=lambda _code, _name: 72500,
                 )
                 current = build_manual_ats_liquidation_preview(
                     stock,
@@ -148,7 +176,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     "현재가",
                     now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
                     holding_qty_override=110,
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=lambda _code, _name: 72500,
                 )
 
         self.assertEqual(70, market["order_candidate"]["quantity"])
@@ -176,7 +204,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     ["extra1"],
                     "시장가",
                     now_dt=datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc),
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=lambda _code, _name: 72500,
                 )
 
         self.assertFalse(preview["ok"])
@@ -212,7 +240,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                             ["extra1"],
                             "시장가",
                             now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
-                            latest_price_reader=lambda _code, _name: 72500,
+                            current_price_reader=lambda _code, _name: 72500,
                         )
                 self.assertTrue(preview["ok"])
                 self.assertEqual(trade_date, preview["trade_date"])
@@ -234,7 +262,7 @@ class ManualAtsLiquidationServiceTest(unittest.TestCase):
                     "시장가",
                     now_dt=datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc),
                     command_id="ats-commit-1",
-                    latest_price_reader=lambda _code, _name: 72500,
+                    current_price_reader=lambda _code, _name: 72500,
                 )
 
             appender = MagicMock(

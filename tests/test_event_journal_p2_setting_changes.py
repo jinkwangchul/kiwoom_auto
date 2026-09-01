@@ -21,6 +21,11 @@ import gui_operation_environment as operation_environment
 import gui_windows
 import routine_instance_repository
 import stock_repository
+from assignment_episode_linkage import (
+    AssignmentTransactionResult,
+    assign_stock_routine,
+    unassign_stock_routine,
+)
 from routine_instance_repository import (
     RoutineInstanceCreateRequest,
     RoutineInstanceRepository,
@@ -29,9 +34,80 @@ from stock_repository import StockRepository
 
 
 INSTANCE_ID = UUID("ab02beab-3aa4-4bde-9d53-c02b03f6090f")
+GROUP_ID = UUID("01f74a69-df36-4df3-8e32-ab50e3d585ef")
 
 
 class EventJournalP2SettingChangeTests(unittest.TestCase):
+    @staticmethod
+    def _write_assignment_foundation(root: Path) -> None:
+        routine_dir = root / "routines" / "indicator_follow"
+        routine_dir.mkdir(parents=True)
+        (routine_dir / "routine.py").write_text("", encoding="utf-8")
+        (routine_dir / "routine.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "definition_id": "indicator_follow",
+                    "name": "지표추종매매",
+                    "entry_file": "routine.py",
+                    "rules_file": "rules.json",
+                    "enabled": True,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        group_dir = root / "groups" / str(GROUP_ID)
+        group_dir.mkdir(parents=True)
+        (group_dir / "group.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "group_id": str(GROUP_ID),
+                    "definition_id": "indicator_follow",
+                    "base_name": "그룹A",
+                    "display_name": "그룹A",
+                    "slot": 0,
+                    "created_at": "2026-08-29T09:00:00+09:00",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (root / "groups" / "registry.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "mode": "logical",
+                    "group_ids": [str(GROUP_ID)],
+                    "cutover_at": "2026-08-29T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        instance_dir = root / "routine_instances" / str(INSTANCE_ID)
+        instance_dir.mkdir(parents=True)
+        (instance_dir / "rules.json").write_text("{}", encoding="utf-8")
+        (instance_dir / "instance.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "instance_id": str(INSTANCE_ID),
+                    "definition_id": "indicator_follow",
+                    "display_name": "루틴A",
+                    "enabled": False,
+                    "buy_limit_enabled": False,
+                    "buy_limit_amount": None,
+                    "rules_file": "rules.json",
+                    "created_at": "2026-08-29T09:00:00+09:00",
+                    "updated_at": "2026-08-29T09:00:00+09:00",
+                    "group_id": str(GROUP_ID),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     def test_system_budget_change_appends_once_and_same_value_appends_zero(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "operation_policy.json"
@@ -119,29 +195,42 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
             stock_dir = root / "stocks" / "005930_삼성전자"
             stock_dir.mkdir(parents=True)
             (stock_dir / "config.json").write_text("{}", encoding="utf-8")
+            self._write_assignment_foundation(root)
             repository = StockRepository(root)
             with patch.object(stock_repository, "append_production_event") as events:
                 self.assertTrue(
-                    repository.update_stock_routine_instance(
+                    assign_stock_routine(
+                        root,
                         "005930",
                         "삼성전자",
-                        instance_id="one",
+                        instance_id=str(INSTANCE_ID),
                         instance_name="루틴A",
                         definition_id="indicator_follow",
                         routine_type="지표추종매매",
-                    )
+                        stock_repository=repository,
+                    ).ok
                 )
                 self.assertTrue(
-                    repository.update_stock_routine_instance(
+                    assign_stock_routine(
+                        root,
                         "005930",
                         "삼성전자",
-                        instance_id="one",
+                        instance_id=str(INSTANCE_ID),
                         instance_name="루틴A",
                         definition_id="indicator_follow",
                         routine_type="지표추종매매",
-                    )
+                        stock_repository=repository,
+                    ).ok
                 )
-                self.assertTrue(repository.update_stock_routine("005930", "삼성전자", []))
+                self.assertTrue(
+                    unassign_stock_routine(
+                        root,
+                        "005930",
+                        "삼성전자",
+                        [],
+                        stock_repository=repository,
+                    ).ok
+                )
 
         self.assertEqual(2, events.call_count)
         self.assertTrue(
@@ -152,7 +241,7 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
             events.call_args_list[-1].kwargs["changes"][0]["after"],
         )
 
-    def test_stock_routine_write_failure_has_no_success_event(self):
+    def test_stock_routine_transaction_failure_has_no_success_event(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock_dir = root / "stocks" / "005930_삼성전자"
@@ -161,10 +250,24 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
             repository = StockRepository(root)
             with (
                 patch.object(stock_repository, "append_production_event") as events,
-                patch.object(stock_repository, "write_json_dict", side_effect=OSError("failed")),
+                patch(
+                    "assignment_episode_linkage.execute_assignment_transaction_foundation",
+                    return_value=AssignmentTransactionResult(
+                        False,
+                        error_code="CONFIG_FAILED",
+                        error="failed",
+                    ),
+                ),
             ):
-                with self.assertRaises(OSError):
-                    repository.update_stock_routine("005930", "삼성전자", ["루틴A"])
+                self.assertFalse(
+                    unassign_stock_routine(
+                        root,
+                        "005930",
+                        "삼성전자",
+                        [],
+                        stock_repository=repository,
+                    ).ok
+                )
         events.assert_not_called()
 
     def _routine_repository(self, root: Path) -> RoutineInstanceRepository:
@@ -317,8 +420,8 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
 
     def test_stock_trading_time_change_and_same_value(self):
         with tempfile.TemporaryDirectory() as temp:
-            stock_dir = Path(temp) / "005930_삼성전자"
-            stock_dir.mkdir()
+            stock_dir = Path(temp) / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
             (stock_dir / "config.json").write_text(
                 json.dumps({"operation_mode": "SCHEDULED"}),
                 encoding="utf-8",
@@ -364,8 +467,6 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
 
     def test_ats_change_appends_once_and_manual_liquidation_is_not_emitted(self):
         class Window:
-            _runtime_file_snapshot = None
-
             def capture_stock_table_view_state(self):
                 return set(), 0
 
@@ -374,9 +475,6 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
 
             def restore_stock_table_view_state(self, *_args):
                 return None
-
-            def current_runtime_file_signature(self):
-                return {}
 
             def update_action_buttons(self):
                 return None
@@ -422,18 +520,21 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
         class Surface:
             OVERRIDE_KEYS = gui_auto_trade_setting_window.StockPolicyOverrideDialog.OVERRIDE_KEYS
 
-            def __init__(self, stock_dir):
+            def __init__(self, stock_dir, config, *, enabled=True, memo="운영 메모"):
                 self.stock_dir = stock_dir
                 self.config_path = stock_dir / "config.json"
                 self.code = "005930"
                 self.name = "삼성전자"
-                self.config = {"policy_override_enabled": False}
-                self.use_override = Value(True)
-                self.memo = Value("운영 메모")
+                self.config = dict(config)
+                self._policy_override_opening_config = dict(config)
+                self.use_override = Value(enabled)
+                self.memo = Value(memo)
 
-            def write_config(self):
-                self.config_path.write_text(
-                    json.dumps(self.config, ensure_ascii=False), encoding="utf-8"
+            def write_config(self, patch, *, expected_fields):
+                return gui_auto_trade_setting_window.StockPolicyOverrideDialog.write_config(
+                    self,
+                    patch,
+                    expected_fields=expected_fields,
                 )
 
             def _append_override_changed(self, before, after):
@@ -445,9 +546,13 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
                 return None
 
         with tempfile.TemporaryDirectory() as temp:
-            stock_dir = Path(temp) / "005930_삼성전자"
-            stock_dir.mkdir()
-            surface = Surface(stock_dir)
+            stock_dir = Path(temp) / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            initial = {"policy_override_enabled": False}
+            (stock_dir / "config.json").write_text(
+                json.dumps(initial, ensure_ascii=False), encoding="utf-8"
+            )
+            surface = Surface(stock_dir, initial)
             with (
                 patch.object(
                     gui_auto_trade_setting_window,
@@ -456,10 +561,14 @@ class EventJournalP2SettingChangeTests(unittest.TestCase):
                 patch.object(gui_auto_trade_setting_window, "append_stock_log"),
                 patch.object(gui_auto_trade_setting_window, "append_changelog"),
                 patch.object(gui_auto_trade_setting_window.QMessageBox, "information"),
+                patch.object(gui_auto_trade_setting_window.QMessageBox, "critical"),
             ):
                 gui_auto_trade_setting_window.StockPolicyOverrideDialog.save_override(surface)
-                gui_auto_trade_setting_window.StockPolicyOverrideDialog.save_override(surface)
-                gui_auto_trade_setting_window.StockPolicyOverrideDialog.reset_all_to_global(surface)
+                saved = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
+                same_value = Surface(stock_dir, saved)
+                gui_auto_trade_setting_window.StockPolicyOverrideDialog.save_override(same_value)
+                reset = Surface(stock_dir, saved)
+                gui_auto_trade_setting_window.StockPolicyOverrideDialog.reset_all_to_global(reset)
 
         self.assertEqual(2, events.call_count)
         self.assertTrue(

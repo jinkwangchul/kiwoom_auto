@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from PyQt5.QtWidgets import QApplication, QDialog, QWidget
 
 import gui_auto_trade_close as close
+from close_liquidation_command import (
+    EARLY_CLOSE_REQUEST,
+    inspect_close_liquidation_availability,
+)
 from gui_window_policy import configure_persistent_feature_window, persistent_feature_owner
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class _MainOwner(QWidget):
@@ -113,30 +121,56 @@ class AutoTradeCloseOwnerResolutionTest(unittest.TestCase):
 
     def test_operating_filter_reads_current_session_participation_from_logical_owner(self) -> None:
         owner = _MainOwner(connected=True, recovery_allowed=True)
-        owner._current_session_operation_participant_stock_codes = {"005930"}
+        attach_participant_owner(owner, {"005930"})
         surface = self._surface(owner)
+        with TemporaryDirectory() as temp:
+            stock_dir = Path(temp) / "005930_Samsung"
+            stock_dir.mkdir()
+            state_path = stock_dir / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "trade_enabled": True,
+                        "holding_qty": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stock_dir / "config.json").write_text("{}", encoding="utf-8")
 
-        self.assertTrue(
-            close._early_close_current_session_operating(
+            allowed = inspect_close_liquidation_availability(
                 surface,
+                stock_dir,
                 "005930",
-                {"status": "RUNNING", "trade_enabled": True},
+                intent=EARLY_CLOSE_REQUEST,
             )
-        )
-        self.assertFalse(
-            close._early_close_current_session_operating(
+            other = inspect_close_liquidation_availability(
                 surface,
+                stock_dir,
                 "000660",
-                {"status": "RUNNING", "trade_enabled": True},
+                intent=EARLY_CLOSE_REQUEST,
             )
-        )
-        self.assertFalse(
-            close._early_close_current_session_operating(
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "status": "STOPPED",
+                        "trade_enabled": False,
+                        "holding_qty": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stopped = inspect_close_liquidation_availability(
                 surface,
+                stock_dir,
                 "005930",
-                {"status": "STOPPED", "trade_enabled": False},
+                intent=EARLY_CLOSE_REQUEST,
             )
-        )
+
+        self.assertTrue(allowed.allowed)
+        self.assertEqual("NOT_CURRENT_PARTICIPANT", other.reason_code)
+        self.assertEqual("NOT_CURRENT_PARTICIPANT", stopped.reason_code)
 
     def test_early_close_confirmation_uses_actual_scope_names(self) -> None:
         all_scope = SimpleNamespace(

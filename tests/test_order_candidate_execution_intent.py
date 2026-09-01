@@ -58,11 +58,11 @@ class OrderCandidateExecutionIntentTest(unittest.TestCase):
         self.assertEqual("CANDIDATE_READY", result["candidate_status"])
         self.assertIsNone(result["price"])
 
-    def test_legacy_candidate_path_still_reads_stock_config(self):
+    def test_reference_candidate_path_still_reads_stock_config(self):
         with (
             mock.patch.object(engine, "read_stock_config", return_value={"buy_qty": 2}),
             mock.patch.object(engine, "read_stock_state", return_value={}),
-            mock.patch.object(engine, "read_latest_price", return_value=50000),
+            mock.patch.object(engine, "read_reference_price", return_value=50000),
         ):
             result = engine.build_order_candidate({
                 "signal": "BUY",

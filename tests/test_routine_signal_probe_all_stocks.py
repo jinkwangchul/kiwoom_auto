@@ -10,6 +10,7 @@ from routine_signal_probe import (
     _is_trade_watch_target,
     probe_all_enabled_routine_stocks_once,
 )
+from tests.participant_owner_fixture import participant_owner
 
 
 class RoutineSignalProbeAllStocksTest(unittest.TestCase):
@@ -71,15 +72,23 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
             ]
             calls: list[tuple[str, Path]] = []
 
-            def fake_probe(_module, routine_name, stock_dir, _tick_key):
+            def fake_probe(
+                _module,
+                routine_name,
+                stock_dir,
+                _tick_key,
+                *,
+                actionable_price_reader,
+                **_kwargs,
+            ):
+                self.assertTrue(callable(actionable_price_reader))
                 calls.append((routine_name, stock_dir))
                 return {"signal": "NONE"}
 
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={
-                    "111111",
-                    "222222",
-                }
+                _main_monitoring_auto_trade_operation_host=participant_owner(
+                    {"111111", "222222"}
+                )
             )
             window.startup_recovery_session_ready = lambda refresh=False: True
 
@@ -133,7 +142,7 @@ class RoutineSignalProbeAllStocksTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes=set()
+                _main_monitoring_auto_trade_operation_host=participant_owner()
             )
             window.startup_recovery_session_ready = lambda refresh=False: True
 

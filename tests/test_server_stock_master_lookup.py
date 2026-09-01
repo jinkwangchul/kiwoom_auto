@@ -211,6 +211,7 @@ class ServerStockMasterLookupTests(unittest.TestCase):
 
         host = QWidget()
         host.refresh_stock_table = MagicMock()
+        host._stock_search_register_opener = setting_window.open_instance_stock_search_register_dialog
         self.addCleanup(host.close)
         with patch.object(setting_window, "InstanceStockSearchRegisterDialog", FakeDialog):
             stock_register_window.StockRegisterWindow.open_search_register_dialog(host)

@@ -96,7 +96,6 @@ class EmergencyScopeLifecycleTest(unittest.TestCase):
             statusBarMessage=Mock(),
             btn_emergency_stop=SimpleNamespace(setText=Mock()),
             startup_recovery_session_ready=lambda refresh=False: recovery_ready,
-            production_recovery_stock_is_review_required=lambda _code: False,
         )
 
     @classmethod

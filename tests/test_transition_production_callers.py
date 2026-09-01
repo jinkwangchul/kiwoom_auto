@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 
 import gui_auto_trade_close as close
 import gui_auto_trade_status_ops as status_ops
+import close_liquidation_command as close_command
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class _ProceedMessageBox:
@@ -88,9 +90,10 @@ class TransitionProductionCallerTest(unittest.TestCase):
         window._persistent_feature_owner_ref = None
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "routine"
-        window._current_session_operation_participant_stock_codes = {
-            str(code) for _stock_dir, code, _name in selected
-        }
+        attach_participant_owner(
+            window,
+            {str(code) for _stock_dir, code, _name in selected},
+        )
         window.capture_stock_table_view_state.return_value = ([], 0)
         return window
 
@@ -122,19 +125,20 @@ class TransitionProductionCallerTest(unittest.TestCase):
             )
             with (
                 patch.object(close, "QMessageBox", _ProceedMessageBox),
-                patch.object(close, "OperationCommandService", return_value=service),
+                patch.object(close_command, "OperationCommandService", return_value=service),
                 patch.object(
                     close,
                     "pending_order_side_quantities",
                     return_value=(0, 0),
                 ),
                 patch.object(
-                    close,
+                    close_command,
                     "auto_trade_setting_liquidation_phase_active",
                     return_value=False,
                 ),
                 patch.object(close, "_kiwoom_server_login_block_message", return_value=""),
                 patch.object(close, "persistent_feature_owner", return_value=parent),
+                patch.object(close_command, "persistent_feature_owner", return_value=parent),
                 patch.object(
                     close,
                     "evaluate_production_transition",
@@ -180,14 +184,15 @@ class TransitionProductionCallerTest(unittest.TestCase):
             with (
                 patch.object(close, "QMessageBox", _ProceedMessageBox),
                 patch.object(close, "persistent_feature_owner", return_value=parent),
-                patch.object(close, "OperationCommandService", return_value=service),
+                patch.object(close_command, "persistent_feature_owner", return_value=parent),
+                patch.object(close_command, "OperationCommandService", return_value=service),
                 patch.object(
                     close,
                     "pending_order_side_quantities",
                     return_value=(0, 0),
                 ),
                 patch.object(
-                    close,
+                    close_command,
                     "auto_trade_setting_liquidation_phase_active",
                     return_value=False,
                 ),
@@ -228,7 +233,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
             service = Mock()
             with (
                 patch.object(close, "persistent_feature_owner", return_value=parent),
-                patch.object(close, "OperationCommandService", return_value=service),
+                patch.object(close_command, "OperationCommandService", return_value=service),
                 patch.object(close.QMessageBox, "critical"),
             ):
                 close.auto_trade_apply_selected_individual_liquidation_method(
@@ -259,7 +264,7 @@ class TransitionProductionCallerTest(unittest.TestCase):
             )
             with (
                 patch.object(close, "persistent_feature_owner", return_value=None),
-                patch.object(close, "OperationCommandService", return_value=service),
+                patch.object(close_command, "OperationCommandService", return_value=service),
                 patch.object(
                     close,
                     "evaluate_production_transition",

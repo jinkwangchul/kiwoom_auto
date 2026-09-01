@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -210,8 +212,7 @@ class ChejanRawEventContractTest(unittest.TestCase):
         result = build_chejan_raw_event_contract(self._policy(), self._raw(), self._context())
 
         self.assertEqual("CHEJAN_EVENT_READY", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

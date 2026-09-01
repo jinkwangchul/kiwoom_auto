@@ -932,6 +932,9 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertEqual(
                 saved["buy"]["execution"]["base"],
                 {
+                    "buy_phase": "BASE",
+                    "buy_round": 1,
+                    "budget_reference": "STARTING_BUDGET",
                     "hoga_mode": "SINGLE",
                     "order_price_basis": "ORDER_PRICE",
                     "hoga_up": 2,
@@ -952,6 +955,8 @@ class RuleApplyCommitServiceTest(unittest.TestCase):
             self.assertEqual(
                 saved["buy"]["execution"]["repeat"],
                 {
+                    "buy_phase": "REPEAT",
+                    "starts_from_round": 2,
                     "apply_all": True,
                     "detail_mode": "ROUND",
                     "round_operator": "ADD",

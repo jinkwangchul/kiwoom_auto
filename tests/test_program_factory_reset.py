@@ -543,12 +543,15 @@ class ProgramFactoryResetTests(unittest.TestCase):
             self.assertTrue((root / "routine_instances" / "instance-1").exists())
 
     def test_confirmation_cancel_does_not_call_reset_service(self) -> None:
-        dialog = OperationEnvironmentSettingsDialog()
         with (
             patch.object(ProgramFactoryResetConfirmDialog, "exec_", return_value=ProgramFactoryResetConfirmDialog.Rejected),
             patch("program_factory_reset.execute_program_factory_reset") as execute_reset,
             patch.object(operation_environment, "append_production_event") as append_event,
         ):
+            dialog = OperationEnvironmentSettingsDialog(
+                factory_reset_validator=validate_factory_reset_safety,
+                factory_reset_executor=execute_reset,
+            )
             dialog._request_program_factory_reset()
         execute_reset.assert_not_called()
         append_event.assert_not_called()

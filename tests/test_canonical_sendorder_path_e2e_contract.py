@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 import hashlib
 import json
 from pathlib import Path
@@ -213,8 +215,7 @@ class CanonicalSendOrderPathE2EContractTest(unittest.TestCase):
         broker_result_review.assert_not_called()
         lifecycle_dry_run.assert_not_called()
 
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_alternate_chains_are_not_called_when_executor_fails(self) -> None:
         adapter = FakeSendOrderAdapter(-1)
@@ -237,8 +238,7 @@ class CanonicalSendOrderPathE2EContractTest(unittest.TestCase):
         final_gate_chain.assert_not_called()
         broker_dispatch_chain.assert_not_called()
         result_recorder.assert_not_called()
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

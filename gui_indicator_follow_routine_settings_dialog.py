@@ -344,13 +344,7 @@ class IndicatorFollowRoutineSettingsDialog(
         self._build_control_tab()
         root.addWidget(self.control_tab, 1)
 
-        # The official settings UI is the single control_tab view. Keep the
-        # legacy tab builders defined, but do not instantiate their hidden
-        # widgets here because they overwrite self.buy_*/self.sell_* refs.
-        # self._build_buy_tab()
-        # self._build_sell_tab()
-        # self._build_buy_edit_tab()
-        # self._build_sell_edit_tab()
+        # The official settings UI is the single control_tab view.
         # Build validation widgets for preview/diagnostic code paths.
         self._build_validation_tab()
 
@@ -1020,6 +1014,8 @@ class IndicatorFollowRoutineSettingsDialog(
         return labels.get(str(path), str(path))
 
     def _clear_rule_approval_controls_layout(self):
+        self._rule_approval_decision_widgets = {}
+        self._rule_approval_save_button = None
         layout = getattr(self, "_rule_approval_controls_layout", None)
         if layout is None or not hasattr(layout, "count"):
             return
@@ -1027,8 +1023,14 @@ class IndicatorFollowRoutineSettingsDialog(
             while layout.count():
                 item = layout.takeAt(0)
                 widget = item.widget() if item is not None and hasattr(item, "widget") else None
-                if widget is not None and hasattr(widget, "setParent"):
-                    widget.setParent(None)
+                if widget is None:
+                    continue
+                hide = getattr(widget, "hide", None)
+                if callable(hide):
+                    hide()
+                delete_later = getattr(widget, "deleteLater", None)
+                if callable(delete_later):
+                    delete_later()
         except TypeError:
             return
 
@@ -1039,7 +1041,6 @@ class IndicatorFollowRoutineSettingsDialog(
             return
 
         self._clear_rule_approval_controls_layout()
-        self._rule_approval_decision_widgets = {}
 
         decisions = session.get("decisions", {}) if isinstance(session, dict) else {}
         candidate_types = session.get("candidate_types", {}) if isinstance(session, dict) else {}

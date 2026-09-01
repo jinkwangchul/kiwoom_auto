@@ -18,6 +18,7 @@ from gui_ats_utils import (
     auto_trade_operation_session_phase,
 )
 from final_execution_guard import evaluate_final_execution_guard
+from tests.participant_owner_fixture import participant_owner
 
 
 class OperationProjectionNormalizationTest(unittest.TestCase):
@@ -411,7 +412,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
 
     def test_modeless_setting_resolves_main_participant_projection(self) -> None:
         main = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
             startup_recovery_session_ready=lambda **_kwargs: True,
         )
         setting = SimpleNamespace()
@@ -444,7 +445,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
 
     def test_main_and_modeless_setting_have_equal_participant_visual_semantics(self) -> None:
         main = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
             startup_recovery_session_ready=lambda **_kwargs: True,
         )
         setting = SimpleNamespace()
@@ -536,7 +537,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
 
     def test_nonparticipant_visual_semantics_remain_inactive(self) -> None:
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes=set(),
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
             startup_recovery_session_ready=lambda **_kwargs: True,
         )
         state = {
@@ -568,7 +569,7 @@ class OperationProjectionNormalizationTest(unittest.TestCase):
     def test_three_stock_preboundary_fixture_matches_main_activity_semantics(self) -> None:
         codes = {"012210", "063440", "130500"}
         main = SimpleNamespace(
-            _current_session_operation_participant_stock_codes=set(codes),
+            _main_monitoring_auto_trade_operation_host=participant_owner(codes),
             startup_recovery_session_ready=lambda **_kwargs: True,
         )
         setting = SimpleNamespace()

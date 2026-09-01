@@ -20,6 +20,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from candle_manager import load_candles
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCKS_DIR = PROJECT_ROOT / "stocks"
@@ -86,33 +88,18 @@ def read_stock_state(code: str, name: str = "") -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def read_latest_price(code: str, name: str = "") -> float | None:
+def read_reference_price(code: str, name: str = "") -> float | None:
+    """Read the last valid close from the canonical candle series."""
+
     stock_dir = find_stock_dir(code, name)
     if stock_dir is None:
         return None
 
-    latest = _read_json(stock_dir / "latest_price.json", {})
-    if isinstance(latest, dict):
-        for key in ("price", "latest_price", "current_price", "close"):
-            value = _safe_float(latest.get(key))
-            if value is not None and value > 0:
-                return value
-
-    candles_data = _read_json(stock_dir / "candles.json", {})
-    candles = None
-    if isinstance(candles_data, dict):
-        candles = candles_data.get("candles")
-    elif isinstance(candles_data, list):
-        candles = candles_data
-
-    if isinstance(candles, list) and candles:
-        last = candles[-1]
-        if isinstance(last, dict):
-            value = _safe_float(last.get("close"))
-            if value is not None and value > 0:
-                return value
-
-    return None
+    candles = load_candles(stock_dir)
+    if not candles:
+        return None
+    value = _safe_float(candles[-1].get("close"))
+    return value if value is not None and value > 0 else None
 
 
 def get_entry_quantity(config: dict[str, Any]) -> int | None:
@@ -193,7 +180,7 @@ def build_buy_candidate(signal: dict[str, Any], config: dict[str, Any], state: d
             "amount": amount,
             "price": price,
             "budget_source": "entry_quantity",
-            "price_basis": "latest_price" if price else "none",
+            "price_basis": "REFERENCE_PRICE" if price else "none",
         }
 
     if amount is not None:
@@ -221,7 +208,7 @@ def build_buy_candidate(signal: dict[str, Any], config: dict[str, Any], state: d
                 "amount": amount,
                 "price": price,
                 "budget_source": "entry_amount",
-                "price_basis": "latest_price",
+                "price_basis": "REFERENCE_PRICE",
             }
 
         return {
@@ -233,7 +220,7 @@ def build_buy_candidate(signal: dict[str, Any], config: dict[str, Any], state: d
             "amount": amount,
             "price": price,
             "budget_source": "entry_amount",
-            "price_basis": "latest_price",
+            "price_basis": "REFERENCE_PRICE",
         }
 
     return {
@@ -245,7 +232,7 @@ def build_buy_candidate(signal: dict[str, Any], config: dict[str, Any], state: d
         "amount": None,
         "price": price,
         "budget_source": None,
-        "price_basis": "latest_price" if price else "none",
+        "price_basis": "REFERENCE_PRICE" if price else "none",
     }
 
 
@@ -262,7 +249,7 @@ def build_sell_candidate(signal: dict[str, Any], config: dict[str, Any], state: 
             "amount": None,
             "price": price,
             "holding_source": source,
-            "price_basis": "latest_price" if price else "none",
+            "price_basis": "REFERENCE_PRICE" if price else "none",
         }
 
     return {
@@ -274,7 +261,7 @@ def build_sell_candidate(signal: dict[str, Any], config: dict[str, Any], state: 
         "amount": None,
         "price": price,
         "holding_source": source,
-        "price_basis": "latest_price" if price else "none",
+        "price_basis": "REFERENCE_PRICE" if price else "none",
     }
 
 
@@ -423,12 +410,12 @@ def build_order_candidate(signal: dict[str, Any]) -> dict[str, Any]:
 
     config = read_stock_config(code, name)
     state = read_stock_state(code, name)
-    price = read_latest_price(code, name)
+    reference_price = read_reference_price(code, name)
 
     if side == "BUY":
-        result = build_buy_candidate(signal, config, state, price)
+        result = build_buy_candidate(signal, config, state, reference_price)
     elif side == "SELL":
-        result = build_sell_candidate(signal, config, state, price)
+        result = build_sell_candidate(signal, config, state, reference_price)
     else:
         result = {
             "candidate_status": "IGNORED",
@@ -437,7 +424,7 @@ def build_order_candidate(signal: dict[str, Any]) -> dict[str, Any]:
             "quantity": None,
             "quantity_estimated": None,
             "amount": None,
-            "price": price,
+            "price": reference_price,
         }
 
     if side in {"BUY", "SELL"}:

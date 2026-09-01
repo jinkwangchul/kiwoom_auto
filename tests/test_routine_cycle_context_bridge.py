@@ -67,12 +67,14 @@ class RoutineCycleContextBridgeTest(unittest.TestCase):
                 mock.patch.object(routine_signal_probe, "FILLS_PATH", fills_path),
                 mock.patch.object(routine_signal_probe, "POSITIONS_PATH", positions_path),
                 mock.patch.object(routine_signal_probe, "_load_candles_from_stock_dir", return_value=[]),
+                mock.patch.object(routine_signal_probe, "read_reference_price", return_value=70_000),
             ):
                 result = routine_signal_probe.probe_routine_for_stock(
                     module,
                     "지표추종매매",
                     stock_dir,
                     "TICK_1",
+                    actionable_price_reader=lambda _code, _name: 71_000,
                 )
 
             self.assertEqual("HOLD", result["signal"])
@@ -80,6 +82,9 @@ class RoutineCycleContextBridgeTest(unittest.TestCase):
             self.assertEqual("resolved", module.context["cycle"]["status"])
             self.assertEqual("005930", module.context["cycle"]["projection_code"])
             self.assertEqual("INSTANCE_A", module.context["cycle"]["projection_instance"])
+            self.assertEqual(70_000, module.context["reference_price"])
+            self.assertEqual(71_000, module.context["actionable_current_price"])
+            self.assertNotIn("current_price", module.context)
 
     def test_indicator_follow_routine_blocks_buy_when_cycle_is_unresolved(self) -> None:
         routine_dir = (

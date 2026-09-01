@@ -24,12 +24,12 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import QMenu, QProxyStyle, QStyle, QStyleOptionMenuItem
 
 from gui_auto_trade_integrity import (
+    inspect_stock_review_state,
     is_emergency_stopped_state,
     is_operation_excluded,
-    is_review_required_state,
 )
 from gui_auto_trade_status_ops import (
-    auto_trade_operation_exclusion_mutation_decision,
+    inspect_auto_trade_operation_exclusion_availability,
 )
 from gui_ats_utils import (
     manual_ats_session_labels,
@@ -39,6 +39,13 @@ from gui_operation_environment import OPERATION_POLICY_PATH
 from gui_stock_data import is_valid_stock_code, normalize_stock_code
 from runtime_io import read_json_dict
 from event_journal_production import append_production_event
+from assignment_authorization_service import inspect_stock_unregister_availability
+from close_liquidation_command import (
+    EARLY_CLOSE_CANCEL,
+    EARLY_CLOSE_REQUEST,
+    INDIVIDUAL_LIQUIDATION,
+    inspect_close_liquidation_availability,
+)
 
 
 _EARLY_CLOSE_MENU_LABELS = {
@@ -164,6 +171,7 @@ class StockContextMenuCallbacks:
     emergency_stop: Callable[[], None] | None = None
     emergency_release: Callable[[], None] | None = None
     unregister: Callable[[], None] | None = None
+    unregister_available: Callable[[], bool] | None = None
     stock_register: Callable[[], None] | None = None
     time_change: Callable[[], None] | None = None
     time_reset: Callable[[], None] | None = None
@@ -179,7 +187,278 @@ class StockContextMenuCallbacks:
     set_operation_exclusion: Callable[[], None] | None = None
     clear_operation_exclusion: Callable[[], None] | None = None
     trade_permission_label: Callable[[], str] | None = None
+    trade_permission_available: Callable[[], bool] | None = None
     toggle_trade_permission: Callable[[], None] | None = None
+
+
+@dataclass(frozen=True)
+class StockContextMenuAvailability:
+    """Read-only projection of the shared stock Context Menu commands."""
+
+    review_managed: bool
+    excluded_management: bool
+    start_allowed: bool
+    emergency_stop_allowed: bool
+    exclusion_allowed: bool
+    trade_permission_allowed: bool
+    early_close_allowed: bool
+    early_close_cancel_allowed: bool
+    individual_liquidation_allowed: bool
+    time_management_allowed: bool
+    ats_settings_allowed: bool
+    stock_register_allowed: bool
+    unregister_allowed: bool
+    chart_allowed: bool
+    reason_codes: tuple[tuple[str, str], ...]
+
+    def reason_for(self, action_key: str) -> str:
+        reasons = dict(self.reason_codes)
+        return str(reasons.get(str(action_key or ""), "") or "")
+
+
+def inspect_stock_context_menu_availability(
+    parent,
+    *,
+    has_selection: bool,
+    callbacks: StockContextMenuCallbacks,
+    selected_targets: Iterable[tuple[object, str, str]] | None,
+    operation_excluded: bool,
+    operation_exclusion_action: str,
+    stock_register_enabled: bool | None,
+    scheduled_excluded_management: bool,
+    operation_policy: dict[str, object] | None = None,
+) -> StockContextMenuAvailability:
+    """Inspect menu command availability without mutating config or runtime."""
+
+    targets = list(selected_targets or [])
+    review_managed = bool(
+        has_selection
+        and any(
+            inspect_stock_review_state(
+                Path(stock_dir),
+                loaded_state=read_json_dict(Path(stock_dir) / "state.json"),
+            ).review_required
+            for stock_dir, _code, _name in targets
+        )
+    )
+    excluded_management = bool(
+        scheduled_excluded_management
+        and operation_excluded
+        and not review_managed
+    )
+    reasons: dict[str, str] = {}
+
+    exclusion_action = str(operation_exclusion_action or "").strip().lower()
+    if not exclusion_action:
+        exclusion_action = "clear" if operation_excluded else "set"
+    exclusion_requested = exclusion_action == "set"
+    exclusion_allowed = bool(has_selection and exclusion_action in {"set", "clear"})
+    if exclusion_allowed and targets:
+        exclusion_decisions = [
+            inspect_auto_trade_operation_exclusion_availability(
+                parent,
+                target,
+                exclusion_requested,
+            )
+            for target in targets
+        ]
+        exclusion_allowed = all(
+            decision.allowed
+            for decision in exclusion_decisions
+        )
+        if not exclusion_allowed:
+            reasons["exclusion"] = next(
+                (
+                    str(decision.reason_code or "EXCLUSION_UNAVAILABLE")
+                    for decision in exclusion_decisions
+                    if not decision.allowed
+                ),
+                "EXCLUSION_UNAVAILABLE",
+            )
+
+    permission_available = True
+    availability_getter = callbacks.trade_permission_available
+    try:
+        if callable(availability_getter):
+            permission_available = bool(availability_getter())
+    except Exception:
+        permission_available = False
+    trade_permission_allowed = bool(has_selection and permission_available)
+
+    start_allowed = bool(has_selection)
+    emergency_stop_allowed = bool(has_selection)
+    early_close_allowed = bool(has_selection and not operation_excluded)
+    early_close_cancel_allowed = bool(has_selection and not operation_excluded)
+    individual_liquidation_allowed = bool(has_selection)
+    time_management_allowed = bool(has_selection)
+    ats_settings_allowed = bool(has_selection)
+    stock_register_allowed = bool(
+        has_selection
+        if stock_register_enabled is None
+        else stock_register_enabled
+    )
+    unregister_allowed = bool(has_selection)
+    if unregister_allowed and callable(callbacks.unregister_available):
+        try:
+            unregister_allowed = bool(callbacks.unregister_available())
+        except Exception:
+            unregister_allowed = False
+        if not unregister_allowed:
+            reasons["unregister"] = "UNREGISTER_UNAVAILABLE"
+    chart_allowed = bool(has_selection)
+
+    canonical_targets = [
+        (Path(stock_dir), str(code or "").strip(), str(name or "").strip())
+        for stock_dir, code, name in targets
+        if (Path(stock_dir) / "state.json").is_file()
+    ]
+    if has_selection and canonical_targets and len(canonical_targets) == len(targets):
+        policy = (
+            operation_policy
+            if isinstance(operation_policy, dict)
+            else _context_menu_operation_policy()
+        )
+        liquidation = policy.get("liquidation", {})
+        liquidation = liquidation if isinstance(liquidation, dict) else {}
+        liquidation_method = str(liquidation.get("method") or "이월").strip()
+        liquidation_minutes = str(
+            liquidation.get("minutes_before_regular_close") or "5"
+        ).strip()
+        early_decisions = [
+            inspect_close_liquidation_availability(
+                parent,
+                stock_dir,
+                code,
+                intent=EARLY_CLOSE_REQUEST,
+            )
+            for stock_dir, code, _name in canonical_targets
+        ]
+        cancel_decisions = [
+            inspect_close_liquidation_availability(
+                parent,
+                stock_dir,
+                code,
+                intent=EARLY_CLOSE_CANCEL,
+            )
+            for stock_dir, code, _name in canonical_targets
+        ]
+        liquidation_decisions = [
+            inspect_close_liquidation_availability(
+                parent,
+                stock_dir,
+                code,
+                intent=INDIVIDUAL_LIQUIDATION,
+                requested_method=liquidation_method,
+                requested_minutes=liquidation_minutes,
+            )
+            for stock_dir, code, _name in canonical_targets
+        ]
+        early_close_allowed = bool(
+            not operation_excluded
+            and all(decision.allowed for decision in early_decisions)
+        )
+        early_close_cancel_allowed = bool(
+            not operation_excluded
+            and all(decision.allowed for decision in cancel_decisions)
+        )
+        individual_liquidation_allowed = all(
+            decision.allowed for decision in liquidation_decisions
+        )
+        if not early_close_allowed:
+            reasons["early_close"] = next(
+                (
+                    decision.reason_code
+                    for decision in early_decisions
+                    if not decision.allowed
+                ),
+                "EARLY_CLOSE_UNAVAILABLE",
+            )
+        if not early_close_cancel_allowed:
+            reasons["early_close_cancel"] = next(
+                (
+                    decision.reason_code
+                    for decision in cancel_decisions
+                    if not decision.allowed
+                ),
+                "EARLY_CLOSE_CANCEL_UNAVAILABLE",
+            )
+        if not individual_liquidation_allowed:
+            reasons["individual_liquidation"] = next(
+                (
+                    decision.reason_code
+                    for decision in liquidation_decisions
+                    if not decision.allowed
+                ),
+                "INDIVIDUAL_LIQUIDATION_UNAVAILABLE",
+            )
+
+    if review_managed:
+        for action_key in (
+            "start",
+            "emergency_stop",
+            "exclusion",
+            "trade_permission",
+            "early_close",
+            "early_close_cancel",
+            "individual_liquidation",
+            "stock_register",
+            "unregister",
+            "chart",
+        ):
+            reasons[action_key] = "REVIEW_REQUIRED"
+        start_allowed = False
+        emergency_stop_allowed = False
+        exclusion_allowed = False
+        trade_permission_allowed = False
+        early_close_allowed = False
+        early_close_cancel_allowed = False
+        individual_liquidation_allowed = False
+        stock_register_allowed = False
+        unregister_allowed = False
+        chart_allowed = False
+    elif excluded_management:
+        reasons["emergency_stop"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
+        reasons["early_close"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
+        reasons["early_close_cancel"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
+        reasons["individual_liquidation"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
+        reasons["stock_register"] = "EXCLUDED_MANAGEMENT_RESTRICTED"
+        emergency_stop_allowed = False
+        early_close_allowed = False
+        early_close_cancel_allowed = False
+        individual_liquidation_allowed = False
+        stock_register_allowed = False
+
+    if not trade_permission_allowed and "trade_permission" not in reasons:
+        reasons["trade_permission"] = "TRADE_PERMISSION_UNAVAILABLE"
+    return StockContextMenuAvailability(
+        review_managed=review_managed,
+        excluded_management=excluded_management,
+        start_allowed=start_allowed,
+        emergency_stop_allowed=emergency_stop_allowed,
+        exclusion_allowed=exclusion_allowed,
+        trade_permission_allowed=trade_permission_allowed,
+        early_close_allowed=early_close_allowed,
+        early_close_cancel_allowed=early_close_cancel_allowed,
+        individual_liquidation_allowed=individual_liquidation_allowed,
+        time_management_allowed=time_management_allowed,
+        ats_settings_allowed=ats_settings_allowed,
+        stock_register_allowed=stock_register_allowed,
+        unregister_allowed=unregister_allowed,
+        chart_allowed=chart_allowed,
+        reason_codes=tuple(reasons.items()),
+    )
+
+
+def _menu_entry_enabled(entry) -> bool:
+    if entry is None:
+        return False
+    getter = getattr(entry, "isEnabled", None)
+    if callable(getter):
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+    return bool(getattr(entry, "enabled", True))
 
 
 def open_selected_stock_instance_charts(
@@ -317,8 +596,12 @@ def selected_emergency_context_state(
     has_selected_emergency = False
     has_non_emergency = False
     for stock_dir, _code, _name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        if is_emergency_stopped_state(state) or is_review_required_state(state):
+        inspection = inspect_stock_review_state(
+            Path(stock_dir),
+            loaded_state=read_json_dict(Path(stock_dir) / "state.json"),
+        )
+        state = inspection.state
+        if is_emergency_stopped_state(state) or inspection.review_required:
             scope = str(state.get("emergency_scope", "") or "").strip().upper()
             if scope == "SELECTED":
                 has_selected_emergency = True
@@ -351,10 +634,6 @@ def _stock_register_context_instance_metadata(window) -> dict[str, object] | Non
         "instance_name": str(metadata.get("instance_name", "") or "").strip(),
     }
     return target
-
-
-def _stock_register_context_action_visible(window) -> bool:
-    return _stock_register_context_instance_metadata(window) is not None
 
 
 def _add_early_close_menu(
@@ -697,24 +976,30 @@ def show_monitor_stock_context_menu(
     menu = _new_stock_context_menu(parent)
     operation_policy = _context_menu_operation_policy()
     targets = list(selected_targets or [])
-    review_managed = has_selection and any(
-        is_review_required_state(read_json_dict(Path(stock_dir) / "state.json"))
-        for stock_dir, _code, _name in targets
+    exclusion_action = str(operation_exclusion_action or "").strip().lower()
+    if not exclusion_action:
+        exclusion_action = "clear" if operation_excluded else "set"
+    availability = inspect_stock_context_menu_availability(
+        parent,
+        has_selection=has_selection,
+        callbacks=callbacks,
+        selected_targets=targets,
+        operation_excluded=operation_excluded,
+        operation_exclusion_action=exclusion_action,
+        stock_register_enabled=stock_register_enabled,
+        scheduled_excluded_management=scheduled_excluded_management,
+        operation_policy=operation_policy,
     )
-    excluded_management = bool(
-        scheduled_excluded_management
-        and operation_excluded
-        and not review_managed
-    )
+    menu._stock_context_availability = availability
 
     action_start = None
     if callbacks.start is not None:
         action_start = menu.addAction("운영시작")
-        action_start.setEnabled(has_selection)
+        action_start.setEnabled(availability.start_allowed)
     action_emergency_stop = None
     if callbacks.emergency_stop is not None:
         action_emergency_stop = menu.addAction("검토정지")
-        action_emergency_stop.setEnabled(has_selection)
+        action_emergency_stop.setEnabled(availability.emergency_stop_allowed)
     if action_start is not None:
         menu.addSeparator()
     action_select_all = menu.addAction("전체선택")
@@ -722,24 +1007,12 @@ def show_monitor_stock_context_menu(
 
     action_set_exclusion = None
     action_clear_exclusion = None
-    exclusion_action = str(operation_exclusion_action or "").strip().lower()
-    if not exclusion_action:
-        exclusion_action = "clear" if operation_excluded else "set"
     if exclusion_action == "clear" and callbacks.clear_operation_exclusion is not None:
         action_clear_exclusion = menu.addAction("제외해제")
-        action_clear_exclusion.setEnabled(has_selection)
+        action_clear_exclusion.setEnabled(availability.exclusion_allowed)
     elif exclusion_action == "set" and callbacks.set_operation_exclusion is not None:
         action_set_exclusion = menu.addAction("운영제외")
-        exclusion_allowed = has_selection and all(
-            auto_trade_operation_exclusion_mutation_decision(
-                parent,
-                target,
-                True,
-            ).get("allowed")
-            is True
-            for target in targets
-        )
-        action_set_exclusion.setEnabled(exclusion_allowed)
+        action_set_exclusion.setEnabled(availability.exclusion_allowed)
 
     action_trade_permission = None
     if callbacks.toggle_trade_permission is not None:
@@ -750,7 +1023,7 @@ def show_monitor_stock_context_menu(
             permission_label = ""
         permission_label = str(permission_label or "").strip() or "거래권한 전환"
         action_trade_permission = menu.addAction(permission_label)
-        action_trade_permission.setEnabled(has_selection)
+        action_trade_permission.setEnabled(availability.trade_permission_allowed)
 
     menu.addSeparator()
     early_close = _add_early_close_menu(
@@ -759,12 +1032,20 @@ def show_monitor_stock_context_menu(
         operation_excluded=operation_excluded,
         operation_policy=operation_policy,
     )
+    early_close["menu"].setEnabled(
+        availability.early_close_allowed
+        or availability.early_close_cancel_allowed
+    )
+    for key in ("routine", "market", "current", "profit_loss", "carry"):
+        early_close[key].setEnabled(availability.early_close_allowed)
+    early_close["cancel"].setEnabled(availability.early_close_cancel_allowed)
 
     individual = _add_individual_liquidation_menu(
         menu,
         has_selection=has_selection,
         operation_policy=operation_policy,
     )
+    individual["menu"].setEnabled(availability.individual_liquidation_allowed)
 
     action_time_change = None
     action_time_reset = None
@@ -774,6 +1055,8 @@ def show_monitor_stock_context_menu(
         menu.addSeparator()
         action_time_change = menu.addAction("시간변경")
         action_time_reset = menu.addAction("변경리셋")
+        action_time_change.setEnabled(availability.time_management_allowed)
+        action_time_reset.setEnabled(availability.time_management_allowed)
     elif selected_modes == {"CONTINUOUS"}:
         menu.addSeparator()
         ats_settings = _add_ats_settings_menu(
@@ -785,6 +1068,10 @@ def show_monitor_stock_context_menu(
             execution_method_setter=callbacks.ats_execution_method_set,
             liquidation_available_getter=callbacks.ats_liquidation_available,
         )
+        ats_settings["menu"].setEnabled(
+            availability.ats_settings_allowed
+            and _menu_entry_enabled(ats_settings["menu"])
+        )
 
     action_stock_register = None
     action_unregister = None
@@ -792,81 +1079,64 @@ def show_monitor_stock_context_menu(
         menu.addSeparator()
         if callbacks.stock_register is not None:
             action_stock_register = menu.addAction("종목등록")
-            action_stock_register.setEnabled(
-                has_selection
-                if stock_register_enabled is None
-                else bool(stock_register_enabled)
-            )
+            action_stock_register.setEnabled(availability.stock_register_allowed)
         if callbacks.unregister is not None:
             action_unregister = menu.addAction("등록해제")
-            action_unregister.setEnabled(has_selection)
+            action_unregister.setEnabled(availability.unregister_allowed)
 
     action_open_charts = None
     if callbacks.open_charts is not None:
         menu.addSeparator()
         action_open_charts = menu.addAction("간이차트")
-        action_open_charts.setEnabled(has_selection)
-
-    if review_managed:
-        for action in (
-            action_start,
-            action_emergency_stop,
-            action_set_exclusion,
-            action_clear_exclusion,
-            action_trade_permission,
-            action_stock_register,
-            action_open_charts,
-        ):
-            if action is not None:
-                action.setEnabled(False)
-        early_close["menu"].setEnabled(False)
-        individual["menu"].setEnabled(False)
-    elif excluded_management:
-        for action in (action_emergency_stop, action_stock_register):
-            if action is not None:
-                action.setEnabled(False)
-        early_close["menu"].setEnabled(False)
-        individual["menu"].setEnabled(False)
+        action_open_charts.setEnabled(availability.chart_allowed)
 
     chosen = menu.exec_(global_pos)
     if chosen is None:
         return
-    if review_managed:
-        review_allowed_actions = [
-            action_select_all,
-            action_clear_selection,
-            action_time_change,
-            action_time_reset,
-            action_unregister,
-        ]
-        if ats_settings is not None:
-            review_allowed_actions.extend(
-                action
-                for _key, _label, action in ats_settings["session_actions"]
-            )
-            review_allowed_actions.extend(
-                action
-                for _key, _label, action in ats_settings["method_actions"]
-            )
-            review_allowed_actions.extend(
-                (ats_settings["market"], ats_settings["current"])
-            )
-        if chosen not in review_allowed_actions:
-            return
-    elif excluded_management:
-        excluded_allowed_actions = [
-            action_start,
-            action_select_all,
-            action_clear_selection,
-            action_clear_exclusion,
-            action_trade_permission,
-            action_time_change,
-            action_time_reset,
-            action_unregister,
-            action_open_charts,
-        ]
-        if chosen not in excluded_allowed_actions:
-            return
+    allowed_actions = [action_select_all, action_clear_selection]
+
+    def allow(action, allowed: bool) -> None:
+        if action is not None and allowed and _menu_entry_enabled(action):
+            allowed_actions.append(action)
+
+    allow(action_start, availability.start_allowed)
+    allow(action_emergency_stop, availability.emergency_stop_allowed)
+    allow(action_set_exclusion, availability.exclusion_allowed)
+    allow(action_clear_exclusion, availability.exclusion_allowed)
+    allow(action_trade_permission, availability.trade_permission_allowed)
+    allow(action_stock_register, availability.stock_register_allowed)
+    allow(action_unregister, availability.unregister_allowed)
+    allow(action_open_charts, availability.chart_allowed)
+    allow(action_time_change, availability.time_management_allowed)
+    allow(action_time_reset, availability.time_management_allowed)
+    if _menu_entry_enabled(early_close["menu"]):
+        if availability.early_close_allowed:
+            for key in ("routine", "market", "current", "profit_loss", "carry"):
+                allow(early_close[key], True)
+        if availability.early_close_cancel_allowed:
+            allow(early_close["cancel"], True)
+    if (
+        availability.individual_liquidation_allowed
+        and _menu_entry_enabled(individual["menu"])
+    ):
+        for key in ("market", "current", "carry"):
+            allow(individual[key], True)
+        if _menu_entry_enabled(individual["time_menu"]):
+            for _minute, action in individual["time_actions"]:
+                allow(action, True)
+    if (
+        ats_settings is not None
+        and availability.ats_settings_allowed
+        and _menu_entry_enabled(ats_settings["menu"])
+    ):
+        for _key, _label, action in ats_settings["session_actions"]:
+            allow(action, True)
+        for _key, _label, action in ats_settings["method_actions"]:
+            allow(action, True)
+        allow(ats_settings["market"], True)
+        allow(ats_settings["current"], True)
+    if chosen not in allowed_actions:
+        return
     selected_option = ""
     decision_event_type = "OPERATOR_OPERATION_DECISION"
     if action_start is not None and chosen == action_start:
@@ -1050,6 +1320,17 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
             if not excluded_view and (stock_register_target is not None or has_selection)
             else None
         ),
+        unregister_available=(
+            lambda: all(
+                inspect_stock_unregister_availability(
+                    window,
+                    Path(__file__).resolve().parent,
+                    code,
+                    name,
+                ).allowed
+                for _stock_dir, code, name in selected
+            )
+        ),
         early_close=lambda method: window_callback("apply_selected_early_close")(
             method,
             source="우클릭",
@@ -1071,6 +1352,13 @@ def show_auto_trade_stock_context_menu(window, pos) -> None:
             "set_selected_manual_ats_execution_method"
         )(method, label, selected),
         trade_permission_label=window_callback("selected_trade_permission_context_label"),
+        trade_permission_available=(
+            getattr(window, "selected_trade_permission_available", None)
+            if callable(
+                getattr(window, "selected_trade_permission_available", None)
+            )
+            else None
+        ),
         toggle_trade_permission=window_callback("toggle_selected_trade_permission"),
         ats_liquidation_available=lambda: (
             window_callback("selected_manual_ats_liquidation_available")(selected)

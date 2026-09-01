@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
-from PyQt5.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt, QTimer
+from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, QRect, Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
 import gui_main_table_loader
 import gui_windows
 import gui_auto_trade_setting_window as setting_window
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 from group_complete_deletion_service import GroupDeletionScope
 from gui_routine_registry import GroupRecord
 from gui_order_utils import (
@@ -40,6 +41,7 @@ from gui_order_utils import (
 )
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 from stock_repository import StockRecord
+from tests.qt_test_support import flush_deferred_deletes
 from gui_auto_trade_display import (
     RatioMetricDisplay,
     ROUTINE_PROFIT_SIGNAL_COLORS,
@@ -323,8 +325,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 },
             )
 
-        self.assertEqual("\uC870\uAE30\uB9C8\uAC10", values[4])
-        self.assertEqual("\uC2DC\uC7A5\uAC00", values[5])
+        # EARLY_CLOSE is a command lifecycle, not a dedicated row-location
+        # projection.  Current-session rows remain in monitoring/waiting while
+        # the method and liquidation columns expose the close request.
+        self.assertEqual("감시/대기", values[4])
+        self.assertEqual("루틴", values[5])
         self.assertEqual("5\uBD84/\uC2DC\uC7A5\uAC00", values[6])
 
     def test_instance_operation_status_uses_runtime_running_count_only(self) -> None:
@@ -395,8 +400,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertEqual(1, second.time_timer.receivers(second.time_timer.timeout))
             self.assertEqual(1, second.runtime_timer.receivers(second.runtime_timer.timeout))
 
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            self.app.processEvents()
+            flush_deferred_deletes(self.app)
             self.assertTrue(gui_windows.sip.isdeleted(first))
             self.assertIs(second, owner.auto_trade_setting_window)
 
@@ -407,12 +411,26 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             second.close()
             second.deleteLater()
             owner.deleteLater()
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            self.app.processEvents()
+            flush_deferred_deletes(self.app)
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def _canonical_operation_owner(
+        self,
+        participant_stock_codes=(),
+    ) -> tuple[QObject, AutoTradeOperationHost]:
+        owner = QObject()
+        host = AutoTradeOperationHost(owner)
+        owner._main_monitoring_auto_trade_operation_host = host
+        host.register_current_session_operation_participants(
+            participant_stock_codes
+        )
+        self.addCleanup(flush_deferred_deletes, self.app)
+        self.addCleanup(owner.deleteLater)
+        self.addCleanup(host.shutdown)
+        return owner, host
 
     def test_group_parent_context_menu_uses_group_scope(self) -> None:
         group = _main_group("지표추종매매")
@@ -1602,12 +1620,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             login_state_changed=None,
             raw_chejan_received=None,
         )
-        host = SimpleNamespace(
-            operation_cycle_completed=SimpleNamespace(connect=MagicMock()),
-            shutdown=MagicMock(),
-            price_signal_observation_enabled=MagicMock(return_value=False),
-            set_price_signal_observation_enabled=MagicMock(),
-        )
         stock = {
             "code": "005930",
             "name": "삼성전자",
@@ -1619,11 +1631,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         with (
             patch.object(gui_windows, "KiwoomApi", return_value=api),
             patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
-            patch.object(
-                gui_windows.MainWindow,
-                "main_monitoring_auto_trade_operation_host",
-                return_value=host,
-            ),
             patch.object(
                 gui_windows.MainWindow,
                 "refresh_startup_recovery_status",
@@ -1639,6 +1646,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         ):
             window = gui_windows.MainWindow()
             try:
+                self.assertIsInstance(
+                    window.main_monitoring_auto_trade_operation_host(),
+                    AutoTradeOperationHost,
+                )
                 row = gui_main_table_loader._routine_tree_stock_row(
                     window,
                     definition_id="indicator_follow",
@@ -1685,6 +1696,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 self.assertNotIn("확인 필요", visible_metrics[2])
             finally:
                 window.close()
+                window.deleteLater()
+                flush_deferred_deletes(self.app)
 
     def test_initial_buy_slot_fits_maximum_amount_and_share_text(self) -> None:
         font_metrics = QFontMetrics(gui_main_table_loader.main_monitoring_table_font())
@@ -1846,6 +1859,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         self.assertEqual("0.00%", format_signed_percent(-0.004))
 
     def test_instance_stock_counts_aggregate_instance_usage_and_profit(self) -> None:
+        operation_owner, operation_host = self._canonical_operation_owner(
+            ("111111",)
+        )
+        self.assertEqual(
+            ("111111",),
+            operation_host.current_session_operation_participant_stock_codes(),
+        )
         instance = RoutineInstanceRecord(
             instance_id="a52f539d-4f18-4ef6-b0cf-f471567982a1",
             definition_id="indicator_follow",
@@ -1923,7 +1943,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 },
             ),
         ):
-            counts = gui_main_table_loader._instance_stock_counts()
+            counts = gui_main_table_loader._instance_stock_counts(
+                window=operation_owner
+            )
             gui_main_table_loader._refresh_instance_pnl_from_batch(counts)
 
         self.assertEqual(2, counts[instance.instance_id]["registered"])
@@ -3534,7 +3556,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     "가격(0 / 7,270)",
                     gui_windows._routine_stock_metric_texts(values, metrics),
                 )
-                self.assertEqual("한도(1,100,000)", values[11])
+                self.assertEqual("권장(1,100,000)", values[11])
                 self.assertIn(
                     "\uc18c\ubaa8(0 / 0.0%)",
                     gui_windows._routine_stock_metric_texts(values, metrics),
@@ -3545,9 +3567,9 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     instance_id="instance-a",
                     stock=stock,
                 )
-                self.assertEqual("CONFIGURED", snapshot_row["buy_limit_source"])
+                self.assertEqual("WAITING", snapshot_row["buy_limit_source"])
                 self.assertEqual(1_100_000, snapshot_row["buy_limit_suggested"])
-                self.assertTrue(snapshot_row["buy_limit_configured"])
+                self.assertFalse(snapshot_row["buy_limit_configured"])
 
                 live.value = SimpleNamespace(
                     connection_epoch=7,
@@ -3566,20 +3588,17 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 metrics = table.item(0, 0).data(
                     gui_main_table_loader.ROUTINE_STOCK_METRICS_ROLE
                 )
-                self.assertEqual("금액 10,905원", values[1])
+                self.assertEqual("금액 12,180원", values[1])
                 self.assertIn(
                     "가격(0 / 8,120)",
                     gui_windows._routine_stock_metric_texts(values, metrics),
                 )
-                self.assertEqual("한도(1,100,000)", values[11])
+                self.assertEqual("권장(1,200,000)", values[11])
                 operation_host.queue_order.assert_not_called()
                 operation_host.send_order.assert_not_called()
 
             self.assertEqual(original_state, state_path.read_bytes())
-            self.assertNotEqual(original_config, config_path.read_bytes())
-            promoted_config = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertTrue(promoted_config["buy_limit_enabled"])
-            self.assertEqual(1_100_000, promoted_config["buy_limit_amount"])
+            self.assertEqual(original_config, config_path.read_bytes())
 
     def test_stock_limit_projection_separates_configured_recommended_and_unset(self) -> None:
         fresh = SimpleNamespace(
@@ -3734,10 +3753,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 kiwoom_api=SimpleNamespace(is_connected=lambda: False),
             )
 
-            gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
-                window,
-                0,
-            )
+            with patch.object(gui_windows, "show_toast") as toast:
+                gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
+                    window,
+                    0,
+                )
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             with patch.object(
                 gui_main_table_loader,
@@ -3760,18 +3780,23 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     },
                 )
 
-            self.assertTrue(saved["buy_limit_enabled"])
+            self.assertFalse(saved["buy_limit_enabled"])
             self.assertIsNone(saved["buy_limit_amount"])
             self.assertEqual("한도(미설정)", row["stock_values"][11])
-            self.assertEqual("WAITING", row["buy_limit_source"])
+            self.assertEqual("UNSET", row["buy_limit_source"])
+            toast.assert_called_once_with(
+                window,
+                "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
+            )
+            window.load_routine_table.assert_not_called()
             window.start_routine_stock_buy_limit_edit.assert_not_called()
             operation_host.queue_order.assert_not_called()
             operation_host.send_order.assert_not_called()
 
     def test_waiting_without_price_double_click_unsets_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            stock_dir = Path(temp_dir) / "012210_삼미금속"
-            stock_dir.mkdir()
+            stock_dir = Path(temp_dir) / "stocks" / "012210_삼미금속"
+            stock_dir.mkdir(parents=True)
             config_path = stock_dir / "config.json"
             config_path.write_text(
                 json.dumps(
@@ -3886,6 +3911,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 finish_routine_stock_buy_limit_edit=MagicMock(),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
                 start_routine_stock_buy_limit_edit=MagicMock(),
             )
 
@@ -3901,12 +3927,12 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 source=None,
             )
             window.start_routine_stock_buy_limit_edit.assert_not_called()
-            window.load_routine_table.assert_called_once_with()
+            window.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_stock_buy_limit_double_click_persists_unset_without_recommitting_suggestion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            stock_dir = Path(temp_dir) / "012210_삼미금속"
-            stock_dir.mkdir()
+            stock_dir = Path(temp_dir) / "stocks" / "012210_삼미금속"
+            stock_dir.mkdir(parents=True)
             config_path = stock_dir / "config.json"
             config_path.write_text(
                 json.dumps(
@@ -3997,6 +4023,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 _stock_suggested_buy_limit=MagicMock(return_value=800_000),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
             )
 
             with patch.object(
@@ -4025,7 +4052,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 amount=800_000,
                 source=gui_windows.BUY_LIMIT_SOURCE_RECOMMENDED,
             )
-            window.load_routine_table.assert_called_once_with()
+            window.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_stock_buy_limit_double_click_cancels_pending_single_click(self) -> None:
         timer = MagicMock()
@@ -4245,7 +4272,8 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
     def test_stock_buy_limit_config_writer_keeps_stock_limits_independent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir) / "stocks"
+            root.mkdir()
             stock_a = root / "003550_LG" / "config.json"
             stock_b = root / "005930_Samsung" / "config.json"
             stock_c = root / "006400_SDI" / "config.json"
@@ -4304,7 +4332,13 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
     def test_stock_initial_buy_writer_preserves_mode_specific_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
+            config_path = (
+                Path(temp_dir)
+                / "stocks"
+                / "005930_Samsung"
+                / "config.json"
+            )
+            config_path.parent.mkdir(parents=True)
             config_path.write_text(
                 json.dumps(
                     {
@@ -4317,25 +4351,33 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            writer_owner = SimpleNamespace(parent=lambda: None)
-            gui_windows.MainWindow._write_stock_initial_buy_config(
+            writer_owner, operation_host = self._canonical_operation_owner()
+            self.assertEqual(
+                (),
+                operation_host.current_session_operation_participant_stock_codes(),
+            )
+            amount_result = gui_windows.MainWindow._write_stock_initial_buy_config(
                 writer_owner,
                 config_path,
                 mode="AMOUNT",
                 value=0,
             )
+            self.assertTrue(amount_result["allowed"])
+            self.assertTrue(amount_result["written"])
             amount_config = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual("AMOUNT", amount_config["trade_amount_type"])
             self.assertEqual(0, amount_config["buy_amount"])
             self.assertEqual(20, amount_config["buy_qty"])
             self.assertEqual("keep", amount_config["unrelated"])
 
-            gui_windows.MainWindow._write_stock_initial_buy_config(
+            quantity_result = gui_windows.MainWindow._write_stock_initial_buy_config(
                 writer_owner,
                 config_path,
                 mode="QUANTITY",
                 value=1,
             )
+            self.assertTrue(quantity_result["allowed"])
+            self.assertTrue(quantity_result["written"])
             quantity_config = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual("QUANTITY", quantity_config["trade_amount_type"])
             self.assertEqual(1, quantity_config["buy_qty"])
@@ -4359,37 +4401,56 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 return_value=config_path
             )
             window._open_running_budget_adjustment_dialog = MagicMock()
-            window.finish_routine_stock_initial_buy_edit = MagicMock()
+            window._stock_start_budget_locked = MagicMock(return_value=False)
+            window._stock_default_initial_buy_value = MagicMock(return_value=1)
+            window._write_stock_initial_buy_config = MagicMock(
+                return_value={"allowed": True, "changed": True, "reason": ""}
+            )
             window.load_routine_table = MagicMock()
+            window.refresh_auto_trade_assignment_views = MagicMock()
 
             for disabled_level in ("routine", "group"):
                 window._main_routine_display_level = disabled_level
                 window.toggle_routine_stock_initial_buy_mode(0)
-                window.start_routine_stock_initial_buy_edit(0)
+                window.open_routine_stock_initial_buy_dialog(0)
 
             unchanged = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual("AMOUNT", unchanged["trade_amount_type"])
             window._stock_config_path_for_routine_row.assert_not_called()
-            window.finish_routine_stock_initial_buy_edit.assert_not_called()
             window.load_routine_table.assert_not_called()
 
             window._main_routine_display_level = "stock"
-            window.toggle_routine_stock_initial_buy_mode(0)
+            with patch.object(
+                gui_windows.MainWindow,
+                "_starting_budget_change_current_price",
+                return_value=70_000,
+            ):
+                window.toggle_routine_stock_initial_buy_mode(0)
+                window.open_routine_stock_initial_buy_dialog(0)
 
             unchanged = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual("AMOUNT", unchanged["trade_amount_type"])
             self.assertEqual(20, unchanged["buy_qty"])
-            window._stock_config_path_for_routine_row.assert_called_once_with(0)
+            self.assertEqual(
+                [call(0), call(0)],
+                window._stock_config_path_for_routine_row.call_args_list,
+            )
+            window._write_stock_initial_buy_config.assert_called_once_with(
+                config_path,
+                mode="QUANTITY",
+                value=1,
+                expected_fields={"trade_amount_type": "AMOUNT"},
+            )
             window._open_running_budget_adjustment_dialog.assert_called_once_with(
                 0,
                 config_path,
             )
-            window.finish_routine_stock_initial_buy_edit.assert_not_called()
-            window.load_routine_table.assert_not_called()
+            window.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_stock_buy_limit_editor_finish_writes_selected_stock_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir) / "stocks"
+            root.mkdir()
             stock_a = root / "003550_LG" / "config.json"
             stock_b = root / "005930_Samsung" / "config.json"
             stock_a.parent.mkdir()
@@ -4416,12 +4477,14 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
             window._routine_stock_buy_limit_editor = editor
             window._routine_stock_buy_limit_editor_config_path = str(stock_a)
+            window._routine_stock_buy_limit_editor_expected_fields = None
             window._routine_stock_buy_limit_edit_finishing = False
             window.routine_table = SimpleNamespace(
                 _editing_stock_buy_limit_path="003550_LG",
                 viewport=lambda: SimpleNamespace(update=MagicMock()),
             )
             window.load_routine_table = MagicMock()
+            window.refresh_auto_trade_assignment_views = MagicMock()
 
             window.finish_routine_stock_buy_limit_edit(save=True)
 
@@ -4430,7 +4493,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             self.assertTrue(config_a["buy_limit_enabled"])
             self.assertEqual(100_000, config_a["buy_limit_amount"])
             self.assertEqual(200_000, config_b["buy_limit_amount"])
-            window.load_routine_table.assert_called_once_with()
+            window.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_draw_limit_metric_can_hide_only_value_slot_while_editing(self) -> None:
         painter = MagicMock()
@@ -4453,8 +4516,10 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
     def test_stock_buy_limit_editor_cancel_clears_edit_state_without_saving(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            stock_config = Path(temp_dir) / "003550_LG" / "config.json"
-            stock_config.parent.mkdir()
+            stock_config = (
+                Path(temp_dir) / "stocks" / "003550_LG" / "config.json"
+            )
+            stock_config.parent.mkdir(parents=True)
             stock_config.write_text(
                 json.dumps(
                     {
@@ -4472,6 +4537,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window = gui_windows.MainWindow.__new__(gui_windows.MainWindow)
             window._routine_stock_buy_limit_editor = editor
             window._routine_stock_buy_limit_editor_config_path = str(stock_config)
+            window._routine_stock_buy_limit_editor_expected_fields = None
             window._routine_stock_buy_limit_edit_finishing = False
             window.routine_table = SimpleNamespace(
                 _editing_stock_buy_limit_path="003550_LG",
@@ -4580,6 +4646,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             window.finish_routine_stock_buy_limit_edit = MagicMock()
             window.finish_routine_instance_buy_limit_edit = MagicMock()
             window.refresh_all = MagicMock()
+            window.refresh_auto_trade_assignment_views = MagicMock()
             result = SimpleNamespace(success=True, error="")
             repository = MagicMock()
             repository.update_buy_limit.return_value = result
@@ -4604,7 +4671,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 enabled=expected_enabled,
                 amount=expected_amount,
             )
-            window.refresh_all.assert_called_once_with()
+            window.refresh_auto_trade_assignment_views.assert_called_once_with()
             label.close()
 
     def test_blank_routine_buy_limit_edit_preserves_enabled_state(self) -> None:
@@ -4665,11 +4732,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
         with (
             patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
             patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[]),
-            patch.object(
-                gui_main_table_loader,
-                "_routine_stock_counts_from_base_stocks",
-                return_value={"지?�추종매�?": 3},
-            ),
             patch.object(
                 gui_main_table_loader,
                 "_instance_stock_counts",
@@ -5668,7 +5730,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
             patch.object(gui_windows, "normalize_base_stock_single_routine_file"),
             patch.object(gui_windows.MainWindow, "refresh_startup_recovery_status", return_value={}),
             patch.object(gui_windows.MainWindow, "refresh_all"),
-            patch.object(gui_windows.MainWindow, "load_running_stock_table"),
             patch.object(gui_main_table_loader, "load_routine_definitions", return_value=[definition]),
             patch.object(gui_main_table_loader, "load_persisted_routine_instances", return_value=[instance]),
             patch.object(gui_main_table_loader, "get_group_records", return_value=[group]),
@@ -5677,7 +5738,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 "_main_pnl_refresh_static_cache",
                 return_value=_main_static_cache([definition], [instance], []),
             ),
-            patch.object(gui_main_table_loader, "_routine_stock_counts_from_base_stocks", return_value={}),
             patch.object(gui_main_table_loader, "_instance_stock_counts", return_value={}),
         ):
             window = gui_windows.MainWindow()
@@ -6104,7 +6164,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     "message": "",
                 }
                 operation_adapter = MagicMock()
-                operation_adapter.apply_selected_early_close.return_value = fake_result
                 early_dialog = MagicMock()
                 early_dialog.exec_.return_value = gui_windows.QMessageBox.Yes
                 with (
@@ -6123,6 +6182,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         "_create_routine_operation_confirmation",
                         return_value=early_dialog,
                     ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_apply_selected_early_close",
+                        return_value=fake_result,
+                    ) as close_command,
                 ):
                     window.request_routine_operation(
                         instance.instance_id,
@@ -6130,9 +6194,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         "루틴",
                         "조기마감",
                     )
-                operation_adapter.apply_selected_early_close.assert_called_once_with(
+                close_command.assert_called_once_with(
+                    operation_adapter,
                     "루틴",
                     source="main_routine_context_menu",
+                    selected=operation_adapter.selected_stock_infos.return_value,
                     show_error_dialog=False,
                     show_result_toast=False,
                     show_confirmation=False,
@@ -6145,7 +6211,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
 
 
                 operation_adapter.reset_mock()
-                operation_adapter.apply_selected_early_close.return_value = fake_result
                 immediate_dialog = MagicMock()
                 immediate_dialog.exec_.return_value = gui_windows.QMessageBox.Yes
                 with (
@@ -6164,6 +6229,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         "_create_routine_operation_confirmation",
                         return_value=immediate_dialog,
                     ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_apply_selected_early_close",
+                        return_value=fake_result,
+                    ) as close_command,
                 ):
                     window.request_routine_operation(
                         instance.instance_id,
@@ -6171,9 +6241,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         gui_windows.POLICY_MARKET,
                         "즉시�?��",
                     )
-                operation_adapter.apply_selected_early_close.assert_called_once_with(
+                close_command.assert_called_once_with(
+                    operation_adapter,
                     gui_windows.POLICY_MARKET,
                     source="main_routine_context_menu",
+                    selected=operation_adapter.selected_stock_infos.return_value,
                     show_error_dialog=False,
                     show_result_toast=False,
                     show_confirmation=False,
@@ -6228,7 +6300,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 adapter_factory.assert_not_called()
 
                 category_adapter = MagicMock()
-                category_adapter.apply_selected_early_close.return_value = {
+                category_close_result = {
                     "ok": False,
                     "completed_count": 1,
                     "failed_count": 1,
@@ -6252,6 +6324,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         "_create_routine_operation_confirmation",
                         return_value=category_early_dialog,
                     ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_apply_selected_early_close",
+                        return_value=category_close_result,
+                    ) as close_command,
                     patch.object(gui_windows.QMessageBox, "warning"),
                 ):
                     window.request_routine_definition_operation(
@@ -6264,9 +6341,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     sorted((instance.instance_id, third_instance_id)),
                     list(collect_targets.call_args.args[1]),
                 )
-                category_adapter.apply_selected_early_close.assert_called_once_with(
+                close_command.assert_called_once_with(
+                    category_adapter,
                     "루틴",
                     source="main_routine_parent_context_menu",
+                    selected=category_adapter.selected_stock_infos.return_value,
                     show_error_dialog=False,
                     show_result_toast=False,
                     show_confirmation=False,
@@ -6287,7 +6366,7 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                     }
                 )
                 category_adapter.reset_mock()
-                category_adapter.apply_selected_early_close.return_value = {
+                category_immediate_result = {
                     "ok": True,
                     "completed_count": 2,
                     "failed_count": 0,
@@ -6311,6 +6390,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         "_create_routine_operation_confirmation",
                         return_value=category_immediate_dialog,
                     ),
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_apply_selected_early_close",
+                        return_value=category_immediate_result,
+                    ) as close_command,
                 ):
                     window.request_routine_definition_operation(
                         definition.definition_id,
@@ -6318,9 +6402,11 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                         gui_windows.POLICY_MARKET,
                         "즉시�?��",
                     )
-                category_adapter.apply_selected_early_close.assert_called_once_with(
+                close_command.assert_called_once_with(
+                    category_adapter,
                     gui_windows.POLICY_MARKET,
                     source="main_routine_parent_context_menu",
+                    selected=category_adapter.selected_stock_infos.return_value,
                     show_error_dialog=False,
                     show_result_toast=False,
                     show_confirmation=False,
@@ -6723,7 +6809,6 @@ class MainRoutineMonitoringDisplayTest(unittest.TestCase):
                 return_value={},
             ),
             patch.object(gui_windows.MainWindow, "refresh_all"),
-            patch.object(gui_windows.MainWindow, "load_running_stock_table"),
             patch.object(
                 gui_main_table_loader,
                 "load_routine_definitions",

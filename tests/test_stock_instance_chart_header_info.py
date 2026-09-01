@@ -9,17 +9,19 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QObject, Qt
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication, QStyle
 
 import gui_stock_instance_chart_window as chart_window
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_AMBER_TEXT_COLOR,
     AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
     AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR,
     auto_trade_operation_identity_color,
 )
+from tests.qt_test_support import flush_deferred_deletes
 
 
 def _header_display(
@@ -397,8 +399,18 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
             repository = Mock()
             repository.resolve_stock_dir.return_value = stock_dir
 
-            class Owner:
-                ready = False
+            class Owner(QObject):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.ready = False
+                    self._main_monitoring_auto_trade_operation_host = (
+                        AutoTradeOperationHost(self)
+                    )
+
+                def main_monitoring_auto_trade_operation_host(
+                    self,
+                ) -> AutoTradeOperationHost:
+                    return self._main_monitoring_auto_trade_operation_host
 
                 def startup_recovery_session_ready(self, refresh=False):
                     return self.ready
@@ -407,6 +419,24 @@ class StockInstanceChartHeaderInfoTests(unittest.TestCase):
                     return [(stock_dir, "005930", "삼성전자")]
 
             owner = Owner()
+            operation_host = owner.main_monitoring_auto_trade_operation_host()
+            self.addCleanup(flush_deferred_deletes, self.app)
+            self.addCleanup(owner.deleteLater)
+            self.addCleanup(operation_host.shutdown)
+            self.assertEqual(
+                (),
+                operation_host.current_session_operation_participant_stock_codes(),
+            )
+            self.assertEqual(
+                ("005930",),
+                operation_host.register_current_session_operation_participants(
+                    ("005930",)
+                ),
+            )
+            self.assertEqual(
+                ("005930",),
+                operation_host.current_session_operation_participant_stock_codes(),
+            )
 
             def read_json(path):
                 return config if Path(path).name == "config.json" else state

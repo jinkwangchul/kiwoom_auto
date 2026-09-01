@@ -14,7 +14,9 @@ from PyQt5.QtWidgets import QApplication, QLineEdit
 
 import gui_windows
 from gui_windows import RunningBudgetAdjustmentDialog
-from gui_auto_trade_setting_window import StockPolicyOverrideDialog
+from gui_auto_trade_setting_window import _patch_stock_policy_override_config
+from stock_repository import STOCK_CONFIG_EXPECTED_MISSING
+from tests.participant_owner_fixture import participant_owner
 
 
 class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
@@ -25,7 +27,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
     @staticmethod
     def _owner(*participants: str, global_running: bool = False):
         return SimpleNamespace(
-            _current_session_operation_participant_stock_codes=set(participants),
+            _main_monitoring_auto_trade_operation_host=participant_owner(participants),
             operation_status="RUNNING" if global_running else "STOPPED",
             startup_recovery_session_ready=lambda refresh=False: True,
             parent=lambda: None,
@@ -33,7 +35,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
 
     @staticmethod
     def _config_path(root: Path) -> Path:
-        stock_dir = root / "005930_Test"
+        stock_dir = root / "stocks" / "005930_Test"
         stock_dir.mkdir(parents=True, exist_ok=True)
         return stock_dir / "config.json"
 
@@ -202,7 +204,6 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             )
             host._open_running_budget_adjustment_dialog = MagicMock()
             host._show_start_budget_mutation_blocked = MagicMock()
-            host.finish_routine_stock_initial_buy_edit = MagicMock()
             host._write_stock_initial_buy_config = MagicMock()
             host.load_routine_table = MagicMock()
             host.routine_table = SimpleNamespace(item=lambda _row, _column: None)
@@ -213,42 +214,12 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                 return_value=70_000,
             ):
                 gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
-                gui_windows.MainWindow.start_routine_stock_initial_buy_edit(host, 0)
+                gui_windows.MainWindow.open_routine_stock_initial_buy_dialog(host, 0)
 
             host._write_stock_initial_buy_config.assert_not_called()
-            host.finish_routine_stock_initial_buy_edit.assert_not_called()
             host._show_start_budget_mutation_blocked.assert_called_once_with(host)
             host._open_running_budget_adjustment_dialog.assert_called_once_with(0, path)
             self.assertEqual(7, self._read(path)["buy_qty"])
-
-    def test_editor_open_before_start_is_blocked_at_enter_or_focusout_commit(self) -> None:
-        for commit_source in ("ENTER", "FOCUS_OUT"):
-            with self.subTest(commit_source=commit_source), tempfile.TemporaryDirectory() as temp_dir:
-                path = self._config_path(Path(temp_dir))
-                self._write(path, {"trade_amount_type": "QUANTITY", "buy_qty": 7})
-                self._write_state(path)
-                editor = QLineEdit("10")
-                host = self._owner("005930")
-                host._routine_stock_initial_buy_editor = editor
-                host._routine_stock_initial_buy_edit_finishing = False
-                host._routine_stock_initial_buy_editor_config_path = str(path)
-                host._routine_stock_initial_buy_editor_mode = "QUANTITY"
-                host.routine_table = SimpleNamespace(
-                    _editing_stock_initial_buy_path="stock",
-                    viewport=lambda: SimpleNamespace(update=MagicMock()),
-                )
-                host._write_stock_initial_buy_config = MethodType(
-                    gui_windows.MainWindow._write_stock_initial_buy_config, host
-                )
-                host._show_start_budget_mutation_blocked = MagicMock()
-                host.load_routine_table = MagicMock()
-
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(host, save=True)
-
-                self.assertEqual(7, self._read(path)["buy_qty"])
-                host._show_start_budget_mutation_blocked.assert_called_once_with(host)
-                host.load_routine_table.assert_called_once_with()
-                editor.deleteLater()
 
     def test_active_noop_does_not_write_or_report_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -263,7 +234,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             self.assertFalse(result["changed"])
             self.assertEqual(before, path.read_bytes())
 
-    def test_stale_full_config_preserves_all_protected_fields(self) -> None:
+    def test_policy_override_patch_preserves_all_start_budget_fields(self) -> None:
         cases = (
             (
                 {"trade_amount_type": "AMOUNT", "buy_qty": 7, "buy_amount": 100000},
@@ -282,23 +253,18 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             with self.subTest(current=current, stale=stale), tempfile.TemporaryDirectory() as temp_dir:
                 path = self._config_path(Path(temp_dir))
                 self._write(path, {**current, "policy_override_memo": "old"})
-                self._write_state(path)
-                dialog = self._owner("005930")
-                dialog.stock_dir = path.parent
-                dialog.config_path = path
-                dialog.code = "005930"
-                dialog.config = {**stale, "policy_override_memo": "new"}
-
-                StockPolicyOverrideDialog.write_config(dialog)
+                result = _patch_stock_policy_override_config(
+                    path.parent,
+                    "005930",
+                    {"policy_override_memo": "new"},
+                    expected_fields={"policy_override_memo": "old"},
+                )
 
                 saved = self._read(path)
+                self.assertTrue(result.ok)
                 for field in ("trade_amount_type", "buy_qty", "buy_amount"):
                     self.assertEqual(current[field], saved[field])
                 self.assertEqual("new", saved["policy_override_memo"])
-                self.assertEqual(
-                    "START_BUDGET_MUTATION_BLOCKED",
-                    dialog._start_budget_preservation_result["reason"],
-                )
 
     def test_retained_participant_unlocks_after_emergency_or_normal_stop(self) -> None:
         for status in ("EMERGENCY_STOPPED", "STOPPED"):
@@ -327,7 +293,7 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                     self.assertFalse(result["current_running"])
                     self.assertEqual(expected, self._read(path)[field])
 
-    def test_stale_full_config_preserves_latest_budget_after_operation_stop(self) -> None:
+    def test_policy_override_patch_preserves_latest_budget_after_operation_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = self._config_path(Path(temp_dir))
             self._write(
@@ -335,27 +301,20 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                 {"trade_amount_type": "QUANTITY", "buy_qty": 7, "buy_amount": 100000},
             )
             self._write_state(path, status="STOPPED", trade_enabled=False)
-            dialog = self._owner("005930")
-            dialog.stock_dir = path.parent
-            dialog.config_path = path
-            dialog.code = "005930"
-            dialog.config = {
-                "trade_amount_type": "AMOUNT",
-                "buy_qty": 10,
-                "buy_amount": 200000,
-            }
-
-            StockPolicyOverrideDialog.write_config(dialog)
+            result = _patch_stock_policy_override_config(
+                path.parent,
+                "005930",
+                {"policy_override_memo": "new"},
+                expected_fields={
+                    "policy_override_memo": STOCK_CONFIG_EXPECTED_MISSING,
+                },
+            )
 
             saved = self._read(path)
+            self.assertTrue(result.ok)
             self.assertEqual("QUANTITY", saved["trade_amount_type"])
             self.assertEqual(7, saved["buy_qty"])
             self.assertEqual(100000, saved["buy_amount"])
-            self.assertTrue(dialog._start_budget_preservation_result["allowed"])
-            self.assertFalse(dialog._start_budget_preservation_result["current_running"])
-            self.assertTrue(
-                dialog._start_budget_preservation_result["canonical_fields_preserved"]
-            )
 
     def test_running_budget_dialog_previews_amount_and_keeps_fraction_light(self) -> None:
         dialog = RunningBudgetAdjustmentDialog(
@@ -673,23 +632,25 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
             host._stock_config_path_for_routine_row = lambda _row: path
             host._stock_start_budget_locked = MagicMock(return_value=False)
             host._open_running_budget_adjustment_dialog = MagicMock()
-            host.finish_routine_stock_initial_buy_edit = MagicMock()
             host._stock_default_initial_buy_value = MagicMock(return_value=100_000)
             host._write_stock_initial_buy_config = MagicMock(
-                return_value={"allowed": True}
+                return_value={"allowed": True, "changed": True}
             )
             host._show_start_budget_mutation_blocked = MagicMock()
             host.load_routine_table = MagicMock()
 
             table_item = MagicMock()
             host.routine_table = SimpleNamespace(item=lambda _row, _column: table_item)
-            with patch.object(
-                gui_windows.MainWindow,
-                "_starting_budget_change_current_price",
-                return_value=70_000,
+            with (
+                patch.object(
+                    gui_windows.MainWindow,
+                    "_starting_budget_change_current_price",
+                    return_value=70_000,
+                ),
+                patch.object(gui_windows, "refresh_auto_trade_views") as refresh_views,
             ):
                 gui_windows.MainWindow.toggle_routine_stock_initial_buy_mode(host, 0)
-                gui_windows.MainWindow.start_routine_stock_initial_buy_edit(host, 0)
+                gui_windows.MainWindow.open_routine_stock_initial_buy_dialog(host, 0)
 
             host._open_running_budget_adjustment_dialog.assert_called_once_with(0, path)
             host._stock_start_budget_locked.assert_called_once_with(path)
@@ -702,9 +663,10 @@ class StartBudgetActiveParticipantGuardTest(unittest.TestCase):
                 path,
                 mode="AMOUNT",
                 value=100_000,
+                expected_fields={"trade_amount_type": "QUANTITY"},
             )
-            host.finish_routine_stock_initial_buy_edit.assert_called_once_with(save=True)
-            host.load_routine_table.assert_called_once()
+            refresh_views.assert_called_once_with(host)
+            host.load_routine_table.assert_not_called()
 
     def test_ui_lock_releases_for_retained_stopped_participant(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

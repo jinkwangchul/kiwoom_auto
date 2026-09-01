@@ -10,12 +10,11 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QPoint
-from PyQt5.QtWidgets import QApplication, QFrame, QPushButton
+from PyQt5.QtWidgets import QApplication, QFrame, QPushButton, QTableWidget
 
 import gui_main_table_loader as table_loader
 import gui_windows
-from gui_windows import AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT, MainWindow
+from gui_windows import MainWindow
 
 
 class GuiMainColumnSortBadgesTest(unittest.TestCase):
@@ -175,104 +174,83 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
             row["column_sort_values"],
         )
 
-    def test_excluded_badge_is_emphasized_and_toggles_only_view_scope(self) -> None:
+    def test_removed_excluded_badge_keeps_shared_scope_switching(self) -> None:
         class Host:
             pass
 
         host = Host()
         host._main_routine_excluded_only = False
+        host._main_routine_stock_scope = "all"
         host._main_routine_metric_sort_key = "profit"
         host._main_routine_metric_sort_active = True
         host._main_routine_initial_buy_sort_mode = "AMOUNT"
         host._main_routine_column_sort_key = "status"
         host._update_main_routine_filter_badges = MagicMock()
         host._reload_main_routine_table_preserving_view = MagicMock()
-        host._create_main_routine_filter_badge = MethodType(
-            MainWindow._create_main_routine_filter_badge,
-            host,
-        )
-        host._set_main_routine_excluded_only = MethodType(
-            MainWindow._set_main_routine_excluded_only,
-            host,
-        )
+        self.assertFalse(hasattr(MainWindow, "_create_main_routine_excluded_badge"))
 
-        button = MainWindow._create_main_routine_excluded_badge(host)
-        try:
-            self.assertEqual("제외종목(0)", button.text())
-            self.assertEqual(
-                round(AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT * 1.1),
-                button.height(),
-            )
-            self.assertGreaterEqual(
-                button.width(),
-                (
-                    button.fontMetrics().horizontalAdvance(f"{button.LABEL}(")
-                    + table_loader.routine_aggregate_number_slot_width(button.font())
-                    + button.fontMetrics().horizontalAdvance(")")
-                    + 28
-                ),
-            )
-
-            original_sorts = (
+        original_sorts = (
+            host._main_routine_metric_sort_key,
+            host._main_routine_metric_sort_active,
+            host._main_routine_initial_buy_sort_mode,
+            host._main_routine_column_sort_key,
+        )
+        MainWindow._set_main_routine_excluded_only(host, True)
+        self.assertTrue(host._main_routine_excluded_only)
+        self.assertEqual("excluded", host._main_routine_stock_scope)
+        self.assertEqual(
+            original_sorts,
+            (
                 host._main_routine_metric_sort_key,
                 host._main_routine_metric_sort_active,
                 host._main_routine_initial_buy_sort_mode,
                 host._main_routine_column_sort_key,
-            )
-            MainWindow._set_main_routine_excluded_only(host, True)
-            self.assertTrue(host._main_routine_excluded_only)
-            self.assertEqual(
-                original_sorts,
-                (
-                    host._main_routine_metric_sort_key,
-                    host._main_routine_metric_sort_active,
-                    host._main_routine_initial_buy_sort_mode,
-                    host._main_routine_column_sort_key,
-                ),
-            )
-            MainWindow._set_main_routine_excluded_only(host, False)
-            self.assertFalse(host._main_routine_excluded_only)
-            self.assertEqual(2, host._reload_main_routine_table_preserving_view.call_count)
-        finally:
-            button.close()
-            button.deleteLater()
-
-    def test_excluded_badge_uses_fixed_three_digit_centered_number_slot(self) -> None:
-        host = SimpleNamespace(
-            _set_main_routine_excluded_only=MagicMock(),
-            _main_routine_excluded_button=None,
+            ),
         )
-        button = MainWindow._create_main_routine_excluded_badge(host)
+        MainWindow._set_main_routine_excluded_only(host, False)
+        self.assertFalse(host._main_routine_excluded_only)
+        self.assertEqual("all", host._main_routine_stock_scope)
+        self.assertEqual(2, host._reload_main_routine_table_preserving_view.call_count)
+
+    def test_shared_summary_excluded_count_uses_fixed_number_slot(self) -> None:
+        routine_table = QTableWidget()
+        host = SimpleNamespace(
+            routine_table=routine_table,
+            _set_main_routine_valid_only=MagicMock(),
+            _activate_main_routine_summary_badge=MagicMock(),
+            _main_routine_display_level="stock",
+            _main_routine_stock_scope="all",
+            _main_routine_excluded_only=False,
+            review_required_window=None,
+            btn_review_required=None,
+        )
+        summary = MainWindow._create_main_routine_summary(host)
         try:
-            expected_width = button.width()
-            expected_rects = button.content_rects()
-            expected_number_width = table_loader.routine_aggregate_number_slot_width(
-                button.count_font()
+            self.assertIsNone(
+                summary.findChild(QPushButton, "mainRoutineExcludedStockBadge")
+            )
+            excluded_button = host._main_routine_summary_count_buttons["excluded"]
+            label, value = host._main_routine_summary_count_labels["excluded"]
+            self.assertEqual("mainRoutineSummaryCountBadge", excluded_button.objectName())
+            self.assertEqual("제외", label.text())
+            expected_number_width = value.width()
+            self.assertEqual(
+                host._main_routine_summary_number_slot_width,
+                expected_number_width,
             )
             for count in (0, 1, 2, 9, 10, 15, 99, 100, 123, 999):
-                button.set_excluded_count(count)
-                label_rect, left_paren_rect, number_rect, right_paren_rect = (
-                    button.content_rects()
+                MainWindow._update_main_routine_summary(
+                    host,
+                    {"count_badges": (("excluded", "제외", count),)},
                 )
-                self.assertEqual(expected_width, button.width())
-                self.assertEqual(expected_rects, button.content_rects())
-                self.assertEqual(expected_number_width, number_rect.width())
-                self.assertEqual(label_rect.right() + 1, left_paren_rect.left())
-                self.assertEqual(left_paren_rect.right() + 1, number_rect.left())
-                self.assertEqual(number_rect.right() + 1, right_paren_rect.left())
-                number_width = button.fontMetrics().horizontalAdvance(str(count))
-                left_space = (number_rect.width() - number_width) // 2
-                right_space = number_rect.width() - number_width - left_space
-                self.assertLessEqual(abs(left_space - right_space), 1)
-                self.assertEqual(f"제외종목({count})", button.text())
-            self.assertAlmostEqual(
-                button.font().pointSizeF() - 1.0,
-                button.count_font().pointSizeF(),
-                places=4,
-            )
+                self.assertEqual(str(count), value.text())
+                self.assertEqual(expected_number_width, value.width())
         finally:
-            button.close()
-            button.deleteLater()
+            summary.close()
+            summary.deleteLater()
+            routine_table.close()
+            routine_table.deleteLater()
+            self.app.processEvents()
 
     def test_instance_stock_reader_separates_normal_and_excluded_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -310,8 +288,8 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
                     return_value=[SimpleNamespace(instance_id="instance-a")],
                 ),
             ):
-                normal = table_loader._instance_stock_counts(False)
-                excluded = table_loader._instance_stock_counts(True)
+                normal = table_loader._instance_stock_counts(stock_scope="normal")
+                excluded = table_loader._instance_stock_counts(stock_scope="excluded")
 
             self.assertEqual(
                 ["000001"],
@@ -321,10 +299,14 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
                 ["000002"],
                 [stock["code"] for stock in excluded["instance-a"]["stocks"]],
             )
-            self.assertEqual(1, normal["instance-a"]["registered"])
-            self.assertEqual(1, excluded["instance-a"]["registered"])
+            self.assertEqual(2, normal["instance-a"]["registered"])
+            self.assertEqual(2, excluded["instance-a"]["registered"])
+            self.assertEqual(1, normal["instance-a"]["normal"])
+            self.assertEqual(1, normal["instance-a"]["excluded"])
+            self.assertEqual(1, excluded["instance-a"]["normal"])
+            self.assertEqual(1, excluded["instance-a"]["excluded"])
 
-    def test_excluded_badge_renders_above_table_at_right_with_shared_style(self) -> None:
+    def test_removed_right_side_badge_uses_shared_summary_count_badge(self) -> None:
         api = SimpleNamespace(
             unavailable_reason=lambda: "test double",
             login_state_changed=None,
@@ -342,32 +324,17 @@ class GuiMainColumnSortBadgesTest(unittest.TestCase):
             window.show()
             self.app.processEvents()
 
-            button = window.findChild(QPushButton, "mainRoutineExcludedStockBadge")
-            self.assertIsNotNone(button)
-            button_pos = button.mapTo(window, QPoint(0, 0))
-            table_pos = window.routine_table.mapTo(window, QPoint(0, 0))
-            valid_button = window._main_routine_valid_button
-            self.assertLess(button_pos.y(), table_pos.y())
-            self.assertLessEqual(
-                abs(
-                    (button_pos.x() + button.width())
-                    - (table_pos.x() + window.routine_table.width())
-                ),
-                8,
+            self.assertFalse(hasattr(MainWindow, "_create_main_routine_excluded_badge"))
+            self.assertIsNone(
+                window.findChild(QPushButton, "mainRoutineExcludedStockBadge")
             )
-            self.assertEqual(
-                round(valid_button.height() * 1.1),
-                button.height(),
-            )
-            self.assertAlmostEqual(
-                valid_button.font().pointSizeF() * 1.1,
-                button.font().pointSizeF(),
-                places=4,
-            )
-            self.assertGreaterEqual(
-                button.width() - button.fontMetrics().horizontalAdvance(button.text()),
-                28,
-            )
+            summary = window._main_routine_summary_widget
+            button = window._main_routine_summary_count_buttons["excluded"]
+            label, value = window._main_routine_summary_count_labels["excluded"]
+            self.assertTrue(summary.isAncestorOf(button))
+            self.assertEqual("mainRoutineSummaryCountBadge", button.objectName())
+            self.assertEqual("제외", label.text())
+            self.assertEqual("0", value.text())
             self.assertFalse(button.isChecked())
             inactive_style = button.styleSheet()
 

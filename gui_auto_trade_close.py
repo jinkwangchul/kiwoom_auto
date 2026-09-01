@@ -12,7 +12,6 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -24,7 +23,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from gui_operation_ui_context import operation_dialog_parent, refresh_auto_trade_views
+from gui_operation_ui_context import (
+    actionable_current_price,
+    operation_dialog_parent,
+    refresh_auto_trade_views,
+)
 from gui_window_policy import persistent_feature_owner
 
 from gui_common_utils import safe_int_value
@@ -39,32 +42,20 @@ from gui_auto_trade_runtime import parse_stock_folder_name
 from gui_auto_trade_table_loader import _selected_instance_stock_dirs
 from gui_toast import show_toast
 from event_journal_production import append_production_event
-from state_policy import auto_trade_status_display
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
-    is_emergency_stopped_state,
-    is_review_required_state,
 )
 from gui_auto_trade_policy import (
     operation_policy_section,
-    auto_trade_setting_current_session_trade_started,
     auto_trade_setting_early_close_requested,
     auto_trade_setting_has_buy_pending_problem,
-    auto_trade_setting_has_close_progress_quantity,
-    auto_trade_setting_individual_liquidation_window_entered,
     auto_trade_setting_liquidation_active,
-    auto_trade_setting_liquidation_phase_active,
-    auto_trade_setting_trade_started,
     clear_early_close_runtime_metadata_only,
     close_method_from_state_or_policy,
-    effective_liquidation_policy_for_config,
     auto_trade_setting_liquidation_text,
     short_close_method_text,
 )
 from close_liquidation_transition_service import (
-    DOMAIN_CLOSE,
-    DOMAIN_LIQUIDATION,
-    POLICY_ROUTINE_CLOSE,
     normalize_direct_close_policy_alias,
 )
 from close_liquidation_execution_pipeline import (
@@ -72,26 +63,18 @@ from close_liquidation_execution_pipeline import (
     commit_close_liquidation_candidate_preview,
     normalize_direct_liquidation_method,
 )
-from close_intent_service import CLOSE_INTENT_EARLY_CLOSE, apply_close_intent
+from close_liquidation_command import (
+    EARLY_CLOSE_CANCEL,
+    EARLY_CLOSE_REQUEST,
+    INDIVIDUAL_LIQUIDATION,
+    execute_early_close_cancel_command,
+    execute_early_close_request_command,
+    execute_individual_liquidation_command,
+    inspect_close_liquidation_availability,
+)
 from operation_close_completion_check_service import (
     SOURCE_EARLY_CLOSE_DURABLE_UPDATE,
     check_global_close_completion_after_durable_update,
-)
-from operation_command_service import (
-    COMMAND_INDIVIDUAL_LIQUIDATION,
-    IndividualLiquidationOverride,
-    MODE_EARLY_CLOSE,
-    MODE_NORMAL,
-    OperationCommandRequest,
-    OperationCommandService,
-    RESULT_FAILED,
-    RESULT_SUCCESS,
-    STOCK_APPLIED,
-    SCOPE_STOCK,
-)
-from transition_evidence_reader import (
-    COMMAND_REQUEST_SCOPE,
-    TransitionEvidenceScope,
 )
 from transition_production_guard import evaluate_production_transition
 from execution_queue_writer import read_execution_queue_records
@@ -196,51 +179,6 @@ def _transition_trade_date(timestamp: object, fallback: str) -> str:
     if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
         return text[:10]
     return fallback[:10]
-
-
-def _current_close_transition_policy(
-    state: dict[str, object],
-    requested_at: str,
-) -> tuple[str, str]:
-    early_method = normalize_direct_close_policy_alias(
-        state.get("early_close_method")
-    )
-    early_policy = state.get("early_close_policy")
-    if not early_method and isinstance(early_policy, dict):
-        early_method = normalize_direct_close_policy_alias(
-            early_policy.get("method")
-        )
-    early_started_at = str(state.get("early_close_requested_at") or "").strip()
-    if early_method or early_started_at:
-        return early_method or POLICY_ROUTINE_CLOSE, early_started_at or requested_at
-
-    auto_method = str(state.get("auto_close_method") or "").strip()
-    auto_policy = state.get("auto_close_policy")
-    if not auto_method and isinstance(auto_policy, dict):
-        auto_method = str(auto_policy.get("method") or "").strip()
-    auto_started_at = str(state.get("auto_close_requested_at") or "").strip()
-    if auto_method or auto_started_at:
-        return auto_method, auto_started_at or requested_at
-
-    return POLICY_ROUTINE_CLOSE, requested_at
-
-
-def _command_transition_scope(
-    *,
-    code: str,
-    routine_instance_id: str,
-    started_at: str,
-    requested_at: str,
-    operation_command_id: str = "",
-) -> TransitionEvidenceScope:
-    return TransitionEvidenceScope(
-        scope_type=COMMAND_REQUEST_SCOPE,
-        stock_code=code,
-        trade_date=_transition_trade_date(started_at, requested_at),
-        routine_instance_id=routine_instance_id,
-        transition_requested_at=started_at,
-        operation_command_id=operation_command_id,
-    )
 
 
 def _close_liquidation_cancel_required(method: object) -> bool:
@@ -538,6 +476,12 @@ def _start_close_liquidation_execution(
         requested_at=requested_at,
         routine_instance_id=routine_instance_id,
         reason=reason,
+        current_price_reader=(
+            lambda stock_code, _stock_name="": actionable_current_price(
+                window,
+                stock_code,
+            )
+        ),
     )
     if preview.get("ok") is not True:
         return {
@@ -873,23 +817,43 @@ def auto_trade_apply_selected_individual_liquidation_method(
         return {"ok": False, "message": "개별청산할 종목을 선택하세요."}
 
     minutes = str(minutes_before_regular_close).strip() or "5"
-    command_service = OperationCommandService(PROJECT_ROOT)
     completed: list[str] = []
     failed: list[str] = []
     failure_messages: list[str] = []
     for stock_dir, code, name in selected:
-        requested_at = now_text()
-        state = read_json_dict(stock_dir / "state.json")
         config = read_json_dict(stock_dir / "config.json")
         routine_instance_id = str(
             config.get("assigned_routine_instance_id") or ""
         ).strip()
-        recovery = _production_recovery_gate(
+        recovery_decisions: dict[str, object] = {}
+
+        def inspect_recovery(stock_code: str, caller_name: str):
+            recovery = _production_recovery_gate(window, stock_code, caller_name)
+            if recovery is not None:
+                recovery_decisions[stock_code] = recovery
+            return recovery
+
+        command_result = execute_individual_liquidation_command(
             window,
+            stock_dir,
             code,
-            "INDIVIDUAL_LIQUIDATION_REQUEST",
+            method=normalized_method,
+            minutes_before_regular_close=minutes,
+            source="우클릭",
+            now_dt=now_dt,
+            project_root=PROJECT_ROOT,
+            queue_path=ORDER_QUEUE_PATH,
+            fills_path=FILLS_PATH,
+            recovery_inspector=inspect_recovery,
+            transition_guard=evaluate_production_transition,
+            requested_at_factory=now_text,
         )
-        if recovery is not None and recovery.allowed is not True:
+        recovery = recovery_decisions.get(code)
+        if (
+            command_result.availability is not None
+            and command_result.availability.recovery_blocked
+            and recovery is not None
+        ):
             _log_recovery_block(
                 window,
                 code=code,
@@ -902,69 +866,7 @@ def auto_trade_apply_selected_individual_liquidation_method(
             )
             failure_messages.append(_recovery_block_user_message(window, recovery))
             continue
-        current_policy, _is_override = effective_liquidation_policy_for_config(
-            config,
-            state,
-        )
-        current_method = str(current_policy.get("method") or "").strip()
-        current_request = state.get("individual_liquidation_request")
-        current_request = (
-            current_request if isinstance(current_request, dict) else {}
-        )
-        current_started_at = str(
-            current_request.get("requested_at") or requested_at
-        ).strip()
-        current_command_id = str(
-            current_request.get("command_id")
-            or current_request.get("operation_command_id")
-            or state.get("operation_command_id")
-            or ""
-        ).strip()
-        transition = evaluate_production_transition(
-            policy_domain=DOMAIN_LIQUIDATION,
-            current_policy=current_method,
-            requested_policy=normalized_method,
-            queue_path=ORDER_QUEUE_PATH,
-            fills_path=FILLS_PATH,
-            runtime_state=state,
-            runtime_routine_instance_id=routine_instance_id,
-            scope=_command_transition_scope(
-                code=code,
-                routine_instance_id=routine_instance_id,
-                started_at=current_started_at,
-                requested_at=requested_at,
-                operation_command_id=current_command_id,
-            ),
-            liquidation_time_window_entered=(
-                auto_trade_setting_individual_liquidation_window_entered(
-                    state,
-                    now_dt=now_dt,
-                    candidate_minutes_before_regular_close=minutes,
-                )
-            ),
-        )
-        if not transition.allowed:
-            reason = f"정책 전환 차단:{transition.reason_code}"
-            failed.append(f"{code} {name}({reason})")
-            failure_messages.append(reason)
-            continue
-        result = command_service.apply_individual_liquidation(
-            OperationCommandRequest(
-                target_scope=SCOPE_STOCK,
-                target_id=str(stock_dir.resolve()),
-                command=COMMAND_INDIVIDUAL_LIQUIDATION,
-                source="우클릭",
-            ),
-            IndividualLiquidationOverride(
-                method=normalized_method,
-                minutes_before_regular_close=minutes,
-            ),
-        )
-        if (
-            result.status == RESULT_SUCCESS
-            and result.stock_results
-            and result.stock_results[0].status == STOCK_APPLIED
-        ):
+        if command_result.ok and command_result.changed:
             completed.append(f"{code} {name}")
             append_stock_log(
                 stock_dir,
@@ -972,10 +874,10 @@ def auto_trade_apply_selected_individual_liquidation_method(
                 f"개별청산 정책 설정: {minutes}분/{normalized_method}",
             )
         else:
-            reason = result.error
-            if result.stock_results:
-                reason = result.stock_results[0].error or reason
-            reason = str(reason or "요청 실패")
+            reason = str(command_result.reason_code or "요청 실패")
+            transition = command_result.operation_result
+            if transition is not None and hasattr(transition, "allowed"):
+                reason = f"정책 전환 차단:{reason}"
             failed.append(f"{code} {name}({reason})")
             failure_messages.append(reason)
 
@@ -997,7 +899,6 @@ def auto_trade_apply_selected_individual_liquidation_method(
     selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
     refresh_auto_trade_views(window)
     window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    window._runtime_file_snapshot = window.current_runtime_file_signature()
     window.update_action_buttons()
     window.statusBarMessage(
         f"개별청산 설정 완료: {minutes}분/{normalized_method} / 대상 {len(completed)}개"
@@ -1081,29 +982,6 @@ def _early_close_confirmation_message(window, target_count: int) -> str:
     return f"{scope_name} {max(0, int(target_count))}종목을 조기마감합니다. 진행하시겠습니까?"
 
 
-def _early_close_current_session_operating(
-    window,
-    code: str,
-    state: dict[str, object],
-) -> bool:
-    status = str(state.get("status") or "STOPPED").strip().upper() or "STOPPED"
-    if status in {"STOPPED", "STOP", "MANUAL_STOPPED"}:
-        return False
-    persisted_trade_started = auto_trade_setting_trade_started(state)
-    contexts = [window]
-    owner = persistent_feature_owner(window)
-    if owner is not None and owner is not window:
-        contexts.append(owner)
-    return any(
-        auto_trade_setting_current_session_trade_started(
-            context,
-            persisted_trade_started,
-            code,
-        )
-        for context in contexts
-    )
-
-
 def _kiwoom_server_login_block_message(window) -> str:
     parent = persistent_feature_owner(window)
     api = getattr(parent, "kiwoom_api", None)
@@ -1148,7 +1026,8 @@ def auto_trade_apply_selected_early_close_profit_loss(window) -> None:
     if not accepted:
         return
 
-    window.apply_selected_early_close(
+    auto_trade_apply_selected_early_close(
+        window,
         "손/익절",
         source="우클릭",
         extra_policy={
@@ -1281,57 +1160,12 @@ def _stock_order_execution_evidence(stock_dir: Path, requested_at: str) -> str:
     return ""
 
 
-def _selected_display_status_by_stock_dir(window) -> dict[str, str]:
-    table = getattr(window, "stock_table", None)
-    if table is None:
-        return {}
-    try:
-        selected_rows = list(table.selectionModel().selectedRows())
-    except Exception:
-        return {}
-
-    result: dict[str, str] = {}
-    for index in selected_rows:
-        try:
-            row = index.row()
-            path_item = table.item(row, 0)
-            status_item = table.item(row, 4)
-        except Exception:
-            continue
-        if path_item is None or status_item is None:
-            continue
-        try:
-            path_text = str(path_item.data(Qt.UserRole) or "").strip()
-        except Exception:
-            path_text = ""
-        if not path_text:
-            continue
-        try:
-            key = str(Path(path_text).resolve())
-        except Exception:
-            key = path_text
-        result[key] = str(status_item.text() or "").strip()
-    return result
-
-
-def _early_close_cancel_block_reason(
+def _early_close_cancel_irreversible_evidence(
     stock_dir: Path,
     code: str,
     state: dict[str, object],
-    *,
-    display_status: str = "",
 ) -> str:
-    if not isinstance(state, dict) or not state:
-        return "state_read_failed"
-    if not auto_trade_setting_trade_started(state):
-        return "trade_not_started"
-    if not auto_trade_setting_early_close_requested(state):
-        return "early_close_not_active"
-    if display_status and display_status != "조기마감":
-        return "display_not_early_close"
     requested_at = str(state.get("early_close_requested_at") or "").strip()
-    if not requested_at:
-        return "early_close_identity_missing"
     if str(state.get("close_routine_final_sell_ordered_at") or "").strip():
         return "final_sell_ordered_at"
     if bool(state.get("close_routine_final_sell_ordered", False)):
@@ -1353,8 +1187,8 @@ def _early_close_cancel_block_reason(
 def auto_trade_cancel_selected_early_close(window) -> None:
     """우클릭 조기마감 > 취소.
 
-    실행 증거가 없는 조기마감 명령만 기존 OperationCommandService의 NORMAL
-    적용 경로로 철회한다. 안전성을 확인할 수 없으면 fail-closed로 차단한다.
+    실행 증거가 없는 조기마감 명령만 shared application command를 통해
+    기존 NORMAL 적용 경로로 철회한다. 안전성을 확인할 수 없으면 fail-closed로 차단한다.
     """
     blocked_message = "현재 상태는 마감정책 취소 대상이 아닙니다."
     success_message = "마감정책이 취소되었습니다."
@@ -1366,22 +1200,27 @@ def auto_trade_cancel_selected_early_close(window) -> None:
         notify(blocked_message)
         return
 
-    states: list[tuple[Path, str, str, dict[str, object]]] = []
+    states: list[tuple[Path, str, str]] = []
     block_reasons: list[tuple[Path, str, str, str]] = []
-    display_status_by_stock_dir = _selected_display_status_by_stock_dir(window)
+
+    def inspect_recovery(stock_code: str, caller_name: str):
+        return _production_recovery_gate(window, stock_code, caller_name)
+
     for stock_dir, code, name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        stock_dir_key = str(stock_dir.resolve())
-        reason = _early_close_cancel_block_reason(
+        availability = inspect_close_liquidation_availability(
+            window,
             stock_dir,
             code,
-            state,
-            display_status=display_status_by_stock_dir.get(stock_dir_key, ""),
+            intent=EARLY_CLOSE_CANCEL,
+            recovery_inspector=inspect_recovery,
+            irreversible_evidence_reader=_early_close_cancel_irreversible_evidence,
         )
-        if reason:
-            block_reasons.append((stock_dir, code, name, reason))
+        if not availability.allowed:
+            block_reasons.append(
+                (stock_dir, code, name, availability.reason_code)
+            )
             continue
-        states.append((stock_dir, code, name, state))
+        states.append((stock_dir, code, name))
 
     if block_reasons or not states:
         for stock_dir, code, name, reason in block_reasons:
@@ -1389,25 +1228,22 @@ def auto_trade_cancel_selected_early_close(window) -> None:
         notify(blocked_message)
         return
 
-    command_service = OperationCommandService(PROJECT_ROOT)
     completed: list[str] = []
     failed: list[tuple[Path, str, str, str]] = []
-    for stock_dir, code, name, _state in states:
-        result = command_service.apply(
-            OperationCommandRequest(
-                target_scope=SCOPE_STOCK,
-                target_id=str(stock_dir.resolve()),
-                command=MODE_NORMAL,
-                source="우클릭",
-            )
+    for stock_dir, code, name in states:
+        result = execute_early_close_cancel_command(
+            window,
+            stock_dir,
+            code,
+            source="우클릭",
+            project_root=PROJECT_ROOT,
+            recovery_inspector=inspect_recovery,
+            irreversible_evidence_reader=_early_close_cancel_irreversible_evidence,
         )
-        if result.status != RESULT_SUCCESS or not result.stock_results or result.stock_results[0].status != STOCK_APPLIED:
-            reason = result.error or (result.stock_results[0].error if result.stock_results else "cancel_failed")
-            failed.append((stock_dir, code, name, reason))
-            continue
-        saved = read_json_dict(stock_dir / "state.json")
-        if auto_trade_setting_early_close_requested(saved):
-            failed.append((stock_dir, code, name, "read_back_early_close_still_active"))
+        if not result.ok or not result.changed:
+            failed.append(
+                (stock_dir, code, name, result.reason_code or "cancel_failed")
+            )
             continue
         completed.append(f"{code} {name}")
         append_stock_log(stock_dir, "GUI", "조기마감 취소 완료")
@@ -1473,43 +1309,28 @@ def auto_trade_apply_selected_early_close(
         )
         return {"ok": False, "message": "조기마감할 종목을 선택하세요."}
 
-    operating_selected: list[tuple[Path, str, str]] = []
-    for stock_dir, code, name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        if _early_close_current_session_operating(window, code, state):
-            operating_selected.append((stock_dir, code, name))
-    selected = operating_selected
-
     method_text = normalize_direct_close_policy_alias(method) or "루틴"
 
     blocked_liquidation: list[str] = []
     close_targets: list[tuple[Path, str, str]] = []
     early_close_applied_count = 0
 
+    def inspect_recovery(stock_code: str, caller_name: str):
+        return _production_recovery_gate(window, stock_code, caller_name)
+
     for stock_dir, code, name in selected:
-        state = read_json_dict(stock_dir / "state.json")
-        config = read_json_dict(stock_dir / "config.json")
-        if not config:
-            config = default_config()
-
-        status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        if is_emergency_stopped_state(state):
-            continue
-        if is_review_required_state(state):
-            continue
-
-        holding_qty = safe_int_value(state.get("holding_qty"), 0)
-        if auto_trade_setting_liquidation_phase_active(config, holding_qty, state=state):
+        availability = inspect_close_liquidation_availability(
+            window,
+            stock_dir,
+            code,
+            intent=EARLY_CLOSE_REQUEST,
+            requested_method=method_text,
+            recovery_inspector=inspect_recovery,
+        )
+        if availability.reason_code == "LIQUIDATION_IN_PROGRESS":
             blocked_liquidation.append(f"{code} {name}")
             continue
-
-        _buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
-        has_close_progress_qty = auto_trade_setting_has_close_progress_quantity(
-            holding_qty,
-            sell_pending_qty,
-        )
-
-        if has_close_progress_qty:
+        if availability.allowed:
             close_targets.append((stock_dir, code, name))
 
     if blocked_liquidation:
@@ -1576,40 +1397,37 @@ def auto_trade_apply_selected_early_close(
     completed: list[str] = []
     skipped: list[str] = []
     for stock_dir, code, name in close_targets:
-        state = read_json_dict(stock_dir / "state.json")
-        status = str(state.get("status", "STOPPED")).strip().upper() or "STOPPED"
-        if not _early_close_current_session_operating(window, code, state):
-            continue
-        if is_emergency_stopped_state(state):
-            skipped.append(f"{code} {name}({auto_trade_status_display(status)})")
-            continue
-        if is_review_required_state(state):
-            skipped.append(f"{code} {name}(검토종목)")
-            continue
-
         config = read_json_dict(stock_dir / "config.json")
         if not config:
             config = default_config()
+        recovery_decisions: dict[str, object] = {}
 
-        buy_pending_qty, sell_pending_qty = pending_order_side_quantities(stock_dir, state)
-        holding_qty = safe_int_value(state.get("holding_qty"), 0)
+        def final_recovery(stock_code: str, caller_name: str):
+            recovery = _production_recovery_gate(window, stock_code, caller_name)
+            if recovery is not None:
+                recovery_decisions[stock_code] = recovery
+            return recovery
 
-        if auto_trade_setting_liquidation_phase_active(config, holding_qty, state=state):
-            skipped.append(f"{code} {name}(청산 진행 중)")
-            continue
-
-        has_close_progress_qty = auto_trade_setting_has_close_progress_quantity(
-            holding_qty,
-            sell_pending_qty,
-        )
-        if not has_close_progress_qty:
-            continue
-        recovery = _production_recovery_gate(
+        application_result = execute_early_close_request_command(
             window,
+            stock_dir,
             code,
-            "EARLY_CLOSE_REQUEST",
+            method=method_text,
+            source=source,
+            extra_policy=dict(extra_policy or {}),
+            project_root=PROJECT_ROOT,
+            queue_path=ORDER_QUEUE_PATH,
+            fills_path=FILLS_PATH,
+            recovery_inspector=final_recovery,
+            transition_guard=evaluate_production_transition,
+            requested_at_factory=now_text,
         )
-        if recovery is not None and recovery.allowed is not True:
+        recovery = recovery_decisions.get(code)
+        if (
+            application_result.availability is not None
+            and application_result.availability.recovery_blocked
+            and recovery is not None
+        ):
             _log_recovery_block(
                 window,
                 code=code,
@@ -1623,71 +1441,38 @@ def auto_trade_apply_selected_early_close(
                 f"{code} {name}({_recovery_block_user_message(window, recovery)})"
             )
             continue
-        transition_requested_at = now_text()
+        if not application_result.ok:
+            reason = application_result.reason_code or "명령 적용 실패"
+            reason_text = {
+                "NOT_CURRENT_PARTICIPANT": "현재 운영종목 아님",
+                "REVIEW_REQUIRED": "검토종목",
+                "EMERGENCY_STOPPED": "긴급정지",
+                "NO_HOLDING": "보유수량 없음",
+                "LIQUIDATION_IN_PROGRESS": "청산 진행 중",
+            }.get(reason, f"정책 전환 차단:{reason}")
+            skipped.append(f"{code} {name}({reason_text})")
+            continue
+
         routine_instance_id = str(
             config.get("assigned_routine_instance_id") or ""
         ).strip()
-        current_policy, current_started_at = _current_close_transition_policy(
-            state,
-            transition_requested_at,
-        )
-        current_command_id = str(state.get("operation_command_id") or "").strip()
-        transition = evaluate_production_transition(
-            policy_domain=DOMAIN_CLOSE,
-            current_policy=current_policy,
-            requested_policy=method_text,
-            queue_path=ORDER_QUEUE_PATH,
-            fills_path=FILLS_PATH,
-            runtime_state=state,
-            runtime_routine_instance_id=routine_instance_id,
-            scope=_command_transition_scope(
-                code=code,
-                routine_instance_id=routine_instance_id,
-                started_at=current_started_at,
-                requested_at=transition_requested_at,
-                operation_command_id=current_command_id,
-            ),
-        )
-        if not transition.allowed:
-            skipped.append(
-                f"{code} {name}(정책 전환 차단:{transition.reason_code})"
-            )
-            continue
-        intent_result = apply_close_intent(
-            intent=CLOSE_INTENT_EARLY_CLOSE,
-            target_scope=SCOPE_STOCK,
-            target_id=str(stock_dir.resolve()),
-            source=source,
-            requested_policy=method_text,
-            has_close_progress_quantity=has_close_progress_qty,
-            extra_policy=dict(extra_policy or {}),
-            stock_code=code,
-            runtime_state=state,
-            runtime_routine_instance_id=routine_instance_id,
-            current_policy=current_policy,
-            current_started_at=current_started_at,
-            current_command_id=current_command_id,
-            requested_at=transition_requested_at,
-            project_root=PROJECT_ROOT,
-            queue_path=ORDER_QUEUE_PATH,
-            fills_path=FILLS_PATH,
-            operation_command_service_factory=OperationCommandService,
-            transition_guard=evaluate_production_transition,
-        )
+        intent_result = application_result.operation_result
+        intent_result = intent_result if isinstance(intent_result, dict) else {}
         command_result = intent_result.get("command_result")
         if command_result is None:
             skipped.append(
-                f"{code} {name}({intent_result.get('reason') or '紐낅졊 ?곸슜 ?ㅽ뙣'})"
+                f"{code} {name}({intent_result.get('reason') or '명령 적용 실패'})"
             )
-            continue
-        if command_result.status == RESULT_FAILED or command_result.failed:
-            reason = command_result.error
-            if command_result.failed:
-                reason = command_result.failed[0].error or reason
-            skipped.append(f"{code} {name}({reason or '명령 적용 실패'})")
             continue
 
         saved_state = read_json_dict(stock_dir / "state.json")
+        transition_requested_at = str(
+            saved_state.get("early_close_requested_at") or now_text()
+        ).strip()
+        has_close_progress_qty = bool(
+            application_result.availability
+            and application_result.availability.holding_qty > 0
+        )
         execution = _start_close_liquidation_execution(
             window,
             stock_dir=stock_dir,
@@ -1727,7 +1512,7 @@ def auto_trade_apply_selected_early_close(
 
         completed.append(f"{code} {name}")
         early_close_applied_count += 1
-        if command_result.stock_results and command_result.stock_results[0].status == STOCK_APPLIED:
+        if application_result.changed:
             log_reason = (
                 f"조기마감/{method_text}/{execution.get('stage')}"
                 if has_close_progress_qty

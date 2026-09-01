@@ -439,6 +439,70 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
         self.assertEqual(projected["buy_signal_markers"][0]["actual_order_count"], 1)
         self.assertEqual(projected["actual_order_count"], 1)
         self.assertEqual(projected["diagnostics"]["legacy_signal_marker_unavailable_count"], 1)
+        self.assertEqual(
+            stock_instance_day_projection.CHART_PROJECTION_VALID,
+            projected["projection_status"],
+        )
+
+    def test_day_projection_classifies_empty_not_ready_and_rules_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stock_dir = root / "stocks" / "005930_삼성전자"
+            stock_dir.mkdir(parents=True)
+            (stock_dir / "config.json").write_text(
+                json.dumps({"assigned_routine_instance_id": "instance-1", "name": "삼성전자"}),
+                encoding="utf-8",
+            )
+            rules_path = root / "rules.json"
+            rules_path.write_text(
+                json.dumps({"bar": {"bar_minutes": 5}}),
+                encoding="utf-8",
+            )
+            instance = SimpleNamespace(rules_path=rules_path)
+
+            with patch.object(
+                stock_instance_day_projection,
+                "routine_instance_by_id",
+                return_value=instance,
+            ):
+                empty = stock_instance_day_projection.project_stock_instance_day(
+                    "005930",
+                    "2026-08-10",
+                    project_root=root,
+                    now=datetime(2026, 8, 10, 9, 2, tzinfo=SEOUL_TIMEZONE),
+                )
+                save_candles(stock_dir, _raw_candles(1), max_count=600)
+                not_ready = stock_instance_day_projection.project_stock_instance_day(
+                    "005930",
+                    "2026-08-10",
+                    project_root=root,
+                    now=datetime(2026, 8, 10, 9, 2, tzinfo=SEOUL_TIMEZONE),
+                )
+
+            with patch.object(
+                stock_instance_day_projection,
+                "routine_instance_by_id",
+                return_value=None,
+            ):
+                unavailable = stock_instance_day_projection.project_stock_instance_day(
+                    "005930",
+                    "2026-08-10",
+                    project_root=root,
+                    now=datetime(2026, 8, 10, 9, 10, tzinfo=SEOUL_TIMEZONE),
+                )
+
+        self.assertEqual(
+            stock_instance_day_projection.CHART_PROJECTION_NO_DAY_DATA,
+            empty["projection_status"],
+        )
+        self.assertEqual(
+            stock_instance_day_projection.CHART_PROJECTION_NOT_READY,
+            not_ready["projection_status"],
+        )
+        self.assertEqual(
+            stock_instance_day_projection.CHART_PROJECTION_RULES_UNAVAILABLE,
+            unavailable["projection_status"],
+        )
 
     def test_projection_ats_ranges_use_runtime_selection_and_operation_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -669,6 +733,10 @@ class SignalMarkerAndDayProjectionTests(unittest.TestCase):
 
         self.assertEqual([], projected["candles"])
         self.assertIn("CANDLE_DATA_MALFORMED", projected["diagnostics"]["issues"])
+        self.assertEqual(
+            stock_instance_day_projection.CHART_PROJECTION_REFRESH_FAILED,
+            projected["projection_status"],
+        )
 
 
 if __name__ == "__main__":

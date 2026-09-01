@@ -271,9 +271,6 @@ def get_group_dirs() -> list[Path]:
     return [record.path for record in get_group_records()]
 
 
-def get_routine_dirs() -> list[Path]:
-    """Compatibility wrapper for callers that historically consumed Group dirs."""
-    return get_group_dirs()
 
 
 def routine_display_name(routine_path: Path) -> str:

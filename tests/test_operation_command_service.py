@@ -7,12 +7,16 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5.QtCore import QObject
+
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 from operation_command_service import (
     COMMAND_INDIVIDUAL_LIQUIDATION,
     COMMAND_MANUAL_ATS_LIQUIDATION,
@@ -40,6 +44,9 @@ from operation_command_service import (
     STOCK_IGNORED_STALE,
     StockOperationCommandResult,
 )
+from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
+from tests.participant_owner_fixture import attach_participant_owner
+from tests.qt_test_support import ensure_qapplication, flush_deferred_deletes
 from gui_auto_trade_policy import (
     auto_trade_setting_close_routine_mode_active,
     auto_trade_setting_display_status,
@@ -996,6 +1003,14 @@ class OperationCommandServiceTest(unittest.TestCase):
 
 
 class EarlyCloseProductionCallerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        operation_state_writer = patch(
+            "close_liquidation_command.write_global_operation_closing_state",
+            return_value={"ok": True},
+        )
+        operation_state_writer.start()
+        self.addCleanup(operation_state_writer.stop)
+
     class _MessageBox:
         Warning = 1
         Information = 2
@@ -1043,9 +1058,10 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         window._persistent_feature_owner_ref = None
         window.selected_stock_infos.return_value = selected
         window.current_selected_routine_name.return_value = "indicator_follow"
-        window._current_session_operation_participant_stock_codes = {
-            str(code) for _stock_dir, code, _name in selected
-        }
+        attach_participant_owner(
+            window,
+            {str(code) for _stock_dir, code, _name in selected},
+        )
         parent = Mock()
         parent.kiwoom_api.is_connected.return_value = True
         window.parent.return_value = parent
@@ -1086,9 +1102,9 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("close_liquidation_command.OperationCommandService") as service_type,
                 patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
-                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch("close_liquidation_command.auto_trade_setting_liquidation_phase_active", return_value=False),
             ):
                 auto_trade_apply_selected_early_close(window, "시장가즉시")
 
@@ -1103,7 +1119,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
         self._MessageBox.proceed = True
         with (
             patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-            patch("gui_auto_trade_close.OperationCommandService") as service_type,
+            patch("close_liquidation_command.OperationCommandService") as service_type,
         ):
             auto_trade_apply_selected_early_close(window, "루틴")
 
@@ -1119,7 +1135,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             window.parent.return_value.kiwoom_api.is_connected.return_value = False
 
             with (
-                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("close_liquidation_command.OperationCommandService") as service_type,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 auto_trade_apply_selected_early_close(window, "루틴")
@@ -1142,7 +1158,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             window.parent.return_value.kiwoom_api.is_connected.return_value = False
 
             with (
-                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("close_liquidation_command.OperationCommandService") as service_type,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 result = auto_trade_apply_selected_early_close(
@@ -1190,7 +1206,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                         return_value=(0, 0),
                     ),
                     patch(
-                        "gui_auto_trade_close.auto_trade_setting_liquidation_phase_active",
+                        "close_liquidation_command.auto_trade_setting_liquidation_phase_active",
                         return_value=False,
                     ),
                     patch("gui_auto_trade_close._production_recovery_gate", return_value=None),
@@ -1199,8 +1215,14 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                         return_value=Mock(allowed=True),
                     ),
                     patch(
-                        "gui_auto_trade_close.apply_close_intent",
-                        return_value={"command_result": command_result},
+                        "close_liquidation_command.apply_close_intent",
+                        return_value={
+                            "ok": True,
+                            "durable_applied": True,
+                            "blocked": False,
+                            "reason": "",
+                            "command_result": command_result,
+                        },
                     ) as close_intent,
                     patch(
                         "gui_auto_trade_close._start_close_liquidation_execution",
@@ -1253,9 +1275,9 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-                patch("gui_auto_trade_close.OperationCommandService", return_value=service),
+                patch("close_liquidation_command.OperationCommandService", return_value=service),
                 patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
-                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch("close_liquidation_command.auto_trade_setting_liquidation_phase_active", return_value=False),
                 patch(
                     "gui_auto_trade_close.evaluate_production_transition",
                     return_value=Mock(allowed=True),
@@ -1316,7 +1338,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
                 patch(
-                    "gui_auto_trade_close.OperationCommandService",
+                    "close_liquidation_command.OperationCommandService",
                     return_value=service,
                 ),
                 patch(
@@ -1324,7 +1346,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
                     return_value=(0, 0),
                 ),
                 patch(
-                    "gui_auto_trade_close.auto_trade_setting_liquidation_phase_active",
+                    "close_liquidation_command.auto_trade_setting_liquidation_phase_active",
                     return_value=False,
                 ),
                 patch(
@@ -1387,9 +1409,9 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             )
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-                patch("gui_auto_trade_close.OperationCommandService", return_value=service),
+                patch("close_liquidation_command.OperationCommandService", return_value=service),
                 patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
-                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch("close_liquidation_command.auto_trade_setting_liquidation_phase_active", return_value=False),
                 patch(
                     "gui_auto_trade_close.evaluate_production_transition",
                     return_value=Mock(allowed=True),
@@ -1472,9 +1494,9 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             self._MessageBox.proceed = False
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("close_liquidation_command.OperationCommandService") as service_type,
                 patch("gui_auto_trade_close.pending_order_side_quantities", return_value=(0, 0)),
-                patch("gui_auto_trade_close.auto_trade_setting_liquidation_phase_active", return_value=False),
+                patch("close_liquidation_command.auto_trade_setting_liquidation_phase_active", return_value=False),
             ):
                 auto_trade_apply_selected_early_close(window, "루틴")
 
@@ -1508,7 +1530,7 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
             self._MessageBox.instances = []
             with (
                 patch("gui_auto_trade_close.QMessageBox", self._MessageBox),
-                patch("gui_auto_trade_close.OperationCommandService") as service_type,
+                patch("close_liquidation_command.OperationCommandService") as service_type,
                 patch("gui_auto_trade_close.show_toast") as show_toast,
             ):
                 result = auto_trade_apply_selected_early_close(window, "루틴")
@@ -1527,6 +1549,16 @@ class EarlyCloseProductionCallerTest(unittest.TestCase):
 
 
 class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
+    def _setting_window_with_participant_owner(self):
+        from PyQt5.QtWidgets import QWidget
+        from gui_auto_trade_setting_window import AutoTradeSettingWindow
+
+        parent = QWidget()
+        attach_participant_owner(parent)
+        window = AutoTradeSettingWindow(parent)
+        window._test_participant_owner_parent = parent
+        return window
+
     def test_unregister_processes_only_immediate_and_blocks_unsafe_items(self) -> None:
         import gui_auto_trade_unregister as unregister
 
@@ -1571,13 +1603,22 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 "auto_trade_unregister_category",
                 side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
             ),
-            patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(
+                unregister,
+                "inspect_stock_unregister_availability",
+                return_value=Mock(allowed=True, current_instance_id=""),
+            ),
+            patch.object(
+                unregister,
+                "execute_assignment_unassign",
+                return_value=Mock(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,
         ):
             unregister.unregister_selected_auto_trade_stocks(window)
 
-        update_routines.assert_called_once_with("111111", "즉시종목", [])
+        execute_unassign.assert_called_once()
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
         warning.assert_not_called()
@@ -1654,7 +1695,16 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                     "runtime_dirs": [],
                 },
             ) as category,
-            patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(
+                unregister,
+                "inspect_stock_unregister_availability",
+                return_value=Mock(allowed=True, current_instance_id=""),
+            ),
+            patch.object(
+                unregister,
+                "execute_assignment_unassign",
+                return_value=Mock(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(unregister, "append_changelog"),
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,
@@ -1662,7 +1712,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
             unregister.unregister_selected_auto_trade_stocks(window)
 
         category.assert_called_once_with("전체", stock_dir, "005930", "Samsung")
-        update_routines.assert_called_once_with("005930", "Samsung", [])
+        execute_unassign.assert_called_once()
         warning.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
@@ -1718,14 +1768,23 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 "auto_trade_unregister_category",
                 side_effect=lambda routine_name, stock_dir, code, name: items_by_code[code],
             ),
-            patch.object(unregister, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(
+                unregister,
+                "inspect_stock_unregister_availability",
+                return_value=Mock(allowed=True, current_instance_id=""),
+            ),
+            patch.object(
+                unregister,
+                "execute_assignment_unassign",
+                return_value=Mock(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(unregister, "append_changelog"),
             patch.object(unregister.QMessageBox, "warning") as warning,
             patch.object(unregister, "show_toast") as toast,
         ):
             unregister.unregister_selected_auto_trade_stocks(window)
 
-        update_routines.assert_called_once_with("111111", "Allowed", [])
+        execute_unassign.assert_called_once()
         warning.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         window.refresh_all.assert_called_once_with()
@@ -1783,7 +1842,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         window.show()
         app.processEvents()
         original_title = window.windowTitle()
@@ -1811,7 +1870,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         from gui_auto_trade_setting_window import AutoTradeSettingWindow
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         window.show()
         app.processEvents()
 
@@ -1832,7 +1891,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         from gui_auto_trade_setting_window import AutoTradeSettingWindow, SelectedTextReadableDelegate
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         delegate = SelectedTextReadableDelegate(window.stock_table)
         window.stock_table.setRowCount(1)
         item = QTableWidgetItem("검토")
@@ -1867,7 +1926,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         from gui_auto_trade_setting_window import AutoTradeSettingWindow, StockPositionMetricDelegate
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         events = []
 
         class FakeStyle:
@@ -1910,7 +1969,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
         from gui_auto_trade_setting_window import AutoTradeSettingWindow, StockPositionMetricDelegate
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         before_widths = [window.stock_table.columnWidth(i) for i in range(window.stock_table.columnCount())]
         delegate = StockPositionMetricDelegate(window.stock_table)
         option = QStyleOptionViewItem()
@@ -1968,7 +2027,7 @@ class AutoTradeSettingWindowStatusMessageTest(unittest.TestCase):
                 self.calls.append((QRect(rect), alignment, text))
 
         app = QApplication.instance() or QApplication([])
-        window = AutoTradeSettingWindow()
+        window = self._setting_window_with_participant_owner()
         test_font = window.stock_table.font()
         samples = [
             ("보유", "0주 / 0", "120주 / 3,450,000"),
@@ -2062,6 +2121,10 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
     def _window(selected) -> Mock:
         window = Mock()
         window.selected_stock_infos.return_value = selected
+        attach_participant_owner(
+            window,
+            {str(code) for _stock_dir, code, _name in selected},
+        )
         window.showAutoTradePopupMessage = Mock()
         viewport = Mock()
         window.stock_table.viewport.return_value = viewport
@@ -2089,7 +2152,7 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
             with (
                 patch("gui_auto_trade_close.QMessageBox.warning") as warning,
                 patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
-                patch("gui_auto_trade_close.OperationCommandService", return_value=OperationCommandService(Path(temp))),
+                patch("close_liquidation_command.OperationCommandService", return_value=OperationCommandService(Path(temp))),
                 patch("gui_auto_trade_close.append_changelog") as append_changelog,
                 patch("gui_auto_trade_close.append_stock_log") as append_stock_log,
             ):
@@ -2120,7 +2183,7 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
             warning.assert_not_called()
             window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
 
-    def test_cancel_early_close_blocks_when_selected_row_displays_waiting(self) -> None:
+    def test_cancel_early_close_uses_canonical_state_when_row_displays_waiting(self) -> None:
         from gui_auto_trade_close import auto_trade_cancel_selected_early_close
 
         with tempfile.TemporaryDirectory() as temp:
@@ -2147,12 +2210,18 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
             window.stock_table.selectionModel.return_value.selectedRows.return_value = [selected_index]
             window.stock_table.item.side_effect = lambda _row, col: path_item if col == 0 else status_item if col == 4 else None
 
-            with patch("gui_auto_trade_close.OperationCommandService") as service_type:
+            with patch(
+                "close_liquidation_command.OperationCommandService",
+                return_value=OperationCommandService(Path(temp)),
+            ), patch("gui_auto_trade_close.append_changelog"):
                 auto_trade_cancel_selected_early_close(window)
 
-            service_type.assert_not_called()
-            self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
-            window.showAutoTradePopupMessage.assert_called_with("현재 상태는 마감정책 취소 대상이 아닙니다.")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual("", saved["early_close_requested_at"])
+            self.assertEqual("", saved["early_close_method"])
+            window.showAutoTradePopupMessage.assert_called_with(
+                "마감정책이 취소되었습니다."
+            )
 
     def test_cancel_early_close_blocks_when_not_trading(self) -> None:
         from gui_auto_trade_close import auto_trade_cancel_selected_early_close
@@ -2382,7 +2451,7 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
 
             with (
                 patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
-                patch("gui_auto_trade_close.OperationCommandService", return_value=service),
+                patch("close_liquidation_command.OperationCommandService", return_value=service),
             ):
                 auto_trade_cancel_selected_early_close(window)
 
@@ -2409,7 +2478,7 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
             with (
                 patch("gui_auto_trade_close.ORDER_QUEUE_PATH", Path(temp) / "runtime" / "order_queue.json"),
                 patch("gui_auto_trade_close.CHANGELOG_PATH", Path(temp) / "PROJECT_CHANGELOG.txt"),
-                patch("gui_auto_trade_close.OperationCommandService", return_value=OperationCommandService(Path(temp))),
+                patch("close_liquidation_command.OperationCommandService", return_value=OperationCommandService(Path(temp))),
             ):
                 auto_trade_cancel_selected_early_close(window)
                 auto_trade_cancel_selected_early_close(window)
@@ -2418,6 +2487,16 @@ class EarlyCloseCancelSafetyTest(unittest.TestCase):
 
 
 class AutoTradeContextMenuTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ensure_qapplication()
+        self.layout = TemporaryProjectRoot(prefix="auto_trade_context_menu_")
+        self.addCleanup(self.layout.cleanup)
+        self.host_owner = QObject()
+        self.operation_host = AutoTradeOperationHost(self.host_owner)
+        self.addCleanup(flush_deferred_deletes, self.app)
+        self.addCleanup(self.host_owner.deleteLater)
+        self.addCleanup(self.operation_host.shutdown)
+
     class _FakeAction:
         def __init__(self, text: str, separator: bool = False) -> None:
             self.text = text
@@ -2491,15 +2570,47 @@ class AutoTradeContextMenuTest(unittest.TestCase):
                         return action
             return None
 
-    @staticmethod
-    def _window() -> Mock:
+    def _window(self, *, cancelable: bool = False) -> Mock:
         AutoTradeContextMenuTest._FakeMenu.chosen_menu_title = None
+        state = {
+            "status": "RUNNING",
+            "trade_enabled": True,
+            "trade_started": True,
+            "holding_qty": 3,
+            "holding_amount": 30_000,
+            "avg_price": 10_000,
+            "pending_order": False,
+            "pending_qty": 0,
+        }
+        if cancelable:
+            state.update(
+                {
+                    "early_close_requested_at": "2026-08-31 09:00:00",
+                    "early_close_method": "시장가",
+                    "early_close_source": "우클릭",
+                }
+            )
+        stock_dir = create_stock_fixture(
+            self.layout,
+            code="005930",
+            name="Samsung",
+            state=state,
+            orders=[],
+        )
+        self.operation_host.register_current_session_operation_participants(
+            {"005930"}
+        )
         window = Mock()
+        window._persistent_feature_owner_ref = None
+        window.parent.return_value = None
+        window._main_monitoring_auto_trade_operation_host = self.operation_host
+        window.kiwoom_api.is_connected.return_value = True
+        window.startup_recovery_session_ready.return_value = True
         item = Mock()
         item.row.return_value = 0
         window.stock_table.itemAt.return_value = item
         window.stock_table.viewport.return_value.mapToGlobal.return_value = object()
-        window.selected_stock_infos.return_value = [(Path("stocks/005930_Samsung"), "005930", "Samsung")]
+        window.selected_stock_infos.return_value = [(stock_dir, "005930", "Samsung")]
         window.selected_operation_mode_set.return_value = set()
         return window
 
@@ -2538,7 +2649,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         }
         for chosen_text, (method_name, args, kwargs) in expected.items():
             with self.subTest(chosen_text=chosen_text):
-                window = self._window()
+                window = self._window(cancelable=chosen_text == "취소")
                 self._FakeMenu.chosen_text = chosen_text
                 with (
                     patch("gui_auto_trade_context_menu.QMenu", self._FakeMenu),
@@ -2771,9 +2882,14 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = OperationCommandServiceTest._stock(root, "005930_Samsung")
+            state_path = stock / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["holding_qty"] = 3
+            state_path.write_text(json.dumps(state), encoding="utf-8")
             config_path = stock / "config.json"
             before = config_path.read_bytes()
             window = Mock()
+            attach_participant_owner(window, {"005930"})
             window.selected_stock_infos.return_value = [
                 (stock, "005930", "Samsung")
             ]
@@ -2869,14 +2985,19 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         window.selected_stock_infos.return_value = [
             (Path("stocks/005930_Samsung"), "005930", "Samsung")
         ]
-        service = Mock()
-        service.apply_individual_liquidation.return_value = OperationCommandResult(
-            RESULT_FAILED,
-            "failed-command",
-            error="injected failure",
+        failure = SimpleNamespace(
+            ok=False,
+            changed=False,
+            reason_code="injected failure",
+            availability=None,
+            operation_result=None,
         )
         with (
-            patch.object(close, "OperationCommandService", return_value=service),
+            patch.object(
+                close,
+                "execute_individual_liquidation_command",
+                return_value=failure,
+            ),
             patch.object(close.QMessageBox, "critical") as critical,
         ):
             close.auto_trade_apply_selected_individual_liquidation_method(
@@ -2897,14 +3018,19 @@ class AutoTradeContextMenuTest(unittest.TestCase):
         window.selected_stock_infos.return_value = [
             (Path("stocks/005930_Samsung"), "005930", "Samsung")
         ]
-        service = Mock()
-        service.apply_individual_liquidation.return_value = OperationCommandResult(
-            RESULT_FAILED,
-            "failed-command",
-            error="키움 서버에 로그인되어 있지 않습니다.",
+        failure = SimpleNamespace(
+            ok=False,
+            changed=False,
+            reason_code="키움 서버에 로그인되어 있지 않습니다.",
+            availability=None,
+            operation_result=None,
         )
         with (
-            patch.object(close, "OperationCommandService", return_value=service),
+            patch.object(
+                close,
+                "execute_individual_liquidation_command",
+                return_value=failure,
+            ),
             patch.object(
                 close,
                 "evaluate_production_transition",
@@ -3073,7 +3199,7 @@ class AutoTradeContextMenuTest(unittest.TestCase):
             ["ATS 장전", "ATS 야간", "시장가", "현재가"],
             [action.text for action in ats_menu.actions if not action.separator],
         )
-        self.assertEqual(1, sum(action.separator for action in ats_menu.actions))
+        self.assertEqual(2, sum(action.separator for action in ats_menu.actions))
         self.assertTrue(ats_menu.actions[0].property("atsSessionCurrent"))
         self.assertFalse(ats_menu.actions[1].property("atsSessionCurrent"))
         self.assertTrue(ats_menu.actions[3].enabled)

@@ -24,10 +24,15 @@ class CycleHost(QObject):
     operation_cycle_completed = pyqtSignal(dict)
 
 
+class ChartApi(QObject):
+    bar_committed = pyqtSignal(object)
+
+
 class ChartOwner(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.operation_host = CycleHost(self)
+        self.kiwoom_api = ChartApi(self)
 
     def main_monitoring_auto_trade_operation_host(self):
         return self.operation_host
@@ -191,6 +196,7 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
         ) as loader:
             window = StockInstanceChartWindow("005930", "2026-08-09", owner)
             self.assertFalse(window._operation_cycle_refresh_connected)
+            self.assertFalse(window._bar_committed_refresh_connected)
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
             self.assertEqual(1, loader.call_count)
             self.assertNotIn("refresh_button", vars(window))
@@ -213,6 +219,7 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
                     owner.operation_host.operation_cycle_completed
                 ),
             )
+            self.assertEqual(1, owner.kiwoom_api.receivers(owner.kiwoom_api.bar_committed))
             window.close()
             self.assertEqual(
                 0,
@@ -220,8 +227,250 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
                     owner.operation_host.operation_cycle_completed
                 ),
             )
+            self.assertEqual(0, owner.kiwoom_api.receivers(owner.kiwoom_api.bar_committed))
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
             self.assertEqual(1, loader.call_count)
+        owner.close()
+
+    def test_matching_bar_committed_refreshes_current_chart_only(self) -> None:
+        owner = ChartOwner()
+        initial = _projection("005930", candle_count=1)
+        updated = _projection("005930", candle_count=2)
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY), patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            side_effect=[initial, updated],
+        ) as loader:
+            window = StockInstanceChartWindow("005930", TODAY, owner)
+            owner.kiwoom_api.bar_committed.emit(
+                {"event_type": "BAR_COMMITTED", "stock_code": "000660", "trade_date": TODAY}
+            )
+            owner.kiwoom_api.bar_committed.emit(
+                {"event_type": "BAR_COMMITTED", "stock_code": "005930", "trade_date": "2026-08-09"}
+            )
+            self.assertEqual(1, loader.call_count)
+
+            owner.kiwoom_api.bar_committed.emit(
+                {"event_type": "BAR_COMMITTED", "stock_code": "005930", "trade_date": TODAY}
+            )
+            owner.kiwoom_api.bar_committed.emit(
+                {"event_type": "BAR_COMMITTED", "stock_code": "005930", "trade_date": TODAY}
+            )
+            self.app.processEvents()
+            self.assertEqual(2, loader.call_count)
+            self.assertEqual(2, len(window.chart.close_series))
+            window.close()
+
+        owner.close()
+
+    def test_bar_committed_rehydrates_chart_after_initial_not_ready(self) -> None:
+        owner = ChartOwner()
+        unavailable = _projection("005930", candle_count=0)
+        unavailable["projection_status"] = "NOT_READY"
+        hydrated = _projection("005930", candle_count=2)
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY), patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            side_effect=[unavailable, hydrated],
+        ):
+            window = StockInstanceChartWindow("005930", TODAY, owner)
+            self.assertEqual([], window.chart.close_series)
+            owner.kiwoom_api.bar_committed.emit(
+                {"event_type": "BAR_COMMITTED", "stock_code": "005930", "trade_date": TODAY}
+            )
+            self.app.processEvents()
+            self.assertEqual(2, len(window.chart.close_series))
+            self.assertEqual("VALID", window.last_refresh_status)
+            window.close()
+
+        owner.close()
+
+    def test_empty_and_exception_refresh_preserve_last_valid_series(self) -> None:
+        owner = ChartOwner()
+        initial = _projection("005930", bar_minutes=1, candle_count=0)
+        initial["candles"] = [
+            {
+                "bar_time": (
+                    f"{TODAY}T{9 + index // 60:02d}:{index % 60:02d}:00+09:00"
+                ),
+                "close": 100 + index,
+            }
+            for index in range(100)
+        ]
+        initial["diagnostics"]["raw_candle_count"] = 100
+        initial["diagnostics"]["completed_candle_count"] = 100
+        empty = _projection("005930", bar_minutes=1, candle_count=0)
+        empty["projection_status"] = "NO_DAY_DATA"
+        outside_session = _projection("005930", bar_minutes=1, candle_count=0)
+        outside_session["projection_status"] = "VALID"
+        outside_session["candles"] = [
+            {"bar_time": f"{TODAY}T08:55:00+09:00", "close": 99}
+        ]
+        replacement = _projection("005930", bar_minutes=1, candle_count=2)
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY), patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            side_effect=[
+                initial,
+                empty,
+                outside_session,
+                RuntimeError("temporary read failure"),
+                replacement,
+            ],
+        ):
+            window = StockInstanceChartWindow("005930", TODAY, owner)
+            original = list(window.chart.close_series)
+            self.assertEqual(100, len(original))
+
+            window.refresh_projection()
+            self.assertEqual(original, window.chart.close_series)
+            self.assertEqual("NO_DAY_DATA", window.last_refresh_status)
+            self.assertIn("이전 그래프", window.notice_label.text())
+
+            window.refresh_projection()
+            self.assertEqual(original, window.chart.close_series)
+            self.assertEqual("STALE_REJECTED", window.last_refresh_status)
+            self.assertIn("그래프", window.notice_label.text())
+
+            window.refresh_projection()
+            self.assertEqual(original, window.chart.close_series)
+            self.assertEqual("REFRESH_FAILED", window.last_refresh_status)
+            self.assertIn("이전 그래프", window.notice_label.text())
+
+            window.refresh_projection()
+            self.assertEqual(2, len(window.chart.close_series))
+            self.assertEqual(1, window.chart.timeframe_minutes)
+            self.assertEqual("VALID", window.last_refresh_status)
+            window.close()
+
+        owner.close()
+
+    def test_same_identity_structured_failure_preserves_last_valid_series(self) -> None:
+        owner = ChartOwner()
+        initial = _projection("005930", bar_minutes=5, candle_count=2)
+        failed = _projection("005930", bar_minutes=5, candle_count=0)
+        failed["projection_status"] = "REFRESH_FAILED"
+        provider = Mock(side_effect=[initial, failed])
+
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY):
+            window = StockInstanceChartWindow(
+                "005930",
+                TODAY,
+                owner,
+                projection_provider=provider,
+            )
+            original = list(window.chart.close_series)
+            original_identity = window._last_valid_projection_identity
+            window.refresh_projection()
+
+            self.assertEqual(original, window.chart.close_series)
+            self.assertEqual(original_identity, window._last_valid_projection_identity)
+            self.assertEqual("REFRESH_FAILED", window.last_refresh_status)
+            window.close()
+
+        owner.close()
+
+    def test_cross_identity_unavailable_or_failure_clears_last_valid_series(self) -> None:
+        cases = (
+            (
+                "trade_date",
+                {"trade_date": "2026-08-11", "projection_status": "NO_DAY_DATA"},
+            ),
+            (
+                "instance",
+                {"instance_id": "instance-reassigned", "projection_status": "REFRESH_FAILED"},
+            ),
+            (
+                "timeframe",
+                {"bar_minutes": 15, "projection_status": "NOT_READY"},
+            ),
+            (
+                "rules_unavailable",
+                {
+                    "instance_id": "",
+                    "bar_minutes": None,
+                    "projection_status": "RULES_UNAVAILABLE",
+                },
+            ),
+        )
+        for label, updates in cases:
+            with self.subTest(identity=label):
+                owner = ChartOwner()
+                initial = _projection("005930", bar_minutes=5, candle_count=2)
+                unavailable = _projection("005930", bar_minutes=5, candle_count=0)
+                unavailable.update(updates)
+                provider = Mock(side_effect=[initial, unavailable])
+
+                with patch.object(chart_window, "_today_trade_date", return_value=TODAY):
+                    window = StockInstanceChartWindow(
+                        "005930",
+                        TODAY,
+                        owner,
+                        projection_provider=provider,
+                    )
+                    self.assertTrue(window.chart.close_series)
+                    window.refresh_projection()
+
+                    self.assertEqual([], window.chart.close_series)
+                    self.assertIsNone(window._last_valid_projection_identity)
+                    self.assertEqual(updates["projection_status"], window.last_refresh_status)
+                    window.close()
+
+                owner.close()
+
+    def test_provider_exception_after_requested_date_change_clears_series(self) -> None:
+        owner = ChartOwner()
+        provider = Mock(
+            side_effect=[
+                _projection("005930", bar_minutes=5, candle_count=2),
+                RuntimeError("temporary read failure"),
+            ]
+        )
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY):
+            window = StockInstanceChartWindow(
+                "005930",
+                TODAY,
+                owner,
+                projection_provider=provider,
+            )
+            window.trade_date = "2026-08-11"
+            window.refresh_projection()
+
+            self.assertEqual([], window.chart.close_series)
+            self.assertIsNone(window._last_valid_projection_identity)
+            self.assertEqual("REFRESH_FAILED", window.last_refresh_status)
+            window.close()
+
+        owner.close()
+
+    def test_bar_committed_same_identity_failure_preserves_last_valid_series(self) -> None:
+        owner = ChartOwner()
+        initial = _projection("005930", bar_minutes=5, candle_count=2)
+        failed = _projection("005930", bar_minutes=5, candle_count=0)
+        failed["projection_status"] = "REFRESH_FAILED"
+        provider = Mock(side_effect=[initial, failed])
+
+        with patch.object(chart_window, "_today_trade_date", return_value=TODAY):
+            window = StockInstanceChartWindow(
+                "005930",
+                TODAY,
+                owner,
+                projection_provider=provider,
+            )
+            original = list(window.chart.close_series)
+            owner.kiwoom_api.bar_committed.emit(
+                {
+                    "event_type": "BAR_COMMITTED",
+                    "stock_code": "005930",
+                    "trade_date": TODAY,
+                }
+            )
+            self.app.processEvents()
+
+            self.assertEqual(original, window.chart.close_series)
+            self.assertEqual("REFRESH_FAILED", window.last_refresh_status)
+            window.close()
+
         owner.close()
 
     def test_multiple_windows_refresh_independently_and_isolate_failure(self) -> None:
@@ -250,7 +499,8 @@ class StockInstanceChartAutoRefreshTests(unittest.TestCase):
             owner.operation_host.operation_cycle_completed.emit(_completed_result())
 
             self.assertEqual({"005930": 2, "000660": 2}, calls)
-            self.assertIn("조회 오류", first.notice_label.text())
+            self.assertIn("이전 그래프", first.notice_label.text())
+            self.assertEqual(1, len(first.chart.close_series))
             self.assertEqual(2, len(second.chart.close_series))
             self.assertNotIn("status", second.info_labels)
             self.assertEqual("", second.notice_label.text())
@@ -296,9 +546,11 @@ class OperationCycleCompletionBoundaryTests(unittest.TestCase):
             "failed": 0,
         }
         host.complete_deferred_operation_cycle = Mock()
+        market_data_host = Mock()
+        host.market_data_host.return_value = market_data_host
         callbacks: list[object] = []
 
-        def begin_refresh(_window, _minute_key, *, on_complete):
+        def begin_refresh(_minute_key, *, on_complete):
             callbacks.append(on_complete)
             return {
                 "accepted": True,
@@ -320,13 +572,10 @@ class OperationCycleCompletionBoundaryTests(unittest.TestCase):
             return_value={"processed": 0, "failed": 0},
         ), patch.object(
             gui_auto_trade_timer,
-            "refresh_operation_candles",
-            side_effect=begin_refresh,
-        ), patch.object(
-            gui_auto_trade_timer,
-            "_auto_trade_run_signal_cycle",
+            "_process_pending_signal_pipeline",
             return_value={"orders_created": 1},
         ):
+            market_data_host.refresh_operation_candles.side_effect = begin_refresh
             returned = gui_auto_trade_timer.auto_trade_run_operation_cycle(host)
             self.assertTrue(
                 returned["signal_result"]["deferred_for_candle_refresh"]

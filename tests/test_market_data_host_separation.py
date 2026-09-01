@@ -479,12 +479,19 @@ class MarketDataHostSeparationTests(unittest.TestCase):
                 session_id="SESSION-8",
             )
         )
-        fresh = self.market.fresh_monitoring_market_information_state("005930")
+        current_display = self.market.monitoring_market_information_state("005930")
         self.assertEqual((8, "SESSION-8", 72_000), (
-            fresh.connection_epoch,
-            fresh.login_session_id,
-            fresh.last_price,
+            current_display.connection_epoch,
+            current_display.login_session_id,
+            current_display.last_price,
         ))
+        self.assertEqual(
+            "SNAPSHOT",
+            dict(current_display.field_sources)["last_price"],
+        )
+        self.assertIsNone(
+            self.market.fresh_monitoring_market_information_state("005930")
+        )
 
     @staticmethod
     def _snapshot_result(

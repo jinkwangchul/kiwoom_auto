@@ -16,8 +16,17 @@ from pathlib import Path
 from uuid import uuid4
 
 from PyQt5.QtWidgets import QMessageBox
-from gui_operation_ui_context import operation_dialog_parent
+from gui_operation_ui_context import (
+    actionable_current_price,
+    operation_dialog_parent,
+    refresh_auto_trade_views,
+)
 
+from close_liquidation_command import (
+    MANUAL_ATS_LIQUIDATION,
+    execute_manual_ats_liquidation_request_command,
+    inspect_close_liquidation_availability,
+)
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import (
     manual_ats_active_now,
@@ -135,23 +144,47 @@ def auto_trade_selected_manual_ats_liquidation_available(
     """Return whether at least one selected stock can run ATS liquidation."""
     targets = list(selected) if selected is not None else list(window.selected_stock_infos())
     return any(
-        _manual_ats_liquidation_target_eligibility(stock_dir, now_dt=now_dt)[
+        _manual_ats_liquidation_target_eligibility(
+            stock_dir,
+            owner=window,
+            stock_code=code,
+            now_dt=now_dt,
+        )[
             "eligible"
         ]
         is True
-        for stock_dir, _code, _name in targets
+        for stock_dir, code, _name in targets
     )
 
 
 def _manual_ats_liquidation_target_eligibility(
     stock_dir: Path,
     *,
+    owner=None,
+    stock_code: str = "",
     now_dt=None,
 ) -> dict[str, object]:
     """Evaluate one stock without borrowing ATS state from other selections."""
     config = read_json_dict(stock_dir / "config.json")
     state = read_json_dict(stock_dir / "state.json")
     selected_sessions = manual_ats_runtime_selected_keys(state, now_dt=now_dt)
+    if owner is not None and str(stock_code or "").strip():
+        availability = inspect_close_liquidation_availability(
+            owner,
+            stock_dir,
+            stock_code,
+            intent=MANUAL_ATS_LIQUIDATION,
+            requested_method="MARKET",
+            now_dt=now_dt,
+        )
+        return {
+            "eligible": availability.allowed,
+            "selected_sessions": selected_sessions,
+            "blocked_reasons": (
+                [] if availability.allowed else [availability.reason_code]
+            ),
+            "availability": availability,
+        }
     reasons: list[str] = []
     if not auto_trade_setting_trade_started(state):
         reasons.append("auto trade is not running")
@@ -195,6 +228,7 @@ def auto_trade_save_manual_ats_state_for_targets(
     result: dict[str, object] = {
         "requested": len(targets),
         "succeeded": 0,
+        "changed": 0,
         "failed": 0,
         "excluded": 0,
         "results": [],
@@ -280,6 +314,7 @@ def auto_trade_save_manual_ats_state_for_targets(
                     }
                 )
         if changes:
+            result["changed"] = int(result["changed"]) + 1
             append_production_event(
                 "ATS_CHANGED",
                 result="SUCCESS",
@@ -316,16 +351,8 @@ def auto_trade_save_manual_ats_state_for_targets(
         )
         result["succeeded"] = int(result["succeeded"]) + 1
 
-    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.load_selected_routine_stocks()
-    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    window._runtime_file_snapshot = window.current_runtime_file_signature()
-    window.update_action_buttons()
-    if int(result["succeeded"]):
-        parent = window.parent()
-        parent_refresh = getattr(parent, "refresh_all", None)
-        if callable(parent_refresh):
-            parent_refresh()
+    if int(result["changed"]):
+        refresh_auto_trade_views(window)
     return result
 
 
@@ -348,11 +375,13 @@ def auto_trade_save_selected_manual_ats_state(
 
 def auto_trade_set_selected_manual_ats_flag(window, flag_key: str, enabled: bool, label: str) -> None:
     """우클릭 ATS 서브메뉴에서 한 구간만 기존 Writer로 변경한다."""
-    current = window.selected_manual_ats_state()
+    selected = list(window.selected_stock_infos())
+    current = auto_trade_selected_manual_ats_state(window, selected)
     current[flag_key] = bool(enabled)
-    changed_count = window.save_selected_manual_ats_state(
+    changed_count = auto_trade_save_selected_manual_ats_state(
+        window,
         current,
-        None,
+        selected,
         (flag_key,),
     )
     window.statusBarMessage(f"ATS설정 변경 완료: {label} {'ON' if enabled else 'OFF'} / {changed_count}개")
@@ -512,6 +541,7 @@ def _dispatch_manual_ats_liquidation_preview(
     if status_result.status != "APPLIED":
         return {
             "ok": False,
+            "projection_changed": False,
             "stage": "runtime_status_readback",
             "preview": preview,
             "commit_result": commit_result,
@@ -523,6 +553,7 @@ def _dispatch_manual_ats_liquidation_preview(
         }
     return {
         "ok": result_status == "SEND_CALL_ACCEPTED",
+        "projection_changed": True,
         "stage": "send_order",
         "result_status": result_status,
         "order_id": order_id,
@@ -551,7 +582,7 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
         detail = ", ".join(
             str(value) for value in holding_result.get("blocked_reasons", []) if value
         )
-        command_service.record_manual_ats_liquidation_status(
+        failure_status_result = command_service.record_manual_ats_liquidation_status(
             stock_dir,
             command_id,
             "FAILED",
@@ -560,6 +591,7 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
         )
         result = {
             "ok": False,
+            "projection_changed": failure_status_result.status == "APPLIED",
             "stage": "holding_reconciliation",
             "holding_result": holding_result,
             "blocked_reasons": list(holding_result.get("blocked_reasons") or []),
@@ -584,6 +616,7 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
     if status_result.status != "APPLIED":
         result = {
             "ok": False,
+            "projection_changed": False,
             "stage": "holding_status_readback",
             "holding_result": holding_result,
             "blocked_reasons": [
@@ -600,6 +633,7 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
     if quantity <= 0:
         result = {
             "ok": True,
+            "projection_changed": True,
             "stage": "completed_no_holding",
             "result_status": "COMPLETED",
             "holding_result": holding_result,
@@ -621,12 +655,18 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
         str(preview.get("sell_method") or ""),
         command_id=command_id,
         holding_qty_override=quantity,
+        current_price_reader=(
+            lambda stock_code, _stock_name="": actionable_current_price(
+                window,
+                stock_code,
+            )
+        ),
     )
     if refreshed.get("ok") is not True:
         detail = ", ".join(
             str(value) for value in refreshed.get("blocked_reasons", []) if value
         )
-        command_service.record_manual_ats_liquidation_status(
+        failure_status_result = command_service.record_manual_ats_liquidation_status(
             stock_dir,
             command_id,
             "FAILED",
@@ -635,6 +675,10 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
         )
         result = {
             "ok": False,
+            "projection_changed": (
+                status_result.status == "APPLIED"
+                or failure_status_result.status == "APPLIED"
+            ),
             "stage": "latest_holding_preview",
             "holding_result": holding_result,
             "preview": refreshed,
@@ -648,6 +692,9 @@ def _finalize_manual_ats_liquidation_with_latest_holding(
         )
         return result
     result = _dispatch_manual_ats_liquidation_preview(window, refreshed)
+    result["projection_changed"] = bool(
+        result.get("projection_changed") is True or status_result.status == "APPLIED"
+    )
     _observe_manual_ats_liquidation_final(
         preview,
         result,
@@ -662,20 +709,32 @@ def _start_manual_ats_liquidation_with_cancel_boundary(
     preview: dict[str, object],
 ) -> dict[str, object]:
     """Persist one request, cancel its pending orders, or dispatch immediately."""
-    request_result = ensure_manual_ats_liquidation_request(
+    application_result = execute_manual_ats_liquidation_request_command(
+        window,
         preview,
         project_root=PROJECT_ROOT,
+        request_writer=ensure_manual_ats_liquidation_request,
     )
-    if request_result.get("ok") is not True:
+    request_result = application_result.operation_result
+    request_result = request_result if isinstance(request_result, dict) else {}
+    projection_changed = bool(getattr(application_result, "changed", False))
+    if not application_result.ok:
         reasons = list(request_result.get("blocked_reasons") or [])
+        if not reasons and application_result.reason_code:
+            reasons = [application_result.reason_code]
+        failed_result = request_result or {
+            "ok": False,
+            "stage": "semantic_guard",
+            "blocked_reasons": reasons,
+        }
         if not any("already waiting" in str(value) for value in reasons):
             _observe_manual_ats_liquidation_final(
                 preview,
-                request_result,
+                failed_result,
                 "FAILED",
                 "REQUEST_PERSIST_FAILED",
             )
-        return request_result
+        return {**failed_result, "projection_changed": projection_changed}
 
     stock_dir = Path(str(preview.get("stock_dir") or ""))
     state = read_json_dict(stock_dir / "state.json")
@@ -704,7 +763,7 @@ def _start_manual_ats_liquidation_with_cancel_boundary(
         detail = ", ".join(
             str(value) for value in cancel_result.get("blocked_reasons", []) if value
         )
-        command_service.record_manual_ats_liquidation_status(
+        status_result = command_service.record_manual_ats_liquidation_status(
             str(stock_dir),
             command_id,
             "FAILED",
@@ -718,6 +777,9 @@ def _start_manual_ats_liquidation_with_cancel_boundary(
         )
         result = {
             "ok": False,
+            "projection_changed": bool(
+                projection_changed or status_result.status == "APPLIED"
+            ),
             "stage": "pending_cancel",
             "cancel_result": cancel_result,
             "blocked_reasons": list(cancel_result.get("blocked_reasons") or []),
@@ -750,6 +812,7 @@ def _start_manual_ats_liquidation_with_cancel_boundary(
         if status_result.status != "APPLIED":
             result = {
                 "ok": False,
+                "projection_changed": projection_changed,
                 "stage": "waiting_status_readback",
                 "cancel_result": cancel_result,
                 "blocked_reasons": [status_result.error or "cancel waiting state was not persisted"],
@@ -763,11 +826,16 @@ def _start_manual_ats_liquidation_with_cancel_boundary(
             return result
         return {
             "ok": True,
+            "projection_changed": True,
             "stage": "awaiting_cancel_confirmation",
             "cancel_result": cancel_result,
             "blocked_reasons": [],
         }
-    return _finalize_manual_ats_liquidation_with_latest_holding(window, preview)
+    result = _finalize_manual_ats_liquidation_with_latest_holding(window, preview)
+    result["projection_changed"] = bool(
+        projection_changed or result.get("projection_changed") is True
+    )
+    return result
 
 
 def _manual_ats_cancel_effects_confirmed(
@@ -820,6 +888,7 @@ def auto_trade_continue_pending_manual_ats_liquidations(
     processed = 0
     waiting = 0
     failed = 0
+    projection_changed = False
     for stock_dir in all_registered_stock_dirs():
         if len(results) >= max(0, int(limit)):
             break
@@ -849,15 +918,23 @@ def auto_trade_continue_pending_manual_ats_liquidations(
             "sell_method": str(request.get("sell_method") or ""),
         }
         result = _finalize_manual_ats_liquidation_with_latest_holding(window, preview)
+        projection_changed = bool(
+            projection_changed
+            or result.get("projection_changed") is True
+            or result.get("ok") is True
+        )
         results.append({"stock_dir": str(stock_path), **result})
         if result.get("ok") is True:
             processed += 1
         else:
             failed += 1
+    if projection_changed:
+        refresh_auto_trade_views(window)
     return {
         "processed": processed,
         "waiting": waiting,
         "failed": failed,
+        "projection_changed": projection_changed,
         "results": results,
     }
 
@@ -883,7 +960,11 @@ def auto_trade_execute_selected_manual_ats_liquidation(
     preview_failed: list[str] = []
     for stock_dir, code, name in selected:
         command_id = uuid4().hex
-        eligibility = _manual_ats_liquidation_target_eligibility(stock_dir)
+        eligibility = _manual_ats_liquidation_target_eligibility(
+            stock_dir,
+            owner=window,
+            stock_code=code,
+        )
         if eligibility["eligible"] is not True:
             reasons = ", ".join(
                 str(value)
@@ -917,6 +998,12 @@ def auto_trade_execute_selected_manual_ats_liquidation(
             eligibility["selected_sessions"],
             method,
             command_id=command_id,
+            current_price_reader=(
+                lambda stock_code, _stock_name="": actionable_current_price(
+                    window,
+                    stock_code,
+                )
+            ),
         )
         if preview.get("ok") is not True:
             reasons = ", ".join(str(value) for value in preview.get("blocked_reasons", []) if value)
@@ -996,11 +1083,17 @@ def auto_trade_execute_selected_manual_ats_liquidation(
     waiting: list[str] = []
     no_holding: list[str] = []
     failed: list[str] = list(preview_failed)
+    projection_changed = False
     for preview in previews:
         code = str(preview.get("code") or "")
         name = str(preview.get("name") or "")
         stock_dir = str(preview.get("stock_dir") or "")
         result = _start_manual_ats_liquidation_with_cancel_boundary(window, preview)
+        projection_changed = bool(
+            projection_changed
+            or result.get("projection_changed") is True
+            or result.get("ok") is True
+        )
         if result.get("stage") == "awaiting_cancel_confirmation":
             waiting.append(f"{code} {name}")
             continue
@@ -1030,11 +1123,8 @@ def auto_trade_execute_selected_manual_ats_liquidation(
                 f"{code} {name}: {result.get('result_status') or 'ATS 청산 실패'}"
             )
 
-    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.refresh_all()
-    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    window._runtime_file_snapshot = window.current_runtime_file_signature()
-    window.update_action_buttons()
+    if projection_changed:
+        refresh_auto_trade_views(window)
 
     if completed:
         window.statusBarMessage(

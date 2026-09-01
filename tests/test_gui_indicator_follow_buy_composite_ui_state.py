@@ -2,21 +2,18 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import os
 from pathlib import Path
-import sys
-import types
 import unittest
 
-from tests.test_gui_execution_preview_button import _install_pyqt5_import_stubs
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-
-_install_pyqt5_import_stubs()
-sys.modules["PyQt5"].sip = types.ModuleType("PyQt5.sip")
-sys.modules["PyQt5.sip"] = sys.modules["PyQt5"].sip
+from PyQt5.QtWidgets import QDialog
 
 import gui_indicator_follow_buy_controls as buy_controls_module
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
+from tests.qt_test_support import create_qt_widget_shell, dispose_qt_widget
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,7 +158,10 @@ class GuiIndicatorFollowBuyCompositeUiStateTest(unittest.TestCase):
             self._originals.append((module, name, getattr(module, name)))
             setattr(module, name, replacement)
 
-        self.dialog = IndicatorFollowRoutineSettingsDialog.__new__(IndicatorFollowRoutineSettingsDialog)
+        self.dialog = create_qt_widget_shell(
+            IndicatorFollowRoutineSettingsDialog,
+            QDialog,
+        )
         self.dialog._buy_exit_time_state_updaters = []
         self.dialog._update_all_buy_method_states = lambda: None
         self.dialog._update_hoga_total = lambda: None
@@ -175,6 +175,7 @@ class GuiIndicatorFollowBuyCompositeUiStateTest(unittest.TestCase):
     def tearDown(self) -> None:
         for module, name, original in reversed(self._originals):
             setattr(module, name, original)
+        dispose_qt_widget(self.dialog)
 
     def _set_group_filters(self, group_index: int, filters: set[str]) -> None:
         for name in self.dialog._buy_composite_filter_names():

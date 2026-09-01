@@ -65,6 +65,50 @@ class IndicatorFollowControlTabMixin:
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
+        self._build_control_status_cards(layout)
+        basic_title = self._build_control_basic_section(layout)
+        buy_title = self._build_control_buy_section(layout)
+        sell_title = self._build_control_sell_section(layout)
+
+        # 구성탭 표시모드: 기본설정은 항상 표시하고, 매수/매도 상세만 접기/펼치기 대상으로 둔다.
+        # 내부 설정 컨트롤은 삭제/변경하지 않고 외곽 표시상태만 제어한다.
+        # 토글 동작은 제목 박스(매수설정/매도설정 QLabel) 클릭에만 반응한다.
+        # 신호검출조건 입력창, A/B/C/D, AND/OR/NOT, 괄호, 지움 버튼은 토글 대상이 아니다.
+        # 창 최대화 상태에서는 매수/매도 전체 영역을 펼쳐 스크롤로 확인한다.
+        self._control_section_mode = "summary"
+        basic_title.setCursor(Qt.ArrowCursor)
+
+        self._control_header_click_modes = {}
+
+        def _register_control_header_click(mode, widgets):
+            for widget in widgets:
+                if widget is None:
+                    continue
+                self._control_header_click_modes[widget] = mode
+                widget.setCursor(Qt.PointingHandCursor)
+                widget.installEventFilter(self)
+
+        _register_control_header_click(
+            "buy",
+            [
+                buy_title,
+            ],
+        )
+        _register_control_header_click(
+            "sell",
+            [
+                sell_title,
+            ],
+        )
+
+        scroll.setWidget(page)
+        self._apply_control_section_mode("summary", force=True)
+        self._sync_control_page_size()
+        outer.addWidget(scroll)
+
+        self.tabs.addTab(self.control_tab, "구성")
+
+    def _build_control_status_cards(self, layout):
         # 호환용 상태 카드: 기존 _populate_fields / refresh_preview가 참조하는 status 객체 유지
         status_box = QGroupBox("루틴 상태")
         status_grid = QGridLayout(status_box)
@@ -85,6 +129,7 @@ class IndicatorFollowControlTabMixin:
         layout.addWidget(status_box)
         status_box.hide()
 
+    def _build_control_basic_section(self, layout):
         # BASIC 구성
         self.basic_box = basic_box = QGroupBox("")
         basic_box.setObjectName("sectionBasicBox")
@@ -186,7 +231,9 @@ class IndicatorFollowControlTabMixin:
         basic_layout.addWidget(self.basic_header_widget)
 
         layout.addWidget(basic_box)
+        return basic_title
 
+    def _build_control_buy_section(self, layout):
         # BUY 구성
         self.buy_box = buy_box = QGroupBox("")
         buy_box.setObjectName("sectionBuyBox")
@@ -566,7 +613,9 @@ class IndicatorFollowControlTabMixin:
         buy_title.setCursor(Qt.PointingHandCursor)
 
         layout.addWidget(buy_box)
+        return buy_title
 
+    def _build_control_sell_section(self, layout):
         # SELL 구성
         self.sell_box = sell_box = QGroupBox("")
         sell_box.setObjectName("sectionSellBox")
@@ -977,44 +1026,7 @@ class IndicatorFollowControlTabMixin:
         sell_title.setCursor(Qt.PointingHandCursor)
 
         layout.addWidget(sell_box)
-
-        # 구성탭 표시모드: 기본설정은 항상 표시하고, 매수/매도 상세만 접기/펼치기 대상으로 둔다.
-        # 내부 설정 컨트롤은 삭제/변경하지 않고 외곽 표시상태만 제어한다.
-        # 토글 동작은 제목 박스(매수설정/매도설정 QLabel) 클릭에만 반응한다.
-        # 신호검출조건 입력창, A/B/C/D, AND/OR/NOT, 괄호, 지움 버튼은 토글 대상이 아니다.
-        # 창 최대화 상태에서는 매수/매도 전체 영역을 펼쳐 스크롤로 확인한다.
-        self._control_section_mode = "summary"
-        basic_title.setCursor(Qt.ArrowCursor)
-
-        self._control_header_click_modes = {}
-
-        def _register_control_header_click(mode, widgets):
-            for widget in widgets:
-                if widget is None:
-                    continue
-                self._control_header_click_modes[widget] = mode
-                widget.setCursor(Qt.PointingHandCursor)
-                widget.installEventFilter(self)
-
-        _register_control_header_click(
-            "buy",
-            [
-                buy_title,
-            ],
-        )
-        _register_control_header_click(
-            "sell",
-            [
-                sell_title,
-            ],
-        )
-
-        scroll.setWidget(page)
-        self._apply_control_section_mode("summary", force=True)
-        self._sync_control_page_size()
-        outer.addWidget(scroll)
-
-        self.tabs.addTab(self.control_tab, "구성")
+        return sell_title
 
     def eventFilter(self, obj, event):
         """구성탭 헤더 클릭 처리.

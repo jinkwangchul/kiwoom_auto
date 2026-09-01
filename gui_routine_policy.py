@@ -17,9 +17,8 @@ from typing import Any
 from gui_common_utils import safe_int_value
 from gui_auto_trade_utils import (
     PENDING_INTEGRITY_USER_REASON,
-    mark_pending_order_integrity_review_required,
 )
-from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
+from gui_order_utils import pending_order_side_quantities
 from gui_routine_guard import routine_action_guard_info
 from gui_auto_trade_integrity import (
     is_emergency_stopped_state,
@@ -336,8 +335,9 @@ def routine_unassign_decision(
                 ):
                     relation_issues.append("legacy routine value does not match assigned instance definition")
 
-        if relation_issues:
-            reason_codes.append("ROUTINE_RELATION_MISMATCH")
+        # Assignment identity is the canonical Instance ID.  Display and
+        # compatibility snapshots may legitimately lag an Instance rename;
+        # retain that evidence without turning it into an unassign blocker.
         evidence["relation_issues"] = tuple(relation_issues)
 
         raw_status = str(state.get("status", "STOPPED") or "STOPPED").strip().upper()
@@ -527,20 +527,6 @@ def routine_action_reasons_for_stock(code: str, name: str, allow_unassigned: boo
     buy_pending_qty = info.get("buy_pending_qty", 0)
     sell_pending_qty = info.get("sell_pending_qty", 0)
     if buy_pending_qty == "?" or sell_pending_qty == "?":
-        stock_dir = info.get("stock_dir")
-        if stock_dir is not None:
-            state = info.get("state")
-            if not isinstance(state, dict):
-                state = {}
-            issue_codes = pending_order_integrity_issue_codes(Path(stock_dir), state)
-            mark_pending_order_integrity_review_required(
-                routine_name,
-                Path(stock_dir),
-                code,
-                name,
-                issue_codes,
-                source="루틴 이동 미체결 데이터 무결성 오류",
-            )
         reasons.append(PENDING_INTEGRITY_USER_REASON)
     else:
         if isinstance(buy_pending_qty, int) and buy_pending_qty > 0:

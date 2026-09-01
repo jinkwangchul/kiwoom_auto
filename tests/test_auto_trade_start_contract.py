@@ -16,9 +16,14 @@ import operation_policy_gate
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
 from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_auto_trade_policy import auto_trade_setting_start_target_decision
+from tests.participant_owner_fixture import (
+    attach_participant_owner,
+    participant_codes,
+)
 from gui_main_stock_context_menu import (
     MainMonitoringStockOperationAdapter,
     MainMonitoringStockTarget,
+    execute_main_monitoring_selective_start,
 )
 from gui_auto_trade_run_control import (
     START_REQUEST_MULTIPLE,
@@ -47,6 +52,7 @@ class _StockTable:
 class _StartWindow:
     def __init__(self, selected: list[tuple[Path, str, str]]) -> None:
         self._selected = selected
+        attach_participant_owner(self)
         self.stock_table = _StockTable()
         self.statusBarMessage = Mock()
         self.show_auto_trade_result_dialog = Mock()
@@ -445,7 +451,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
                     encoding="utf-8",
                 )
             window = _StartWindow(targets)
-            window._current_session_operation_participant_stock_codes = set()
+            attach_participant_owner(window)
             window.startup_recovery_session_ready = lambda refresh=False: True
             window.start_target_is_review_isolated = (
                 lambda _stock_dir, _code: False
@@ -474,12 +480,12 @@ class AutoTradeStartContractTest(unittest.TestCase):
         )
         self.assertEqual(
             {target[1] for target in targets},
-            window._current_session_operation_participant_stock_codes,
+            set(participant_codes(window)),
         )
 
     def test_scheduled_start_admission_distinguishes_pre_active_and_final_end(self) -> None:
         window = _StartWindow([])
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         config = {
             "operation_mode": "SCHEDULED",
             "start_time": "09:00:00",
@@ -664,7 +670,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
 
             events: list[str] = []
             window = _StartWindow(targets)
-            window._current_session_operation_participant_stock_codes = set()
+            attach_participant_owner(window)
             window.start_target_is_review_isolated = lambda _stock_dir, _code: False
             window.split_start_targets = lambda selected: (
                 AutoTradeOperationHost.split_start_targets(window, selected)
@@ -758,7 +764,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
         )
         self.assertEqual(
             {"012210"},
-            window._current_session_operation_participant_stock_codes,
+            set(participant_codes(window)),
         )
         self.assertEqual(["012210"], [call[1] for call in window.recalculate_calls])
         self.assertLess(events.index("state:012210"), events.index("participant:012210"))
@@ -824,9 +830,13 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 btn_start=Mock(),
                 statusBar=lambda: status_bar,
                 startup_recovery_session_ready=lambda refresh=True: True,
+                global_operation_start_prerequisite=lambda _action: {
+                    "allowed": True,
+                    "reason": "READY",
+                },
             )
             host = AutoTradeOperationHost(main)
-            host._current_session_operation_participant_stock_codes = set()
+            self.assertEqual((), host.current_session_operation_participant_stock_codes())
             main.main_monitoring_auto_trade_operation_host = lambda: host
             adapter = MainMonitoringStockOperationAdapter(main, adapter_targets)
             events: list[str] = []
@@ -838,7 +848,6 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 side_effect=lambda: events.append("button")
             )
             adapter.statusBarMessage = Mock()
-            adapter.show_auto_trade_result_dialog = Mock()
             host.recalculate_stock_status_by_operation_policy = Mock()
             state_before = {
                 stock_dir: (stock_dir / "state.json").read_bytes()
@@ -889,7 +898,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
                     side_effect=lambda *_args: events.append("toast"),
                 ),
             ):
-                result = adapter.start_selected_auto_trades()
+                result = execute_main_monitoring_selective_start(adapter)
 
             state_after = {
                 stock_dir: (stock_dir / "state.json").read_bytes()
@@ -911,14 +920,13 @@ class AutoTradeStartContractTest(unittest.TestCase):
             tuple(item["operation_mode"] for item in result["blocked_target_details"]),
         )
         self.assertEqual(state_before, state_after)
-        self.assertEqual(set(), host._current_session_operation_participant_stock_codes)
+        self.assertEqual((), host.current_session_operation_participant_stock_codes())
         host.recalculate_stock_status_by_operation_policy.assert_not_called()
         participant_writer.assert_not_called()
         global_state_writer.assert_not_called()
         operation_host_start.assert_not_called()
         self.assertLess(events.index("refresh"), events.index("button"))
         self.assertLess(events.index("button"), events.index("toast"))
-        adapter.show_auto_trade_result_dialog.assert_not_called()
         self.assertEqual(
             "대상종목 5  |  기운영중 0  |  운영시작 0  |  운영불가 5\n수동운영 종료 1 · 시간운영 종료 4",
             operation_start_result_summary_toast_text(result),
@@ -1113,7 +1121,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
         )
         self.assertNotIn("RECOVERY_", window.statusBarMessage.call_args.args[0])
 
-    def test_runtime_missing_reports_actionable_message_once(self) -> None:
+    def test_runtime_missing_isolated_as_review_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, "111111", "정상종목", "inst-a", "루틴 A")
@@ -1124,8 +1132,9 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 result = auto_trade_start_selected_auto_trades(window)
 
         self.assertFalse(result["ok"])
-        self.assertIn("운영 상태 데이터를 읽을 수 없습니다.", result["user_message"])
-        self.assertTrue(window._last_operation_failure_dialog_shown)
+        self.assertIn("검토관리 대상", result["user_message"])
+        self.assertFalse(window._last_operation_failure_dialog_shown)
+        window.statusBarMessage.assert_called_once_with(result["user_message"])
         window.show_auto_trade_result_dialog.assert_not_called()
 
     def test_state_save_failure_reports_one_aggregate_failure(self) -> None:
@@ -1398,7 +1407,7 @@ class AutoTradeStartContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = _StartWindow([stock])
-            window._current_session_operation_participant_stock_codes = {"068270"}
+            attach_participant_owner(window, {"068270"})
             window.split_start_targets = Mock(
                 return_value=([], ["068270 셀트리온(운영)"])
             )
@@ -1681,12 +1690,34 @@ class AutoTradeStartContractTest(unittest.TestCase):
 
         with (
             patch.object(context_menu, "_new_stock_context_menu", return_value=menu),
+            patch.object(
+                context_menu,
+                "inspect_stock_review_state",
+                return_value=SimpleNamespace(
+                    review_required=False,
+                    state={"status": "STOPPED"},
+                ),
+            ),
             patch.object(context_menu, "_context_menu_operation_policy", return_value={}),
-            patch.object(context_menu, "_add_early_close_menu", return_value={}),
+            patch.object(
+                context_menu,
+                "_add_early_close_menu",
+                return_value={
+                    "menu": FakeAction("조기마감"),
+                    "routine": FakeAction("루틴마감"),
+                    "market": FakeAction("시장가"),
+                    "current": FakeAction("현재가"),
+                    "profit_loss": FakeAction("손/익절"),
+                    "carry": FakeAction("이월"),
+                    "cancel": FakeAction("취소"),
+                },
+            ),
             patch.object(
                 context_menu,
                 "_add_individual_liquidation_menu",
                 return_value={
+                    "menu": FakeAction("개별청산"),
+                    "time_menu": FakeAction("시간"),
                     "time_actions": (),
                     "market": object(),
                     "current": object(),

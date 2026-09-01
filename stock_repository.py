@@ -27,13 +27,17 @@ kiwoom_auto/
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import threading
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from stock_code_contract import (
     is_broker_action_stock_code,
@@ -48,6 +52,101 @@ from event_journal_production import append_production_event
 PROJECT_ROOT = Path(__file__).resolve().parent
 STOCKS_DIR = PROJECT_ROOT / "stocks"
 ROUTINE_ASSIGNMENT_HISTORY_KEY = "routine_assignment_history"
+
+STOCK_CONFIG_WRITE_OK = "OK"
+STOCK_CONFIG_WRITE_NO_CHANGE = "NO_CHANGE"
+STOCK_CONFIG_WRITE_CONFIG_NOT_FOUND = "CONFIG_NOT_FOUND"
+STOCK_CONFIG_WRITE_INVALID_CONFIG = "INVALID_CONFIG"
+STOCK_CONFIG_WRITE_INVALID_PATCH = "INVALID_PATCH"
+STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY = "INVALID_STOCK_IDENTITY"
+STOCK_CONFIG_WRITE_FIELD_CONFLICT = "FIELD_CONFLICT"
+STOCK_CONFIG_WRITE_ATOMIC_WRITE_FAILED = "ATOMIC_WRITE_FAILED"
+STOCK_CONFIG_WRITE_READBACK_FAILED = "READBACK_FAILED"
+STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED = (
+    "CONCURRENT_UPDATE_RETRY_EXHAUSTED"
+)
+
+_STOCK_CONFIG_WRITE_LOCK = threading.RLock()
+_STOCK_CONFIG_WRITE_MAX_RETRIES = 3
+
+
+class _MissingStockConfigField:
+    pass
+
+
+STOCK_CONFIG_EXPECTED_MISSING = _MissingStockConfigField()
+
+
+class _DeleteStockConfigField:
+    pass
+
+
+STOCK_CONFIG_DELETE_FIELD = _DeleteStockConfigField()
+
+
+@dataclass(frozen=True)
+class StockConfigWriteResult:
+    ok: bool
+    changed: bool
+    field_keys: tuple[str, ...]
+    conflict_detected: bool
+    read_back_verified: bool
+    reason_code: str
+    before_fingerprint: str = ""
+    after_fingerprint: str = ""
+
+
+@dataclass(frozen=True)
+class StockAssignmentMutationResult:
+    ok: bool
+    changed: bool = False
+    reason_code: str = ""
+    transaction_id: str = ""
+    assignment_before: str = ""
+    assignment_after: str = ""
+    reconciliation_required: bool = False
+    error: str = ""
+
+    @property
+    def success(self) -> bool:
+        return self.ok
+
+    @property
+    def error_code(self) -> str:
+        return self.reason_code
+
+    @property
+    def rollback_complete(self) -> bool:
+        return not self.reconciliation_required
+
+
+@dataclass(frozen=True)
+class _StockConfigSnapshot:
+    config: dict[str, Any] | None
+    fingerprint: str
+    reason_code: str
+
+
+class _StockConfigConcurrentUpdateError(RuntimeError):
+    pass
+
+
+def _stock_config_fingerprint(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    return json.dumps(
+        left,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) == json.dumps(
+        right,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _routine_assignment(config: dict[str, Any]) -> dict[str, str]:
@@ -201,6 +300,272 @@ class StockRepository:
         self.project_root = Path(project_root or PROJECT_ROOT)
         self.stocks_dir = self.project_root / "stocks"
         self.last_assignment_linkage_result = None
+        self.last_assignment_transaction_result: StockAssignmentMutationResult | None = None
+
+    @staticmethod
+    def _read_stock_config_snapshot(config_path: Path) -> _StockConfigSnapshot:
+        try:
+            payload = config_path.read_bytes()
+        except FileNotFoundError:
+            return _StockConfigSnapshot(
+                config=None,
+                fingerprint="",
+                reason_code=STOCK_CONFIG_WRITE_CONFIG_NOT_FOUND,
+            )
+        except OSError:
+            return _StockConfigSnapshot(
+                config=None,
+                fingerprint="",
+                reason_code=STOCK_CONFIG_WRITE_INVALID_CONFIG,
+            )
+
+        fingerprint = _stock_config_fingerprint(payload)
+        try:
+            config = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _StockConfigSnapshot(
+                config=None,
+                fingerprint=fingerprint,
+                reason_code=STOCK_CONFIG_WRITE_INVALID_CONFIG,
+            )
+        if not isinstance(config, dict):
+            return _StockConfigSnapshot(
+                config=None,
+                fingerprint=fingerprint,
+                reason_code=STOCK_CONFIG_WRITE_INVALID_CONFIG,
+            )
+        return _StockConfigSnapshot(
+            config=config,
+            fingerprint=fingerprint,
+            reason_code=STOCK_CONFIG_WRITE_OK,
+        )
+
+    @staticmethod
+    def _atomic_write_stock_config(
+        config_path: Path,
+        config: dict[str, Any],
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        temporary = config_path.with_name(
+            f".{config_path.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(config, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            try:
+                current_fingerprint = _stock_config_fingerprint(
+                    config_path.read_bytes()
+                )
+            except OSError as exc:
+                raise _StockConfigConcurrentUpdateError from exc
+            if current_fingerprint != expected_fingerprint:
+                raise _StockConfigConcurrentUpdateError
+            os.replace(temporary, config_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def patch_stock_config(
+        self,
+        code: str,
+        patch: dict[str, Any],
+        *,
+        name: str = "",
+        expected_fields: dict[str, Any] | None = None,
+    ) -> StockConfigWriteResult:
+        """Patch only the requested fields in the latest Stock config document."""
+
+        field_keys = tuple(patch.keys()) if isinstance(patch, dict) else ()
+        if not is_valid_stock_code(normalize_stock_code(code)):
+            return StockConfigWriteResult(
+                ok=False,
+                changed=False,
+                field_keys=field_keys,
+                conflict_detected=False,
+                read_back_verified=False,
+                reason_code=STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+            )
+        if (
+            not isinstance(patch, dict)
+            or not patch
+            or any(not isinstance(key, str) or not key.strip() for key in patch)
+            or (
+                expected_fields is not None
+                and (
+                    not isinstance(expected_fields, dict)
+                    or any(
+                        not isinstance(key, str)
+                        or not key.strip()
+                        or key not in patch
+                        for key in expected_fields
+                    )
+                )
+            )
+        ):
+            return StockConfigWriteResult(
+                ok=False,
+                changed=False,
+                field_keys=field_keys,
+                conflict_detected=False,
+                read_back_verified=False,
+                reason_code=STOCK_CONFIG_WRITE_INVALID_PATCH,
+            )
+        try:
+            json.dumps(
+                {
+                    key: value
+                    for key, value in patch.items()
+                    if value is not STOCK_CONFIG_DELETE_FIELD
+                },
+                ensure_ascii=False,
+            )
+            if expected_fields is not None:
+                json.dumps(
+                    {
+                        key: value
+                        for key, value in expected_fields.items()
+                        if value is not STOCK_CONFIG_EXPECTED_MISSING
+                    },
+                    ensure_ascii=False,
+                )
+        except (TypeError, ValueError):
+            return StockConfigWriteResult(
+                ok=False,
+                changed=False,
+                field_keys=field_keys,
+                conflict_detected=False,
+                read_back_verified=False,
+                reason_code=STOCK_CONFIG_WRITE_INVALID_PATCH,
+            )
+
+        config_path = self.resolve_stock_dir(code, name) / "config.json"
+        before_fingerprint = ""
+        with _STOCK_CONFIG_WRITE_LOCK:
+            for _attempt in range(_STOCK_CONFIG_WRITE_MAX_RETRIES):
+                snapshot = self._read_stock_config_snapshot(config_path)
+                before_fingerprint = snapshot.fingerprint
+                if snapshot.config is None:
+                    return StockConfigWriteResult(
+                        ok=False,
+                        changed=False,
+                        field_keys=field_keys,
+                        conflict_detected=False,
+                        read_back_verified=False,
+                        reason_code=snapshot.reason_code,
+                        before_fingerprint=before_fingerprint,
+                    )
+                current = snapshot.config
+                if expected_fields is not None and any(
+                    (
+                        expected_value is STOCK_CONFIG_EXPECTED_MISSING
+                        and key in current
+                    )
+                    or (
+                        expected_value is not STOCK_CONFIG_EXPECTED_MISSING
+                        and (
+                            key not in current
+                            or not _json_values_equal(current[key], expected_value)
+                        )
+                    )
+                    for key, expected_value in expected_fields.items()
+                ):
+                    return StockConfigWriteResult(
+                        ok=False,
+                        changed=False,
+                        field_keys=field_keys,
+                        conflict_detected=True,
+                        read_back_verified=False,
+                        reason_code=STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+                        before_fingerprint=before_fingerprint,
+                    )
+
+                merged = deepcopy(current)
+                for key, value in patch.items():
+                    if value is STOCK_CONFIG_DELETE_FIELD:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = deepcopy(value)
+                if _json_values_equal(merged, current):
+                    return StockConfigWriteResult(
+                        ok=True,
+                        changed=False,
+                        field_keys=field_keys,
+                        conflict_detected=False,
+                        read_back_verified=True,
+                        reason_code=STOCK_CONFIG_WRITE_NO_CHANGE,
+                        before_fingerprint=before_fingerprint,
+                        after_fingerprint=before_fingerprint,
+                    )
+                try:
+                    json.dumps(merged, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    return StockConfigWriteResult(
+                        ok=False,
+                        changed=False,
+                        field_keys=field_keys,
+                        conflict_detected=False,
+                        read_back_verified=False,
+                        reason_code=STOCK_CONFIG_WRITE_INVALID_PATCH,
+                        before_fingerprint=before_fingerprint,
+                    )
+
+                try:
+                    self._atomic_write_stock_config(
+                        config_path,
+                        merged,
+                        expected_fingerprint=before_fingerprint,
+                    )
+                except _StockConfigConcurrentUpdateError:
+                    continue
+                except (OSError, TypeError, ValueError):
+                    return StockConfigWriteResult(
+                        ok=False,
+                        changed=False,
+                        field_keys=field_keys,
+                        conflict_detected=False,
+                        read_back_verified=False,
+                        reason_code=STOCK_CONFIG_WRITE_ATOMIC_WRITE_FAILED,
+                        before_fingerprint=before_fingerprint,
+                    )
+
+                read_back = self._read_stock_config_snapshot(config_path)
+                if read_back.config is None or not _json_values_equal(
+                    read_back.config, merged
+                ):
+                    return StockConfigWriteResult(
+                        ok=False,
+                        changed=True,
+                        field_keys=field_keys,
+                        conflict_detected=False,
+                        read_back_verified=False,
+                        reason_code=STOCK_CONFIG_WRITE_READBACK_FAILED,
+                        before_fingerprint=before_fingerprint,
+                        after_fingerprint=read_back.fingerprint,
+                    )
+                return StockConfigWriteResult(
+                    ok=True,
+                    changed=True,
+                    field_keys=field_keys,
+                    conflict_detected=False,
+                    read_back_verified=True,
+                    reason_code=STOCK_CONFIG_WRITE_OK,
+                    before_fingerprint=before_fingerprint,
+                    after_fingerprint=read_back.fingerprint,
+                )
+
+        return StockConfigWriteResult(
+            ok=False,
+            changed=False,
+            field_keys=field_keys,
+            conflict_detected=True,
+            read_back_verified=False,
+            reason_code=STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED,
+            before_fingerprint=before_fingerprint,
+        )
 
     def has_central_stocks(self) -> bool:
         if not self.stocks_dir.exists():
@@ -380,6 +745,11 @@ class StockRepository:
             return False
         config_path = path / "config.json"
         config = read_json_dict(config_path)
+        expected_history = (
+            deepcopy(config[ROUTINE_ASSIGNMENT_HISTORY_KEY])
+            if ROUTINE_ASSIGNMENT_HISTORY_KEY in config
+            else STOCK_CONFIG_EXPECTED_MISSING
+        )
         changed = False
         history = self._assignment_history(config)
         for item in history:
@@ -391,9 +761,12 @@ class StockRepository:
                 changed = True
         if not changed:
             return False
-        config[ROUTINE_ASSIGNMENT_HISTORY_KEY] = history
-        write_json_dict(config_path, config)
-        return True
+        result = self.patch_stock_config(
+            code,
+            {ROUTINE_ASSIGNMENT_HISTORY_KEY: history},
+            expected_fields={ROUTINE_ASSIGNMENT_HISTORY_KEY: expected_history},
+        )
+        return result.ok and result.read_back_verified
 
     def list_from_central_stocks(self) -> list[StockRecord]:
         records: list[StockRecord] = []
@@ -469,190 +842,6 @@ class StockRepository:
             return self.project_root / record.stock_path
         return self.stocks_dir / safe_stock_folder_name(code, name)
 
-    def update_stock_routine(
-        self,
-        code: str,
-        name: str,
-        routines: list[str],
-        *,
-        _episode_before_target=None,
-    ) -> bool:
-        """
-        중앙 stocks/ 구조에서 종목의 현재 소속 루틴을 config.json에 반영한다.
-
-        정책:
-        - 종목당 활성 루틴은 1개만 사용한다.
-        - holding_qty 등 현재 상태값은 절대 수정하지 않는다.
-        - state.json은 종목의 진실이므로 이 함수에서 건드리지 않는다.
-        """
-        clean_routines: list[str] = []
-        seen: set[str] = set()
-        for routine in routines:
-            routine_name = str(routine or "").strip()
-            if routine_name and routine_name not in seen:
-                clean_routines.append(routine_name)
-                seen.add(routine_name)
-        routine_name = clean_routines[0] if clean_routines else ""
-
-        path = self.resolve_stock_dir(code, name)
-        if not path.exists():
-            return False
-
-        config_path = path / "config.json"
-        config = read_json_dict(config_path)
-        if not isinstance(config, dict):
-            config = {}
-        before_config = deepcopy(config)
-        before_assignment = _routine_assignment(config)
-        changed_at = now_text()
-        self._close_assignment_history(
-            config,
-            instance_id=str(config.get("assigned_routine_instance_id", "") or ""),
-            instance_name=str(config.get("routine_instance_name", "") or ""),
-            definition_id=str(config.get("routine_definition_id", "") or ""),
-            routine_type=str(config.get("routine_type", "") or ""),
-            changed_at=changed_at,
-        )
-
-        # 루틴 연결 정보 일원화
-        config["routine"] = routine_name
-        config["routine_name"] = routine_name
-
-        # 과거 구조 호환 필드도 함께 갱신/정리한다.
-        # 읽기 쪽에서 여러 후보 필드를 검사하므로 해제 시 전부 비워야 한다.
-        config["assigned_routine"] = routine_name
-        config["active_routine"] = routine_name
-        config["routines"] = [routine_name] if routine_name else []
-        config["assigned_routine_instance_id"] = ""
-        config["routine_instance_name"] = ""
-        config["routine_definition_id"] = ""
-        config["routine_type"] = routine_name
-
-        config["updated_at"] = changed_at
-        from assignment_episode_linkage import commit_assignment_with_episode
-
-        linkage = commit_assignment_with_episode(
-            self.project_root,
-            normalize_stock_code(code),
-            config_path,
-            before_config,
-            config,
-            changed_at=datetime.now().astimezone(),
-            reason="STOCK_ASSIGNMENT_REMOVED",
-            source="STOCK_REPOSITORY",
-            before_target=_episode_before_target,
-        )
-        self.last_assignment_linkage_result = linkage
-        if not linkage.success:
-            return False
-        saved = read_json_dict(config_path)
-        expected_assignment = _routine_assignment(config)
-        saved_assignment = _routine_assignment(saved)
-        if saved_assignment != expected_assignment:
-            return False
-        _append_routine_changed(
-            code=code,
-            name=name,
-            before=before_assignment,
-            after=saved_assignment,
-        )
-        return True
-
-    def update_stock_routine_instance(
-        self,
-        code: str,
-        name: str,
-        *,
-        instance_id: str,
-        instance_name: str,
-        definition_id: str,
-        routine_type: str,
-    ) -> bool:
-        clean_instance_id = str(instance_id or "").strip()
-        clean_instance_name = str(instance_name or "").strip()
-        clean_definition_id = str(definition_id or "").strip()
-        clean_routine_type = str(routine_type or "").strip()
-        if not all(
-            (
-                clean_instance_id,
-                clean_instance_name,
-                clean_definition_id,
-                clean_routine_type,
-            )
-        ):
-            return False
-
-        path = self.resolve_stock_dir(code, name)
-        if not path.exists():
-            return False
-        config_path = path / "config.json"
-        config = read_json_dict(config_path)
-        current_instance_id = str(
-            config.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        if current_instance_id == clean_instance_id:
-            return True
-        before_config = deepcopy(config)
-        before_assignment = _routine_assignment(config)
-        changed_at = now_text()
-        previous_instance_id = str(
-            config.get("assigned_routine_instance_id", "") or ""
-        ).strip()
-        if previous_instance_id and previous_instance_id != clean_instance_id:
-            self._close_assignment_history(
-                config,
-                instance_id=previous_instance_id,
-                instance_name=str(config.get("routine_instance_name", "") or ""),
-                definition_id=str(config.get("routine_definition_id", "") or ""),
-                routine_type=str(config.get("routine_type", "") or ""),
-                changed_at=changed_at,
-            )
-        self._open_assignment_history(
-            config,
-            instance_id=clean_instance_id,
-            instance_name=clean_instance_name,
-            definition_id=clean_definition_id,
-            routine_type=clean_routine_type,
-            changed_at=changed_at,
-        )
-        config["routine"] = clean_routine_type
-        config["routine_name"] = clean_routine_type
-        config["assigned_routine"] = clean_routine_type
-        config["active_routine"] = clean_routine_type
-        config["routines"] = [clean_routine_type]
-        config["assigned_routine_instance_id"] = clean_instance_id
-        config["routine_instance_name"] = clean_instance_name
-        config["routine_definition_id"] = clean_definition_id
-        config["routine_type"] = clean_routine_type
-        config["updated_at"] = changed_at
-        from assignment_episode_linkage import commit_assignment_with_episode
-
-        linkage = commit_assignment_with_episode(
-            self.project_root,
-            normalize_stock_code(code),
-            config_path,
-            before_config,
-            config,
-            changed_at=datetime.now().astimezone(),
-            reason="STOCK_ASSIGNMENT_CHANGED",
-            source="STOCK_REPOSITORY",
-        )
-        self.last_assignment_linkage_result = linkage
-        if not linkage.success:
-            return False
-        saved = read_json_dict(config_path)
-        expected_assignment = _routine_assignment(config)
-        saved_assignment = _routine_assignment(saved)
-        if saved_assignment != expected_assignment:
-            return False
-        _append_routine_changed(
-            code=code,
-            name=name,
-            before=before_assignment,
-            after=saved_assignment,
-        )
-        return True
-
     def ensure_stock_folder(self, code: str, name: str, routine: str = "") -> Path:
         """
         중앙 stocks/ 종목 폴더를 생성한다.
@@ -715,13 +904,6 @@ def read_base_stocks_from_repository() -> list[dict[str, Any]]:
     return repository().read_base_stocks_compatible()
 
 
-
-def update_base_stock_routines_in_repository(code: str, name: str, routines: list[str]) -> bool:
-    """
-    기존 update_base_stock_routines() 교체 후보 함수.
-    중앙 stocks/ 구조에서는 config.json의 routine 값을 갱신한다.
-    """
-    return repository().update_stock_routine(code, name, routines)
 
 def stock_runtime_dir_from_repository(code: str, name: str = "") -> Path:
     return repository().resolve_stock_dir(code, name)

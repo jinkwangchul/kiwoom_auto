@@ -19,7 +19,7 @@ from gui_auto_trade_integrity import (
     operator_review_location,
     REVIEW_REASON_PENDING_ORDER_DATA_ERROR,
 )
-from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
+from gui_order_utils import pending_order_side_quantities
 from gui_review_utils import merge_existing_review_metadata, normalized_review_reasons
 from runtime_io import read_json_dict
 
@@ -139,6 +139,13 @@ def auto_trade_unregister_category(
         "name": name,
         "title": f"{code} {name}",
         "runtime_dirs": [(routine_name, stock_dir)],
+        "instance_id": str(
+            read_json_dict(stock_dir / "config.json").get(
+                "assigned_routine_instance_id",
+                "",
+            )
+            or ""
+        ).strip(),
     }
 
     known_statuses = {
@@ -166,12 +173,6 @@ def auto_trade_unregister_category(
         item["reasons"] = [f"{routine_name}: 긴급정지 종목입니다."]
         return item
 
-    operation_active_statuses = {"RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"}
-    if raw_status in operation_active_statuses:
-        item["category"] = "blocked"
-        item["reasons"] = [f"{routine_name}: 운영 중 종목입니다."]
-        return item
-
     if raw_status not in known_statuses:
         item["category"] = "blocked"
         LOGGER.error(
@@ -187,15 +188,6 @@ def auto_trade_unregister_category(
 
     if buy_pending_qty == "?" or sell_pending_qty == "?":
         item["category"] = "blocked"
-        issue_codes = pending_order_integrity_issue_codes(stock_dir, state)
-        mark_pending_order_integrity_review_required(
-            routine_name,
-            stock_dir,
-            code,
-            name,
-            issue_codes,
-            source="등록해제 미체결 데이터 무결성 오류",
-        )
         item["reasons"] = [f"{routine_name}: {PENDING_INTEGRITY_USER_REASON}"]
         return item
 

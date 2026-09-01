@@ -15,8 +15,16 @@ from PyQt5.QtWidgets import QMessageBox
 from gui_auto_trade_utils import auto_trade_unregister_category
 from gui_base_stock_service import update_base_stock_routines as update_base_stock_routines_from_service
 from gui_toast import show_toast
-from gui_operation_ui_context import refresh_auto_trade_views
+from gui_operation_ui_context import (
+    refresh_auto_trade_views,
+    sync_auto_trade_monitoring_universe,
+)
 from gui_operation_ui_context import operation_dialog_parent
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+    execute_assignment_unassign,
+    inspect_stock_unregister_availability,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
@@ -51,7 +59,13 @@ def append_changelog(change_type: str, filename: str, message: str) -> None:
         file.write(block)
 
 
-def update_base_stock_routines(code: str, name: str, routines: list[str]) -> bool:
+def update_base_stock_routines(
+    code: str,
+    name: str,
+    routines: list[str],
+    *,
+    expected_instance_id: str | None = None,
+) -> bool:
     """
     등록해제 루틴 연결 갱신.
 
@@ -61,7 +75,14 @@ def update_base_stock_routines(code: str, name: str, routines: list[str]) -> boo
     - 아직 stocks/가 없으면 기존 기초종목.txt fallback
     흐름을 동일하게 사용한다.
     """
-    return bool(update_base_stock_routines_from_service(code, name, routines))
+    return bool(
+        update_base_stock_routines_from_service(
+            code,
+            name,
+            routines,
+            expected_instance_id=expected_instance_id,
+        )
+    )
 
 
 
@@ -96,7 +117,23 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if key in seen:
             continue
         seen.add(key)
-        item = auto_trade_unregister_category(routine_name, stock_dir, code, name)
+        availability = inspect_stock_unregister_availability(
+            window,
+            PROJECT_ROOT,
+            code,
+            name,
+        )
+        if not availability.allowed:
+            item = {
+                "category": "blocked",
+                "code": code,
+                "name": name,
+                "title": f"{code} {name}",
+                "instance_id": availability.current_instance_id,
+                "reasons": [availability.reason_code],
+            }
+        else:
+            item = auto_trade_unregister_category(routine_name, stock_dir, code, name)
         category = str(item.get("category", "blocked"))
         if category == "immediate":
             immediate_items.append(item)
@@ -123,8 +160,19 @@ def unregister_selected_auto_trade_stocks(window) -> None:
         if not code or not name:
             continue
 
-        if update_base_stock_routines(code, name, []):
+        expected_instance_id = str(item.get("instance_id", "") or "").strip()
+        result = execute_assignment_unassign(
+            window,
+            PROJECT_ROOT,
+            code,
+            name,
+            expected_instance_id=expected_instance_id,
+            intent=ASSIGNMENT_INTENT_STOCK_UNREGISTER,
+        )
+        if result.ok and result.changed:
             completed_items.append(f"{code},{name}")
+        elif not result.ok:
+            failed_names.append(name)
 
     if not completed_items:
         show_toast(
@@ -143,6 +191,7 @@ def unregister_selected_auto_trade_stocks(window) -> None:
     )
 
     window.statusBar_message(f"루틴 등록해제 완료: {len(completed_items)}개")
+    sync_auto_trade_monitoring_universe(window)
     refresh_auto_trade_views(window)
     show_toast(
         message_parent,

@@ -26,6 +26,7 @@ from gui_window_policy import persistent_feature_owner
 from gui_common_utils import safe_int_value
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
+    auto_trade_setting_server_mismatch_detected,
     is_emergency_stopped_state,
     is_review_required_state,
     operator_review_location,
@@ -37,13 +38,15 @@ from gui_auto_trade_run_control import (
     _active_queue_reason,
 )
 from gui_order_utils import pending_order_integrity_issue_codes, pending_order_side_quantities
-from gui_review_required_window import auto_trade_setting_server_mismatch_detected
 from runtime_io import read_json_dict, read_orders_data
 from gui_auto_trade_runtime import write_state_json
 from gui_auto_trade_status_ops import append_changelog, append_stock_log, now_text
 from gui_auto_trade_runtime import parse_stock_folder_name
 from runtime_stock_state_mutation import mutate_runtime_stock_state
-from gui_base_stock_service import update_base_stock_routines
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_REVIEW_RESOLUTION_UNASSIGN,
+    execute_assignment_unassign,
+)
 from operation_policy_gate import read_operation_state, write_global_emergency_stop_state
 from event_journal_production import (
     append_production_event,
@@ -52,9 +55,11 @@ from event_journal_production import (
 from production_recovery_state_registry import (
     check_production_recovery_gate,
     production_recovery_registry,
+    recovery_stock_is_review_required,
 )
 from execution_queue_writer import read_execution_queue_records
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 REVIEW_RETURN_ALLOWED = "ALLOWED"
 REVIEW_RETURN_BLOCKED = "BLOCKED"
 EMERGENCY_SCOPE_GLOBAL = "GLOBAL"
@@ -714,6 +719,40 @@ def normalize_review_emergency_target(
             {"active_routine": "", "routine_name": "", "review_routine": ""}
         )
 
+        config_before = read_json_dict(stock_dir / "config.json")
+        expected_instance_id = str(
+            config_before.get("assigned_routine_instance_id", "") or ""
+        ).strip()
+        assignment_result = execute_assignment_unassign(
+            window,
+            PROJECT_ROOT,
+            code,
+            name,
+            expected_instance_id=expected_instance_id,
+            intent=ASSIGNMENT_INTENT_REVIEW_RESOLUTION_UNASSIGN,
+        )
+        if not assignment_result.ok:
+            reason_code = str(
+                getattr(assignment_result, "reason_code", "TRANSACTION_FAILED")
+                or "TRANSACTION_FAILED"
+            )
+            return {
+                "status": "FAILED",
+                "reason": "루틴 연결 해제 실패",
+                "reason_code": reason_code,
+                "reconciliation_required": bool(
+                    getattr(assignment_result, "reconciliation_required", False)
+                ),
+            }
+        config_after = read_json_dict(stock_dir / "config.json")
+        if str(config_after.get("assigned_routine_instance_id", "") or "").strip():
+            return {
+                "status": "FAILED",
+                "reason": "루틴 연결 해제 검증 실패",
+                "reason_code": "READ_BACK_FAILED",
+                "reconciliation_required": True,
+            }
+
     if not update_runtime_stock_status(
         window,
         stock_dir,
@@ -726,18 +765,6 @@ def normalize_review_emergency_target(
         allow_review_state_transition=True,
     ):
         return {"status": "FAILED", "reason": "상태 저장 실패"}
-
-    if normalized_destination == "UNASSIGNED" and not update_base_stock_routines(
-        code,
-        name,
-        [],
-    ):
-        write_state_json(
-            stock_dir,
-            state_before,
-            allow_review_state_transition=True,
-        )
-        return {"status": "FAILED", "reason": "루틴 연결 해제 실패"}
 
     return {
         "status": "NORMALIZED",
@@ -1044,13 +1071,8 @@ def release_emergency_stop_target(
         or emergency_scope(state_before) != EMERGENCY_SCOPE_SELECTED
     ):
         return RELEASE_SKIPPED
-    registry_checker = getattr(
-        window,
-        "production_recovery_stock_is_review_required",
-        None,
-    )
     already_in_review = is_review_required_state(state_before) or (
-        bool(registry_checker(code)) if callable(registry_checker) else False
+        recovery_stock_is_review_required(code)
     )
     release_allowed, guard_reason = emergency_release_common_guard(
         window,

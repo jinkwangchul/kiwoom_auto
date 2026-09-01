@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -222,8 +224,7 @@ class LifecycleCommitContractPreviewTest(unittest.TestCase):
         result = build_lifecycle_commit_contract_preview(self._approval(), self._target(), self._snapshot())
 
         self.assertEqual("LIFECYCLE_COMMIT_READY", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,12 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog, QTableWidget, QTableWidgetItem
 
 import gui_stock_instance_chart_window as chart_window
+from tests.qt_test_support import flush_deferred_deletes
 from gui_auto_trade_context_menu import open_selected_stock_instance_charts
 import gui_windows
 from gui_auto_trade_setting_window import AutoTradeSettingWindow
@@ -55,6 +56,39 @@ def _projection(stock_code: str, trade_date: str) -> dict[str, object]:
 
 class _OperationHost(QObject):
     operation_cycle_completed = pyqtSignal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._participants: set[str] = set()
+
+    def current_session_operation_participant_stock_codes(self):
+        return tuple(sorted(self._participants))
+
+    def register_current_session_operation_participants(self, stock_codes):
+        registered = {str(code or "").strip() for code in stock_codes}
+        registered.discard("")
+        self._participants.update(registered)
+        return tuple(sorted(registered))
+
+    def retire_current_session_operation_participants(self, stock_codes):
+        requested = tuple(
+            sorted(
+                {
+                    str(code or "").strip()
+                    for code in stock_codes
+                    if str(code or "").strip()
+                }
+            )
+        )
+        before = self.current_session_operation_participant_stock_codes()
+        removed = tuple(code for code in before if code in set(requested))
+        self._participants.difference_update(removed)
+        return {
+            "before": before,
+            "requested": requested,
+            "removed": removed,
+            "remaining": self.current_session_operation_participant_stock_codes(),
+        }
 
     def price_signal_observation_enabled(self) -> bool:
         return False
@@ -205,10 +239,6 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
         ), patch.object(
             AutoTradeSettingWindow, "update_startup_recovery_controls"
         ), patch.object(
-            AutoTradeSettingWindow,
-            "current_runtime_file_signature",
-            return_value={},
-        ), patch.object(
             chart_window, "project_stock_instance_day", side_effect=_projection
         ), patch.object(
             chart_window, "_today_trade_date", return_value="2026-08-11"
@@ -264,8 +294,7 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
 
             settings.close()
             self.app.processEvents()
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            self.app.processEvents()
+            flush_deferred_deletes(self.app)
             self.assertTrue(sip.isdeleted(settings))
             self.assertFalse(sip.isdeleted(chart))
             self.assertTrue(chart.isVisible())
@@ -306,8 +335,7 @@ class StockInstanceChartSingletonRegistryTests(unittest.TestCase):
 
             main.close()
             main.deleteLater()
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            self.app.processEvents()
+            flush_deferred_deletes(self.app)
             self.assertTrue(sip.isdeleted(chart))
             self.assertFalse(sip.isdeleted(timer))
             self.assertFalse(timer.isActive())

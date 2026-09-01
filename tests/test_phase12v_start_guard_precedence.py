@@ -11,10 +11,9 @@ from unittest.mock import MagicMock, Mock, patch
 
 import gui_auto_trade_run_control as run_control
 import gui_ats_utils as ats_utils
-import gui_auto_trade_setting_window as setting_window_module
 import gui_main_stock_context_menu as monitoring_context_menu
 import routine_order_permission as order_permission
-from gui_auto_trade_setting_window import AutoTradeSettingWindow
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 def _target(
@@ -88,6 +87,7 @@ class _PrecedenceWindow:
             viewport=lambda: SimpleNamespace(update=MagicMock()),
             repaint=MagicMock(),
         )
+        attach_participant_owner(self)
 
     def selected_stock_infos(self):
         return list(self.targets)
@@ -507,9 +507,10 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 [],
             )
             result_holder = {}
+            start_backend = run_control.auto_trade_start_selected_auto_trades
 
             def invoke_backend(window, **kwargs):
-                result = run_control.auto_trade_start_selected_auto_trades(window, **kwargs)
+                result = start_backend(window, **kwargs)
                 result_holder["result"] = result
                 return result
 
@@ -527,10 +528,8 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                     "current_datetime",
                     return_value=run_control.datetime(2026, 8, 25, 21, 0),
                 ),
-                patch.object(setting_window_module, "_today_global_operation_status", return_value=""),
-                patch.object(setting_window_module, "read_operation_state", return_value={}),
                 patch.object(
-                    setting_window_module,
+                    run_control,
                     "auto_trade_start_selected_auto_trades",
                     side_effect=invoke_backend,
                 ),
@@ -539,7 +538,14 @@ class Phase12VStartGuardPrecedenceTest(unittest.TestCase):
                 patch.object(run_control, "_show_start_failure_once"),
                 patch.object(run_control, "write_global_operation_running_state") as writer,
             ):
-                AutoTradeSettingWindow.start_selected_auto_trades(adapter)
+                run_control.execute_operation_start_command(
+                    adapter,
+                    run_control.OperationStartCommandRequest(
+                        intent=run_control.OperationStartIntent.FULL_START,
+                        source="auto_trade_global_start_button",
+                    ),
+                    operation_state_reader=lambda: {},
+                )
 
         result = result_holder["result"]
         self.assertEqual("RECOVERY_CONTEXT_MISSING", result["reason"])

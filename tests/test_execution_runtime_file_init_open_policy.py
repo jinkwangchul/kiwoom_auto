@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    assert_project_mutable_guard_active,
+    patch_project_runtime_classifiers,
+)
+
 import hashlib
 from pathlib import Path
-import tempfile
 import unittest
 from unittest import mock
 
@@ -30,13 +35,21 @@ def _sha256(path: Path) -> str | None:
 
 class ExecutionRuntimeFileInitOpenPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.temp_root = Path(self.tmp.name)
-        self.order_executions_path = ROOT / "runtime" / "order_executions.json"
-        self.order_locks_path = ROOT / "runtime" / "order_locks.json"
+        self.layout = TemporaryProjectRoot()
+        self.temp_root = self.layout.root
+        self.order_executions_path = self.layout.runtime / "order_executions.json"
+        self.order_locks_path = self.layout.runtime / "order_locks.json"
+        self.runtime_patches = patch_project_runtime_classifiers(
+            self.layout.runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_open_policy",
+            ),
+        )
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        self.runtime_patches.close()
+        self.layout.cleanup()
 
     def _orchestrator(
         self,
@@ -241,8 +254,7 @@ class ExecutionRuntimeFileInitOpenPolicyTest(unittest.TestCase):
         init_commit.assert_not_called()
         queue_commit.assert_not_called()
         send_order.assert_not_called()
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_runtime_and_rules_hash_unchanged(self) -> None:
         runtime_paths = [
@@ -260,8 +272,7 @@ class ExecutionRuntimeFileInitOpenPolicyTest(unittest.TestCase):
 
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
         self.assertEqual(before_rules, {str(path): _sha256(path) for path in rules_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

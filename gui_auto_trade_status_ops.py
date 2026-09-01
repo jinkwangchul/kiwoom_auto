@@ -7,8 +7,8 @@ gui_auto_trade_status_ops.py
 
 from __future__ import annotations
 
-import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -52,13 +52,22 @@ from state_policy import (
     validate_buy_time_range,
 )
 from gui_auto_trade_policy import (
+    auto_trade_current_session_operation_participant_codes,
     auto_trade_setting_current_session_trade_started,
     auto_trade_setting_should_preserve_raw_status,
     auto_trade_setting_trade_started,
 )
 from gui_stock_data import normalize_stock_code
+from stock_repository import (
+    STOCK_CONFIG_EXPECTED_MISSING,
+    STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+    STOCK_CONFIG_WRITE_NO_CHANGE,
+    StockConfigWriteResult,
+    StockRepository,
+)
 from gui_auto_trade_integrity import (
     auto_trade_setting_data_inconsistency_reasons,
+    inspect_stock_review_state,
     is_emergency_stopped_state,
     is_operation_excluded,
     is_review_required_state,
@@ -82,9 +91,108 @@ OPERATION_EXCLUDED_CONFIG_KEY = "operation_excluded"
 OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE = (
     "운영 중에는 더블클릭으로 운영 대상을 변경할 수 없습니다. 우클릭 운영시작을 사용하세요."
 )
+OPERATION_EXCLUSION_REVIEW_BLOCK_MESSAGE = (
+    "검토관리 종목은 일반 운영제외 기능으로 변경할 수 없습니다."
+)
+
+
+@dataclass(frozen=True)
+class OperationExclusionAvailability:
+    allowed: bool
+    reason_code: str
+    stock_code: str
+    requested_excluded: bool
+    current_excluded: bool
+    review_required: bool
+    current_running: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "allowed": self.allowed,
+            "reason": self.reason_code,
+            "reason_code": self.reason_code,
+            "stock_code": self.stock_code,
+            "excluded": self.requested_excluded,
+            "requested_excluded": self.requested_excluded,
+            "current_excluded": self.current_excluded,
+            "review_required": self.review_required,
+            "current_running": self.current_running,
+        }
+
+
+@dataclass(frozen=True)
+class OperationExclusionCommandResult:
+    ok: bool
+    changed: bool
+    allowed: bool
+    reason_code: str
+    stock_code: str
+    requested_excluded: bool
+    current_excluded: bool
+    review_required: bool
+    current_running: bool
+
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _stock_config_expected_fields(
+    config: dict[str, object],
+    field_keys: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        key: config[key] if key in config else STOCK_CONFIG_EXPECTED_MISSING
+        for key in field_keys
+    }
+
+
+def _invalid_stock_config_write_result(
+    field_keys: tuple[str, ...],
+) -> StockConfigWriteResult:
+    return StockConfigWriteResult(
+        ok=False,
+        changed=False,
+        field_keys=field_keys,
+        conflict_detected=False,
+        read_back_verified=False,
+        reason_code=STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+    )
+
+
+def _no_change_stock_config_write_result(
+    field_keys: tuple[str, ...],
+) -> StockConfigWriteResult:
+    return StockConfigWriteResult(
+        ok=True,
+        changed=False,
+        field_keys=field_keys,
+        conflict_detected=False,
+        read_back_verified=True,
+        reason_code=STOCK_CONFIG_WRITE_NO_CHANGE,
+    )
+
+
+def _patch_canonical_stock_config(
+    stock_dir: Path,
+    patch: dict[str, object],
+    *,
+    expected_fields: dict[str, object] | None = None,
+) -> StockConfigWriteResult:
+    target_dir = Path(stock_dir)
+    stocks_dir = target_dir.parent
+    stock_code = normalize_stock_code(target_dir.name.partition("_")[0])
+    field_keys = tuple(patch.keys())
+    if stocks_dir.name != "stocks" or not stock_code:
+        return _invalid_stock_config_write_result(field_keys)
+    repository = StockRepository(stocks_dir.parent)
+    if repository.resolve_stock_dir(stock_code).resolve() != target_dir.resolve():
+        return _invalid_stock_config_write_result(field_keys)
+    return repository.patch_stock_config(
+        stock_code,
+        patch,
+        expected_fields=expected_fields,
+    )
 
 def current_datetime() -> datetime:
     return datetime.now()
@@ -132,16 +240,27 @@ def auto_trade_stock_operation_excluded(stock_dir: Path) -> bool:
     return is_operation_excluded(config)
 
 
-def auto_trade_operation_exclusion_mutation_decision(
+def inspect_auto_trade_operation_exclusion_availability(
     window,
     target: tuple[Path, str, str],
     excluded: bool,
-) -> dict[str, object]:
-    """Block direct exclusion of a current-session running stock."""
+) -> OperationExclusionAvailability:
+    """Read the canonical guard state for one direct exclusion request."""
 
     stock_dir, code, _name = target
     clean_code = normalize_stock_code(code)
-    current_running = False
+    config = read_json_dict(Path(stock_dir) / "config.json")
+    loaded_state = read_json_dict(Path(stock_dir) / "state.json")
+    review_inspection = inspect_stock_review_state(
+        Path(stock_dir),
+        loaded_state=loaded_state,
+    )
+    state = review_inspection.state
+    current_excluded = is_operation_excluded(config)
+    review_required = review_inspection.review_required
+    current_running = clean_code in set(
+        auto_trade_current_session_operation_participant_codes(window)
+    )
     running_getter = getattr(window, "running_registered_operation_targets", None)
     running_targets: tuple[object, ...] | None = None
     if callable(running_getter):
@@ -150,47 +269,213 @@ def auto_trade_operation_exclusion_mutation_decision(
         except Exception:
             running_targets = None
     if running_targets is not None:
-        target_path = Path(stock_dir).resolve()
-        current_running = any(
-            (
-                clean_code
-                and normalize_stock_code(running_code) == clean_code
+        if not current_running:
+            target_path = Path(stock_dir).resolve()
+            current_running = any(
+                (
+                    clean_code
+                    and normalize_stock_code(running_code) == clean_code
+                )
+                or Path(running_dir).resolve() == target_path
+                for running_dir, running_code, _running_name in running_targets
             )
-            or Path(running_dir).resolve() == target_path
-            for running_dir, running_code, _running_name in running_targets
-        )
-    else:
-        state = read_json_dict(Path(stock_dir) / "state.json")
+    elif not current_running:
         current_running = auto_trade_setting_current_session_trade_started(
             window,
             auto_trade_setting_trade_started(state),
             clean_code,
         )
 
-    blocked = bool(excluded and current_running)
-    return {
-        "allowed": not blocked,
-        "reason": "CURRENT_RUNNING_OPERATION_EXCLUSION_BLOCKED" if blocked else "",
-        "stock_code": clean_code,
-        "current_running": current_running,
-        "excluded": bool(excluded),
-    }
+    requested_excluded = bool(excluded)
+    if review_required:
+        reason_code = "REVIEW_REQUIRED"
+    elif requested_excluded and current_running:
+        reason_code = "CURRENTLY_RUNNING"
+    elif current_excluded == requested_excluded:
+        reason_code = "ALREADY_EXCLUDED" if requested_excluded else "NOT_EXCLUDED"
+    else:
+        reason_code = ""
+    return OperationExclusionAvailability(
+        allowed=reason_code not in {"REVIEW_REQUIRED", "CURRENTLY_RUNNING"},
+        reason_code=reason_code,
+        stock_code=clean_code,
+        requested_excluded=requested_excluded,
+        current_excluded=current_excluded,
+        review_required=review_required,
+        current_running=current_running,
+    )
 
 
-def set_auto_trade_stock_operation_excluded(stock_dir: Path, excluded: bool) -> bool:
+def auto_trade_operation_exclusion_mutation_decision(
+    window,
+    target: tuple[Path, str, str],
+    excluded: bool,
+) -> dict[str, object]:
+    """Compatibility projection of the canonical exclusion availability."""
+
+    return inspect_auto_trade_operation_exclusion_availability(
+        window,
+        target,
+        excluded,
+    ).as_dict()
+
+
+def _patch_auto_trade_stock_operation_excluded(
+    stock_dir: Path,
+    excluded: bool,
+    *,
+    expected_fields: dict[str, object] | None = None,
+) -> StockConfigWriteResult:
     config_path = Path(stock_dir) / "config.json"
     config = read_json_dict(config_path)
     if not config_path.exists() or not isinstance(config, dict):
-        return False
+        return _invalid_stock_config_write_result(
+            (OPERATION_EXCLUDED_CONFIG_KEY,)
+        )
     if is_operation_excluded(config) == bool(excluded):
-        return True
-    config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
-    config["updated_at"] = now_text()
-    config_path.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+        return _no_change_stock_config_write_result(
+            (OPERATION_EXCLUDED_CONFIG_KEY,)
+        )
+    if expected_fields is None:
+        expected_fields = _stock_config_expected_fields(
+            config,
+            (OPERATION_EXCLUDED_CONFIG_KEY,),
+        )
+    return _patch_canonical_stock_config(
+        stock_dir,
+        {
+            OPERATION_EXCLUDED_CONFIG_KEY: bool(excluded),
+            "updated_at": now_text(),
+        },
+        expected_fields=expected_fields,
     )
-    return True
+
+
+def set_auto_trade_stock_operation_excluded(stock_dir: Path, excluded: bool) -> bool:
+    """Low-level writer retained for Operation Start's established side effects."""
+
+    return _patch_auto_trade_stock_operation_excluded(stock_dir, excluded).ok
+
+
+def execute_auto_trade_stock_operation_exclusion(
+    window,
+    target: tuple[Path, str, str],
+    excluded: bool,
+) -> OperationExclusionCommandResult:
+    """Revalidate and execute one ordinary operator exclusion command."""
+
+    stock_dir, code, _name = target
+    availability = inspect_auto_trade_operation_exclusion_availability(
+        window,
+        target,
+        excluded,
+    )
+    if not availability.allowed:
+        return OperationExclusionCommandResult(
+            ok=False,
+            changed=False,
+            allowed=False,
+            reason_code=availability.reason_code,
+            stock_code=availability.stock_code,
+            requested_excluded=availability.requested_excluded,
+            current_excluded=availability.current_excluded,
+            review_required=availability.review_required,
+            current_running=availability.current_running,
+        )
+    if availability.current_excluded == availability.requested_excluded:
+        return OperationExclusionCommandResult(
+            ok=True,
+            changed=False,
+            allowed=True,
+            reason_code=availability.reason_code,
+            stock_code=availability.stock_code,
+            requested_excluded=availability.requested_excluded,
+            current_excluded=availability.current_excluded,
+            review_required=availability.review_required,
+            current_running=availability.current_running,
+        )
+
+    config = read_json_dict(Path(stock_dir) / "config.json") or default_config()
+    write_result = _patch_auto_trade_stock_operation_excluded(
+        stock_dir,
+        excluded,
+        expected_fields=_stock_config_expected_fields(
+            config,
+            (OPERATION_EXCLUDED_CONFIG_KEY,),
+        ),
+    )
+    return OperationExclusionCommandResult(
+        ok=write_result.ok,
+        changed=bool(write_result.ok and write_result.changed),
+        allowed=True,
+        reason_code=(
+            "UPDATED"
+            if write_result.ok and write_result.changed
+            else write_result.reason_code
+        ),
+        stock_code=normalize_stock_code(code),
+        requested_excluded=bool(excluded),
+        current_excluded=is_operation_excluded(
+            read_json_dict(Path(stock_dir) / "config.json")
+        ),
+        review_required=availability.review_required,
+        current_running=availability.current_running,
+    )
+
+
+def _apply_auto_trade_stock_operation_exclusion(
+    window,
+    target: tuple[Path, str, str],
+    excluded: bool,
+    *,
+    notify: bool,
+    refresh: bool,
+) -> OperationExclusionCommandResult:
+    message_parent_getter = getattr(window, "operation_message_parent", None)
+    message_parent = message_parent_getter() if callable(message_parent_getter) else window
+    stock_dir, code, name = target
+    result = execute_auto_trade_stock_operation_exclusion(window, target, excluded)
+    if not result.allowed:
+        status_message = getattr(window, "statusBarMessage", None)
+        if callable(status_message):
+            status_message(
+                OPERATION_EXCLUSION_REVIEW_BLOCK_MESSAGE
+                if result.reason_code == "REVIEW_REQUIRED"
+                else OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE
+            )
+        return result
+    if not result.ok:
+        QMessageBox.critical(
+            message_parent,
+            "저장 오류",
+            f"{code} {name} 운영 제외 설정 저장 중 오류가 발생했습니다."
+            f"\n\n{result.reason_code}",
+        )
+        return result
+    if not result.changed:
+        return result
+
+    label = "운영 제외" if excluded else "운영 제외 해제"
+    toast_message = "운영종목에서 제외됐습니다." if excluded else "운영종목으로 전환됐습니다."
+    append_production_event(
+        "OPERATION_EXCLUDED" if excluded else "OPERATION_EXCLUSION_RELEASED",
+        result="COMPLETED",
+        source="AutoTradeSettingWindow.set_stock_operation_exclusion",
+        template_args={"stock_name": str(name or code)},
+        target_type="STOCK",
+        target_id=str(code),
+        target_name=str(name),
+        stock_code=str(code),
+        stock_name=str(name),
+    )
+    append_stock_log(stock_dir, "GUI", f"{label}: {code} {name}")
+    append_changelog("UPDATE", "config.json", f"{label}: {code} {name}")
+    if notify:
+        window.statusBarMessage(f"{code} {name} {label}")
+        show_toast(message_parent, toast_message)
+    if refresh:
+        refresh_auto_trade_views(window)
+    return result
 
 
 def auto_trade_set_stock_operation_exclusion(
@@ -201,60 +486,13 @@ def auto_trade_set_stock_operation_exclusion(
     notify: bool = True,
     refresh: bool = True,
 ) -> bool:
-    message_parent_getter = getattr(window, "operation_message_parent", None)
-    message_parent = message_parent_getter() if callable(message_parent_getter) else window
-    stock_dir, code, name = target
-    config_path = stock_dir / "config.json"
-    config = read_json_dict(config_path) or default_config()
-    decision = auto_trade_operation_exclusion_mutation_decision(
+    return _apply_auto_trade_stock_operation_exclusion(
         window,
         target,
         excluded,
-    )
-    if decision.get("allowed") is not True:
-        status_message = getattr(window, "statusBarMessage", None)
-        if callable(status_message):
-            status_message(OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE)
-        return False
-    exclusion_changed = is_operation_excluded(config) != bool(excluded)
-    config[OPERATION_EXCLUDED_CONFIG_KEY] = bool(excluded)
-    config["updated_at"] = now_text()
-
-    try:
-        config_path.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        QMessageBox.critical(
-            message_parent,
-            "저장 오류",
-            f"{code} {name} 운영 제외 설정 저장 중 오류가 발생했습니다.\n\n{exc}",
-        )
-        return False
-
-    label = "운영 제외" if excluded else "운영 제외 해제"
-    toast_message = "운영종목에서 제외됐습니다." if excluded else "운영종목으로 전환됐습니다."
-    if exclusion_changed:
-        append_production_event(
-            "OPERATION_EXCLUDED" if excluded else "OPERATION_EXCLUSION_RELEASED",
-            result="COMPLETED",
-            source="AutoTradeSettingWindow.set_stock_operation_exclusion",
-            template_args={"stock_name": str(name or code)},
-            target_type="STOCK",
-            target_id=str(code),
-            target_name=str(name),
-            stock_code=str(code),
-            stock_name=str(name),
-        )
-    append_stock_log(stock_dir, "GUI", f"{label}: {code} {name}")
-    append_changelog("UPDATE", "config.json", f"{label}: {code} {name}")
-    if notify:
-        window.statusBarMessage(f"{code} {name} {label}")
-        show_toast(message_parent, toast_message)
-    if refresh:
-        refresh_auto_trade_views(window)
-    return True
+        notify=notify,
+        refresh=refresh,
+    ).ok
 
 
 def auto_trade_toggle_stock_operation_exclusion(
@@ -289,23 +527,16 @@ def _set_selected_stock_operation_exclusions(window, excluded: bool) -> None:
         if key in seen:
             continue
         seen.add(key)
-        state = read_json_dict(stock_dir / "state.json")
-        config = read_json_dict(stock_dir / "config.json") or default_config()
-        if (
-            is_review_required_state(state)
-            or is_operation_excluded(config) == bool(excluded)
-        ):
-            failed += 1
-            continue
-        if auto_trade_set_stock_operation_exclusion(
+        result = _apply_auto_trade_stock_operation_exclusion(
             window,
             target,
             excluded,
             notify=False,
             refresh=False,
-        ):
+        )
+        if result.ok and result.changed:
             succeeded.append(name or code)
-        else:
+        elif not result.ok:
             failed += 1
 
     if succeeded:
@@ -345,9 +576,6 @@ def get_group_dirs() -> list[Path]:
     return registry_get_group_dirs()
 
 
-def get_routine_dirs() -> list[Path]:
-    """Compatibility wrapper for historical Group-path callers."""
-    return get_group_dirs()
 
 
 def parse_stock_folder_name(folder_name: str) -> tuple[str, str]:
@@ -888,34 +1116,62 @@ def auto_trade_update_stock_operation_mode(window, stock_dir: Path, code: str, n
         )
         return False
 
-    config = target_config
-    config["operation_mode"] = mode
+    target_fields: dict[str, object] = {"operation_mode": mode}
     if config_updates:
+        for key in (
+            "start_time",
+            "trade_start_time",
+            "end_buy_time",
+            "buy_end_time",
+        ):
+            if key in config_updates:
+                target_fields[key] = target_config.get(key)
         start_time = normalized_hhmmss_or_empty(
-            config.get("start_time", config.get("trade_start_time", ""))
+            target_config.get("start_time", target_config.get("trade_start_time", ""))
         )
         end_buy_time = normalized_hhmmss_or_empty(
-            config.get("end_buy_time", config.get("buy_end_time", ""))
+            target_config.get("end_buy_time", target_config.get("buy_end_time", ""))
         )
         if start_time and end_buy_time:
-            config["start_time"] = start_time
-            config["trade_start_time"] = start_time
-            config["end_buy_time"] = end_buy_time
-            config["buy_end_time"] = end_buy_time
+            target_fields.update(
+                {
+                    "start_time": start_time,
+                    "trade_start_time": start_time,
+                    "end_buy_time": end_buy_time,
+                    "buy_end_time": end_buy_time,
+                }
+            )
 
-    config["operation_mode_updated_at"] = now_text()
-
-    try:
-        config_path.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+    semantic_field_keys = tuple(target_fields.keys())
+    semantic_changed = any(
+        key not in before_config or before_config.get(key) != value
+        for key, value in target_fields.items()
+    )
+    if semantic_changed:
+        target_fields["operation_mode_updated_at"] = now_text()
+        write_result = _patch_canonical_stock_config(
+            stock_dir,
+            target_fields,
+            expected_fields=_stock_config_expected_fields(
+                before_config,
+                semantic_field_keys,
+            ),
         )
-    except Exception as exc:
-        append_stock_log(stock_dir, "ERROR", f"운영방식 저장 실패: {operation_mode_display(before_mode)} -> {operation_mode_display(mode)} / {exc}")
+    else:
+        write_result = _no_change_stock_config_write_result(semantic_field_keys)
+
+    if not write_result.ok:
+        append_stock_log(
+            stock_dir,
+            "ERROR",
+            "운영방식 저장 실패: "
+            f"{operation_mode_display(before_mode)} -> {operation_mode_display(mode)}"
+            f" / {write_result.reason_code}",
+        )
         return False
 
     saved_config = read_json_dict(config_path)
-    if saved_config != config:
+    if any(saved_config.get(key) != value for key, value in target_fields.items()):
         append_stock_log(
             stock_dir,
             "ERROR",
@@ -1136,7 +1392,9 @@ def auto_trade_finalize_operation_mode_result(
 ) -> None:
     """Refresh UI adapters and present the existing operation-mode failure contract."""
 
-    refresh_auto_trade_views(window)
+    succeeded = int(result.get("succeeded", 0) or 0)
+    if succeeded:
+        refresh_auto_trade_views(window)
 
     failed = int(result.get("failed", 0) or 0)
     if not failed:
@@ -1150,7 +1408,6 @@ def auto_trade_finalize_operation_mode_result(
         if isinstance(item, dict) and not bool(item.get("success"))
     ]
     requested = int(result.get("requested", 0) or 0)
-    succeeded = int(result.get("succeeded", 0) or 0)
     if requested == 1:
         message = "선택한 종목을 변경할 수 없습니다."
     elif succeeded:

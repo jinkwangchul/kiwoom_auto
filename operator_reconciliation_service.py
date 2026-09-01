@@ -564,6 +564,7 @@ def assess_startup_recovery(
     order_locks_path: str | Path = DEFAULT_ORDER_LOCKS_PATH,
     routine_signals_path: str | Path = DEFAULT_ROUTINE_SIGNALS_PATH,
     stock_state_paths: list[str | Path] | None = None,
+    assignment_reconciliation_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assess whether the current process may resume automatic trading.
 
@@ -615,6 +616,35 @@ def assess_startup_recovery(
     blocked_reasons: list[str] = []
     review_reasons: list[str] = []
     reconciliation_details: list[dict[str, Any]] = []
+    assignment_summary = (
+        dict(assignment_reconciliation_summary)
+        if isinstance(assignment_reconciliation_summary, dict)
+        else {}
+    )
+    assignment_review_codes = tuple(
+        str(code or "").strip()
+        for code in tuple(assignment_summary.get("review_stock_codes") or ())
+        if str(code or "").strip()
+    )
+    if assignment_review_codes:
+        review_reasons.append(
+            "assignment reconciliation required: "
+            + ", ".join(assignment_review_codes)
+        )
+    failed_review_codes = tuple(
+        str(item.get("stock_code") or "").strip()
+        for item in tuple(assignment_summary.get("review_transitions") or ())
+        if isinstance(item, dict)
+        and item.get("ok") is not True
+        and str(item.get("stock_code") or "").strip()
+    )
+    if failed_review_codes:
+        blocked_reasons.append(
+            "assignment Review transition failed: "
+            + ", ".join(failed_review_codes)
+        )
+    if assignment_summary.get("global_fail_closed") is True:
+        blocked_reasons.append("assignment reconciliation has unidentified journal corruption")
     seen_order_ids: set[str] = set()
 
     for order in queue_orders:
@@ -792,6 +822,7 @@ def assess_startup_recovery(
         },
         "stock_state_summary": stock_summary,
         "operator_reconciliation": operator_items,
+        "assignment_reconciliation": assignment_summary,
         "reconciliation_details": reconciliation_details,
         "read_results": reads,
         "checked_at": _now_text(),

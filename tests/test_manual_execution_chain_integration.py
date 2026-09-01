@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ import operation_policy_gate
 import order_approval_engine
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_preview_order_service import preview_execution_for_real_ready_order
+from production_recovery_contract import STOCK_RESTORED, create_recovery_session_identity
+from production_recovery_state_registry import ProductionRecoveryStateRegistry
 from real_order_preflight_service import commit_real_order_preflight, preview_real_order_preflight
 
 
@@ -23,21 +26,36 @@ class ManualExecutionChainIntegrationTest(unittest.TestCase):
         self.stocks_dir = self.root / "stocks"
         self.stock_dir = self.stocks_dir / "003550_LG"
         self.queue_path = self.runtime_dir / "order_queue.json"
+        self.positions_path = self.runtime_dir / "positions.json"
         self.guard_path = self.runtime_dir / "real_trade_guard.json"
         self.operation_state_path = self.runtime_dir / "operation_state.json"
+        self.account_no = "12345678"
         self.runtime_dir.mkdir(parents=True)
         self.stock_dir.mkdir(parents=True)
+        self.recovery_registry = self._ready_recovery_registry()
         self._patches = [
             mock.patch.object(order_approval_engine, "RUNTIME_DIR", self.runtime_dir),
             mock.patch.object(order_approval_engine, "ORDER_QUEUE_PATH", self.queue_path),
             mock.patch.object(operation_policy_gate, "RUNTIME_DIR", self.runtime_dir),
             mock.patch.object(operation_policy_gate, "STOCKS_DIR", self.stocks_dir),
             mock.patch.object(operation_policy_gate, "ORDER_QUEUE_PATH", self.queue_path),
+            mock.patch.object(operation_policy_gate, "POSITIONS_PATH", self.positions_path),
             mock.patch.object(operation_policy_gate, "OPERATION_STATE_PATH", self.operation_state_path),
+            mock.patch.object(
+                operation_policy_gate,
+                "read_system_total_budget_for_recalculation",
+                return_value=4_000,
+            ),
+            mock.patch.object(
+                operation_policy_gate,
+                "production_recovery_registry",
+                self.recovery_registry,
+            ),
         ]
         for patcher in self._patches:
             patcher.start()
         self._write_json(self.operation_state_path, {})
+        self._write_json(self.positions_path, {"positions": []})
         self._write_json(
             self.stock_dir / "state.json",
             {
@@ -49,6 +67,29 @@ class ManualExecutionChainIntegrationTest(unittest.TestCase):
                 "auto_close": False,
             },
         )
+
+    def _ready_recovery_registry(self) -> ProductionRecoveryStateRegistry:
+        now = datetime.now()
+        identity = create_recovery_session_identity(
+            login_session_id="LOGIN_CHAIN_1",
+            account_no=self.account_no,
+            trading_day=now.date().isoformat(),
+            requested_at=now.isoformat(timespec="seconds"),
+        )
+        registry = ProductionRecoveryStateRegistry()
+        self.assertTrue(registry.begin_recovery(identity)["ok"])
+        self.assertTrue(registry.mark_collecting(identity)["ok"])
+        self.assertTrue(registry.mark_reconciling(identity)["ok"])
+        self.assertTrue(
+            registry.set_stock_result(
+                identity,
+                stock_code="003550",
+                stock_status=STOCK_RESTORED,
+                review_required=False,
+            )["ok"]
+        )
+        self.assertTrue(registry.complete_account(identity)["ok"])
+        return registry
 
     def tearDown(self) -> None:
         for patcher in reversed(self._patches):
@@ -98,6 +139,12 @@ class ManualExecutionChainIntegrationTest(unittest.TestCase):
                         "price_basis": "latest_price",
                         "quantity_estimated": 10,
                         "execution_enabled": False,
+                        "account_no": self.account_no,
+                        "execution_intent": {
+                            "side": "BUY",
+                            "budget": 1000,
+                            "account_no": self.account_no,
+                        },
                         "order_intent": {
                             "side": "BUY",
                             "hoga": "시장가",
@@ -137,6 +184,13 @@ class ManualExecutionChainIntegrationTest(unittest.TestCase):
         self.assertEqual("EXECUTABLE", executable_order["status"])
         self.assertEqual("EXECUTABLE", executable_order["policy_status"])
         self.assertFalse(executable_order["execution_enabled"])
+        policy_evidence = policy_result["policy_evidence"]
+        self.assertTrue(policy_evidence["available"])
+        self.assertTrue(policy_evidence["admitted"])
+        self.assertEqual(self.account_no, policy_evidence["account_no"])
+        self.assertEqual(4_000, policy_evidence["system_total_budget"])
+        self.assertEqual(0, policy_evidence["account_consumed_amount"])
+        self.assertEqual(1_000, policy_evidence["candidate_buy_amount"])
 
         enable_preview = preview_execution_enable(
             executable_order,

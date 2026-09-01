@@ -28,6 +28,7 @@ from gui_auto_trade_run_control import (
     initial_buy_start_validation,
 )
 from gui_main_table_loader import main_stock_resolved_starting_budget
+from tests.participant_owner_fixture import attach_participant_owner, participant_codes
 from gui_main_stock_context_menu import MainMonitoringStockOperationAdapter
 
 
@@ -127,6 +128,55 @@ class MainStockOperationHostTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_main_monitoring_adapter_has_no_application_command_borrowing(self) -> None:
+        method_names = {
+            name
+            for name, member in inspect.getmembers(
+                MainMonitoringStockOperationAdapter,
+                predicate=inspect.isfunction,
+            )
+            if not (name.startswith("__") and name.endswith("__"))
+        }
+        removed_command_proxies = {
+            "close",
+            "target_snapshot",
+            "set_stock_operation_exclusion",
+            "toggle_stock_operation_exclusion",
+            "set_selected_stock_operation_exclusions",
+            "clear_selected_stock_operation_exclusions",
+            "selected_stock_trade_permission_label",
+            "selected_stock_trade_permission_available",
+            "toggle_selected_stock_trade_permission",
+            "execute_selected_emergency_stop",
+            "unregister_selected_stocks",
+            "unregister_available",
+            "require_startup_recovery_session",
+            "show_auto_trade_result_dialog",
+            "start_selected_auto_trades",
+            "set_selected_individual_schedule_time",
+            "reset_selected_schedule_to_global",
+            "set_selected_continuous_operation_mode",
+            "handle_operation_mode_double_click",
+            "selected_manual_ats_state",
+            "save_selected_manual_ats_state",
+            "selected_manual_ats_execution_method_state",
+            "set_selected_manual_ats_execution_method",
+            "selected_manual_ats_liquidation_available",
+            "execute_selected_manual_ats_liquidation",
+            "show_operation_failure_dialog",
+            "apply_selected_early_close_profit_loss",
+            "cancel_selected_early_close",
+            "apply_selected_early_close",
+            "apply_selected_individual_liquidation_method",
+        }
+
+        self.assertTrue(removed_command_proxies.isdisjoint(method_names))
+        self.assertLessEqual(len(method_names), 40)
+        adapter_source = inspect.getsource(MainMonitoringStockOperationAdapter)
+        self.assertNotIn("AutoTradeSettingWindow", adapter_source)
+        self.assertNotIn("StockRepository", adapter_source)
+        self.assertNotIn("patch_stock_config", adapter_source)
+
     def test_host_is_widget_free_and_does_not_create_setting_window(self) -> None:
         owner = Mock()
         with patch(
@@ -221,7 +271,7 @@ class MainStockOperationHostTest(unittest.TestCase):
                 adapter.selected_stocks_are_operation_excluded.return_value = (
                     operation_excluded
                 )
-                adapter.target_snapshot.return_value = [
+                adapter.selected_stock_infos.return_value = [
                     (context_target.stock_dir, context_target.code, context_target.name)
                 ]
                 with patch.object(
@@ -945,6 +995,7 @@ class MainStockOperationHostTest(unittest.TestCase):
             monitor_sequence = list(_Menu.root.sequence)
 
             settings_window = Mock()
+            attach_participant_owner(settings_window)
             settings_window.stock_table.itemAt.return_value = None
             settings_window.stock_table.viewport.return_value.mapToGlobal.return_value = (
                 QPoint()
@@ -1010,7 +1061,7 @@ class MainStockOperationHostTest(unittest.TestCase):
                 encoding="utf-8",
             )
             host = AutoTradeOperationHost(Mock())
-            host._current_session_operation_participant_stock_codes = set()
+            self.assertEqual((), host.current_session_operation_participant_stock_codes())
             host.startup_recovery_session_ready = lambda refresh=False: True
 
             with patch(
@@ -1037,7 +1088,7 @@ class MainStockOperationHostTest(unittest.TestCase):
                 encoding="utf-8",
             )
             host = AutoTradeOperationHost(Mock())
-            host._current_session_operation_participant_stock_codes = {"005930"}
+            host.register_current_session_operation_participants({"005930"})
             host.startup_recovery_session_ready = lambda refresh=False: True
 
             targets, skipped = host.split_start_targets(

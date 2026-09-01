@@ -70,7 +70,7 @@ class GlobalDiagnosticObserverPhase5Tests(unittest.TestCase):
         ), patch.object(
             routine_signal_probe, "completed_timeframe_candles", return_value=[]
         ), patch.object(
-            routine_signal_probe, "read_latest_price", return_value=None
+            routine_signal_probe, "read_reference_price", return_value=None
         ), patch.object(
             routine_signal_probe, "_default_decision_trace_observer", return_value=None
         ), patch.object(routine_signal_probe, "_append_log") as append_log:

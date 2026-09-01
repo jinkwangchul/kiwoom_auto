@@ -94,8 +94,9 @@ from gui_auto_trade_policy import (
 )
 from gui_auto_trade_integrity import (
     auto_trade_setting_server_mismatch_detected,
+    inspect_review_state_data,
+    inspect_stock_review_state,
     is_operation_excluded,
-    is_review_required_state,
 )
 
 
@@ -326,11 +327,19 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
         for stock_dir in stock_dirs:
             code, name = parse_stock_folder_name(stock_dir.name)
             snapshot_data = stock_data_by_dir.get(str(stock_dir), {})
-            state = (
-                dict(snapshot_data.get("state", {}))
+            review_inspection = (
+                inspect_review_state_data(
+                    snapshot_data.get("state", {}),
+                    state_issue_reason=snapshot_data.get("state_issue_reason", ""),
+                    source="SETTINGS_REFRESH_SNAPSHOT",
+                )
                 if snapshot_data
-                else read_json_dict(stock_dir / "state.json")
+                else inspect_stock_review_state(
+                    stock_dir,
+                    loaded_state=read_json_dict(stock_dir / "state.json"),
+                )
             )
+            state = review_inspection.state
             trade_key = str(code or "").strip().lstrip("A")
             buy_trade_count, sell_trade_count = trade_counts_by_code.get(
                 trade_key,
@@ -346,7 +355,7 @@ def auto_trade_load_selected_routine_stocks(window) -> None:
             if not config:
                 config = default_config()
             operation_excluded = is_operation_excluded(config)
-            review_required = is_review_required_state(state)
+            review_required = review_inspection.review_required
             trade_started = auto_trade_setting_trade_started(state)
             operation_category = auto_trade_stock_operation_category(
                 window,

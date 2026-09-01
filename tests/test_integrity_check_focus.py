@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 import integrity_checker
+from gui_auto_trade_operation_host import AutoTradeOperationHost
+from tests.qt_test_support import dispose_qt_widget, flush_deferred_deletes
 
 
 class LocalStockIntegrityCheckTest(unittest.TestCase):
@@ -530,6 +532,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.parent = self._parent()
         self.patches = [
@@ -539,13 +542,13 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         ]
         for patcher in self.patches:
             patcher.start()
-
-    def tearDown(self) -> None:
-        for patcher in reversed(self.patches):
-            patcher.stop()
-        self.parent.close()
-        self.parent.deleteLater()
-        self.tmp.cleanup()
+            self.addCleanup(patcher.stop)
+        self.operation_host = AutoTradeOperationHost(self.parent)
+        self.parent._main_monitoring_auto_trade_operation_host = self.operation_host
+        self.addCleanup(flush_deferred_deletes, self.app)
+        self.addCleanup(self.parent.deleteLater)
+        self.addCleanup(self.parent.close)
+        self.addCleanup(self.operation_host.shutdown)
 
     def _parent(self):
         QWidget = self.QWidget
@@ -569,8 +572,7 @@ class StockRegisterIntegrityAutoCheckTest(unittest.TestCase):
         from gui_stock_register_window import StockRegisterWindow
 
         window = StockRegisterWindow(self.parent)
-        self.addCleanup(window.close)
-        self.addCleanup(window.deleteLater)
+        self.addCleanup(dispose_qt_widget, window, close=True)
         return window
 
     def test_integrity_toast_fallback_uses_window_center(self) -> None:

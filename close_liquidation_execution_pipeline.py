@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from order_approval_engine import evaluate_order_approval
-from order_candidate_engine import get_real_holding_qty, read_latest_price
+from order_candidate_engine import get_real_holding_qty
 from order_queue import append_order_candidates
 from operation_policy_gate import apply_operation_policy_gate_for_order
 from runtime_io import read_json_dict
@@ -50,7 +50,7 @@ def build_close_liquidation_candidate_preview(
     requested_at: str,
     routine_instance_id: str,
     reason: str,
-    latest_price_reader: Callable[[str, str], Any] = read_latest_price,
+    current_price_reader: Callable[[str, str], Any] | None = None,
 ) -> dict[str, Any]:
     path = Path(stock_dir).resolve()
     clean_code = str(code or "").strip()
@@ -103,18 +103,23 @@ def build_close_liquidation_candidate_preview(
     if holding_qty is None or holding_qty <= 0:
         blocked.append("actual holding quantity is missing or zero")
 
-    latest_price = latest_price_reader(clean_code, clean_name)
-    try:
-        price_value = (
-            float(latest_price) if latest_price not in (None, "") else None
-        )
-    except (TypeError, ValueError):
-        price_value = None
-    if (
-        normalized_method == METHOD_CURRENT_PRICE
-        and (price_value is None or price_value <= 0)
-    ):
-        blocked.append("current-price liquidation requires a positive current price")
+    price_value = None
+    if normalized_method == METHOD_CURRENT_PRICE:
+        try:
+            current_price = (
+                current_price_reader(clean_code, clean_name)
+                if callable(current_price_reader)
+                else None
+            )
+            price_value = (
+                float(current_price) if current_price not in (None, "") else None
+            )
+        except Exception:
+            price_value = None
+        if price_value is None or price_value <= 0:
+            blocked.append(
+                "current-price liquidation requires an actionable current price"
+            )
     if blocked:
         return result
 
@@ -149,9 +154,7 @@ def build_close_liquidation_candidate_preview(
         "candidate_status": "CANDIDATE_READY",
         "candidate_reason": str(reason or "청산 Command").strip(),
         "holding_source": "state",
-        "price_basis": (
-            "market" if normalized_method == METHOD_MARKET else "latest_price"
-        ),
+        "price_basis": normalized_method,
         "execution_enabled": False,
         "reason": str(reason or "LIQUIDATION_COMMAND").strip(),
         "order_intent": {

@@ -165,7 +165,6 @@ class AtsSessionVisibilityTest(unittest.TestCase):
 
             window = MagicMock()
             window.capture_stock_table_view_state.return_value = (set(), 0)
-            window.current_runtime_file_signature.return_value = ()
             result = ats_ops.auto_trade_save_manual_ats_state_for_targets(
                 window,
                 targets,

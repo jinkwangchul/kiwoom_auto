@@ -822,25 +822,25 @@ class KiwoomStockLibrarySyncService(QObject):
 
         summary = self._diagnostic_summary()
         self.state.diagnostic_summary = summary
-        payload = {
-            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
-            "source": SOURCE_NAME,
-            "login_session_id": self.state.session_id,
-            "connection_epoch": self.state.connection_epoch,
-            "captured_at": datetime.now().astimezone().isoformat(timespec="microseconds"),
-            "markets": self._market_diagnostics,
-            "summary": summary,
-            "invalid_items": self._invalid_items,
-        }
-        try:
-            diagnostic_path = self._write_diagnostic_file(payload)
-        except Exception:
-            LOGGER.exception("Stock Library invalid-code diagnostic write failed")
-            self.state.diagnostic_file_written = False
-            self.state.diagnostic_file_name = ""
-        else:
-            self.state.diagnostic_file_written = True
-            self.state.diagnostic_file_name = diagnostic_path.name
+        self.state.diagnostic_file_written = False
+        self.state.diagnostic_file_name = ""
+        if int(summary.get("invalid_count", 0) or 0) > 0:
+            payload = {
+                "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+                "source": SOURCE_NAME,
+                "login_session_id": self.state.session_id,
+                "connection_epoch": self.state.connection_epoch,
+                "captured_at": datetime.now().astimezone().isoformat(timespec="microseconds"),
+                "summary": summary,
+                "invalid_items": [dict(item) for item in self._invalid_items],
+            }
+            try:
+                diagnostic_path = self._write_diagnostic_file(payload)
+            except Exception:
+                LOGGER.exception("Stock Library invalid-code diagnostic write failed")
+            else:
+                self.state.diagnostic_file_written = True
+                self.state.diagnostic_file_name = diagnostic_path.name
         self._finalize_collection()
 
     def _finalize_collection(self) -> None:
@@ -1097,6 +1097,7 @@ class KiwoomStockLibrarySyncService(QObject):
                 "master_stock_info_duration_ms": self.state.master_stock_info_duration_ms,
                 "duplicate_count": self.state.duplicate_count,
                 "invalid_count": self.state.invalid_count,
+                "issue_detected": self.state.invalid_count > 0,
                 "conflict_count": self.state.conflict_count,
                 "duration_ms": self.state.duration_ms,
                 "content_sha256": self.state.content_sha256,

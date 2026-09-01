@@ -37,13 +37,18 @@ class ProductionMutableIsolationTest(unittest.TestCase):
         self.assertEqual(before, target.read_bytes())
 
     def test_production_stock_write_is_blocked_before_mutation(self) -> None:
-        target = PROJECT_ROOT / "stocks" / "005930_삼성전자" / "config.json"
-        before = target.read_bytes()
+        target = (
+            PROJECT_ROOT
+            / "stocks"
+            / "__production_mutable_guard_fixture__"
+            / "config.json"
+        )
+        self.assertFalse(target.exists())
 
         with self.assertRaisesRegex(AssertionError, "Production mutable"):
             target.write_text("{}", encoding="utf-8")
 
-        self.assertEqual(before, target.read_bytes())
+        self.assertFalse(target.exists())
 
     def test_atomic_replace_into_production_runtime_is_blocked(self) -> None:
         with TemporaryDirectory() as temp:

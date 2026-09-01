@@ -408,7 +408,7 @@ class DecisionTraceProductionObservationTests(unittest.TestCase):
         (stock_dir / "candles.json").write_text(json.dumps(self.candles), encoding="utf-8")
 
         with patch.object(routine_signal_probe, "_append_log"), patch.object(
-            routine_signal_probe, "read_latest_price", return_value=None
+            routine_signal_probe, "read_reference_price", return_value=None
         ):
             baseline = routine_signal_probe.probe_routine_for_stock(
                 _NoneRoutine, "지표추종매매", stock_dir, "tick", decision_trace_observer=None

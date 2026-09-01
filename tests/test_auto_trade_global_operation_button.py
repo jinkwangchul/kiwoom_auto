@@ -10,7 +10,6 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication, QPushButton, QTableWidget, QTableWidgetItem, QWidget
 
 import gui_auto_trade_run_control as run_control
@@ -21,6 +20,8 @@ import gui_auto_trade_setting_window as setting_window
 import gui_auto_trade_status_ops as status_ops
 import operation_policy_gate
 from runtime_io import read_json_dict
+from tests.participant_owner_fixture import attach_participant_owner
+from tests.qt_test_support import flush_deferred_deletes
 
 
 class _OperationButtonHarness(QWidget):
@@ -109,9 +110,6 @@ class _OperationButtonHarness(QWidget):
 
     def current_selected_routine_name(self) -> str:
         return ""
-
-    def production_recovery_stock_is_review_required(self, _code: str) -> bool:
-        return False
 
     def split_start_targets(self, selected):
         return setting_window.AutoTradeSettingWindow.split_start_targets(
@@ -237,6 +235,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             for index in range(1, 13)
         ]
         self.window = _OperationButtonHarness()
+        attach_participant_owner(self.window)
         self.window.registered_operation_targets = lambda: list(self.targets)
         self.addCleanup(self._dispose_window)
         self.registered_patcher = patch.object(
@@ -261,14 +260,13 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
     def _dispose_window(self) -> None:
         self.window.close()
         self.window.deleteLater()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.app.processEvents()
+        flush_deferred_deletes(self.app)
 
     def _create_stock(self, index: int):
         code = f"{index:06d}"
         name = f"테스트{index}"
-        stock_dir = self.root / f"{code}_{name}"
-        stock_dir.mkdir()
+        stock_dir = self.root / "stocks" / f"{code}_{name}"
+        stock_dir.mkdir(parents=True)
         (stock_dir / "config.json").write_text(
             json.dumps(
                 {
@@ -725,9 +723,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
         owner.routine_table = QTableWidget(0, 1, owner)
         owner.btn_start = QPushButton("▶ 운영시작", owner)
         owner.startup_recovery_session_ready = Mock(return_value=False)
-        owner._current_session_operation_participant_stock_codes = {
-            self.targets[0][1]
-        }
+        attach_participant_owner(owner, {self.targets[0][1]})
         adapter = monitoring_context_menu.MainMonitoringStockOperationAdapter(owner, [])
         adapter.registered_operation_targets = lambda: list(self.targets)
         setting_button = QPushButton("▶ 운영시작", owner)
@@ -738,9 +734,7 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             run_control.auto_trade_running_registered_operation_targets(setting_host)
         )
         setting_host.startup_recovery_session_ready.return_value = False
-        setting_host._current_session_operation_participant_stock_codes = {
-            self.targets[0][1]
-        }
+        attach_participant_owner(setting_host, {self.targets[0][1]})
 
         with patch.object(run_control, "read_operation_state", return_value={}):
             adapter.update_global_operation_button_state()
@@ -1807,7 +1801,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "WindowWithoutRoutineName",
             (),
              {
-                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
                  "startup_recovery_session_ready": lambda _self, refresh=False: True,
              },
         )()
@@ -1929,7 +1922,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "WindowWithoutRoutineName",
             (),
              {
-                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
                  "startup_recovery_session_ready": lambda _self, refresh=False: True,
              },
         )()
@@ -1980,7 +1972,6 @@ class AutoTradeGlobalOperationButtonTest(unittest.TestCase):
             "WindowWithoutRoutineName",
             (),
              {
-                 "production_recovery_stock_is_review_required": lambda _self, _code: False,
                  "startup_recovery_session_ready": lambda _self, refresh=False: True,
              },
         )()

@@ -27,8 +27,18 @@ from PyQt5.QtWidgets import (
 
 from routine_instance_registry import RoutineDefinitionRecord, RoutineInstanceRecord
 from gui_routine_registry import GroupRecord
+from tests.participant_owner_fixture import (
+    attach_participant_owner,
+    participant_codes,
+)
+from tests.qt_test_support import (
+    dispose_qt_widget,
+    ensure_qapplication,
+    flush_deferred_deletes,
+)
 
 import gui_auto_trade_setting_window as setting_window
+import auto_trade_performance_ui as performance_ui
 import auto_trade_order_execution_boundary as execution_boundary
 import gui_auto_trade_close as close_ops
 import gui_main_table_loader as main_table_loader
@@ -40,9 +50,10 @@ from gui_auto_trade_setting_window import AutoTradeSettingWindow
 class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._app = QApplication.instance() or QApplication([])
+        cls._app = ensure_qapplication()
 
     def setUp(self) -> None:
+        self._use_fixture_canonical_tree_owner = True
         self._canonical_auto_trade_projected_instance_ids = (
             setting_window.auto_trade_projected_instance_ids
         )
@@ -112,13 +123,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             setting_window,
             "normalize_base_stock_single_routine_file",
             return_value=False,
-        ), patch.object(
-            setting_window,
-            "ensure_single_real_trade_routine_for_all_stocks",
-        ), patch.object(
-            AutoTradeSettingWindow,
-            "current_runtime_file_signature",
-            return_value=tuple(),
         ), patch.object(
             AutoTradeSettingWindow,
             "update_review_required_button_text",
@@ -429,11 +433,273 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             group_id=group_id,
         )
 
+    def _fixture_canonical_tree_snapshot(self, window, instances, groups):
+        current_by_instance = window._current_stocks_by_instance()
+        historical_by_instance = window._historical_stocks_by_instance()
+        instance_by_id = {
+            str(instance.instance_id): instance for instance in instances
+        }
+        group_by_id = {
+            str(getattr(group, "group_id", "") or ""): group
+            for group in groups
+            if str(getattr(group, "group_id", "") or "")
+        }
+        fixture_stocks: list[dict[str, object]] = []
+        for relation_kind, stocks_by_instance in (
+            ("current", current_by_instance),
+            ("historical", historical_by_instance),
+        ):
+            for instance_id, stocks in stocks_by_instance.items():
+                instance = instance_by_id.get(str(instance_id))
+                for source in stocks:
+                    stock = dict(source)
+                    stock_path = str(stock.get("stock_path", "") or "")
+                    stock_code = str(
+                        stock.get("stock_code", "")
+                        or stock.get("code", "")
+                        or Path(stock_path).name.split("_", 1)[0]
+                    ).strip()
+                    stock_name = str(
+                        stock.get("stock_name", "")
+                        or stock.get("name", "")
+                        or (
+                            Path(stock_path).name.split("_", 1)[1]
+                            if "_" in Path(stock_path).name
+                            else stock_code
+                        )
+                    ).strip()
+                    stock.update(
+                        {
+                            "instance_id": str(instance_id),
+                            "stock_code": stock_code,
+                            "stock_name": stock_name,
+                            "is_historical": relation_kind == "historical",
+                            "group_id": str(
+                                getattr(instance, "group_id", "") or ""
+                            ),
+                        }
+                    )
+                    fixture_stocks.append(stock)
+
+        current_relations = {}
+        current_detail_by_code = {}
+        for stock in fixture_stocks:
+            code = str(stock["stock_code"])
+            if not bool(stock["is_historical"]):
+                current_relations[code] = SimpleNamespace(
+                    current_instance_id=str(stock["instance_id"]),
+                    current_group_id=str(stock["group_id"]),
+                )
+                current_detail_by_code[code] = {
+                    "stock_path": str(stock.get("stock_path", "") or ""),
+                    "stock_name": str(stock["stock_name"]),
+                }
+            else:
+                current_detail_by_code.setdefault(
+                    code,
+                    {
+                        "stock_path": str(stock.get("stock_path", "") or ""),
+                        "stock_name": str(stock["stock_name"]),
+                    },
+                )
+
+        stocks_by_code: dict[str, list[dict[str, object]]] = {}
+        for stock in fixture_stocks:
+            stocks_by_code.setdefault(str(stock["stock_code"]), []).append(stock)
+
+        stock_row_by_code = {}
+        for code, code_stocks in stocks_by_code.items():
+            relation = current_relations.get(code)
+            representative = next(
+                (
+                    stock
+                    for stock in code_stocks
+                    if not bool(stock["is_historical"])
+                ),
+                code_stocks[0],
+            )
+            stock_row_by_code[code] = SimpleNamespace(
+                stock_code=code,
+                stock_name=str(representative["stock_name"]),
+                current_instance_id=(
+                    str(relation.current_instance_id) if relation is not None else ""
+                ),
+                current_group_id=(
+                    str(relation.current_group_id) if relation is not None else ""
+                ),
+                current_relation_consistency=SimpleNamespace(
+                    consistent=True,
+                    reasons=(),
+                ),
+                is_currently_assigned=relation is not None,
+                fixture_stocks=tuple(code_stocks),
+            )
+
+        instance_rows = {}
+        for instance_id, instance in instance_by_id.items():
+            stocks = tuple(
+                stock
+                for stock in fixture_stocks
+                if str(stock["instance_id"]) == instance_id
+            )
+            instance_rows[instance_id] = SimpleNamespace(
+                instance_id=instance_id,
+                display_name=str(getattr(instance, "display_name", "") or instance_id),
+                group_id=str(getattr(instance, "group_id", "") or ""),
+                episode_ids=(),
+                fixture_stocks=stocks,
+            )
+        group_rows_by_id = {
+            group_id: SimpleNamespace(
+                group_id=group_id,
+                display_name=str(getattr(group, "name", "") or group_id),
+                episode_ids=(),
+                fixture_stocks=tuple(
+                    stock
+                    for stock in fixture_stocks
+                    if str(stock["group_id"]) == group_id
+                ),
+            )
+            for group_id, group in group_by_id.items()
+        }
+
+        def scoped_stocks(scope: str) -> tuple[dict[str, object], ...]:
+            if scope == "current":
+                return tuple(
+                    stock for stock in fixture_stocks if not stock["is_historical"]
+                )
+            if scope == "historical":
+                return tuple(
+                    stock for stock in fixture_stocks if stock["is_historical"]
+                )
+            return tuple(fixture_stocks)
+
+        snapshot = SimpleNamespace(
+            aggregator=SimpleNamespace(
+                snapshot=SimpleNamespace(episodes_by_id={}),
+            ),
+            projection=SimpleNamespace(
+                current_relations=SimpleNamespace(
+                    stocks_by_code=current_relations,
+                ),
+            ),
+            fixture_stocks=tuple(fixture_stocks),
+        )
+
+        def scoped_projection_row(row, scope: str):
+            scoped = tuple(
+                stock
+                for stock in row.fixture_stocks
+                if stock in scoped_stocks(scope)
+            )
+            return SimpleNamespace(
+                **{
+                    **vars(row),
+                    "fixture_stocks": scoped,
+                }
+            )
+
+        snapshot.group_rows = lambda scope: tuple(
+            scoped_projection_row(row, scope)
+            for row in group_rows_by_id.values()
+            if any(stock in scoped_stocks(scope) for stock in row.fixture_stocks)
+        )
+        snapshot.instance_rows = lambda scope: tuple(
+            scoped_projection_row(row, scope)
+            for row in instance_rows.values()
+            if any(stock in scoped_stocks(scope) for stock in row.fixture_stocks)
+        )
+        snapshot.stock_rows = lambda scope: tuple(
+            scoped_projection_row(stock_row_by_code[code], scope)
+            for code in dict.fromkeys(
+                str(stock["stock_code"]) for stock in scoped_stocks(scope)
+            )
+        )
+        snapshot.instance_stock_codes = lambda row: tuple(
+            dict.fromkeys(str(stock["stock_code"]) for stock in row.fixture_stocks)
+        )
+        snapshot.current_stock_detail = lambda code: dict(
+            current_detail_by_code[str(code)]
+        )
+        snapshot.stock_name = lambda row: str(row.stock_name)
+        snapshot.group_name = lambda row, **_kwargs: str(row.display_name)
+        snapshot.instance_name = lambda row, **_kwargs: str(row.display_name)
+        snapshot.identity_tooltip = lambda _row: "TEST_CANONICAL_FIXTURE"
+        return snapshot
+
+    def _fixture_canonical_performance_texts(
+        self,
+        window,
+        projection_row,
+        canonical_snapshot,
+    ):
+        if canonical_snapshot is None:
+            return AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+                window,
+                projection_row,
+                canonical_snapshot,
+            )
+        if projection_row is None:
+            stocks = [
+                dict(stock)
+                for stock in getattr(canonical_snapshot, "fixture_stocks", ())
+            ]
+            if not stocks:
+                return AutoTradeSettingWindow._routine_tree_canonical_performance_texts(
+                    window,
+                    projection_row,
+                    canonical_snapshot,
+                )
+            return window._routine_tree_performance_texts(stocks)
+        stocks = [
+            dict(stock)
+            for stock in getattr(projection_row, "fixture_stocks", ())
+        ]
+        if hasattr(projection_row, "stock_code") and len(stocks) > 1:
+            aggregate_key = "__canonical_stock_projection__"
+            aggregate_source = window._routine_tree_stock_group_performance_source(
+                stocks
+            )
+            return window._routine_tree_performance_texts(
+                [{"stock_path": aggregate_key}],
+                {aggregate_key: aggregate_source},
+            )
+        return window._routine_tree_performance_texts(stocks)
+
+    def _attach_fixture_canonical_tree_owner(self, window) -> None:
+        window._canonical_performance_snapshot_for_tree = lambda **kwargs: (
+            self._fixture_canonical_tree_snapshot(
+                window,
+                kwargs["instances"],
+                kwargs["groups"],
+            )
+        )
+        window._routine_tree_canonical_performance_texts = MethodType(
+            lambda target, row, snapshot: self._fixture_canonical_performance_texts(
+                target,
+                row,
+                snapshot,
+            ),
+            window,
+        )
+
+    def _patch_fixture_performance_source(self, source) -> None:
+        side_effect = lambda _context, stock: source(stock)
+        for module in (performance_ui, setting_window):
+            patcher = patch.object(
+                module,
+                "routine_tree_stock_performance_source",
+                side_effect=side_effect,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _window_harness(self):
-        class Harness(QObject):
+        class Harness(QWidget):
             pass
 
         harness = Harness()
+        attach_participant_owner(harness, set())
         harness.routine_table = QTableWidget(0, 1)
         harness.stock_table = QTableWidget(0, 1)
         harness.routine_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -459,6 +725,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         harness._routine_instance_name_editor_instance_id = ""
         harness._routine_instance_name_editor_original = ""
         harness._routine_instance_name_edit_finishing = False
+        harness.capture_stock_table_view_state = lambda: (set(), 0)
+        harness.restore_stock_table_view_state = lambda _paths, _scroll: None
         for name in (
             "_setup_routine_table",
             "_setup_stock_table",
@@ -479,7 +747,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_canonical_metric_tooltip",
             "_routine_tree_canonical_performance_texts",
             "_routine_tree_stock_group_performance_source",
-            "_routine_tree_group_stock_rows_by_code",
             "_routine_tree_performance_texts",
             "_routine_tree_metric_text_parts",
             "_routine_tree_metric_values",
@@ -538,9 +805,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "_routine_tree_stock_relation_kind",
             "_routine_tree_action_tooltip",
             "_routine_tree_stock_row_action_context",
-            "_routine_tree_register_convert_enabled_for_stock_row",
-            "_routine_tree_hide_historical_display_enabled_for_stock_row",
-            "_routine_tree_unregister_target_for_stock_row",
             "_routine_unassign_event_details",
             "_record_routine_unassign_blocked",
             "_escalate_routine_unassign_review",
@@ -565,8 +829,29 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             setattr(harness, name, MethodType(getattr(AutoTradeSettingWindow, name), harness))
         harness.update_review_required_button_text = MagicMock()
+        harness.update_action_buttons = MagicMock()
         harness.mark_review_required = MagicMock(return_value=True)
+        if bool(getattr(self, "_use_fixture_canonical_tree_owner", False)):
+            self._attach_fixture_canonical_tree_owner(harness)
+        self.addCleanup(self._dispose_window_harness, harness)
         return harness
+
+    def _dispose_window_harness(self, harness: QObject) -> None:
+        self._app.processEvents()
+        seen: set[int] = set()
+        roots = []
+        for value in vars(harness).values():
+            if not isinstance(value, QWidget) or value.parentWidget() is not None:
+                continue
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            roots.append(value)
+        for widget in roots:
+            widget.close()
+            widget.deleteLater()
+        harness.deleteLater()
+        flush_deferred_deletes(self._app)
 
     @contextmanager
     def _routine_instance_lookup(self, instance_id: str = "inst-a"):
@@ -617,11 +902,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.restore_stock_table_view_state = MagicMock()
         window.update_selected_routine_status_bar = MagicMock()
         window.load_selected_routine_stocks = MagicMock()
-        window.current_runtime_file_signature = MagicMock(return_value=("runtime",))
         window.update_action_buttons = MagicMock()
 
-        with patch.object(setting_window, "normalize_base_stock_single_routine_file"), \
-                patch.object(setting_window, "ensure_single_real_trade_routine_for_all_stocks"):
+        with patch.object(setting_window, "normalize_base_stock_single_routine_file"):
             AutoTradeSettingWindow.refresh_all(window)
 
         self.assertEqual([], selection_signal_calls)
@@ -637,8 +920,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.capture_stock_table_view_state = MagicMock(return_value=(set(), 0))
         window.load_routine_table = MagicMock(side_effect=RuntimeError("reload failed"))
 
-        with patch.object(setting_window, "normalize_base_stock_single_routine_file"), \
-                patch.object(setting_window, "ensure_single_real_trade_routine_for_all_stocks"):
+        with patch.object(setting_window, "normalize_base_stock_single_routine_file"):
             with self.assertRaises(RuntimeError):
                 AutoTradeSettingWindow.refresh_all(window)
 
@@ -1417,7 +1699,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "load_stock_library_snapshot",
                 return_value=SimpleNamespace(source="TEST", records=tuple(library)),
             ), \
-                patch.object(setting_window, "read_base_stocks", return_value=[]):
+                patch.object(setting_window, "read_base_stocks", return_value=[]), \
+                patch.object(
+                    setting_window,
+                    "inspect_stock_review_state",
+                    return_value=SimpleNamespace(review_required=False),
+                ):
             dialog = setting_window.InstanceStockSearchRegisterDialog(
                 None,
                 instance_metadata=metadata,
@@ -1600,7 +1887,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         register_row.assert_called_once_with(0)
 
-    def test_instance_stock_search_classification_uses_review_routine_or_pending(self) -> None:
+    def test_instance_stock_search_classification_fails_closed_for_missing_state(self) -> None:
         metadata = {
             "row_kind": "instance",
             "definition_id": "indicator_follow",
@@ -1670,11 +1957,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     dialog._classification_text("111111", "검토종목"),
                 )
                 self.assertEqual(
-                    "B 루틴",
+                    "검토관리",
                     dialog._classification_text("222222", "이동종목"),
                 )
                 self.assertEqual(
-                    "등록대기",
+                    "검토관리",
                     dialog._classification_text("333333", "대기종목"),
                 )
 
@@ -1782,15 +2069,18 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         def read_registered():
             return list(registered)
 
-        def update_instance(
+        def register_assignment(
+            _project_root,
             code,
             name,
             *,
+            operation_owner,
             instance_id,
             instance_name,
             definition_id,
             routine_type,
         ):
+            self.assertIs(operation_owner, parent)
             registered[:] = [
                 {
                     "code": code,
@@ -1798,7 +2088,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "assigned_routine_instance_id": instance_id,
                 }
             ]
-            return True
+            return SimpleNamespace(success=True, changed=True)
 
         stock_dir = Path("stocks") / "dummy"
         repository = MagicMock()
@@ -1813,12 +2103,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(setting_window, "read_base_stocks", side_effect=read_registered),
             patch.object(setting_window, "append_base_stock", return_value=True),
-            patch.object(
-                setting_window,
-                "update_base_stock_routine_instance",
-                side_effect=update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                side_effect=register_assignment,
             ),
             patch.object(setting_window, "StockRepository", return_value=repository),
+            patch.object(
+                setting_window,
+                "inspect_stock_review_state",
+                return_value=SimpleNamespace(review_required=False),
+            ),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
             patch.object(setting_window, "show_toast"),
@@ -1948,11 +2242,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         stock_dir = Path("stocks") / "dummy"
         repository = MagicMock()
         repository.resolve_stock_dir.return_value = stock_dir
+        repository.find_by_code.return_value = SimpleNamespace(
+            assigned_routine_instance_id="inst-a"
+        )
 
-        def update_routines(code, name, routines):
-            self.assertEqual(("005930", "삼성전자", []), (code, name, routines))
+        def execute_unassign(_owner, _root, code, name, *, expected_instance_id=None, intent=None):
+            self.assertEqual(("005930", "삼성전자"), (code, name))
+            self.assertEqual("inst-a", expected_instance_id)
             registered[0]["assigned_routine_instance_id"] = ""
-            return True
+            return SimpleNamespace(ok=True, changed=True)
 
         with (
             patch.object(setting_window, "read_base_stocks", side_effect=lambda: list(registered)),
@@ -1960,17 +2258,27 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "read_json_dict", return_value={}),
             patch.object(
                 setting_window,
+                "inspect_stock_review_state",
+                return_value=SimpleNamespace(review_required=False),
+            ),
+            patch.object(
+                setting_window,
                 "can_unassign_active_routine_from_stock",
                 return_value=(True, "A 인스턴스", []),
             ),
             patch.object(setting_window.QMessageBox, "question") as question,
-            patch.object(setting_window, "update_base_stock_routines", side_effect=update_routines) as update,
+            patch.object(
+                setting_window,
+                "inspect_stock_unregister_availability",
+                return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
+            ),
+            patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign) as execute,
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.unregister_selected_result_rows())
 
-        update.assert_called_once()
+        execute.assert_called_once()
         question.assert_not_called()
         ensure_routine.assert_called_once_with("005930", "삼성전자")
         parent.refresh_all.assert_called_once_with()
@@ -1990,27 +2298,44 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             }
         ]
 
-        def update_routines(_code, _name, _routines):
+        repository = MagicMock()
+        repository.find_by_code.return_value = SimpleNamespace(
+            assigned_routine_instance_id="inst-a"
+        )
+
+        def execute_unassign(_owner, _root, _code, _name, *, expected_instance_id=None, intent=None):
+            self.assertEqual("inst-a", expected_instance_id)
             registered[0]["assigned_routine_instance_id"] = ""
-            return True
+            return SimpleNamespace(ok=True, changed=True)
 
         with (
             patch.object(setting_window, "read_base_stocks", side_effect=lambda: list(registered)),
+            patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "read_json_dict", return_value={}),
+            patch.object(
+                setting_window,
+                "inspect_stock_review_state",
+                return_value=SimpleNamespace(review_required=False),
+            ),
             patch.object(
                 setting_window,
                 "can_unassign_active_routine_from_stock",
                 return_value=(True, "A 인스턴스", []),
             ),
             patch.object(setting_window.QMessageBox, "question") as question,
-            patch.object(setting_window, "update_base_stock_routines", side_effect=update_routines) as update,
+            patch.object(
+                setting_window,
+                "inspect_stock_unregister_availability",
+                return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
+            ),
+            patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign) as execute,
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.unregister_selected_result_rows())
 
         question.assert_not_called()
-        update.assert_called_once()
+        execute.assert_called_once()
         parent.refresh_all.assert_called_once_with()
         self.assertEqual("등록대기", dialog.result_table.item(0, 3).text())
         toast.assert_called_with(dialog, "등록해제 1건 | 삼성전자")
@@ -2039,12 +2364,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         stock_dir = Path("stocks") / "dummy"
         repository = MagicMock()
         repository.resolve_stock_dir.return_value = stock_dir
+        repository.find_by_code.return_value = SimpleNamespace(
+            assigned_routine_instance_id="inst-a"
+        )
 
-        def update_routines(code, _name, _routines):
+        def execute_unassign(_owner, _root, code, _name, *, expected_instance_id=None, intent=None):
+            self.assertEqual("inst-a", expected_instance_id)
             if code == "005930":
                 registered[0]["assigned_routine_instance_id"] = ""
-                return True
-            return False
+                return SimpleNamespace(ok=True, changed=True)
+            return SimpleNamespace(ok=False, changed=False)
 
         with (
             patch.object(setting_window, "read_base_stocks", side_effect=lambda: list(registered)),
@@ -2052,11 +2381,21 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "read_json_dict", return_value={}),
             patch.object(
                 setting_window,
+                "inspect_stock_review_state",
+                return_value=SimpleNamespace(review_required=False),
+            ),
+            patch.object(
+                setting_window,
                 "can_unassign_active_routine_from_stock",
                 return_value=(True, "A 인스턴스", []),
             ),
             patch.object(setting_window.QMessageBox, "question") as question,
-            patch.object(setting_window, "update_base_stock_routines", side_effect=update_routines),
+            patch.object(
+                setting_window,
+                "inspect_stock_unregister_availability",
+                return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
+            ),
+            patch.object(setting_window, "execute_assignment_unassign", side_effect=execute_unassign),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "show_toast") as toast,
         ):
@@ -2075,17 +2414,28 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         dialog.result_table.selectRow(0)
 
         with (
-            patch.object(dialog, "_is_review_required_stock", return_value=True),
-            patch.object(setting_window, "can_unassign_active_routine_from_stock") as policy,
-            patch.object(setting_window, "update_base_stock_routines") as update,
+            patch.object(
+                dialog,
+                "_registered_routine_name_for_stock",
+                return_value="A 인스턴스",
+            ),
+            patch.object(
+                setting_window,
+                "inspect_stock_unregister_availability",
+                return_value=SimpleNamespace(
+                    allowed=False,
+                    reason_code="REVIEW_REQUIRED",
+                ),
+            ) as inspect_unregister,
+            patch.object(setting_window, "execute_assignment_unassign") as execute_unassign,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(dialog.unregister_selected_result_rows())
 
-        policy.assert_not_called()
-        update.assert_not_called()
+        inspect_unregister.assert_called_once()
+        execute_unassign.assert_not_called()
         parent.refresh_all.assert_not_called()
-        toast.assert_called_once_with(dialog, "등록해제할 종목이 없습니다.")
+        toast.assert_called_once_with(dialog, "등록해제 차단 1건")
 
     def test_instance_stock_search_context_register_without_selection_uses_toast(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
@@ -2161,6 +2511,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         host = QWidget()
         host.refresh_stock_table = MagicMock()
+        host._stock_search_register_opener = setting_window.open_instance_stock_search_register_dialog
         self.addCleanup(host.close)
         with patch.object(
             setting_window,
@@ -2213,14 +2564,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", side_effect=library_stock),
             patch.object(setting_window, "read_base_stocks", return_value=registered),
             patch.object(setting_window, "append_base_stock", return_value=True) as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertTrue(dialog.register_selected_result_rows())
 
         append_stock.assert_called_once_with("005930", "삼성전자")
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
         question.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(dialog, "등록 1건 | 중복 1건 | 차단 1건")
@@ -2237,14 +2590,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "035420", "name": "NAVER"}),
             patch.object(setting_window, "read_base_stocks", return_value=[registered]),
             patch.object(setting_window, "append_base_stock") as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(dialog.register_or_assign_result_row(0))
 
         append_stock.assert_not_called()
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
         question.assert_not_called()
         parent.refresh_all.assert_not_called()
         toast.assert_called_once_with(dialog, "차단 1건")
@@ -2288,7 +2643,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "routine_action_reasons_for_stock", side_effect=assignment_guard),
             patch.object(setting_window.QMessageBox, "question", return_value=QMessageBox.Yes) as question,
             patch.object(setting_window, "append_base_stock", return_value=True) as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(success=True, changed=True),
+            ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
@@ -2297,21 +2655,21 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertTrue(dialog.register_selected_result_rows())
 
         append_stock.assert_called_once_with("005930", "삼성전자")
-        self.assertEqual(3, update_instance.call_count)
-        updated_codes = [call.args[0] for call in update_instance.call_args_list]
-        self.assertEqual(["005930", "005380", "035420"], updated_codes)
-        question.assert_called_once()
+        self.assertEqual(2, register_assignment.call_count)
+        updated_codes = [call.args[1] for call in register_assignment.call_args_list]
+        self.assertEqual(["005930", "005380"], updated_codes)
+        question.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(
             dialog,
-            "등록 2건 | 이동 1건 | 중복 1건 | 차단 1건",
+            "등록 2건 | 중복 1건 | 차단 2건",
         )
 
     def test_instance_stock_search_register_commit_allows_current_operation(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
         self._set_instance_stock_search_rows(dialog, [("005930", "삼성전자")])
         dialog.result_table.selectAll()
-        parent._current_session_operation_participant_stock_codes = {"000660"}
+        attach_participant_owner(parent, {"000660"})
         parent.running_registered_operation_targets = MagicMock(
             return_value=[(Path("stocks/000660_SK하이닉스"), "000660", "SK하이닉스")]
         )
@@ -2348,14 +2706,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent.running_registered_operation_targets.assert_not_called()
         self.assertEqual(
             {"000660"},
-            parent._current_session_operation_participant_stock_codes,
+            set(participant_codes(parent)),
         )
         append_stock.assert_called_once_with("005930", "삼성전자")
         assignment.assert_called_once()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(dialog, "등록 1건")
 
-    def test_instance_stock_search_context_register_skips_routine_move_when_declined(self) -> None:
+    def test_instance_stock_search_context_register_blocks_other_instance(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
         rows = [
             ("005930", "삼성전자"),
@@ -2381,9 +2739,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", side_effect=library_stock),
             patch.object(setting_window, "read_base_stocks", return_value=registered),
             patch.object(setting_window, "routine_action_reasons_for_stock", return_value=(True, {"reasons": []})),
-            patch.object(setting_window.QMessageBox, "question", return_value=QMessageBox.No),
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=QMessageBox.No,
+            ) as question,
             patch.object(setting_window, "append_base_stock", return_value=True),
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(success=True, changed=True),
+            ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
@@ -2391,15 +2756,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             self.assertTrue(dialog.register_selected_result_rows())
 
-        self.assertEqual(1, update_instance.call_count)
-        self.assertEqual("005930", update_instance.call_args.args[0])
+        self.assertEqual(1, register_assignment.call_count)
+        self.assertEqual("005930", register_assignment.call_args.args[1])
+        question.assert_not_called()
         parent.refresh_all.assert_called_once_with()
         toast.assert_called_with(
             dialog,
-            "등록 1건 | 등록 취소 1건",
+            "등록 1건 | 차단 1건",
         )
 
-    def test_instance_stock_search_context_register_declined_move_only_shows_cancel_toast(self) -> None:
+    def test_instance_stock_search_context_register_all_other_instances_are_blocked(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
         rows = [
             ("005930", "삼성전자"),
@@ -2422,15 +2788,22 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", side_effect=library_stock),
             patch.object(setting_window, "read_base_stocks", return_value=registered),
             patch.object(setting_window, "routine_action_reasons_for_stock", return_value=(True, {"reasons": []})),
-            patch.object(setting_window.QMessageBox, "question", return_value=QMessageBox.No),
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch.object(
+                setting_window.QMessageBox,
+                "question",
+                return_value=QMessageBox.No,
+            ) as question,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(dialog.register_selected_result_rows())
 
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
+        question.assert_not_called()
         parent.refresh_all.assert_not_called()
-        toast.assert_called_once_with(dialog, "등록 취소")
+        toast.assert_called_once_with(dialog, "차단 2건")
 
     def test_instance_stock_search_double_click_registers_and_assigns_new_stock(self) -> None:
         dialog, parent = self._instance_stock_search_dialog()
@@ -2443,7 +2816,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
             patch.object(setting_window, "read_base_stocks", return_value=[]),
             patch.object(setting_window, "append_base_stock", return_value=True) as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(success=True, changed=True),
+            ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
@@ -2452,12 +2828,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertTrue(dialog.register_or_assign_result_row(0))
 
         append_stock.assert_called_once_with("005930", "삼성전자")
-        update_instance.assert_called_once_with(
+        register_assignment.assert_called_once_with(
+            setting_window.PROJECT_ROOT,
             "005930",
             "삼성전자",
             instance_id="inst-a",
             instance_name="A 인스턴스",
             definition_id="indicator_follow",
+            operation_owner=parent,
             routine_type="지표추종매매",
         )
         repository.ensure_stock_folder.assert_called_once_with(
@@ -2485,7 +2863,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
             patch.object(setting_window, "read_base_stocks", return_value=[registered]),
             patch.object(setting_window, "append_base_stock") as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(success=True, changed=True),
+            ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(setting_window, "append_changelog"),
@@ -2494,7 +2875,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             self.assertTrue(dialog.register_or_assign_result_row(0))
 
         append_stock.assert_not_called()
-        update_instance.assert_called_once()
+        register_assignment.assert_called_once_with(
+            setting_window.PROJECT_ROOT,
+            "005930",
+            "삼성전자",
+            instance_id="inst-a",
+            instance_name="A 인스턴스",
+            definition_id="indicator_follow",
+            operation_owner=_parent,
+            routine_type="지표추종매매",
+        )
         toast.assert_called_with(dialog, "종목 지정이 완료됐습니다.")
 
     def test_instance_stock_search_double_click_skips_same_instance(self) -> None:
@@ -2509,17 +2899,19 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
             patch.object(setting_window, "read_base_stocks", return_value=[registered]),
             patch.object(setting_window, "append_base_stock") as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(dialog.register_or_assign_result_row(0))
 
         append_stock.assert_not_called()
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
         parent.refresh_all.assert_not_called()
         toast.assert_called_once_with(dialog, "이미 같은 루틴에 지정된 종목입니다.")
 
-    def test_instance_stock_search_double_click_reassigns_other_instance_after_confirmation(self) -> None:
+    def test_instance_stock_search_double_click_blocks_other_instance_without_confirmation(self) -> None:
         dialog, _parent = self._instance_stock_search_dialog()
         stock_dir = Path("stocks") / "005930_삼성전자"
         repository = MagicMock()
@@ -2534,66 +2926,74 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         with (
             patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
             patch.object(setting_window, "read_base_stocks", return_value=[registered]),
-            patch.object(setting_window, "routine_action_reasons_for_stock", return_value=(True, {"reasons": []})),
             patch.object(setting_window.QMessageBox, "question", return_value=QMessageBox.Yes) as question,
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
-            patch.object(setting_window, "StockRepository", return_value=repository),
-            patch.object(setting_window, "ensure_single_real_trade_routine_for_stock"),
-            patch.object(setting_window, "append_changelog"),
-            patch.object(setting_window, "show_toast") as toast,
-        ):
-            self.assertTrue(dialog.register_or_assign_result_row(0))
-
-        question.assert_called_once()
-        update_instance.assert_called_once()
-        toast.assert_called_with(dialog, "종목 지정이 변경됐습니다.")
-
-    def test_instance_stock_search_double_click_reassign_no_keeps_existing_assignment(self) -> None:
-        dialog, _parent = self._instance_stock_search_dialog()
-        registered = {
-            "code": "005930",
-            "name": "삼성전자",
-            "assigned_routine_instance_id": "inst-b",
-        }
-
-        with (
-            patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
-            patch.object(setting_window, "read_base_stocks", return_value=[registered]),
-            patch.object(setting_window, "routine_action_reasons_for_stock", return_value=(True, {"reasons": []})),
-            patch.object(setting_window.QMessageBox, "question", return_value=QMessageBox.No),
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
-            patch.object(setting_window, "show_toast") as toast,
-        ):
-            self.assertFalse(dialog.register_or_assign_result_row(0))
-
-        update_instance.assert_not_called()
-        toast.assert_called_once_with(dialog, "등록 취소")
-
-    def test_instance_stock_search_double_click_blocks_disallowed_reassign_with_toast(self) -> None:
-        dialog, _parent = self._instance_stock_search_dialog()
-        registered = {
-            "code": "005930",
-            "name": "삼성전자",
-            "assigned_routine_instance_id": "inst-b",
-        }
-
-        with (
-            patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
-            patch.object(setting_window, "read_base_stocks", return_value=[registered]),
-            patch.object(
-                setting_window,
-                "routine_action_reasons_for_stock",
-                return_value=(False, {"reasons": ["검토관리 종목입니다."]}),
-            ),
-            patch.object(setting_window.QMessageBox, "question") as question,
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(dialog.register_or_assign_result_row(0))
 
         question.assert_not_called()
-        update_instance.assert_not_called()
-        toast.assert_called_once_with(dialog, "검토관리 종목입니다.")
+        register_assignment.assert_not_called()
+        toast.assert_called_with(
+            dialog,
+            "다른 루틴에 등록된 종목입니다. 기존 등록전환 경로를 사용하세요.",
+        )
+
+    def test_instance_stock_search_double_click_other_instance_never_prompts(self) -> None:
+        dialog, _parent = self._instance_stock_search_dialog()
+        registered = {
+            "code": "005930",
+            "name": "삼성전자",
+            "assigned_routine_instance_id": "inst-b",
+        }
+
+        with (
+            patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
+            patch.object(setting_window, "read_base_stocks", return_value=[registered]),
+            patch.object(setting_window.QMessageBox, "question") as question,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
+            patch.object(setting_window, "show_toast") as toast,
+        ):
+            self.assertFalse(dialog.register_or_assign_result_row(0))
+
+        question.assert_not_called()
+        register_assignment.assert_not_called()
+        toast.assert_called_once_with(
+            dialog,
+            "다른 루틴에 등록된 종목입니다. 기존 등록전환 경로를 사용하세요.",
+        )
+
+    def test_instance_stock_search_double_click_other_instance_skips_move_policy(self) -> None:
+        dialog, _parent = self._instance_stock_search_dialog()
+        registered = {
+            "code": "005930",
+            "name": "삼성전자",
+            "assigned_routine_instance_id": "inst-b",
+        }
+
+        with (
+            patch.object(setting_window, "find_library_stock_by_code", return_value={"code": "005930", "name": "삼성전자"}),
+            patch.object(setting_window, "read_base_stocks", return_value=[registered]),
+            patch.object(setting_window, "routine_action_reasons_for_stock") as move_policy,
+            patch.object(setting_window.QMessageBox, "question") as question,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
+            patch.object(setting_window, "show_toast") as toast,
+        ):
+            self.assertFalse(dialog.register_or_assign_result_row(0))
+
+        question.assert_not_called()
+        move_policy.assert_not_called()
+        register_assignment.assert_not_called()
+        toast.assert_called_once_with(
+            dialog,
+            "다른 루틴에 등록된 종목입니다. 기존 등록전환 경로를 사용하세요.",
+        )
 
     def test_routine_move_policy_reports_unexpected_status_as_processing_error(self) -> None:
         with patch.object(
@@ -2620,18 +3020,27 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_routine_move_policy_allows_running_without_position_or_pending(self) -> None:
         for raw_status in ("RUNNING", "STARTED", "AUTO", "TRADING", "SELL_ONLY"):
-            with self.subTest(raw_status=raw_status), patch.object(
-                routine_policy,
-                "routine_action_guard_info",
-                return_value={
-                    "routine_name": "루틴A",
-                    "stock_dir": Path("stocks/005930_삼성전자"),
-                    "raw_status": raw_status,
-                    "display_status": "매수/매도",
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                },
+            with (
+                self.subTest(raw_status=raw_status),
+                patch.object(
+                    routine_policy,
+                    "routine_action_guard_info",
+                    return_value={
+                        "routine_name": "루틴A",
+                        "stock_dir": Path("stocks/005930_삼성전자"),
+                        "raw_status": raw_status,
+                        "state": {"status": raw_status, "holding_qty": 0},
+                        "display_status": "매수/매도",
+                        "holding_qty": 0,
+                        "buy_pending_qty": 0,
+                        "sell_pending_qty": 0,
+                    },
+                ),
+                patch.object(
+                    routine_policy,
+                    "is_review_protected_stock_dir",
+                    return_value=False,
+                ),
             ):
                 allowed, info = routine_policy.routine_action_reasons_for_stock(
                     "005930",
@@ -2663,7 +3072,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(["검토관리"], info["reasons"])
 
-    def test_routine_move_policy_moves_pending_integrity_error_to_review(self) -> None:
+    def test_routine_move_policy_reports_pending_integrity_without_mutation(self) -> None:
         with TemporaryDirectory() as temp:
             stock_dir = Path(temp) / "stocks" / "005930_삼성전자"
             stock_dir.mkdir(parents=True)
@@ -2719,9 +3128,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ["처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."],
             info["reasons"],
         )
-        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
-        self.assertTrue(saved_state["review_required"])
-        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
+        self.assertEqual("RUNNING", saved_state["status"])
+        self.assertNotIn("review_required", saved_state)
+        self.assertNotIn("review_reason", saved_state)
 
     def test_routine_move_policy_treats_paused_as_unexpected_legacy_state(self) -> None:
         with patch.object(
@@ -2855,20 +3264,38 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "instance_id": "inst-a",
             "instance_name": "A 인스턴스",
         }
-        repository = MagicMock()
+        scope = SimpleNamespace(instance_id="inst-a")
+        result = SimpleNamespace(
+            success=False,
+            error="",
+            blocked=(SimpleNamespace(message="지정 종목이 남아 있습니다."),),
+            cleared_stock_codes=(),
+        )
         with (
             patch.object(
-                setting_window,
-                "read_base_stocks",
-                return_value=[{"assigned_routine_instance_id": "inst-a"}],
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
             ),
             patch.object(setting_window.QMessageBox, "warning") as warning,
-            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+            patch(
+                "routine_instance_deletion_service.collect_routine_instance_deletion_scope",
+                return_value=scope,
+            ),
+            patch(
+                "routine_instance_deletion_service.delete_routine_instance_completely",
+                return_value=result,
+            ) as delete_instance,
+            patch.object(
+                setting_window,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
+            ),
         ):
             window.delete_routine_instance(metadata)
 
         warning.assert_called_once()
-        repository.delete_instance.assert_not_called()
+        delete_instance.assert_called_once_with(scope, running_stock_dirs=[])
         window.refresh_all.assert_not_called()
 
     def test_routine_instance_delete_checks_config_assignment_fallback(self) -> None:
@@ -2879,25 +3306,38 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "instance_id": "inst-a",
             "instance_name": "A 인스턴스",
         }
-        repository = MagicMock()
+        scope = SimpleNamespace(instance_id="inst-a")
+        result = SimpleNamespace(
+            success=False,
+            error="",
+            blocked=(SimpleNamespace(message="config assignment remains"),),
+            cleared_stock_codes=(),
+        )
         with (
             patch.object(
-                setting_window,
-                "read_base_stocks",
-                return_value=[{"stock_path": "stocks/005930_삼성전자"}],
+                setting_window.QMessageBox,
+                "question",
+                return_value=setting_window.QMessageBox.Yes,
+            ),
+            patch.object(setting_window.QMessageBox, "warning") as warning,
+            patch(
+                "routine_instance_deletion_service.collect_routine_instance_deletion_scope",
+                return_value=scope,
+            ) as collect_scope,
+            patch(
+                "routine_instance_deletion_service.delete_routine_instance_completely",
+                return_value=result,
             ),
             patch.object(
                 setting_window,
-                "read_json_dict",
-                return_value={"assigned_routine_instance_id": "inst-a"},
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
             ),
-            patch.object(setting_window.QMessageBox, "warning") as warning,
-            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
         ):
             window.delete_routine_instance(metadata)
 
+        collect_scope.assert_called_once_with(setting_window.PROJECT_ROOT, "inst-a")
         warning.assert_called_once()
-        repository.delete_instance.assert_not_called()
         window.refresh_all.assert_not_called()
 
     def test_routine_instance_delete_uses_repository_and_refreshes(self) -> None:
@@ -2908,21 +3348,39 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "instance_id": "inst-a",
             "instance_name": "A 인스턴스",
         }
-        repository = MagicMock()
-        repository.delete_instance.return_value = SimpleNamespace(success=True, error="")
+        scope = SimpleNamespace(instance_id="inst-a")
+        result = SimpleNamespace(
+            success=True,
+            error="",
+            blocked=(),
+            cleared_stock_codes=(),
+        )
         with (
-            patch.object(setting_window, "read_base_stocks", return_value=[]),
             patch.object(
                 setting_window.QMessageBox,
                 "question",
                 return_value=setting_window.QMessageBox.Yes,
             ),
-            patch.object(setting_window, "RoutineInstanceRepository", return_value=repository),
+            patch(
+                "routine_instance_deletion_service.collect_routine_instance_deletion_scope",
+                return_value=scope,
+            ),
+            patch(
+                "routine_instance_deletion_service.delete_routine_instance_completely",
+                return_value=result,
+            ) as delete_instance,
+            patch.object(
+                setting_window,
+                "auto_trade_running_registered_operation_targets",
+                return_value=[],
+            ),
+            patch.object(setting_window, "append_production_event"),
+            patch.object(setting_window, "refresh_auto_trade_views") as refresh_views,
         ):
             window.delete_routine_instance(metadata)
 
-        repository.delete_instance.assert_called_once_with("inst-a")
-        window.refresh_all.assert_called_once_with()
+        delete_instance.assert_called_once_with(scope, running_stock_dirs=[])
+        refresh_views.assert_called_once_with(window)
 
     def test_top_table_uses_definition_and_instance_rows_without_stock_scope_rows(self) -> None:
         instances = [self._instance("inst-a", "A 인스턴스"), self._instance("inst-b", "B 인스턴스")]
@@ -2970,6 +3428,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         parent_meta_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeMetaGroup")
         parent_status_group = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreeStatusGroup")
         parent_period = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriod")
+        parent_group_metric_gap = parent_widget.findChild(
+            setting_window.QWidget,
+            "autoTradeSettingRoutineTreeGroupMetricGap",
+        )
 
         parent_period_spacer = parent_widget.findChild(setting_window.QWidget, "autoTradeSettingRoutineTreePerformancePeriodSpacer")
         parent_identity_compensation = parent_widget.findChild(
@@ -2989,6 +3451,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIsNotNone(parent_meta_group)
         self.assertIsNone(parent_status_group)
         self.assertIsNone(parent_period)
+        self.assertIsNotNone(parent_group_metric_gap)
         self.assertIsNotNone(parent_profit)
         self.assertIsNone(parent_period_spacer)
         self.assertIsNone(parent_identity_compensation)
@@ -3036,9 +3499,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             for index in range(parent_widget.layout().count())
             if parent_widget.layout().itemAt(index).widget() is not None
         ]
+        parent_identity_index = parent_layout_widgets.index(parent_meta_group)
+        self.assertEqual(
+            parent_group_metric_gap,
+            parent_layout_widgets[parent_identity_index + 1],
+        )
         self.assertEqual(
             parent_profit,
-            parent_layout_widgets[parent_layout_widgets.index(parent_meta_group) + 1],
+            parent_layout_widgets[parent_identity_index + 2],
         )
         self.assertGreaterEqual(window.routine_table.item(0, 0).sizeHint().height(), parent_widget.sizeHint().height())
         child_widget = window.routine_table.cellWidget(1, 0)
@@ -3257,6 +3725,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_tree_display_level_badges_reserve_control_area_without_changing_table_width(self) -> None:
         window = self._window_harness()
+        window.load_selected_routine_stocks = MagicMock()
         window.eventFilter = MethodType(lambda _self, _obj, _event: False, window)
         window.routine_box = setting_window.QGroupBox("자동매매 루틴")
         window.routine_box.setAlignment(setting_window.Qt.AlignLeft)
@@ -3416,12 +3885,25 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         window = self._window_harness()
+        window._historical_stocks_by_instance = lambda: {}
         window._routine_tree_display_level_buttons = {}
         window._routine_tree_display_scope_buttons = {}
         window._routine_tree_display_criterion_buttons = {}
         window._routine_instance_operation_counts = lambda: {
-            "inst-stocked": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
-            "inst-empty": {"registered": 0, "running": 0, "stopped": 0, "error": 0},
+            "inst-stocked": {
+                "registered": 1,
+                "running": 0,
+                "stopped": 1,
+                "error": 0,
+                "normal": 1,
+            },
+            "inst-empty": {
+                "registered": 0,
+                "running": 0,
+                "stopped": 0,
+                "error": 0,
+                "normal": 0,
+            },
         }
 
         def visible_counts() -> dict[str, int]:
@@ -3460,7 +3942,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             )
             window._set_routine_tree_valid_only(True)
             self.assertEqual(
-                {"definition": 2, "instance": 0, "stock": 0},
+                {"definition": 1, "instance": 0, "stock": 0},
                 visible_counts(),
             )
             self.assertEqual(
@@ -3520,8 +4002,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {
@@ -3598,8 +4079,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {
@@ -3703,23 +4183,23 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             "fixture/history-minus": {"realized_profit": -48000.0, "trade_days": 2},
         }
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
+        self._attach_fixture_canonical_tree_owner(window)
         window._routine_instance_operation_counts = lambda: {
             "inst-a": {"registered": 0, "running": 0, "stopped": 0, "error": 0},
             "inst-b": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average": None,
             "average_rate": None,
             "profit_factor": 0.0,
-        }
+        })
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances):
@@ -3816,21 +4296,22 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         }
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
-        self.addCleanup(window.close)
+        attach_participant_owner(window, set())
+        self._attach_fixture_canonical_tree_owner(window)
+        self.addCleanup(dispose_qt_widget, window, close=True)
         window._routine_instance_operation_counts = lambda: {
             "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
             "inst-b": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: {}
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average_rate": 0.0,
-        }
+        })
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances):
@@ -3946,8 +4427,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {
@@ -4078,10 +4558,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             source_name="routine.json",
         )
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
+        self._attach_fixture_canonical_tree_owner(window)
+        attach_participant_owner(window)
         window._routine_instance_operation_counts = lambda: {}
 
         with patch.object(setting_window, "load_routine_definitions", return_value=[empty_definition]), \
@@ -4156,8 +4637,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         )
         instances = [self._instance("inst-a", "A 인스턴스")]
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {}
@@ -4283,9 +4763,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         ]
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
+        attach_participant_owner(window)
         self.addCleanup(window.close)
         window._routine_instance_operation_counts = lambda: {
             "inst-a": {"registered": 1, "running": 0, "stopped": 1, "error": 0},
@@ -4524,7 +5004,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         with patch.object(setting_window, "load_routine_definitions", return_value=[self._definition()]), \
                 patch.object(setting_window, "load_persisted_routine_instances", return_value=instances), \
                 patch.object(setting_window, "read_base_stocks", return_value=stocks), \
-                patch.object(setting_window, "read_orders_data", return_value=orders):
+                patch.object(performance_ui, "read_orders_data", return_value=orders):
             window.load_routine_table()
             window._toggle_routine_instance_collapsed("inst-a")
             collapsed_before = set(window._collapsed_auto_trade_instance_ids)
@@ -4704,7 +5184,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
 
         with patch.object(
-            setting_window,
+            performance_ui,
             "read_orders_data",
             return_value=orders,
         ):
@@ -4986,6 +5466,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             window = AutoTradeSettingWindow()
         try:
+            self._attach_fixture_canonical_tree_owner(window)
             window._routine_instance_operation_counts = lambda: {
                 instance.instance_id: {
                     "registered": 1,
@@ -4997,17 +5478,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             }
             window._historical_stocks_by_instance = lambda: historical_stocks
 
-            def performance_source(
-                _window,
-                stock: dict[str, object],
-            ) -> dict[str, object]:
+            def performance_source(stock: dict[str, object]) -> dict[str, object]:
                 code = str(stock.get("stock_code", stock.get("code", "")))
                 return dict(performance_by_code[code])
 
-            window._routine_tree_stock_performance_source = MethodType(
-                performance_source,
-                window,
-            )
+            self._patch_fixture_performance_source(performance_source)
             with (
                 patch.object(
                     setting_window,
@@ -6787,12 +7262,20 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "load_persisted_routine_instances", return_value=[instance]),
             patch.object(stock_register_window, "routine_definition_by_id", return_value=definition),
             patch.object(stock_register_window, "read_base_stocks", return_value=[{"code": "111111", "name": "가능1", "routines": []}]),
-            patch.object(stock_register_window, "routine_action_reasons_for_stock", return_value=(True, {})),
+            patch.object(
+                stock_register_window,
+                "inspect_assignment_authorization",
+                return_value=SimpleNamespace(allowed=True, reason_code="ALLOWED"),
+            ),
             patch.object(stock_register_window, "is_valid_stock_code", return_value=True),
             patch.object(stock_register_window, "find_library_stock_by_code", return_value={"code": "111111", "name": "가능1"}),
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
-            patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch.object(
+                stock_register_window,
+                "execute_assignment_change",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -6802,14 +7285,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=[("111111", "가능1")]):
                 window.show_stock_table_context_menu(QPoint(1, 1))
 
-        update_instance.assert_called_once_with(
-            "111111",
-            "가능1",
-            instance_id="inst-a",
-            instance_name="지표추종매매B",
-            definition_id="indicator_follow",
-            routine_type="지표추종매매",
-        )
+        execute_assignment.assert_called_once()
         repository.ensure_stock_folder.assert_called_once_with(
             "111111",
             "가능1",
@@ -6840,20 +7316,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         repository.resolve_stock_dir.side_effect = lambda code, name: stock_register_window.PROJECT_ROOT / "stocks" / f"{code}_{name}"
         repository.ensure_stock_folder.side_effect = lambda code, name, routine: stock_register_window.PROJECT_ROOT / "stocks" / f"{code}_{name}"
 
-        def policy(code, name, allow_unassigned=True):
+        def policy(_owner, _root, code, name, **_kwargs):
             if code == "444444":
-                return False, {"code": code, "name": name, "reasons": ["차단"]}
-            return True, {}
+                return SimpleNamespace(allowed=False, reason_code="REVIEW_REQUIRED")
+            return SimpleNamespace(allowed=True, reason_code="ALLOWED")
 
         with (
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(stock_register_window, "read_base_stocks", return_value=stocks),
-            patch.object(stock_register_window, "routine_action_reasons_for_stock", side_effect=policy),
+            patch.object(stock_register_window, "inspect_assignment_authorization", side_effect=policy),
             patch.object(stock_register_window, "is_valid_stock_code", return_value=True),
             patch.object(stock_register_window, "find_library_stock_by_code", side_effect=lambda code: {"code": code, "name": {"111111": "가능1", "222222": "가능2", "333333": "중복", "444444": "차단"}[code]}),
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
-            patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch.object(
+                stock_register_window,
+                "execute_assignment_change",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -6863,7 +7343,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=[(item["code"], item["name"]) for item in stocks]):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
-        self.assertEqual(2, update_instance.call_count)
+        self.assertEqual(2, execute_assignment.call_count)
         ensure_single.assert_any_call("111111", "가능1", "지표추종매매")
         ensure_single.assert_any_call("222222", "가능2", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 2종목 | 등록불가 2종목")
@@ -6880,10 +7360,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window, "read_base_stocks", return_value=[{"code": code, "name": name, "routines": []} for code, name in selected]),
             patch.object(
                 stock_register_window,
-                "routine_action_reasons_for_stock",
-                side_effect=lambda code, name, allow_unassigned=True: (False, {"code": code, "name": name, "reasons": ["차단"]}),
+                "inspect_assignment_authorization",
+                return_value=SimpleNamespace(allowed=False, reason_code="REVIEW_REQUIRED"),
             ),
-            patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
+            patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -6893,7 +7373,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
-        update_instance.assert_not_called()
+        execute_assignment.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 2종목")
@@ -6959,21 +7439,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(stock_register_window, "read_base_stocks", return_value=[{"code": "111111", "name": "긴급대기", "routines": []}]),
             patch.object(
-                routine_policy,
-                "routine_action_guard_info",
-                return_value={
-                    "code": "111111",
-                    "name": "긴급대기",
-                    "routine_name": "",
-                    "raw_status": "EMERGENCY_STOPPED",
-                    "state": {"status": "EMERGENCY_STOPPED"},
-                    "stock_dir": None,
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                },
+                stock_register_window,
+                "inspect_assignment_authorization",
+                return_value=SimpleNamespace(allowed=False, reason_code="EMERGENCY_REQUIRED"),
             ),
-            patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
+            patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -6983,7 +7453,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
-        update_instance.assert_not_called()
+        execute_assignment.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
@@ -6999,21 +7469,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(stock_register_window, "read_base_stocks", return_value=[{"code": "111111", "name": "검토대기", "routines": []}]),
             patch.object(
-                routine_policy,
-                "routine_action_guard_info",
-                return_value={
-                    "code": "111111",
-                    "name": "검토대기",
-                    "routine_name": "",
-                    "raw_status": "STOPPED",
-                    "state": {"status": "STOPPED", "review_required": True},
-                    "stock_dir": None,
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                },
+                stock_register_window,
+                "inspect_assignment_authorization",
+                return_value=SimpleNamespace(allowed=False, reason_code="REVIEW_REQUIRED"),
             ),
-            patch.object(stock_register_window, "update_base_stock_routine_instance") as update_instance,
+            patch.object(stock_register_window, "execute_assignment_change") as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7023,7 +7483,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
-        update_instance.assert_not_called()
+        execute_assignment.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴등록 0종목 | 등록불가 1종목")
@@ -7038,40 +7498,24 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         repository.resolve_stock_dir.side_effect = lambda code, name: stock_register_window.PROJECT_ROOT / "stocks" / f"{code}_{name}"
         repository.ensure_stock_folder.side_effect = lambda code, name, routine: stock_register_window.PROJECT_ROOT / "stocks" / f"{code}_{name}"
 
-        def guard_info(code, name):
+        def guard_info(_owner, _root, code, name, **_kwargs):
             if code == "222222":
-                return {
-                    "code": code,
-                    "name": name,
-                    "routine_name": "",
-                    "raw_status": "EMERGENCY_STOP",
-                    "state": {"status": "EMERGENCY_STOP"},
-                    "stock_dir": None,
-                    "holding_qty": 0,
-                    "buy_pending_qty": 0,
-                    "sell_pending_qty": 0,
-                }
-            return {
-                "code": code,
-                "name": name,
-                "routine_name": "",
-                "raw_status": "STOPPED",
-                "state": {"status": "STOPPED"},
-                "stock_dir": None,
-                "holding_qty": 0,
-                "buy_pending_qty": 0,
-                "sell_pending_qty": 0,
-            }
+                return SimpleNamespace(allowed=False, reason_code="EMERGENCY_REQUIRED")
+            return SimpleNamespace(allowed=True, reason_code="ALLOWED")
 
         with (
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(stock_register_window, "read_base_stocks", return_value=[{"code": code, "name": name, "routines": []} for code, name in selected]),
-            patch.object(routine_policy, "routine_action_guard_info", side_effect=guard_info),
+            patch.object(stock_register_window, "inspect_assignment_authorization", side_effect=guard_info),
             patch.object(stock_register_window, "is_valid_stock_code", return_value=True),
             patch.object(stock_register_window, "find_library_stock_by_code", side_effect=lambda code: {"code": code, "name": {"111111": "가능", "222222": "긴급"}[code]}),
             patch.object(stock_register_window, "stock_repository_factory", return_value=repository),
             patch.object(stock_register_window, "read_json_dict", return_value={}),
-            patch.object(stock_register_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch.object(
+                stock_register_window,
+                "execute_assignment_change",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_assignment,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7081,14 +7525,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.assign_selected_stocks_to_routine_instance(instance, definition)
 
-        update_instance.assert_called_once_with(
-            "111111",
-            "가능",
-            instance_id="inst-a",
-            instance_name="지표추종매매B",
-            definition_id="indicator_follow",
-            routine_type="지표추종매매",
-        )
+        execute_assignment.assert_called_once()
         ensure_single.assert_called_once_with("111111", "가능", "지표추종매매")
         toast.assert_called_once_with(window, "루틴등록 1종목 | 등록불가 1종목")
 
@@ -7136,11 +7573,39 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         FakeMenu.last.actions[3].setEnabled.assert_called_once_with(True)
 
     def test_routine_policy_blocks_emergency_unassign(self) -> None:
+        runtime = routine_policy.RoutineUnassignRuntimeResolution(
+            status="FOUND",
+            stock_dir=Path("stocks") / "111111_긴급",
+            config={
+                "assigned_routine_instance_id": "inst-a",
+                "routine": "루틴A",
+                "routine_definition_id": "def-a",
+                "routine_instance_name": "A 인스턴스",
+            },
+            state={"status": "EMERGENCY_STOP", "holding_qty": 0},
+        )
         with (
-            patch.object(routine_policy, "base_stock_routines_for_stock", return_value=(True, ["루틴A"])),
-            patch.object(routine_policy, "stock_runtime_dir_for_routine", return_value=Path("stocks") / "111111_긴급"),
-            patch.object(routine_policy, "read_json_dict", return_value={"status": "EMERGENCY_STOP"}),
+            patch.object(
+                routine_policy,
+                "resolve_routine_unassign_runtime",
+                return_value=runtime,
+            ),
+            patch.object(
+                routine_policy,
+                "routine_instance_by_id",
+                return_value=SimpleNamespace(
+                    definition_id="def-a",
+                    display_name="A 인스턴스",
+                    source_routine_name="루틴A",
+                ),
+            ),
+            patch.object(
+                routine_policy,
+                "routine_definition_by_id",
+                return_value=SimpleNamespace(display_name="루틴A"),
+            ),
             patch.object(routine_policy, "pending_order_side_quantities", return_value=(0, 0)),
+            patch.object(routine_policy, "is_review_protected_stock_dir", return_value=False),
         ):
             allowed, routine_name, reasons = routine_policy.can_unassign_active_routine_from_stock(
                 "111111",
@@ -7149,14 +7614,46 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual("루틴A", routine_name)
-        self.assertEqual(["검토관리", "긴급정지"], reasons)
+        self.assertEqual(["긴급정지 상태입니다."], reasons)
 
     def test_routine_policy_blocks_review_unassign(self) -> None:
+        runtime = routine_policy.RoutineUnassignRuntimeResolution(
+            status="FOUND",
+            stock_dir=Path("stocks") / "111111_검토",
+            config={
+                "assigned_routine_instance_id": "inst-a",
+                "routine": "루틴A",
+                "routine_definition_id": "def-a",
+                "routine_instance_name": "A 인스턴스",
+            },
+            state={
+                "status": "STOPPED",
+                "review_required": True,
+                "holding_qty": 0,
+            },
+        )
         with (
-            patch.object(routine_policy, "base_stock_routines_for_stock", return_value=(True, ["루틴A"])),
-            patch.object(routine_policy, "stock_runtime_dir_for_routine", return_value=Path("stocks") / "111111_검토"),
-            patch.object(routine_policy, "read_json_dict", return_value={"status": "STOPPED", "review_required": True}),
+            patch.object(
+                routine_policy,
+                "resolve_routine_unassign_runtime",
+                return_value=runtime,
+            ),
+            patch.object(
+                routine_policy,
+                "routine_instance_by_id",
+                return_value=SimpleNamespace(
+                    definition_id="def-a",
+                    display_name="A 인스턴스",
+                    source_routine_name="루틴A",
+                ),
+            ),
+            patch.object(
+                routine_policy,
+                "routine_definition_by_id",
+                return_value=SimpleNamespace(display_name="루틴A"),
+            ),
             patch.object(routine_policy, "pending_order_side_quantities", return_value=(0, 0)),
+            patch.object(routine_policy, "is_review_protected_stock_dir", return_value=False),
         ):
             allowed, routine_name, reasons = routine_policy.can_unassign_active_routine_from_stock(
                 "111111",
@@ -7165,7 +7662,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual("루틴A", routine_name)
-        self.assertEqual(["검토관리"], reasons)
+        self.assertEqual(["검토관리 대상입니다."], reasons)
 
     def test_stock_register_unassign_blocks_emergency_before_writer(self) -> None:
         import gui_stock_register_window as stock_register_window
@@ -7174,10 +7671,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         with (
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
-            patch.object(routine_policy, "base_stock_routines_for_stock", return_value=(True, ["지표추종매매"])),
-            patch.object(routine_policy, "stock_runtime_dir_for_routine", return_value=Path("stocks") / "005930_삼성전자"),
-            patch.object(routine_policy, "read_json_dict", return_value={"status": "EMERGENCY_STOPPED"}),
-            patch.object(routine_policy, "pending_order_side_quantities", return_value=(0, 0)),
+            patch.object(
+                stock_register_window,
+                "can_unassign_active_routine_from_stock",
+                return_value=(False, "지표추종매매", ["검토관리", "긴급정지"]),
+            ),
             patch.object(
                 stock_register_window,
                 "routine_action_guard_info",
@@ -7189,7 +7687,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "state": {"status": "EMERGENCY_STOPPED"},
                 },
             ),
-            patch.object(stock_register_window, "update_base_stock_routines") as update,
+            patch.object(stock_register_window, "execute_assignment_unassign") as execute_unassign,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7200,7 +7698,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.unassign_selected_stock_routines()
 
-        update.assert_not_called()
+        execute_unassign.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
@@ -7212,10 +7710,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
         with (
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
-            patch.object(routine_policy, "base_stock_routines_for_stock", return_value=(True, ["지표추종매매"])),
-            patch.object(routine_policy, "stock_runtime_dir_for_routine", return_value=Path("stocks") / "005930_검토종목"),
-            patch.object(routine_policy, "read_json_dict", return_value={"status": "STOPPED", "review_required": True}),
-            patch.object(routine_policy, "pending_order_side_quantities", return_value=(0, 0)),
+            patch.object(
+                stock_register_window,
+                "can_unassign_active_routine_from_stock",
+                return_value=(False, "지표추종매매", ["검토관리"]),
+            ),
             patch.object(
                 stock_register_window,
                 "routine_action_guard_info",
@@ -7227,7 +7726,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "state": {"status": "STOPPED", "review_required": True},
                 },
             ),
-            patch.object(stock_register_window, "update_base_stock_routines") as update,
+            patch.object(stock_register_window, "execute_assignment_unassign") as execute_unassign,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7238,7 +7737,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.unassign_selected_stock_routines()
 
-        update.assert_not_called()
+        execute_unassign.assert_not_called()
         ensure_single.assert_not_called()
         changelog.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 1종목")
@@ -7364,7 +7863,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         import gui_stock_register_window as stock_register_window
 
         cases = [
-            ("holding", "STOPPED", {"holding_qty": 1}, [], "보유수량 있음"),
+            (
+                "holding",
+                "STOPPED",
+                {"holding_qty": 1, "avg_price": 1000},
+                [],
+                "보유수량 있음",
+            ),
             ("buy_pending", "STOPPED", {}, [{"status": "OPEN", "side": "BUY", "pending_qty": 3}], "매수미결 있음"),
             ("sell_pending", "STOPPED", {}, [{"status": "OPEN", "side": "SELL", "pending_qty": 2}], "매도미결 있음"),
             ("running", "RUNNING", {}, [], "운영 중"),
@@ -7700,7 +8205,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(stock_register_window.StockRegisterWindow, "refresh_stock_table", lambda _self: None),
             patch.object(stock_register_window, "can_unassign_active_routine_from_stock", side_effect=classify),
             patch.object(stock_register_window, "routine_action_guard_info", side_effect=guard_info),
-            patch.object(stock_register_window, "update_base_stock_routines", return_value=True) as update,
+            patch.object(
+                stock_register_window,
+                "execute_assignment_unassign",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(stock_register_window, "append_changelog") as changelog,
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7712,13 +8221,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.unassign_selected_stock_routines()
 
-        self.assertEqual(
-            [
-                ("111111", "가능1", []),
-                ("222222", "가능2", []),
-            ],
-            [call.args for call in update.call_args_list],
-        )
+        self.assertEqual(2, execute_unassign.call_count)
         ensure_single.assert_any_call("111111", "가능1")
         ensure_single.assert_any_call("222222", "가능2")
         changelog.assert_called_once()
@@ -7742,7 +8245,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "routine_action_guard_info",
                 side_effect=lambda code, name: {"code": code, "name": name, "routine_name": "루틴A"},
             ),
-            patch.object(stock_register_window, "update_base_stock_routines") as update,
+            patch.object(stock_register_window, "execute_assignment_unassign") as execute_unassign,
             patch.object(stock_register_window, "show_toast") as toast,
             patch.object(stock_register_window.QMessageBox, "information") as information,
             patch.object(stock_register_window.QDialog, "exec_", side_effect=AssertionError("confirm dialog must not open")),
@@ -7752,7 +8255,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.unassign_selected_stock_routines()
 
-        update.assert_not_called()
+        execute_unassign.assert_not_called()
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 0종목 | 해제불가 2종목")
 
@@ -7768,7 +8271,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "can_unassign_active_routine_from_stock",
                 return_value=(True, "루틴A", []),
             ),
-            patch.object(stock_register_window, "update_base_stock_routines", return_value=True) as update,
+            patch.object(
+                stock_register_window,
+                "execute_assignment_unassign",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(stock_register_window, "ensure_single_real_trade_routine_for_stock"),
             patch.object(stock_register_window, "append_changelog"),
             patch.object(stock_register_window, "show_toast") as toast,
@@ -7780,7 +8287,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             with patch.object(window, "selected_registered_stocks", return_value=selected):
                 window.unassign_selected_stock_routines()
 
-        self.assertEqual(2, update.call_count)
+        self.assertEqual(2, execute_unassign.call_count)
         information.assert_not_called()
         toast.assert_called_once_with(window, "루틴해제 2종목 | 해제불가 0종목")
 
@@ -7811,7 +8318,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("#D1D5DB", stock_header._section_grid_color().name().upper())
 
     def test_window_uses_standard_minimize_maximize_close_title_buttons(self) -> None:
-        window = setting_window.AutoTradeSettingWindow()
+        with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
+            window = setting_window.AutoTradeSettingWindow()
+        attach_participant_owner(window)
         try:
             flags = window.windowFlags()
             self.assertFalse(bool(flags & setting_window.Qt.WindowContextHelpButtonHint))
@@ -8010,9 +8520,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_group_and_instance_title_slots_match_display_contract(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
+        attach_participant_owner(window)
         self.addCleanup(window.close)
         rows = [
             {
@@ -8087,7 +8597,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window._routine_tree_row_geometry["group_metric_gap"],
                 gap.width(),
             )
-            self.assertEqual(badge_right + gap.width(), profit_left)
             group_profit_lefts.add(profit_left)
         self.assertEqual(1, len(group_profit_lefts))
 
@@ -8115,14 +8624,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 expected_gap,
                 window._routine_tree_row_geometry["child_title_shift"],
             )
-            self.assertEqual(title_right + gap.width(), period_left)
             instance_period_lefts.add(period_left)
         self.assertEqual(1, len(instance_period_lefts))
 
     def test_disclosure_icons_receive_clicks_and_preserve_metric_axes(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         rows = [
@@ -8478,8 +8985,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_routine_tree_restores_fixed_metric_widths(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window.resize(3000, window.height())
@@ -8590,8 +9096,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_group_row_keeps_compact_identity_and_metric_layout(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window.resize(3000, window.height())
@@ -8849,8 +9354,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_stock_title_uses_seven_character_slot_and_fixed_period_axis(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         rows = [
@@ -8938,7 +9442,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 window._routine_tree_row_geometry["stock_metric_gap"],
                 gap.width(),
             )
-            self.assertEqual(title_right + gap.width(), period_left)
             for object_name in metric_object_names:
                 metric = widget.findChild(setting_window.QWidget, object_name)
                 self.assertEqual(
@@ -9038,7 +9541,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             window.stock_table.setColumnCount(11)
             window._stock_status_filter = "all"
             window._stock_visual_order = []
-            window._current_session_operation_participant_stock_codes = set()
+            attach_participant_owner(window)
             window.capture_stock_table_view_state = lambda: (set(), 0)
             window.restore_stock_table_view_state = lambda _paths, _scroll: None
             window.update_selected_routine_status_bar = lambda: None
@@ -9375,8 +9878,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_selection_summary_area_is_removed_from_workspace(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
 
@@ -9579,7 +10081,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual("#111827", setting_window.AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR)
         self.assertEqual("#4B5563", setting_window.AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR)
         self.assertEqual(
-            expected_active_badge_style,
+            expected_inactive_badge_style,
             window.btn_all_stocks.styleSheet(),
         )
         self.assertTrue(
@@ -9742,8 +10244,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_actual_registered_stock_badge_single_and_double_click_projection(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window._all_stocks_scope_active = True
@@ -9822,7 +10323,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window._selected_stock_normal_projection_active = True
         window._stock_status_filter = "normal"
         window._stock_visual_order = []
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         window.stock_table.setColumnCount(11)
         window.capture_stock_table_view_state = lambda: (set(), 0)
         window.restore_stock_table_view_state = lambda _paths, _scroll: None
@@ -9886,10 +10387,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_all_stocks_button_restores_hierarchical_row_scope_on_selection(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
-        self.addCleanup(window.close)
+        attach_participant_owner(window, set())
+        self.addCleanup(dispose_qt_widget, window, close=True)
         stock_loader = MagicMock()
         window.load_selected_routine_stocks = stock_loader
         window.routine_table.setRowCount(2)
@@ -9978,9 +10479,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
 
     def test_auto_trade_setting_open_resets_default_filters(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
+        attach_participant_owner(window)
         self.addCleanup(window.close)
         stock_loader = MagicMock()
         window.load_selected_routine_stocks = stock_loader
@@ -10224,7 +10725,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.all_registered_instance_ids = lambda: tuple(
             instance.instance_id for instance in instances
         )
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         window._stock_visual_order = []
         window.stock_table.setColumnCount(11)
         window.capture_stock_table_view_state = lambda: (set(), 0)
@@ -10350,7 +10851,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window._routine_tree_valid_only = True
         window._all_stocks_scope_active = True
         window._stock_status_filter = "all"
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         window._stock_visual_order = []
         window.stock_table.setColumnCount(11)
         window.capture_stock_table_view_state = lambda: (set(), 0)
@@ -10545,7 +11046,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window._selected_stock_normal_projection_active = False
         window._stock_status_filter = "all"
         window._stock_visual_order = []
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
         window.stock_table.setColumnCount(11)
         window.capture_stock_table_view_state = lambda: (set(), 0)
         window.restore_stock_table_view_state = lambda _paths, _scroll: None
@@ -10704,11 +11205,6 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "update_startup_recovery_controls",
                 lambda _self: None,
             ),
-            patch.object(
-                AutoTradeSettingWindow,
-                "current_runtime_file_signature",
-                lambda _self: tuple(),
-            ),
         ):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
@@ -10728,14 +11224,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.update_selected_routine_status_bar = MagicMock()
         window.update_review_required_button_text = MagicMock()
         window.update_action_buttons = MagicMock()
-        window.current_runtime_file_signature = lambda: tuple()
-
         with (
             patch.object(setting_window, "normalize_base_stock_single_routine_file"),
-            patch.object(
-                setting_window,
-                "ensure_single_real_trade_routine_for_all_stocks",
-            ),
             patch(
                 "gui_main_table_loader._invalidate_main_pnl_refresh_cache"
             ),
@@ -10783,19 +11273,40 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertNotIn("현재 종목", [window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["display_name"] for row in range(window.routine_table.rowCount())])
         self.assertNotIn("과거 종목", [window.routine_table.item(row, 0).data(setting_window.Qt.UserRole)["display_name"] for row in range(window.routine_table.rowCount())])
 
-        stock_widget = window.routine_table.cellWidget(2, 0)
-        second_stock_widget = window.routine_table.cellWidget(3, 0)
+        stock_rows = [
+            row
+            for row in range(window.routine_table.rowCount())
+            if window.routine_table.item(row, 0)
+            .data(setting_window.Qt.UserRole)
+            .get("row_kind")
+            == "stock"
+        ]
+        stock_row_by_code = {
+            str(
+                window.routine_table.item(row, 0)
+                .data(setting_window.Qt.UserRole)
+                .get("stock_code", "")
+            ): row
+            for row in stock_rows
+        }
+        first_stock_row, second_stock_row = stock_rows
+        stock_row = stock_row_by_code["005930"]
+        first_stock_widget = window.routine_table.cellWidget(first_stock_row, 0)
+        second_stock_widget = window.routine_table.cellWidget(second_stock_row, 0)
+        stock_widget = window.routine_table.cellWidget(stock_row, 0)
         instance_widget = window.routine_table.cellWidget(1, 0)
         instance_widget.layout().activate()
-        stock_widget.layout().activate()
+        first_stock_widget.layout().activate()
         self._app.processEvents()
-        stock_layout_margins = stock_widget.layout().contentsMargins()
+        stock_layout_margins = first_stock_widget.layout().contentsMargins()
         second_stock_layout_margins = second_stock_widget.layout().contentsMargins()
         self.assertEqual(
             (
                 setting_window.routine_tree_layout_metrics(stock_widget.font())["outer_margin"],
                 setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
-                setting_window.routine_tree_layout_metrics(stock_widget.font())["outer_margin"],
+                setting_window.routine_tree_layout_metrics(stock_widget.font())[
+                    "performance_trailing_margin"
+                ],
                 0,
             ),
             (
@@ -10819,7 +11330,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertIn("color: #7E22CE", stock_icon.styleSheet())
         self.assertEqual("삼성전자", stock_widget.findChild(setting_window.QLabel, "autoTradeSettingRoutineTreeTitle").text())
         self.assertEqual("삼성전자", stock_title.toolTip())
-        self.assertEqual("삼성전자", window.routine_table.item(2, 0).data(setting_window.Qt.ToolTipRole))
+        self.assertEqual(
+            "삼성전자",
+            window.routine_table.item(stock_row, 0).data(
+                setting_window.Qt.ToolTipRole
+            ),
+        )
         self.assertEqual(setting_window.Qt.AlignLeft | setting_window.Qt.AlignVCenter, instance_title.alignment())
         self.assertEqual(setting_window.Qt.AlignLeft | setting_window.Qt.AlignVCenter, stock_title.alignment())
         self.assertIn("color: #7E22CE", stock_title.styleSheet())
@@ -10870,13 +11386,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT
             + setting_window.AUTO_TRADE_SETTING_INSTANCE_GROUP_TOP_GAP,
-            window.routine_table.rowHeight(2),
+            window.routine_table.rowHeight(first_stock_row),
         )
         self.assertEqual(
             setting_window.AUTO_TRADE_SETTING_STOCK_ROW_HEIGHT,
-            window.routine_table.rowHeight(3),
+            window.routine_table.rowHeight(second_stock_row),
         )
-        self.assertLessEqual(window.routine_table.rowHeight(3), window.routine_table.rowHeight(1) - 2)
+        self.assertLessEqual(
+            window.routine_table.rowHeight(second_stock_row),
+            window.routine_table.rowHeight(1) - 2,
+        )
         stock_widget.resize(max(stock_widget.sizeHint().width(), 960), stock_widget.sizeHint().height())
         stock_widget.layout().activate()
         previous_x = -1
@@ -10944,7 +11463,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "profit_factor": 0.0 if negative else 3.2,
             }
 
-        window._routine_tree_stock_performance_source = performance_source
+        self._patch_fixture_performance_source(performance_source)
         unavailable_performance_texts = window._routine_tree_canonical_performance_texts
         instance_rows = {
             "inst-a": SimpleNamespace(
@@ -11178,7 +11697,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 selected_dirs = table_loader._selected_instance_stock_dirs(window)
 
             self.assertEqual(
-                ["105560_KB_CURRENT_ORIGINAL"],
+                [],
                 [path.name for path in selected_dirs],
             )
             with patch.object(
@@ -11297,7 +11816,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
             "100001": {
                 "trade_days": 10,
-                "realized_profit": 100.0,
+                "realized_profit": 90.0,
                 "average": -10.0,
                 "profit_factor": 2.0,
             },
@@ -11318,6 +11837,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         ):
             window = AutoTradeSettingWindow()
         try:
+            self._attach_fixture_canonical_tree_owner(window)
             window._routine_instance_operation_counts = lambda: {
                 "inst-sort": {
                     "registered": 2,
@@ -11333,10 +11853,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "inst-sort": list(historical_stocks)
             }
 
-            def performance_source(
-                _window,
-                stock: dict[str, object],
-            ) -> dict[str, object]:
+            def performance_source(stock: dict[str, object]) -> dict[str, object]:
                 code = str(stock.get("stock_code", "") or "")
                 return {
                     **performance_by_code[code],
@@ -11345,10 +11862,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     "is_current": not bool(stock.get("is_historical", False)),
                 }
 
-            window._routine_tree_stock_performance_source = MethodType(
-                performance_source,
-                window,
-            )
+            self._patch_fixture_performance_source(performance_source)
 
             def stock_codes() -> list[str]:
                 result = []
@@ -11581,12 +12095,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "running": 0,
                 "stopped": 2,
                 "error": 0,
+                "normal": 2,
             },
             "inst-b": {
                 "registered": 1,
                 "running": 0,
                 "stopped": 1,
                 "error": 0,
+                "normal": 1,
             },
         }
         window._current_stocks_by_instance = lambda: current_stocks
@@ -11601,7 +12117,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "is_current": not bool(stock.get("is_historical", False)),
             }
 
-        window._routine_tree_stock_performance_source = performance_source
+        self._patch_fixture_performance_source(performance_source)
 
         def visible_rows() -> list[dict[str, object]]:
             return [
@@ -11668,7 +12184,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             expected_by_criterion = {
                 "period": ["035420", "005930", "005380", "035720"],
                 "profit": ["005380", "035720", "005930", "035420"],
-                "average": ["035720", "005380", "005930", "035420"],
+                "average": ["035720", "005930", "005380", "035420"],
                 "efficiency": ["005380", "035420", "035720", "005930"],
             }
             for criterion, expected_codes in expected_by_criterion.items():
@@ -11706,7 +12222,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 all_row_kinds(),
             )
             self.assertEqual(
-                ["005930", "005380", "035720", "035420"],
+                ["005380", "005930", "035420", "035720"],
                 all_stock_codes(),
             )
             self.assertTrue(
@@ -11816,12 +12332,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: {}
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average_rate": 0.0,
             "is_current": True,
-        }
+        })
 
         def visible_instance_ids() -> list[str]:
             return [
@@ -11912,12 +12428,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: {}
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average_rate": 0.0,
             "is_current": True,
-        }
+        })
 
         def visible_stock_codes() -> list[str]:
             return [
@@ -12016,13 +12532,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average": None,
             "average_rate": None,
             "profit_factor": 0.0,
-        }
+        })
 
         def visible_instance_ids() -> list[str]:
             return [
@@ -12050,6 +12566,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
         ):
             window.routine_box = setting_window.QGroupBox("자동매매 루틴")
+            window.eventFilter = MethodType(
+                lambda _self, _obj, _event: False,
+                window,
+            )
             setting_window.QVBoxLayout(window.routine_box).addWidget(
                 window.routine_table
             )
@@ -12118,13 +12638,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average": None,
             "average_rate": None,
             "profit_factor": 0.0,
-        }
+        })
 
         def visible_stock_codes() -> list[str]:
             return [
@@ -12152,10 +12672,15 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
         ):
             window.routine_box = setting_window.QGroupBox("자동매매 루틴")
+            window.eventFilter = MethodType(
+                lambda _self, _obj, _event: False,
+                window,
+            )
             setting_window.QVBoxLayout(window.routine_box).addWidget(
                 window.routine_table
             )
             window._setup_routine_tree_display_level_badges()
+            self._app.processEvents()
             window.load_routine_table()
             self.assertFalse(window._routine_tree_valid_only)
 
@@ -12224,13 +12749,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average": None,
             "average_rate": None,
             "profit_factor": 0.0,
-        }
+        })
 
         def visible_stock_codes() -> list[str]:
             return [
@@ -12280,10 +12805,34 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             replace(self._definition(), definition_id="def-d", display_name="D 그룹"),
         ]
         instances = [
-            replace(self._instance("inst-a", "A 루틴"), definition_id="def-a"),
-            replace(self._instance("inst-b", "B 루틴"), definition_id="def-b"),
-            replace(self._instance("inst-c", "C 루틴"), definition_id="def-c"),
-            replace(self._instance("inst-d", "D 루틴"), definition_id="def-d"),
+            replace(
+                self._instance("inst-a", "A 루틴", group_id="group-a"),
+                definition_id="def-a",
+            ),
+            replace(
+                self._instance("inst-b", "B 루틴", group_id="group-b"),
+                definition_id="def-b",
+            ),
+            replace(
+                self._instance("inst-c", "C 루틴", group_id="group-c"),
+                definition_id="def-c",
+            ),
+            replace(
+                self._instance("inst-d", "D 루틴", group_id="group-d"),
+                definition_id="def-d",
+            ),
+        ]
+        groups = [
+            GroupRecord(
+                name=f"{suffix} 그룹",
+                path=Path("groups") / f"group-{suffix.lower()}",
+                source_type="logical_registry",
+                group_id=f"group-{suffix.lower()}",
+                definition_id=f"def-{suffix.lower()}",
+                budget={},
+                valid=True,
+            )
+            for suffix in ("A", "B", "C", "D")
         ]
         current_stocks = {
             instance.instance_id: [
@@ -12296,6 +12845,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ]
             for index, instance in enumerate(instances, start=1)
         }
+        base_stocks = [
+            {
+                "stock_path": stock["stock_path"],
+                "assigned_routine_instance_id": instance_id,
+                "code": stock["stock_code"],
+                "name": stock["stock_name"],
+            }
+            for instance_id, stocks in current_stocks.items()
+            for stock in stocks
+        ]
         performance_by_path = {
             "fixture/inst-a": {
                 "trade_days": 3,
@@ -12323,23 +12882,25 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             },
         }
         window = self._window_harness()
+        window._routine_tree_projected_instance_ids_override = None
         window._routine_instance_operation_counts = lambda: {
             instance.instance_id: {
                 "registered": 1,
                 "running": 0,
                 "stopped": 1,
                 "error": 0,
+                "normal": 1,
             }
             for instance in instances
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: {}
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average_rate": 0.0,
             "is_current": True,
-        }
+        })
 
         def visible_definition_ids() -> list[str]:
             return [
@@ -12364,6 +12925,16 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 setting_window,
                 "load_persisted_routine_instances",
                 return_value=instances,
+            ),
+            patch.object(
+                setting_window,
+                "get_group_records",
+                return_value=groups,
+            ),
+            patch.object(
+                setting_window,
+                "read_base_stocks",
+                return_value=base_stocks,
             ),
         ):
             window.load_routine_table()
@@ -12456,12 +13027,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average_rate": 0.0,
             "is_current": not bool(stock.get("is_historical", False)),
-        }
+        })
 
         def visible_instance_ids() -> list[str]:
             return [
@@ -12578,7 +13149,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = (
+        self._patch_fixture_performance_source(
             lambda stock: dict(performance_by_path[str(stock.get("stock_path", ""))])
         )
 
@@ -12678,13 +13249,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         }
         window._current_stocks_by_instance = lambda: current_stocks
         window._historical_stocks_by_instance = lambda: historical_stocks
-        window._routine_tree_stock_performance_source = lambda stock: {
+        self._patch_fixture_performance_source(lambda stock: {
             **performance_by_path[str(stock.get("stock_path", ""))],
             "profit_rate": 0.0,
             "average": None,
             "average_rate": None,
             "profit_factor": 0.0,
-        }
+        })
 
         def visible_rows() -> list[dict[str, object]]:
             return [
@@ -12839,6 +13410,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window.StockRepository, "resolve_stock_dir", return_value=Path("stocks/005930_삼성전자")),
             patch.object(setting_window, "read_json_dict", return_value={}),
             patch.object(setting_window, "read_base_stocks", return_value=[]),
+            patch.object(
+                window,
+                "_routine_tree_stock_is_review_required",
+                return_value=False,
+            ),
             patch.object(window, "convert_historical_stock_to_registered") as convert,
             patch.object(window, "unregister_routine_tree_stock") as unregister,
             patch.object(window, "hide_historical_stock_display") as hide_display,
@@ -13142,7 +13718,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "routine_unassign_decision",
                 return_value=SimpleNamespace(allowed=True),
             ) as unassign_decision,
-            patch.object(setting_window, "update_base_stock_routines", return_value=True) as update_routines,
+            patch.object(
+                setting_window,
+                "execute_assignment_unassign",
+                return_value=SimpleNamespace(ok=True, changed=True),
+            ) as execute_unassign,
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_single,
             patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window, "show_toast") as toast,
@@ -13155,7 +13735,14 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             row_instance_id="inst-a",
             row_relation_kind="CURRENT",
         )
-        update_routines.assert_called_once_with("005930", "삼성전자", [])
+        execute_unassign.assert_called_once_with(
+            None,
+            setting_window.PROJECT_ROOT,
+            "005930",
+            "삼성전자",
+            expected_instance_id="inst-a",
+            intent=setting_window.ASSIGNMENT_INTENT_UNASSIGN,
+        )
         ensure_single.assert_called_once_with("005930", "삼성전자")
         question.assert_not_called()
         window.refresh_all.assert_called_once_with()
@@ -13195,12 +13782,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ),
             patch.object(window, "_record_routine_unassign_blocked") as blocked_event,
             patch.object(window, "_escalate_routine_unassign_review") as review,
-            patch.object(setting_window, "update_base_stock_routines") as update_routines,
+            patch.object(setting_window, "execute_assignment_unassign") as execute_unassign,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(window.unregister_routine_tree_stock(target))
 
-        update_routines.assert_not_called()
+        execute_unassign.assert_not_called()
         blocked_event.assert_not_called()
         review.assert_called_once()
         toast.assert_called_once_with(
@@ -13236,12 +13823,17 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "routine_unassign_decision",
                 return_value=SimpleNamespace(allowed=True),
             ),
-            patch.object(setting_window, "update_base_stock_routines", return_value=False),
+            patch.object(
+                setting_window,
+                "execute_assignment_unassign",
+                return_value=SimpleNamespace(ok=False, changed=False),
+            ) as execute_unassign,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(window.unregister_routine_tree_stock(target))
 
         window.refresh_all.assert_not_called()
+        execute_unassign.assert_called_once()
         toast.assert_called_once_with(
             window,
             "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.",
@@ -13277,7 +13869,10 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             patch.object(setting_window, "routine_action_reasons_for_stock", return_value=(True, {"reasons": []})) as policy,
             patch.object(setting_window.QMessageBox, "question") as question,
             patch.object(setting_window, "append_base_stock", return_value=True) as append_stock,
-            patch.object(setting_window, "update_base_stock_routine_instance", return_value=True) as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance",
+                return_value=SimpleNamespace(success=True, changed=True),
+            ) as register_assignment,
             patch.object(setting_window, "StockRepository", return_value=repository),
             patch.object(setting_window, "ensure_single_real_trade_routine_for_stock") as ensure_routine,
             patch.object(setting_window, "append_changelog"),
@@ -13293,9 +13888,11 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         question.assert_not_called()
         policy.assert_called_once_with("005930", "삼성전자", allow_unassigned=True)
         append_stock.assert_called_once_with("005930", "삼성전자")
-        update_instance.assert_called_once_with(
+        register_assignment.assert_called_once_with(
+            setting_window.PROJECT_ROOT,
             "005930",
             "삼성전자",
+            operation_owner=parent,
             instance_id="inst-a",
             instance_name="A 인스턴스",
             definition_id="indicator_follow",
@@ -13337,7 +13934,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                     }
                 ],
             ),
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(
@@ -13347,7 +13946,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 )
             )
 
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
         parent.refresh_all.assert_not_called()
         toast.assert_called_with(parent, "이미 같은 루틴에 지정된 종목입니다.")
 
@@ -13378,7 +13977,9 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 "routine_action_reasons_for_stock",
                 return_value=(False, {"reasons": ["처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."]}),
             ),
-            patch.object(setting_window, "update_base_stock_routine_instance") as update_instance,
+            patch(
+                "stock_assignment_registration_service.register_unassigned_stock_to_instance"
+            ) as register_assignment,
             patch.object(setting_window, "show_toast") as toast,
         ):
             self.assertFalse(
@@ -13388,7 +13989,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 )
             )
 
-        update_instance.assert_not_called()
+        register_assignment.assert_not_called()
         parent.refresh_all.assert_not_called()
         toast.assert_called_with(parent, "처리할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
 
@@ -14058,6 +14659,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
                 return_value=setting_window.QMessageBox.Yes,
             ) as question,
             patch.object(setting_window, "StockRepository", return_value=repository),
+            patch.object(setting_window, "refresh_auto_trade_views") as refresh_views,
         ):
             window.hide_historical_stock_display(metadata)
 
@@ -14072,7 +14674,8 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             code="005930",
             instance_id="inst-a",
         )
-        window.load_routine_table.assert_called_once_with()
+        window.load_routine_table.assert_not_called()
+        refresh_views.assert_called_once_with(window)
 
     def test_development_fixture_display_delete_is_session_only(self) -> None:
         window = self._window_harness()
@@ -14261,6 +14864,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             pass
 
         window = Window()
+        attach_participant_owner(window)
         window.stock_table = QTableWidget(0, 11)
         window.current_selected_target_instance_ids = lambda: ("inst-a",)
         window.current_selected_routine_dir = lambda: Path("routines") / "indicator_follow"
@@ -14270,7 +14874,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.update_selected_routine_status_bar = lambda: None
         window.update_action_buttons = lambda: None
         window._stock_visual_order = []
-        window._current_session_operation_participant_stock_codes = {"111111"}
+        attach_participant_owner(window, {"111111"})
 
         stocks = [
             {"stock_path": "stocks/111111_RUN", "assigned_routine_instance_id": "inst-a", "code": "111111", "name": "정상1"},
@@ -14346,6 +14950,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             pass
 
         window = Window()
+        attach_participant_owner(window)
         window.stock_table = QTableWidget(0, 11)
         window._all_stocks_scope_active = False
         window._routine_tree_display_level = "stock"
@@ -14357,7 +14962,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         window.update_selected_routine_status_bar = lambda: None
         window.update_action_buttons = lambda: None
         window._stock_visual_order = []
-        window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(window)
 
         stocks = [
             {
@@ -14425,7 +15030,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             pass
 
         aggregate_window = Window()
-        aggregate_window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(aggregate_window)
 
         table_window = Window()
         table_window.stock_table = QTableWidget(0, 11)
@@ -14437,7 +15042,7 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
         table_window.update_selected_routine_status_bar = lambda: None
         table_window.update_action_buttons = lambda: None
         table_window._stock_visual_order = []
-        table_window._current_session_operation_participant_stock_codes = set()
+        attach_participant_owner(table_window)
 
         stocks = [
             {
@@ -14524,11 +15129,12 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             ))
             self.assertEqual(["002810"], filtered_codes("excluded"))
 
-    def test_setting_status_column_highlights_emergency_and_review_text_only(self) -> None:
+    def test_setting_status_column_highlights_emergency_and_dims_review_activity(self) -> None:
         class Window:
             pass
 
         window = Window()
+        attach_participant_owner(window, {"111111", "333333"})
         window.stock_table = QTableWidget(0, 11)
         window.current_selected_target_instance_ids = lambda: ("inst-a",)
         window.current_selected_routine_dir = lambda: Path("routines") / "indicator_follow"
@@ -14550,14 +15156,26 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             text = str(path)
             if text.endswith("config.json"):
                 return {"assigned_routine_instance_id": "inst-a", "operation_mode": "SCHEDULED"}
-            if "111111_EMERGENCY" in text:
-                return {"status": "EMERGENCY_STOP", "trade_enabled": False}
-            if "222222_REVIEW" in text:
+            if "111111" in text:
+                return {"status": "EMERGENCY_STOP", "trade_enabled": True}
+            if "222222" in text:
                 return {"status": "REVIEW_REQUIRED", "review_required": True, "trade_enabled": False}
             return {"status": "RUNNING", "trade_enabled": True}
 
+        def fake_review_inspection(stock_dir: Path, *, loaded_state=None):
+            state = dict(loaded_state or fake_read_json(stock_dir / "state.json"))
+            return SimpleNamespace(
+                state=state,
+                review_required=bool(state.get("review_required")),
+            )
+
         with patch.object(table_loader, "read_base_stocks", return_value=stocks), \
-                patch.object(table_loader, "read_json_dict", side_effect=fake_read_json):
+                patch.object(table_loader, "read_json_dict", side_effect=fake_read_json), \
+                patch.object(
+                    table_loader,
+                    "inspect_stock_review_state",
+                    side_effect=fake_review_inspection,
+                ):
             table_loader.auto_trade_load_selected_routine_stocks(window)
 
         status_by_code = {
@@ -14565,14 +15183,13 @@ class AutoTradeSettingRoutineTreeTest(unittest.TestCase):
             for row in range(window.stock_table.rowCount())
         }
         self.assertEqual("#e60000", status_by_code["111111"].foreground().color().name())
-        self.assertEqual("#ff8c00", status_by_code["222222"].foreground().color().name())
+        self.assertEqual("#afb2b9", status_by_code["222222"].foreground().color().name())
         self.assertNotEqual("#e60000", status_by_code["333333"].foreground().color().name())
         self.assertNotEqual("#ff8c00", status_by_code["333333"].foreground().color().name())
 
     def test_maximized_workspace_reserves_stock_table_required_width(self) -> None:
         with patch.object(AutoTradeSettingWindow, "refresh_all", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None), \
-                patch.object(AutoTradeSettingWindow, "current_runtime_file_signature", lambda _self: tuple()):
+                patch.object(AutoTradeSettingWindow, "update_startup_recovery_controls", lambda _self: None):
             window = AutoTradeSettingWindow()
         self.addCleanup(window.close)
         window.show()

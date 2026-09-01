@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 gui_auto_trade_timer.py
 
@@ -39,20 +39,6 @@ except Exception:
 LOGGER = logging.getLogger(__name__)
 
 
-def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """루틴 폴더 아래 실제 종목 runtime 폴더 목록을 반환한다."""
-    if not routine_dir.exists() or not routine_dir.is_dir():
-        return []
-    result: list[Path] = []
-    for child in routine_dir.iterdir():
-        if (
-            child.is_dir()
-            and not child.name.startswith(".")
-            and not child.name.startswith("__")
-            and (child / "config.json").exists()
-        ):
-            result.append(child)
-    return result
 
 
 def auto_trade_signal_probe_only_active(
@@ -91,43 +77,6 @@ def auto_trade_current_time_policy_minute_key(window) -> str:
     """시간정책 자동 재판정용 분 단위 키."""
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
-
-
-def auto_trade_current_runtime_file_signature(window) -> dict[str, int]:
-    """중앙 등록 종목의 runtime 파일 변경 여부를 판단하는 스냅샷."""
-    try:
-        from gui_auto_trade_runtime import all_registered_stock_dirs
-
-        stock_dirs = all_registered_stock_dirs()
-    except Exception:
-        stock_dirs = []
-
-    signature: dict[str, int] = {}
-    for stock_dir in stock_dirs:
-        for filename in ("state.json", "config.json", "orders.json"):
-            path = stock_dir / filename
-            try:
-                signature[str(path)] = path.stat().st_mtime_ns
-            except Exception:
-                signature[str(path)] = -1
-    return signature
-
-
-
-def auto_trade_on_runtime_file_timer_tick(window) -> None:
-    """외부 파일 수정분을 자동매매설정 표에 반영한다."""
-    if not window.isVisible():
-        return
-
-    signature = window.current_runtime_file_signature()
-    if signature == window._runtime_file_snapshot:
-        return
-
-    window._runtime_file_snapshot = signature
-    selected_stock_paths, stock_scroll_value = window.capture_stock_table_view_state()
-    window.load_selected_routine_stocks()
-    window.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-    window.update_action_buttons()
 
 
 def auto_trade_on_time_policy_gui_timer_tick(window) -> None:
@@ -669,17 +618,4 @@ def auto_trade_run_operation_cycle(window) -> dict[str, object]:
         )
 
     return operation_cycle_result()
-
-
-
-def auto_trade_on_time_policy_timer_tick(window) -> None:
-    """Backward-compatible entry point for the durable operation cycle.
-
-    원칙:
-    - 초 단위 반복 작업 금지
-    - 상태 변화가 없으면 화면 갱신 금지
-    - 변경 종목이 있을 때만 현재 창을 갱신
-    - 긴급정지/검토종목/조기마감은 재판정 함수에서 보호
-    """
-    return auto_trade_run_operation_cycle(window)
 

@@ -25,9 +25,12 @@ from stock_code_contract import (
 )
 
 try:
+    from assignment_episode_linkage import assign_stock_routine, unassign_stock_routine
     from stock_repository import repository as stock_repository_factory
 except Exception:
+    assign_stock_routine = None
     stock_repository_factory = None
+    unassign_stock_routine = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -172,6 +175,8 @@ def _update_base_stock_routines_in_central_repository_if_available(
     code: str,
     name: str,
     routines: list[str],
+    *,
+    expected_instance_id: str | None = None,
 ) -> bool | None:
     """
     중앙 stocks/ 종목관리 구조가 준비된 경우에만 config.json의 routine 값을 갱신한다.
@@ -180,10 +185,20 @@ def _update_base_stock_routines_in_central_repository_if_available(
     - True/False: 중앙 repository로 처리함
     - None: 중앙 repository 미사용, 기존 기초종목.txt fallback 필요
     """
-    if not _central_repository_available():
+    if not _central_repository_available() or unassign_stock_routine is None:
         return None
     try:
-        return bool(stock_repository_factory().update_stock_routine(code, name, routines))
+        repository = stock_repository_factory()
+        return bool(
+            unassign_stock_routine(
+                repository.project_root,
+                code,
+                name,
+                routines,
+                expected_instance_id=expected_instance_id,
+                stock_repository=repository,
+            ).ok
+        )
     except Exception:
         return None
 
@@ -215,7 +230,13 @@ def ensure_single_real_trade_routine_for_all_stocks() -> None:
             ensure_single_real_trade_routine_for_stock(code, name)
 
 
-def update_base_stock_routines(code: str, name: str, routines: list[str]) -> bool:
+def update_base_stock_routines(
+    code: str,
+    name: str,
+    routines: list[str],
+    *,
+    expected_instance_id: str | None = None,
+) -> bool:
     """
     특정 종목의 활성 루틴 목록을 중앙 stocks/종목/config.json에 반영한다.
 
@@ -223,10 +244,39 @@ def update_base_stock_routines(code: str, name: str, routines: list[str]) -> boo
     - 기초종목.txt를 갱신하지 않는다.
     - 중앙 stocks/ 구조가 없으면 실패(False)로 처리한다.
     """
-    central_updated = _update_base_stock_routines_in_central_repository_if_available(code, name, routines)
+    central_updated = _update_base_stock_routines_in_central_repository_if_available(
+        code,
+        name,
+        routines,
+        expected_instance_id=expected_instance_id,
+    )
     if central_updated is not None:
         return central_updated
     return False
+
+
+def update_base_stock_routines_result(
+    code: str,
+    name: str,
+    routines: list[str],
+    *,
+    expected_instance_id: str | None = None,
+):
+    """Return the repository's semantic Assignment result for guarded callers."""
+    if not _central_repository_available() or unassign_stock_routine is None:
+        return None
+    try:
+        repository = stock_repository_factory()
+        return unassign_stock_routine(
+            repository.project_root,
+            code,
+            name,
+            routines,
+            expected_instance_id=expected_instance_id,
+            stock_repository=repository,
+        )
+    except Exception:
+        return None
 
 
 def update_base_stock_routine_instance(
@@ -237,19 +287,24 @@ def update_base_stock_routine_instance(
     instance_name: str,
     definition_id: str,
     routine_type: str,
+    expected_instance_id: str | None = None,
 ) -> bool:
-    if not _central_repository_available():
+    if not _central_repository_available() or assign_stock_routine is None:
         return False
     try:
+        repository = stock_repository_factory()
         return bool(
-            stock_repository_factory().update_stock_routine_instance(
+            assign_stock_routine(
+                repository.project_root,
                 code,
                 name,
                 instance_id=instance_id,
                 instance_name=instance_name,
                 definition_id=definition_id,
                 routine_type=routine_type,
-            )
+                expected_instance_id=expected_instance_id,
+                stock_repository=repository,
+            ).ok
         )
     except Exception:
         return False

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared lightweight current-price PnL refresh contract for GUI surfaces."""
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from confirmable_pnl_cycle_service import (
     ConfirmablePnlRuntimeSnapshot,
     load_confirmable_pnl_runtime_snapshot,
@@ -55,6 +55,7 @@ def project_current_stock_pnl_snapshot(
     stock_codes: Iterable[str],
     *,
     project_root: str | Path,
+    state_by_code: Mapping[str, object] | None = None,
 ) -> dict[str, dict[str, Any]]:
     root = Path(project_root)
     codes = list(
@@ -72,22 +73,34 @@ def project_current_stock_pnl_snapshot(
         reason = f"PNL_SNAPSHOT_UNAVAILABLE:{exc}"
         return {code: _projection_error_result(reason) for code in codes}
 
+    supplied_states = {
+        str(code or "").strip().lstrip("A"): (
+            dict(state) if isinstance(state, dict) else {}
+        )
+        for code, state in (state_by_code or {}).items()
+        if str(code or "").strip().lstrip("A")
+    }
+    missing_codes = [code for code in codes if code not in supplied_states]
     repository = StockRepository(project_root=root)
     stock_dirs: dict[str, Path] = {}
-    try:
-        for stock_dir in repository.list_stock_dirs():
-            code, _name = repository.parse_stock_folder(stock_dir)
-            stock_dirs.setdefault(code, stock_dir)
-    except Exception:
-        stock_dirs = {}
+    if missing_codes:
+        try:
+            for stock_dir in repository.list_stock_dirs():
+                code, _name = repository.parse_stock_folder(stock_dir)
+                stock_dirs.setdefault(code, stock_dir)
+        except Exception:
+            stock_dirs = {}
 
     results: dict[str, dict[str, Any]] = {}
     for code in codes:
         try:
-            stock_dir = stock_dirs.get(code) or (
-                repository.stocks_dir / safe_stock_folder_name(code)
-            )
-            state = read_json_dict(stock_dir / "state.json")
+            if code in supplied_states:
+                state = supplied_states[code]
+            else:
+                stock_dir = stock_dirs.get(code) or (
+                    repository.stocks_dir / safe_stock_folder_name(code)
+                )
+                state = read_json_dict(stock_dir / "state.json")
             results[code] = _project_current_stock_pnl_from_state(
                 code,
                 state,

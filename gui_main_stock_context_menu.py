@@ -7,14 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import QItemSelectionModel
-from PyQt5.QtWidgets import (
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QTextEdit,
-    QVBoxLayout,
-)
+from PyQt5.QtWidgets import QDialog
 
 from gui_auto_trade_close import (
     auto_trade_apply_selected_early_close,
@@ -23,13 +16,14 @@ from gui_auto_trade_close import (
     auto_trade_cancel_selected_early_close,
 )
 from gui_auto_trade_run_control import (
+    OperationStartCommandRequest,
+    OperationStartIntent,
     auto_trade_registered_operation_start_targets,
     auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
     auto_trade_start_selected_rows_auto_trades,
     auto_trade_update_global_operation_button_state,
-    show_auto_trade_operation_failure_dialog,
-    startup_recovery_operation_block_message,
+    execute_operation_start_command,
 )
 from gui_auto_trade_status_ops import (
     auto_trade_apply_schedule_times_to_targets,
@@ -37,18 +31,14 @@ from gui_auto_trade_status_ops import (
     auto_trade_finalize_operation_mode_result,
     auto_trade_reset_schedule_times_for_targets,
     auto_trade_set_selected_stock_operation_exclusions,
-    auto_trade_set_stock_operation_exclusion,
-    auto_trade_toggle_stock_operation_exclusion,
-    auto_trade_set_operation_mode_for_targets,
-    handle_auto_trade_operation_mode_double_click,
 )
 from gui_auto_trade_unregister import unregister_selected_auto_trade_stocks
+from assignment_authorization_service import inspect_stock_unregister_availability
 from gui_main_emergency_ops import (
     execute_selected_emergency_stop,
 )
 from gui_auto_trade_ats_ops import (
     auto_trade_execute_selected_manual_ats_liquidation,
-    auto_trade_save_selected_manual_ats_state,
     auto_trade_selected_manual_ats_execution_method_state,
     auto_trade_selected_manual_ats_liquidation_available,
     auto_trade_selected_manual_ats_state,
@@ -65,7 +55,6 @@ from gui_config_utils import default_config
 from gui_schedule_window import ScheduleOperationDialog
 from gui_auto_trade_integrity import (
     is_operation_excluded,
-    is_review_required_stock_dir,
 )
 from gui_main_table_loader import (
     ROUTINE_INSTANCE_ID_ROLE,
@@ -79,9 +68,13 @@ from runtime_io import read_json_dict
 from state_policy import (
     effective_schedule_times,
     normalize_operation_mode,
-    real_trade_enabled,
 )
-from gui_routine_service import set_stock_real_trade_enabled
+from gui_routine_service import (
+    execute_selected_stock_real_trade_command,
+    selected_stock_real_trade_target_enabled,
+    selected_stock_trade_permission_available,
+    selected_stock_trade_permission_label,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -93,41 +86,6 @@ class MainMonitoringStockTarget:
     code: str
     name: str
     routine_instance_id: str
-
-
-def _show_monitoring_auto_trade_result_dialog(
-    parent,
-    title: str,
-    heading: str,
-    lines: list[str],
-) -> None:
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(title)
-    dialog.resize(420, 320)
-    layout = QVBoxLayout()
-    layout.setContentsMargins(18, 16, 18, 14)
-    layout.setSpacing(10)
-    title_label = QLabel(heading)
-    title_font = title_label.font()
-    title_font.setBold(True)
-    title_font.setPointSize(title_font.pointSize() + 1)
-    title_label.setFont(title_font)
-    layout.addWidget(title_label)
-    body = QTextEdit()
-    body.setReadOnly(True)
-    body.setPlainText("\n".join(lines))
-    body.setMinimumHeight(180)
-    body.setLineWrapMode(QTextEdit.NoWrap)
-    layout.addWidget(body)
-    buttons = QHBoxLayout()
-    buttons.addStretch(1)
-    ok_button = QPushButton("확인")
-    ok_button.setMinimumWidth(80)
-    ok_button.clicked.connect(dialog.accept)
-    buttons.addWidget(ok_button)
-    layout.addLayout(buttons)
-    dialog.setLayout(layout)
-    dialog.exec_()
 
 
 def _stock_target_for_row(window, row: int) -> MainMonitoringStockTarget | None:
@@ -259,16 +217,12 @@ class MainMonitoringStockOperationAdapter:
         )
         self._recovery_action_label = str(recovery_action_label or "").strip()
         self.stock_table = window.routine_table
-        self._runtime_file_snapshot = ()
         self._last_operation_block_reason = ""
         self._last_operation_user_message = ""
         self._last_operation_failure_dialog_shown = False
 
     def parent(self):
         return self._window
-
-    def close(self) -> None:
-        return
 
     def selected_stock_infos(self) -> list[tuple[Path, str, str]]:
         return [
@@ -303,9 +257,6 @@ class MainMonitoringStockOperationAdapter:
         if len(instance_ids) == 1:
             return next(iter(instance_ids))
         return "관제창 복수 루틴"
-
-    def target_snapshot(self) -> list[tuple[Path, str, str]]:
-        return self.selected_stock_infos()
 
     def capture_stock_table_view_state(self) -> tuple[set[str], int]:
         return (
@@ -377,34 +328,6 @@ class MainMonitoringStockOperationAdapter:
             for stock_dir, _code, _name in selected
         )
 
-    def set_stock_operation_exclusion(
-        self,
-        target: tuple[Path, str, str],
-        excluded: bool,
-        *,
-        notify: bool = True,
-        refresh: bool = True,
-    ) -> bool:
-        return auto_trade_set_stock_operation_exclusion(
-            self,
-            target,
-            excluded,
-            notify=notify,
-            refresh=refresh,
-        )
-
-    def toggle_stock_operation_exclusion(
-        self,
-        target: tuple[Path, str, str],
-        *,
-        refresh: bool = True,
-    ) -> bool:
-        return auto_trade_toggle_stock_operation_exclusion(
-            self,
-            target,
-            refresh=refresh,
-        )
-
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_targets(self._window)
 
@@ -417,61 +340,6 @@ class MainMonitoringStockOperationAdapter:
     def update_global_operation_button_state(self) -> None:
         auto_trade_update_global_operation_button_state(self)
 
-    def set_selected_stock_operation_exclusions(self) -> None:
-        auto_trade_set_selected_stock_operation_exclusions(self)
-
-    def clear_selected_stock_operation_exclusions(self) -> None:
-        auto_trade_clear_selected_stock_operation_exclusions(self)
-
-    def selected_trade_permission_context_label(self) -> str:
-        values = []
-        for stock_dir, _code, _name in self.selected_stock_infos():
-            config = read_json_dict(stock_dir / "config.json")
-            values.append(real_trade_enabled(config if config else default_config()))
-        return "감시전용 전환" if values and all(values) else "실주문 전환"
-
-    def toggle_selected_trade_permission(self) -> dict[str, object]:
-        selected = self.selected_stock_infos()
-        if not selected:
-            self.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
-            return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
-        target_enabled = self.selected_trade_permission_context_label().startswith("실주문")
-        changed: list[str] = []
-        blocked: list[str] = []
-        for stock_dir, code, name in selected:
-            result = set_stock_real_trade_enabled(
-                self,
-                stock_dir,
-                code,
-                name,
-                target_enabled,
-            )
-            label = f"{code} {name}".strip()
-            if result.get("ok") is True:
-                if result.get("changed") is True:
-                    changed.append(label)
-            else:
-                blocked.append(f"{label}({result.get('reason') or 'BLOCKED'})")
-        if changed:
-            self._window.refresh_all()
-        message = f"거래권한 변경: {len(changed)}개"
-        if blocked:
-            message += f" / 차단 {len(blocked)}개"
-        self.statusBarMessage(message)
-        return {
-            "ok": bool(changed) and not blocked,
-            "changed": len(changed),
-            "blocked": len(blocked),
-            "target_real_trade_enabled": target_enabled,
-            "blocked_targets": tuple(blocked),
-        }
-
-    def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
-        return execute_selected_emergency_stop(self, self.selected_stock_infos())
-
-    def unregister_selected_auto_trade_stocks(self) -> None:
-        unregister_selected_auto_trade_stocks(self)
-
     def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
         self._last_operation_user_message = str(message or "").strip()
         self._window.statusBar().showMessage(message, timeout_ms)
@@ -481,9 +349,6 @@ class MainMonitoringStockOperationAdapter:
 
     def operation_message_parent(self):
         return self._window
-
-    def current_runtime_file_signature(self):
-        return self._execution_host().current_runtime_file_signature()
 
     def update_stock_status(self, *args, **kwargs):
         return self._execution_host().update_stock_status(*args, **kwargs)
@@ -521,45 +386,18 @@ class MainMonitoringStockOperationAdapter:
 
     def startup_recovery_session_ready(self, *, refresh: bool = True) -> bool:
         checker = getattr(self._window, "startup_recovery_session_ready", None)
-        if not callable(checker):
-            return False
-        try:
+        if callable(checker):
             return bool(checker(refresh=refresh))
-        except Exception:
-            return False
-
-    def require_startup_recovery_session(self, action_name: str) -> bool:
-        checker = getattr(self._window, "startup_recovery_session_ready", None)
-        if callable(checker) and checker(refresh=True):
-            self._last_operation_block_reason = ""
-            return True
-        reason_getter = getattr(self._window, "startup_recovery_block_reason", None)
-        reason = str(reason_getter() or "").strip() if callable(reason_getter) else ""
-        formatter = getattr(
-            self._window,
-            "routine_recovery_block_message",
-            None,
-        )
-        message = (
-            formatter(self._recovery_action_label)
-            if self._recovery_action_label and callable(formatter)
-            else startup_recovery_operation_block_message(action_name, reason)
-        )
-        self._last_operation_block_reason = reason or "RECOVERY_NOT_READY"
-        self.statusBarMessage(message)
-        return False
+        return bool(self._execution_host().startup_recovery_session_ready(refresh=refresh))
 
     def global_operation_start_prerequisite(self, action_name: str) -> dict[str, object]:
         checker = getattr(self._window, "global_operation_start_prerequisite", None)
         if callable(checker):
             result = checker(action_name)
             return result if isinstance(result, dict) else {"allowed": True}
-        if self.require_startup_recovery_session(action_name):
-            return {"allowed": True, "reason": "GLOBAL_PREREQUISITE_READY"}
         return {
             "allowed": False,
-            "reason": self._last_operation_block_reason or "RECOVERY_NOT_READY",
-            "user_message": self._last_operation_user_message,
+            "reason": "GLOBAL_PREREQUISITE_OWNER_UNAVAILABLE",
         }
 
     def start_target_is_review_isolated(
@@ -567,8 +405,6 @@ class MainMonitoringStockOperationAdapter:
         stock_dir: Path,
         stock_code: str,
     ) -> bool:
-        if is_review_required_stock_dir(stock_dir):
-            return True
         checker = getattr(
             self._execution_host(),
             "start_target_is_review_isolated",
@@ -603,16 +439,9 @@ class MainMonitoringStockOperationAdapter:
                 result = dict(result)
                 result["user_message"] = formatter(self._recovery_action_label)
             return result
-        if self.require_startup_recovery_session(action):
-            return {
-                "allowed": True,
-                "reason": "RECOVERY_COMPLETED",
-                "eligible": tuple(targets),
-                "excluded_review": (),
-            }
         return {
             "allowed": False,
-            "reason": self._last_operation_block_reason or "RECOVERY_NOT_READY",
+            "reason": "RECOVERY_OWNER_UNAVAILABLE",
             "eligible": (),
             "excluded_review": (),
         }
@@ -641,224 +470,102 @@ class MainMonitoringStockOperationAdapter:
     def rebind_startup_recovery_after_trusted_runtime_update(self) -> None:
         self._execution_host().rebind_startup_recovery_after_trusted_runtime_update()
 
-    def show_auto_trade_result_dialog(
-        self,
-        title: str,
-        heading: str,
-        lines: list[str],
-    ) -> None:
-        _show_monitoring_auto_trade_result_dialog(
-            self._window,
-            title,
-            heading,
-            lines,
-        )
-
     def open_review_required_window(self) -> None:
         self._window.open_review_required_window()
 
-    def start_selected_auto_trades(self) -> dict[str, object]:
-        result = auto_trade_start_selected_rows_auto_trades(self)
-        return result if isinstance(result, dict) else {
-            "ok": False,
-            "reason": "NO_STARTABLE_TARGETS",
-        }
 
-    def set_selected_individual_schedule_time(self) -> None:
-        selected = self.target_snapshot()
-        if not selected:
-            return
-        first_config = (
-            read_json_dict(selected[0][0] / "config.json") or default_config()
-        )
-        start_time, end_buy_time, _ = effective_schedule_times(first_config)
-        dialog = ScheduleOperationDialog(
-            self._window,
-            start_time,
-            end_buy_time,
-            len(selected),
-        )
-        dialog.setWindowTitle("종목 시간 예외 설정")
-        if dialog.exec_() != QDialog.Accepted:
-            return
-        result = auto_trade_apply_schedule_times_to_targets(
-            self,
-            selected,
-            dialog.start_time(),
-            dialog.end_buy_time(),
-        )
-        auto_trade_finalize_operation_mode_result(self, result)
+def execute_main_monitoring_selective_start(
+    adapter: MainMonitoringStockOperationAdapter,
+    *,
+    source: str = "auto_trade_context_menu",
+) -> dict[str, object]:
+    """Route a Main selection to the shared Operation Start command."""
 
-    def reset_selected_schedule_to_global(self) -> None:
-        selected = self.target_snapshot()
-        if not selected:
-            return
-        result = auto_trade_reset_schedule_times_for_targets(
-            self,
-            selected,
-        )
-        auto_trade_finalize_operation_mode_result(self, result)
-
-    def set_selected_continuous_operation_mode(self) -> dict[str, object]:
-        selected = self.target_snapshot()
-        if not selected:
-            return {
-                "requested": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "results": [],
-            }
-        return auto_trade_set_operation_mode_for_targets(
-            self,
-            selected,
-            "CONTINUOUS",
-        )
-
-    def handle_operation_mode_double_click(self) -> dict[str, object]:
-        selected = self.target_snapshot()
-        if not selected:
-            return {
-                "requested": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "results": [],
-            }
-        return handle_auto_trade_operation_mode_double_click(self, selected[0])
-
-    def selected_manual_ats_state(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, bool]:
-        return auto_trade_selected_manual_ats_state(
-            self,
-            selected if selected is not None else self.target_snapshot(),
-        )
-
-    def selected_manual_ats_liquidation_available(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> bool:
-        return auto_trade_selected_manual_ats_liquidation_available(
-            self,
-            selected if selected is not None else self.target_snapshot(),
-        )
-
-    def selected_manual_ats_execution_method_state(
-        self,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, object]:
-        return auto_trade_selected_manual_ats_execution_method_state(
-            self,
-            selected if selected is not None else self.target_snapshot(),
-        )
-
-    def save_selected_manual_ats_state(
-        self,
-        ats_state: dict[str, bool],
-        selected: list[tuple[Path, str, str]] | None = None,
-        editable_keys: tuple[str, ...] | None = None,
-    ) -> int:
-        return auto_trade_save_selected_manual_ats_state(
-            self,
-            ats_state,
-            selected if selected is not None else self.target_snapshot(),
-            editable_keys,
-        )
-
-    def set_selected_manual_ats_flag(
-        self,
-        flag_key: str,
-        enabled: bool,
-        label: str,
-    ) -> None:
-        auto_trade_set_selected_manual_ats_flag(
-            self,
-            flag_key,
-            enabled,
-            label,
-        )
-
-    def set_selected_manual_ats_execution_method(
-        self,
-        execution_method: str,
-        label: str,
-        selected: list[tuple[Path, str, str]] | None = None,
-    ) -> dict[str, object]:
-        return auto_trade_set_selected_manual_ats_execution_method(
-            self,
-            execution_method,
-            label,
-            selected if selected is not None else self.target_snapshot(),
-        )
-
-    def execute_selected_manual_ats_liquidation(
-        self,
-        method: str,
-        ats_state: dict[str, bool],
-        selected: list[tuple[Path, str, str]] | None = None,
-        editable_keys: tuple[str, ...] | None = None,
-        selected_sessions: tuple[str, ...] | None = None,
-    ) -> None:
-        auto_trade_execute_selected_manual_ats_liquidation(
-            self,
-            method,
-            ats_state,
-            selected if selected is not None else self.target_snapshot(),
-            editable_keys,
-            selected_sessions,
-        )
-
-    def show_operation_failure_dialog(
-        self,
-        action: str,
-        result: dict[str, object] | None,
-    ) -> bool:
-        return show_auto_trade_operation_failure_dialog(
-            self,
-            action,
-            result,
-            self._targets,
-        )
-
-    def apply_selected_early_close_profit_loss(self) -> None:
-        auto_trade_apply_selected_early_close_profit_loss(self)
-
-    def cancel_selected_early_close(self) -> None:
-        auto_trade_cancel_selected_early_close(self)
-
-    def apply_selected_early_close(
-        self,
-        method: str,
-        *,
-        source: str = "우클릭",
-        extra_policy: dict[str, object] | None = None,
-        show_error_dialog: bool = True,
-        show_result_toast: bool = True,
-        show_confirmation: bool = True,
-    ) -> dict[str, object]:
-        return auto_trade_apply_selected_early_close(
-            self,
-            method,
+    selected = tuple(adapter.selected_stock_infos())
+    return execute_operation_start_command(
+        adapter,
+        OperationStartCommandRequest(
+            intent=OperationStartIntent.SELECTIVE_START,
+            selected_targets=selected,
             source=source,
-            extra_policy=extra_policy,
-            show_error_dialog=show_error_dialog,
-            show_result_toast=show_result_toast,
-            show_confirmation=show_confirmation,
-        )
+        ),
+        selective_backend=auto_trade_start_selected_rows_auto_trades,
+    ).as_legacy_dict()
 
-    def apply_selected_individual_liquidation_method(
-        self,
-        method: str,
-        minutes: str,
-        *,
-        show_error_dialog: bool = True,
-    ) -> dict[str, object]:
-        return auto_trade_apply_selected_individual_liquidation_method(
-            self,
-            method,
-            minutes,
-            show_error_dialog=show_error_dialog,
-        )
+
+def toggle_main_monitoring_trade_permission(
+    adapter: MainMonitoringStockOperationAdapter,
+) -> dict[str, object]:
+    """Apply the shared RealTrade command and keep Main-only UI feedback here."""
+
+    selected = adapter.selected_stock_infos()
+    if not selected:
+        adapter.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
+        return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
+    result = execute_selected_stock_real_trade_command(
+        adapter,
+        selected,
+        selected_stock_real_trade_target_enabled(selected),
+    )
+    if result.get("changed"):
+        adapter.refresh_all()
+    message = f"거래권한 변경: {result.get('changed', 0)}개"
+    if result.get("blocked"):
+        message += f" / 차단 {result.get('blocked', 0)}개"
+    adapter.statusBarMessage(message)
+    return result
+
+
+def set_main_monitoring_individual_schedule_time(
+    adapter: MainMonitoringStockOperationAdapter,
+) -> None:
+    """Collect Main schedule input, then delegate to the existing status owner."""
+
+    selected = adapter.selected_stock_infos()
+    if not selected:
+        return
+    first_config = read_json_dict(selected[0][0] / "config.json") or default_config()
+    start_time, end_buy_time, _ = effective_schedule_times(first_config)
+    dialog = ScheduleOperationDialog(
+        adapter.parent(),
+        start_time,
+        end_buy_time,
+        len(selected),
+    )
+    dialog.setWindowTitle("종목 시간 예외 설정")
+    if dialog.exec_() != QDialog.Accepted:
+        return
+    result = auto_trade_apply_schedule_times_to_targets(
+        adapter,
+        selected,
+        dialog.start_time(),
+        dialog.end_buy_time(),
+    )
+    auto_trade_finalize_operation_mode_result(adapter, result)
+
+
+def reset_main_monitoring_schedule_to_global(
+    adapter: MainMonitoringStockOperationAdapter,
+) -> None:
+    selected = adapter.selected_stock_infos()
+    if not selected:
+        return
+    result = auto_trade_reset_schedule_times_for_targets(adapter, selected)
+    auto_trade_finalize_operation_mode_result(adapter, result)
+
+
+def main_monitoring_unregister_available(
+    adapter: MainMonitoringStockOperationAdapter,
+) -> bool:
+    return bool(adapter._targets) and all(
+        inspect_stock_unregister_availability(
+            adapter,
+            PROJECT_ROOT,
+            target.code,
+            target.name,
+        ).allowed
+        for target in adapter._targets
+    )
 
 
 def show_main_monitoring_stock_context_menu(window, position) -> bool:
@@ -885,9 +592,12 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
     callbacks = StockContextMenuCallbacks(
         select_all=lambda: select_all_visible_main_monitoring_stocks(window),
         clear_selection=lambda: clear_main_monitoring_stock_selection(window),
-        start=adapter.start_selected_auto_trades,
+        start=lambda: execute_main_monitoring_selective_start(adapter),
         emergency_stop=(
-            adapter.emergency_stop_selected_auto_trade_stocks
+            lambda: execute_selected_emergency_stop(
+                adapter,
+                adapter.selected_stock_infos(),
+            )
             if has_non_emergency
             else None
         ),
@@ -896,42 +606,87 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
                 target_instance_id
             )
         ),
-        early_close=lambda method: adapter.apply_selected_early_close(
+        early_close=lambda method: auto_trade_apply_selected_early_close(
+            adapter,
             method,
             source="우클릭",
+            selected=adapter.selected_stock_infos(),
         ),
-        early_close_profit_loss=adapter.apply_selected_early_close_profit_loss,
-        early_close_cancel=adapter.cancel_selected_early_close,
-        individual_liquidation=adapter.apply_selected_individual_liquidation_method,
+        early_close_profit_loss=lambda: auto_trade_apply_selected_early_close_profit_loss(
+            adapter
+        ),
+        early_close_cancel=lambda: auto_trade_cancel_selected_early_close(adapter),
+        individual_liquidation=(
+            lambda method, minutes: auto_trade_apply_selected_individual_liquidation_method(
+                adapter,
+                method,
+                minutes,
+            )
+        ),
         open_charts=lambda: open_selected_main_monitoring_stock_instance_charts(
             window,
             adapter.selected_stock_infos(),
         ),
-        time_change=adapter.set_selected_individual_schedule_time,
-        time_reset=adapter.reset_selected_schedule_to_global,
-        ats_state=adapter.selected_manual_ats_state,
-        ats_toggle=adapter.set_selected_manual_ats_flag,
-        ats_execution_method_state=adapter.selected_manual_ats_execution_method_state,
-        ats_execution_method_set=adapter.set_selected_manual_ats_execution_method,
-        trade_permission_label=adapter.selected_trade_permission_context_label,
-        toggle_trade_permission=adapter.toggle_selected_trade_permission,
+        time_change=lambda: set_main_monitoring_individual_schedule_time(adapter),
+        time_reset=lambda: reset_main_monitoring_schedule_to_global(adapter),
+        ats_state=lambda: auto_trade_selected_manual_ats_state(
+            adapter,
+            adapter.selected_stock_infos(),
+        ),
+        ats_toggle=lambda flag_key, enabled, label: auto_trade_set_selected_manual_ats_flag(
+            adapter,
+            flag_key,
+            enabled,
+            label,
+        ),
+        ats_execution_method_state=(
+            lambda: auto_trade_selected_manual_ats_execution_method_state(
+                adapter,
+                adapter.selected_stock_infos(),
+            )
+        ),
+        ats_execution_method_set=(
+            lambda execution_method, label: auto_trade_set_selected_manual_ats_execution_method(
+                adapter,
+                execution_method,
+                label,
+                adapter.selected_stock_infos(),
+            )
+        ),
+        trade_permission_label=lambda: selected_stock_trade_permission_label(
+            adapter.selected_stock_infos()
+        ),
+        trade_permission_available=lambda: selected_stock_trade_permission_available(
+            adapter,
+            adapter.selected_stock_infos(),
+        ),
+        toggle_trade_permission=lambda: toggle_main_monitoring_trade_permission(adapter),
         ats_liquidation_available=(
-            adapter.selected_manual_ats_liquidation_available
+            lambda: auto_trade_selected_manual_ats_liquidation_available(
+                adapter,
+                adapter.selected_stock_infos(),
+            )
         ),
         ats_liquidation=(
             lambda method, state, visible_keys, selected_sessions: (
-                adapter.execute_selected_manual_ats_liquidation(
+                auto_trade_execute_selected_manual_ats_liquidation(
+                    adapter,
                     method,
                     state,
-                    adapter.target_snapshot(),
+                    adapter.selected_stock_infos(),
                     visible_keys,
                     selected_sessions,
                 )
             )
         ),
-        set_operation_exclusion=adapter.set_selected_stock_operation_exclusions,
-        clear_operation_exclusion=adapter.clear_selected_stock_operation_exclusions,
-        unregister=adapter.unregister_selected_auto_trade_stocks,
+        set_operation_exclusion=lambda: auto_trade_set_selected_stock_operation_exclusions(
+            adapter
+        ),
+        clear_operation_exclusion=(
+            lambda: auto_trade_clear_selected_stock_operation_exclusions(adapter)
+        ),
+        unregister=lambda: unregister_selected_auto_trade_stocks(adapter),
+        unregister_available=lambda: main_monitoring_unregister_available(adapter),
     )
     show_monitor_stock_context_menu(
         window,
@@ -940,7 +695,7 @@ def show_main_monitoring_stock_context_menu(window, position) -> bool:
         callbacks=callbacks,
         selected_modes=selected_modes,
         operation_excluded=operation_excluded,
-        selected_targets=adapter.target_snapshot(),
+        selected_targets=adapter.selected_stock_infos(),
         scheduled_excluded_management=(
             operation_excluded and selected_modes == {"SCHEDULED"}
         ),

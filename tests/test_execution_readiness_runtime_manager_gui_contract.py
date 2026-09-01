@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 import hashlib
 from pathlib import Path
 import unittest
@@ -197,8 +199,7 @@ class ExecutionReadinessRuntimeManagerGuiContractTest(unittest.TestCase):
 
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
         self.assertEqual(before_rules, {str(path): _sha256(path) for path in rules_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

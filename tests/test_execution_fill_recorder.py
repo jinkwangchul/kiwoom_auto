@@ -11,6 +11,8 @@ import threading
 import unittest
 from unittest import mock
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 import execution_fill_recorder
 from execution_fill_recorder import record_execution_fill
 
@@ -680,6 +682,7 @@ class ExecutionFillRecorderTest(unittest.TestCase):
             self._record_fill(path)
 
         self.assertEqual(before, self._sha256(runtime_order_queue))
+        assert_project_mutable_guard_active(self)
 
     def test_runtime_positions_not_created(self) -> None:
         runtime_positions = Path("runtime") / "positions.json"

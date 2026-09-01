@@ -14,6 +14,7 @@ from execution_runtime_commit_service import (
 )
 from execution_runtime_file_schema import default_order_executions_data, default_order_locks_data
 from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
+from tests.filesystem_test_support import TemporaryProjectRoot, patch_project_runtime_classifiers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -229,22 +230,18 @@ class ExecutionRuntimeCommitServiceTest(unittest.TestCase):
         self.assertIn("MANUAL_PROJECT_RUNTIME_COMMIT_CONFIRMATION_REQUIRED", result["issues"])
 
     def test_project_runtime_policy_ready_existing_files_committed(self) -> None:
-        executions = ROOT / "runtime" / "order_executions.json"
-        locks = ROOT / "runtime" / "order_locks.json"
-        if executions.exists() or locks.exists():
-            result = commit_execution_runtime_plan(
-                self._commit_orchestrator(),
-                executions,
-                locks,
-                context=self._context(),
-            )
-            self.assertEqual("BLOCKED", result["status"])
-            return
-
-        _write_json(executions, default_order_executions_data())
-        _write_json(locks, default_order_locks_data())
-        orchestrator = self._commit_orchestrator()
-        try:
+        with TemporaryProjectRoot() as layout, patch_project_runtime_classifiers(
+            layout.runtime,
+            (
+                "execution_runtime_commit_service",
+                "execution_runtime_real_commit_readiness_policy",
+            ),
+        ):
+            executions = layout.runtime / "order_executions.json"
+            locks = layout.runtime / "order_locks.json"
+            _write_json(executions, default_order_executions_data())
+            _write_json(locks, default_order_locks_data())
+            orchestrator = self._commit_orchestrator()
             result = commit_execution_runtime_plan(
                 orchestrator,
                 executions,
@@ -262,10 +259,6 @@ class ExecutionRuntimeCommitServiceTest(unittest.TestCase):
             lock_data = json.loads(locks.read_text(encoding="utf-8"))
             self.assertEqual("EXEC_1", execution_data["executions"][0]["execution_id"])
             self.assertEqual("LOCK_1", lock_data["locks"][0]["lock_id"])
-        finally:
-            for path in (executions, locks, Path(str(executions) + ".bak"), Path(str(locks) + ".bak")):
-                if path.exists():
-                    path.unlink()
 
     def test_confirmations_missing_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

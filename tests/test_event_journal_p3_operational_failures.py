@@ -157,23 +157,58 @@ class EventJournalP3OperationalFailureTests(unittest.TestCase):
     def test_global_emergency_release_failure_records_once(self):
         owner = _Owner()
         owner.all_runtime_stock_dirs = lambda: []
+        owner.startup_recovery_session_ready = lambda *, refresh=False: True
         owner.statusBar = lambda: SimpleNamespace(showMessage=lambda _message: None)
         owner.refresh_all = Mock()
+        call_order = []
+
+        def fail_write(**_kwargs):
+            call_order.append("write")
+            return {"ok": False}
+
+        def capture_event(*_args, **_kwargs):
+            call_order.append("event")
+            return {"appended": True}
+
         with (
-            patch.object(event_journal_production, "append_production_event") as append,
+            patch.object(
+                event_journal_production,
+                "append_production_event",
+                side_effect=capture_event,
+            ) as append,
             patch.object(emergency_ops, "read_operation_state", return_value={"emergency_stop": True}),
-            patch.object(emergency_ops, "write_global_emergency_stop_state", return_value={"ok": False}),
+            patch.object(
+                emergency_ops,
+                "read_execution_queue_records",
+                return_value={"ok": True, "records": []},
+            ),
+            patch.object(
+                emergency_ops,
+                "write_global_emergency_stop_state",
+                side_effect=fail_write,
+            ) as write_state,
+            patch.object(
+                emergency_ops,
+                "observe_owner_failure_transition",
+                wraps=emergency_ops.observe_owner_failure_transition,
+            ) as observe_failure,
             patch.object(emergency_ops, "append_changelog"),
             patch.object(emergency_ops, "update_emergency_button_state"),
             patch.object(emergency_ops, "show_toast"),
         ):
-            emergency_ops.release_emergency_stop(owner)
-            emergency_ops.release_emergency_stop(owner)
+            result = emergency_ops.release_emergency_stop(owner)
+        self.assertEqual("INCOMPLETE", result["status"])
+        self.assertEqual(1, result["failed_count"])
+        write_state.assert_called_once()
+        observe_failure.assert_called_once()
         self.assertEqual(1, append.call_count)
+        self.assertEqual("PROCESSING_ERROR", append.call_args.args[0])
+        self.assertEqual("FAILED", append.call_args.kwargs["result"])
         self.assertEqual(
             "GLOBAL_EMERGENCY_RELEASE_WRITE_FAILED",
             append.call_args.kwargs["reason_code"],
         )
+        self.assertEqual(["write", "event"], call_order)
 
     def test_budget_evidence_failure_transition_and_recovery(self):
         owner = _Owner()

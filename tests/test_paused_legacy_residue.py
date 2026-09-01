@@ -7,7 +7,7 @@ from pathlib import Path
 
 import signal_decision_policy_service
 from gui_config_utils import default_config, default_state
-from gui_review_utils import build_review_required_item, review_reason_summary
+from gui_review_utils import build_review_required_item
 from state_policy import auto_trade_status_display
 
 
@@ -56,7 +56,6 @@ class PausedLegacyResidueTests(unittest.TestCase):
         self.assertNotIn("paused_at", item)
         self.assertNotIn("missed_buy_signal_count", item)
         self.assertNotIn("missed_sell_signal_count", item)
-        self.assertEqual("미체결X / 현재가X", review_reason_summary(item))
 
     def test_pending_order_review_is_unchanged(self) -> None:
         item = self._review_item(

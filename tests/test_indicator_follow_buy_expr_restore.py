@@ -2,19 +2,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import os
 from pathlib import Path
-import sys
-import types
 import unittest
 
-from tests.test_gui_execution_preview_button import _install_pyqt5_import_stubs
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-
-_install_pyqt5_import_stubs()
-sys.modules["PyQt5"].sip = types.ModuleType("PyQt5.sip")
-sys.modules["PyQt5.sip"] = sys.modules["PyQt5"].sip
+from PyQt5.QtWidgets import QDialog
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
+from tests.qt_test_support import create_qt_widget_shell, dispose_qt_widget
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,9 +64,11 @@ class IndicatorFollowBuyExprRestoreTest(unittest.TestCase):
 
     def test_apply_ui_state_restores_expression_without_writing_rules_json(self):
         before = _sha256(RULES_PATH)
-        dialog = dialog_module.IndicatorFollowRoutineSettingsDialog.__new__(
-            dialog_module.IndicatorFollowRoutineSettingsDialog
+        dialog = create_qt_widget_shell(
+            dialog_module.IndicatorFollowRoutineSettingsDialog,
+            QDialog,
         )
+        self.addCleanup(dispose_qt_widget, dialog)
         dialog.buy_signal_expr_line = _FakeLine()
         applied = []
 

@@ -32,6 +32,9 @@ SORT_ROLE = Qt.UserRole + 100
 AUTO_TRADE_SETTING_BADGE_HEIGHT = 22
 AUTO_TRADE_SETTING_BADGE_BORDER_COLOR = "#A855F7"
 AUTO_TRADE_SETTING_BADGE_TEXT_COLOR = "#6D28D9"
+AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
+AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
+AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = AUTO_TRADE_SETTING_BADGE_HEIGHT
 AUTO_TRADE_SETTING_INACTIVE_TEXT_COLOR = "#AFB2B9"
 AUTO_TRADE_SETTING_AMBER_TEXT_COLOR = "#D97706"
 
@@ -303,21 +306,6 @@ def ratio_metric_layout(
     )
 
 
-def ratio_metric_display_width(
-    metric: RatioMetricDisplay,
-    *,
-    font: QFont | None = None,
-    prefix: str = "",
-    outer_padding: int = 0,
-) -> int:
-    return ratio_metric_layout(
-        QFontMetrics(font or QFont()),
-        metric,
-        prefix=prefix,
-        outer_padding=outer_padding,
-    ).total_width
-
-
 def stock_position_metric_width(
     *,
     label: str,
@@ -399,38 +387,6 @@ def draw_ratio_metric_display(
     if show_label:
         painter.drawText(x, draw_rect.top(), layout.close_width, draw_rect.height(), Qt.AlignLeft | Qt.AlignVCenter, ")")
     painter.restore()
-
-
-def draw_ratio_metric(
-    painter,
-    rect,
-    *,
-    label: str,
-    left_value: str,
-    right_value: str,
-    left_width: int,
-    right_width: int,
-    color=None,
-    prefix: str = "",
-    outer_padding: int = 0,
-) -> None:
-    draw_ratio_metric_display(
-        painter,
-        rect,
-        RatioMetricDisplay(
-            label=label,
-            value1=left_value,
-            value2=right_value,
-            value1_sample=left_value,
-            value2_sample=right_value,
-            value1_width=left_width,
-            value2_width=right_width,
-            force_slot_render=(label == "가격"),
-        ),
-        color=color,
-        prefix=prefix,
-        outer_padding=outer_padding,
-    )
 
 
 def draw_stock_position_metric(
@@ -860,9 +816,11 @@ def create_routine_profit_signal_widget(
 
 
 from state_policy import (
+    auto_trade_setting_display_status,
     auto_trade_status_color,
     auto_trade_status_display,
     auto_trade_status_dot,
+    display_status_text_for_gui,
 )
 
 
@@ -879,27 +837,6 @@ def create_auto_trade_status_item(display_status: str) -> QTableWidgetItem:
     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     item.setForeground(QColor(auto_trade_status_color(normalized_status)))
     return item
-
-
-def auto_trade_setting_display_status(
-    display_status: str,
-    *,
-    emergency_scope: str | None = None,
-) -> str:
-    """자동매매설정창 표시용 상태명.
-
-    이 창은 운영 가능 종목의 설정/현황을 보는 곳이므로
-    기존 감시/매도 표시를 운영자 기준의 자동마감으로 보여준다.
-    """
-    normalized = display_status_text_for_gui(display_status)
-    if normalized == "감시/매도":
-        return "자동마감"
-    if (
-        normalized == "긴급정지"
-        and str(emergency_scope or "").strip().upper() == "SELECTED"
-    ):
-        return "검토종목"
-    return normalized
 
 
 def auto_trade_setting_status_color(display_status: str) -> str:
@@ -970,21 +907,18 @@ def create_auto_trade_setting_activity_status_item(
 
 
 def create_auto_trade_operation_item(
-    config: dict[str, object],
-    state: dict[str, object] | None,
+    operation_display: tuple[str, str, str, object],
     *,
     liquidation_result_policy: str = "NONE",
     liquidation_completed_today: bool = False,
 ) -> QTableWidgetItem:
     """Create the official operation-mode cell used by auto-trade views."""
-    from gui_auto_trade_policy import auto_trade_operation_display
-
     (
         operation_display_text,
         operation_color,
         operation_display_tooltip,
         _ats_labels,
-    ) = auto_trade_operation_display(config, state)
+    ) = operation_display
     item = SortableTableWidgetItem(operation_display_text)
 
     if liquidation_result_policy == "RED_STOP":
@@ -1111,17 +1045,6 @@ def yes_no_display(value: object) -> str:
         return "예"
 
     return "아니오"
-
-
-def display_status_text_for_gui(raw_status: object) -> str:
-    """GUI 표시용 상태명. state_policy 기준 6개 표시 상태로 통일한다."""
-    status = str(raw_status or "").strip()
-    if not status or status == "-":
-        return "-"
-    try:
-        return auto_trade_status_display(status)
-    except Exception:
-        return "검토종목"
 
 
 def routine_status_display_text(raw_status: object) -> str:

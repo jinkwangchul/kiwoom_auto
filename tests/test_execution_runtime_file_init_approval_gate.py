@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    assert_project_mutable_guard_active,
+    patch_project_runtime_classifiers,
+)
+
 import hashlib
 from pathlib import Path
-import tempfile
 import unittest
 from unittest import mock
 
@@ -24,13 +29,21 @@ def _sha256(path: Path) -> str | None:
 
 class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.temp_root = Path(self.tmp.name)
+        self.layout = TemporaryProjectRoot()
+        self.temp_root = self.layout.root
         self.order_executions_path = self.temp_root / "order_executions.json"
         self.order_locks_path = self.temp_root / "order_locks.json"
+        self.runtime_patches = patch_project_runtime_classifiers(
+            self.layout.runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_approval_gate",
+            ),
+        )
 
     def tearDown(self) -> None:
-        self.tmp.cleanup()
+        self.runtime_patches.close()
+        self.layout.cleanup()
 
     def _preview(self, **overrides) -> dict:
         kwargs = {
@@ -63,8 +76,8 @@ class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
 
     def test_project_runtime_path_missing_project_confirmation_blocked(self) -> None:
         preview = build_execution_runtime_file_init_preview(
-            ROOT / "runtime" / "order_executions.json",
-            ROOT / "runtime" / "order_locks.json",
+            self.layout.runtime / "order_executions.json",
+            self.layout.runtime / "order_locks.json",
             allow_project_runtime_path=True,
         )
 
@@ -79,8 +92,8 @@ class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
 
     def test_project_runtime_path_with_both_confirmations_approved(self) -> None:
         preview = build_execution_runtime_file_init_preview(
-            ROOT / "runtime" / "order_executions.json",
-            ROOT / "runtime" / "order_locks.json",
+            self.layout.runtime / "order_executions.json",
+            self.layout.runtime / "order_locks.json",
             allow_project_runtime_path=True,
         )
 
@@ -163,8 +176,8 @@ class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
 
         self._approve(self._preview())
         runtime_preview = build_execution_runtime_file_init_preview(
-            ROOT / "runtime" / "order_executions.json",
-            ROOT / "runtime" / "order_locks.json",
+            self.layout.runtime / "order_executions.json",
+            self.layout.runtime / "order_locks.json",
             allow_project_runtime_path=True,
         )
         approve_execution_runtime_file_init(
@@ -175,8 +188,7 @@ class ExecutionRuntimeFileInitApprovalGateTest(unittest.TestCase):
 
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
         self.assertEqual(before_rules, {str(path): _sha256(path) for path in rules_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

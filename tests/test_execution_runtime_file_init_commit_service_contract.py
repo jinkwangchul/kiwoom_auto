@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    assert_project_mutable_guard_active,
+    patch_project_runtime_classifiers,
+)
+
 from copy import deepcopy
 import hashlib
 import json
@@ -59,10 +65,11 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
             manual_temp_file_init_confirmed=confirmed,
         )
 
-    def _project_orchestrator(self) -> dict:
+    def _project_orchestrator(self, runtime_root: Path | None = None) -> dict:
+        runtime_root = ROOT / "runtime" if runtime_root is None else Path(runtime_root)
         preview = build_execution_runtime_file_init_preview(
-            ROOT / "runtime" / "order_executions.json",
-            ROOT / "runtime" / "order_locks.json",
+            runtime_root / "order_executions.json",
+            runtime_root / "order_locks.json",
             allow_project_runtime_path=True,
         )
         approval = approve_execution_runtime_file_init(
@@ -117,7 +124,7 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
 
         self.assertEqual("BLOCKED", result["status"])
         self.assertIn("PROJECT_RUNTIME_PATH_BLOCKED", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_actual_project_runtime_order_locks_path_blocked(self) -> None:
         orchestrator = self._valid_orchestrator_with_target(
@@ -128,16 +135,20 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
 
         self.assertEqual("BLOCKED", result["status"])
         self.assertIn("PROJECT_RUNTIME_PATH_BLOCKED", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_project_runtime_open_policy_ready_with_confirmation_committed(self) -> None:
-        order_executions_path = ROOT / "runtime" / "order_executions.json"
-        order_locks_path = ROOT / "runtime" / "order_locks.json"
-        self.assertFalse(order_executions_path.exists())
-        self.assertFalse(order_locks_path.exists())
-        orchestrator = self._project_orchestrator()
-
-        try:
+        with TemporaryProjectRoot() as layout, patch_project_runtime_classifiers(
+            layout.runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_commit_service",
+                "execution_runtime_file_init_open_policy",
+            ),
+        ):
+            order_executions_path = layout.runtime / "order_executions.json"
+            order_locks_path = layout.runtime / "order_locks.json"
+            orchestrator = self._project_orchestrator(layout.runtime)
             result = commit_execution_runtime_file_init_plan(
                 orchestrator,
                 manual_runtime_file_init_commit_confirmed=True,
@@ -150,24 +161,26 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
             self.assertTrue(result["runtime_write"])
             self.assertEqual([str(order_executions_path), str(order_locks_path)], result["created_files"])
             self.assertTrue(result["read_back_verified"])
-        finally:
-            for path in (order_executions_path, order_locks_path):
-                if path.exists():
-                    path.unlink()
 
     def test_project_runtime_open_policy_ready_without_project_confirmation_blocked(self) -> None:
-        orchestrator = self._project_orchestrator()
-
-        result = commit_execution_runtime_file_init_plan(
-            orchestrator,
-            manual_runtime_file_init_commit_confirmed=True,
-            file_init_open_policy_result=self._open_policy(orchestrator),
-        )
+        with TemporaryProjectRoot() as layout, patch_project_runtime_classifiers(
+            layout.runtime,
+            (
+                "execution_runtime_file_init_preview",
+                "execution_runtime_file_init_commit_service",
+                "execution_runtime_file_init_open_policy",
+            ),
+        ):
+            orchestrator = self._project_orchestrator(layout.runtime)
+            result = commit_execution_runtime_file_init_plan(
+                orchestrator,
+                manual_runtime_file_init_commit_confirmed=True,
+                file_init_open_policy_result=self._open_policy(orchestrator),
+            )
 
         self.assertEqual("BLOCKED", result["status"])
         self.assertIn("MANUAL_PROJECT_RUNTIME_FILE_INIT_COMMIT_CONFIRMATION_REQUIRED", result["issues"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_confirmations_missing_blocked(self) -> None:
         result = self._commit(self._orchestrator(), confirmed=False)
@@ -278,8 +291,7 @@ class ExecutionRuntimeFileInitCommitServiceContractTest(unittest.TestCase):
 
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
         self.assertEqual(before_rules, {str(path): _sha256(path) for path in rules_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

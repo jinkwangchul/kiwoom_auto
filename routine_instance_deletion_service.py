@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import shutil
 from dataclasses import dataclass
@@ -10,10 +9,8 @@ from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
 
-from assignment_episode_repository import (
-    AssignmentEpisodeTarget,
-    CanonicalAssignmentEpisodeRepository,
-)
+from assignment_episode_linkage import unassign_stock_routine
+from assignment_episode_repository import CanonicalAssignmentEpisodeRepository
 from routine_delete_policy import DeleteScopeBlock, preview_delete_scope
 from routine_instance_registry import routine_instance_by_id
 from runtime_io import read_json_dict
@@ -139,24 +136,15 @@ def delete_routine_instance_completely(
                     (episode_path, episode_path.read_bytes() if episode_path.exists() else None),
                 )
             )
-            before_target = AssignmentEpisodeTarget.assigned(
-                instance_id=scope.instance_id,
-                group_id=scope.group_id,
-                definition_id=scope.definition_id,
-                instance_name_snapshot=scope.instance_name,
-                group_name_snapshot="",
+            result = unassign_stock_routine(
+                repository.project_root,
+                stock.code,
+                stock.name,
+                [],
+                expected_instance_id=scope.instance_id,
+                stock_repository=repository,
             )
-            parameters = inspect.signature(repository.update_stock_routine).parameters
-            if "_episode_before_target" in parameters:
-                updated = repository.update_stock_routine(
-                    stock.code,
-                    stock.name,
-                    [],
-                    _episode_before_target=before_target,
-                )
-            else:
-                updated = repository.update_stock_routine(stock.code, stock.name, [])
-            if not updated:
+            if not result.ok:
                 raise RuntimeError(f"종목 관계를 해제하지 못했습니다: {stock.code} {stock.name}")
             saved = read_json_dict(config_path)
             if str(saved.get("assigned_routine_instance_id", "") or "").strip() or saved.get("routines"):

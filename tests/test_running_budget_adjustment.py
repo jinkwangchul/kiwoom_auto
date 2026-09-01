@@ -24,12 +24,13 @@ from running_budget_adjustment import (
     transition_running_budget_adjustment_for_signal,
 )
 from runtime_io import read_json_dict
+from tests.participant_owner_fixture import attach_participant_owner, participant_owner
 
 
 class RunningBudgetAdjustmentContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.stock_dir = Path(self.temp.name) / "005930_삼성전자"
+        self.stock_dir = Path(self.temp.name) / "stocks" / "005930_삼성전자"
         self.stock_dir.mkdir(parents=True)
         self.config = {
             "trade_amount_type": "AMOUNT",
@@ -267,6 +268,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         }
         item = SimpleNamespace(data=lambda role: role_values.get(role))
         host = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
             routine_table=SimpleNamespace(item=lambda _row, _column: item),
             _running_budget_adjustment_dialog=None,
             load_routine_table=MagicMock(),
@@ -486,11 +488,20 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
 
         host = self._dialog_host()
         host._adjusted_buy_limit_for_start_budget.return_value = 20_000
+        original_patch = (
+            gui_windows.CanonicalStockConfigRepository.patch_stock_config
+        )
         with (
             patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
             patch.object(gui_windows, "auto_trade_start_budget_current_running", return_value=False),
             patch.object(gui_windows, "commit_running_budget_adjustment") as commit,
             patch.object(gui_windows, "show_toast"),
+            patch.object(
+                gui_windows.CanonicalStockConfigRepository,
+                "patch_stock_config",
+                autospec=True,
+                side_effect=original_patch,
+            ) as config_patch,
         ):
             gui_windows.MainWindow._open_running_budget_adjustment_dialog(
                 host,
@@ -506,6 +517,168 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         self.assertEqual("RECOMMENDED", saved["buy_limit_source"])
         host._adjusted_buy_limit_for_start_budget.assert_called_once()
         commit.assert_not_called()
+        config_patch.assert_called_once()
+        persisted_patch = config_patch.call_args.args[2]
+        self.assertEqual(300, persisted_patch["buy_amount"])
+        self.assertEqual(20_000, persisted_patch["buy_limit_amount"])
+
+    def test_non_running_same_budget_field_conflict_fails_closed(self) -> None:
+        config_path = self.stock_dir / "config.json"
+
+        class AcceptedStaleDialog:
+            result = {
+                "mode": "AMOUNT",
+                "value": 300,
+                "apply_timing": "PRE_OPERATION",
+                "apply_limit": False,
+            }
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                latest = read_json_dict(config_path)
+                latest["buy_amount"] = 250
+                latest["external_marker"] = "preserved"
+                config_path.write_text(json.dumps(latest), encoding="utf-8")
+                return gui_windows.QDialog.Accepted
+
+            def deleteLater(self):
+                pass
+
+        host = self._dialog_host()
+        with (
+            patch.object(
+                gui_windows,
+                "RunningBudgetAdjustmentDialog",
+                AcceptedStaleDialog,
+            ),
+            patch.object(
+                gui_windows,
+                "auto_trade_start_budget_current_running",
+                return_value=False,
+            ),
+            patch.object(gui_windows, "observe_owner_failure_transition") as evidence,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                config_path,
+            )
+
+        saved = read_json_dict(config_path)
+        self.assertEqual(250, saved["buy_amount"])
+        self.assertEqual("preserved", saved["external_marker"])
+        self.assertEqual("FAILED", evidence.call_args.kwargs["result"])
+        self.assertFalse(evidence.call_args.kwargs["details"]["runtime_committed"])
+        self.assertEqual(
+            "기본예산 설정이 변경되어 적용하지 않았습니다.",
+            toast.call_args.args[1],
+        )
+        host.load_routine_table.assert_called_once_with()
+
+    def test_running_runtime_success_then_config_conflict_is_partial(self) -> None:
+        config_path = self.stock_dir / "config.json"
+
+        class AcceptedStaleDialog:
+            result = {
+                "mode": "AMOUNT",
+                "value": 300,
+                "apply_timing": "IMMEDIATE",
+                "apply_limit": False,
+            }
+            requested_at = "2026-08-28 12:00:00"
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                latest = read_json_dict(config_path)
+                latest["buy_amount"] = 250
+                config_path.write_text(json.dumps(latest), encoding="utf-8")
+                return gui_windows.QDialog.Accepted
+
+            def deleteLater(self):
+                pass
+
+        host = self._dialog_host()
+        attach_participant_owner(host, {"005930"})
+        host.startup_recovery_session_ready = lambda refresh=False: True
+        with (
+            patch.object(
+                gui_windows,
+                "RunningBudgetAdjustmentDialog",
+                AcceptedStaleDialog,
+            ),
+            patch.object(gui_windows, "observe_owner_failure_transition") as evidence,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                config_path,
+            )
+
+        self.assertEqual(250, read_json_dict(config_path)["buy_amount"])
+        adjustment = running_budget_adjustment_snapshot(self.stock_dir)
+        self.assertEqual(300, adjustment["requested_value"])
+        self.assertEqual("PARTIAL", evidence.call_args.kwargs["result"])
+        self.assertTrue(evidence.call_args.kwargs["details"]["runtime_committed"])
+        self.assertNotIn("저장했습니다", toast.call_args.args[1])
+
+    def test_running_runtime_failure_does_not_write_base_config(self) -> None:
+        class AcceptedDialog:
+            result = {
+                "mode": "AMOUNT",
+                "value": 300,
+                "apply_timing": "IMMEDIATE",
+                "apply_limit": False,
+            }
+            requested_at = "2026-08-28 12:00:00"
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                return gui_windows.QDialog.Accepted
+
+            def deleteLater(self):
+                pass
+
+        host = self._dialog_host()
+        original_config = read_json_dict(self.stock_dir / "config.json")
+        with (
+            patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
+            patch.object(
+                gui_windows,
+                "auto_trade_start_budget_current_running",
+                return_value=True,
+            ),
+            patch.object(
+                gui_windows,
+                "commit_running_budget_adjustment",
+                return_value={"ok": False, "reason": "STATE_WRITE_FAILED"},
+            ),
+            patch.object(
+                host,
+                "_write_stock_initial_buy_config",
+                wraps=host._write_stock_initial_buy_config,
+            ) as config_writer,
+            patch.object(gui_windows, "show_toast") as toast,
+        ):
+            gui_windows.MainWindow._open_running_budget_adjustment_dialog(
+                host,
+                0,
+                self.stock_dir / "config.json",
+            )
+
+        config_writer.assert_not_called()
+        self.assertEqual(original_config, read_json_dict(self.stock_dir / "config.json"))
+        self.assertEqual(
+            "기본예산 변경 요청을 저장하지 못했습니다.",
+            toast.call_args.args[1],
+        )
 
     def test_running_immediate_confirm_persists_base_without_signal(self) -> None:
         class AcceptedDialog:
@@ -527,7 +700,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                 pass
 
         host = self._dialog_host()
-        host._current_session_operation_participant_stock_codes = {"005930"}
+        attach_participant_owner(host, {"005930"})
         host.startup_recovery_session_ready = lambda refresh=False: True
         with (
             patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
@@ -573,7 +746,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
 
         host = self._dialog_host()
         host._adjusted_buy_limit_for_start_budget.return_value = 20_000
-        host._current_session_operation_participant_stock_codes = {"005930"}
+        attach_participant_owner(host, {"005930"})
         host.startup_recovery_session_ready = lambda refresh=False: True
         with (
             patch.object(gui_windows, "RunningBudgetAdjustmentDialog", AcceptedDialog),
@@ -870,7 +1043,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         self.assertEqual("QUANTITY", captured["config"]["trade_amount_type"])
         self.assertEqual(10, captured["config"]["buy_qty"])
 
-    def test_main_row_uses_requested_budget_and_limit_for_display_projection(self) -> None:
+    def test_main_row_keeps_current_budget_and_separates_pending_projection(self) -> None:
         state = {
             **self.state,
             ADJUSTMENT_KEY: {
@@ -897,7 +1070,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         row = gui_main_table_loader._routine_tree_stock_row(
             SimpleNamespace(
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                _current_session_operation_participant_stock_codes={"005930"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"}),
             ),
             definition_id="fixture",
             instance_id="fixture-instance",
@@ -915,9 +1088,12 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
                 },
             },
         )
-        self.assertEqual("60,000원", row["initial_buy"]["value_text"])
-        self.assertEqual("한도(6,000,000)", row["stock_values"][11])
-        self.assertTrue(row["running_budget_adjustment_display"]["hydrated"])
+        self.assertEqual("20,000원", row["initial_buy"]["value_text"])
+        self.assertEqual("한도(2,000,000)", row["stock_values"][11])
+        adjustment = row["running_budget_adjustment_display"]
+        self.assertEqual("WAITING_FOR_SELL", adjustment["reason"])
+        self.assertTrue(adjustment["pending"])
+        self.assertTrue(adjustment["pending_request"]["hydrated"])
 
     def test_non_running_main_row_uses_saved_config_not_stale_running_projection(self) -> None:
         state = {
@@ -946,7 +1122,7 @@ class RunningBudgetAdjustmentContractTest(unittest.TestCase):
         row = gui_main_table_loader._routine_tree_stock_row(
             SimpleNamespace(
                 main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                _current_session_operation_participant_stock_codes=set(),
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
             ),
             definition_id="fixture",
             instance_id="fixture-instance",

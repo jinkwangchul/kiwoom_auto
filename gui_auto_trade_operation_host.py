@@ -32,7 +32,6 @@ from gui_auto_trade_status_ops import (
     auto_trade_update_stock_operation_mode,
     auto_trade_update_stock_status,
 )
-from gui_auto_trade_timer import auto_trade_current_runtime_file_signature
 from candle_manager import canonical_candle_content_hash, load_candles
 from execution_universe import project_execution_universe
 from gui_market_data_host import MarketDataHost
@@ -44,6 +43,7 @@ from gui_review_utils import (
 from gui_auto_trade_policy import auto_trade_setting_start_target_decision
 from runtime_io import read_json_dict
 from state_policy import auto_trade_status_display
+from stock_code_contract import normalize_stock_code
 from stock_repository import StockRepository
 from event_journal_production import (
     append_production_event,
@@ -72,6 +72,7 @@ class AutoTradeOperationHost(QObject):
         self._shutting_down = False
         self._factory_reset_quiesced = False
         self._last_start_target_block_details = []
+        self._current_session_operation_participant_stock_codes: set[str] = set()
         self._order_execution_boundary = AutoTradeOrderExecutionBoundary(
             AutoTradeOrderExecutionContext(
                 kiwoom_connected=self._kiwoom_connected,
@@ -119,6 +120,57 @@ class AutoTradeOperationHost(QObject):
 
     def parent(self):
         return self._owner
+
+    def current_session_operation_participant_stock_codes(self) -> tuple[str, ...]:
+        """Return an immutable snapshot of this process's explicit participants."""
+
+        return tuple(sorted(self._current_session_operation_participant_stock_codes))
+
+    def is_current_session_operation_participant(self, stock_code: object) -> bool:
+        code = normalize_stock_code(stock_code)
+        return bool(
+            code and code in self._current_session_operation_participant_stock_codes
+        )
+
+    def register_current_session_operation_participants(
+        self,
+        stock_codes,
+    ) -> tuple[str, ...]:
+        registered = {
+            normalize_stock_code(code)
+            for code in stock_codes
+            if normalize_stock_code(code)
+        }
+        if registered:
+            self._current_session_operation_participant_stock_codes.update(registered)
+        return tuple(sorted(registered))
+
+    def retire_current_session_operation_participants(
+        self,
+        stock_codes,
+    ) -> dict[str, tuple[str, ...]]:
+        requested = tuple(
+            sorted(
+                {
+                    normalize_stock_code(code)
+                    for code in stock_codes
+                    if normalize_stock_code(code)
+                }
+            )
+        )
+        before = self.current_session_operation_participant_stock_codes()
+        requested_set = set(requested)
+        removed = tuple(code for code in before if code in requested_set)
+        if removed:
+            self._current_session_operation_participant_stock_codes.difference_update(
+                removed
+            )
+        return {
+            "before": before,
+            "requested": requested,
+            "removed": removed,
+            "remaining": self.current_session_operation_participant_stock_codes(),
+        }
 
     def statusBarMessage(self, message: str, timeout_ms: int = 5000) -> None:
         status_bar_getter = getattr(self._owner, "statusBar", None)
@@ -637,9 +689,6 @@ class AutoTradeOperationHost(QObject):
             return bool(checker(refresh=refresh)) if callable(checker) else False
         except Exception:
             return False
-
-    def current_runtime_file_signature(self):
-        return auto_trade_current_runtime_file_signature(self)
 
     def recalculate_all_status_by_operation_policy(
         self,

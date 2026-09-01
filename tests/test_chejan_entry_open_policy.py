@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -220,8 +222,7 @@ class ChejanEntryOpenPolicyTest(unittest.TestCase):
         result = evaluate_chejan_entry_open_policy(self._entry(), self._runtime(), self._operation())
 
         self.assertEqual("CHEJAN_ENTRY_OPEN", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

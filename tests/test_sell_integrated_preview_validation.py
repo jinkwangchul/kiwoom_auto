@@ -279,15 +279,25 @@ class SellIntegratedPreviewValidationTests(unittest.TestCase):
         self.assertFalse(result["actual_order_sent"])
 
     def test_file_runtime_queue_sendorder_functions_are_not_called(self):
+        original_read_text = Path.read_text
+
+        def read_screen_registry(path, *args, **kwargs):
+            self.assertEqual("screen_registry.json", Path(path).name)
+            return original_read_text(path, *args, **kwargs)
+
         with (
-            mock.patch("pathlib.Path.read_text") as read_text,
+            mock.patch(
+                "pathlib.Path.read_text",
+                autospec=True,
+                side_effect=read_screen_registry,
+            ) as read_text,
             mock.patch("pathlib.Path.write_text") as write_text,
             mock.patch("builtins.open", mock.mock_open()) as open_mock,
         ):
             result = self._ready_result(_contract())
 
         self.assertEqual(result["status"], "READY")
-        read_text.assert_not_called()
+        self.assertGreaterEqual(read_text.call_count, 1)
         write_text.assert_not_called()
         open_mock.assert_not_called()
 

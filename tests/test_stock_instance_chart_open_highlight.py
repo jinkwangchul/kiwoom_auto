@@ -8,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, Qt
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
 
 import gui_auto_trade_table_loader as settings_loader
 import gui_stock_instance_chart_window as chart_window
+from tests.qt_test_support import flush_deferred_deletes
 import gui_windows
 from gui_main_table_loader import (
     ROUTINE_CHECKBOX_VISUAL_ENABLED_ROLE,
@@ -59,6 +60,9 @@ class _SettingsWindow(QDialog):
             font.setItalic(True)
             item.setFont(font)
             self.stock_table.setItem(row, 0, item)
+
+    def refresh_stock_instance_chart_open_code_styles(self) -> None:
+        settings_loader.refresh_auto_trade_chart_open_code_styles(self)
 
 
 class _MainOwner(QDialog):
@@ -120,8 +124,7 @@ class StockInstanceChartOpenHighlightTests(unittest.TestCase):
 
         chart.close()
         self.app.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.app.processEvents()
+        flush_deferred_deletes(self.app)
 
         self.assertEqual(baseline_color, code_item.foreground().color().name().lower())
         self.assertEqual(baseline_font.bold(), code_item.font().bold())
@@ -330,8 +333,7 @@ class StockInstanceChartOpenHighlightTests(unittest.TestCase):
             chart = chart_window.open_stock_instance_chart("005930", parent=owner)
         chart.close()
         self.app.processEvents()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.app.processEvents()
+        flush_deferred_deletes(self.app)
         self.assertTrue(sip.isdeleted(chart))
         chart_window._OPEN_STOCK_INSTANCE_CHARTS["005930"] = chart
 

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -198,8 +200,7 @@ class ChejanEventClassificationPreviewTest(unittest.TestCase):
         result = preview_chejan_event_classification(self._event(), self._policy())
 
         self.assertEqual("CLASSIFICATION_READY", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

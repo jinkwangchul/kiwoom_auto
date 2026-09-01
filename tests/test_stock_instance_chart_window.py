@@ -261,7 +261,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                 self.assertEqual(expected_end, end.strftime("%H:%M"))
                 window.close()
 
-    def test_missing_timeframe_candles_are_not_connected_across_gap(self) -> None:
+    def test_missing_timeframe_candles_split_only_across_session_gap(self) -> None:
         candles = [
             {"bar_time": "2026-08-10T08:00:00+09:00", "close": 100},
             {"bar_time": "2026-08-10T08:05:00+09:00", "close": 101},
@@ -279,6 +279,31 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         ))
         self.assertEqual([2, 2], [len(segment) for segment in window.chart._line_segments()])
         self.assertNotIn(999.0, [close for _bar_time, close in window.chart.close_series])
+        window.close()
+
+    def test_missing_bucket_connects_existing_same_session_points_without_fake_candle(self) -> None:
+        candles = [
+            {"bar_time": "2026-08-10T09:01:00+09:00", "close": 101},
+            {"bar_time": "2026-08-10T09:02:00+09:00", "close": 102},
+            {"bar_time": "2026-08-10T09:04:00+09:00", "close": 104},
+        ]
+        window = self._window(_projection(
+            candles=candles,
+            buys=[],
+            sells=[],
+            bar_minutes=1,
+            raw_candle_count=len(candles),
+        ))
+
+        self.assertEqual([3], [len(segment) for segment in window.chart._line_segments()])
+        self.assertEqual(
+            ["09:01", "09:02", "09:04"],
+            [bar_time.strftime("%H:%M") for bar_time, _close in window.chart.close_series],
+        )
+        self.assertNotIn(
+            "09:03",
+            [bar_time.strftime("%H:%M") for bar_time, _close in window.chart.close_series],
+        )
         window.close()
 
     def test_signal_price_labels_use_signal_bar_close(self) -> None:
@@ -307,7 +332,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         painter.drawRect.assert_not_called()
 
     def test_bar_minutes_in_title_and_all_top_projection_fields_are_displayed(self) -> None:
-        for minutes in (1, 5, 15):
+        for minutes in (1, 3, 5, 10, 15, 30, 60, 120, 240):
             with self.subTest(minutes=minutes):
                 window = self._window(_projection(bar_minutes=minutes))
                 self.assertEqual(
@@ -514,6 +539,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
     def test_chart_early_close_is_always_routine_regardless_of_policy(self) -> None:
         adapter = Mock()
+        close_command = Mock()
         with patch.object(
             StockInstanceChartWindow,
             "_build_stock_operation_adapter",
@@ -524,6 +550,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             return_value=False,
         ):
             window = self._window(_projection())
+            window._stock_operation_executor = close_command
             self.assertTrue(window.early_close_button.isEnabled())
             self.assertTrue(window.immediate_liquidation_button.isEnabled())
             with patch.object(window, "refresh_projection") as refresh:
@@ -537,10 +564,15 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
         self.assertEqual(
             ["루틴", "루틴", "루틴"],
-            [item.args[0] for item in adapter.apply_selected_early_close.call_args_list],
+            [item.args[1] for item in close_command.call_args_list],
         )
-        for item in adapter.apply_selected_early_close.call_args_list:
+        for item in close_command.call_args_list:
+            self.assertIs(adapter, item.args[0])
             self.assertEqual("간이차트", item.kwargs["source"])
+            self.assertIs(
+                adapter.selected_stock_infos.return_value,
+                item.kwargs["selected"],
+            )
             self.assertFalse(item.kwargs["show_error_dialog"])
             self.assertFalse(item.kwargs["show_result_toast"])
         adapter.apply_selected_individual_liquidation_method.assert_not_called()
@@ -549,6 +581,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
     def test_chart_immediate_liquidation_is_early_close_market(self) -> None:
         adapter = Mock()
+        close_command = Mock()
         with patch.object(
             StockInstanceChartWindow,
             "_build_stock_operation_adapter",
@@ -559,6 +592,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             return_value=False,
         ):
             window = self._window(_projection())
+            window._stock_operation_executor = close_command
             with patch(
                 "gui_auto_trade_policy.operation_policy_section",
                 return_value={
@@ -572,9 +606,11 @@ class StockInstanceChartWindowTests(unittest.TestCase):
                 window.immediate_liquidation_button.click()
 
         operation_policy_section.assert_not_called()
-        adapter.apply_selected_early_close.assert_called_once_with(
+        close_command.assert_called_once_with(
+            adapter,
             "시장가",
             source="간이차트",
+            selected=adapter.selected_stock_infos.return_value,
             show_error_dialog=False,
             show_result_toast=False,
         )
@@ -593,10 +629,11 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
     def test_operation_failure_uses_chart_toast_once(self) -> None:
         adapter = Mock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": False,
             "message": "키움 서버에 로그인되어 있지 않습니다.",
         }
+        close_command = Mock(return_value=close_result)
         with patch.object(
             StockInstanceChartWindow,
             "_build_stock_operation_adapter",
@@ -607,6 +644,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             return_value=False,
         ), patch("gui_toast.show_toast") as show_toast:
             window = self._window(_projection())
+            window._stock_operation_executor = close_command
             window.immediate_liquidation_button.click()
 
         show_toast.assert_called_once_with(
@@ -618,10 +656,11 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
     def test_early_close_failure_uses_chart_toast_once(self) -> None:
         adapter = Mock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": False,
             "message": "조기마감 불가: 청산 진행 중",
         }
+        close_command = Mock(return_value=close_result)
         with patch.object(
             StockInstanceChartWindow,
             "_build_stock_operation_adapter",
@@ -632,6 +671,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             return_value=False,
         ), patch("gui_toast.show_toast") as show_toast:
             window = self._window(_projection())
+            window._stock_operation_executor = close_command
             window.early_close_button.click()
 
         show_toast.assert_called_once_with(
@@ -643,6 +683,7 @@ class StockInstanceChartWindowTests(unittest.TestCase):
 
     def test_operation_button_enabled_state_reuses_existing_menu_selection_rule(self) -> None:
         adapter = Mock()
+        close_command = Mock()
         with patch.object(
             StockInstanceChartWindow,
             "_build_stock_operation_adapter",
@@ -653,12 +694,13 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             return_value=True,
         ):
             window = self._window(_projection())
+            window._stock_operation_executor = close_command
 
         self.assertFalse(window.early_close_button.isEnabled())
         self.assertTrue(window.immediate_liquidation_button.isEnabled())
         window._operation_command_in_progress = True
         window._run_stock_operation("early_close")
-        adapter.apply_selected_early_close.assert_not_called()
+        close_command.assert_not_called()
         window.close()
 
     def test_zero_signals_and_orders_are_normal_empty_states(self) -> None:
@@ -760,6 +802,31 @@ class StockInstanceChartWindowTests(unittest.TestCase):
         self.assertIsNotNone(point)
         chart.close()
 
+    def test_close_series_normalizes_sorting_duplicates_and_invalid_values(self) -> None:
+        chart = StockInstanceCloseChart()
+        chart.set_projection(
+            [
+                {"bar_time": "2026-08-10T09:04:00+09:00", "close": 104},
+                {"bar_time": "2026-08-10T09:01:00+09:00", "close": 101},
+                {"bar_time": "2026-08-10T09:04:00+09:00", "close": 105},
+                {"bar_time": "2026-08-10T09:02:00+09:00", "close": 0},
+                {"bar_time": "2026-08-10T09:03:00+09:00", "close": None},
+                {"bar_time": "bad", "close": 999},
+                {"bar_time": "2026-08-10T09:05:00+09:00", "close": "invalid"},
+            ],
+            [],
+            [],
+            x_range_start="2026-08-10T09:00:00+09:00",
+            x_range_end="2026-08-10T15:30:00+09:00",
+            timeframe_minutes=1,
+        )
+
+        self.assertEqual(
+            [("09:01", 101.0), ("09:04", 105.0)],
+            [(bar_time.strftime("%H:%M"), close) for bar_time, close in chart.close_series],
+        )
+        chart.close()
+
     def test_marker_draws_circle_centered_on_canonical_coordinate(self) -> None:
         painter = Mock()
         point = chart_window.QPointF(17.5, 23.25)
@@ -789,6 +856,51 @@ class StockInstanceChartWindowTests(unittest.TestCase):
             window.windowTitle(),
         )
         self.assertEqual([], window.chart.buy_series)
+        window.close()
+
+    def test_valid_routine_reassignment_rebuilds_series_and_timeframe(self) -> None:
+        first = _projection(
+            bar_minutes=1,
+            candles=[
+                {"bar_time": "2026-08-10T09:01:00+09:00", "close": 101},
+                {"bar_time": "2026-08-10T09:02:00+09:00", "close": 102},
+            ],
+            buys=[],
+            sells=[],
+            instance_id="instance-1",
+            raw_candle_count=2,
+        )
+        second = _projection(
+            bar_minutes=5,
+            candles=[
+                {"bar_time": "2026-08-10T09:00:00+09:00", "close": 105},
+                {"bar_time": "2026-08-10T09:05:00+09:00", "close": 110},
+            ],
+            buys=[],
+            sells=[],
+            instance_id="instance-2",
+            raw_candle_count=10,
+        )
+        second["instance_name"] = "새 루틴"
+        with patch.object(
+            chart_window,
+            "project_stock_instance_day",
+            side_effect=[first, second],
+        ):
+            window = StockInstanceChartWindow("005930", "2026-08-10")
+            self.assertEqual(1, window.chart.timeframe_minutes)
+            window.refresh_projection()
+
+        self.assertEqual(5, window.chart.timeframe_minutes)
+        self.assertEqual(
+            [("09:00", 105.0), ("09:05", 110.0)],
+            [(bar_time.strftime("%H:%M"), close) for bar_time, close in window.chart.close_series],
+        )
+        self.assertIn("새 루틴 / 수동운영 / 5분봉", window.windowTitle())
+        self.assertEqual(
+            ("2026-08-10", "instance-2", 5),
+            window._last_valid_projection_identity,
+        )
         window.close()
 
     def test_common_open_api_keeps_date_argument_and_defaults_to_today(self) -> None:

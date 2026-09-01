@@ -52,7 +52,11 @@ from gui_operation_environment import (
     suggested_buy_limit,
 )
 from runtime_io import read_json_dict
-from running_budget_adjustment import project_running_budget_adjustment_display_config
+from running_budget_adjustment import (
+    STATE_WAIT_SELL,
+    project_running_budget_adjustment_config,
+    project_running_budget_adjustment_display_config,
+)
 from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
     RatioMetricDisplay,
@@ -83,7 +87,11 @@ from gui_auto_trade_display import (
     SortableTableWidgetItem,
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
-from gui_auto_trade_integrity import is_operation_excluded, is_review_required_state
+from gui_auto_trade_integrity import (
+    inspect_review_state_data,
+    inspect_stock_review_state,
+    is_operation_excluded,
+)
 from gui_auto_trade_policy import (
     auto_trade_start_budget_current_running,
     auto_trade_stock_operation_category,
@@ -216,6 +224,7 @@ ROUTINE_GROUP_ID_ROLE = Qt.UserRole + 223
 ROUTINE_GROUP_PATH_ROLE = Qt.UserRole + 224
 ROUTINE_STOCK_TOOLTIP_DATA_ROLE = Qt.UserRole + 225
 _MAIN_PNL_STATIC_CACHE_ATTR = "_main_pnl_refresh_static_cache"
+_MAIN_REFRESH_READ_CONTEXT_ATTR = "_main_refresh_read_context"
 ROUTINE_ROW_PARENT = "group"
 ROUTINE_ROW_CHILD = "instance"
 ROUTINE_ROW_STOCK = "stock"
@@ -225,6 +234,77 @@ MAIN_STOCK_OPERATION_CATEGORY_LABELS = {
     "excluded": "제외",
     "review": "검토",
 }
+
+
+def build_main_refresh_read_context(window=None) -> dict[str, object]:
+    """Read one refresh-local canonical projection input set for Main."""
+
+    definitions = tuple(load_routine_definitions())
+    instances = tuple(load_persisted_routine_instances())
+    groups = tuple(get_group_records())
+    stocks = tuple(read_base_stocks())
+    stock_data_by_dir: dict[str, dict[str, object]] = {}
+    for stock in stocks:
+        stock_path = str(stock.get("stock_path", "") or "").strip()
+        if not stock_path:
+            continue
+        stock_dir = Path(__file__).resolve().parent / stock_path
+        loaded_state = read_json_dict(stock_dir / "state.json")
+        review_inspection = inspect_stock_review_state(
+            stock_dir,
+            loaded_state=loaded_state,
+        )
+        config = read_json_dict(stock_dir / "config.json")
+        stock_data_by_dir[str(stock_dir)] = {
+            "config": dict(config) if isinstance(config, dict) else {},
+            "state": dict(review_inspection.state),
+            "review_inspection": review_inspection,
+            "state_issue_reason": str(
+                getattr(review_inspection, "issue_reason", "") or ""
+            ),
+        }
+    return {
+        "definitions": definitions,
+        "instances": instances,
+        "groups": groups,
+        "stocks": stocks,
+        "stock_data_by_dir": stock_data_by_dir,
+    }
+
+
+def _main_refresh_read_context(window) -> dict[str, object] | None:
+    context = getattr(window, _MAIN_REFRESH_READ_CONTEXT_ATTR, None)
+    return context if isinstance(context, dict) else None
+
+
+def _main_refresh_stock_data(window, stock_dir: Path | None) -> dict[str, object]:
+    if stock_dir is None:
+        return {
+            "config": {},
+            "state": {},
+            "review_inspection": inspect_review_state_data(
+                {},
+                source="MAIN_LEGACY_STOCK_RECORD",
+            ),
+        }
+    context = _main_refresh_read_context(window)
+    if context is not None:
+        stock_data = context.get("stock_data_by_dir", {})
+        if isinstance(stock_data, dict):
+            cached = stock_data.get(str(stock_dir))
+            if isinstance(cached, dict):
+                return cached
+    loaded_state = read_json_dict(stock_dir / "state.json")
+    review_inspection = inspect_stock_review_state(
+        stock_dir,
+        loaded_state=loaded_state,
+    )
+    config = read_json_dict(stock_dir / "config.json")
+    return {
+        "config": dict(config) if isinstance(config, dict) else {},
+        "state": dict(review_inspection.state),
+        "review_inspection": review_inspection,
+    }
 ROUTINE_PARENT_CHECKBOX_OFFSET = 4
 ROUTINE_CHILD_CHECKBOX_OFFSET = 24
 ROUTINE_STOCK_CHECKBOX_OFFSET = 45
@@ -502,13 +582,6 @@ def main_monitoring_stock_status_text(value: object) -> str:
         and token not in {"담보대출", "신용가능"}
     ]
     return " | ".join(visible_tokens) or "-"
-
-
-def _stock_library_market_by_code() -> dict[str, str]:
-    return {
-        code: str(metadata.get("market", "") or "")
-        for code, metadata in _stock_library_tooltip_metadata_by_code().items()
-    }
 
 
 def _main_stock_row_tooltip(
@@ -833,6 +906,7 @@ def main_stock_resolved_starting_budget(
     fresh_state = main_stock_fresh_market_information_state(window, stock)
     if fresh_state is None:
         return None
+    last_price = safe_float_value(getattr(fresh_state, "last_price", None), 0.0)
     defaults = starting_budget_defaults(policy)
     mode = normalize_initial_buy_mode(config.get("trade_amount_type"))
     configured_value = safe_int_value(
@@ -852,6 +926,7 @@ def main_stock_resolved_starting_budget(
         configured_value,
         int(defaults["quantity"]),
         float(defaults["amount_multiplier"]),
+        last_price,
     )
     cache = getattr(window, "_main_stock_resolved_starting_budget_cache", None)
     if not isinstance(cache, dict):
@@ -862,7 +937,7 @@ def main_stock_resolved_starting_budget(
         return cached.get("amount")
     amount = stock_starting_budget_amount(
         config,
-        current_price=getattr(fresh_state, "last_price", None),
+        current_price=last_price,
         policy={"starting_budget_defaults": defaults},
     )
     cache[stock_key] = {"signature": signature, "amount": amount}
@@ -1292,19 +1367,6 @@ def routine_instance_consumed_text(
     return f"소모({amount_text} / {_format_percent((consumed_value / denominator) * 100.0, digits=1)})"
 
 
-def stock_buy_limit_config(stock: dict[str, object]) -> tuple[bool, object | None]:
-    stock_path = str(stock.get("stock_path", "") or "").strip()
-    config: dict[str, object] = {}
-    if stock_path:
-        stock_dir = Path(__file__).resolve().parent / stock_path
-        loaded_config = read_json_dict(stock_dir / "config.json")
-        if isinstance(loaded_config, dict):
-            config = loaded_config
-    elif isinstance(stock.get("config"), dict):
-        config = stock["config"]
-    return bool(config.get("buy_limit_enabled", False)), config.get("buy_limit_amount")
-
-
 def routine_instance_profit_text(
     *,
     profit_amount: object,
@@ -1677,39 +1739,6 @@ def _routine_names_for_stock_record(stock: dict[str, object]) -> list[str]:
     return [routine_text] if routine_text else []
 
 
-def _routine_stock_counts_from_base_stocks() -> dict[str, int]:
-    """
-    메인 좌측 루틴표의 종목수를 중앙 종목관리 기준으로 계산한다.
-
-    자동매매설정창 하단 목록과 같은 기준을 사용한다.
-    - 루틴 미지정 종목 제외
-    - 검토관리/검토종목 상태 제외
-    """
-    counts: dict[str, int] = {}
-
-    for stock in read_base_stocks():
-        code = str(stock.get("code", "")).strip()
-        name = str(stock.get("name", "")).strip()
-        if not code or not name:
-            continue
-
-        for routine_name in _routine_names_for_stock_record(stock):
-            if not routine_name:
-                continue
-
-            stock_dir = stock_runtime_dir_for_routine(routine_name, code, name)
-            state = read_json_dict(stock_dir / "state.json") if stock_dir is not None else {}
-            if not isinstance(state, dict):
-                state = {}
-
-            if is_review_required_state(state):
-                continue
-
-            counts[routine_name] = counts.get(routine_name, 0) + 1
-
-    return counts
-
-
 def _instance_stock_counts(
     operation_excluded_only: bool | None = None,
     *,
@@ -1718,6 +1747,7 @@ def _instance_stock_counts(
     stock_paths: set[str] | None = None,
     static_data: dict[str, object] | None = None,
     state_by_stock_dir: dict[str, dict[str, object]] | None = None,
+    state_issue_by_stock_dir: dict[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
     counts: dict[str, dict[str, object]] = {}
     clean_scope = str(stock_scope or "").strip().lower()
@@ -1740,23 +1770,44 @@ def _instance_stock_counts(
         if isinstance(static_data, dict)
         else _main_pnl_refresh_static_cache(window)
     )
-    dynamic_stocks: list[tuple[dict[str, object], dict[str, object]]] = []
+    dynamic_stocks: list[tuple[dict[str, object], dict[str, object], bool]] = []
     seen_stock_identities: set[str] = set()
     for stock in static_cache["stocks"]:
         stock_dir = Path(stock["stock_dir"])
-        state = (
-            state_by_stock_dir.get(str(stock_dir), {})
-            if state_by_stock_dir is not None
-            else read_json_dict(stock_dir / "state.json")
+        if state_by_stock_dir is not None:
+            inspection = inspect_review_state_data(
+                state_by_stock_dir.get(str(stock_dir), {}),
+                state_issue_reason=(state_issue_by_stock_dir or {}).get(
+                    str(stock_dir),
+                    "",
+                ),
+                source="MAIN_REFRESH_SNAPSHOT",
+            )
+        else:
+            refresh_context = _main_refresh_read_context(window)
+            if refresh_context is not None:
+                snapshot_data = _main_refresh_stock_data(window, stock_dir)
+                inspection = snapshot_data.get("review_inspection")
+                if inspection is None:
+                    inspection = inspect_review_state_data(
+                        snapshot_data.get("state", {}),
+                        source="MAIN_REFRESH_SNAPSHOT",
+                    )
+            else:
+                loaded_state = read_json_dict(stock_dir / "state.json")
+                inspection = inspect_stock_review_state(
+                    stock_dir,
+                    loaded_state=loaded_state,
+                )
+        dynamic_stocks.append(
+            (stock, inspection.state, inspection.review_required)
         )
-        dynamic_stocks.append((stock, state))
-    for stock, state in dynamic_stocks:
+    for stock, state, review_required in dynamic_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if stock_paths is not None and stock_path not in stock_paths:
             continue
         instance_id = str(stock.get("instance_id", "") or "").strip()
         operation_excluded = bool(stock.get("operation_excluded", False))
-        review_required = is_review_required_state(state)
         code = str(stock.get("code", "") or "").strip()
         name = str(stock.get("name", "") or "").strip()
         stock_identity = normalize_stock_code(code) or stock_path
@@ -1871,20 +1922,43 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
     if isinstance(cached, dict):
         return cached
 
-    definitions = tuple(load_routine_definitions())
-    instances = tuple(load_persisted_routine_instances())
+    refresh_context = _main_refresh_read_context(window)
+    definitions = (
+        tuple(refresh_context.get("definitions", ()))
+        if refresh_context is not None
+        else tuple(load_routine_definitions())
+    )
+    instances = (
+        tuple(refresh_context.get("instances", ()))
+        if refresh_context is not None
+        else tuple(load_persisted_routine_instances())
+    )
+    groups = (
+        tuple(refresh_context.get("groups", ()))
+        if refresh_context is not None
+        else tuple(get_group_records())
+    )
     valid_instance_ids = {
         str(instance_id)
         for instance in instances
         if (instance_id := getattr(instance, "instance_id", ""))
     }
     stocks: list[dict[str, object]] = []
-    for stock in read_base_stocks():
+    base_stocks = (
+        tuple(refresh_context.get("stocks", ()))
+        if refresh_context is not None
+        else tuple(read_base_stocks())
+    )
+    for stock in base_stocks:
         stock_path = str(stock.get("stock_path", "") or "").strip()
         if not stock_path:
             continue
         stock_dir = Path(__file__).resolve().parent / stock_path
-        config = read_json_dict(stock_dir / "config.json")
+        config = (
+            _main_refresh_stock_data(window, stock_dir).get("config", {})
+            if refresh_context is not None
+            else read_json_dict(stock_dir / "config.json")
+        )
         instance_id = str(
             stock.get("assigned_routine_instance_id", "")
             or config.get("assigned_routine_instance_id", "")
@@ -1909,11 +1983,42 @@ def _main_pnl_refresh_static_cache(window) -> dict[str, object]:
     result: dict[str, object] = {
         "definitions": definitions,
         "instances": instances,
+        "groups": groups,
         "stocks": tuple(stocks),
     }
     if window is not None:
         setattr(window, _MAIN_PNL_STATIC_CACHE_ATTR, result)
     return result
+
+
+def _main_pnl_tick_state_snapshot(
+    static_data: dict[str, object],
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, str],
+    dict[str, dict[str, object]],
+]:
+    """Read each stock state once for all projections in one PnL tick."""
+    state_by_stock_dir: dict[str, dict[str, object]] = {}
+    state_issue_by_stock_dir: dict[str, str] = {}
+    state_by_code: dict[str, dict[str, object]] = {}
+    for stock in static_data.get("stocks", ()):
+        if not isinstance(stock, dict):
+            continue
+        stock_dir = Path(str(stock.get("stock_dir", "") or ""))
+        if not stock_dir.name:
+            continue
+        inspection = inspect_stock_review_state(stock_dir)
+        stock_dir_key = str(stock_dir)
+        state = dict(inspection.state)
+        state_by_stock_dir[stock_dir_key] = state
+        state_issue_by_stock_dir[stock_dir_key] = str(
+            inspection.issue_reason or ""
+        )
+        code = normalize_stock_code(stock.get("code"))
+        if code:
+            state_by_code.setdefault(code, state)
+    return state_by_stock_dir, state_issue_by_stock_dir, state_by_code
 
 
 def routine_instance_suggested_buy_limits(
@@ -1981,6 +2086,9 @@ def _main_pnl_refresh_routine_metadata(window) -> tuple[list[object], list[objec
 
 def _refresh_instance_pnl_from_batch(
     instance_counts: dict[str, dict[str, object]],
+    *,
+    state_by_code: dict[str, dict[str, object]] | None = None,
+    pnl_by_code: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Apply one confirmable-PnL Runtime snapshot to all registered stocks."""
     stock_codes = [
@@ -1989,10 +2097,16 @@ def _refresh_instance_pnl_from_batch(
         for code in count.get("pnl_stock_codes", [])
         if str(code or "").strip().lstrip("A")
     ]
-    pnl_by_code = project_current_stock_pnl_snapshot(
-        stock_codes,
-        project_root=Path(__file__).resolve().parent,
-    )
+    if pnl_by_code is None:
+        projection_kwargs: dict[str, object] = {
+            "project_root": Path(__file__).resolve().parent,
+        }
+        if state_by_code is not None:
+            projection_kwargs["state_by_code"] = state_by_code
+        pnl_by_code = project_current_stock_pnl_snapshot(
+            stock_codes,
+            **projection_kwargs,
+        )
     for count in instance_counts.values():
         if "pnl_stock_codes" not in count:
             continue
@@ -2253,19 +2367,40 @@ def _main_routine_effective_stock_scope(window) -> str:
 
 def main_refresh_pnl_only(window) -> None:
     """Refresh monitoring stock/instance PnL without rebuilding either table."""
-    instance_counts = _instance_stock_counts(window=window)
-    pnl_by_code = _refresh_instance_pnl_from_batch(instance_counts)
+    static_cache = _main_pnl_refresh_static_cache(window)
+    (
+        state_by_stock_dir,
+        state_issue_by_stock_dir,
+        state_by_code,
+    ) = _main_pnl_tick_state_snapshot(static_cache)
+    instance_counts = _instance_stock_counts(
+        window=window,
+        static_data=static_cache,
+        state_by_stock_dir=state_by_stock_dir,
+        state_issue_by_stock_dir=state_issue_by_stock_dir,
+    )
+    pnl_by_code = _refresh_instance_pnl_from_batch(
+        instance_counts,
+        state_by_code=state_by_code,
+    )
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
+    groups = static_cache.get("groups")
+    if not isinstance(groups, (list, tuple)):
+        groups = get_group_records()
     group_projection = build_main_group_projection(
-        get_group_records(),
+        groups,
         instances,
-        tuple(_main_pnl_refresh_static_cache(window).get("stocks", ())),
+        tuple(static_cache.get("stocks", ())),
     )
     relation_counts = (
         _projected_group_relation_counts(
             window,
             group_projection,
             _main_routine_effective_stock_scope(window),
+            static_data=static_cache,
+            state_by_stock_dir=state_by_stock_dir,
+            state_issue_by_stock_dir=state_issue_by_stock_dir,
+            pnl_by_code=pnl_by_code,
         )
         if any(projected_group.instances for projected_group in group_projection)
         else {}
@@ -2440,15 +2575,16 @@ def _routine_tree_stock_display_values(
     name = str(stock.get("name", "") or "").strip()
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
-    state = (
-        read_json_dict(stock_dir / "state.json")
-        if stock_dir is not None
-        else stock.get("state")
-        if isinstance(stock.get("state"), dict)
-        else {}
-    )
+    snapshot_data = _main_refresh_stock_data(window, stock_dir)
+    review_inspection = snapshot_data.get("review_inspection")
+    if stock_dir is None and isinstance(stock.get("state"), dict):
+        review_inspection = inspect_review_state_data(
+            stock.get("state"),
+            source="MAIN_STOCK_RECORD",
+        )
+    state = review_inspection.state
     config = (
-        read_json_dict(stock_dir / "config.json")
+        snapshot_data.get("config", {})
         if stock_dir is not None
         else stock.get("config")
         if isinstance(stock.get("config"), dict)
@@ -2477,7 +2613,7 @@ def _routine_tree_stock_display_values(
         stock_code=code,
         persisted_trade_started=trade_started,
         operation_excluded=is_operation_excluded(config),
-        review_required=is_review_required_state(state),
+        review_required=review_inspection.review_required,
     )
     row_projection = auto_trade_setting_row_projection(
         state,
@@ -2490,9 +2626,13 @@ def _routine_tree_stock_display_values(
         persisted_trade_started=trade_started,
     )
     display_status = str(row_projection["display_status"])
-    operation_display_text, _operation_color, _operation_tooltip, _ats_labels = (
-        auto_trade_operation_display(config, state)
-    )
+    operation_display = auto_trade_operation_display(config, state)
+    (
+        operation_display_text,
+        _operation_color,
+        _operation_tooltip,
+        _ats_labels,
+    ) = operation_display
     method_text = str(row_projection["method_text"])
     liquidation_text = str(row_projection["liquidation_text"])
     current_price = main_stock_current_price(window, stock, state)
@@ -2590,15 +2730,16 @@ def _routine_tree_stock_display_snapshots(
     name = str(stock.get("name", "") or "").strip()
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
-    state = (
-        read_json_dict(stock_dir / "state.json")
-        if stock_dir is not None
-        else stock.get("state")
-        if isinstance(stock.get("state"), dict)
-        else {}
-    )
+    snapshot_data = _main_refresh_stock_data(window, stock_dir)
+    review_inspection = snapshot_data.get("review_inspection")
+    if stock_dir is None and isinstance(stock.get("state"), dict):
+        review_inspection = inspect_review_state_data(
+            stock.get("state"),
+            source="MAIN_STOCK_RECORD",
+        )
+    state = review_inspection.state
     config = (
-        read_json_dict(stock_dir / "config.json")
+        snapshot_data.get("config", {})
         if stock_dir is not None
         else stock.get("config")
         if isinstance(stock.get("config"), dict)
@@ -2637,7 +2778,7 @@ def _routine_tree_stock_display_snapshots(
         stock_code=code,
         persisted_trade_started=trade_started,
         operation_excluded=is_operation_excluded(config),
-        review_required=is_review_required_state(state),
+        review_required=review_inspection.review_required,
     )
     row_projection = auto_trade_setting_row_projection(
         state,
@@ -2650,6 +2791,7 @@ def _routine_tree_stock_display_snapshots(
         persisted_trade_started=trade_started,
     )
     display_status = str(row_projection["display_status"])
+    operation_display = auto_trade_operation_display(config, state)
     method_text = str(row_projection["method_text"])
     liquidation_text = str(row_projection["liquidation_text"])
     status_cell_active = bool(row_projection["status_cell_active"])
@@ -2661,7 +2803,7 @@ def _routine_tree_stock_display_snapshots(
     tokens: list[dict[str, object]] = []
     name_item = create_auto_trade_stock_name_item(
         f"{code} {name}".strip(),
-        review_required=is_review_required_state(state),
+        review_required=review_inspection.review_required,
         review_status=display_status in {"긴급정지", "검토종목"},
         trade_started=trade_started,
     )
@@ -2672,7 +2814,7 @@ def _routine_tree_stock_display_snapshots(
             alignment=int(Qt.AlignCenter),
         )
     )
-    tokens.append(_item_style_snapshot(create_auto_trade_operation_item(config, state)))
+    tokens.append(_item_style_snapshot(create_auto_trade_operation_item(operation_display)))
     tokens.append(
         _item_style_snapshot(
             create_auto_trade_situation_item(
@@ -2719,7 +2861,7 @@ def _routine_tree_stock_display_snapshots(
                     alignment=int(Qt.AlignCenter),
                 )
             )
-    review_required = is_review_required_state(state)
+    review_required = review_inspection.review_required
     operation_excluded = is_operation_excluded(config)
     if review_required or operation_excluded:
         for token_index, token in enumerate(tokens):
@@ -2758,8 +2900,9 @@ def _routine_tree_stock_metric_values(
 ) -> tuple[tuple[object, ...], str, str, str | None, dict[str, object]]:
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
+    snapshot_data = _main_refresh_stock_data(window, stock_dir)
     state = (
-        read_json_dict(stock_dir / "state.json")
+        snapshot_data.get("state", {})
         if stock_dir is not None
         else stock.get("state")
         if isinstance(stock.get("state"), dict)
@@ -2808,7 +2951,7 @@ def _routine_tree_stock_metric_values(
         dict(config_override) if isinstance(config_override, dict) else {}
     )
     if not config and stock_dir is not None:
-        loaded_config = read_json_dict(stock_dir / "config.json")
+        loaded_config = snapshot_data.get("config", {})
         if isinstance(loaded_config, dict):
             config = loaded_config
     elif not config and isinstance(stock.get("config"), dict):
@@ -2918,8 +3061,9 @@ def _routine_tree_stock_row(
     )
     stock_path = str(stock.get("stock_path", "") or "").strip()
     stock_dir = Path(__file__).resolve().parent / stock_path if stock_path else None
+    snapshot_data = _main_refresh_stock_data(window, stock_dir)
     stock_config = (
-        read_json_dict(stock_dir / "config.json")
+        snapshot_data.get("config", {})
         if stock_dir is not None
         else dict(stock.get("config"))
         if isinstance(stock.get("config"), dict)
@@ -2927,24 +3071,37 @@ def _routine_tree_stock_row(
     )
     if not isinstance(stock_config, dict) or not stock_config:
         stock_config = default_config()
-    stock_state = (
-        read_json_dict(stock_dir / "state.json")
-        if stock_dir is not None
-        else stock.get("state")
-        if isinstance(stock.get("state"), dict)
-        else {}
-    )
-    if not isinstance(stock_state, dict):
-        stock_state = {}
+    review_inspection = snapshot_data.get("review_inspection")
+    if stock_dir is None and isinstance(stock.get("state"), dict):
+        review_inspection = inspect_review_state_data(
+            stock.get("state"),
+            source="MAIN_STOCK_RECORD",
+        )
+    stock_state = review_inspection.state
     if auto_trade_start_budget_current_running(
         window,
         stock.get("code"),
         stock_config,
         stock_state,
     ):
-        display_config, adjustment_display = (
+        display_config, current_adjustment = project_running_budget_adjustment_config(
+            stock_config,
+            stock_state,
+        )
+        _pending_config, pending_adjustment = (
             project_running_budget_adjustment_display_config(stock_config, stock_state)
         )
+        pending_visible = bool(
+            str(current_adjustment.get("state") or "").strip().upper()
+            == STATE_WAIT_SELL
+            and pending_adjustment.get("hydrated", False)
+        )
+        adjustment_display = {
+            **current_adjustment,
+            "current": current_adjustment,
+            "pending": pending_visible,
+            "pending_request": pending_adjustment if pending_visible else None,
+        }
     else:
         display_config = dict(stock_config)
         adjustment_display = {
@@ -3007,7 +3164,7 @@ def _routine_tree_stock_row(
         stock_code=stock.get("code"),
         stock_state=stock_state,
         operation_excluded=is_operation_excluded(stock_config),
-        review_required=is_review_required_state(stock_state),
+        review_required=review_inspection.review_required,
     )
     current_price = main_stock_current_price(window, stock, stock_state)
     return {
@@ -3152,7 +3309,16 @@ def _empty_instance_count() -> dict[str, object]:
     }
 
 
-def _projected_group_relation_counts(window, projection, stock_scope: str):
+def _projected_group_relation_counts(
+    window,
+    projection,
+    stock_scope: str,
+    *,
+    static_data: dict[str, object] | None = None,
+    state_by_stock_dir: dict[str, dict[str, object]] | None = None,
+    state_issue_by_stock_dir: dict[str, str] | None = None,
+    pnl_by_code: dict[str, dict[str, object]] | None = None,
+):
     relation_counts: dict[str, dict[str, object]] = {}
     for projected_group in projection:
         if not projected_group.instances:
@@ -3167,6 +3333,9 @@ def _projected_group_relation_counts(window, projection, stock_scope: str):
             window=window,
             stock_scope=stock_scope,
             stock_paths=group_stock_paths,
+            static_data=static_data,
+            state_by_stock_dir=state_by_stock_dir,
+            state_issue_by_stock_dir=state_issue_by_stock_dir,
         )
         for projected_instance in projected_group.instances:
             relation_id = main_group_instance_relation_id(
@@ -3177,7 +3346,13 @@ def _projected_group_relation_counts(window, projection, stock_scope: str):
                 projected_instance.instance_id,
                 _empty_instance_count(),
             )
-    _refresh_instance_pnl_from_batch(relation_counts)
+    if pnl_by_code is None:
+        _refresh_instance_pnl_from_batch(relation_counts)
+    else:
+        _refresh_instance_pnl_from_batch(
+            relation_counts,
+            pnl_by_code=pnl_by_code,
+        )
     return relation_counts
 
 
@@ -3199,8 +3374,14 @@ def main_load_routine_table(window) -> None:
     _refresh_instance_pnl_from_batch(instance_counts)
     definitions, instances = _main_pnl_refresh_routine_metadata(window)
     static_stocks = tuple(_main_pnl_refresh_static_cache(window).get("stocks", ()))
+    refresh_context = _main_refresh_read_context(window)
+    group_records = (
+        tuple(refresh_context.get("groups", ()))
+        if refresh_context is not None
+        else get_group_records()
+    )
     group_projection = build_main_group_projection(
-        get_group_records(),
+        group_records,
         instances,
         static_stocks,
     )
@@ -3856,12 +4037,23 @@ def main_load_running_stock_table(window) -> None:
     """메인 관제창 실행 종목표를 중앙 종목관리 + state 기준으로 표시한다."""
     rows: list[dict[str, object]] = []
     stock_tooltip_metadata_by_code = _stock_library_tooltip_metadata_by_code()
+    refresh_context = _main_refresh_read_context(window)
+    instances = (
+        tuple(refresh_context.get("instances", ()))
+        if refresh_context is not None
+        else tuple(load_persisted_routine_instances())
+    )
     instance_by_id = {
         instance.instance_id: instance
-        for instance in load_persisted_routine_instances()
+        for instance in instances
     }
 
-    for stock in read_base_stocks():
+    base_stocks = (
+        tuple(refresh_context.get("stocks", ()))
+        if refresh_context is not None
+        else tuple(read_base_stocks())
+    )
+    for stock in base_stocks:
         code = str(stock.get("code", "")).strip()
         name = str(stock.get("name", "")).strip()
         routine_list = _routine_names_for_stock_record(stock)
@@ -3896,19 +4088,20 @@ def main_load_running_stock_table(window) -> None:
                 code,
                 name,
             )
-        state = read_json_dict(stock_dir / "state.json") if stock_dir is not None else {}
-        config = read_json_dict(stock_dir / "config.json") if stock_dir is not None else {}
+        snapshot_data = _main_refresh_stock_data(window, stock_dir)
+        review_inspection = snapshot_data.get("review_inspection")
+        state = review_inspection.state
+        config = snapshot_data.get("config", {})
 
         if not isinstance(state, dict):
             state = {}
         if not isinstance(config, dict):
             config = {}
 
-        operation, _operation_color, _operation_tooltip, _ats_labels = (
-            auto_trade_operation_display(config, state)
-        )
+        operation_display = auto_trade_operation_display(config, state)
+        operation, _operation_color, _operation_tooltip, _ats_labels = operation_display
 
-        if is_review_required_state(state):
+        if review_inspection.review_required:
             continue
 
         trade_started = auto_trade_setting_trade_started(state)
@@ -3946,7 +4139,7 @@ def main_load_running_stock_table(window) -> None:
             stock_code=code,
             stock_state=state,
             operation_excluded=is_operation_excluded(config),
-            review_required=is_review_required_state(state),
+            review_required=review_inspection.review_required,
         )
 
         stock_metadata = stock_tooltip_metadata_by_code.get(
@@ -3959,6 +4152,7 @@ def main_load_running_stock_table(window) -> None:
                 "name": name,
                 "routine": routine_name or "미지정",
                 "operation": operation,
+                "operation_display": operation_display,
                 "config": config,
                 "state": state,
                 "trade_started": bool(row_projection["situation_active"]),
@@ -4010,10 +4204,7 @@ def main_load_running_stock_table(window) -> None:
                     trade_started=bool(row.get("trade_started")),
                 )
             elif col == 3:
-                item = create_auto_trade_operation_item(
-                    row.get("config") if isinstance(row.get("config"), dict) else {},
-                    row.get("state") if isinstance(row.get("state"), dict) else {},
-                )
+                item = create_auto_trade_operation_item(row["operation_display"])
             elif col == 4:
                 item = create_auto_trade_situation_item(
                     row.get("state") if isinstance(row.get("state"), dict) else {},

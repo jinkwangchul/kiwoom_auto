@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 import hashlib
 import json
 from pathlib import Path
@@ -328,8 +330,7 @@ class ExecutionPipelineE2EContractAuditTest(unittest.TestCase):
         broker_dispatch.assert_not_called()
 
         self.assertEqual(before, {path: _sha256(path) for path in _protected_paths()})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
     def test_concept_guard_future_concepts_are_not_created_or_called(self) -> None:
         before = {path: _sha256(path) for path in _protected_paths()}
@@ -355,8 +356,7 @@ class ExecutionPipelineE2EContractAuditTest(unittest.TestCase):
         self.assertEqual(1, len(fake_adapter.calls))
         self.assertEqual("SEND_ORDER_REVIEW_OK", results["executor_review"]["status"])
         self.assertEqual(before, {path: _sha256(path) for path in _protected_paths()})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

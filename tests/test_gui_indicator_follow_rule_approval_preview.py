@@ -5,20 +5,17 @@ from copy import deepcopy
 from pathlib import Path
 import hashlib
 import json
-import sys
+import os
 import tempfile
-import types
 import unittest
 
-from tests.test_gui_execution_preview_button import _install_pyqt5_import_stubs
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-
-_install_pyqt5_import_stubs()
-sys.modules["PyQt5"].sip = types.ModuleType("PyQt5.sip")
-sys.modules["PyQt5.sip"] = sys.modules["PyQt5"].sip
+from PyQt5.QtWidgets import QDialog
 
 import gui_indicator_follow_routine_settings_dialog as dialog_module
 from gui_indicator_follow_routine_settings_dialog import IndicatorFollowRoutineSettingsDialog
+from tests.qt_test_support import create_qt_widget_shell, dispose_qt_widget
 
 
 class _FakeLine:
@@ -235,7 +232,10 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
             ],
             "warnings": [],
         }
-        self.dialog = IndicatorFollowRoutineSettingsDialog.__new__(IndicatorFollowRoutineSettingsDialog)
+        self.dialog = create_qt_widget_shell(
+            IndicatorFollowRoutineSettingsDialog,
+            QDialog,
+        )
         self.dialog.rules = self.current_rules
         self.dialog.rules_data = self.current_rules
         self.dialog.preview_text = _FakeText()
@@ -266,6 +266,7 @@ class GuiIndicatorFollowRuleApprovalPreviewTest(unittest.TestCase):
         dialog_module.QComboBox = self._original_combo
         dialog_module.QLabel = self._original_label
         dialog_module.QPushButton = self._original_button
+        dispose_qt_widget(self.dialog)
         self._temp_dir.cleanup()
 
     def _rules_json_hash(self) -> str:

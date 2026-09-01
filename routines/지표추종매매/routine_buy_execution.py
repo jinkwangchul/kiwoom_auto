@@ -60,12 +60,12 @@ def _budget_context(
     stock_config: dict[str, Any],
     rules: dict[str, Any],
     cycle: dict[str, Any],
-    current_price: float,
+    sizing_reference_price: float,
 ) -> dict[str, Any]:
     mode = str(stock_config.get("trade_amount_type") or "QUANTITY").strip().upper()
     budget: dict[str, Any] = {
         "starting_budget_type": mode,
-        "current_price": current_price,
+        "sizing_reference_price": sizing_reference_price,
         "base_buy_budget": _positive_float(cycle.get("base_filled_buy_amount")),
         "previous_buy_budget": _positive_float(cycle.get("last_filled_buy_amount")),
         "max_buy_rounds": _maximum_rounds(stock_config, rules),
@@ -92,6 +92,12 @@ def _budget_context(
         budget["total_budget"] = limit_amount
         budget["remaining_budget"] = limit_amount - cumulative
     return budget
+
+
+def _configured_order_price_basis(rules: dict[str, Any]) -> str:
+    execution = _as_dict(_as_dict(rules.get("buy")).get("execution"))
+    base = _as_dict(execution.get("base"))
+    return str(base.get("order_price_basis") or "").strip().upper()
 
 
 def build_indicator_follow_buy_intent(
@@ -122,22 +128,36 @@ def build_indicator_follow_buy_intent(
     if isinstance(pending_rounds, list) and pending_rounds:
         return {"status": "BLOCKED", "reason": "BUY_ORDER_STILL_PENDING", "execution_intent": None}
 
-    current_price = _positive_float(runtime_context.get("current_price"))
-    if current_price is None:
-        return {"status": "BLOCKED", "reason": "CURRENT_PRICE_VALUE_MISSING", "execution_intent": None}
-
     stock_config = _as_dict(runtime_context.get("stock_config"))
     rules = _as_dict(runtime_context.get("rules"))
+    price_basis = _configured_order_price_basis(rules)
+    reference_price = _positive_float(
+        runtime_context.get("reference_price", runtime_context.get("current_price"))
+    )
+    actionable_price = _positive_float(runtime_context.get("actionable_current_price"))
+    sizing_reference_price = (
+        actionable_price if price_basis == "CURRENT_PRICE" else reference_price
+    )
+    if sizing_reference_price is None:
+        reason = (
+            "CURRENT_PRICE_VALUE_MISSING"
+            if price_basis == "CURRENT_PRICE"
+            else "REFERENCE_PRICE_VALUE_MISSING"
+        )
+        return {"status": "BLOCKED", "reason": reason, "execution_intent": None}
+
     signal.update({
         "side": "BUY",
-        "current_price": current_price,
-        "order_price": current_price,
-        "market_price": current_price,
+        "sizing_reference_price": sizing_reference_price,
         "routine_type": "INDICATOR_FOLLOW",
         "routine_instance_id": runtime_context.get("routine_instance_id"),
         "cycle_identity": cycle.get("cycle_identity"),
         "confirmed_previous_round": confirmed_round,
     })
+    if price_basis == "CURRENT_PRICE":
+        signal["current_price"] = actionable_price
+    elif price_basis == "ORDER_PRICE":
+        signal["order_price"] = reference_price
     preview = build_buy_order_candidate_preview(
         buy_signal_result=signal,
         approved_rules=_official_execution_rules(rules),
@@ -149,7 +169,7 @@ def build_indicator_follow_buy_intent(
             stock_config=stock_config,
             rules=rules,
             cycle=cycle,
-            current_price=current_price,
+            sizing_reference_price=sizing_reference_price,
         ),
     )
     if preview.get("status") != STATUS_READY:

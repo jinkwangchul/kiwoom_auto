@@ -4,23 +4,35 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import Qt
+from PyQt5 import sip
+from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QMessageBox,
 )
 
 import gui_operation_environment as environment_dialog
-from gui_toast import show_toast
+from gui_toast import ToastMessage, show_toast
+from tests.qt_test_support import (
+    dispose_qt_widget,
+    ensure_qapplication,
+    flush_deferred_deletes,
+)
 
 
 class ToastMessageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
+
+    def flush_deferred_deletes(self) -> None:
+        flush_deferred_deletes(self.app)
+
+    def delete_widget(self, widget: QDialog) -> None:
+        widget.deleteLater()
+        self.flush_deferred_deletes()
 
     def test_toast_is_non_modal_and_closes_after_duration(self) -> None:
         parent = QDialog()
@@ -37,23 +49,108 @@ class ToastMessageTest(unittest.TestCase):
         self.assertFalse(toast.isModal())
 
         QTest.qWait(60)
-        self.app.processEvents()
-        self.assertFalse(toast.isVisible())
+        self.flush_deferred_deletes()
+        self.assertTrue(sip.isdeleted(toast))
+        self.assertEqual([], parent.findChildren(ToastMessage))
+        self.assertEqual([], parent.findChildren(QTimer))
         self.assertTrue(parent.isVisible())
-        parent.close()
+        self.delete_widget(parent)
 
     def test_repeated_toast_replaces_previous_message(self) -> None:
         parent = QDialog()
         parent.show()
         first = show_toast(parent, "first", duration_ms=2000)
         second = show_toast(parent, "second", duration_ms=2000)
-        self.app.processEvents()
+        self.flush_deferred_deletes()
 
-        self.assertFalse(first.isVisible())
+        self.assertTrue(sip.isdeleted(first))
         self.assertTrue(second.isVisible())
         self.assertIs(second, parent._common_toast_message)
         self.assertEqual("second", second.message())
-        parent.close()
+        self.delete_widget(parent)
+
+    def test_sequential_toasts_keep_one_live_child_and_timer(self) -> None:
+        parent = QDialog()
+        parent.show()
+        toasts = []
+
+        for _index in range(10):
+            toasts.append(show_toast(parent, "same", duration_ms=5000))
+            self.app.processEvents()
+
+        active_timers = [
+            timer
+            for toast in parent.findChildren(ToastMessage)
+            for timer in toast.findChildren(QTimer)
+            if timer.isActive()
+        ]
+        self.assertEqual(1, len(active_timers))
+
+        self.flush_deferred_deletes()
+        live_toasts = parent.findChildren(ToastMessage)
+        self.assertEqual(1, len(live_toasts))
+        self.assertIs(toasts[-1], live_toasts[0])
+        self.assertTrue(all(sip.isdeleted(toast) for toast in toasts[:-1]))
+        self.delete_widget(parent)
+
+    def test_burst_toasts_keep_lifecycle_bounded(self) -> None:
+        parent = QDialog()
+        parent.show()
+
+        for index in range(50):
+            show_toast(parent, f"burst-{index}", duration_ms=5000)
+
+        active_timers = [
+            timer
+            for toast in parent.findChildren(ToastMessage)
+            for timer in toast.findChildren(QTimer)
+            if timer.isActive()
+        ]
+        self.assertEqual(1, len(active_timers))
+
+        self.flush_deferred_deletes()
+        self.assertEqual(1, len(parent.findChildren(ToastMessage)))
+        self.delete_widget(parent)
+
+    def test_replaced_toast_timeout_cannot_close_current_toast(self) -> None:
+        parent = QDialog()
+        parent.show()
+        first = show_toast(parent, "first", duration_ms=40)
+        QTest.qWait(10)
+        second = show_toast(parent, "second", duration_ms=300)
+        self.flush_deferred_deletes()
+
+        self.assertTrue(sip.isdeleted(first))
+        QTest.qWait(80)
+        self.app.processEvents()
+        self.assertTrue(second.isVisible())
+        self.assertIs(second, parent._common_toast_message)
+
+        QTest.qWait(260)
+        self.flush_deferred_deletes()
+        self.assertTrue(sip.isdeleted(second))
+        self.assertIsNone(parent._common_toast_message)
+        self.delete_widget(parent)
+
+    def test_toasts_are_owned_independently_per_parent(self) -> None:
+        first_parent = QDialog()
+        second_parent = QDialog()
+        first_parent.show()
+        second_parent.show()
+        replaced = show_toast(first_parent, "first-a", duration_ms=5000)
+        second_toast = show_toast(second_parent, "second", duration_ms=5000)
+        current = show_toast(first_parent, "first-b", duration_ms=5000)
+        self.flush_deferred_deletes()
+
+        self.assertTrue(sip.isdeleted(replaced))
+        self.assertIs(current, first_parent._common_toast_message)
+        self.assertIs(second_toast, second_parent._common_toast_message)
+        self.assertTrue(current.isVisible())
+        self.assertTrue(second_toast.isVisible())
+        self.assertEqual(1, len(first_parent.findChildren(ToastMessage)))
+        self.assertEqual(1, len(second_parent.findChildren(ToastMessage)))
+        self.delete_widget(first_parent)
+        self.delete_widget(second_parent)
 
     def test_toast_tracks_parent_dialog_center(self) -> None:
         parent = QDialog()
@@ -74,7 +171,7 @@ class ToastMessageTest(unittest.TestCase):
             (toast.frameGeometry().center() - parent.frameGeometry().center()).manhattanLength(),
             1,
         )
-        parent.close()
+        self.delete_widget(parent)
 
     def test_toast_tracks_parent_bottom_right(self) -> None:
         parent = QDialog()
@@ -109,10 +206,11 @@ class ToastMessageTest(unittest.TestCase):
             parent.frameGeometry().bottom() - margin,
             toast.frameGeometry().bottom(),
         )
-        parent.close()
+        self.delete_widget(parent)
 
     def test_environment_save_button_uses_toast_and_closes_dialog(self) -> None:
         host = QDialog()
+        self.addCleanup(dispose_qt_widget, host, close=True)
         host.resize(900, 600)
         host.show()
         with patch.object(
@@ -166,6 +264,7 @@ class ToastMessageTest(unittest.TestCase):
             return_value={},
         ):
             dialog = environment_dialog.OperationEnvironmentSettingsDialog()
+        self.addCleanup(dispose_qt_widget, dialog, close=True)
 
         with (
             patch.object(
@@ -180,7 +279,6 @@ class ToastMessageTest(unittest.TestCase):
 
         toast.assert_not_called()
         critical.assert_called_once()
-        dialog.close()
 
 
 if __name__ == "__main__":

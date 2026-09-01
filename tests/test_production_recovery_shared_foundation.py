@@ -405,9 +405,8 @@ class RecoveryMainWindowResolutionConnectionTest(unittest.TestCase):
                 "fail_account",
             ) as fail_account,
             mock.patch.object(gui_windows, "append_owner_event_once"),
-            mock.patch.object(
-                gui_windows,
-                "emergency_update_runtime_stock_status",
+            mock.patch(
+                "gui_main_emergency_ops.update_runtime_stock_status",
             ) as stock_writer,
         ):
             gui_windows.MainWindow._fail_production_recovery(
@@ -770,7 +769,9 @@ class RecoveryTimerLifecycleTest(unittest.TestCase):
             AutoTradeSettingWindow.start_periodic_timers_after_recovery
         )
         self.assertNotIn("_time_policy_timer.start()", init_source)
-        self.assertNotIn("_runtime_file_timer.start()", init_source)
+        self.assertNotIn("_runtime_file_timer", init_source)
+        self.assertNotIn("_runtime_file_timer", show_source)
+        self.assertNotIn("_runtime_file_timer", start_source)
         self.assertIn("timer.start()", show_source)
         self.assertNotIn("start_recovery_bound_timers", start_source)
         self.assertIn("SETTINGS_GUI_TIMERS_STARTED", start_source)
@@ -907,17 +908,26 @@ class ProductionRecoveryCallPathSourceTest(unittest.TestCase):
 
     def test_early_close_recovery_gate_precedes_transition_and_command(self) -> None:
         source = (
+            Path(__file__).resolve().parents[1] / "close_liquidation_command.py"
+        ).read_text(encoding="utf-8")
+        inspect_function_at = source.index(
+            "def inspect_close_liquidation_availability("
+        )
+        recovery_at = source.index("_recovery_decision(", inspect_function_at)
+        execute_at = source.index("def execute_early_close_request_command(")
+        availability_at = source.index(
+            "inspect_close_liquidation_availability(", execute_at
+        )
+        intent_at = source.index("apply_close_intent(", availability_at)
+        self.assertLess(recovery_at, execute_at)
+        self.assertLess(availability_at, intent_at)
+
+        gui_source = (
             Path(__file__).resolve().parents[1] / "gui_auto_trade_close.py"
         ).read_text(encoding="utf-8")
-        function_at = source.index("def auto_trade_apply_selected_early_close(")
-        recovery_at = source.index('"EARLY_CLOSE_REQUEST"', function_at)
-        transition_at = source.index("evaluate_production_transition(", recovery_at)
-        intent_at = source.index("apply_close_intent(", transition_at)
-        self.assertLess(recovery_at, transition_at)
-        self.assertLess(transition_at, intent_at)
-        execution_at = source.index("def _start_close_liquidation_execution(")
-        execution_gate_at = source.index('f"{reason}_EXECUTION"', execution_at)
-        cancel_at = source.index(
+        execution_at = gui_source.index("def _start_close_liquidation_execution(")
+        execution_gate_at = gui_source.index('f"{reason}_EXECUTION"', execution_at)
+        cancel_at = gui_source.index(
             "queue_pending_order_cancellations_for_stock_automatically(",
             execution_at,
         )

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt5 import sip
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QDialog
 
@@ -18,6 +19,7 @@ import gui_auto_trade_ats_ops as ats_ops
 import gui_auto_trade_status_ops as status_ops
 import gui_auto_trade_unregister as unregister_ops
 from gui_toast import show_toast
+from tests.qt_test_support import flush_deferred_deletes
 
 
 class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
@@ -57,9 +59,9 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         app.processEvents()
 
         QTest.qWait(60)
-        app.processEvents()
+        flush_deferred_deletes(app)
 
-        self.assertFalse(toast.isVisible())
+        self.assertTrue(sip.isdeleted(toast))
         self.assertIsNone(getattr(parent, "_common_toast_message", None))
         parent.close()
 
@@ -69,9 +71,9 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         parent.show()
         first = show_toast(parent, "첫 번째", duration_ms=0)
         second = show_toast(parent, "두 번째", duration_ms=0)
-        first.deleteLater()
-        app.processEvents()
+        flush_deferred_deletes(app)
 
+        self.assertTrue(sip.isdeleted(first))
         self.assertIs(second, parent._common_toast_message)
         self.assertTrue(second.isVisible())
         parent.close()
@@ -86,9 +88,10 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         with patch.object(sys, "excepthook") as excepthook:
             parent.deleteLater()
             QTest.qWait(20)
-            app.processEvents()
+            flush_deferred_deletes(app)
 
         excepthook.assert_not_called()
+        self.assertTrue(sip.isdeleted(toast))
 
     def test_schedule_change_uses_fixed_targets_and_aggregates_partial_failure(self) -> None:
         targets = [
@@ -370,8 +373,6 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         }
         window = Mock()
         window.capture_stock_table_view_state.return_value = (set(), 0)
-        window.current_runtime_file_signature.return_value = ()
-
         with (
             patch.object(
                 ats_ops,
@@ -413,8 +414,6 @@ class AutoTradeMultiTargetContextOpsTest(unittest.TestCase):
         ]
         window = Mock()
         window.capture_stock_table_view_state.return_value = (set(), 0)
-        window.current_runtime_file_signature.return_value = ()
-
         with (
             patch.object(
                 ats_ops,

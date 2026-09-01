@@ -10,9 +10,11 @@ from unittest import mock
 from execution_runtime_commit_service import commit_execution_runtime_plan
 from execution_runtime_file_schema import default_order_executions_data, default_order_locks_data
 from execution_runtime_real_commit_readiness_policy import evaluate_execution_runtime_real_commit_readiness
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.filesystem_test_support import (
+    TemporaryProjectRoot,
+    patch_project_runtime_classifiers,
+    write_json,
+)
 
 
 def _sha256(path: Path) -> str | None:
@@ -29,17 +31,33 @@ def _write_json(path: Path, data: dict) -> None:
 
 class ExecutionRuntimeCommitServiceProjectRuntimeAppendE2EContractTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.order_executions_path = ROOT / "runtime" / "order_executions.json"
-        self.order_locks_path = ROOT / "runtime" / "order_locks.json"
-        self.order_queue_path = ROOT / "runtime" / "order_queue.json"
+        self.layout = TemporaryProjectRoot()
+        self.order_executions_path = self.layout.runtime / "order_executions.json"
+        self.order_locks_path = self.layout.runtime / "order_locks.json"
+        self.order_queue_path = self.layout.runtime / "order_queue.json"
+        write_json(self.order_queue_path, {"orders": []})
+        write_json(self.layout.routines / "fixture" / "rules.json", {"fixture": True})
+        self.runtime_classifier_patches = patch_project_runtime_classifiers(
+            self.layout.runtime,
+            (
+                "execution_runtime_commit_service",
+                "execution_runtime_real_commit_readiness_policy",
+            ),
+        )
         self.created_paths: list[Path] = []
         self.preexisting_executions = self.order_executions_path.exists()
         self.preexisting_locks = self.order_locks_path.exists()
 
     def tearDown(self) -> None:
+        self._clear_created_paths()
+        self.runtime_classifier_patches.close()
+        self.layout.cleanup()
+
+    def _clear_created_paths(self) -> None:
         for path in self.created_paths:
             if path.exists():
                 path.unlink()
+        self.created_paths = []
 
     def _commit_orchestrator(self) -> dict:
         commit_plan = {
@@ -186,7 +204,7 @@ class ExecutionRuntimeCommitServiceProjectRuntimeAppendE2EContractTest(unittest.
             return
 
         before_order_queue = _sha256(self.order_queue_path)
-        before_rules = {str(path): _sha256(path) for path in (ROOT / "routines").glob("**/rules.json")}
+        before_rules = {str(path): _sha256(path) for path in self.layout.routines.glob("**/rules.json")}
         orchestrator = self._commit_orchestrator()
         result = self._commit(policy=self._real_commit_policy(orchestrator))
 
@@ -202,7 +220,7 @@ class ExecutionRuntimeCommitServiceProjectRuntimeAppendE2EContractTest(unittest.
         self.assertEqual("EXEC_PROJECT_E2E_1", executions_data["executions"][0]["execution_id"])
         self.assertEqual("LOCK_PROJECT_E2E_1", locks_data["locks"][0]["lock_id"])
         self.assertEqual(before_order_queue, _sha256(self.order_queue_path))
-        self.assertEqual(before_rules, {str(path): _sha256(path) for path in (ROOT / "routines").glob("**/rules.json")})
+        self.assertEqual(before_rules, {str(path): _sha256(path) for path in self.layout.routines.glob("**/rules.json")})
 
     def test_duplicate_execution_id_request_hash_order_id_lock_id_blocked(self) -> None:
         duplicate_cases = [
@@ -228,8 +246,7 @@ class ExecutionRuntimeCommitServiceProjectRuntimeAppendE2EContractTest(unittest.
 
                 self.assertEqual("BLOCKED", result["status"])
                 self.assertIn(expected_issue, result["issues"])
-                self.tearDown()
-                self.created_paths = []
+                self._clear_created_paths()
 
     def test_second_write_failure_rolls_back_project_runtime_files(self) -> None:
         import execution_runtime_commit_service

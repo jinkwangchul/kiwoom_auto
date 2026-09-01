@@ -222,7 +222,10 @@ class ReviewReturnAvailabilityTest(unittest.TestCase):
                     "review_return_availability",
                     return_value={"availability": "BLOCKED", "reason": "ACTIVE_ORDER"},
                 ) as availability,
-                patch.object(emergency_ops, "update_base_stock_routines") as unassign,
+                patch.object(
+                    emergency_ops,
+                    "execute_assignment_unassign",
+                ) as unassign,
             ):
                 result = emergency_ops.normalize_review_emergency_target(
                     self._window(), stock_dir, "000001", "TEST", destination="UNASSIGNED"

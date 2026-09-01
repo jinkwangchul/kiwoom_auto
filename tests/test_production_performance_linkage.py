@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from assignment_episode_linkage import assign_stock_routine
 from assignment_episode_repository import CanonicalAssignmentEpisodeRepository, EpisodeMutationResult
 from production_performance_linkage import (
     append_performance_from_realization,
@@ -99,14 +100,16 @@ class ProductionPerformanceLinkageTests(unittest.TestCase):
         self._json(stock / "orders.json", {"orders": []})
 
     def _assign(self, instance_id: str, name: str) -> None:
-        success = self.stock_repository.update_stock_routine_instance(
+        success = assign_stock_routine(
+                self.root,
                 "005930",
                 "Sample",
                 instance_id=instance_id,
                 instance_name=name,
                 definition_id="sample",
                 routine_type="Sample",
-            )
+                stock_repository=self.stock_repository,
+            ).ok
         self.assertTrue(success, self.stock_repository.last_assignment_linkage_result)
 
     @staticmethod
@@ -254,14 +257,16 @@ class ProductionPerformanceLinkageTests(unittest.TestCase):
             "transition_episode",
             return_value=EpisodeMutationResult(False, error="injected"),
         ):
-            success = self.stock_repository.update_stock_routine_instance(
+            success = assign_stock_routine(
+                self.root,
                 "005930",
                 "Sample",
                 instance_id=self.instance_b,
                 instance_name="Beta",
                 definition_id="sample",
                 routine_type="Sample",
-            )
+                stock_repository=self.stock_repository,
+            ).ok
 
         self.assertFalse(success)
         self.assertEqual(before, (config_path.read_bytes(), episode_path.read_bytes()))

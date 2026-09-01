@@ -3,26 +3,62 @@
 from __future__ import annotations
 
 import os
-import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QWidget
+from PyQt5.QtWidgets import QDialog, QMessageBox, QTableWidget, QWidget
 
+import close_liquidation_command as close_command
 import event_journal_contract as contract
 from event_journal_writer import EventJournalWriter
 import gui_auto_trade_ats_ops as ats_ops
 import gui_auto_trade_close as close_ops
 import gui_auto_trade_context_menu as context_menu
+from gui_auto_trade_integrity import inspect_stock_review_state
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 import gui_auto_trade_setting_window as setting_window
 import gui_operation_environment as operation_environment
 import gui_stock_register_window as stock_register
 import gui_windows
+from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
+from tests.qt_test_support import dispose_qt_widget, ensure_qapplication
 from tests.test_gui_main_stock_context_menu import _FakeMenu
+
+
+class _ConnectedKiwoomApi:
+    def is_connected(self) -> bool:
+        return True
+
+
+class _CanonicalOperationOwner(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.kiwoom_api = _ConnectedKiwoomApi()
+        self._main_monitoring_auto_trade_operation_host = AutoTradeOperationHost(self)
+
+    def main_monitoring_auto_trade_operation_host(self) -> AutoTradeOperationHost:
+        return self._main_monitoring_auto_trade_operation_host
+
+
+class _OperationContext(QWidget):
+    def __init__(self, owner: _CanonicalOperationOwner) -> None:
+        super().__init__(owner)
+        self.status_messages: list[str] = []
+        self.stock_table = QTableWidget(self)
+
+    def current_selected_routine_name(self) -> str:
+        return "테스트 루틴"
+
+    def startup_recovery_session_ready(self, *, refresh: bool = False) -> bool:
+        return True
+
+    def statusBarMessage(self, message: str) -> None:
+        self.status_messages.append(str(message))
 
 
 class _FactoryConfirmation:
@@ -79,7 +115,17 @@ class _ClickedMessageBox:
 class OperatorDecisionEventJournalTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication([])
+        cls.app = ensure_qapplication()
+
+    def _operation_context(self, *participant_codes: str) -> _OperationContext:
+        owner = _CanonicalOperationOwner()
+        self.addCleanup(dispose_qt_widget, owner, close=True)
+        self.addCleanup(owner.main_monitoring_auto_trade_operation_host().shutdown)
+        if participant_codes:
+            owner.main_monitoring_auto_trade_operation_host().register_current_session_operation_participants(
+                participant_codes
+            )
+        return _OperationContext(owner)
 
     def test_contract_has_only_the_four_operator_decision_types(self) -> None:
         expected = {
@@ -113,7 +159,8 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
             self.assertTrue(result["appended"])
 
     def test_profit_loss_decision_records_only_numeric_input_and_cancel_is_mutation_free(self) -> None:
-        window = MagicMock()
+        window = QWidget()
+        self.addCleanup(dispose_qt_widget, window, close=True)
         accepted_dialog = MagicMock()
         accepted_dialog.exec_.return_value = QDialog.Accepted
         accepted_dialog.values.return_value = ("1.5", "2")
@@ -123,11 +170,21 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         with (
             patch.object(close_ops, "ProfitLossEarlyCloseDialog", side_effect=[accepted_dialog, cancelled_dialog]),
             patch.object(close_ops, "append_production_event") as journal,
+            patch.object(
+                close_ops,
+                "auto_trade_apply_selected_early_close",
+                return_value={"ok": False, "reason_code": "TEST_BOUNDARY"},
+            ) as apply_early_close,
         ):
             close_ops.auto_trade_apply_selected_early_close_profit_loss(window)
             close_ops.auto_trade_apply_selected_early_close_profit_loss(window)
 
-        self.assertEqual(1, window.apply_selected_early_close.call_count)
+        apply_early_close.assert_called_once_with(
+            window,
+            "손/익절",
+            source="우클릭",
+            extra_policy={"profit_percent": "1.5", "loss_percent": "2"},
+        )
         accepted = journal.call_args_list[0].kwargs
         cancelled = journal.call_args_list[1].kwargs
         self.assertEqual("ACCEPTED", accepted["result"])
@@ -136,43 +193,77 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         self.assertNotIn("input_value", cancelled["details"])
 
     def test_direct_early_close_records_proceed_and_cancel_before_backend_outcome(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            stock_dir = Path(temp)
-            (stock_dir / "state.json").write_text(
-                json.dumps({"status": "RUNNING", "holding_qty": 10}), encoding="utf-8"
-            )
-            (stock_dir / "config.json").write_text(json.dumps({}), encoding="utf-8")
-            (stock_dir / "orders.json").write_text(json.dumps({"orders": []}), encoding="utf-8")
-            window = MagicMock()
-            window._persistent_feature_owner_ref = None
-            window.current_selected_routine_name.return_value = "테스트 루틴"
-            window._current_session_operation_participant_stock_codes = {"005930"}
-            window.stock_table.viewport.return_value = MagicMock()
-            recovery = MagicMock(allowed=False)
-            with (
-                patch.object(close_ops, "QMessageBox", _ClickedMessageBox),
-                patch.object(close_ops, "append_production_event") as journal,
-                patch.object(close_ops, "_kiwoom_server_login_block_message", return_value=""),
-                patch.object(close_ops, "pending_order_side_quantities", return_value=(0, 0)),
-                patch.object(close_ops, "auto_trade_setting_liquidation_phase_active", return_value=False),
-                patch.object(close_ops, "auto_trade_setting_has_close_progress_quantity", return_value=True),
-                patch.object(close_ops, "_production_recovery_gate", return_value=recovery),
-                patch.object(close_ops, "_log_recovery_block"),
-                patch.object(close_ops, "_recovery_block_user_message", return_value="Recovery 차단"),
-                patch.object(close_ops, "append_changelog"),
-                patch.object(close_ops, "refresh_auto_trade_views"),
-                patch.object(close_ops, "show_toast"),
-            ):
-                _ClickedMessageBox.accepted = False
-                result = close_ops.auto_trade_apply_selected_early_close(
-                    window, "시장가즉시", selected=[(stock_dir, "005930", "삼성전자")]
-                )
-                self.assertTrue(result["cancelled"])
-                _ClickedMessageBox.accepted = True
-                close_ops.auto_trade_apply_selected_early_close(
-                    window, "시장가즉시", selected=[(stock_dir, "005930", "삼성전자")]
-                )
+        layout = TemporaryProjectRoot(prefix="operator_decision_close_")
+        self.addCleanup(layout.cleanup)
+        stock_dir = create_stock_fixture(
+            layout,
+            code="005930",
+            name="Samsung",
+            config={
+                "assigned_routine_instance_id": "instance-1",
+                "operation_mode": "SCHEDULED",
+            },
+            state={
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "trade_started": True,
+                "holding_qty": 10,
+                "holding_amount": 700_000,
+                "avg_price": 70_000,
+                "pending_order": False,
+                "pending_qty": 0,
+            },
+            orders=[],
+        )
+        inspection = inspect_stock_review_state(stock_dir)
+        self.assertFalse(inspection.review_required)
+        self.assertTrue(inspection.state_valid)
+        self.assertEqual("CLEAR", inspection.reason_code)
 
+        window = self._operation_context("005930")
+        allowed_recovery = SimpleNamespace(allowed=True, reason_code="", evidence=())
+        blocked_recovery = SimpleNamespace(
+            allowed=False,
+            reason_code="RECOVERY_BLOCKED",
+            evidence=("fixture",),
+        )
+        with (
+            patch.object(close_ops, "QMessageBox", _ClickedMessageBox),
+            patch.object(close_ops, "append_production_event") as journal,
+            patch.object(
+                close_command,
+                "auto_trade_setting_liquidation_phase_active",
+                wraps=close_command.auto_trade_setting_liquidation_phase_active,
+            ) as liquidation_phase_active,
+            patch.object(
+                close_ops,
+                "_production_recovery_gate",
+                side_effect=[allowed_recovery, allowed_recovery, blocked_recovery],
+            ) as recovery_gate,
+            patch.object(
+                close_ops,
+                "execute_early_close_request_command",
+                wraps=close_ops.execute_early_close_request_command,
+            ) as execute_command,
+            patch.object(close_ops, "_log_recovery_block"),
+            patch.object(close_ops, "_recovery_block_user_message", return_value="Recovery 차단"),
+            patch.object(close_ops, "append_changelog"),
+            patch.object(close_ops, "refresh_auto_trade_views"),
+            patch.object(close_ops, "show_toast"),
+        ):
+            _ClickedMessageBox.accepted = False
+            result = close_ops.auto_trade_apply_selected_early_close(
+                window, "시장가즉시", selected=[(stock_dir, "005930", "삼성전자")]
+            )
+            self.assertTrue(result["cancelled"])
+            _ClickedMessageBox.accepted = True
+            close_ops.auto_trade_apply_selected_early_close(
+                window, "시장가즉시", selected=[(stock_dir, "005930", "삼성전자")]
+            )
+
+        self.assertEqual(2, liquidation_phase_active.call_count)
+        self.assertEqual(3, recovery_gate.call_count)
+        self.assertEqual(1, execute_command.call_count)
         self.assertEqual(["CANCELLED", "ACCEPTED"], [call.kwargs["result"] for call in journal.call_args_list])
         self.assertEqual("시장가", journal.call_args_list[1].kwargs["details"]["method"])
         self.assertEqual(
@@ -193,7 +284,6 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         eligibility = {"eligible": True, "selected_sessions": ("extra1",), "blocked_reasons": []}
         window = MagicMock()
         window.capture_stock_table_view_state.return_value = (set(), 0)
-        window.current_runtime_file_signature.return_value = (0, 0)
         with (
             patch.object(ats_ops, "_manual_ats_liquidation_target_eligibility", return_value=eligibility),
             patch.object(ats_ops, "build_manual_ats_liquidation_preview", return_value=preview),
@@ -209,42 +299,48 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         self.assertTrue(all(call.kwargs["details"]["method"] == "MARKET" for call in journal.call_args_list))
 
     def test_stock_and_factory_reset_record_cancel_and_accept_without_raw_confirmation(self) -> None:
+        stock_reset_parent = QWidget()
+        self.addCleanup(dispose_qt_widget, stock_reset_parent, close=True)
         with patch.object(stock_register, "QMessageBox", _ClickedMessageBox), patch.object(
             stock_register, "append_production_event"
         ) as stock_journal:
             _ClickedMessageBox.accepted = False
-            self.assertFalse(stock_register.confirm_stock_reset(QWidget(), "005930", "삼성전자"))
+            self.assertFalse(stock_register.confirm_stock_reset(stock_reset_parent, "005930", "삼성전자"))
             _ClickedMessageBox.accepted = True
-            self.assertTrue(stock_register.confirm_stock_reset(QWidget(), "005930", "삼성전자"))
+            self.assertTrue(stock_register.confirm_stock_reset(stock_reset_parent, "005930", "삼성전자"))
         self.assertEqual(["CANCELLED", "ACCEPTED"], [call.kwargs["result"] for call in stock_journal.call_args_list])
         self.assertEqual("005930", stock_journal.call_args_list[1].kwargs["stock_code"])
 
-        owner = MagicMock()
-        owner._main_window_kiwoom_api.return_value = object()
+        factory_owner = QWidget()
+        self.addCleanup(dispose_qt_widget, factory_owner, close=True)
+        validator = MagicMock(return_value={"success": True, "issues": []})
+        executor = MagicMock(return_value={"success": False, "issues": ["fixture"]})
+        owner = operation_environment.OperationEnvironmentSettingsDialog(
+            factory_owner,
+            factory_reset_validator=validator,
+            factory_reset_executor=executor,
+        )
+        self.addCleanup(dispose_qt_widget, owner, close=True)
         with (
             patch.object(operation_environment, "ProgramFactoryResetConfirmDialog", _FactoryConfirmation),
             patch.object(operation_environment, "append_production_event") as factory_journal,
-            patch.object(operation_environment.QMessageBox, "warning"),
-            patch.object(operation_environment.QMessageBox, "critical"),
-            patch(
-                "program_factory_reset.validate_factory_reset_safety",
-                return_value={"success": True, "issues": []},
-            ),
-            patch(
-                "program_factory_reset.execute_program_factory_reset",
-                return_value={"success": False, "issues": ["fixture"]},
-            ),
+            patch.object(operation_environment.QMessageBox, "critical") as critical,
+            patch.object(operation_environment.QMessageBox, "information") as information,
         ):
             _FactoryConfirmation.result = QDialog.Rejected
             _FactoryConfirmation.text = "비밀 원문"
-            operation_environment.OperationEnvironmentSettingsDialog._request_program_factory_reset(owner)
+            owner._request_program_factory_reset()
             _FactoryConfirmation.result = QDialog.Accepted
             _FactoryConfirmation.text = "전체초기화"
-            operation_environment.OperationEnvironmentSettingsDialog._request_program_factory_reset(owner)
+            owner._request_program_factory_reset()
         event_text = repr([call.kwargs for call in factory_journal.call_args_list])
         self.assertNotIn("비밀 원문", event_text)
         self.assertEqual(1, factory_journal.call_count)
         self.assertEqual(True, factory_journal.call_args.kwargs["details"]["confirmation_matched"])
+        self.assertEqual(2, validator.call_count)
+        self.assertEqual(1, executor.call_count)
+        self.assertEqual(1, critical.call_count)
+        self.assertEqual(0, information.call_count)
 
     def test_manual_cancel_modify_and_execution_approvals_are_correlated(self) -> None:
         host = QWidget()
@@ -294,6 +390,34 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         self.assertNotIn("1234567890", repr([call.kwargs for call in manual_journal.call_args_list]))
 
     def test_context_menu_records_action_once_and_no_selection_zero(self) -> None:
+        layout = TemporaryProjectRoot(prefix="operator_decision_context_")
+        self.addCleanup(layout.cleanup)
+        stock_dir = create_stock_fixture(
+            layout,
+            code="005930",
+            name="Samsung",
+            config={
+                "assigned_routine_instance_id": "instance-1",
+                "operation_mode": "SCHEDULED",
+            },
+            state={
+                "status": "RUNNING",
+                "trade_enabled": True,
+                "trade_started": True,
+                "holding_qty": 10,
+                "holding_amount": 700_000,
+                "avg_price": 70_000,
+                "pending_order": False,
+                "pending_qty": 0,
+            },
+            orders=[],
+        )
+        inspection = inspect_stock_review_state(stock_dir)
+        self.assertFalse(inspection.review_required)
+        self.assertTrue(inspection.state_valid)
+        self.assertEqual("CLEAR", inspection.reason_code)
+
+        menu_owner = self._operation_context("005930")
         callbacks = context_menu.StockContextMenuCallbacks(
             select_all=MagicMock(),
             clear_selection=MagicMock(),
@@ -308,17 +432,18 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
             _FakeMenu.chosen_menu_title = "조기마감"
             _FakeMenu.chosen_text = "시장가"
             context_menu.show_monitor_stock_context_menu(
-                QWidget(),
+                menu_owner,
                 None,
                 has_selection=True,
                 callbacks=callbacks,
-                selected_targets=[(Path("fixture"), "005930", "삼성전자")],
+                selected_targets=[(stock_dir, "005930", "삼성전자")],
             )
             self.assertEqual(1, journal.call_count)
             self.assertEqual("EARLY_CLOSE_MARKET", journal.call_args.kwargs["details"]["selected_option"])
+            callbacks.early_close.assert_called_once_with("시장가즉시")
             _FakeMenu.chosen_text = None
             context_menu.show_monitor_stock_context_menu(
-                QWidget(), None, has_selection=True, callbacks=callbacks
+                menu_owner, None, has_selection=True, callbacks=callbacks
             )
             self.assertEqual(1, journal.call_count)
 
@@ -352,10 +477,31 @@ class OperatorDecisionEventJournalTest(unittest.TestCase):
         self.assertEqual(["CANCELLED", "ACCEPTED"], [call.kwargs["result"] for call in exit_journal.call_args_list])
 
         routine_owner = MagicMock()
-        routine_owner._production_recovery_allows_routine_operation.return_value = False
-        with patch.object(gui_windows, "_create_routine_operation_confirmation") as confirmation, patch.object(
-            gui_windows, "append_production_event"
-        ) as routine_journal:
+        operation_adapter = MagicMock()
+        operation_adapter.selected_stock_infos.return_value = []
+        with (
+            patch.object(
+                gui_windows.MainWindow,
+                "_running_routine_operation_targets",
+                return_value=(MagicMock(),),
+            ),
+            patch.object(
+                gui_windows,
+                "MainMonitoringStockOperationAdapter",
+                return_value=operation_adapter,
+            ),
+            patch.object(
+                gui_windows,
+                "auto_trade_apply_selected_early_close",
+                return_value={"ok": True, "completed_count": 0, "failed_count": 0},
+            ),
+            patch.object(
+                gui_windows,
+                "_create_routine_operation_confirmation",
+            ) as confirmation,
+            patch.object(gui_windows, "append_production_event") as routine_journal,
+            patch.object(gui_windows, "show_toast"),
+        ):
             confirmation.return_value.exec_.return_value = QMessageBox.Yes
             gui_windows.MainWindow.request_routine_operation(
                 routine_owner, "instance-1", "테스트 루틴", gui_windows.POLICY_MARKET, gui_windows.ROUTINE_STATUS_IMMEDIATE_LIQUIDATION

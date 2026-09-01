@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 def _install_pyqt5_import_stubs() -> None:
@@ -132,8 +133,9 @@ from gui_auto_trade_policy import (
     auto_trade_setting_display_status_for_current_session,
 )
 from gui_auto_trade_run_control import auto_trade_start_selected_auto_trades
-from gui_auto_trade_timer import auto_trade_on_time_policy_timer_tick, auto_trade_real_execution_active
+from gui_auto_trade_timer import auto_trade_real_execution_active, auto_trade_run_operation_cycle
 from operator_reconciliation_service import assess_startup_recovery
+from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
 
 
 class StartupRecoverySessionResumeTest(unittest.TestCase):
@@ -387,25 +389,28 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             self.assertIn("SIG_1", " ".join(result["review_reasons"]))
 
     def test_start_and_timer_are_blocked_before_recovery_completion(self) -> None:
-        class StartWindow:
-            def __init__(self) -> None:
-                self.selected = [(Path("stocks/005930_삼성전자"), "005930", "삼성전자")]
-                self.selected_stock_infos = Mock(return_value=list(self.selected))
-                self.split_start_targets = Mock(
-                    return_value=(list(self.selected), [])
-                )
+        with TemporaryProjectRoot() as layout:
+            stock_dir = create_stock_fixture(layout)
 
-            def require_startup_recovery_session(self, _action: str) -> bool:
-                return False
+            class StartWindow:
+                def __init__(self) -> None:
+                    self.selected = [(stock_dir, "005930", "삼성전자")]
+                    self.selected_stock_infos = Mock(return_value=list(self.selected))
+                    self.split_start_targets = Mock(
+                        return_value=(list(self.selected), [])
+                    )
 
-        start_window = StartWindow()
+                def require_startup_recovery_session(self, _action: str) -> bool:
+                    return False
 
-        auto_trade_start_selected_auto_trades(start_window)
+            start_window = StartWindow()
 
-        start_window.selected_stock_infos.assert_called_once()
-        start_window.split_start_targets.assert_called_once_with(
-            start_window.selected
-        )
+            auto_trade_start_selected_auto_trades(start_window)
+
+            start_window.selected_stock_infos.assert_called_once()
+            start_window.split_start_targets.assert_called_once_with(
+                start_window.selected
+            )
 
         class TimerWindow:
             def __init__(self) -> None:
@@ -437,7 +442,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
         with patch(
             "gui_auto_trade_timer.probe_all_enabled_routine_stocks_once"
         ) as probe:
-            auto_trade_on_time_policy_timer_tick(timer_window)
+            auto_trade_run_operation_cycle(timer_window)
 
         timer_window.recalculate_all_status_by_operation_policy.assert_not_called()
         timer_window.refresh_all.assert_not_called()
@@ -509,7 +514,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = TimerWindow(routine_dir)
-            window._current_session_operation_participant_stock_codes = {"003550"}
+            attach_participant_owner(window, {"003550"})
             consumer = Mock(return_value={"summary": {"signals_checked": 1, "orders_created": 1}})
 
             with patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
@@ -527,7 +532,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 "auto_trade_continue_pending_manual_ats_liquidations",
                 return_value={"processed": 0, "failed": 0},
             ), patch("execution_universe.all_registered_stock_dirs", return_value=[stock_dir]):
-                auto_trade_on_time_policy_timer_tick(window)
+                auto_trade_run_operation_cycle(window)
 
             consumer.assert_called_once_with(
                 limit=5,
@@ -582,9 +587,11 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             )
             before = state_path.read_bytes()
 
+            window = Window()
+            attach_participant_owner(window)
             self.assertFalse(
                 auto_trade_setting_current_session_trade_started(
-                    Window(),
+                    window,
                     True,
                     "003550",
                 )
@@ -598,6 +605,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 return True
 
         window = Window()
+        attach_participant_owner(window)
         self.assertFalse(
             auto_trade_setting_current_session_trade_started(window, True, "003550")
         )
@@ -611,6 +619,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
                 return True
 
         window = Window()
+        attach_participant_owner(window)
         auto_trade_register_current_session_operation_participants(
             window,
             ("003550",),
@@ -712,6 +721,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
 
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             blocked = Window(ready=False)
+            attach_participant_owner(blocked)
             gui_main_table_loader.main_load_running_stock_table(blocked)
             self.assertEqual(1, blocked.running_stock_table.row_count)
             self.assertEqual(
@@ -733,6 +743,7 @@ class StartupRecoverySessionResumeTest(unittest.TestCase):
             )
 
             approved = Window(ready=True)
+            attach_participant_owner(approved)
             auto_trade_register_current_session_operation_participants(
                 approved,
                 ("003550",),

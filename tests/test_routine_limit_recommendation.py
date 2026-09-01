@@ -185,7 +185,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             self.assertEqual((None, None), self._amounts([ready, waiting]))
             self.assertEqual((None, None), self._amounts([]))
 
-    def test_same_session_price_change_does_not_recalculate_instance_limit(self):
+    def test_same_session_price_change_recalculates_instance_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stock = self._stock(root, "000001_First", 12_345)
@@ -234,7 +234,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 )
 
         self.assertEqual((1_200_000, 310_000), first)
-        self.assertEqual(first, second)
+        self.assertEqual((10_000_000, 2_500_000), second)
 
     @staticmethod
     def _routine_host(editor_text: str = ""):
@@ -500,7 +500,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             _parse_buy_limit_amount=gui_windows.MainWindow._parse_buy_limit_amount,
             _stock_suggested_buy_limit=MagicMock(return_value=900_000),
             _write_stock_buy_limit_config=MagicMock(),
-            load_routine_table=MagicMock(),
+            refresh_auto_trade_assignment_views=MagicMock(),
         )
         with (
             patch.object(
@@ -521,7 +521,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
             amount=None,
             source=None,
         )
-        manual_host.load_routine_table.assert_called_once_with()
+        manual_host.refresh_auto_trade_assignment_views.assert_called_once_with()
         toast.assert_called_once_with(
             manual_host,
             "입력값이 전체예산을 초과합니다.",
@@ -550,7 +550,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                     )
                 ),
                 _write_stock_buy_limit_config=MagicMock(),
-                load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
             )
             with patch.object(
                 gui_windows,
@@ -577,7 +577,7 @@ class RoutineLimitRecommendationTest(unittest.TestCase):
                 amount=5_000_000,
                 source=gui_windows.BUY_LIMIT_SOURCE_RECOMMENDED,
             )
-            host.load_routine_table.assert_called_once_with()
+            host.refresh_auto_trade_assignment_views.assert_called_once_with()
 
         editor = QLineEdit("5000000")
         manual_host = SimpleNamespace(

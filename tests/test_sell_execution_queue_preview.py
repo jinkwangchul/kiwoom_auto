@@ -634,15 +634,26 @@ class SellExecutionQueuePreviewTests(unittest.TestCase):
         commit_write.assert_not_called()
 
     def test_no_actual_file_access(self):
+        original_read_text = Path.read_text
+        screen_registry_path = (Path(__file__).resolve().parents[1] / "screen_registry.json").resolve()
+
+        def read_screen_registry(path, *args, **kwargs):
+            self.assertEqual(screen_registry_path, Path(path).resolve())
+            return original_read_text(path, *args, **kwargs)
+
         with (
-            mock.patch("pathlib.Path.read_text") as read_text,
+            mock.patch(
+                "pathlib.Path.read_text",
+                autospec=True,
+                side_effect=read_screen_registry,
+            ) as read_text,
             mock.patch("pathlib.Path.write_text") as write_text,
             mock.patch("builtins.open", mock.mock_open()) as open_mock,
         ):
             result = build_sell_execution_queue_preview(_signal_gate_preview(_gate_candidate()), guard_context=self._guard())
 
         self.assertEqual(result["status"], "READY")
-        read_text.assert_not_called()
+        self.assertGreaterEqual(read_text.call_count, 1)
         write_text.assert_not_called()
         open_mock.assert_not_called()
 

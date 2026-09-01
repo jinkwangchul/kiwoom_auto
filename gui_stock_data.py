@@ -23,9 +23,11 @@ from stock_code_contract import (
 )
 
 try:
+    from assignment_episode_linkage import unassign_stock_routine
     from stock_repository import repository as stock_repository_factory
 except Exception:
     stock_repository_factory = None
+    unassign_stock_routine = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -425,14 +427,24 @@ def remove_base_stock(code: str, name: str) -> bool:
     if not is_valid_stock_code(clean_code) or not clean_name:
         return False
 
-    if stock_repository_factory is None:
+    if stock_repository_factory is None or unassign_stock_routine is None:
         return False
 
     try:
         repo = stock_repository_factory()
-        if repo.find_by_code(clean_code) is None:
+        current = repo.find_by_code(clean_code)
+        if current is None:
             return False
-        return bool(repo.update_stock_routine(clean_code, clean_name, []))
+        return bool(
+            unassign_stock_routine(
+                repo.project_root,
+                clean_code,
+                clean_name,
+                [],
+                expected_instance_id=current.assigned_routine_instance_id,
+                stock_repository=repo,
+            ).ok
+        )
     except Exception:
         return False
 

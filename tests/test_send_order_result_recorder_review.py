@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 import json
@@ -214,8 +216,7 @@ class SendOrderResultRecorderReviewTest(unittest.TestCase):
             result = review_send_order_result_record(recorder_result, record_id, record_path)
 
             self.assertEqual("RECORD_REVIEW_OK", result["status"])
-            self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-            self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+            assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

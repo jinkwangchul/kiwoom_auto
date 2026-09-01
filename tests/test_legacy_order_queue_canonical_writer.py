@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import msvcrt
@@ -48,15 +49,11 @@ def _signal(index: int, *, source_signal_id: str | None = None) -> dict:
     }
 
 
-def _process_build_worker(signal_path: str, queue_path: str, signal: dict, start_event: object, result_queue: object) -> None:
+def _process_build_worker(signal_path: str, queue_path: str, start_event: object, result_queue: object) -> None:
     import order_queue as child_order_queue
 
     child_order_queue.SIGNAL_QUEUE_PATH = Path(signal_path)
     child_order_queue.ORDER_QUEUE_PATH = Path(queue_path)
-    Path(signal_path).write_text(
-        json.dumps({"version": 1, "updated_at": "", "signals": [signal]}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
     start_event.wait()
     result_queue.put(child_order_queue.build_order_queue_from_signals())
 
@@ -310,13 +307,19 @@ class LegacyOrderQueueCanonicalWriterTest(unittest.TestCase):
 
     def test_two_processes_build_order_queue_from_same_signal_appends_once(self) -> None:
         self._write_queue(revision=0)
+        signal = _signal(1, source_signal_id="SIG_BUILD_PROCESS")
+        self._write_signals([signal])
+        signal_bytes_before = self.signal_path.read_bytes()
+        signal_sha_before = hashlib.sha256(signal_bytes_before).hexdigest()
+        self.assertEqual([signal], json.loads(signal_bytes_before)["signals"])
+
         ctx = multiprocessing.get_context("spawn")
         start_event = ctx.Event()
         result_queue = ctx.Queue()
         workers = [
             ctx.Process(
                 target=_process_build_worker,
-                args=(str(self.signal_path), str(self.queue_path), _signal(1, source_signal_id="SIG_BUILD_PROCESS"), start_event, result_queue),
+                args=(str(self.signal_path), str(self.queue_path), start_event, result_queue),
             )
             for _ in range(2)
         ]
@@ -327,12 +330,23 @@ class LegacyOrderQueueCanonicalWriterTest(unittest.TestCase):
         for worker in workers:
             worker.join(timeout=10)
             self.assertEqual(0, worker.exitcode)
+            self.assertFalse(worker.is_alive())
 
         data = self._read_queue()
+        signal_sha_after = hashlib.sha256(self.signal_path.read_bytes()).hexdigest()
+        created_count = sum(1 for item in results if item.get("orders_created") == 1)
+        duplicate_count = sum(1 for item in results if item.get("duplicates") == 1)
+        failed_count = sum(1 for item in results if item.get("append_result", {}).get("ok") is False)
+
+        self.assertEqual(signal_sha_before, signal_sha_after)
+        self.assertEqual(2, sum(int(item.get("signals_checked", 0) or 0) for item in results), results)
+        self.assertEqual(2, created_count + duplicate_count + failed_count, results)
         self.assertEqual(1, len(data["orders"]))
         self.assertEqual(1, data["revision"])
-        self.assertEqual(1, sum(1 for item in results if item.get("orders_created") == 1))
-        self.assertEqual(1, sum(1 for item in results if item.get("duplicates") == 1))
+        self.assertEqual(["SIG_BUILD_PROCESS"], [item["source_signal_id"] for item in data["orders"]])
+        self.assertEqual(1, created_count, results)
+        self.assertEqual(1, duplicate_count, results)
+        self.assertEqual(0, failed_count, results)
 
 
 class RoutineSignalConsumerCanonicalAppendTest(unittest.TestCase):

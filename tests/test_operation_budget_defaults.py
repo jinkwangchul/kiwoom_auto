@@ -203,29 +203,48 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 dialog.accept()
         self.assertFalse(dialog._starting_budget_defaults_changed)
 
-    def test_saved_starting_budget_change_recalculates_main_recommended_limits(self) -> None:
-        owner = SimpleNamespace(
-            _recalculate_recommended_stock_buy_limits_for_starting_budget_change=(
-                MagicMock(return_value=1)
+    def test_saved_starting_budget_change_refreshes_projection_without_limit_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = (
+                Path(temp_dir) / "stocks" / "005930_삼성전자" / "config.json"
             )
-        )
-        host = SimpleNamespace(
-            statusBarMessage=MagicMock(),
-            refresh_all=MagicMock(),
-        )
-        dialog = SimpleNamespace(_starting_budget_defaults_changed=True)
-        with patch.object(
-            auto_trade_window,
-            "persistent_feature_owner",
-            return_value=owner,
-        ):
-            auto_trade_window.AutoTradeSettingWindow._handle_operation_environment_settings_saved(
-                host,
-                dialog,
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "buy_limit_enabled": True,
+                        "buy_limit_amount": 3_000_000,
+                        "buy_limit_source": BUY_LIMIT_SOURCE_RECOMMENDED,
+                    }
+                ),
+                encoding="utf-8",
             )
-        owner._recalculate_recommended_stock_buy_limits_for_starting_budget_change.assert_called_once_with()
-        host.statusBarMessage.assert_called_once_with("환경설정 저장 완료")
-        host.refresh_all.assert_called_once_with()
+            original = config_path.read_bytes()
+            owner = SimpleNamespace(
+                _recalculate_recommended_stock_buy_limits_for_starting_budget_change=(
+                    MagicMock(return_value=1)
+                )
+            )
+            host = SimpleNamespace(
+                statusBarMessage=MagicMock(),
+                refresh_all=MagicMock(),
+            )
+            dialog = SimpleNamespace(_starting_budget_defaults_changed=True)
+            with patch.object(
+                auto_trade_window,
+                "persistent_feature_owner",
+                return_value=owner,
+            ) as owner_resolver:
+                auto_trade_window.AutoTradeSettingWindow._handle_operation_environment_settings_saved(
+                    host,
+                    dialog,
+                )
+
+            owner_resolver.assert_not_called()
+            owner._recalculate_recommended_stock_buy_limits_for_starting_budget_change.assert_not_called()
+            host.statusBarMessage.assert_called_once_with("환경설정 저장 완료")
+            host.refresh_all.assert_called_once_with()
+            self.assertEqual(original, config_path.read_bytes())
 
     def test_amount_budget_applies_multiplier_and_floors_to_won(self) -> None:
         self.assertEqual(
@@ -455,7 +474,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             )
         )
 
-    def test_limit_requires_price_then_uses_first_current_price_without_fluctuation(self) -> None:
+    def test_limit_recalculates_when_current_price_changes(self) -> None:
         live = SimpleNamespace(value=None)
         operation_host = SimpleNamespace(
             fresh_monitoring_market_information_state=lambda _code: live.value,
@@ -467,7 +486,12 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             "code": "005930",
             "name": "삼성전자",
             "stock_path": "",
-            "config": {"buy_limit_enabled": True, "buy_limit_amount": None},
+            "config": {
+                "trade_amount_type": "QUANTITY",
+                "buy_qty": 2,
+                "buy_limit_enabled": True,
+                "buy_limit_amount": None,
+            },
             "state": {},
         }
         with patch.object(
@@ -484,23 +508,28 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             live.value = SimpleNamespace(
                 connection_epoch=7,
                 login_session_id="SESSION-7",
-                last_price=12_345,
+                last_price=10_000,
             )
             first_result = main_loader._routine_tree_stock_metric_values(window, stock)
             live.value = SimpleNamespace(
                 connection_epoch=7,
                 login_session_id="SESSION-7",
-                last_price=20_000,
+                last_price=12_000,
             )
             later_result = main_loader._routine_tree_stock_metric_values(window, stock)
 
         self.assertEqual("한도(미설정)", waiting_result[2])
         self.assertEqual(6, len(waiting_result[0]))
-        self.assertEqual("권장(1,200,000)", first_result[2])
+        self.assertEqual("권장(2,000,000)", first_result[2])
         self.assertEqual(6, len(first_result[0]))
-        self.assertEqual(first_result[2], later_result[2])
+        self.assertEqual("권장(2,400,000)", later_result[2])
         self.assertEqual(
-            {"buy_limit_enabled": True, "buy_limit_amount": None},
+            {
+                "trade_amount_type": "QUANTITY",
+                "buy_qty": 2,
+                "buy_limit_enabled": True,
+                "buy_limit_amount": None,
+            },
             stock["config"],
         )
 
@@ -707,12 +736,12 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             self.assertEqual(("금액", "350,000원"), (display["badge"], display["value_text"]))
             self.assertEqual(config, json.loads(config_path.read_text(encoding="utf-8")))
 
-    def test_resolved_starting_budget_changes_only_for_setting_or_session_event(self) -> None:
+    def test_resolved_starting_budget_cache_tracks_all_calculation_inputs(self) -> None:
         live = SimpleNamespace(
             value=SimpleNamespace(
                 connection_epoch=7,
                 login_session_id="SESSION-7",
-                last_price=7_270,
+                last_price=10_000,
             )
         )
         operation_host = SimpleNamespace(
@@ -722,44 +751,90 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             main_monitoring_auto_trade_operation_host=lambda: operation_host,
         )
         stock = {"stock_path": "stocks/012210_삼미금속", "code": "012210"}
-        config = {"trade_amount_type": "QUANTITY", "buy_qty": 5}
+        quantity_config = {"trade_amount_type": "QUANTITY", "buy_qty": 2}
+        defaults = {
+            "starting_budget_defaults": {
+                "quantity": 1,
+                "amount_multiplier": 1.5,
+                "limit_recommended_multiplier": 100,
+                "limit_minimum_multiplier": 25,
+            }
+        }
+        changed_defaults = {
+            "starting_budget_defaults": {
+                **defaults["starting_budget_defaults"],
+                "amount_multiplier": 2.0,
+            }
+        }
 
-        first = main_loader.main_stock_resolved_starting_budget(window, stock, config)
-        live.value = SimpleNamespace(
-            connection_epoch=7,
-            login_session_id="SESSION-7",
-            last_price=8_120,
-        )
-        same_session_tick = main_loader.main_stock_resolved_starting_budget(
-            window,
-            stock,
-            config,
-        )
-        changed_setting = main_loader.main_stock_resolved_starting_budget(
-            window,
-            stock,
-            {**config, "buy_qty": 10},
-        )
-        live.value = SimpleNamespace(
-            connection_epoch=8,
-            login_session_id="SESSION-8",
-            last_price=9_000,
-        )
-        reauthenticated = main_loader.main_stock_resolved_starting_budget(
-            window,
-            stock,
-            {**config, "buy_qty": 10},
-        )
+        with patch.object(
+            main_loader,
+            "stock_starting_budget_amount",
+            wraps=main_loader.stock_starting_budget_amount,
+        ) as calculator:
+            first = main_loader.main_stock_resolved_starting_budget(
+                window, stock, quantity_config, policy=defaults
+            )
+            live.value = SimpleNamespace(
+                connection_epoch=7,
+                login_session_id="SESSION-7",
+                last_price=10_000.0,
+            )
+            same_price = main_loader.main_stock_resolved_starting_budget(
+                window, stock, quantity_config, policy=defaults
+            )
+            live.value = SimpleNamespace(
+                connection_epoch=7,
+                login_session_id="SESSION-7",
+                last_price=12_000,
+            )
+            changed_price = main_loader.main_stock_resolved_starting_budget(
+                window, stock, quantity_config, policy=defaults
+            )
+            changed_mode = main_loader.main_stock_resolved_starting_budget(
+                window,
+                stock,
+                {"trade_amount_type": "AMOUNT", "buy_amount": 0},
+                policy=defaults,
+            )
+            changed_value = main_loader.main_stock_resolved_starting_budget(
+                window,
+                stock,
+                {"trade_amount_type": "AMOUNT", "buy_amount": 30_000},
+                policy=defaults,
+            )
+            changed_environment = main_loader.main_stock_resolved_starting_budget(
+                window,
+                stock,
+                {"trade_amount_type": "AMOUNT", "buy_amount": 0},
+                policy=changed_defaults,
+            )
+            live.value = SimpleNamespace(
+                connection_epoch=8,
+                login_session_id="SESSION-8",
+                last_price=13_000,
+            )
+            reauthenticated = main_loader.main_stock_resolved_starting_budget(
+                window,
+                stock,
+                {"trade_amount_type": "AMOUNT", "buy_amount": 0},
+                policy=changed_defaults,
+            )
 
-        self.assertEqual(36_350, first)
-        self.assertEqual(first, same_session_tick)
-        self.assertEqual(81_200, changed_setting)
-        self.assertEqual(90_000, reauthenticated)
+        self.assertEqual(20_000, first)
+        self.assertEqual(first, same_price)
+        self.assertEqual(24_000, changed_price)
+        self.assertEqual(18_000, changed_mode)
+        self.assertEqual(30_000, changed_value)
+        self.assertEqual(24_000, changed_environment)
+        self.assertEqual(26_000, reauthenticated)
+        self.assertEqual(6, calculator.call_count)
+        self.assertEqual(1, len(window._main_stock_resolved_starting_budget_cache))
 
-    def test_first_fresh_price_promotes_waiting_limit_exactly_once(self) -> None:
+    def test_first_fresh_price_refresh_preserves_waiting_limit_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            stock_dir = Path(temp_dir) / "012210_삼미금속"
-            stock_dir.mkdir()
+            stock_dir = Path(temp_dir) / "stocks" / "012210_삼미금속"
+            stock_dir.mkdir(parents=True)
             config_path = stock_dir / "config.json"
             config_path.write_text(
                 json.dumps(
@@ -772,50 +847,35 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            table = QTableWidget(1, 1)
-            item = QTableWidgetItem()
-            item.setData(main_loader.ROUTINE_ROW_KIND_ROLE, main_loader.ROUTINE_ROW_STOCK)
-            item.setData(main_loader.ROUTINE_STOCK_CODE_ROLE, "012210")
-            item.setData(main_loader.ROUTINE_STOCK_PATH_ROLE, str(stock_dir))
-            table.setItem(0, 0, item)
-            fresh = SimpleNamespace(
-                connection_epoch=7,
-                login_session_id="SESSION-7",
-                last_price=7_270,
-            )
-            operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: fresh,
-            )
+            original = config_path.read_bytes()
             window = SimpleNamespace(
-                routine_table=table,
-                main_monitoring_auto_trade_operation_host=lambda: operation_host,
+                _pending_main_market_information_codes={"012210"},
             )
-
+            projection = MagicMock(return_value=1)
+            writer = MagicMock()
             with patch.object(
                 gui_windows,
-                "_system_total_budget_amount",
-                return_value=20_000_000,
+                "main_refresh_market_information_only",
+                projection,
+            ), patch.object(
+                gui_windows.MainWindow,
+                "_write_stock_buy_limit_config",
+                writer,
             ):
-                first = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window,
-                    ("012210",),
+                refreshed = gui_windows.MainWindow._refresh_main_market_information_rows(
+                    window
                 )
-                second = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window,
-                    ("012210",),
-                )
-            saved = json.loads(config_path.read_text(encoding="utf-8"))
 
-            self.assertEqual((1, 0), (first, second))
-            self.assertTrue(saved["buy_limit_enabled"])
-            self.assertEqual(10_000_000, saved["buy_limit_amount"])
-            self.assertEqual(BUY_LIMIT_SOURCE_RECOMMENDED, saved["buy_limit_source"])
-            table.close()
+            self.assertEqual(1, refreshed)
+            self.assertEqual(set(), window._pending_main_market_information_codes)
+            projection.assert_called_once_with(window, ("012210",))
+            writer.assert_not_called()
+            self.assertEqual(original, config_path.read_bytes())
 
-    def test_recommended_configured_limit_recalculates_once_per_fresh_session(self) -> None:
+    def test_recommended_limit_is_immutable_across_realtime_and_reconnect_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            stock_dir = Path(temp_dir) / "012210_삼미금속"
-            stock_dir.mkdir()
+            stock_dir = Path(temp_dir) / "stocks" / "012210_삼미금속"
+            stock_dir.mkdir(parents=True)
             config_path = stock_dir / "config.json"
             config_path.write_text(
                 json.dumps(
@@ -827,71 +887,34 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            table = QTableWidget(1, 1)
-            item = QTableWidgetItem()
-            item.setData(main_loader.ROUTINE_ROW_KIND_ROLE, main_loader.ROUTINE_ROW_STOCK)
-            item.setData(main_loader.ROUTINE_STOCK_CODE_ROLE, "012210")
-            item.setData(main_loader.ROUTINE_STOCK_PATH_ROLE, str(stock_dir))
-            table.setItem(0, 0, item)
-            fresh = SimpleNamespace(
-                value=SimpleNamespace(
-                    connection_epoch=7,
-                    login_session_id="SESSION-7",
-                    last_price=7_270,
-                )
-            )
-            operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: fresh.value,
-            )
-            window = SimpleNamespace(
-                routine_table=table,
-                main_monitoring_auto_trade_operation_host=lambda: operation_host,
-            )
-            suggested = MagicMock(return_value=800_000)
+            original = config_path.read_bytes()
+            window = SimpleNamespace(_pending_main_market_information_codes=set())
+            projection = MagicMock(return_value=1)
             writer = MagicMock()
-            with (
-                patch.object(
-                    gui_windows.MainWindow,
-                    "_stock_suggested_buy_limit",
-                    suggested,
-                ),
-                patch.object(
-                    gui_windows.MainWindow,
-                    "_write_stock_buy_limit_config",
-                    writer,
-                ),
+            with patch.object(
+                gui_windows,
+                "main_refresh_market_information_only",
+                projection,
+            ), patch.object(
+                gui_windows.MainWindow,
+                "_write_stock_buy_limit_config",
+                writer,
             ):
-                first = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window, ("012210",)
+                window._pending_main_market_information_codes.add("012210")
+                first = gui_windows.MainWindow._refresh_main_market_information_rows(
+                    window
                 )
-                second = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window, ("012210",)
-                )
-                fresh.value = SimpleNamespace(
-                    connection_epoch=8,
-                    login_session_id="SESSION-8",
-                    last_price=7_270,
-                )
-                third = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window, ("012210",)
-                )
-                fourth = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window, ("012210",)
+                window._pending_main_market_information_codes.add("012210")
+                second = gui_windows.MainWindow._refresh_main_market_information_rows(
+                    window
                 )
 
-            self.assertEqual((1, 0, 1, 0), (first, second, third, fourth))
-            self.assertEqual(2, suggested.call_count)
-            self.assertEqual(2, writer.call_count)
-            self.assertEqual(
-                {("SESSION-7", 7), ("SESSION-8", 8)},
-                {
-                    (session_id, epoch)
-                    for _path, epoch, session_id in window._main_stock_recommended_limit_refreshed_sessions
-                },
-            )
-            table.close()
+            self.assertEqual((1, 1), (first, second))
+            self.assertEqual(2, projection.call_count)
+            writer.assert_not_called()
+            self.assertEqual(original, config_path.read_bytes())
 
-    def test_recommended_limit_over_total_is_cleared_on_fresh_price(self) -> None:
+    def test_over_total_recommendation_calculation_preserves_persistent_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             stock_dir = Path(temp_dir) / "012210_삼미금속"
             stock_dir.mkdir()
@@ -900,61 +923,129 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 json.dumps(
                     {
                         "buy_limit_enabled": True,
-                        "buy_limit_amount": None,
+                        "buy_limit_amount": 900_000,
                         "buy_limit_source": BUY_LIMIT_SOURCE_RECOMMENDED,
                     }
                 ),
                 encoding="utf-8",
             )
-            table = QTableWidget(1, 1)
-            item = QTableWidgetItem()
-            item.setData(main_loader.ROUTINE_ROW_KIND_ROLE, main_loader.ROUTINE_ROW_STOCK)
-            item.setData(main_loader.ROUTINE_STOCK_CODE_ROLE, "012210")
-            item.setData(main_loader.ROUTINE_STOCK_PATH_ROLE, str(stock_dir))
-            table.setItem(0, 0, item)
-            fresh = SimpleNamespace(
-                connection_epoch=7,
-                login_session_id="SESSION-7",
-                last_price=7_460,
-            )
-            operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: fresh,
-            )
-            window = SimpleNamespace(
-                routine_table=table,
-                main_monitoring_auto_trade_operation_host=lambda: operation_host,
-            )
-            writer = MagicMock()
+            original = config_path.read_bytes()
+            defaults = {
+                "quantity": 1,
+                "amount_multiplier": 1.5,
+                "limit_recommended_multiplier": 100,
+                "limit_minimum_multiplier": 25,
+            }
             with (
                 patch.object(
-                    gui_windows.MainWindow,
-                    "_stock_suggested_buy_limit",
-                    MagicMock(return_value=50_000_000),
-                ),
-                patch.object(
-                    gui_windows.MainWindow,
-                    "_write_stock_buy_limit_config",
-                    writer,
+                    gui_windows,
+                    "starting_budget_defaults",
+                    return_value=defaults,
                 ),
                 patch.object(
                     gui_windows,
-                    "_system_total_budget_amount",
-                    return_value=2_000_000,
+                    "main_stock_resolved_starting_budget",
+                    return_value=500_000,
+                ),
+                patch.object(
+                    gui_windows,
+                    "stock_limit_digit_alignment_enabled",
+                    return_value=False,
                 ),
             ):
-                result = gui_windows.MainWindow._promote_waiting_stock_buy_limits(
-                    window,
-                    ("012210",),
+                recommendation = gui_windows.MainWindow._stock_suggested_buy_limit(
+                    config_path,
+                    window=SimpleNamespace(),
                 )
 
-            self.assertEqual(1, result)
-            writer.assert_called_once_with(
-                config_path,
-                enabled=False,
-                amount=None,
-                source=None,
-            )
-            table.close()
+            self.assertEqual(50_000_000, recommendation)
+            self.assertEqual(original, config_path.read_bytes())
+
+    def test_main_table_reload_is_projection_only_for_stock_limit(self) -> None:
+        window = SimpleNamespace(
+            _install_routine_buy_limit_edit_filters=MagicMock(),
+        )
+        loader = MagicMock()
+        writer = MagicMock()
+        with patch.object(
+            gui_windows,
+            "main_load_routine_table",
+            loader,
+        ), patch.object(
+            gui_windows.MainWindow,
+            "_write_stock_buy_limit_config",
+            writer,
+        ):
+            gui_windows.MainWindow.load_routine_table(window)
+
+        loader.assert_called_once_with(window)
+        window._install_routine_buy_limit_edit_filters.assert_called_once_with()
+        writer.assert_not_called()
+
+    def test_manual_and_applied_recommended_limits_survive_new_projection(self) -> None:
+        defaults = {
+            "quantity": 1,
+            "amount_multiplier": 1.5,
+            "limit_recommended_multiplier": 100,
+            "limit_minimum_multiplier": 25,
+        }
+        for source in (BUY_LIMIT_SOURCE_MANUAL, BUY_LIMIT_SOURCE_RECOMMENDED):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temp_dir:
+                stock_dir = Path(temp_dir) / "stocks" / "005930_삼성전자"
+                stock_dir.mkdir(parents=True)
+                (stock_dir / "state.json").write_text("{}", encoding="utf-8")
+                config_path = stock_dir / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "buy_limit_enabled": True,
+                            "buy_limit_amount": 3_000_000,
+                            "buy_limit_source": source,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                original = config_path.read_bytes()
+                with patch.object(
+                    main_loader,
+                    "main_stock_current_price",
+                    return_value=32_000,
+                ), patch.object(
+                    main_loader,
+                    "main_stock_resolved_starting_budget",
+                    return_value=32_000,
+                ), patch.object(
+                    main_loader,
+                    "main_budget_display_auth_state",
+                    return_value=main_loader.SERVER_AUTH_COMPLETE,
+                ), patch.object(
+                    main_loader,
+                    "starting_budget_defaults",
+                    return_value=defaults,
+                ), patch.object(
+                    main_loader,
+                    "stock_limit_digit_alignment_enabled",
+                    return_value=False,
+                ), patch.object(
+                    main_loader,
+                    "project_confirmable_cumulative_pnl",
+                    return_value={"available": False},
+                ):
+                    _metrics, _led, limit_text, _consumed, sort_values = (
+                        main_loader._routine_tree_stock_metric_values(
+                            SimpleNamespace(),
+                            {
+                                "code": "005930",
+                                "name": "삼성전자",
+                                "stock_path": str(stock_dir),
+                            },
+                        )
+                    )
+
+                self.assertEqual("한도(3,000,000)", limit_text)
+                self.assertEqual(3_200_000, sort_values["recommended_limit"])
+                self.assertEqual(3_000_000, sort_values["configured_limit"])
+                self.assertEqual(original, config_path.read_bytes())
 
     def test_legacy_configured_limit_source_is_unknown(self) -> None:
         self.assertEqual(
@@ -977,7 +1068,10 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
     def test_stock_limit_writer_persists_and_reads_back_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
+            config_path = (
+                Path(temp_dir) / "stocks" / "005930_삼성전자" / "config.json"
+            )
+            config_path.parent.mkdir(parents=True)
             config_path.write_text("{}", encoding="utf-8")
             gui_windows.MainWindow._write_stock_buy_limit_config(
                 config_path,
@@ -1004,6 +1098,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             _parse_buy_limit_amount=gui_windows.MainWindow._parse_buy_limit_amount,
             _write_stock_buy_limit_config=MagicMock(),
             load_routine_table=MagicMock(),
+            refresh_auto_trade_assignment_views=MagicMock(),
         )
         with (
             patch.object(gui_windows, "show_toast") as toast,
@@ -1022,7 +1117,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             amount=None,
             source=None,
         )
-        host.load_routine_table.assert_called_once_with()
+        host.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_blank_limit_save_preserves_existing_limit_state(self) -> None:
         editor = QLineEdit("")
@@ -1373,14 +1468,13 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 return_value=config_path
             )
             host._open_running_budget_adjustment_dialog = MagicMock()
-            host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
                 return_value=QRect(10, 5, 120, 24)
             )
             host._routine_buy_limit_edit_filter = QObject()
 
-            host.start_routine_stock_initial_buy_edit(0)
+            host.open_routine_stock_initial_buy_dialog(0)
 
             host._open_running_budget_adjustment_dialog.assert_called_once_with(
                 0,
@@ -1426,14 +1520,13 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 return_value=config_path
             )
             host._open_running_budget_adjustment_dialog = MagicMock()
-            host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
                 return_value=QRect(10, 5, 120, 24)
             )
             host._routine_buy_limit_edit_filter = QObject()
 
-            host.start_routine_stock_initial_buy_edit(0)
+            host.open_routine_stock_initial_buy_dialog(0)
 
             host._open_running_budget_adjustment_dialog.assert_called_once_with(
                 0,
@@ -1479,14 +1572,13 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 return_value=config_path
             )
             host._open_running_budget_adjustment_dialog = MagicMock()
-            host.finish_routine_stock_initial_buy_edit = MagicMock()
             host.finish_routine_stock_buy_limit_edit = MagicMock()
             host._routine_stock_initial_buy_value_rect = MagicMock(
                 return_value=QRect(10, 5, 120, 24)
             )
             host._routine_buy_limit_edit_filter = QObject()
 
-            host.start_routine_stock_initial_buy_edit(0)
+            host.open_routine_stock_initial_buy_dialog(0)
 
             host._open_running_budget_adjustment_dialog.assert_called_once_with(
                 0,
@@ -1500,254 +1592,6 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 ),
             )
             table.close()
-
-    def _initial_budget_finish_host(
-        self,
-        config_path: Path,
-        text: str,
-        *,
-        default_amount: int,
-        mode: str = "AMOUNT",
-    ):
-        editor = QLineEdit(text)
-        table = SimpleNamespace(
-            _editing_stock_initial_buy_path="stock",
-            viewport=lambda: SimpleNamespace(update=MagicMock()),
-        )
-        host = SimpleNamespace(
-            _routine_stock_initial_buy_editor=editor,
-            _routine_stock_initial_buy_edit_finishing=False,
-            _routine_stock_initial_buy_editor_config_path=str(config_path),
-            _routine_stock_initial_buy_editor_mode=mode,
-            routine_table=table,
-            _stock_default_initial_buy_value=MagicMock(
-                return_value=default_amount
-            ),
-            _write_stock_initial_buy_config=MagicMock(),
-            load_routine_table=MagicMock(),
-        )
-        return host, editor
-
-    def test_initial_amount_invalid_below_default_preserves_valid_explicit_value(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            original = {"trade_amount_type": "AMOUNT", "buy_amount": 30_000}
-            config_path.write_text(json.dumps(original), encoding="utf-8")
-            host, editor = self._initial_budget_finish_host(
-                config_path,
-                "10000",
-                default_amount=15_000,
-            )
-            with patch.object(gui_windows, "show_toast") as toast:
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-
-            host._write_stock_initial_buy_config.assert_not_called()
-            host.load_routine_table.assert_called_once_with()
-            self.assertEqual(original, json.loads(config_path.read_text(encoding="utf-8")))
-            toast.assert_called_once_with(
-                host,
-                "시작예산은 현재 기본금액 15,000원 이상이어야 합니다.",
-                duration_ms=2500,
-            )
-            self.assertIsNone(host._routine_stock_initial_buy_editor)
-
-    def test_initial_amount_invalid_below_new_default_clears_explicit_override(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            config_path.write_text(
-                json.dumps({"trade_amount_type": "AMOUNT", "buy_amount": 30_000}),
-                encoding="utf-8",
-            )
-            host, _editor = self._initial_budget_finish_host(
-                config_path,
-                "10000",
-                default_amount=40_000,
-            )
-            host._write_stock_initial_buy_config = MagicMock(
-                side_effect=lambda *args, **kwargs: (
-                    gui_windows.MainWindow._write_stock_initial_buy_config(
-                        host,
-                        *args,
-                        **kwargs,
-                    )
-                )
-            )
-            with patch.object(gui_windows, "show_toast"):
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-
-            host._write_stock_initial_buy_config.assert_called_once_with(
-                config_path,
-                mode="AMOUNT",
-                value=0,
-            )
-            host.load_routine_table.assert_called_once_with()
-            saved = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("AMOUNT", saved["trade_amount_type"])
-            self.assertEqual(0, saved["buy_amount"])
-
-    def test_initial_amount_at_default_and_above_default_save(self) -> None:
-        for text, amount in (("15000", 15_000), ("50000", 50_000)):
-            with self.subTest(text=text), tempfile.TemporaryDirectory() as temp_dir:
-                config_path = Path(temp_dir) / "config.json"
-                config_path.write_text(
-                    json.dumps({"trade_amount_type": "AMOUNT", "buy_amount": 0}),
-                    encoding="utf-8",
-                )
-                host, _editor = self._initial_budget_finish_host(
-                    config_path,
-                    text,
-                    default_amount=15_000,
-                )
-                with patch.object(gui_windows, "show_toast"):
-                    gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                        host,
-                        save=True,
-                    )
-                host._write_stock_initial_buy_config.assert_called_once_with(
-                    config_path,
-                    mode="AMOUNT",
-                    value=amount,
-                )
-                host.load_routine_table.assert_called_once_with()
-
-    def test_initial_amount_invalid_text_is_discarded(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            original = {"trade_amount_type": "AMOUNT", "buy_amount": 30_000}
-            config_path.write_text(json.dumps(original), encoding="utf-8")
-            host, _editor = self._initial_budget_finish_host(
-                config_path,
-                "not-a-number",
-                default_amount=15_000,
-            )
-            with patch.object(gui_windows, "show_toast") as toast:
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-            host._write_stock_initial_buy_config.assert_not_called()
-            host.load_routine_table.assert_called_once_with()
-            self.assertEqual(original, json.loads(config_path.read_text(encoding="utf-8")))
-            toast.assert_called_once()
-
-    def test_initial_amount_invalid_without_fresh_price_preserves_explicit_value(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            original = {"trade_amount_type": "AMOUNT", "buy_amount": 30_000}
-            config_path.write_text(json.dumps(original), encoding="utf-8")
-            host, _editor = self._initial_budget_finish_host(
-                config_path,
-                "not-a-number",
-                default_amount=0,
-            )
-            with patch.object(gui_windows, "show_toast"):
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-            host._write_stock_initial_buy_config.assert_not_called()
-            self.assertEqual(original, json.loads(config_path.read_text(encoding="utf-8")))
-
-    def test_initial_amount_invalid_without_fresh_price_keeps_waiting_default_path(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            original = {"trade_amount_type": "AMOUNT", "buy_amount": 0}
-            config_path.write_text(json.dumps(original), encoding="utf-8")
-            host, _editor = self._initial_budget_finish_host(
-                config_path,
-                "0",
-                default_amount=0,
-            )
-            with patch.object(gui_windows, "show_toast"):
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-            host._write_stock_initial_buy_config.assert_not_called()
-            self.assertEqual(original, json.loads(config_path.read_text(encoding="utf-8")))
-
-    def test_initial_amount_validation_uses_current_multiplier_default(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            stock_dir = Path(temp_dir) / "012210_삼미금속"
-            stock_dir.mkdir()
-            config_path = stock_dir / "config.json"
-            config_path.write_text(
-                json.dumps({"trade_amount_type": "AMOUNT", "buy_amount": 30_000}),
-                encoding="utf-8",
-            )
-            fresh = SimpleNamespace(
-                connection_epoch=1,
-                login_session_id="SESSION-1",
-                last_price=10_000,
-            )
-            operation_host = SimpleNamespace(
-                fresh_monitoring_market_information_state=lambda _code: fresh,
-            )
-            host = SimpleNamespace(
-                _routine_stock_initial_buy_editor=QLineEdit("10000"),
-                _routine_stock_initial_buy_edit_finishing=False,
-                _routine_stock_initial_buy_editor_config_path=str(config_path),
-                _routine_stock_initial_buy_editor_mode="AMOUNT",
-                routine_table=SimpleNamespace(
-                    _editing_stock_initial_buy_path="stock",
-                    viewport=lambda: SimpleNamespace(update=MagicMock()),
-                ),
-                main_monitoring_auto_trade_operation_host=lambda: operation_host,
-                _main_stock_resolved_starting_budget_cache={},
-                _stock_default_initial_buy_value=(
-                    gui_windows.MainWindow._stock_default_initial_buy_value
-                ),
-                load_routine_table=MagicMock(),
-                _write_stock_initial_buy_config=MagicMock(),
-            )
-            with patch.object(
-                gui_windows,
-                "starting_budget_defaults",
-                return_value={"quantity": 1, "amount_multiplier": 4.0},
-            ), patch.object(gui_windows, "show_toast"):
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-            host._write_stock_initial_buy_config.assert_called_once_with(
-                config_path,
-                mode="AMOUNT",
-                value=0,
-            )
-
-    def test_initial_quantity_validation_contract_is_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "config.json"
-            original = {"trade_amount_type": "QUANTITY", "buy_qty": 5}
-            config_path.write_text(json.dumps(original), encoding="utf-8")
-            host, _editor = self._initial_budget_finish_host(
-                config_path,
-                "0",
-                default_amount=0,
-                mode="QUANTITY",
-            )
-            with patch.object(gui_windows, "show_toast") as toast:
-                gui_windows.MainWindow.finish_routine_stock_initial_buy_edit(
-                    host,
-                    save=True,
-                )
-            host._write_stock_initial_buy_config.assert_not_called()
-            host.load_routine_table.assert_not_called()
-            toast.assert_not_called()
 
     def test_limit_save_uses_offline_config_writer_when_price_is_unavailable(self) -> None:
         editor = QLineEdit("750000")
@@ -1763,6 +1607,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             _stock_suggested_buy_limit=MagicMock(return_value=None),
             _write_stock_buy_limit_config=MagicMock(),
             load_routine_table=MagicMock(),
+            refresh_auto_trade_assignment_views=MagicMock(),
             kiwoom_api=MagicMock(),
         )
 
@@ -1779,7 +1624,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
             amount=750_000,
             source=BUY_LIMIT_SOURCE_MANUAL,
         )
-        host.load_routine_table.assert_called_once_with()
+        host.refresh_auto_trade_assignment_views.assert_called_once_with()
         self.assertEqual([], host.kiwoom_api.method_calls)
 
     def test_unchanged_configured_limit_does_not_write(self) -> None:
@@ -1810,6 +1655,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 _stock_suggested_buy_limit=MagicMock(return_value=None),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
             )
 
             gui_windows.MainWindow.finish_routine_stock_buy_limit_edit(
@@ -1819,100 +1665,6 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
 
             host._write_stock_buy_limit_config.assert_not_called()
             host.load_routine_table.assert_not_called()
-
-    def test_starting_budget_change_recalculates_recommended_only(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_root = Path(temp_dir)
-            configs = {
-                "stocks/000001_recommended": {
-                    "buy_limit_enabled": True,
-                    "buy_limit_amount": 500_000,
-                    "buy_limit_source": BUY_LIMIT_SOURCE_RECOMMENDED,
-                },
-                "stocks/000002_manual": {
-                    "buy_limit_enabled": True,
-                    "buy_limit_amount": 600_000,
-                    "buy_limit_source": BUY_LIMIT_SOURCE_MANUAL,
-                },
-                "stocks/000003_unknown": {
-                    "buy_limit_enabled": True,
-                    "buy_limit_amount": 700_000,
-                },
-                "stocks/000004_recommended_waiting": {
-                    "buy_limit_enabled": True,
-                    "buy_limit_amount": 900_000,
-                    "buy_limit_source": BUY_LIMIT_SOURCE_RECOMMENDED,
-                },
-            }
-            records = []
-            for stock_path, config in configs.items():
-                config_path = project_root / stock_path / "config.json"
-                config_path.parent.mkdir(parents=True)
-                config_path.write_text(json.dumps(config), encoding="utf-8")
-                records.append(SimpleNamespace(stock_path=stock_path))
-
-            repository = MagicMock()
-            repository.list_current_registered_stocks.return_value = records
-            def recommendation(config_path, *, window):
-                return None if "recommended_waiting" in str(config_path) else 800_000
-
-            host = SimpleNamespace(
-                _main_stock_resolved_starting_budget_cache={"old": {"amount": 1}},
-                _stock_suggested_buy_limit=MagicMock(side_effect=recommendation),
-                _write_stock_buy_limit_config=(
-                    gui_windows.MainWindow._write_stock_buy_limit_config
-                ),
-                kiwoom_api=MagicMock(),
-            )
-            with (
-                patch.object(gui_windows, "PROJECT_ROOT", project_root),
-                patch.object(gui_windows, "StockRepository", return_value=repository),
-                patch.object(
-                    gui_windows,
-                    "_system_total_budget_amount",
-                    return_value=2_000_000,
-                ),
-            ):
-                first = gui_windows.MainWindow._recalculate_recommended_stock_buy_limits_for_starting_budget_change(
-                    host
-                )
-                second = gui_windows.MainWindow._recalculate_recommended_stock_buy_limits_for_starting_budget_change(
-                    host
-                )
-
-            recommended = json.loads(
-                (project_root / "stocks/000001_recommended/config.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            manual = json.loads(
-                (project_root / "stocks/000002_manual/config.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            unknown = json.loads(
-                (project_root / "stocks/000003_unknown/config.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            waiting = json.loads(
-                (
-                    project_root
-                    / "stocks/000004_recommended_waiting/config.json"
-                ).read_text(encoding="utf-8")
-            )
-
-        self.assertEqual((1, 0), (first, second))
-        self.assertEqual(800_000, recommended["buy_limit_amount"])
-        self.assertEqual(BUY_LIMIT_SOURCE_RECOMMENDED, recommended["buy_limit_source"])
-        self.assertEqual(600_000, manual["buy_limit_amount"])
-        self.assertEqual(BUY_LIMIT_SOURCE_MANUAL, manual["buy_limit_source"])
-        self.assertEqual(700_000, unknown["buy_limit_amount"])
-        self.assertNotIn("buy_limit_source", unknown)
-        self.assertEqual(900_000, waiting["buy_limit_amount"])
-        self.assertEqual(BUY_LIMIT_SOURCE_RECOMMENDED, waiting["buy_limit_source"])
-        self.assertEqual({}, host._main_stock_resolved_starting_budget_cache)
-        self.assertEqual([], host.kiwoom_api.method_calls)
 
     def test_changed_configured_limit_writes_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1941,6 +1693,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 _stock_suggested_buy_limit=MagicMock(return_value=None),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
             )
 
             with patch.object(
@@ -1959,7 +1712,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 amount=750_000,
                 source=BUY_LIMIT_SOURCE_MANUAL,
             )
-            host.load_routine_table.assert_called_once_with()
+            host.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_invalid_configured_limit_forces_unset_after_toast(self) -> None:
         for invalid_text in ("1", "10000001"):
@@ -1988,6 +1741,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     _stock_suggested_buy_limit=MagicMock(return_value=250_000),
                     _write_stock_buy_limit_config=MagicMock(),
                     load_routine_table=MagicMock(),
+                    refresh_auto_trade_assignment_views=MagicMock(),
                 )
                 total_budget = 10_000_000
                 with patch.object(
@@ -2001,7 +1755,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     )
 
                 host._write_stock_buy_limit_config.assert_not_called()
-                host.load_routine_table.assert_called_once_with()
+                host.refresh_auto_trade_assignment_views.assert_not_called()
                 toast.assert_called_once()
 
     def test_invalid_unset_limit_forces_unset_after_toast(self) -> None:
@@ -2030,6 +1784,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 _stock_suggested_buy_limit=MagicMock(return_value=250_000),
                 _write_stock_buy_limit_config=MagicMock(),
                 load_routine_table=MagicMock(),
+                refresh_auto_trade_assignment_views=MagicMock(),
             )
             with patch.object(
                 gui_windows,
@@ -2047,7 +1802,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                 amount=None,
                 source=None,
             )
-            host.load_routine_table.assert_called_once_with()
+            host.refresh_auto_trade_assignment_views.assert_called_once_with()
 
     def test_limit_double_click_cancels_pending_single_click_release(self) -> None:
         timer = MagicMock()
@@ -2173,6 +1928,7 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     finish_routine_stock_buy_limit_edit=MagicMock(),
                     _write_stock_buy_limit_config=MagicMock(),
                     load_routine_table=MagicMock(),
+                    refresh_auto_trade_assignment_views=MagicMock(),
                 )
 
                 with patch.object(
@@ -2194,9 +1950,9 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     amount=None,
                     source=None,
                 )
-                host.load_routine_table.assert_called_once()
+                host.refresh_auto_trade_assignment_views.assert_called_once()
 
-    def test_unconfigured_limit_double_click_activates_waiting_or_recommendation(self) -> None:
+    def test_unconfigured_limit_double_click_requires_calculable_recommendation(self) -> None:
         for suggested_amount in (None, 2_000_000):
             with self.subTest(suggested_amount=suggested_amount), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.json"
@@ -2220,26 +1976,26 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                     ),
                     _write_stock_buy_limit_config=MagicMock(),
                     load_routine_table=MagicMock(),
+                    refresh_auto_trade_assignment_views=MagicMock(),
                 )
 
                 with patch.object(
                     gui_windows,
                     "_system_total_budget_amount",
                     return_value=2_000_000,
-                ):
+                ), patch.object(gui_windows, "show_toast") as toast:
                     gui_windows.MainWindow.handle_routine_stock_buy_limit_double_click(
                         host,
                         0,
                     )
 
                 if suggested_amount is None:
-                    host._write_stock_buy_limit_config.assert_called_once_with(
-                        config_path,
-                        enabled=True,
-                        amount=None,
-                        source=BUY_LIMIT_SOURCE_RECOMMENDED,
+                    host._write_stock_buy_limit_config.assert_not_called()
+                    host.load_routine_table.assert_not_called()
+                    toast.assert_called_once_with(
+                        host,
+                        "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
                     )
-                    host.load_routine_table.assert_called_once()
                 else:
                     host._write_stock_buy_limit_config.assert_called_once_with(
                         config_path,
@@ -2247,7 +2003,8 @@ class OperationBudgetDefaultsTest(unittest.TestCase):
                         amount=suggested_amount,
                         source=BUY_LIMIT_SOURCE_RECOMMENDED,
                     )
-                    host.load_routine_table.assert_called_once()
+                    host.refresh_auto_trade_assignment_views.assert_called_once()
+                    toast.assert_not_called()
 
     def test_unconfigured_limit_double_click_reports_real_recommendation_over_total(
         self,

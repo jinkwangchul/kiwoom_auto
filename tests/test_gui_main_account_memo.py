@@ -11,9 +11,18 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "windows")
 
-from PyQt5.QtCore import QEvent, QObject, QPointF, QSettings, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QSettings,
+    QSignalBlocker,
+    QTimer,
+    Qt,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QInputMethodEvent, QMouseEvent
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 from PyQt5.QtWidgets import QApplication, QMenu, QStyleOptionViewItem
 
 from account_funds_foundation import AccountFundsSnapshot
@@ -332,11 +341,54 @@ class MainAccountMemoTests(unittest.TestCase):
     def test_focus_out_and_account_change_save_previous_then_load_new_memo(self) -> None:
         self.window.set_account_memo("1234567890", "둘째계좌")
         self.window.refresh_kiwoom_accounts()
-        self.window.account_combo.setCurrentIndex(0)
-        self.window.account_memo_edit.setText("첫계좌")
-        self.window.account_combo.setCurrentIndex(1)
-        self.assertEqual("첫계좌", self.window.account_memos()["8129123456"])
-        self.assertEqual("둘째계좌", self.window.account_memo_edit.text())
+        combo = self.window.account_combo
+        account_changed = QSignalSpy(combo.currentIndexChanged)
+        with (
+            patch.object(
+                gui_windows,
+                "append_production_event",
+                return_value={"appended": True},
+            ) as append_event,
+            patch.object(
+                self.window,
+                "sync_account_funds_selection",
+            ) as sync_funds,
+            patch.object(
+                self.window,
+                "request_account_funds",
+                return_value={"ok": True},
+            ) as request_funds,
+            patch.object(
+                self.window,
+                "_production_recovery_required",
+                return_value=False,
+            ) as recovery_required,
+            patch.object(
+                self.window,
+                "_stop_production_recovery_timers",
+            ) as stop_recovery_timers,
+            patch.object(
+                gui_windows.production_recovery_registry,
+                "invalidate",
+            ) as invalidate_recovery,
+        ):
+            combo.setCurrentIndex(0)
+            self.window.account_memo_edit.setText("첫계좌")
+            combo.setCurrentIndex(1)
+
+            self.assertEqual([0, 1], [int(args[0]) for args in account_changed])
+            self.assertEqual(2, append_event.call_count)
+            self.assertEqual(
+                ["ACCOUNT_CHANGED", "ACCOUNT_CHANGED"],
+                [call.args[0] for call in append_event.call_args_list],
+            )
+            self.assertEqual(2, sync_funds.call_count)
+            self.assertEqual(2, request_funds.call_count)
+            self.assertEqual(2, recovery_required.call_count)
+            self.assertEqual(2, stop_recovery_timers.call_count)
+            self.assertEqual(2, invalidate_recovery.call_count)
+            self.assertEqual("첫계좌", self.window.account_memos()["8129123456"])
+            self.assertEqual("둘째계좌", self.window.account_memo_edit.text())
 
         self.window.show()
         self.window.account_memo_edit.setFocus()
@@ -348,7 +400,46 @@ class MainAccountMemoTests(unittest.TestCase):
 
     def test_inactive_popup_selection_edits_memo_without_changing_production_account(self) -> None:
         self.window.refresh_kiwoom_accounts()
-        self.window.account_combo.setCurrentIndex(0)
+        combo = self.window.account_combo
+        account_changed = QSignalSpy(combo.currentIndexChanged)
+        with (
+            patch.object(
+                gui_windows,
+                "append_production_event",
+                return_value={"appended": True},
+            ) as append_event,
+            patch.object(
+                self.window,
+                "sync_account_funds_selection",
+            ) as sync_funds,
+            patch.object(
+                self.window,
+                "request_account_funds",
+                return_value={"ok": True},
+            ) as request_funds,
+            patch.object(
+                self.window,
+                "_production_recovery_required",
+                return_value=False,
+            ) as recovery_required,
+            patch.object(
+                self.window,
+                "_stop_production_recovery_timers",
+            ) as stop_recovery_timers,
+            patch.object(
+                gui_windows.production_recovery_registry,
+                "invalidate",
+            ) as invalidate_recovery,
+        ):
+            combo.setCurrentIndex(0)
+            self.assertEqual([0], [int(args[0]) for args in account_changed])
+            append_event.assert_called_once()
+            self.assertEqual("ACCOUNT_CHANGED", append_event.call_args.args[0])
+            sync_funds.assert_called_once_with()
+            request_funds.assert_called_once_with()
+            recovery_required.assert_called_once_with()
+            stop_recovery_timers.assert_called_once_with()
+            invalidate_recovery.assert_called_once_with("account changed")
         self.assertEqual("8129123456", self.window.selected_account_no())
         self.api.accounts = ["8129123456"]
         self.window.refresh_kiwoom_accounts()
@@ -371,36 +462,43 @@ class MainAccountMemoTests(unittest.TestCase):
         view = combo.view()
         observed: dict[str, object] = {}
 
-        def click_delete_confirmation() -> None:
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, gui_windows.QMessageBox) and widget.isVisible():
-                    observed["question"] = widget.text()
-                    observed["default"] = widget.defaultButton().text()
-                    buttons = {button.text(): button for button in widget.buttons()}
-                    QTest.mouseClick(buttons["삭제"], Qt.LeftButton)
+        def select_delete_action(menu, _global_position):
+            action = menu.actions()[0]
+            key = "menu" if action.isEnabled() else "active_menu"
+            observed[key] = action.text()
+            observed["enabled" if action.isEnabled() else "active_enabled"] = (
+                action.isEnabled()
+            )
+            return action
 
-        def click_delete_action() -> None:
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, QMenu) and widget.isVisible():
-                    action = widget.actions()[0]
-                    observed["menu"] = action.text()
-                    observed["enabled"] = action.isEnabled()
-                    QTimer.singleShot(50, click_delete_confirmation)
-                    QTest.mouseClick(
-                        widget,
-                        Qt.LeftButton,
-                        pos=widget.actionGeometry(action).center(),
-                    )
+        def accept_delete_confirmation(dialog) -> int:
+            observed["question"] = dialog.text()
+            observed["default"] = dialog.defaultButton().text()
+            buttons = {button.text(): button for button in dialog.buttons()}
+            buttons["삭제"].click()
+            return 0
 
-        combo.showPopup()
-        self.app.processEvents()
         inactive_index = combo.model().index(1, 0)
-        QTimer.singleShot(50, click_delete_action)
-        QTest.mouseClick(
-            view.viewport(),
-            Qt.RightButton,
-            pos=view.visualRect(inactive_index).center(),
-        )
+        active_index = combo.model().index(0, 0)
+        with (
+            patch.object(gui_windows.QMenu, "exec_", new=select_delete_action),
+            patch.object(
+                gui_windows.QMessageBox,
+                "exec_",
+                new=accept_delete_confirmation,
+            ),
+        ):
+            self.window.open_kiwoom_account_context_menu_for_index(
+                inactive_index,
+                view.viewport().mapToGlobal(
+                    view.visualRect(inactive_index).center()
+                ),
+            )
+            self.window.open_kiwoom_account_context_menu_for_index(
+                active_index,
+                view.viewport().mapToGlobal(view.visualRect(active_index).center()),
+            )
+
         self.assertEqual("정보삭제", observed.get("menu"))
         self.assertTrue(observed.get("enabled"))
         self.assertEqual(
@@ -411,24 +509,6 @@ class MainAccountMemoTests(unittest.TestCase):
         self.assertNotIn("1234567890", self.window.remembered_account_numbers())
         self.assertNotIn("1234567890", self.window.account_memos())
         self.assertNotEqual("1234567890", self.window._account_memo_edit_account_no)
-
-        def inspect_active_delete_action() -> None:
-            for widget in QApplication.topLevelWidgets():
-                if isinstance(widget, QMenu) and widget.isVisible():
-                    action = widget.actions()[0]
-                    observed["active_menu"] = action.text()
-                    observed["active_enabled"] = action.isEnabled()
-                    widget.close()
-
-        combo.showPopup()
-        self.app.processEvents()
-        active_index = combo.model().index(0, 0)
-        QTimer.singleShot(50, inspect_active_delete_action)
-        QTest.mouseClick(
-            view.viewport(),
-            Qt.RightButton,
-            pos=view.visualRect(active_index).center(),
-        )
         self.assertEqual("정보삭제", observed.get("active_menu"))
         self.assertFalse(observed.get("active_enabled"))
 
@@ -589,7 +669,12 @@ class MainAccountMemoTests(unittest.TestCase):
         self.assertFalse(self.window.account_query_status_label.isHidden())
         self.assertFalse(self.window.account_query_neutral_label.isHidden())
         self.window.refresh_kiwoom_accounts()
-        self.window.account_combo.setCurrentIndex(0)
+        combo = self.window.account_combo
+        account_changed = QSignalSpy(combo.currentIndexChanged)
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(0)
+        self.window.refresh_account_authentication_ui()
+        self.assertEqual(0, len(account_changed))
         self.assertTrue(self.window.account_auth_separator.isHidden())
         self.assertFalse(self.window.account_auth_label.isHidden())
         self.assertTrue(self.window.account_auth_neutral_label.isHidden())
@@ -631,16 +716,21 @@ class MainAccountMemoTests(unittest.TestCase):
             "8129123456": gui_windows.ACCOUNT_FUNDS_READY,
             "1234567890": gui_windows.ACCOUNT_AUTHENTICATION_REQUIRED,
         }
+        combo = self.window.account_combo
+        account_changed = QSignalSpy(combo.currentIndexChanged)
 
-        self.window.account_combo.setCurrentIndex(0)
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(0)
         self.window.refresh_account_authentication_ui()
         self.assertFalse(self.window.account_auth_done_label.isHidden())
         self.assertTrue(self.window.btn_account_authentication.isHidden())
 
-        self.window.account_combo.setCurrentIndex(1)
+        with QSignalBlocker(combo):
+            combo.setCurrentIndex(1)
         self.window.refresh_account_authentication_ui()
         self.assertTrue(self.window.account_auth_done_label.isHidden())
         self.assertFalse(self.window.btn_account_authentication.isHidden())
+        self.assertEqual(0, len(account_changed))
 
     def test_account_query_status_projects_unauthenticated_ready_and_retry_states(self) -> None:
         account = "8129123456"
@@ -810,7 +900,25 @@ class MainAccountMemoTests(unittest.TestCase):
     def test_connected_account_query_runs_before_recovery(self) -> None:
         self.api.accounts = ["8129123456"]
         events: list[str] = []
+        scheduled: list[tuple[int, object]] = []
+        operation_host = self.window.main_monitoring_auto_trade_operation_host()
         with (
+            patch.object(
+                gui_windows,
+                "append_production_event",
+                return_value={"appended": True},
+            ) as append_event,
+            patch.object(
+                gui_windows.QTimer,
+                "singleShot",
+                side_effect=lambda delay, callback: scheduled.append(
+                    (int(delay), callback)
+                ),
+            ) as single_shot,
+            patch.object(
+                operation_host,
+                "sync_monitoring_universe_for_current_session",
+            ) as sync_universe,
             patch.object(
                 self.window,
                 "request_account_funds",
@@ -823,10 +931,26 @@ class MainAccountMemoTests(unittest.TestCase):
             ),
         ):
             self.window.on_kiwoom_login_state_changed(
-                {"connected": True, "message": "연결됨"}
+                {
+                    "connected": True,
+                    "message": "연결됨",
+                    "connection_epoch": 1,
+                    "login_session_id": self.api.session_id,
+                }
             )
 
+            self.assertEqual([], events)
+            request_funds.assert_not_called()
+            self.assertEqual(1, len(scheduled))
+            self.assertEqual(500, scheduled[0][0])
+            scheduled[0][1]()
+
         request_funds.assert_called_once_with()
+        sync_universe.assert_called_once_with()
+        append_event.assert_called_once()
+        self.assertEqual("LOGIN_SUCCEEDED", append_event.call_args.args[0])
+        self.assertEqual([500, 0], [delay for delay, _callback in scheduled])
+        self.assertEqual(2, single_shot.call_count)
         self.assertEqual(["funds", "recovery"], events)
 
     def test_failed_recovery_restarts_once_after_verified_funds_success(self) -> None:

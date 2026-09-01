@@ -1354,12 +1354,7 @@ from gui_review_required_window import (
     collect_global_review_required_rows,
 )
 from gui_main_emergency_ops import (
-    has_emergency_stopped_stock as emergency_has_emergency_stopped_stock,
     update_emergency_button_state as emergency_update_emergency_button_state,
-    emergency_review_reason_for_stock as emergency_review_reason_for_stock_impl,
-    update_runtime_stock_status as emergency_update_runtime_stock_status,
-    execute_emergency_stop as emergency_execute_emergency_stop,
-    release_emergency_stop as emergency_release_emergency_stop,
     on_emergency_stop_clicked as emergency_on_emergency_stop_clicked,
 )
 from gui_main_table_loader import (
@@ -1412,6 +1407,7 @@ from gui_main_table_loader import (
     routine_instance_number_widths,
     main_refresh_market_information_only,
     main_refresh_pnl_only,
+    build_main_refresh_read_context,
     main_group_instance_relation_id,
     main_stock_fresh_market_information_state,
     main_stock_resolved_starting_budget,
@@ -1423,8 +1419,6 @@ from gui_main_table_loader import (
     ROUTINE_STATUS_IMMEDIATE_LIQUIDATION,
     main_sort_routine_table_by_column,
     main_sort_running_table_by_column,
-    main_apply_routine_sort,
-    main_apply_running_sort,
     main_load_routine_table,
     main_load_running_stock_table,
     main_monitoring_table_font,
@@ -1460,6 +1454,7 @@ from gui_main_stock_context_menu import (
     MainMonitoringStockTarget,
     _stock_target_for_row,
     clear_main_monitoring_chart_open_selection,
+    execute_main_monitoring_selective_start,
     show_main_monitoring_stock_context_menu,
 )
 from gui_auto_trade_context_menu import (
@@ -1474,9 +1469,22 @@ from gui_auto_trade_display import (
     profit_loss_value_color,
 )
 from gui_auto_trade_run_control import (
+    OperationStartCommandRequest,
+    OperationStartIntent,
     auto_trade_registered_operation_targets,
     auto_trade_running_registered_operation_targets,
+    auto_trade_update_global_operation_button_state,
+    execute_operation_start_command,
     show_auto_trade_operation_failure_dialog,
+)
+from gui_auto_trade_close import auto_trade_apply_selected_early_close
+from gui_operation_ui_context import (
+    refresh_auto_trade_views,
+    sync_auto_trade_monitoring_universe,
+)
+from gui_auto_trade_status_ops import (
+    auto_trade_set_stock_operation_exclusion,
+    handle_auto_trade_operation_mode_double_click,
 )
 from gui_routine_policy import can_unassign_active_routine_from_stock
 from group_complete_deletion_service import (
@@ -1547,6 +1555,13 @@ from running_budget_adjustment import (
     commit_running_budget_adjustment,
     project_running_budget_adjustment_display_config,
 )
+from budget_command import (
+    BudgetModeChangeRequest,
+    BudgetValueChangeRequest,
+    CURRENT_PRICE_UNAVAILABLE,
+    execute_budget_mode_change,
+    inspect_budget_value_entry,
+)
 from gui_auto_trade_setting_window import (
     AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
@@ -1565,7 +1580,6 @@ from gui_auto_trade_setting_window import (
     normalize_base_stock_single_routine_file,
     open_instance_stock_search_register_dialog,
     open_routine_settings_dialog_for_owner,
-    routine_display_name,
 )
 from gui_routine_registry import (
     group_record_by_id,
@@ -1583,13 +1597,20 @@ from routine_instance_registry import (
     validate_routine_limit_response_policy,
 )
 from routine_instance_repository import RoutineInstanceRepository
-from stock_repository import now_text as stock_now_text
-from stock_repository import StockRepository
+from stock_repository import (
+    STOCK_CONFIG_EXPECTED_MISSING,
+    STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED,
+    STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+    STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+    StockConfigWriteResult,
+    StockRepository,
+    now_text as stock_now_text,
+)
+from stock_repository import StockRepository as CanonicalStockConfigRepository
 from stock_buy_limit_provenance import (
     BUY_LIMIT_SOURCE_MANUAL,
     BUY_LIMIT_SOURCE_RECOMMENDED,
     canonical_stock_buy_limit_values,
-    normalized_stock_buy_limit_source,
 )
 from gui_main_routine_selection import (
     routine_definition_enabled,
@@ -1597,7 +1618,14 @@ from gui_main_routine_selection import (
 )
 from kiwoom_api import KiwoomApi
 from kiwoom_stock_library_service import KiwoomStockLibrarySyncService
+from stock_library_diagnostics_retention import (
+    StockLibraryDiagnosticsAutomaticRetention,
+)
 from operator_reconciliation_service import assess_startup_recovery
+from assignment_startup_reconciliation_service import (
+    apply_assignment_reconciliation_to_production_registry,
+    reconcile_assignment_startup,
+)
 from broker_holding_recorder import (
     resolve_account_holding_snapshot_failures,
     write_production_recovery_review,
@@ -1640,13 +1668,6 @@ BASE_STOCK_PATH = PROJECT_ROOT / "기초종목.txt"
 RECOVERY_ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 RECOVERY_POSITIONS_PATH = PROJECT_ROOT / "runtime" / "positions.json"
 RECOVERY_BROKER_HOLDINGS_PATH = PROJECT_ROOT / "runtime" / "broker_holdings.json"
-EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS = frozenset(
-    {
-        RECOVERY_CONTEXT_MISSING,
-        RECOVERY_NOT_STARTED,
-        RECOVERY_IN_PROGRESS,
-    }
-)
 MAIN_ROUTINE_BADGE_IDLE_TEXT_COLOR = "#404040"
 MAIN_PERFORMANCE_CUMULATIVE_TITLE_COLOR = "#22B14C"
 MAIN_PERFORMANCE_CURRENT_TITLE_COLOR = "#FF7F27"
@@ -1936,34 +1957,6 @@ def _draw_initial_buy_display(
             ),
             value_text,
         )
-
-
-def _routine_stock_metric_texts_legacy_unused(values: list[object], metrics_data: tuple[object, ...]) -> list[str]:
-    if MAIN_STOCK_METRIC_LAYOUT_PREVIEW:
-        return list(MAIN_STOCK_METRIC_MAX_TEXTS)
-    texts: list[str] = []
-    for metric in metrics_data[:4]:
-        metric_text = _routine_stock_metric_display_text(metric)
-        if metric_text:
-            texts.append(metric_text)
-    initial_buy_offset = (
-        1
-        if len(values) > 1 and str(values[1] or "").startswith(("금액 ", "주수 "))
-        else 0
-    )
-    limit_index = 10 + initial_buy_offset
-    consumed_index = 11 + initial_buy_offset
-    if len(values) > limit_index:
-        texts.append(str(values[limit_index] or "").strip())
-    if len(metrics_data) > 5:
-        consumed_text = _routine_stock_metric_display_text(metrics_data[5])
-        if consumed_text:
-            texts.append(consumed_text)
-    elif len(values) > consumed_index:
-        texts.append(str(values[consumed_index] or "").strip())
-    else:
-        texts.append("소모(0 / 0.0%)")
-    return [text for text in texts if text]
 
 
 def _routine_stock_metric_texts(
@@ -2410,7 +2403,7 @@ class _RoutineTreeInteractionController(QObject):
                             event.accept()
                             return True
                         if initial_buy_parts["value"].contains(event.pos()):
-                            self.window.start_routine_stock_initial_buy_edit(index.row())
+                            self.window.open_routine_stock_initial_buy_dialog(index.row())
                             event.accept()
                             return True
                     return super().eventFilter(watched, event)
@@ -2541,18 +2534,6 @@ class _RoutineBuyLimitValueEditFilter(QObject):
                     return True
             if event.type() == QEvent.FocusOut:
                 self.window.finish_routine_stock_buy_limit_edit(save=True)
-        if object_name == "routineStockInitialBuyEditor":
-            if event.type() == QEvent.KeyPress:
-                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-                    self.window.finish_routine_stock_initial_buy_edit(save=True)
-                    event.accept()
-                    return True
-                if event.key() == Qt.Key_Escape:
-                    self.window.finish_routine_stock_initial_buy_edit(save=False)
-                    event.accept()
-                    return True
-            if event.type() == QEvent.FocusOut:
-                self.window.finish_routine_stock_initial_buy_edit(save=True)
         return super().eventFilter(watched, event)
 
 
@@ -2811,17 +2792,6 @@ class _RoutineTreeItemDelegate(QStyledItemDelegate):
                         painter,
                         cell_rect,
                         initial_buy,
-                        hide_value=(
-                            str(
-                                getattr(
-                                    option.widget,
-                                    "_editing_stock_initial_buy_path",
-                                    "",
-                                )
-                                or ""
-                            )
-                            == str(index.data(ROUTINE_STOCK_PATH_ROLE) or "").strip()
-                        ),
                     )
                     continue
                 if column == 3:
@@ -3193,13 +3163,6 @@ def append_base_stock(code: str, name: str) -> None:
 
     with BASE_STOCK_PATH.open("a", encoding="utf-8") as file:
         file.write(f"{prefix}{code},{name}\n")
-
-
-def routine_dir_by_display_name() -> dict[str, Path]:
-    """
-    GUI 표시 루틴명 기준으로 루틴 폴더를 찾는다.
-    """
-    return {routine_display_name(path): path for path in get_group_dirs()}
 
 
 class _MarketDataMonitoringWindow(QDialog):
@@ -3834,6 +3797,12 @@ class MainWindow(QMainWindow):
             if self.kiwoom_api is not None
             else None
         )
+        self.stock_library_diagnostics_retention = (
+            StockLibraryDiagnosticsAutomaticRetention(
+                PROJECT_ROOT / "runtime" / "diagnostics",
+                event_writer=append_production_event,
+            )
+        )
 
         self.login_status_label = QLabel("로그인 상태: 미연결")
         self.btn_kiwoom_login = QPushButton("키움 로그인")
@@ -4002,6 +3971,7 @@ class MainWindow(QMainWindow):
         )
         self._routine_stock_buy_limit_editor = None
         self._routine_stock_buy_limit_editor_config_path = ""
+        self._routine_stock_buy_limit_editor_expected_fields = None
         self._routine_stock_buy_limit_edit_finishing = False
         self._routine_stock_buy_limit_pending_path = ""
         self._routine_stock_buy_limit_suppressed_release_row = -1
@@ -4011,14 +3981,11 @@ class MainWindow(QMainWindow):
             self._execute_routine_stock_buy_limit_single_click
         )
         self.routine_table._editing_stock_buy_limit_path = ""
-        self._routine_stock_initial_buy_editor = None
-        self._routine_stock_initial_buy_editor_config_path = ""
-        self._routine_stock_initial_buy_editor_mode = "QUANTITY"
-        self._routine_stock_initial_buy_edit_finishing = False
-        self.routine_table._editing_stock_initial_buy_path = ""
         self._main_running_sort_column = -1
         self._main_running_sort_order = Qt.AscendingOrder
         self._startup_recovery_result: dict[str, object] = {}
+        self._assignment_startup_reconciliation_result: dict[str, object] = {}
+        self._assignment_production_registry_result: dict[str, object] = {}
         self._startup_recovery_approved = False
         self._startup_recovery_approved_snapshot = ""
         self._production_recovery_identity = None
@@ -4064,6 +4031,9 @@ class MainWindow(QMainWindow):
             self._on_main_operation_cycle_completed
         )
         normalize_base_stock_single_routine_file()
+        self._assignment_startup_reconciliation_result = (
+            reconcile_assignment_startup(PROJECT_ROOT)
+        )
         self.refresh_startup_recovery_status()
         self.refresh_all()
         self._pnl_refresh_timer = QTimer(self)
@@ -4959,9 +4929,6 @@ class MainWindow(QMainWindow):
             style += " }"
             button.setMinimumHeight(28)
             button.setStyleSheet(style)
-
-    def _style_main_visible_early_close_button(self) -> None:
-        self._style_main_top_action_buttons()
 
     def _create_main_routine_summary(self) -> QWidget:
         summary = QWidget()
@@ -6193,9 +6160,6 @@ class MainWindow(QMainWindow):
         clear_main_monitoring_chart_open_selection(self)
         return True
 
-    def startup_recovery_stock_state_paths(self) -> list[Path]:
-        return [stock_dir / "state.json" for stock_dir in self.all_runtime_stock_dirs()]
-
     def _production_recovery_required(self) -> bool:
         api = getattr(self, "kiwoom_api", None)
         checker = getattr(api, "is_connected", None)
@@ -6299,6 +6263,9 @@ class MainWindow(QMainWindow):
         self.last_buffer_response_cycle_reconciliation_result = (
             reconcile_main_window_buffer_response_cycle(self)
         )
+        # Preserve the existing operation-cycle reconciliation fallback without
+        # making an ordinary view refresh mutate the Broker subscription set.
+        sync_auto_trade_monitoring_universe(self)
         self.refresh_auto_trade_assignment_views()
 
     def _on_main_market_data_observed(self, payload: object) -> None:
@@ -6314,98 +6281,7 @@ class MainWindow(QMainWindow):
     def _refresh_main_market_information_rows(self) -> int:
         stock_codes = tuple(self._pending_main_market_information_codes)
         self._pending_main_market_information_codes.clear()
-        MainWindow._promote_waiting_stock_buy_limits(self, stock_codes)
         return main_refresh_market_information_only(self, stock_codes)
-
-    def _promote_waiting_stock_buy_limits(
-        self,
-        stock_codes: tuple[str, ...],
-    ) -> int:
-        targets = {
-            str(code or "").strip().upper().lstrip("A")
-            for code in stock_codes
-            if str(code or "").strip()
-        }
-        if not targets:
-            return 0
-        promoted = 0
-        for row in range(self.routine_table.rowCount()):
-            item = self.routine_table.item(row, 0)
-            if item is None or item.data(ROUTINE_ROW_KIND_ROLE) != ROUTINE_ROW_STOCK:
-                continue
-            code = str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip().upper().lstrip("A")
-            if code not in targets:
-                continue
-            config_path = MainWindow._stock_config_path_for_routine_row(self, row)
-            if config_path is None:
-                continue
-            config = read_json_dict(config_path)
-            if not isinstance(config, dict):
-                config = {}
-            limit_state = stock_buy_limit_state(
-                enabled=bool(config.get("buy_limit_enabled", False)),
-                amount=config.get("buy_limit_amount"),
-            )
-            if limit_state not in {"WAITING", "CONFIGURED"}:
-                continue
-            if normalized_stock_buy_limit_source(config) != BUY_LIMIT_SOURCE_RECOMMENDED:
-                continue
-            session_key = MainWindow._stock_recommended_limit_session_key(
-                self,
-                config_path,
-            )
-            if session_key is None:
-                continue
-            refreshed_sessions = getattr(
-                self,
-                "_main_stock_recommended_limit_refreshed_sessions",
-                None,
-            )
-            if not isinstance(refreshed_sessions, set):
-                refreshed_sessions = set()
-                setattr(
-                    self,
-                    "_main_stock_recommended_limit_refreshed_sessions",
-                    refreshed_sessions,
-                )
-            if session_key in refreshed_sessions:
-                continue
-            recommended = MainWindow._stock_suggested_buy_limit(
-                config_path,
-                window=self,
-            )
-            if recommended is None or recommended <= 0:
-                continue
-            total_budget = _system_total_budget_amount()
-            if total_budget is not None and recommended > total_budget:
-                try:
-                    MainWindow._write_stock_buy_limit_config(
-                        config_path,
-                        enabled=False,
-                        amount=None,
-                        source=None,
-                    )
-                except (OSError, RuntimeError, TypeError, ValueError):
-                    continue
-                refreshed_sessions.add(session_key)
-                promoted += 1
-                continue
-            if (
-                config.get("buy_limit_amount") != recommended
-                or config.get("buy_limit_source") != BUY_LIMIT_SOURCE_RECOMMENDED
-            ):
-                try:
-                    MainWindow._write_stock_buy_limit_config(
-                        config_path,
-                        enabled=True,
-                        amount=recommended,
-                        source=BUY_LIMIT_SOURCE_RECOMMENDED,
-                    )
-                except (OSError, RuntimeError, TypeError, ValueError):
-                    continue
-                promoted += 1
-            refreshed_sessions.add(session_key)
-        return promoted
 
     def _production_recovery_status_result(self) -> dict[str, object]:
         context = production_recovery_registry.snapshot()
@@ -6620,6 +6496,14 @@ class MainWindow(QMainWindow):
                     broker_evidence={"items": broker_items},
                     runtime_evidence={"position": runtime_position or {}},
                 )
+
+        self._assignment_production_registry_result = (
+            apply_assignment_reconciliation_to_production_registry(
+                self._assignment_startup_reconciliation_result,
+                identity=identity,
+                registry=production_recovery_registry,
+            )
+        )
 
         context = production_recovery_registry.snapshot()
         current_session_participants = (
@@ -6972,9 +6856,6 @@ class MainWindow(QMainWindow):
             "user_message": self.production_recovery_block_user_message(decision),
         }
 
-    def production_recovery_stock_is_review_required(self, stock_code: str) -> bool:
-        return recovery_stock_is_review_required(stock_code)
-
     def routine_recovery_block_message(self, action: str) -> str:
         """Format a routine-operation block without exposing recovery internals."""
         title = f"{str(action or '루틴 작업').strip()} 불가"
@@ -7018,14 +6899,6 @@ class MainWindow(QMainWindow):
                     "잠시 후 다시 시도해 주세요."
                 )
         return f"{title}\n\n{detail}"
-
-    def show_routine_recovery_block_toast(self, action: str) -> None:
-        show_toast(
-            parent=self,
-            message=self.routine_recovery_block_message(action),
-            duration_ms=2500,
-            position="center",
-        )
 
     def production_recovery_block_user_message(self, decision) -> str:
         reason_code = str(getattr(decision, "reason_code", "") or "").strip()
@@ -7197,12 +7070,18 @@ class MainWindow(QMainWindow):
             result = self._production_recovery_status_result()
             self._startup_recovery_result = result
             return result
-        stock_state_paths = self.startup_recovery_stock_state_paths()
+        stock_state_paths = [
+            stock_dir / "state.json"
+            for stock_dir in self.all_runtime_stock_dirs()
+        ]
         self._startup_runtime_initialization_result = (
             initialize_pristine_startup_runtime()
         )
         result = assess_startup_recovery(
             stock_state_paths=stock_state_paths,
+            assignment_reconciliation_summary=(
+                self._assignment_startup_reconciliation_result
+            ),
         )
         self._startup_recovery_result = result
         status = str(result.get("status") or "INVALID_RUNTIME")
@@ -7506,6 +7385,22 @@ class MainWindow(QMainWindow):
         self._event_journal_kiwoom_connected = connected
         if new_authenticated_session:
             self._handled_kiwoom_login_identity = login_identity
+            retention_runner = getattr(
+                self,
+                "stock_library_diagnostics_retention",
+                None,
+            )
+            run_retention = getattr(retention_runner, "run_for_session", None)
+            if callable(run_retention):
+                try:
+                    run_retention(
+                        current_connection_epoch=login_identity[0],
+                        current_session_id=login_identity[1],
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Automatic Stock Library diagnostics retention failed"
+                    )
         if connected != previously_connected or new_authenticated_session:
             MainWindow._refresh_start_budget_displays_for_auth_state(self)
         self.statusBar().showMessage(status_message)
@@ -8330,12 +8225,17 @@ class MainWindow(QMainWindow):
             load_routine_table()
 
     def refresh_all(self) -> None:
-        self.load_routine_table()
-        self.load_running_stock_table()
-        self.update_budget_panel()
-        self.update_emergency_button_state()
-        self.update_review_required_button_text()
-        self.update_global_operation_button_state()
+        previous_context = getattr(self, "_main_refresh_read_context", None)
+        self._main_refresh_read_context = build_main_refresh_read_context(self)
+        try:
+            self.load_routine_table()
+            main_load_running_stock_table(self)
+            self.update_budget_panel()
+            self.update_emergency_button_state()
+            self.update_review_required_button_text()
+            self.update_global_operation_button_state()
+        finally:
+            self._main_refresh_read_context = previous_context
 
     def recalculate_routine_limits_for_new_operation_session(self) -> dict[str, object]:
         from routine_limit_recalculation import (
@@ -8346,7 +8246,7 @@ class MainWindow(QMainWindow):
 
     def update_global_operation_button_state(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(self, [])
-        adapter.update_global_operation_button_state()
+        auto_trade_update_global_operation_button_state(adapter)
         window = getattr(self, "auto_trade_setting_window", None)
         if window is None or sip.isdeleted(window):
             return
@@ -8356,15 +8256,16 @@ class MainWindow(QMainWindow):
 
     def start_global_auto_trades(self) -> None:
         adapter = MainMonitoringStockOperationAdapter(self, [])
-        AutoTradeSettingWindow.start_selected_auto_trades(adapter)
+        execute_operation_start_command(
+            adapter,
+            OperationStartCommandRequest(
+                intent=OperationStartIntent.FULL_START,
+                source="auto_trade_global_start_button",
+            ),
+        )
 
     def refresh_auto_trade_assignment_views(self) -> None:
         """Refresh monitoring and an already-open auto-trade settings window once."""
-        host_getter = getattr(self, "main_monitoring_auto_trade_operation_host", None)
-        host = host_getter() if callable(host_getter) else None
-        sync = getattr(host, "sync_monitoring_universe_for_current_session", None)
-        if callable(sync):
-            sync()
         self.refresh_all()
         window = getattr(self, "auto_trade_setting_window", None)
         if window is None:
@@ -8711,6 +8612,17 @@ class MainWindow(QMainWindow):
 
     def review_required_stock_count(self) -> int:
         """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
+        refresh_context = getattr(self, "_main_refresh_read_context", None)
+        if isinstance(refresh_context, dict):
+            return len(
+                collect_global_review_required_rows(
+                    preloaded_stocks=refresh_context.get("stocks", ()),
+                    preloaded_stock_data_by_dir=refresh_context.get(
+                        "stock_data_by_dir",
+                        {},
+                    ),
+                )
+            )
         return len(collect_global_review_required_rows())
 
     def update_review_required_button_text(self) -> None:
@@ -8732,27 +8644,9 @@ class MainWindow(QMainWindow):
     def sort_main_running_table_by_column(self, column: int) -> None:
         main_sort_running_table_by_column(self, column)
 
-    def _apply_main_routine_sort(self) -> None:
-        main_apply_routine_sort(self)
-
-    def _apply_main_running_sort(self) -> None:
-        main_apply_running_sort(self)
-
     def load_routine_table(self) -> None:
         main_load_routine_table(self)
-        stock_codes = tuple(
-            str(item.data(ROUTINE_STOCK_CODE_ROLE) or "").strip()
-            for row in range(self.routine_table.rowCount())
-            for item in (self.routine_table.item(row, 0),)
-            if item is not None
-            and item.data(ROUTINE_ROW_KIND_ROLE) == ROUTINE_ROW_STOCK
-        )
-        if MainWindow._promote_waiting_stock_buy_limits(self, stock_codes):
-            main_refresh_market_information_only(self, stock_codes)
         self._install_routine_buy_limit_edit_filters()
-
-    def load_running_stock_table(self) -> None:
-        main_load_running_stock_table(self)
 
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         return auto_trade_registered_operation_targets(self)
@@ -8763,47 +8657,8 @@ class MainWindow(QMainWindow):
 
         return list(load_group_scope().all_group_stock_dirs())
 
-    def routine_name_for_stock_dir(self, stock_dir: Path) -> str:
-        """종목 runtime 폴더 기준 루틴 표시명을 반환한다."""
-        try:
-            return routine_display_name(stock_dir.parent)
-        except Exception:
-            return str(stock_dir.parent.name).lstrip("_") or "루틴확인필요"
-
-    def has_emergency_stopped_stock(self) -> bool:
-        return emergency_has_emergency_stopped_stock(self)
-
     def update_emergency_button_state(self) -> None:
         emergency_update_emergency_button_state(self)
-
-    def emergency_review_reason_for_stock(self, stock_dir: Path) -> tuple[bool, str]:
-        return emergency_review_reason_for_stock_impl(stock_dir)
-
-
-    def update_runtime_stock_status(
-        self,
-        stock_dir: Path,
-        code: str,
-        name: str,
-        new_status: str,
-        extra_state: dict[str, object] | None = None,
-        log_suffix: str = "",
-    ) -> bool:
-        return emergency_update_runtime_stock_status(
-            self,
-            stock_dir,
-            code,
-            name,
-            new_status,
-            extra_state,
-            log_suffix,
-        )
-
-    def execute_emergency_stop(self) -> None:
-        emergency_execute_emergency_stop(self)
-
-    def release_emergency_stop(self) -> None:
-        emergency_release_emergency_stop(self)
 
     def on_emergency_stop_clicked(self) -> None:
         emergency_on_emergency_stop_clicked(self)
@@ -8996,7 +8851,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.refresh_all()
+        refresh_auto_trade_views(self)
 
     def _install_routine_buy_limit_edit_filters(self) -> None:
         for row in range(self.routine_table.rowCount()):
@@ -9032,13 +8887,69 @@ class MainWindow(QMainWindow):
         return amount if amount > 0 else None
 
     @staticmethod
+    def _stock_config_expected_fields(
+        config: dict[str, object],
+        field_keys: tuple[str, ...],
+    ) -> dict[str, object]:
+        return {
+            key: config[key] if key in config else STOCK_CONFIG_EXPECTED_MISSING
+            for key in field_keys
+        }
+
+    @staticmethod
+    def _stock_config_repository_target(
+        config_path: Path,
+    ) -> tuple[StockRepository | None, str]:
+        target = Path(config_path)
+        stock_dir = target.parent
+        stocks_dir = stock_dir.parent
+        stock_code = stock_dir.name.partition("_")[0].strip()
+        if (
+            target.name != "config.json"
+            or stocks_dir.name != "stocks"
+            or not stock_code
+        ):
+            return None, stock_code
+        return CanonicalStockConfigRepository(stocks_dir.parent), stock_code
+
+    @staticmethod
+    def _invalid_stock_config_write_result(
+        field_keys: tuple[str, ...],
+    ) -> StockConfigWriteResult:
+        return StockConfigWriteResult(
+            ok=False,
+            changed=False,
+            field_keys=field_keys,
+            conflict_detected=False,
+            read_back_verified=False,
+            reason_code=STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+        )
+
+    @staticmethod
+    def _stock_config_write_succeeded(result: object) -> bool:
+        return bool(getattr(result, "ok", False))
+
+    @staticmethod
+    def _show_stock_buy_limit_write_failure(window, result: object) -> None:
+        reason_code = str(getattr(result, "reason_code", "") or "").strip()
+        if reason_code in {
+            STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+            STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED,
+        }:
+            message = "종목 한도 설정이 변경되어 적용하지 않았습니다."
+        else:
+            message = "종목 한도를 변경하지 못했습니다."
+        show_toast(window, message, duration_ms=2500)
+
+    @staticmethod
     def _write_stock_buy_limit_config(
         config_path: Path,
         *,
         enabled: bool,
         amount: int | None = None,
         source: str | None = None,
-    ) -> None:
+        expected_fields: dict[str, object] | None = None,
+    ) -> StockConfigWriteResult:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
@@ -9047,88 +8958,31 @@ class MainWindow(QMainWindow):
             amount=amount,
             source=source,
         )
-        config["buy_limit_enabled"] = enabled_value
-        config["buy_limit_amount"] = amount_value
-        config["buy_limit_source"] = source_value
-        config["updated_at"] = stock_now_text()
-        config_path.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        field_keys = (
+            "buy_limit_enabled",
+            "buy_limit_amount",
+            "buy_limit_source",
         )
-        saved = read_json_dict(config_path)
-        if (
-            bool(saved.get("buy_limit_enabled", False)) != enabled_value
-            or saved.get("buy_limit_amount") != amount_value
-            or saved.get("buy_limit_source") != source_value
-        ):
-            raise RuntimeError("stock buy limit read-back verification failed")
-
-    def _recalculate_recommended_stock_buy_limits_for_starting_budget_change(
-        self,
-    ) -> int:
-        cache = getattr(self, "_main_stock_resolved_starting_budget_cache", None)
-        if isinstance(cache, dict):
-            cache.clear()
-        changed = 0
-        total_budget = _system_total_budget_amount()
-        for stock in StockRepository(PROJECT_ROOT).list_current_registered_stocks():
-            config_path = PROJECT_ROOT / stock.stock_path / "config.json"
-            config = read_json_dict(config_path)
-            if not isinstance(config, dict) or not bool(
-                config.get("buy_limit_enabled", False)
-            ):
-                continue
-            if normalized_stock_buy_limit_source(config) != BUY_LIMIT_SOURCE_RECOMMENDED:
-                continue
-            recommended = self._stock_suggested_buy_limit(
-                config_path,
-                window=self,
+        if expected_fields is None:
+            expected_fields = MainWindow._stock_config_expected_fields(
+                config,
+                field_keys,
             )
-            if recommended is None:
-                continue
-            if (
-                total_budget is not None
-                and recommended > total_budget
-            ):
-                try:
-                    self._write_stock_buy_limit_config(
-                        config_path,
-                        enabled=False,
-                        amount=None,
-                        source=None,
-                    )
-                except (OSError, RuntimeError, TypeError, ValueError):
-                    continue
-                changed += 1
-                continue
-            if (
-                recommended <= 0
-                or total_budget is None
-                or recommended > total_budget
-            ):
-                continue
-            next_amount = int(recommended)
-            session_key = MainWindow._stock_recommended_limit_session_key(
-                self,
-                config_path,
-            )
-            if config.get("buy_limit_amount") == next_amount and config.get(
-                "buy_limit_source"
-            ) == BUY_LIMIT_SOURCE_RECOMMENDED:
-                MainWindow._mark_stock_recommended_limit_session(self, session_key)
-                continue
-            try:
-                self._write_stock_buy_limit_config(
-                    config_path,
-                    enabled=True,
-                    amount=next_amount,
-                    source=BUY_LIMIT_SOURCE_RECOMMENDED,
-                )
-            except (OSError, RuntimeError, TypeError, ValueError):
-                continue
-            MainWindow._mark_stock_recommended_limit_session(self, session_key)
-            changed += 1
-        return changed
+        repository, stock_code = MainWindow._stock_config_repository_target(config_path)
+        if repository is None:
+            return MainWindow._invalid_stock_config_write_result(field_keys)
+        patch = {
+            "buy_limit_enabled": enabled_value,
+            "buy_limit_amount": amount_value,
+            "buy_limit_source": source_value,
+        }
+        if any(config.get(key) != value for key, value in patch.items()):
+            patch["updated_at"] = stock_now_text()
+        return repository.patch_stock_config(
+            stock_code,
+            patch,
+            expected_fields=expected_fields,
+        )
 
     def _write_stock_initial_buy_config(
         self,
@@ -9139,6 +8993,7 @@ class MainWindow(QMainWindow):
         apply_limit: bool = False,
         adjusted_limit_amount: int | None = None,
         running_adjustment_authorized: bool = False,
+        expected_fields: dict[str, object] | None = None,
     ) -> dict[str, object]:
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
@@ -9205,16 +9060,58 @@ class MainWindow(QMainWindow):
             next_config["buy_limit_source"] = source_value
         if decision.get("changed") is not True and not limit_changed:
             return {**decision, "limit_changed": False}
-        next_config["updated_at"] = stock_now_text()
-        config_path.write_text(
-            json.dumps(next_config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        patch = {
+            "trade_amount_type": normalized_mode,
+            (
+                "buy_amount" if normalized_mode == "AMOUNT" else "buy_qty"
+            ): next_config[
+                "buy_amount" if normalized_mode == "AMOUNT" else "buy_qty"
+            ],
+            "updated_at": stock_now_text(),
+        }
+        if bool(apply_limit):
+            patch.update(
+                {
+                    "buy_limit_enabled": next_config["buy_limit_enabled"],
+                    "buy_limit_amount": next_config["buy_limit_amount"],
+                    "buy_limit_source": next_config["buy_limit_source"],
+                }
+            )
+        domain_field_keys = tuple(key for key in patch if key != "updated_at")
+        if expected_fields is None:
+            expected_fields = MainWindow._stock_config_expected_fields(
+                config,
+                domain_field_keys,
+            )
+        repository, canonical_stock_code = MainWindow._stock_config_repository_target(
+            config_path
         )
+        if repository is None:
+            persistence_result = MainWindow._invalid_stock_config_write_result(
+                domain_field_keys
+            )
+        else:
+            persistence_result = repository.patch_stock_config(
+                canonical_stock_code,
+                patch,
+                expected_fields=expected_fields,
+            )
+        if not persistence_result.ok:
+            return {
+                **decision,
+                "allowed": False,
+                "reason": persistence_result.reason_code,
+                "changed": False,
+                "limit_changed": False,
+                "written": False,
+                "config_write_result": persistence_result,
+            }
         return {
             **decision,
             "changed": bool(decision.get("changed")) or limit_changed,
             "limit_changed": limit_changed,
-            "written": True,
+            "written": persistence_result.changed,
+            "config_write_result": persistence_result,
         }
 
     @staticmethod
@@ -9222,24 +9119,97 @@ class MainWindow(QMainWindow):
         show_toast(window, "운영중에는 시작예산을 변경할 수 없습니다.", duration_ms=2500)
 
     @staticmethod
+    def _start_budget_config_expected_fields(
+        opened_config: dict[str, object],
+        *,
+        mode: str,
+        apply_limit: bool,
+    ) -> dict[str, object]:
+        normalized_mode = "AMOUNT" if str(mode).upper() == "AMOUNT" else "QUANTITY"
+        field_keys = [
+            "trade_amount_type",
+            "buy_amount" if normalized_mode == "AMOUNT" else "buy_qty",
+        ]
+        if apply_limit:
+            field_keys.extend(
+                (
+                    "buy_limit_enabled",
+                    "buy_limit_amount",
+                    "buy_limit_source",
+                )
+            )
+        return MainWindow._stock_config_expected_fields(
+            opened_config,
+            tuple(field_keys),
+        )
+
+    @staticmethod
+    def _record_start_budget_config_write_failure(
+        window,
+        *,
+        stock_code: str,
+        stock_name: str,
+        reason_code: str,
+        runtime_committed: bool,
+    ) -> None:
+        target_name = " ".join(
+            part for part in (str(stock_code).strip(), str(stock_name).strip()) if part
+        )
+        event_type = "RUNTIME_WARNING" if runtime_committed else "PROCESSING_ERROR"
+        observe_owner_failure_transition(
+            window,
+            f"start_budget_config_write:{stock_code}",
+            active=True,
+            signature=f"{event_type}:{reason_code}:{runtime_committed}",
+            event_type=event_type,
+            severity="WARNING" if runtime_committed else "ERROR",
+            result="PARTIAL" if runtime_committed else "FAILED",
+            source="gui_windows.MainWindow._open_running_budget_adjustment_dialog",
+            template_args={"target": target_name or "기본예산 설정"},
+            target_type="STOCK",
+            target_id=stock_code,
+            target_name=target_name,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            reason_code=reason_code,
+            details={
+                "stage": "base_config_write",
+                "runtime_committed": runtime_committed,
+            },
+        )
+
+    @staticmethod
+    def _show_start_budget_config_write_failure(
+        window,
+        *,
+        reason_code: str,
+        runtime_committed: bool,
+    ) -> None:
+        if reason_code in {
+            STOCK_CONFIG_WRITE_FIELD_CONFLICT,
+            STOCK_CONFIG_WRITE_CONCURRENT_UPDATE_RETRY_EXHAUSTED,
+        }:
+            message = "기본예산 설정이 변경되어 적용하지 않았습니다."
+        elif runtime_committed:
+            message = "기본예산 변경 요청은 저장됐지만 영구 설정을 저장하지 못했습니다."
+        else:
+            message = "기본예산을 저장하지 못했습니다."
+        show_toast(window, message)
+
+    @staticmethod
     def _starting_budget_change_current_price(
         window,
         config_path: Path,
     ) -> float | None:
-        fresh_state = main_stock_fresh_market_information_state(
+        availability = inspect_budget_value_entry(
             window,
-            MainWindow._stock_projection_for_config_path(config_path),
+            BudgetValueChangeRequest(Path(config_path)),
         )
-        current_price = safe_float_value(
-            getattr(fresh_state, "last_price", None)
-            if fresh_state is not None
-            else None,
-            0.0,
-        )
-        if current_price <= 0:
+        current_price = availability.get("current_price")
+        if availability.get("allowed") is not True:
             show_toast(window, "현재주가 수신 후 변경할 수 있습니다.")
             return None
-        return current_price
+        return safe_float_value(current_price, 0.0)
 
     def _open_running_budget_adjustment_dialog(
         self,
@@ -9352,6 +9322,12 @@ class MainWindow(QMainWindow):
                 show_toast(self, "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.")
                 return
 
+        expected_fields = MainWindow._start_budget_config_expected_fields(
+            display_config,
+            mode=current_mode,
+            apply_limit=bool(request.get("apply_limit", False)),
+        )
+
         if opened_current_running:
             commit_result = commit_running_budget_adjustment(
                 config_path.parent,
@@ -9373,9 +9349,23 @@ class MainWindow(QMainWindow):
                 apply_limit=bool(request.get("apply_limit", False)),
                 adjusted_limit_amount=adjusted_limit_amount,
                 running_adjustment_authorized=True,
+                expected_fields=expected_fields,
             )
             if write_result.get("allowed") is not True:
-                show_toast(self, "기본예산 영구 설정을 저장하지 못했습니다.")
+                reason_code = str(write_result.get("reason") or "").strip()
+                MainWindow._record_start_budget_config_write_failure(
+                    self,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    reason_code=reason_code,
+                    runtime_committed=True,
+                )
+                refresh_auto_trade_views(self)
+                MainWindow._show_start_budget_config_write_failure(
+                    self,
+                    reason_code=reason_code,
+                    runtime_committed=True,
+                )
                 return
             success_message = "기본예산 변경 요청을 저장했습니다."
         else:
@@ -9385,6 +9375,7 @@ class MainWindow(QMainWindow):
                 value=requested_value,
                 apply_limit=bool(request.get("apply_limit", False)),
                 adjusted_limit_amount=adjusted_limit_amount,
+                expected_fields=expected_fields,
             )
             if write_result.get("allowed") is not True:
                 if write_result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
@@ -9393,10 +9384,24 @@ class MainWindow(QMainWindow):
                         "운영 상태가 변경되어 기본예산 변경을 적용하지 않았습니다.",
                     )
                 else:
-                    show_toast(self, "기본예산을 저장하지 못했습니다.")
+                    reason_code = str(write_result.get("reason") or "").strip()
+                    MainWindow._record_start_budget_config_write_failure(
+                        self,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        reason_code=reason_code,
+                        runtime_committed=False,
+                    )
+                    self.load_routine_table()
+                    MainWindow._show_start_budget_config_write_failure(
+                        self,
+                        reason_code=reason_code,
+                        runtime_committed=False,
+                    )
                 return
             success_message = "기본예산을 변경했습니다."
-        self.load_routine_table()
+        if opened_current_running or bool(write_result.get("changed")):
+            refresh_auto_trade_views(self)
         show_toast(self, success_message)
 
     def _adjusted_buy_limit_for_start_budget(
@@ -9471,42 +9476,6 @@ class MainWindow(QMainWindow):
             "code": target_path.parent.name.partition("_")[0].strip(),
             "name": target_path.parent.name.partition("_")[2].strip(),
         }
-
-    @staticmethod
-    def _stock_recommended_limit_session_key(
-        window,
-        config_path: Path,
-    ) -> tuple[str, int, str] | None:
-        projection = MainWindow._stock_projection_for_config_path(config_path)
-        fresh_state = main_stock_fresh_market_information_state(window, projection)
-        if fresh_state is None:
-            return None
-        return (
-            str(projection.get("stock_path", "") or ""),
-            int(getattr(fresh_state, "connection_epoch", 0) or 0),
-            str(getattr(fresh_state, "login_session_id", "") or "").strip(),
-        )
-
-    @staticmethod
-    def _mark_stock_recommended_limit_session(
-        window,
-        session_key: tuple[str, int, str] | None,
-    ) -> None:
-        if session_key is None:
-            return
-        refreshed_sessions = getattr(
-            window,
-            "_main_stock_recommended_limit_refreshed_sessions",
-            None,
-        )
-        if not isinstance(refreshed_sessions, set):
-            refreshed_sessions = set()
-            setattr(
-                window,
-                "_main_stock_recommended_limit_refreshed_sessions",
-                refreshed_sessions,
-            )
-        refreshed_sessions.add(session_key)
 
     @staticmethod
     def _stock_default_initial_buy_value(
@@ -9589,7 +9558,10 @@ class MainWindow(QMainWindow):
             request_scope="single",
         )
         self._main_monitoring_stock_operation_adapter = adapter
-        adapter.handle_operation_mode_double_click()
+        handle_auto_trade_operation_mode_double_click(
+            adapter,
+            (target.stock_dir, target.code, target.name),
+        )
         return True
 
     def handle_routine_stock_name_double_click(self, row: int) -> bool:
@@ -9642,7 +9614,8 @@ class MainWindow(QMainWindow):
             code, separator, name = stock_dir.name.partition("_")
             if not separator or not code or not name:
                 continue
-            if adapter.set_stock_operation_exclusion(
+            if auto_trade_set_stock_operation_exclusion(
+                adapter,
                 (stock_dir, code, name),
                 should_exclude,
                 refresh=False,
@@ -9685,7 +9658,8 @@ class MainWindow(QMainWindow):
             code, separator, name = stock_dir.name.partition("_")
             if not separator or not code or not name:
                 continue
-            if adapter.set_stock_operation_exclusion(
+            if auto_trade_set_stock_operation_exclusion(
+                adapter,
                 (stock_dir, code, name),
                 should_exclude,
                 refresh=False,
@@ -9720,123 +9694,67 @@ class MainWindow(QMainWindow):
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
-        if MainWindow._starting_budget_change_current_price(self, config_path) is None:
-            return
-        if self._stock_start_budget_locked(config_path):
-            self._show_start_budget_mutation_blocked(self)
-            return
-        self.finish_routine_stock_initial_buy_edit(save=True)
         config = read_json_dict(config_path)
         if not isinstance(config, dict):
             config = {}
         current_mode = str(config.get("trade_amount_type", "QUANTITY") or "").upper()
         next_mode = "QUANTITY" if current_mode == "AMOUNT" else "AMOUNT"
-        next_value = self._stock_default_initial_buy_value(
-            config_path,
-            next_mode,
-            window=self,
+        result = execute_budget_mode_change(
+            self,
+            BudgetModeChangeRequest(
+                config_path=config_path,
+                target_mode=next_mode,
+            ),
+            writer=self._write_stock_initial_buy_config,
+            # Keep the existing UI notice owner while the command owns the
+            # read-only fresh-price contract and the mode transition.
+            fresh_price_reader=(
+                lambda host, path: MainWindow._starting_budget_change_current_price(
+                    host,
+                    path,
+                )
+            ),
+            current_running_reader=(
+                lambda host, _code, _config, _state: (
+                    getattr(
+                        host,
+                        "_stock_start_budget_locked",
+                        MainWindow._stock_start_budget_locked,
+                    )(config_path)
+                )
+            ),
+            default_value_reader=(
+                lambda host, path, mode: getattr(
+                    host,
+                    "_stock_default_initial_buy_value",
+                    MainWindow._stock_default_initial_buy_value,
+                )(
+                    path,
+                    mode,
+                    window=host,
+                )
+            ),
         )
-        result = self._write_stock_initial_buy_config(
-            config_path,
-            mode=next_mode,
-            value=next_value,
-        )
+        if result.get("reason") == CURRENT_PRICE_UNAVAILABLE:
+            return
         if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
             self._show_start_budget_mutation_blocked(self)
-        self.load_routine_table()
+        elif result.get("allowed") is not True:
+            MainWindow._show_start_budget_config_write_failure(
+                self,
+                reason_code=str(result.get("reason_code") or result.get("reason") or ""),
+                runtime_committed=False,
+            )
+        if result.get("allowed") is True and result.get("changed") is True:
+            refresh_auto_trade_views(self)
 
-    def start_routine_stock_initial_buy_edit(self, row: int) -> None:
+    def open_routine_stock_initial_buy_dialog(self, row: int) -> None:
         if not self._main_routine_initial_buy_badge_enabled():
             return
         config_path = self._stock_config_path_for_routine_row(row)
         if config_path is None:
             return
         self._open_running_budget_adjustment_dialog(row, config_path)
-
-    def finish_routine_stock_initial_buy_edit(self, *, save: bool) -> None:
-        editor = self._routine_stock_initial_buy_editor
-        if editor is None or self._routine_stock_initial_buy_edit_finishing:
-            return
-        self._routine_stock_initial_buy_edit_finishing = True
-        config_path_text = self._routine_stock_initial_buy_editor_config_path
-        mode = self._routine_stock_initial_buy_editor_mode
-        normalized = str(editor.text() or "").replace(",", "").replace("원", "").replace("주", "").strip()
-        value = int(normalized) if normalized.isdigit() else None
-
-        self._routine_stock_initial_buy_editor = None
-        self._routine_stock_initial_buy_editor_config_path = ""
-        self._routine_stock_initial_buy_editor_mode = "QUANTITY"
-        self.routine_table._editing_stock_initial_buy_path = ""
-        editor.hide()
-        editor.deleteLater()
-        self._routine_stock_initial_buy_edit_finishing = False
-
-        if not save:
-            self.routine_table.viewport().update()
-            return
-        if mode == "QUANTITY" and value is None:
-            self.routine_table.viewport().update()
-            return
-        if mode == "QUANTITY" and value < 1:
-            self.routine_table.viewport().update()
-            return
-        config_path = Path(config_path_text)
-
-        if mode == "AMOUNT":
-            current_config = read_json_dict(config_path)
-            if not isinstance(current_config, dict):
-                current_config = {}
-            try:
-                previous_amount = int(current_config.get("buy_amount") or 0)
-            except (TypeError, ValueError):
-                previous_amount = 0
-            previous_amount = previous_amount if previous_amount > 0 else 0
-            default_amount = self._stock_default_initial_buy_value(
-                config_path,
-                "AMOUNT",
-                window=self,
-            )
-            default_amount = default_amount if default_amount > 0 else None
-
-            invalid = value is None or value <= 0 or (
-                default_amount is not None and value < default_amount
-            )
-            if invalid:
-                if default_amount is None:
-                    message = "시작예산 금액을 확인하세요."
-                else:
-                    message = (
-                        "시작예산은 현재 기본금액 "
-                        f"{default_amount:,}원 이상이어야 합니다."
-                    )
-                show_toast(self, message, duration_ms=2500)
-
-                # Keep a still-valid explicit amount.  If the setting changed
-                # underneath the editor and made it invalid, clear the
-                # override so the canonical Fresh/Default path is restored.
-                if (
-                    default_amount is not None
-                    and previous_amount > 0
-                    and previous_amount < default_amount
-                ):
-                    result = self._write_stock_initial_buy_config(
-                        config_path,
-                        mode="AMOUNT",
-                        value=0,
-                    )
-                    if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
-                        self._show_start_budget_mutation_blocked(self)
-                self.load_routine_table()
-                return
-
-        result = self._write_stock_initial_buy_config(
-            config_path,
-            mode=mode,
-            value=value,
-        )
-        if result.get("reason") == "START_BUDGET_MUTATION_BLOCKED":
-            self._show_start_budget_mutation_blocked(self)
-        self.load_routine_table()
 
     def _routine_stock_buy_limit_value_rect(self, row: int) -> QRect:
         index = self.routine_table.model().index(row, 0)
@@ -9980,6 +9898,16 @@ class MainWindow(QMainWindow):
 
         self._routine_stock_buy_limit_editor = editor
         self._routine_stock_buy_limit_editor_config_path = str(config_path)
+        self._routine_stock_buy_limit_editor_expected_fields = (
+            MainWindow._stock_config_expected_fields(
+                config,
+                (
+                    "buy_limit_enabled",
+                    "buy_limit_amount",
+                    "buy_limit_source",
+                ),
+            )
+        )
 
     def handle_routine_stock_buy_limit_double_click(self, row: int) -> None:
         config_path = self._stock_config_path_for_routine_row(row)
@@ -9997,13 +9925,16 @@ class MainWindow(QMainWindow):
         self.finish_routine_stock_buy_limit_edit(save=False)
 
         if limit_state in {"WAITING", "CONFIGURED"}:
-            self._write_stock_buy_limit_config(
+            write_result = self._write_stock_buy_limit_config(
                 config_path,
                 enabled=False,
                 amount=None,
                 source=None,
             )
-            self.load_routine_table()
+            if not MainWindow._stock_config_write_succeeded(write_result):
+                MainWindow._show_stock_buy_limit_write_failure(self, write_result)
+            elif bool(getattr(write_result, "changed", False)):
+                refresh_auto_trade_views(self)
             return
 
         recommended = self._stock_suggested_buy_limit(
@@ -10011,13 +9942,10 @@ class MainWindow(QMainWindow):
             window=self,
         )
         if recommended is None:
-            self._write_stock_buy_limit_config(
-                config_path,
-                enabled=True,
-                amount=None,
-                source=BUY_LIMIT_SOURCE_RECOMMENDED,
+            show_toast(
+                self,
+                "한도금액 계산 근거를 확인할 수 없어 적용하지 않았습니다.",
             )
-            self.load_routine_table()
             return
         total_budget = _system_total_budget_amount()
         if recommended <= 0 or total_budget is None:
@@ -10045,25 +9973,34 @@ class MainWindow(QMainWindow):
                 use_suggested_amount=False,
             )
             return
-        self._write_stock_buy_limit_config(
+        write_result = self._write_stock_buy_limit_config(
             config_path,
             enabled=True,
             amount=recommended,
             source=BUY_LIMIT_SOURCE_RECOMMENDED,
         )
-        self.load_routine_table()
+        if not MainWindow._stock_config_write_succeeded(write_result):
+            MainWindow._show_stock_buy_limit_write_failure(self, write_result)
+        elif bool(getattr(write_result, "changed", False)):
+            refresh_auto_trade_views(self)
 
     def finish_routine_stock_buy_limit_edit(self, *, save: bool) -> None:
         editor = self._routine_stock_buy_limit_editor
         if editor is None or self._routine_stock_buy_limit_edit_finishing:
             return
         config_path_text = self._routine_stock_buy_limit_editor_config_path
+        expected_fields = getattr(
+            self,
+            "_routine_stock_buy_limit_editor_expected_fields",
+            None,
+        )
         amount = self._parse_buy_limit_amount(editor.text()) if save else None
 
         def close_editor() -> None:
             self._routine_stock_buy_limit_edit_finishing = True
             self._routine_stock_buy_limit_editor = None
             self._routine_stock_buy_limit_editor_config_path = ""
+            self._routine_stock_buy_limit_editor_expected_fields = None
             self.routine_table._editing_stock_buy_limit_path = ""
             editor.hide()
             editor.deleteLater()
@@ -10095,13 +10032,19 @@ class MainWindow(QMainWindow):
         def restore_after_invalid_input() -> None:
             close_editor()
             if not had_configured_limit:
-                self._write_stock_buy_limit_config(
+                write_result = self._write_stock_buy_limit_config(
                     config_path,
                     enabled=False,
                     amount=None,
                     source=None,
                 )
-            self.load_routine_table()
+                if not MainWindow._stock_config_write_succeeded(write_result):
+                    MainWindow._show_stock_buy_limit_write_failure(
+                        self,
+                        write_result,
+                    )
+                elif bool(getattr(write_result, "changed", False)):
+                    refresh_auto_trade_views(self)
 
         if (
             bool(current_config.get("buy_limit_enabled", False))
@@ -10136,11 +10079,16 @@ class MainWindow(QMainWindow):
             return
         try:
             close_editor()
-            self._write_stock_buy_limit_config(
+            writer_kwargs = {
+                "enabled": True,
+                "amount": amount,
+                "source": BUY_LIMIT_SOURCE_MANUAL,
+            }
+            if isinstance(expected_fields, dict):
+                writer_kwargs["expected_fields"] = expected_fields
+            write_result = self._write_stock_buy_limit_config(
                 config_path,
-                enabled=True,
-                amount=amount,
-                source=BUY_LIMIT_SOURCE_MANUAL,
+                **writer_kwargs,
             )
         except Exception as exc:
             show_toast(
@@ -10149,7 +10097,12 @@ class MainWindow(QMainWindow):
                 duration_ms=2500,
             )
             return
-        self.load_routine_table()
+        if not MainWindow._stock_config_write_succeeded(write_result):
+            MainWindow._show_stock_buy_limit_write_failure(self, write_result)
+            self.load_routine_table()
+            return
+        if bool(getattr(write_result, "changed", False)):
+            refresh_auto_trade_views(self)
 
     def handle_routine_instance_buy_limit_double_click(self, amount_label: QLabel) -> None:
         instance_id = self._routine_instance_id_for_buy_limit_widget(amount_label)
@@ -10186,7 +10139,7 @@ class MainWindow(QMainWindow):
                 result.error or "매수한도를 변경하지 못했습니다.",
             )
             return
-        self.refresh_all()
+        refresh_auto_trade_views(self)
 
     def _routine_instance_id_for_buy_limit_widget(self, widget: QWidget) -> str:
         instance_id = str(widget.property("routine_instance_id") or "").strip()
@@ -10353,7 +10306,7 @@ class MainWindow(QMainWindow):
                     result.error or "매수한도를 변경하지 못했습니다.",
                 )
                 return
-            self.refresh_all()
+            refresh_auto_trade_views(self)
             return
         if amount < minimum:
             show_toast(
@@ -10376,7 +10329,7 @@ class MainWindow(QMainWindow):
                 result.error or "매수한도를 변경하지 못했습니다.",
             )
             return
-        self.refresh_all()
+        refresh_auto_trade_views(self)
 
     def _routine_instance_has_assigned_stocks(self, instance_id: str) -> bool:
         return int(
@@ -10618,9 +10571,11 @@ class MainWindow(QMainWindow):
             request_scope="multiple",
         )
         self._main_monitoring_stock_operation_adapter = adapter
-        result = adapter.apply_selected_early_close(
+        result = auto_trade_apply_selected_early_close(
+            adapter,
             method,
             source="main_visible_early_close_button",
+            selected=adapter.selected_stock_infos(),
             show_error_dialog=False,
             show_result_toast=False,
             show_confirmation=False,
@@ -10726,17 +10681,9 @@ class MainWindow(QMainWindow):
                 routine_instance_id=instance_id,
             )
             targets.append(target)
-            registry_review_checker = getattr(
-                self,
-                "production_recovery_stock_is_review_required",
-                None,
-            )
             if (
                 is_review_required_state(state)
-                or (
-                    callable(registry_review_checker)
-                    and registry_review_checker(code)
-                )
+                or recovery_stock_is_review_required(code)
             ):
                 continue
             if str(stock_dir.resolve()) not in current_running_stock_dirs:
@@ -10772,7 +10719,10 @@ class MainWindow(QMainWindow):
         self._main_monitoring_stock_operation_adapter = adapter
         requested_action = "운영시작"
         try:
-            operation_result = adapter.start_selected_auto_trades()
+            operation_result = execute_main_monitoring_selective_start(
+                adapter,
+                source="main_routine_start",
+            )
         except Exception:
             LOGGER.exception(
                 "루틴 %s %s 처리 오류",
@@ -10834,76 +10784,12 @@ class MainWindow(QMainWindow):
             f"{instance.display_name} {requested_action} 실패: "
             f"{user_message or '로그인, 계좌 및 운영 상태를 확인하십시오.'}"
         )
-        adapter.show_operation_failure_dialog(requested_action, operation_result)
-
-    def _production_recovery_allows_routine_operation(
-        self,
-        instance_id: str,
-        *,
-        command: str,
-        caller_name: str,
-    ) -> bool:
-        for stock_dir in self._routine_instance_stock_dirs(instance_id):
-            code, _, _name = stock_dir.name.partition("_")
-            try:
-                decision = self.production_recovery_gate_for_stock(
-                    code,
-                    caller_name=caller_name,
-                )
-            except Exception:
-                LOGGER.exception(
-                    "Routine operation Recovery Gate failed: "
-                    "command=%s caller=%s instance=%s stock=%s",
-                    command,
-                    caller_name,
-                    instance_id,
-                    code,
-                )
-                return False
-            if getattr(decision, "allowed", None) is True:
-                continue
-            api = getattr(self, "kiwoom_api", None)
-            login_session_reader = getattr(api, "login_session_id", None)
-            login_session_present = False
-            if callable(login_session_reader):
-                try:
-                    login_session_present = bool(
-                        str(login_session_reader() or "").strip()
-                    )
-                except Exception:
-                    login_session_present = False
-            account_selected = False
-            try:
-                account_selected = bool(str(self.selected_account_no() or "").strip())
-            except Exception:
-                account_selected = False
-            reason_code = str(getattr(decision, "reason_code", "") or "").strip()
-            evidence = tuple(getattr(decision, "evidence", ()) or ())
-            has_internal_error_evidence = any(
-                str(item).startswith(("registry_error=", "gate_exception="))
-                for item in evidence
-            )
-            if (
-                reason_code not in EXPECTED_USER_ACTION_RECOVERY_BLOCK_REASONS
-                or has_internal_error_evidence
-            ):
-                LOGGER.warning(
-                    "Routine operation blocked by Production Recovery: "
-                    "command=%s caller=%s instance=%s stock=%s reason=%s "
-                    "evidence=%s login_session_present=%s account_selected=%s "
-                    "requested_at=%s",
-                    command,
-                    caller_name,
-                    instance_id,
-                    code,
-                    reason_code,
-                    evidence,
-                    login_session_present,
-                    account_selected,
-                    datetime.now().isoformat(timespec="seconds"),
-                )
-            return False
-        return True
+        show_auto_trade_operation_failure_dialog(
+            adapter,
+            requested_action,
+            operation_result,
+            adapter._targets,
+        )
 
     @staticmethod
     def _set_routine_operation_actions_enabled(actions, enabled: bool) -> None:
@@ -11053,6 +10939,8 @@ class MainWindow(QMainWindow):
                 ],
             },
         )
+        if result.cleared_stock_codes:
+            sync_auto_trade_monitoring_universe(self)
         self.refresh_auto_trade_assignment_views()
         show_toast(
             self,
@@ -11352,9 +11240,11 @@ class MainWindow(QMainWindow):
             request_scope="multiple",
         )
         self._main_monitoring_stock_operation_adapter = adapter
-        result = adapter.apply_selected_early_close(
+        result = auto_trade_apply_selected_early_close(
+            adapter,
             requested_policy,
             source="main_routine_parent_context_menu",
+            selected=adapter.selected_stock_infos(),
             show_error_dialog=False,
             show_result_toast=False,
             show_confirmation=False,
@@ -11480,9 +11370,11 @@ class MainWindow(QMainWindow):
             request_scope="multiple",
         )
         self._main_monitoring_stock_operation_adapter = adapter
-        result = adapter.apply_selected_early_close(
+        result = auto_trade_apply_selected_early_close(
+            adapter,
             requested_policy,
             source="main_routine_context_menu",
+            selected=adapter.selected_stock_infos(),
             show_error_dialog=False,
             show_result_toast=False,
             show_confirmation=False,
@@ -11550,6 +11442,38 @@ class MainWindow(QMainWindow):
         self.load_routine_table()
         return True
 
+    def _build_stock_instance_chart_operation_adapter(
+        self,
+        stock_dir: Path,
+        code: str,
+        name: str,
+        routine_instance_id: str,
+    ) -> MainMonitoringStockOperationAdapter:
+        return MainMonitoringStockOperationAdapter(
+            self,
+            [
+                MainMonitoringStockTarget(
+                    stock_dir=stock_dir,
+                    code=code,
+                    name=name,
+                    routine_instance_id=routine_instance_id,
+                )
+            ],
+            request_scope="single",
+        )
+
+    def _execute_stock_instance_chart_operation(
+        self,
+        adapter: MainMonitoringStockOperationAdapter,
+        requested_policy: str,
+        **kwargs,
+    ) -> dict[str, object]:
+        return auto_trade_apply_selected_early_close(
+            adapter,
+            requested_policy,
+            **kwargs,
+        )
+
     def open_stock_register_window(self) -> None:
         window = getattr(self, "stock_register_window", None)
         if window is not None and not sip.isdeleted(window) and window.isVisible():
@@ -11557,7 +11481,10 @@ class MainWindow(QMainWindow):
             window.raise_()
             window.activateWindow()
             return
-        window = StockRegisterWindow(self)
+        window = StockRegisterWindow(
+            self,
+            stock_search_register_opener=open_instance_stock_search_register_dialog,
+        )
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.stock_register_window = window
         window.destroyed.connect(
@@ -11738,6 +11665,12 @@ class MainWindow(QMainWindow):
                     ),
                 )
             )
+        marker_result = chejan_result.get("close_routine_final_sell_marker")
+        if (
+            isinstance(marker_result, dict)
+            and marker_result.get("changed") is True
+        ):
+            refresh_auto_trade_views(self)
         try:
             window = getattr(self, "auto_trade_setting_window", None)
         except RuntimeError:

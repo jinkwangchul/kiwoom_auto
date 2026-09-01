@@ -28,9 +28,20 @@ from manual_ats_runtime import (
     write_manual_ats_runtime_selection,
 )
 from runtime_io import read_json_dict
+from tests.filesystem_test_support import TemporaryProjectRoot, create_stock_fixture
+from tests.participant_owner_fixture import participant_owner
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _participant_window(*, participant_codes=(), **attributes) -> SimpleNamespace:
+    return SimpleNamespace(
+        _main_monitoring_auto_trade_operation_host=participant_owner(
+            participant_codes
+        ),
+        **attributes,
+    )
 
 
 class _Header:
@@ -270,10 +281,11 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 encoding="utf-8",
             )
             main_owner = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={"012210"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
                 startup_recovery_session_ready=lambda refresh=False: True,
             )
-            window = SimpleNamespace(
+            window = _participant_window(
+                participant_codes={"012210"},
                 stock_table=QTableWidget(),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -495,7 +507,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            window = SimpleNamespace(
+            window = _participant_window(
                 stock_table=QTableWidget(),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -579,7 +591,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                         "assigned_routine_instance_id": "instance-a",
                     }
                 )
-            window = SimpleNamespace(
+            window = _participant_window(
                 stock_table=QTableWidget(),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -642,7 +654,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 "stock_path": str(stock_dir),
                 "assigned_routine_instance_id": "instance-a",
             }
-            window = SimpleNamespace(
+            window = _participant_window(
                 stock_table=QTableWidget(0, 11),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -676,7 +688,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 gui_auto_trade_table_loader.auto_trade_load_selected_routine_stocks(window)
 
             main_values = gui_main_table_loader._routine_tree_stock_display_values(
-                SimpleNamespace(),
+                _participant_window(),
                 {
                     "code": "005930",
                     "name": "삼성전자",
@@ -768,7 +780,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
 
             for projection, expected_text in cases:
                 with self.subTest(expected_text=expected_text, projection=projection):
-                    window = SimpleNamespace(
+                    window = _participant_window(
                         stock_table=QTableWidget(0, 11),
                         _all_stocks_scope_active=True,
                         _stock_status_filter="all",
@@ -807,7 +819,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                             window
                         )
                         main_row = gui_main_table_loader._routine_tree_stock_row(
-                            SimpleNamespace(),
+                            _participant_window(),
                             definition_id="indicator_follow",
                             instance_id="instance-a",
                             stock=main_stock,
@@ -833,7 +845,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
         _ = app
 
         def build_window() -> SimpleNamespace:
-            window = SimpleNamespace(
+            window = _participant_window(
                 stock_table=QTableWidget(),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -974,21 +986,37 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
         )
 
     def test_actual_manual_ats_stock_metadata_matches_shared_display(self) -> None:
-        for relative_path in ("stocks/003550_LG", "stocks/005380_현대차"):
-            with self.subTest(stock=relative_path):
-                stock_dir = PROJECT_ROOT / relative_path
-                config = read_json_dict(stock_dir / "config.json")
-                persisted_state = read_json_dict(stock_dir / "state.json")
-                display_state = dict(persisted_state)
-                display_state["manual_ats_selection"] = (
-                    _runtime_ats_state("extra1")["manual_ats_selection"]
-                )
+        with TemporaryProjectRoot(prefix="manual_ats_display_sync_") as layout:
+            stock_dirs = (
+                create_stock_fixture(
+                    layout,
+                    code="003550",
+                    name="LG",
+                    config={"operation_mode": "CONTINUOUS"},
+                ),
+                create_stock_fixture(
+                    layout,
+                    code="005380",
+                    name="현대차",
+                    config={"operation_mode": "CONTINUOUS"},
+                ),
+            )
+            for stock_dir in stock_dirs:
+                with self.subTest(stock=stock_dir.name):
+                    self.assertTrue(
+                        write_manual_ats_runtime_selection(
+                            stock_dir,
+                            {"extra1": True},
+                        )
+                    )
+                    config = read_json_dict(stock_dir / "config.json")
+                    display_state = read_json_dict(stock_dir / "state.json")
 
-                self.assertEqual("CONTINUOUS", config.get("operation_mode"))
-                self.assertEqual(
-                    "수동+ATS",
-                    auto_trade_operation_display(config, display_state)[0],
-                )
+                    self.assertEqual("CONTINUOUS", config.get("operation_mode"))
+                    self.assertEqual(
+                        "수동+ATS",
+                        auto_trade_operation_display(config, display_state)[0],
+                    )
 
     def test_ats_save_and_clear_refresh_display_from_read_back(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1051,7 +1079,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 instance_id="instance-a",
                 display_name="지표추종매매",
             )
-            window = SimpleNamespace(
+            window = _participant_window(
                 running_stock_table=_Table(),
                 _main_running_sort_column=-1,
                 _main_running_sort_order=0,
@@ -1168,7 +1196,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 instance_id="instance-a",
                 display_name="지표추종매매",
             )
-            window = SimpleNamespace(
+            window = _participant_window(
                 running_stock_table=QTableWidget(),
                 _main_running_sort_column=-1,
                 _main_running_sort_order=0,
@@ -1230,7 +1258,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 _item_style_tuple(status_item),
             )
 
-    def test_ats_save_success_refreshes_parent_monitoring_window(self) -> None:
+    def test_ats_save_success_refreshes_shared_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             stock_dir = Path(temp_dir) / "003550_LG"
             stock_dir.mkdir()
@@ -1239,21 +1267,20 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (stock_dir / "state.json").write_text("{}", encoding="utf-8")
-            parent = MagicMock()
             window = MagicMock()
-            window.parent.return_value = parent
             window.capture_stock_table_view_state.return_value = (set(), 0)
-            window.current_runtime_file_signature.return_value = ()
-
-            result = gui_auto_trade_ats_ops.auto_trade_save_manual_ats_state_for_targets(
-                window,
-                [(stock_dir, "003550", "LG")],
-                {"extra1": True, "extra2": False, "extra3": False},
-            )
+            with patch.object(
+                gui_auto_trade_ats_ops,
+                "refresh_auto_trade_views",
+            ) as refresh:
+                result = gui_auto_trade_ats_ops.auto_trade_save_manual_ats_state_for_targets(
+                    window,
+                    [(stock_dir, "003550", "LG")],
+                    {"extra1": True, "extra2": False, "extra3": False},
+                )
 
         self.assertEqual(1, result["succeeded"])
-        window.load_selected_routine_stocks.assert_called_once()
-        parent.refresh_all.assert_called_once()
+        refresh.assert_called_once_with(window)
 
     def test_after_regular_end_display_projection_is_runtime_read_only(self) -> None:
         app = QApplication.instance() or QApplication([])
@@ -1284,7 +1311,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                 encoding="utf-8",
             )
             before_text = state_path.read_text(encoding="utf-8")
-            window = SimpleNamespace(
+            window = _participant_window(
                 stock_table=QTableWidget(),
                 _all_stocks_scope_active=True,
                 _stock_status_filter="all",
@@ -1383,7 +1410,7 @@ class AutoTradeOperationDisplaySyncTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 before_text = state_path.read_text(encoding="utf-8")
-                window = SimpleNamespace(
+                window = _participant_window(
                     stock_table=QTableWidget(),
                     _all_stocks_scope_active=True,
                     _stock_status_filter="all",

@@ -25,7 +25,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from candle_timeframe_aggregation import (
     candle_market_datetime,
@@ -42,7 +42,8 @@ from event_journal_production import (
     observe_production_exception,
 )
 from routine_instance_registry import load_routine_definitions, routine_instance_by_id
-from order_candidate_engine import read_latest_price
+from gui_operation_ui_context import actionable_current_price
+from order_candidate_engine import read_reference_price
 from running_budget_adjustment import (
     project_running_budget_adjustment_config,
     transition_running_budget_adjustment_for_signal,
@@ -345,6 +346,7 @@ def probe_routine_for_stock(
     decision_trace_observer: Any = _DEFAULT_OBSERVER_SENTINEL,
     trigger_provenance: dict[str, Any] | None = None,
     account_budget_context: dict[str, Any] | None = None,
+    actionable_price_reader: Callable[[str, str], Any] | None = None,
 ) -> dict[str, Any]:
     code, name = _parse_stock_folder_name(stock_dir)
     state = _read_json_dict(stock_dir / "state.json")
@@ -456,9 +458,16 @@ def probe_routine_for_stock(
                         context["decision_trace_observer"] = trace_collector
                 except Exception:
                     trace_collector = None
-            current_price = read_latest_price(code, name)
-            if isinstance(current_price, (int, float)) and current_price > 0:
-                context["current_price"] = current_price
+            reference_price = read_reference_price(code, name)
+            if isinstance(reference_price, (int, float)) and reference_price > 0:
+                context["reference_price"] = reference_price
+            if callable(actionable_price_reader):
+                try:
+                    current_price = actionable_price_reader(code, name)
+                except Exception:
+                    current_price = None
+                if isinstance(current_price, (int, float)) and current_price > 0:
+                    context["actionable_current_price"] = current_price
             cycle_projector = getattr(routine_module, "project_cycle_context", None)
             if callable(cycle_projector):
                 try:
@@ -709,6 +718,12 @@ def probe_selected_routine_once(
         probe_kwargs = {}
         if callable(getattr(window, "selected_account_no", None)):
             probe_kwargs["account_budget_context"] = _production_account_budget_context(window)
+        probe_kwargs["actionable_price_reader"] = (
+            lambda stock_code, _stock_name="": actionable_current_price(
+                window,
+                stock_code,
+            )
+        )
         result = probe_routine_for_stock(
             routine_module,
             routine_name,
@@ -904,6 +919,12 @@ def probe_execution_stock_for_committed_bar(
     )
     if callable(getattr(window, "selected_account_no", None)):
         probe_kwargs["account_budget_context"] = _production_account_budget_context(window)
+    probe_kwargs["actionable_price_reader"] = (
+        lambda stock_code, _stock_name="": actionable_current_price(
+            window,
+            stock_code,
+        )
+    )
     return probe_routine_for_stock(
         routine_module,
         routine_name,

@@ -20,6 +20,7 @@ from PyQt5.QtCore import Qt
 
 from gui_operation_environment import (
     read_system_budget_policy,
+    round_money_to_two_significant_digits,
     validate_available_budget_percent,
     validate_system_total_budget,
     write_system_budget_policy,
@@ -339,16 +340,6 @@ def total_budget_from_orderable_cash(
     if amount > cash:
         raise ValueError("calculated total_budget exceeds current orderable cash")
     return validate_system_total_budget(amount)
-
-
-def round_money_to_two_significant_digits(value: object) -> int:
-    """Round a nonnegative integer half-up while preserving two leading digits."""
-    amount = _nonnegative_integer_amount(value)
-    digits = len(str(amount))
-    if digits <= 2:
-        return amount
-    quantum = 10 ** (digits - 2)
-    return ((amount + (quantum // 2)) // quantum) * quantum
 
 
 def persist_main_total_budget(

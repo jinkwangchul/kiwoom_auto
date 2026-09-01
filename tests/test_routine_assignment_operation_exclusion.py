@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from uuid import UUID
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,13 +15,87 @@ from PyQt5.QtWidgets import QApplication, QLabel
 
 import gui_operation_environment as environment
 import gui_stock_data
+from assignment_episode_linkage import assign_stock_routine, unassign_stock_routine
 from stock_repository import StockRepository
+
+
+GROUP_ID = UUID("8ce8ace2-d55b-42bb-a55a-a75d7f246082")
+INSTANCE_A = UUID("0cd3db68-d5e8-4c35-9c48-a25fbe39feb8")
+INSTANCE_B = UUID("56d22f86-c424-4484-838e-06a7acb52a34")
 
 
 class StockRegistrationRosterPolicyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def _write_assignment_foundation(root: Path) -> None:
+        routine_dir = root / "routines" / "sample"
+        routine_dir.mkdir(parents=True)
+        (routine_dir / "routine.py").write_text("", encoding="utf-8")
+        (routine_dir / "routine.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "definition_id": "sample",
+                    "name": "Sample",
+                    "entry_file": "routine.py",
+                    "rules_file": "rules.json",
+                    "enabled": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        group_dir = root / "groups" / str(GROUP_ID)
+        group_dir.mkdir(parents=True)
+        (group_dir / "group.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "group_id": str(GROUP_ID),
+                    "definition_id": "sample",
+                    "base_name": "Group",
+                    "display_name": "Group",
+                    "slot": 0,
+                    "created_at": "2026-08-29T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "groups" / "registry.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "mode": "logical",
+                    "group_ids": [str(GROUP_ID)],
+                    "cutover_at": "2026-08-29T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        for instance_id, name in ((INSTANCE_A, "A"), (INSTANCE_B, "B")):
+            instance_dir = root / "routine_instances" / str(instance_id)
+            instance_dir.mkdir(parents=True)
+            (instance_dir / "rules.json").write_text("{}", encoding="utf-8")
+            (instance_dir / "instance.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "instance_id": str(instance_id),
+                        "definition_id": "sample",
+                        "display_name": name,
+                        "enabled": False,
+                        "buy_limit_enabled": False,
+                        "buy_limit_amount": None,
+                        "rules_file": "rules.json",
+                        "created_at": "2026-08-29T09:00:00+09:00",
+                        "updated_at": "2026-08-29T09:00:00+09:00",
+                        "group_id": str(GROUP_ID),
+                    }
+                ),
+                encoding="utf-8",
+            )
 
     def test_default_legacy_and_malformed_policy_are_waiting(self) -> None:
         self.assertEqual({"default_location": "WAITING"}, environment.stock_registration_policy())
@@ -114,21 +189,25 @@ class StockRegistrationRosterPolicyTest(unittest.TestCase):
     def test_existing_first_assignment_move_and_unassign_preserve_category(self) -> None:
         for excluded in (False, True):
             with self.subTest(excluded=excluded), tempfile.TemporaryDirectory() as temp:
-                repo = StockRepository(Path(temp))
+                root = Path(temp)
+                self._write_assignment_foundation(root)
+                repo = StockRepository(root)
                 stock_dir = repo.ensure_stock_folder("005930", "Test")
                 config_path = stock_dir / "config.json"
                 config = json.loads(config_path.read_text(encoding="utf-8"))
                 config["operation_excluded"] = excluded
                 config_path.write_text(json.dumps(config), encoding="utf-8")
-                self.assertTrue(repo.update_stock_routine_instance(
-                    "005930", "Test", instance_id="A", instance_name="A",
-                    definition_id="D1", routine_type="RoutineA",
-                ))
-                self.assertTrue(repo.update_stock_routine_instance(
-                    "005930", "Test", instance_id="B", instance_name="B",
-                    definition_id="D2", routine_type="RoutineB",
-                ))
-                self.assertTrue(repo.update_stock_routine("005930", "Test", []))
+                self.assertTrue(assign_stock_routine(
+                    root, "005930", "Test", instance_id=str(INSTANCE_A), instance_name="A",
+                    definition_id="sample", routine_type="Sample", stock_repository=repo,
+                ).ok)
+                self.assertTrue(assign_stock_routine(
+                    root, "005930", "Test", instance_id=str(INSTANCE_B), instance_name="B",
+                    definition_id="sample", routine_type="Sample", stock_repository=repo,
+                ).ok)
+                self.assertTrue(unassign_stock_routine(
+                    root, "005930", "Test", [], stock_repository=repo,
+                ).ok)
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
                 self.assertIs(saved["operation_excluded"], excluded)
 

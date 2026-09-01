@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
 import gui_auto_trade_selection
 import gui_auto_trade_run_control as run_control
 import gui_auto_trade_setting_window as setting_window
+from tests.participant_owner_fixture import participant_owner
 import gui_main_stock_context_menu as context_menu
 import gui_main_table_loader as table_loader
 import gui_windows
@@ -452,6 +453,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
     def test_instance_without_registered_stocks_has_actionable_message(self) -> None:
         status_bar = MagicMock()
         window = SimpleNamespace(
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
             _routine_instance_stock_dirs=Mock(return_value=[]),
             statusBar=lambda: status_bar,
         )
@@ -491,7 +493,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
         )
 
-    def test_run_control_adapter_reuses_setting_start_orchestration(self) -> None:
+    def test_main_selective_start_route_reuses_shared_orchestration(self) -> None:
         parent = QWidget()
         parent.routine_table = MagicMock()
         target = context_menu.MainMonitoringStockTarget(
@@ -509,16 +511,16 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 return_value={"ok": True, "reason": "STARTED"},
             ) as start_orchestration,
         ):
-            start_result = adapter.start_selected_auto_trades()
+            start_result = context_menu.execute_main_monitoring_selective_start(adapter)
 
-        start_orchestration.assert_called_once_with(adapter)
+        start_orchestration.assert_called_once()
         self.assertEqual("STARTED", start_result["reason"])
-        adapter.close()
         parent.close()
 
     def test_monitor_start_before_running_uses_setting_selective_start_contract(self) -> None:
         with TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp) / "stocks"
+            root.mkdir()
             targets = []
             for index in range(4):
                 code = f"{index + 1:06d}"
@@ -572,7 +574,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     return_value={"ok": True, "reason": "STARTED"},
                 ) as start_backend,
             ):
-                result = adapter.start_selected_auto_trades()
+                result = context_menu.execute_main_monitoring_selective_start(adapter)
 
             self.assertTrue(result["ok"])
             self.assertEqual(
@@ -591,7 +593,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
 
     def test_monitor_start_while_running_adds_only_selected_excluded_target(self) -> None:
         with TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp) / "stocks"
+            root.mkdir()
             targets = []
             for index, excluded in enumerate((False, True, True)):
                 code = f"{index + 1:06d}"
@@ -643,7 +646,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     return_value={"ok": True, "reason": "STARTED"},
                 ) as start_backend,
             ):
-                result = adapter.start_selected_auto_trades()
+                result = context_menu.execute_main_monitoring_selective_start(adapter)
 
             self.assertTrue(result["ok"])
             start_backend.assert_called_once()
@@ -691,7 +694,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "ok": False,
                 "reason": "NO_STARTABLE_TARGETS",
             }
-            result = adapter.start_selected_auto_trades()
+            result = context_menu.execute_main_monitoring_selective_start(adapter)
 
         self.assertFalse(result["ok"])
         self.assertEqual("NO_STARTABLE_TARGETS", result["reason"])
@@ -752,7 +755,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertIsNone(owner.auto_trade_setting_window)
         setting_window_widget.close()
 
-    def test_monitoring_bottom_start_reuses_setting_global_orchestration(self) -> None:
+    def test_monitoring_bottom_start_uses_shared_application_command(self) -> None:
         window = SimpleNamespace()
         adapter = Mock()
 
@@ -762,15 +765,16 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "MainMonitoringStockOperationAdapter",
                 return_value=adapter,
             ) as adapter_factory,
-            patch.object(
-                gui_windows.AutoTradeSettingWindow,
-                "start_selected_auto_trades",
-            ) as orchestration,
+            patch.object(gui_windows, "execute_operation_start_command") as command,
         ):
             gui_windows.MainWindow.start_global_auto_trades(window)
 
         adapter_factory.assert_called_once_with(window, [])
-        orchestration.assert_called_once_with(adapter)
+        command.assert_called_once()
+        self.assertIs(adapter, command.call_args.args[0])
+        request = command.call_args.args[1]
+        self.assertEqual(run_control.OperationStartIntent.FULL_START, request.intent)
+        self.assertEqual("auto_trade_global_start_button", request.source)
 
     def test_monitoring_global_start_uses_global_target_scope_and_source(self) -> None:
         with TemporaryDirectory() as temp:
@@ -798,16 +802,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             adapter.running_registered_operation_targets = Mock(return_value=[])
             adapter.update_global_operation_button_state = Mock()
 
-            with (
-                patch.object(setting_window, "read_operation_state", return_value={}),
-                patch.object(
-                    setting_window,
-                    "auto_trade_start_selected_auto_trades",
-                    return_value={"ok": True},
-                ) as backend,
-            ):
-                setting_window.AutoTradeSettingWindow.start_selected_auto_trades(
-                    adapter
+            with patch.object(
+                run_control,
+                "auto_trade_start_selected_auto_trades",
+                return_value={"ok": True},
+            ) as backend:
+                run_control.execute_operation_start_command(
+                    adapter,
+                    run_control.OperationStartCommandRequest(
+                        intent=run_control.OperationStartIntent.FULL_START,
+                        source="auto_trade_global_start_button",
+                    ),
+                    operation_state_reader=lambda: {},
                 )
 
             backend.assert_called_once_with(
@@ -817,7 +823,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 source="auto_trade_global_start_button",
             )
             adapter.update_global_operation_button_state.assert_called_once_with()
-            adapter.close()
             parent.close()
 
     def test_monitoring_global_start_button_uses_setting_button_state_contract(self) -> None:
@@ -976,7 +981,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window = SimpleNamespace(
                 update_global_operation_button_state=Mock(),
                 startup_recovery_session_ready=Mock(return_value=True),
-                _current_session_operation_participant_stock_codes={"005930"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"}),
                 registered_operation_targets=Mock(
                     return_value=[(running_dir, "005930", "삼성전자")]
                 ),
@@ -1079,7 +1084,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window = SimpleNamespace(
                 btn_start=MagicMock(),
                 startup_recovery_session_ready=Mock(return_value=True),
-                _current_session_operation_participant_stock_codes={"005930"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"005930"}),
                 registered_operation_targets=Mock(
                     return_value=[
                         (running_dir, "005930", "삼성전자"),
@@ -1128,6 +1133,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 encoding="utf-8",
             )
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 stock_info_from_row=Mock(
                     return_value=(stock_dir, "000660", "SK하이닉스")
                 ),
@@ -1135,22 +1141,22 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             target = (stock_dir, "000660", "Test")
             window.stock_info_from_row.return_value = target
-            window.toggle_stock_operation_exclusion = Mock(return_value=True)
             item = SimpleNamespace(column=lambda: 1, row=lambda: 2)
 
             with patch(
-                "gui_auto_trade_setting_window.auto_trade_start_status_indicator"
-            ) as adapter:
+                "gui_auto_trade_setting_window.auto_trade_toggle_stock_operation_exclusion",
+                return_value=True,
+            ) as toggle_exclusion:
                 gui_windows.AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
                     window,
                     item,
                 )
 
-        window.toggle_stock_operation_exclusion.assert_called_once_with(
+        toggle_exclusion.assert_called_once_with(
+            window,
             target,
             refresh=False,
         )
-        adapter.assert_not_called()
 
     def test_running_status_indicator_does_not_call_start_backend(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1163,7 +1169,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             window = SimpleNamespace(
                 statusBarMessage=Mock(),
                 startup_recovery_session_ready=Mock(return_value=True),
-                _current_session_operation_participant_stock_codes={"000660"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"000660"}),
             )
             target = (stock_dir, "000660", "SK하이닉스")
 
@@ -1399,13 +1405,21 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
         table.close()
 
-    def test_recovery_block_message_is_reported_on_monitoring_window(self) -> None:
+    def test_recovery_filter_delegates_to_operation_host(self) -> None:
         parent = QWidget()
         parent.routine_table = MagicMock()
-        parent.startup_recovery_session_ready = MagicMock(return_value=False)
-        parent.startup_recovery_block_reason = MagicMock(return_value="INVALID_RUNTIME")
-        parent.statusBar = MagicMock()
-        status_bar = parent.statusBar.return_value
+        expected = {
+            "allowed": False,
+            "reason": "INVALID_RUNTIME",
+            "eligible": (),
+            "excluded_review": (),
+        }
+        operation_host = SimpleNamespace(
+            filter_start_targets_by_recovery=Mock(return_value=expected)
+        )
+        parent.main_monitoring_auto_trade_operation_host = Mock(
+            return_value=operation_host
+        )
         target = context_menu.MainMonitoringStockTarget(
             stock_dir=Path("stocks/005930_삼성전자"),
             code="005930",
@@ -1414,12 +1428,17 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
         adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [target])
 
-        self.assertFalse(adapter.require_startup_recovery_session("운영시작"))
-        status_bar.showMessage.assert_called_once()
-        message = status_bar.showMessage.call_args.args[0]
-        self.assertIn("Recovery 완료 상태를 확인", message)
-        self.assertNotIn("INVALID_RUNTIME", message)
-        adapter.close()
+        targets = [(target.stock_dir, target.code, target.name)]
+        result = adapter.filter_start_targets_by_recovery(
+            targets,
+            action="운영시작",
+        )
+
+        self.assertEqual(expected, result)
+        operation_host.filter_start_targets_by_recovery.assert_called_once_with(
+            targets,
+            action="운영시작",
+        )
         parent.close()
 
     def test_stopped_instance_badge_starts_instance(self) -> None:
@@ -1442,6 +1461,14 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 instance_id="instance-a",
                 display_name="지표추종매매",
             )
+
+            def start_instance(*_args, **_kwargs) -> dict[str, object]:
+                (stopped_dir / "state.json").write_text(
+                    json.dumps({"status": "MONITORING", "trade_enabled": True}),
+                    encoding="utf-8",
+                )
+                return {"ok": True, "reason": "STARTED"}
+
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
                 patch.object(
@@ -1457,21 +1484,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ) as adapter_factory,
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    side_effect=start_instance,
+                ) as start_command,
             ):
-                def start_instance() -> dict[str, object]:
-                    (stopped_dir / "state.json").write_text(
-                        json.dumps({"status": "MONITORING", "trade_enabled": True}),
-                        encoding="utf-8",
-                    )
-                    return {"ok": True, "reason": "STARTED"}
-
-                adapter.start_selected_auto_trades.side_effect = start_instance
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
                     "instance-a",
                 )
 
-            adapter.start_selected_auto_trades.assert_called_once()
+            start_command.assert_called_once_with(adapter, source="main_routine_start")
             targets = adapter_factory.call_args.args[1]
             self.assertEqual(["005930"], [target.code for target in targets])
             self.assertEqual(
@@ -1592,7 +1616,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 for stock_dir in stock_dirs
             ]
             adapter = MagicMock()
-            adapter.start_selected_auto_trades.return_value = {
+            start_result = {
                 "ok": True,
                 "reason": "STARTED",
             }
@@ -1619,13 +1643,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ) as adapter_factory,
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    return_value=start_result,
+                ) as start_command,
             ):
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
                     "instance-a",
                 )
 
-            adapter.start_selected_auto_trades.assert_called_once()
+            start_command.assert_called_once_with(adapter, source="main_routine_start")
             passed_targets = adapter_factory.call_args.args[1]
             self.assertEqual(
                 ["000002", "000003", "000004", "000005"],
@@ -1645,12 +1674,13 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 encoding="utf-8",
             )
             adapter = MagicMock()
-            adapter.start_selected_auto_trades.return_value = {
+            start_result = {
                 "ok": False,
                 "reason": "BLOCKED_RECOVERY",
             }
             status_bar = MagicMock()
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 _routine_instance_stock_dirs=lambda _instance_id: [stock_dir],
                 _reload_main_routine_table_preserving_view=MagicMock(),
                 statusBar=lambda: status_bar,
@@ -1671,13 +1701,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ),
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    return_value=start_result,
+                ) as start_command,
             ):
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
                     "instance-a",
                 )
 
-            adapter.start_selected_auto_trades.assert_called_once()
+            start_command.assert_called_once_with(adapter, source="main_routine_start")
 
     def test_blocked_start_keeps_official_state_and_reports_reason(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1693,11 +1728,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             adapter._last_operation_user_message = (
                 "운영 시작 전에 Recovery가 완료되지 않았습니다."
             )
-            adapter.start_selected_auto_trades.return_value = {
+            start_result = {
                 "ok": False,
                 "reason": "BLOCKED_RECOVERY",
             }
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 _routine_instance_stock_dirs=lambda _instance_id: [stock_dir],
                 _reload_main_routine_table_preserving_view=MagicMock(),
                 statusBar=lambda: status_bar,
@@ -1713,6 +1749,15 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ),
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    return_value=start_result,
+                ),
+                patch.object(
+                    gui_windows,
+                    "show_auto_trade_operation_failure_dialog",
+                ) as failure_dialog,
             ):
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
@@ -1724,12 +1769,14 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             status_message = status_bar.showMessage.call_args.args[0]
             self.assertIn("Recovery가 완료되지 않았습니다.", status_message)
             self.assertNotIn("BLOCKED_RECOVERY", status_message)
-            adapter.show_operation_failure_dialog.assert_called_once_with(
+            failure_dialog.assert_called_once_with(
+                adapter,
                 "운영시작",
                 {
                     "ok": False,
                     "reason": "BLOCKED_RECOVERY",
                 },
+                adapter._targets,
             )
             window._reload_main_routine_table_preserving_view.assert_called_once()
 
@@ -1747,16 +1794,15 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             "INVALID_RUNTIME: 보유수량 있음 + 현재가 확인 불가"
         )
 
-        with (
-            patch("gui_auto_trade_run_control.show_toast") as toast,
-            patch("gui_auto_trade_run_control.QMessageBox.warning") as warning,
-        ):
-            shown = adapter.show_operation_failure_dialog(
+        with patch("gui_auto_trade_run_control.show_toast") as toast:
+            shown = run_control.show_auto_trade_operation_failure_dialog(
+                adapter,
                 "운영시작",
                 {
                     "ok": False,
                     "reason": adapter._last_operation_block_reason,
                 },
+                adapter._targets,
             )
 
         self.assertTrue(shown)
@@ -1770,8 +1816,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             duration_ms=2500,
             position="center",
         )
-        warning.assert_not_called()
-        adapter.close()
         parent.close()
 
     def test_recovery_context_missing_displays_actual_login_cause(self) -> None:
@@ -2197,7 +2241,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
         target = self._routine_close_target()
         adapter = MagicMock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": True,
             "completed_count": 3,
             "failed_count": 0,
@@ -2226,6 +2270,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "MainMonitoringStockOperationAdapter",
                 return_value=adapter,
             ) as adapter_factory,
+            patch.object(
+                gui_windows,
+                "auto_trade_apply_selected_early_close",
+                return_value=close_result,
+            ) as close_command,
             patch.object(gui_windows, "show_toast") as toast,
         ):
             gui_windows.MainWindow.request_visible_monitoring_early_close(window)
@@ -2235,9 +2284,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             [target],
             request_scope="multiple",
         )
-        adapter.apply_selected_early_close.assert_called_once_with(
+        close_command.assert_called_once_with(
+            adapter,
             "현재가",
             source="main_visible_early_close_button",
+            selected=adapter.selected_stock_infos.return_value,
             show_error_dialog=False,
             show_result_toast=False,
             show_confirmation=False,
@@ -2279,7 +2330,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
                 target = self._routine_close_target()
                 adapter = MagicMock()
-                adapter.apply_selected_early_close.return_value = {
+                close_result = {
                     "ok": True,
                     "completed_count": 1,
                     "failed_count": 0,
@@ -2305,6 +2356,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                         "MainMonitoringStockOperationAdapter",
                         return_value=adapter,
                     ) as adapter_factory,
+                    patch.object(
+                        gui_windows,
+                        "auto_trade_apply_selected_early_close",
+                        return_value=close_result,
+                    ) as close_command,
                     patch.object(gui_windows, "show_toast") as toast,
                 ):
                     gui_windows.MainWindow.request_routine_operation(
@@ -2325,9 +2381,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     [target],
                     request_scope="multiple",
                 )
-                adapter.apply_selected_early_close.assert_called_once_with(
+                close_command.assert_called_once_with(
+                    adapter,
                     method,
                     source="main_routine_context_menu",
+                    selected=adapter.selected_stock_infos.return_value,
                     show_error_dialog=False,
                     show_result_toast=False,
                     show_confirmation=False,
@@ -2351,7 +2409,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             self._routine_close_target("000660", "instance-b"),
         ]
         adapter = MagicMock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": True,
             "completed_count": 2,
             "failed_count": 0,
@@ -2382,6 +2440,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "MainMonitoringStockOperationAdapter",
                 return_value=adapter,
             ) as adapter_factory,
+            patch.object(
+                gui_windows,
+                "auto_trade_apply_selected_early_close",
+                return_value=close_result,
+            ) as close_command,
             patch.object(gui_windows, "show_toast") as toast,
         ):
             gui_windows.MainWindow.request_routine_definition_operation(
@@ -2402,7 +2465,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             targets,
             request_scope="multiple",
         )
-        adapter.apply_selected_early_close.assert_called_once()
+        close_command.assert_called_once()
         toast.assert_called_once_with(
             window,
             "조기마감 2종목 적용 합니다.",
@@ -2458,7 +2521,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         confirmation = MagicMock()
         confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
         adapter = MagicMock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": False,
             "completed_count": 2,
             "failed_count": 1,
@@ -2484,6 +2547,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "MainMonitoringStockOperationAdapter",
                 return_value=adapter,
             ),
+            patch.object(
+                gui_windows,
+                "auto_trade_apply_selected_early_close",
+                return_value=close_result,
+            ),
             patch.object(gui_windows.QMessageBox, "warning") as warning,
             patch.object(gui_windows, "show_toast") as toast,
         ):
@@ -2498,226 +2566,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertIn("2건 접수 / 1건 차단", warning.call_args.args[2])
         toast.assert_not_called()
 
-    def test_routine_recovery_global_block_does_not_write_any_stock(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            stock_dirs = []
-            before = {}
-            for index in range(8):
-                stock_dir = root / f"{index:06d}_stock-{index}"
-                stock_dir.mkdir()
-                state_path = stock_dir / "state.json"
-                state_path.write_text(
-                    json.dumps(
-                        {
-                            "status": "MONITORING",
-                            "review_required": False,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                stock_dirs.append(stock_dir)
-                before[state_path] = state_path.read_bytes()
-
-            decision = SimpleNamespace(
-                allowed=False,
-                reason_code=gui_windows.RECOVERY_CONTEXT_MISSING,
-                evidence=("caller=EARLY_CLOSE_ROUTINE_INSTANCE",),
-            )
-            window = SimpleNamespace(
-                _routine_instance_stock_dirs=Mock(return_value=stock_dirs),
-                production_recovery_gate_for_stock=Mock(return_value=decision),
-                kiwoom_api=SimpleNamespace(
-                    login_session_id=Mock(return_value="")
-                ),
-                selected_account_no=Mock(return_value=""),
-                update_runtime_stock_status=Mock(),
-            )
-
-            stdout = StringIO()
-            stderr = StringIO()
-            with (
-                patch.object(gui_windows.LOGGER, "warning") as warning,
-                patch.object(gui_windows.LOGGER, "exception") as exception,
-                redirect_stdout(stdout),
-                redirect_stderr(stderr),
-            ):
-                allowed = (
-                    gui_windows.MainWindow._production_recovery_allows_routine_operation(
-                        window,
-                        "instance-a",
-                        command=gui_windows.MODE_EARLY_CLOSE,
-                        caller_name="EARLY_CLOSE_ROUTINE_INSTANCE",
-                    )
-                )
-
-            self.assertFalse(allowed)
-            window.production_recovery_gate_for_stock.assert_called_once_with(
-                "000000",
-                caller_name="EARLY_CLOSE_ROUTINE_INSTANCE",
-            )
-            window.update_runtime_stock_status.assert_not_called()
-            warning.assert_not_called()
-            exception.assert_not_called()
-            self.assertEqual("", stdout.getvalue())
-            self.assertEqual("", stderr.getvalue())
-            for state_path, content in before.items():
-                self.assertEqual(content, state_path.read_bytes())
-
-    def test_repeated_routine_recovery_blocks_never_write_review_state(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            stock_dirs = []
-            before = {}
-            for index in range(8):
-                stock_dir = root / f"{index:06d}_stock-{index}"
-                stock_dir.mkdir()
-                state_path = stock_dir / "state.json"
-                state_path.write_text(
-                    json.dumps(
-                        {
-                            "status": "MONITORING",
-                            "review_required": False,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                stock_dirs.append(stock_dir)
-                before[state_path] = state_path.read_bytes()
-
-            decision = SimpleNamespace(
-                allowed=False,
-                reason_code=gui_windows.RECOVERY_CONTEXT_MISSING,
-                evidence=(),
-            )
-            window = SimpleNamespace(
-                _routine_instance_stock_dirs=Mock(return_value=stock_dirs),
-                production_recovery_gate_for_stock=Mock(return_value=decision),
-                kiwoom_api=SimpleNamespace(
-                    login_session_id=Mock(return_value="")
-                ),
-                selected_account_no=Mock(return_value=""),
-                update_runtime_stock_status=Mock(),
-            )
-            caller_names = (
-                "EARLY_CLOSE_ROUTINE_INSTANCE",
-                "MARKET_EARLY_CLOSE_ROUTINE_INSTANCE",
-                "EARLY_CLOSE_ROUTINE_INSTANCE",
-            )
-
-            with patch.object(gui_windows.LOGGER, "warning") as warning:
-                for caller_name in caller_names:
-                    self.assertFalse(
-                        gui_windows.MainWindow._production_recovery_allows_routine_operation(
-                            window,
-                            "instance-a",
-                            command=gui_windows.MODE_EARLY_CLOSE,
-                            caller_name=caller_name,
-                        )
-                    )
-
-            warning.assert_not_called()
-            self.assertEqual(
-                len(caller_names),
-                window.production_recovery_gate_for_stock.call_count,
-            )
-            window.update_runtime_stock_status.assert_not_called()
-            for state_path, content in before.items():
-                self.assertEqual(content, state_path.read_bytes())
-
-    def test_unknown_recovery_reason_keeps_diagnostic_log(self) -> None:
-        stock_dir = Path("000000_stock")
-        decision = SimpleNamespace(
-            allowed=False,
-            reason_code="RECOVERY_UNKNOWN_CONTRACT_STATE",
-            evidence=(),
-        )
-        window = SimpleNamespace(
-            _routine_instance_stock_dirs=Mock(return_value=[stock_dir]),
-            production_recovery_gate_for_stock=Mock(return_value=decision),
-            kiwoom_api=SimpleNamespace(
-                login_session_id=Mock(return_value="login-a")
-            ),
-            selected_account_no=Mock(return_value="12345678"),
-            update_runtime_stock_status=Mock(),
-        )
-
-        with patch.object(gui_windows.LOGGER, "warning") as warning:
-            allowed = (
-                gui_windows.MainWindow._production_recovery_allows_routine_operation(
-                    window,
-                    "instance-a",
-                    command=gui_windows.MODE_EARLY_CLOSE,
-                    caller_name="EARLY_CLOSE_ROUTINE_INSTANCE",
-                )
-            )
-
-        self.assertFalse(allowed)
-        warning.assert_called_once()
-        window.update_runtime_stock_status.assert_not_called()
-
-    def test_registry_error_evidence_keeps_diagnostic_log(self) -> None:
-        stock_dir = Path("000000_stock")
-        decision = SimpleNamespace(
-            allowed=False,
-            reason_code=gui_windows.RECOVERY_CONTEXT_MISSING,
-            evidence=("registry_error=RuntimeError",),
-        )
-        window = SimpleNamespace(
-            _routine_instance_stock_dirs=Mock(return_value=[stock_dir]),
-            production_recovery_gate_for_stock=Mock(return_value=decision),
-            kiwoom_api=SimpleNamespace(
-                login_session_id=Mock(return_value="login-a")
-            ),
-            selected_account_no=Mock(return_value="12345678"),
-            update_runtime_stock_status=Mock(),
-        )
-
-        with patch.object(gui_windows.LOGGER, "warning") as warning:
-            allowed = (
-                gui_windows.MainWindow._production_recovery_allows_routine_operation(
-                    window,
-                    "instance-a",
-                    command=gui_windows.MODE_EARLY_CLOSE,
-                    caller_name="MARKET_EARLY_CLOSE_ROUTINE_INSTANCE",
-                )
-            )
-
-        self.assertFalse(allowed)
-        warning.assert_called_once()
-        window.update_runtime_stock_status.assert_not_called()
-
-    def test_recovery_gate_exception_is_fail_closed_and_logged(self) -> None:
-        window = SimpleNamespace(
-            _routine_instance_stock_dirs=Mock(
-                return_value=[Path("000000_stock")]
-            ),
-            production_recovery_gate_for_stock=Mock(
-                side_effect=RuntimeError("registry failed")
-            ),
-            update_runtime_stock_status=Mock(),
-        )
-
-        with patch.object(gui_windows.LOGGER, "exception") as exception:
-            allowed = (
-                gui_windows.MainWindow._production_recovery_allows_routine_operation(
-                    window,
-                    "instance-a",
-                    command=gui_windows.MODE_EARLY_CLOSE,
-                    caller_name="EARLY_CLOSE_ROUTINE_INSTANCE",
-                )
-            )
-
-        self.assertFalse(allowed)
-        exception.assert_called_once()
-        window.update_runtime_stock_status.assert_not_called()
-
     def test_routine_definition_recovery_block_uses_canonical_failure_result(self) -> None:
         confirmation = MagicMock()
         confirmation.exec_.return_value = gui_windows.QMessageBox.Yes
         target = self._routine_close_target()
         adapter = MagicMock()
-        adapter.apply_selected_early_close.return_value = {
+        close_result = {
             "ok": False,
             "completed_count": 0,
             "failed_count": 1,
@@ -2755,6 +2609,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 "MainMonitoringStockOperationAdapter",
                 return_value=adapter,
             ),
+            patch.object(
+                gui_windows,
+                "auto_trade_apply_selected_early_close",
+                return_value=close_result,
+            ) as close_command,
             patch.object(gui_windows.QMessageBox, "warning") as warning,
             patch.object(gui_windows, "show_toast") as toast,
         ):
@@ -2766,7 +2625,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 gui_windows.ROUTINE_STATUS_EARLY_CLOSE,
             )
 
-        adapter.apply_selected_early_close.assert_called_once()
+        close_command.assert_called_once()
         self.assertIn("계좌 상태", warning.call_args.args[2])
         toast.assert_not_called()
 
@@ -2906,24 +2765,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         self.assertIn("Recovery를 다시 실행", message)
         self.assertNotIn("RECOVERY_TIMER_START_FAILED", message)
 
-    def test_runtime_timer_exception_hides_internal_exception(self) -> None:
-        window = SimpleNamespace(
-            _runtime_file_snapshot=(("state.json", 1, 1),),
-            statusBarMessage=Mock(),
-        )
-        with (
-            patch(
-                "gui_auto_trade_setting_window.auto_trade_on_runtime_file_timer_tick",
-                side_effect=RuntimeError("secret runtime error"),
-            ),
-            patch("gui_auto_trade_setting_window.LOGGER.exception"),
-        ):
-            gui_windows.AutoTradeSettingWindow.on_runtime_file_timer_tick(window)
-
-        message = window.statusBarMessage.call_args.args[0]
-        self.assertIn("Runtime 상태를 갱신하지 못했습니다.", message)
-        self.assertNotIn("secret runtime error", message)
-
     def test_time_policy_timer_exception_hides_internal_exception(self) -> None:
         window = SimpleNamespace(
             _last_time_policy_gui_minute_key="10:00",
@@ -2953,21 +2794,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         )
         adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [target])
 
-        with (
-            patch("gui_auto_trade_run_control.show_toast") as toast,
-            patch("gui_auto_trade_run_control.QMessageBox.warning") as warning,
-        ):
-            shown = adapter.show_operation_failure_dialog(
+        with patch("gui_auto_trade_run_control.show_toast") as toast:
+            shown = run_control.show_auto_trade_operation_failure_dialog(
+                adapter,
                 "운영시작",
                 {"ok": False, "reason": "RECOVERY_CONTEXT_MISSING"},
+                adapter._targets,
             )
 
         self.assertTrue(shown)
         message = toast.call_args.kwargs["message"]
         self.assertNotIn("RECOVERY_CONTEXT_MISSING", message)
         self.assertIn("로그인, 계좌 및 운영 상태", message)
-        warning.assert_not_called()
-        adapter.close()
         parent.close()
 
     def test_review_required_failure_displays_stock_and_official_reason(self) -> None:
@@ -2994,13 +2832,12 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [target])
 
-            with (
-                patch("gui_auto_trade_run_control.show_toast") as toast,
-                patch("gui_auto_trade_run_control.QMessageBox.warning") as warning,
-            ):
-                shown = adapter.show_operation_failure_dialog(
+            with patch("gui_auto_trade_run_control.show_toast") as toast:
+                shown = run_control.show_auto_trade_operation_failure_dialog(
+                    adapter,
                     "운영시작",
                     {"ok": False, "reason": "REVIEW_REQUIRED"},
+                    adapter._targets,
                 )
 
             self.assertTrue(shown)
@@ -3008,8 +2845,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             self.assertIn("000660 SK하이닉스", message)
             self.assertIn("보유수량 있음 + 현재가 확인 불가", message)
             self.assertIn("검토관리", message)
-            warning.assert_not_called()
-            adapter.close()
             parent.close()
 
     def test_backend_warning_is_not_duplicated_by_monitoring_presenter(self) -> None:
@@ -3024,19 +2859,16 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
         adapter = context_menu.MainMonitoringStockOperationAdapter(parent, [target])
         adapter._last_operation_failure_dialog_shown = True
 
-        with (
-            patch("gui_auto_trade_run_control.show_toast") as toast,
-            patch("gui_auto_trade_run_control.QMessageBox.warning") as warning,
-        ):
-            shown = adapter.show_operation_failure_dialog(
+        with patch("gui_auto_trade_run_control.show_toast") as toast:
+            shown = run_control.show_auto_trade_operation_failure_dialog(
+                adapter,
                 "운영시작",
                 {"ok": False, "reason": "START_FAILED"},
+                adapter._targets,
             )
 
         self.assertFalse(shown)
         toast.assert_not_called()
-        warning.assert_not_called()
-        adapter.close()
         parent.close()
 
     def test_backend_exception_uses_critical_dialog_and_keeps_state(self) -> None:
@@ -3050,8 +2882,8 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             )
             status_bar = MagicMock()
             adapter = MagicMock()
-            adapter.start_selected_auto_trades.side_effect = RuntimeError("backend failed")
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 _routine_instance_stock_dirs=lambda _instance_id: [stock_dir],
                 _reload_main_routine_table_preserving_view=MagicMock(),
                 statusBar=lambda: status_bar,
@@ -3066,6 +2898,11 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     gui_windows,
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
+                ),
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    side_effect=RuntimeError("backend failed"),
                 ),
                 patch.object(gui_windows.QMessageBox, "critical") as critical,
             ):
@@ -3103,6 +2940,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             adapter = MagicMock()
             status_bar = MagicMock()
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 _routine_instance_stock_dirs=lambda _instance_id: [
                     review_dir,
                     normal_dir,
@@ -3115,7 +2953,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                 display_name="지표추종매매",
             )
 
-            def start_instance() -> dict[str, object]:
+            def start_instance(*_args, **_kwargs) -> dict[str, object]:
                 (normal_dir / "state.json").write_text(
                     json.dumps({"status": "MONITORING", "trade_enabled": True}),
                     encoding="utf-8",
@@ -3126,7 +2964,6 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "excluded_review": ("000660 SK하이닉스",),
                 }
 
-            adapter.start_selected_auto_trades.side_effect = start_instance
             with (
                 patch.object(gui_windows, "routine_instance_by_id", return_value=instance),
                 patch.object(
@@ -3134,13 +2971,18 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
                     "MainMonitoringStockOperationAdapter",
                     return_value=adapter,
                 ) as adapter_factory,
+                patch.object(
+                    gui_windows,
+                    "execute_main_monitoring_selective_start",
+                    side_effect=start_instance,
+                ) as start_command,
             ):
                 gui_windows.MainWindow.toggle_routine_instance_operation(
                     window,
                     "instance-a",
                 )
 
-            adapter.start_selected_auto_trades.assert_called_once()
+            start_command.assert_called_once_with(adapter, source="main_routine_start")
             targets = adapter_factory.call_args.args[1]
             self.assertEqual(
                 {"005930"},
@@ -3175,6 +3017,7 @@ class MainInstanceOperationBadgeTest(unittest.TestCase):
             reload_table = MagicMock()
             status_bar = MagicMock()
             window = SimpleNamespace(
+                _main_monitoring_auto_trade_operation_host=participant_owner(),
                 _routine_instance_stock_dirs=lambda _instance_id: review_dirs,
                 _reload_main_routine_table_preserving_view=reload_table,
                 statusBar=lambda: status_bar,

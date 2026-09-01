@@ -380,7 +380,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
         backend.assert_called_once_with(window, target)
         self.assertFalse(window._stock_operation_mode_double_click_pending)
 
-    def test_write_failure_does_not_report_success_and_reloads_runtime_views(self) -> None:
+    def test_write_failure_does_not_report_success_or_refresh_views(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stock_dir = self._stock(Path(temp))
             window, parent = self._window(stock_dir)
@@ -393,8 +393,8 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
                 status_ops.auto_trade_set_selected_operation_mode(window, "CONTINUOUS")
 
         append_changelog.assert_not_called()
-        window.refresh_all.assert_called_once_with()
-        parent.refresh_all.assert_called_once_with()
+        window.refresh_all.assert_not_called()
+        parent.refresh_all.assert_not_called()
         window.statusBarMessage.assert_not_called()
         window.showAutoTradePopupMessage.assert_not_called()
         warning.assert_called_once_with(
@@ -436,7 +436,11 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             window, _parent = self._window(stock_dir)
             with (
                 patch.object(status_ops, "manual_ats_active_now", return_value=False),
-                patch.object(Path, "write_text", side_effect=OSError("write failed")),
+                patch.object(
+                    status_ops.StockRepository,
+                    "_atomic_write_stock_config",
+                    side_effect=OSError("write failed"),
+                ),
                 patch.object(status_ops, "clear_manual_ats_runtime_selection") as clear_ats,
                 patch.object(status_ops, "append_stock_log"),
             ):
@@ -942,7 +946,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             refresh_all=Mock(),
         )
         monitoring_adapter = SimpleNamespace(
-            target_snapshot=lambda: [target],
+            selected_stock_infos=lambda: [target],
             _window=Mock(),
             parent=lambda: None,
             refresh_all=Mock(),
@@ -961,7 +965,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             patch.object(monitoring_menu, "auto_trade_finalize_operation_mode_result") as monitoring_finalize,
         ):
             AutoTradeSettingWindow.set_selected_individual_schedule_time(setting_window)
-            monitoring_menu.MainMonitoringStockOperationAdapter.set_selected_individual_schedule_time(
+            monitoring_menu.set_main_monitoring_individual_schedule_time(
                 monitoring_adapter
             )
 
@@ -993,7 +997,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             refresh_all=Mock(),
         )
         monitoring_adapter = SimpleNamespace(
-            target_snapshot=lambda: [target],
+            selected_stock_infos=lambda: [target],
             parent=lambda: None,
             refresh_all=Mock(),
         )
@@ -1005,7 +1009,7 @@ class AutoTradeOperationModeE2ETest(unittest.TestCase):
             patch.object(monitoring_menu, "auto_trade_finalize_operation_mode_result") as monitoring_finalize,
         ):
             AutoTradeSettingWindow.reset_selected_schedule_to_global(setting_window)
-            monitoring_menu.MainMonitoringStockOperationAdapter.reset_selected_schedule_to_global(
+            monitoring_menu.reset_main_monitoring_schedule_to_global(
                 monitoring_adapter
             )
 

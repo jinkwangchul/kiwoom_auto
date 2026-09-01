@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 import json
@@ -260,8 +262,7 @@ class OrderExecutionsPilotBoundaryTest(unittest.TestCase):
         send_order.assert_not_called()
         self.assertFalse(self.target.exists())
         self.assertEqual(before_runtime, {str(path): _sha256(path) for path in runtime_paths})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

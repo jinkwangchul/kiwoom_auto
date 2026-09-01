@@ -18,8 +18,10 @@ from datetime import date, datetime
 from typing import Iterable
 
 from state_policy import (
+    auto_trade_setting_display_status,
     normalize_operation_mode,
     auto_trade_status_display,
+    display_status_text_for_gui,
     normalized_hhmmss_or_empty,
     operation_text_and_color,
     scheduled_status_for_now,
@@ -28,7 +30,6 @@ from state_policy import (
 )
 
 from gui_operation_environment import read_operation_policy
-from gui_auto_trade_display import auto_trade_setting_display_status, display_status_text_for_gui
 from gui_auto_trade_integrity import is_operation_excluded
 from gui_auto_trade_runtime import now_text
 from gui_ats_utils import (
@@ -114,8 +115,10 @@ def auto_trade_setting_trade_started(state: dict[str, object]) -> bool:
     return raw_status not in ("STOPPED", "STOP", "MANUAL_STOPPED")
 
 
-_CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR = (
-    "_current_session_operation_participant_stock_codes"
+_PARTICIPANT_OWNER_API = (
+    "current_session_operation_participant_stock_codes",
+    "register_current_session_operation_participants",
+    "retire_current_session_operation_participants",
 )
 START_BUDGET_PROTECTED_FIELDS = (
     "trade_amount_type",
@@ -124,18 +127,52 @@ START_BUDGET_PROTECTED_FIELDS = (
 )
 
 
-def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
-    """Return process-local owners that can carry explicit start participation."""
+class ParticipantOwnerUnavailableError(RuntimeError):
+    reason_code = "OPERATION_HOST_OWNER_UNAVAILABLE"
 
-    contexts: list[object] = []
+    def __init__(self) -> None:
+        super().__init__(self.reason_code)
+
+
+def _is_operation_participant_owner(candidate: object | None) -> bool:
+    if candidate is None:
+        return False
+    instance_attributes = getattr(candidate, "__dict__", {})
+    if not isinstance(instance_attributes, dict):
+        instance_attributes = {}
+    return all(
+        callable(getattr(candidate, method_name, None))
+        and (
+            callable(getattr(type(candidate), method_name, None))
+            or method_name in instance_attributes
+        )
+        for method_name in _PARTICIPANT_OWNER_API
+    )
+
+
+def _auto_trade_operation_participant_owner(window):
+    """Resolve the already-created widget-free participant owner."""
+
     pending = [window]
     seen: set[int] = set()
-    while pending and len(contexts) < 8:
+    while pending and len(seen) < 8:
         current = pending.pop(0)
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        contexts.append(current)
+        if _is_operation_participant_owner(current):
+            return current
+
+        try:
+            operation_host = getattr(
+                current,
+                "_main_monitoring_auto_trade_operation_host",
+                None,
+            )
+        except Exception:
+            operation_host = None
+        if _is_operation_participant_owner(operation_host):
+            return operation_host
 
         try:
             logical_owner = persistent_feature_owner(current)
@@ -149,10 +186,7 @@ def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
             owner = None
         if owner is not None:
             pending.append(owner)
-        for linked_attr in (
-            "auto_trade_setting_window",
-            "_main_monitoring_auto_trade_operation_host",
-        ):
+        for linked_attr in ("_window",):
             try:
                 linked = getattr(current, linked_attr, None)
             except Exception:
@@ -170,7 +204,7 @@ def _auto_trade_operation_session_contexts(window) -> tuple[object, ...]:
                 parent = None
             if parent is not None:
                 pending.append(parent)
-    return tuple(contexts)
+    raise ParticipantOwnerUnavailableError()
 
 
 def auto_trade_register_current_session_operation_participants(
@@ -183,30 +217,8 @@ def auto_trade_register_current_session_operation_participants(
     ``trade_enabled`` values must never create current-session participation.
     """
 
-    normalized = {
-        normalize_stock_code(code)
-        for code in stock_codes
-        if normalize_stock_code(code)
-    }
-    if not normalized:
-        return ()
-    for context in _auto_trade_operation_session_contexts(window):
-        existing = getattr(
-            context,
-            _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
-            None,
-        )
-        participants = set(existing) if isinstance(existing, (set, frozenset)) else set()
-        participants.update(normalized)
-        try:
-            setattr(
-                context,
-                _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
-                participants,
-            )
-        except Exception:
-            continue
-    return tuple(sorted(normalized))
+    owner = _auto_trade_operation_participant_owner(window)
+    return tuple(owner.register_current_session_operation_participants(stock_codes))
 
 
 def auto_trade_retire_current_session_operation_participants(
@@ -215,59 +227,13 @@ def auto_trade_retire_current_session_operation_participants(
 ) -> dict[str, tuple[str, ...]]:
     """Remove explicit operation participation from this process only."""
 
-    requested = tuple(
-        sorted(
-            {
-                normalize_stock_code(code)
-                for code in stock_codes
-                if normalize_stock_code(code)
-            }
-        )
-    )
-    before = auto_trade_current_session_operation_participant_codes(window)
-    requested_set = set(requested)
-    removed = tuple(code for code in before if code in requested_set)
-    remaining = tuple(code for code in before if code not in requested_set)
-
-    if removed:
-        remaining_set = set(remaining)
-        for context in _auto_trade_operation_session_contexts(window):
-            try:
-                setattr(
-                    context,
-                    _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
-                    set(remaining_set),
-                )
-            except Exception:
-                continue
-
-    return {
-        "before": before,
-        "requested": requested,
-        "removed": removed,
-        "remaining": remaining,
-    }
+    owner = _auto_trade_operation_participant_owner(window)
+    return dict(owner.retire_current_session_operation_participants(stock_codes))
 
 
 def auto_trade_current_session_operation_participant_codes(window) -> tuple[str, ...]:
-    participants: set[str] = set()
-    for context in _auto_trade_operation_session_contexts(window):
-        try:
-            values = getattr(
-                context,
-                _CURRENT_SESSION_OPERATION_PARTICIPANTS_ATTR,
-                None,
-            )
-        except Exception:
-            values = None
-        if not isinstance(values, (set, frozenset, tuple, list)):
-            continue
-        participants.update(
-            str(code or "").strip()
-            for code in values
-            if str(code or "").strip()
-        )
-    return tuple(sorted(participants))
+    owner = _auto_trade_operation_participant_owner(window)
+    return tuple(owner.current_session_operation_participant_stock_codes())
 
 
 def auto_trade_start_budget_mutation_decision(
@@ -325,17 +291,8 @@ def auto_trade_start_budget_current_running(
     if not clean_code or is_operation_excluded(config):
         return False
 
-    running_owner = window
-    for context in _auto_trade_operation_session_contexts(window):
-        try:
-            checker = getattr(context, "startup_recovery_session_ready", None)
-        except Exception:
-            checker = None
-        if callable(checker):
-            running_owner = context
-            break
     return auto_trade_setting_current_session_trade_started(
-        running_owner,
+        window,
         auto_trade_setting_trade_started(state),
         clean_code,
     )
@@ -802,26 +759,6 @@ def auto_trade_setting_start_target_decision(
     }
 
 
-def auto_trade_setting_start_target_allowed(
-    window,
-    state: dict[str, object],
-    stock_code: object,
-    *,
-    config: dict[str, object] | None = None,
-    now_dt: datetime | None = None,
-) -> bool:
-    """Return whether an explicit current-session start may classify the target."""
-    return bool(
-        auto_trade_setting_start_target_decision(
-            window,
-            state,
-            stock_code,
-            config=config,
-            now_dt=now_dt,
-        ).get("allowed")
-    )
-
-
 def auto_trade_setting_no_next_step_notice(state: dict[str, object] | None) -> bool:
     """정상 흐름이지만 다음 절차로 진행할 대상이 없어 주황 현황으로 표시할 상태.
 
@@ -1277,14 +1214,6 @@ def individual_liquidation_policy_from_state(
         "minutes_before_regular_close": str(minutes),
         "method": method,
     }
-
-
-def _safe_nonnegative_int(value: object) -> int:
-    try:
-        result = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, result)
 
 
 def effective_liquidation_policy_for_config(

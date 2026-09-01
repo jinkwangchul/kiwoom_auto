@@ -21,6 +21,11 @@ import gui_auto_trade_run_control as run_control
 import routine_signal_order_bridge
 import routine_signal_consumer
 import gui_auto_trade_timer
+from tests.participant_owner_fixture import (
+    attach_participant_owner,
+    participant_codes,
+    participant_owner,
+)
 
 
 TODAY = "2026-08-26"
@@ -109,7 +114,7 @@ class ParticipantWriterTests(unittest.TestCase):
     def test_retirement_is_canonical_idempotent_and_process_local(self) -> None:
         owner = SimpleNamespace()
         setting = SimpleNamespace(_owner=owner)
-        host = SimpleNamespace(_owner=owner)
+        host = participant_owner()
         owner.auto_trade_setting_window = setting
         owner._main_monitoring_auto_trade_operation_host = host
 
@@ -404,7 +409,7 @@ class RetirementServiceAndHostTests(unittest.TestCase):
         targets.append((continuous, "012210", "012210"))
         all_codes = {*scheduled_codes, "012210"}
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes=set(all_codes),
+            _main_monitoring_auto_trade_operation_host=participant_owner(all_codes),
             startup_recovery_session_ready=lambda refresh=False: True,
         )
         operation_state = _operation_state(
@@ -459,7 +464,7 @@ class RetirementServiceAndHostTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"},
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
             startup_recovery_session_ready=lambda refresh=False: True,
         )
         ledger = self.root / "operation_state.json"
@@ -497,7 +502,9 @@ class RetirementServiceAndHostTests(unittest.TestCase):
             },
         )
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210", "063440"}
+            _main_monitoring_auto_trade_operation_host=participant_owner(
+                {"012210", "063440"}
+            )
         )
         result = self._run_service(
             window,
@@ -509,7 +516,7 @@ class RetirementServiceAndHostTests(unittest.TestCase):
 
     def test_same_day_explicit_restart_readds_retired_participant(self) -> None:
         window = SimpleNamespace(
-            _current_session_operation_participant_stock_codes={"012210"}
+            _main_monitoring_auto_trade_operation_host=participant_owner({"012210"})
         )
         auto_trade_retire_current_session_operation_participants(window, ["012210"])
         added = auto_trade_register_current_session_operation_participants(

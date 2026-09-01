@@ -11,6 +11,7 @@ from PyQt5.QtCore import QCoreApplication, QObject
 
 import auto_candle_refresh
 from execution_universe import project_execution_universe
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 from gui_market_data_host import MarketDataHost
 from kiwoom_api import KiwoomApi
 from kiwoom_market_data_authority import (
@@ -122,12 +123,28 @@ class Phase12LoadReconnectSimulationTest(unittest.TestCase):
             (excluded / "config.json").write_text(
                 json.dumps({"operation_excluded": True}), encoding="utf-8"
             )
-            fresh_process = SimpleNamespace(
-                startup_recovery_session_ready=Mock(return_value=True)
+            fresh_process = QObject()
+            fresh_process.startup_recovery_session_ready = Mock(return_value=True)
+            operation_host = AutoTradeOperationHost(fresh_process)
+            fresh_process._main_monitoring_auto_trade_operation_host = operation_host
+            self.addCleanup(operation_host.deleteLater)
+            self.addCleanup(fresh_process.deleteLater)
+
+            self.assertEqual(
+                (), operation_host.current_session_operation_participant_stock_codes()
             )
-            snapshot = project_execution_universe(
-                fresh_process,
-                stock_dirs=[running, waiting, excluded],
+            with patch.object(
+                operation_host,
+                "register_current_session_operation_participants",
+                wraps=operation_host.register_current_session_operation_participants,
+            ) as register_participants:
+                snapshot = project_execution_universe(
+                    fresh_process,
+                    stock_dirs=[running, waiting, excluded],
+                )
+            register_participants.assert_not_called()
+            self.assertEqual(
+                (), operation_host.current_session_operation_participant_stock_codes()
             )
 
         self.assertEqual((), snapshot.participant_stock_codes)

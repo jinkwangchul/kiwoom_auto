@@ -157,16 +157,16 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertEqual("immediate", unregister["category"])
         self.assertEqual(["Strategy: 보유·미체결 없음"], unregister["reasons"])
 
-    def test_unregister_policy_blocks_active_and_emergency_statuses(self) -> None:
+    def test_unregister_policy_ignores_stale_active_status_and_blocks_emergency(self) -> None:
         scenarios = {
-            "RUNNING": "Strategy: 운영 중 종목입니다.",
-            "STARTED": "Strategy: 운영 중 종목입니다.",
-            "AUTO": "Strategy: 운영 중 종목입니다.",
-            "TRADING": "Strategy: 운영 중 종목입니다.",
-            "SELL_ONLY": "Strategy: 운영 중 종목입니다.",
-            "EMERGENCY_STOP": "Strategy: 긴급정지 종목입니다.",
+            "RUNNING": ("immediate", "Strategy: 보유·미체결 없음"),
+            "STARTED": ("immediate", "Strategy: 보유·미체결 없음"),
+            "AUTO": ("immediate", "Strategy: 보유·미체결 없음"),
+            "TRADING": ("immediate", "Strategy: 보유·미체결 없음"),
+            "SELL_ONLY": ("immediate", "Strategy: 보유·미체결 없음"),
+            "EMERGENCY_STOP": ("blocked", "Strategy: 긴급정지 종목입니다."),
         }
-        for raw_status, expected_reason in scenarios.items():
+        for raw_status, (expected_category, expected_reason) in scenarios.items():
             with self.subTest(raw_status=raw_status), tempfile.TemporaryDirectory() as temp:
                 _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
                 state_path = stock_dir / "state.json"
@@ -184,7 +184,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                     "Stock",
                 )
 
-            self.assertEqual("blocked", unregister["category"])
+            self.assertEqual(expected_category, unregister["category"])
             self.assertEqual([expected_reason], unregister["reasons"])
 
     def test_unregister_policy_blocks_review_required_as_review_management(self) -> None:
@@ -208,7 +208,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
         self.assertEqual("blocked", unregister["category"])
         self.assertEqual(["Strategy: 검토관리 종목입니다."], unregister["reasons"])
 
-    def test_unregister_policy_moves_pending_integrity_error_to_review(self) -> None:
+    def test_unregister_policy_reports_pending_integrity_without_review_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
             state_path = stock_dir / "state.json"
@@ -239,12 +239,10 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             ["Strategy: 처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."],
             unregister["reasons"],
         )
-        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
-        self.assertTrue(saved_state["review_required"])
-        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
-        self.assertIn("LEGACY_PENDING_SUMMARY_ONLY", saved_state["review_detail"])
+        self.assertEqual("STOPPED", saved_state["status"])
+        self.assertFalse(bool(saved_state.get("review_required")))
 
-    def test_unregister_policy_moves_unknown_pending_side_to_review(self) -> None:
+    def test_unregister_policy_reports_unknown_pending_side_without_review_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             _routines_dir, _stocks_dir, stock_dir = self._fixture(Path(temp))
             state_path = stock_dir / "state.json"
@@ -281,9 +279,8 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             ["Strategy: 처리할 수 없는 종목입니다.\n검토관리에서 확인하세요."],
             unregister["reasons"],
         )
-        self.assertEqual("REVIEW_REQUIRED", saved_state["status"])
-        self.assertEqual("미체결 데이터 오류", saved_state["review_reason"])
-        self.assertIn("PENDING_ORDER_SIDE_UNKNOWN", saved_state["review_detail"])
+        self.assertEqual("STOPPED", saved_state["status"])
+        self.assertFalse(bool(saved_state.get("review_required")))
 
     def test_unregister_policy_keeps_normal_buy_pending_as_policy_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -472,7 +469,7 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
                 patch.object(status_ops, "append_changelog"),
                 patch.object(auto_trade_timer, "probe_all_enabled_routine_stocks_once", None),
             ):
-                auto_trade_timer.auto_trade_on_time_policy_timer_tick(window)
+                auto_trade_timer.auto_trade_run_operation_cycle(window)
 
             state = read_json_dict(stock_dir / "state.json")
 
@@ -534,43 +531,11 @@ class AutoTradeStatusRecalculationPipelineTest(unittest.TestCase):
             ),
             patch("execution_universe.all_registered_stock_dirs", return_value=[]),
         ):
-            auto_trade_timer.auto_trade_on_time_policy_timer_tick(window)
+            auto_trade_timer.auto_trade_run_operation_cycle(window)
 
         probe.assert_not_called()
         pipeline.assert_called_once_with(window)
         self.assertEqual("", window.current_selected_routine_name())
-
-    def test_runtime_file_signature_tracks_central_stocks_without_routine_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            _routines_dir, stocks_dir, stock_dir = self._fixture(Path(temp))
-            window = SimpleNamespace(current_selected_routine_dir=lambda: None)
-
-            with patch.object(auto_trade_runtime, "CENTRAL_STOCKS_DIR", stocks_dir):
-                signature = auto_trade_timer.auto_trade_current_runtime_file_signature(
-                    window
-                )
-
-        self.assertIn(str(stock_dir / "state.json"), signature)
-        self.assertIn(str(stock_dir / "config.json"), signature)
-        self.assertIn(str(stock_dir / "orders.json"), signature)
-
-    def test_runtime_file_tick_refreshes_open_setting_after_central_change(self) -> None:
-        window = SimpleNamespace(
-            isVisible=lambda: True,
-            current_runtime_file_signature=Mock(return_value={"state.json": 2}),
-            _runtime_file_snapshot={"state.json": 1},
-            capture_stock_table_view_state=Mock(return_value=({"stock"}, 7)),
-            load_selected_routine_stocks=Mock(),
-            restore_stock_table_view_state=Mock(),
-            update_action_buttons=Mock(),
-        )
-
-        auto_trade_timer.auto_trade_on_runtime_file_timer_tick(window)
-
-        window.load_selected_routine_stocks.assert_called_once_with()
-        window.restore_stock_table_view_state.assert_called_once_with({"stock"}, 7)
-        window.update_action_buttons.assert_called_once_with()
-        self.assertEqual({"state.json": 2}, window._runtime_file_snapshot)
 
     def test_missing_runtime_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

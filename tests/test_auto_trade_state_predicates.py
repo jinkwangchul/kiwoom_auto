@@ -4,9 +4,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from gui_auto_trade_integrity import (
+    REVIEW_INSPECTION_STATE_DATA_INCONSISTENT,
+    REVIEW_INSPECTION_STATE_MISSING,
+    REVIEW_INSPECTION_STATE_READ_ERROR,
+    inspect_review_state_path,
     is_emergency_stopped_state,
     is_operation_excluded,
     is_review_protected_stock_dir,
+    is_review_required_stock_dir,
     is_review_required_state,
 )
 
@@ -84,6 +89,38 @@ class AutoTradeStatePredicateTests(unittest.TestCase):
 
             (stock_dir / "state.json").write_text("{broken", encoding="utf-8")
             self.assertTrue(is_review_protected_stock_dir(stock_dir))
+
+    def test_review_inspector_fails_closed_for_missing_and_corrupt_state(self):
+        with TemporaryDirectory() as root:
+            stock_dir = Path(root) / "000001_TEST"
+            stock_dir.mkdir(parents=True)
+            state_path = stock_dir / "state.json"
+
+            missing = inspect_review_state_path(state_path)
+            self.assertTrue(missing.review_required)
+            self.assertFalse(missing.state_valid)
+            self.assertEqual(REVIEW_INSPECTION_STATE_MISSING, missing.reason_code)
+            self.assertTrue(is_review_required_stock_dir(stock_dir))
+
+            state_path.write_text("{broken", encoding="utf-8")
+            corrupt = inspect_review_state_path(state_path)
+            self.assertTrue(corrupt.review_required)
+            self.assertFalse(corrupt.state_valid)
+            self.assertEqual(REVIEW_INSPECTION_STATE_READ_ERROR, corrupt.reason_code)
+            self.assertTrue(is_review_required_stock_dir(stock_dir))
+
+            state_path.write_text(
+                json.dumps({"status": "STOPPED", "holding_qty": "invalid"}),
+                encoding="utf-8",
+            )
+            partial = inspect_review_state_path(state_path)
+            self.assertTrue(partial.review_required)
+            self.assertFalse(partial.state_valid)
+            self.assertEqual(
+                REVIEW_INSPECTION_STATE_DATA_INCONSISTENT,
+                partial.reason_code,
+            )
+            self.assertIn("holding_qty 숫자 형식 오류", partial.issues)
 
     def test_emergency_stopped_state_normalizes_case_and_whitespace(self):
         self.assertTrue(is_emergency_stopped_state({"status": " emergency_stopped "}))

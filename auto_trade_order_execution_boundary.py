@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -1046,6 +1047,210 @@ class AutoTradeOrderExecutionBoundary:
             return None
         return amount if amount >= 0 else None
 
+    @staticmethod
+    def _execution_price_basis(
+        order: Mapping[str, object],
+        *,
+        execution_method: object = None,
+    ) -> str:
+        method = str(execution_method or "").strip().upper()
+        if method in {"MARKET", "CURRENT_PRICE", "ORDER_PRICE"}:
+            return method
+        for source in (
+            order,
+            order.get("execution_intent"),
+            order.get("order_intent"),
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            value = str(source.get("price_basis") or "").strip().upper()
+            if value in {"MARKET", "CURRENT_PRICE", "ORDER_PRICE"}:
+                return value
+        return ""
+
+    @staticmethod
+    def _positive_price(value: object) -> tuple[int | float | None, str]:
+        if isinstance(value, bool):
+            return None, "fresh CURRENT_PRICE must be positive"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None, "fresh CURRENT_PRICE must be positive"
+        if not math.isfinite(numeric) or numeric <= 0:
+            return None, "fresh CURRENT_PRICE must be positive"
+        return (int(numeric) if numeric.is_integer() else numeric), ""
+
+    def _fresh_current_price(self, stock_code: object) -> tuple[int | float | None, str]:
+        callback = self._context.fresh_current_price
+        if not callable(callback):
+            return None, "CURRENT_PRICE actionable resolver is unavailable"
+        code = normalize_stock_code(stock_code)
+        if not code:
+            return None, "CURRENT_PRICE stock code is unavailable"
+        try:
+            value = callback(code)
+        except Exception as exc:
+            return None, f"CURRENT_PRICE actionable resolver failed: {exc}"
+        return self._positive_price(value)
+
+    @staticmethod
+    def _order_with_final_current_price(
+        order: Mapping[str, object],
+        price: int | float,
+    ) -> dict[str, object]:
+        finalized = deepcopy(dict(order))
+        finalized["price"] = price
+        for key in ("execution_intent", "order_intent"):
+            source = finalized.get(key)
+            if not isinstance(source, dict) or "price" not in source:
+                continue
+            updated = deepcopy(source)
+            updated["price"] = price
+            finalized[key] = updated
+        return finalized
+
+    def finalize_current_price_before_hash(
+        self,
+        order: Mapping[str, object],
+        *,
+        queue_path: Path,
+        execution_method: object = None,
+        resolved_current_price: object = None,
+    ) -> dict[str, object]:
+        """Freeze CURRENT_PRICE and rerun existing risk guards before identity creation."""
+        original = deepcopy(dict(order))
+        price_basis = self._execution_price_basis(
+            original,
+            execution_method=execution_method,
+        )
+        if price_basis != "CURRENT_PRICE":
+            return {
+                "ok": True,
+                "applied": False,
+                "stage": "current_price_pre_hash_not_applicable",
+                "price_basis": price_basis,
+                "order": original,
+                "blocked_reasons": [],
+            }
+
+        if resolved_current_price is None:
+            final_price, price_reason = self._fresh_current_price(original.get("code"))
+        else:
+            final_price, price_reason = self._positive_price(resolved_current_price)
+        if final_price is None:
+            return {
+                "ok": False,
+                "applied": False,
+                "stage": "current_price_pre_hash_unavailable",
+                "price_basis": price_basis,
+                "order": original,
+                "blocked_reasons": [price_reason],
+            }
+
+        finalized = self._order_with_final_current_price(original, final_price)
+        side = str(finalized.get("side") or "").strip().upper()
+        quantity, quantity_reason = self._positive_int(
+            finalized.get("quantity"),
+            field=f"requested {side or 'order'} quantity",
+        )
+        if quantity is None:
+            return {
+                "ok": False,
+                "applied": False,
+                "stage": "current_price_pre_hash_quantity",
+                "price_basis": price_basis,
+                "order": original,
+                "blocked_reasons": [quantity_reason],
+            }
+
+        refreshed_exposure = quantity * final_price
+        try:
+            selected_account = str(self._context.selected_account_no() or "").strip()
+        except Exception:
+            selected_account = ""
+        environment = {"selected_account_no": selected_account}
+
+        approved_budget: int | None = None
+        if side == "BUY":
+            try:
+                approved_budget = canonical_buy_candidate_amount(original)
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "applied": False,
+                    "stage": "current_price_pre_hash_approved_budget",
+                    "price_basis": price_basis,
+                    "order": original,
+                    "blocked_reasons": [f"approved BUY budget unavailable: {exc}"],
+                }
+            if refreshed_exposure > approved_budget:
+                return {
+                    "ok": False,
+                    "applied": False,
+                    "stage": "current_price_pre_hash_approved_budget_exceeded",
+                    "price_basis": price_basis,
+                    "order": original,
+                    "original_price": original.get("price"),
+                    "final_price": final_price,
+                    "quantity": quantity,
+                    "approved_budget": approved_budget,
+                    "refreshed_exposure": refreshed_exposure,
+                    "blocked_reasons": [
+                        "refreshed CURRENT_PRICE exposure exceeds approved BUY budget"
+                    ],
+                }
+            risk_result = self._fresh_buy_dispatch_preflight(
+                finalized,
+                environment,
+                queue_path,
+                requested_exposure_override=refreshed_exposure,
+            )
+        elif side == "SELL":
+            risk_result = self._fresh_sell_dispatch_preflight(finalized, environment)
+        else:
+            return {
+                "ok": False,
+                "applied": False,
+                "stage": "current_price_pre_hash_side",
+                "price_basis": price_basis,
+                "order": original,
+                "blocked_reasons": ["CURRENT_PRICE side must be BUY or SELL"],
+            }
+
+        if risk_result.get("ok") is not True:
+            return {
+                "ok": False,
+                "applied": False,
+                "stage": str(risk_result.get("stage") or "current_price_pre_hash_risk"),
+                "price_basis": price_basis,
+                "order": original,
+                "original_price": original.get("price"),
+                "final_price": final_price,
+                "quantity": quantity,
+                "approved_budget": approved_budget,
+                "refreshed_exposure": refreshed_exposure,
+                "risk_result": risk_result,
+                "blocked_reasons": list(
+                    risk_result.get("blocked_reasons")
+                    or ["CURRENT_PRICE pre-hash risk revalidation failed"]
+                ),
+            }
+
+        return {
+            "ok": True,
+            "applied": True,
+            "stage": "current_price_pre_hash_finalized",
+            "price_basis": price_basis,
+            "order": finalized,
+            "original_price": original.get("price"),
+            "final_price": final_price,
+            "quantity": quantity,
+            "approved_budget": approved_budget,
+            "refreshed_exposure": refreshed_exposure,
+            "risk_result": risk_result,
+            "blocked_reasons": [],
+        }
+
     def _load_queue_orders_for_fresh_preflight(self, queue_path: Path) -> tuple[list[dict[str, object]], str]:
         try:
             data = json.loads(queue_path.read_text(encoding="utf-8"))
@@ -1176,6 +1381,8 @@ class AutoTradeOrderExecutionBoundary:
         order: dict[str, object],
         environment: dict[str, object],
         queue_path: Path,
+        *,
+        requested_exposure_override: int | float | None = None,
     ) -> dict[str, object]:
         request = self._order_request_preview(order)
         qty, qty_reason = self._positive_int(
@@ -1184,10 +1391,24 @@ class AutoTradeOrderExecutionBoundary:
         )
         if qty is None:
             return {"ok": False, "stage": "fresh_buy_quantity", "blocked_reasons": [qty_reason]}
-        try:
-            requested_exposure = canonical_buy_candidate_amount(order)
-        except ValueError as exc:
-            return {"ok": False, "stage": "fresh_buy_exposure", "blocked_reasons": [f"fresh BUY exposure unavailable: {exc}"]}
+        if requested_exposure_override is None:
+            try:
+                requested_exposure = canonical_buy_candidate_amount(order)
+            except ValueError as exc:
+                return {"ok": False, "stage": "fresh_buy_exposure", "blocked_reasons": [f"fresh BUY exposure unavailable: {exc}"]}
+        else:
+            if (
+                isinstance(requested_exposure_override, bool)
+                or not isinstance(requested_exposure_override, (int, float))
+                or not math.isfinite(float(requested_exposure_override))
+                or requested_exposure_override <= 0
+            ):
+                return {
+                    "ok": False,
+                    "stage": "fresh_buy_exposure",
+                    "blocked_reasons": ["requested BUY exposure must be positive"],
+                }
+            requested_exposure = requested_exposure_override
 
         orderable_cash = self._current_orderable_cash()
         if orderable_cash is None:
@@ -2356,6 +2577,53 @@ class AutoTradeOrderExecutionBoundary:
         if auto_reasons:
             return observed_execution({"processed": False, "stage": "auto_trade_runtime_state", "order_id": order_id, "blocked_reasons": auto_reasons}, "EXECUTION_ENABLE", False)
 
+        ats_execution_method = self.project_ats_execution_order(order_dict)
+        if ats_execution_method.get("ok") is not True:
+            return {
+                "processed": False,
+                "stage": "ats_execution_method",
+                "order_id": order_id,
+                "blocked_reasons": list(
+                    ats_execution_method.get("blocked_reasons") or []
+                ),
+                "ats_execution_method_result": ats_execution_method,
+            }
+        projected_order = ats_execution_method.get("order")
+        projected_order_dict = (
+            projected_order if isinstance(projected_order, dict) else order_dict
+        )
+        pre_hash_current_price = self.finalize_current_price_before_hash(
+            projected_order_dict,
+            queue_path=queue_path,
+            execution_method=(
+                ats_execution_method.get("execution_method")
+                if ats_execution_method.get("applied") is True
+                else None
+            ),
+            resolved_current_price=(
+                ats_execution_method.get("current_price")
+                if ats_execution_method.get("applied") is True
+                and ats_execution_method.get("execution_method") == "CURRENT_PRICE"
+                else None
+            ),
+        )
+        if pre_hash_current_price.get("ok") is not True:
+            return {
+                "processed": False,
+                "stage": "current_price_pre_hash",
+                "order_id": order_id,
+                "blocked_reasons": list(
+                    pre_hash_current_price.get("blocked_reasons")
+                    or ["CURRENT_PRICE pre-hash revalidation failed"]
+                ),
+                "ats_execution_method_result": ats_execution_method,
+                "current_price_pre_hash_result": pre_hash_current_price,
+            }
+        finalized_order = pre_hash_current_price.get("order")
+        finalized_order_dict = (
+            finalized_order if isinstance(finalized_order, dict) else projected_order_dict
+        )
+
         enable_snapshot = self.queue_file_snapshot(queue_path)
         enable_preview = preview_execution_enable(order_dict, {"operator_confirmed_for_execution_enable": True})
         if enable_preview.get("enable_preview") is not True:
@@ -2406,19 +2674,16 @@ class AutoTradeOrderExecutionBoundary:
         real_ready_read = self.read_order_from_queue_by_id(order_id, queue_path)
         real_ready_order = real_ready_read.get("order") if isinstance(real_ready_read, dict) else {}
         real_ready_order_dict = real_ready_order if isinstance(real_ready_order, dict) else {}
-        ats_execution_method = self.project_ats_execution_order(real_ready_order_dict)
-        if ats_execution_method.get("ok") is not True:
-            return observed_execution({
-                "processed": False,
-                "stage": "ats_execution_method",
-                "order_id": order_id,
-                "blocked_reasons": list(ats_execution_method.get("blocked_reasons") or []),
-                "execution_enable_result": enable_result,
-                "real_preflight_result": preflight_result,
-                "ats_execution_method_result": ats_execution_method,
-            }, "FINAL_GUARD", False)
-        effective_order = ats_execution_method.get("order")
-        effective_order_dict = effective_order if isinstance(effective_order, dict) else real_ready_order_dict
+        effective_order_dict = deepcopy(finalized_order_dict)
+        for field in (
+            "status",
+            "execution_enabled",
+            "approval_status",
+            "policy_status",
+            "updated_at",
+        ):
+            if field in real_ready_order_dict:
+                effective_order_dict[field] = deepcopy(real_ready_order_dict[field])
         execution_preview = preview_execution_for_real_ready_order(
             order_id,
             guard,
@@ -2433,6 +2698,8 @@ class AutoTradeOrderExecutionBoundary:
                 "blocked_reasons": list(execution_preview.get("blocked_reasons") or execution_preview.get("issues") or []),
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
+                "ats_execution_method_result": ats_execution_method,
+                "current_price_pre_hash_result": pre_hash_current_price,
             }, "FINAL_GUARD", False)
 
         runtime_commit = self.commit_execution_runtime_for_preview(
@@ -2452,6 +2719,8 @@ class AutoTradeOrderExecutionBoundary:
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
+                "ats_execution_method_result": ats_execution_method,
+                "current_price_pre_hash_result": pre_hash_current_price,
                 "runtime_commit_result": runtime_commit,
             }, "FINAL_GUARD", False)
 
@@ -2469,6 +2738,8 @@ class AutoTradeOrderExecutionBoundary:
                 "execution_enable_result": enable_result,
                 "real_preflight_result": preflight_result,
                 "execution_preview_result": execution_preview,
+                "ats_execution_method_result": ats_execution_method,
+                "current_price_pre_hash_result": pre_hash_current_price,
                 "runtime_commit_result": runtime_commit,
             }, "FINAL_GUARD", False)
 
@@ -2567,6 +2838,7 @@ class AutoTradeOrderExecutionBoundary:
             "execution_enable_result": enable_result,
             "real_preflight_result": preflight_result,
             "ats_execution_method_result": ats_execution_method,
+            "current_price_pre_hash_result": pre_hash_current_price,
             "execution_preview_result": execution_preview,
             "runtime_commit_result": runtime_commit,
             "queue_commit_readiness_policy_result": queue_commit_readiness,

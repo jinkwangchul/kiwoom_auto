@@ -103,24 +103,30 @@ def _price_for_basis(
     signal_context: dict[str, Any],
     budget_context: dict[str, Any],
 ) -> tuple[float | None, str]:
+    if order_price_basis == "MARKET":
+        return None, "MARKET"
     source_keys = {
         "ORDER_PRICE": ("order_price", "planned_order_price", "price"),
-        "CURRENT_PRICE": ("current_price", "latest_price", "close"),
-        "MARKET": ("market_price", "current_price", "latest_price", "price"),
+        "CURRENT_PRICE": ("actionable_current_price", "current_price"),
     }
     for source in (signal_context, budget_context):
         for key in source_keys.get(order_price_basis, ()):
             price = _positive_float(source.get(key))
             if price is not None:
                 return price, key
-    if order_price_basis == "MARKET":
-        return None, "MARKET"
     return None, "MISSING"
 
 
 def _current_price(signal_context: dict[str, Any], budget_context: dict[str, Any]) -> tuple[float | None, str]:
     for source in (signal_context, budget_context):
-        for key in ("current_price", "latest_price", "close"):
+        for key in (
+            "sizing_reference_price",
+            "actionable_current_price",
+            "current_price",
+            "reference_price",
+            "latest_price",
+            "close",
+        ):
             price = _positive_float(source.get(key))
             if price is not None:
                 return price, key

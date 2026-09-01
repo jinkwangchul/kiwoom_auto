@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from gui_auto_trade_operation_host import AutoTradeOperationHost
+from gui_operation_ui_context import sync_auto_trade_monitoring_universe
 from gui_windows import MainWindow
 from stock_repository import StockRecord, StockRepository
 
@@ -150,7 +151,70 @@ class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
 
         host.sync_monitoring_universe_for_current_session.assert_not_called()
 
-    def test_stock_membership_refresh_resyncs_monitoring_once(self) -> None:
+    def test_automatic_retention_runs_once_for_each_new_login_session(self) -> None:
+        events: list[str] = []
+        owner, _host = self._main_double(events)
+        retention_runner = SimpleNamespace(run_for_session=Mock())
+        owner.stock_library_diagnostics_retention = retention_runner
+        first_state = {
+            "connected": True,
+            "connection_epoch": 7,
+            "login_session_id": "SESSION-7",
+        }
+        second_state = {
+            "connected": True,
+            "connection_epoch": 8,
+            "login_session_id": "SESSION-8",
+        }
+
+        with patch("gui_windows.QTimer.singleShot"), patch(
+            "gui_windows.append_production_event"
+        ):
+            for _ in range(10):
+                MainWindow.on_kiwoom_login_state_changed(owner, first_state)
+            MainWindow.on_kiwoom_login_state_changed(owner, second_state)
+
+        self.assertEqual(
+            [
+                call(
+                    current_connection_epoch=7,
+                    current_session_id="SESSION-7",
+                ),
+                call(
+                    current_connection_epoch=8,
+                    current_session_id="SESSION-8",
+                ),
+            ],
+            retention_runner.run_for_session.call_args_list,
+        )
+
+    def test_automatic_retention_exception_does_not_change_login_success(self) -> None:
+        events: list[str] = []
+        owner, host = self._main_double(events)
+        owner.stock_library_diagnostics_retention = SimpleNamespace(
+            run_for_session=Mock(side_effect=RuntimeError("cleanup failed"))
+        )
+        scheduled: list[object] = []
+
+        with patch(
+            "gui_windows.QTimer.singleShot",
+            side_effect=lambda _delay, callback: scheduled.append(callback),
+        ), patch("gui_windows.append_production_event"):
+            MainWindow.on_kiwoom_login_state_changed(
+                owner,
+                {
+                    "connected": True,
+                    "connection_epoch": 9,
+                    "login_session_id": "SESSION-9",
+                },
+            )
+
+        self.assertEqual((9, "SESSION-9"), owner._handled_kiwoom_login_identity)
+        self.assertTrue(owner._event_journal_kiwoom_connected)
+        self.assertEqual(1, len(scheduled))
+        host.sync_monitoring_universe_for_current_session.assert_called_once_with()
+
+    def test_view_refresh_does_not_resync_monitoring(self) -> None:
         host = SimpleNamespace(
             sync_monitoring_universe_for_current_session=Mock(return_value={"ok": True})
         )
@@ -160,8 +224,24 @@ class LoginTimeMonitoringIntegrationTests(unittest.TestCase):
             auto_trade_setting_window=None,
         )
         MainWindow.refresh_auto_trade_assignment_views(owner)
-        host.sync_monitoring_universe_for_current_session.assert_called_once_with()
+        host.sync_monitoring_universe_for_current_session.assert_not_called()
         owner.refresh_all.assert_called_once_with()
+
+    def test_explicit_membership_sync_uses_operation_host_once(self) -> None:
+        host = SimpleNamespace(
+            sync_monitoring_universe_for_current_session=Mock(
+                return_value={"ok": True, "changed": True}
+            )
+        )
+        owner = SimpleNamespace(
+            main_monitoring_auto_trade_operation_host=Mock(return_value=host),
+        )
+
+        result = sync_auto_trade_monitoring_universe(owner)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        host.sync_monitoring_universe_for_current_session.assert_called_once_with()
 
 
 if __name__ == "__main__":

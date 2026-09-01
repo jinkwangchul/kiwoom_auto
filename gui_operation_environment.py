@@ -18,7 +18,7 @@ import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from PyQt5.QtCore import QSettings, Qt, QTime, QTimer
 from PyQt5.QtWidgets import (
@@ -727,10 +727,25 @@ def suggested_buy_limit(
     if raw_amount is None:
         return None
     if align_digits:
-        from gui_main_budget_panel import round_money_to_two_significant_digits
-
         return round_money_to_two_significant_digits(raw_amount)
     return raw_amount
+
+
+def round_money_to_two_significant_digits(value: object) -> int:
+    """Round a nonnegative integer half-up while preserving two leading digits."""
+    if isinstance(value, bool):
+        raise ValueError("money value must be an integer amount")
+    try:
+        amount = int(str(value).replace(",", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("money value must be an integer amount") from exc
+    if amount < 0:
+        raise ValueError("money value must not be negative")
+    digits = len(str(amount))
+    if digits <= 2:
+        return amount
+    quantum = 10 ** (digits - 2)
+    return ((amount + (quantum // 2)) // quantum) * quantum
 
 
 class TimeComboWidget(QWidget):
@@ -885,9 +900,17 @@ class OperationEnvironmentSettingsDialog(QDialog):
     CLOSE_METHODS = ["루틴매도신호", "시장가", "현재가", "익절/손절", "이월"]
     LIQUIDATION_METHODS = ["이월", "시장가", "현재가"]
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        factory_reset_validator: Callable[..., dict[str, object]] | None = None,
+        factory_reset_executor: Callable[..., dict[str, object]] | None = None,
+    ) -> None:
         super().__init__(None)
         configure_persistent_feature_window(self, parent)
+        self._factory_reset_validator = factory_reset_validator
+        self._factory_reset_executor = factory_reset_executor
         self.setWindowTitle("환경설정")
         self.setStyleSheet("""
             QDialog, QWidget, QLabel, QCheckBox, QComboBox, QLineEdit, QPushButton {
@@ -1584,15 +1607,6 @@ class OperationEnvironmentSettingsDialog(QDialog):
     def _current_registration_location(self) -> str:
         return "EXCLUDED" if self.registration_excluded.isChecked() else "WAITING"
 
-    def _main_window_kiwoom_api(self) -> object | None:
-        current: QWidget | None = persistent_feature_owner(self)
-        while current is not None:
-            api = getattr(current, "kiwoom_api", None)
-            if api is not None:
-                return api
-            current = persistent_feature_owner(current)
-        return None
-
     def _main_window_owner(self) -> QWidget | None:
         current: QWidget | None = persistent_feature_owner(self)
         last: QWidget | None = current
@@ -1655,12 +1669,12 @@ class OperationEnvironmentSettingsDialog(QDialog):
                 timer.start()
 
     def _request_program_factory_reset(self) -> None:
-        from program_factory_reset import (
-            execute_program_factory_reset,
-            validate_factory_reset_safety,
-        )
+        if not callable(self._factory_reset_validator) or not callable(
+            self._factory_reset_executor
+        ):
+            return
 
-        preview = validate_factory_reset_safety(PROJECT_ROOT, broker_connected=False)
+        preview = self._factory_reset_validator(PROJECT_ROOT, broker_connected=False)
         self._last_factory_reset_preview = preview
         if not preview.get("success"):
             issues = [str(item) for item in preview.get("issues", []) if str(item).strip()]
@@ -1698,7 +1712,7 @@ class OperationEnvironmentSettingsDialog(QDialog):
             },
         )
 
-        result = execute_program_factory_reset(
+        result = self._factory_reset_executor(
             PROJECT_ROOT,
             broker_connected=False,
             quiesce=self._quiesce_for_program_factory_reset,

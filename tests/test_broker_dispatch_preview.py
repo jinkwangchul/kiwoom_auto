@@ -8,9 +8,7 @@ import unittest
 from unittest import mock
 
 from broker_dispatch_preview import preview_broker_dispatch
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.filesystem_test_support import TemporaryProjectRoot, write_json
 
 
 def _sha256(path: Path) -> str | None:
@@ -19,13 +17,13 @@ def _sha256(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _protected_paths() -> list[Path]:
+def _protected_paths(root: Path) -> list[Path]:
     paths = [
-        ROOT / "runtime" / "order_queue.json",
-        ROOT / "runtime" / "order_executions.json",
-        ROOT / "runtime" / "order_locks.json",
+        root / "runtime" / "order_queue.json",
+        root / "runtime" / "order_executions.json",
+        root / "runtime" / "order_locks.json",
     ]
-    paths.extend(sorted((ROOT / "routines").glob("*/rules.json")))
+    paths.extend(sorted((root / "routines").glob("*/rules.json")))
     return paths
 
 
@@ -171,22 +169,29 @@ class BrokerDispatchPreviewTest(unittest.TestCase):
         self.assertEqual(originals[2], market)
 
     def test_runtime_order_queue_rules_hash_unchanged(self) -> None:
-        before = {path: _sha256(path) for path in _protected_paths()}
-
-        with mock.patch("send_order_entrypoint.execute_send_order") as send_order, \
-            mock.patch("execution_broker_dispatch_orchestrator.orchestrate_broker_dispatch") as broker_dispatch:
-            result = preview_broker_dispatch(
-                self._dispatch_builder(),
-                self._capabilities(),
-                self._market(),
+        with TemporaryProjectRoot() as layout:
+            write_json(layout.runtime / "order_queue.json", {"orders": []})
+            write_json(layout.runtime / "order_executions.json", {"executions": []})
+            write_json(layout.runtime / "order_locks.json", {"locks": []})
+            write_json(
+                layout.routines / "fixture" / "rules.json",
+                {"fixture": True},
             )
+            protected_paths = _protected_paths(layout.root)
+            before = {path: _sha256(path) for path in protected_paths}
 
-        self.assertEqual("BROKER_DISPATCH_READY", result["status"])
-        send_order.assert_not_called()
-        broker_dispatch.assert_not_called()
-        self.assertEqual(before, {path: _sha256(path) for path in _protected_paths()})
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+            with mock.patch("send_order_entrypoint.execute_send_order") as send_order, \
+                mock.patch("execution_broker_dispatch_orchestrator.orchestrate_broker_dispatch") as broker_dispatch:
+                result = preview_broker_dispatch(
+                    self._dispatch_builder(),
+                    self._capabilities(),
+                    self._market(),
+                )
+
+            self.assertEqual("BROKER_DISPATCH_READY", result["status"])
+            send_order.assert_not_called()
+            broker_dispatch.assert_not_called()
+            self.assertEqual(before, {path: _sha256(path) for path in protected_paths})
 
 
 if __name__ == "__main__":

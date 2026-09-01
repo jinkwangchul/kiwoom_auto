@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -226,8 +228,7 @@ class ChejanToLifecycleTransitionPreviewTest(unittest.TestCase):
         result = preview_chejan_lifecycle_transition(self._review_result(), self._policy(), self._snapshot())
 
         self.assertEqual("TRANSITION_READY", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

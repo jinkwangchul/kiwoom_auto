@@ -2,149 +2,29 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from contextlib import ExitStack, nullcontext
 from datetime import date
 from types import SimpleNamespace
-import sys
 import tempfile
-import types
 import unittest
 from unittest import mock
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-class _QtImportStub:
-    Accepted = 1
-    Rejected = 0
-    AlignCenter = 0
-    AlignLeft = 0
-    AlignRight = 0
-    AlignVCenter = 0
-    Checked = 2
-    Unchecked = 0
-    Horizontal = 1
-    Vertical = 2
-    NoFocus = 0
-    CustomContextMenu = 0
-    UserRole = 256
-    DisplayRole = 0
-    EditRole = 1
-    BackgroundRole = 8
-    ForegroundRole = 9
-    TextAlignmentRole = 7
-    AscendingOrder = 0
-    DescendingOrder = 1
-    ItemIsEnabled = 1
-    ItemIsSelectable = 2
-    Question = 0
-    Yes = 1
-    No = 0
-    AcceptRole = 0
-    RejectRole = 1
-
-    def __init__(self, *args, **kwargs) -> None:
-        self.clicked = _QtImportStubSignal()
-        self.stateChanged = _QtImportStubSignal()
-        self.currentIndexChanged = _QtImportStubSignal()
-        self.itemSelectionChanged = _QtImportStubSignal()
-        self.customContextMenuRequested = _QtImportStubSignal()
-
-    def __getattr__(self, name):
-        return _QtImportStub()
-
-    def __call__(self, *args, **kwargs):
-        return _QtImportStub()
-
-    def __or__(self, other):
-        return 0
-
-    @staticmethod
-    def getText(*args, **kwargs):
-        return "", False
-
-
-class _QtImportStubSignal:
-    def connect(self, callback) -> None:
-        self.callback = callback
-
-
-def _install_pyqt5_import_stubs() -> None:
-    if "PyQt5" in sys.modules:
-        return
-
-    pyqt5 = types.ModuleType("PyQt5")
-    sip = types.ModuleType("PyQt5.sip")
-    qtcore = types.ModuleType("PyQt5.QtCore")
-    qtgui = types.ModuleType("PyQt5.QtGui")
-    qtwidgets = types.ModuleType("PyQt5.QtWidgets")
-    sip.isdeleted = lambda obj: False
-    pyqt5.sip = sip
-
-    qtcore.Qt = _QtImportStub()
-    qtcore.QDate = _QtImportStub
-    qtcore.QTime = _QtImportStub
-    qtcore.QTimer = _QtImportStub
-    qtcore.QItemSelectionModel = _QtImportStub
-    qtcore.QRect = _QtImportStub
-
-    qtgui.QColor = _QtImportStub
-    qtgui.QFont = _QtImportStub
-    qtcore.__getattr__ = lambda name: _QtImportStub
-    qtgui.__getattr__ = lambda name: _QtImportStub
-    qtwidgets.__getattr__ = lambda name: _QtImportStub
-
-    for name in (
-        "QApplication",
-        "QAbstractItemView",
-        "QCheckBox",
-        "QComboBox",
-        "QDateEdit",
-        "QDialog",
-        "QDialogButtonBox",
-        "QFileDialog",
-        "QFrame",
-        "QGridLayout",
-        "QGroupBox",
-        "QHBoxLayout",
-        "QInputDialog",
-        "QLabel",
-        "QLineEdit",
-        "QListWidget",
-        "QListWidgetItem",
-        "QMenu",
-        "QMessageBox",
-        "QPushButton",
-        "QStyle",
-        "QStyleOptionButton",
-        "QStyledItemDelegate",
-        "QTableWidget",
-        "QTableWidgetItem",
-        "QTextEdit",
-        "QTimeEdit",
-        "QVBoxLayout",
-        "QWidget",
-        "QHeaderView",
-    ):
-        setattr(qtwidgets, name, _QtImportStub)
-
-    qtwidgets.QDialog.Accepted = 1
-    qtwidgets.QDialog.Rejected = 0
-    qtwidgets.QTextEdit.NoWrap = "NoWrap"
-
-    sys.modules["PyQt5"] = pyqt5
-    sys.modules["PyQt5.sip"] = sip
-    sys.modules["PyQt5.QtCore"] = qtcore
-    sys.modules["PyQt5.QtGui"] = qtgui
-    sys.modules["PyQt5.QtWidgets"] = qtwidgets
-
-
-_install_pyqt5_import_stubs()
+from PyQt5.QtWidgets import QDialog, QMainWindow
 
 import gui_auto_trade_setting_window as gui
 import gui_windows as main_gui
 import auto_trade_order_execution_boundary as execution_boundary
 from execution_runtime_file_schema import default_order_executions_data, default_order_locks_data
 from production_recovery_contract import ACCOUNT_COMPLETED, STOCK_RESTORED
+from tests.qt_test_support import (
+    create_qt_widget_shell,
+    dispose_qt_widget,
+    ensure_qapplication,
+)
 
 
 class _FakeWindow:
@@ -379,6 +259,10 @@ class _FakeDialog:
 
 
 class GuiExecutionPreviewButtonTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = ensure_qapplication()
+
     def setUp(self) -> None:
         self._realized_pnl_temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._realized_pnl_temp_dir.cleanup)
@@ -390,8 +274,22 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self._realized_pnl_path_patcher.start()
         self.addCleanup(self._realized_pnl_path_patcher.stop)
 
+    def _main_window_shell(self):
+        window = create_qt_widget_shell(main_gui.MainWindow, QMainWindow)
+        window._account_authentication_states = {}
+        window._account_query_states = {}
+        window.refresh_account_authentication_ui = lambda: None
+        window.refresh_account_query_status_ui = lambda: None
+        self.addCleanup(dispose_qt_widget, window)
+        return window
+
+    def _setting_window_shell(self):
+        window = create_qt_widget_shell(gui.AutoTradeSettingWindow, QDialog)
+        self.addCleanup(dispose_qt_widget, window)
+        return window
+
     def test_startup_recovery_approval_is_bound_to_runtime_snapshot(self) -> None:
-        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._main_window_shell()
         window._startup_recovery_approved = True
         window._startup_recovery_approved_snapshot = "SNAPSHOT_A"
         window._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
@@ -413,8 +311,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         )
 
     def test_startup_recovery_gate_applies_to_initialized_production_parent(self) -> None:
-        window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
-        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._setting_window_shell()
+        parent = self._main_window_shell()
         parent._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
         self._bind_window_parent(window, parent)
         window.require_startup_recovery_session = mock.Mock(return_value=False)
@@ -425,7 +323,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         window.require_startup_recovery_session.assert_called_once_with("Manual SendOrder")
 
     def test_trusted_runtime_update_rebinds_approved_session_to_new_snapshot(self) -> None:
-        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._main_window_shell()
         window._startup_recovery_approved = True
         window._startup_recovery_approved_snapshot = "SNAPSHOT_A"
         window._startup_recovery_result = {"snapshot_hash": "SNAPSHOT_A"}
@@ -466,7 +364,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 return self.ready
 
         def start_enabled(*, has_registered: bool, ready: bool) -> bool:
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             for name in (
                 "btn_start",
                 "btn_early_close",
@@ -528,7 +426,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 self.messages.append(message)
 
         setting_window = mock.Mock()
-        main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        main = self._main_window_shell()
         main._startup_recovery_approved = False
         main._startup_recovery_approved_snapshot = ""
         main._startup_recovery_result = {}
@@ -557,7 +455,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         setting_window.update_startup_recovery_controls.assert_not_called()
 
     def _window_for_queue_commit(self):
-        window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+        window = self._setting_window_shell()
         window.messages = []
         window.commit_reports = []
         window.btn_manual_queue_commit = _FakeButton("수동 Queue 저장")
@@ -594,7 +492,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         orderable_cash: int | None = 1_000_000,
     ):
         account_list = list(accounts if accounts is not None else [selected_account])
-        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent = self._main_window_shell()
         parent.kiwoom_api = _FakeApi(
             connected=connected,
             accounts=account_list,
@@ -715,7 +613,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         return stack
 
     def _window_for_execution_enable(self):
-        window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+        window = self._setting_window_shell()
         window.messages = []
         window.enable_reports = []
         window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
@@ -723,12 +621,12 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         return window
 
     def _window_for_real_preflight(self):
-        window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+        window = self._setting_window_shell()
         window.messages = []
         window.real_preflight_reports = []
         window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
         window.show_real_preflight_result = lambda result: window.real_preflight_reports.append(result)
-        parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        parent = self._main_window_shell()
         parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"])
         parent.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(parent)
@@ -997,7 +895,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         }
 
     def test_main_window_refresh_accounts_auto_selects_single_real_account(self) -> None:
-        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._main_window_shell()
         window.kiwoom_api = _FakeApi(connected=True, accounts=["12345678", "", "12345678"])
         window.account_combo = _FakeAccountCombo()
 
@@ -1008,7 +906,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertTrue(window.account_combo.enabled)
 
     def test_main_window_refresh_accounts_preserves_valid_multi_account_selection(self) -> None:
-        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._main_window_shell()
         window.kiwoom_api = _FakeApi(connected=True, accounts=["11111111", "22222222"])
         window.account_combo = _FakeAccountCombo()
         main_gui.MainWindow.refresh_kiwoom_accounts(window)
@@ -1020,7 +918,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
         self.assertEqual("22222222", main_gui.MainWindow.selected_account_no(window))
 
     def test_main_window_refresh_accounts_clears_disconnected_selection(self) -> None:
-        window = main_gui.MainWindow.__new__(main_gui.MainWindow)
+        window = self._main_window_shell()
         window.kiwoom_api = _FakeApi(connected=False, accounts=["12345678"])
         window.account_combo = _FakeAccountCombo()
 
@@ -2456,7 +2354,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             window.messages = []
             window.statusBarMessage = lambda message, timeout_ms=5000: window.messages.append(message)
             parent = self._prepare_parent_account(send_order_result=0)
@@ -2599,8 +2497,8 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
-            parent = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            window = self._setting_window_shell()
+            parent = self._main_window_shell()
             parent.kiwoom_api = _FakeApi(connected=True, accounts=["12345678"], send_order_result=0)
             parent.account_combo = _FakeAccountCombo()
             main_gui.MainWindow.refresh_kiwoom_accounts(parent)
@@ -2656,7 +2554,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 }
                 state.update(state_update)
                 (stock_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-                window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+                window = self._setting_window_shell()
                 window.current_selected_routine_dir = lambda: routine_dir
 
                 with mock.patch.object(
@@ -2699,7 +2597,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             parent = self._prepare_parent_account(send_order_result=0)
             parent.kiwoom_api = ApiWithoutSendOrder()
             self._bind_window_parent(window, parent)
@@ -2750,7 +2648,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             parent = self._prepare_parent_account(send_order_result=0)
             self._bind_window_parent(window, parent)
             window.current_selected_routine_dir = lambda: routine_dir
@@ -2804,7 +2702,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             parent = self._prepare_parent_account(orderable_cash=9_999)
             self._bind_window_parent(window, parent)
             window.current_selected_routine_dir = lambda: routine_dir
@@ -2860,7 +2758,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            window = gui.AutoTradeSettingWindow.__new__(gui.AutoTradeSettingWindow)
+            window = self._setting_window_shell()
             parent = self._prepare_parent_account(send_order_result=0)
             self._bind_window_parent(window, parent)
             window.current_selected_routine_dir = lambda: routine_dir
@@ -3710,7 +3608,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 }
             )
             self._write_queue_for_send_order(queue_path, record)
-            main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            main = self._main_window_shell()
             raw_event = {
                 "source": "kiwoom_chejan",
                 "gubun": "0",
@@ -3754,7 +3652,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
                 }
             )
             self._write_queue_for_send_order(queue_path, record)
-            main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            main = self._main_window_shell()
             raw_event = {
                 "source": "kiwoom_chejan",
                 "gubun": "0",
@@ -4781,7 +4679,7 @@ class GuiExecutionPreviewButtonTest(unittest.TestCase):
             broker_holdings_path = Path(tmp) / "broker_holdings.json"
             positions_path = Path(tmp) / "positions.json"
             self._write_open_position(positions_path, quantity=3, average_price=1000)
-            main = main_gui.MainWindow.__new__(main_gui.MainWindow)
+            main = self._main_window_shell()
             raw_event = {
                 "source": "kiwoom_chejan",
                 "gubun": "1",

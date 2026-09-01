@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import gui_auto_trade_run_control as run_control
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 import gui_auto_trade_status_ops as status_ops
 
 
@@ -299,6 +300,7 @@ class SameDayRestartGuardTest(unittest.TestCase):
         )
         target = (self.stock_dir, "005930", "삼성전자")
         window = _PersistingStartWindow(target)
+        window._main_monitoring_auto_trade_operation_host = AutoTradeOperationHost(None)
 
         with (
             patch.object(run_control, "current_datetime", return_value=self.NOW),
@@ -363,6 +365,9 @@ class SameDayRestartGuardTest(unittest.TestCase):
         for source in ("auto_trade_context_menu", "main_monitoring_window"):
             with self.subTest(source=source):
                 restart_window = _PersistingStartWindow(target)
+                restart_window._main_monitoring_auto_trade_operation_host = (
+                    AutoTradeOperationHost(None)
+                )
                 (self.stock_dir / "state.json").write_text(
                     json.dumps(self.state, ensure_ascii=False),
                     encoding="utf-8",
@@ -401,7 +406,7 @@ class SameDayRestartGuardTest(unittest.TestCase):
             assigned_routine_instance_id="instance-b",
             routine_instance_name="루틴 B",
         )
-        blocked_state = dict(self.state, holding_qty=2)
+        blocked_state = dict(self.state, holding_qty=2, avg_price=1000)
         (blocked_dir / "config.json").write_text(
             json.dumps(blocked_config, ensure_ascii=False), encoding="utf-8"
         )
@@ -410,6 +415,8 @@ class SameDayRestartGuardTest(unittest.TestCase):
         )
         second_target = (blocked_dir, "000660", "SK하이닉스")
         window = _StartWindow([first_target, second_target])
+        participant_host = AutoTradeOperationHost(None)
+        window._main_monitoring_auto_trade_operation_host = participant_host
 
         with (
             patch.object(run_control, "current_datetime", return_value=self.NOW),
@@ -430,6 +437,14 @@ class SameDayRestartGuardTest(unittest.TestCase):
             (blocked_dir / "state.json").read_text(encoding="utf-8")
         )
         self.assertEqual(blocked_state, saved_blocked)
+        self.assertEqual(
+            blocked_config,
+            json.loads((blocked_dir / "config.json").read_text(encoding="utf-8")),
+        )
+        self.assertEqual(
+            ("005930",),
+            participant_host.current_session_operation_participant_stock_codes(),
+        )
         global_write.assert_called_once_with(participant_stock_codes=["005930"])
 
 

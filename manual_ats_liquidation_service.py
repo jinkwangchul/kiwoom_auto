@@ -28,7 +28,7 @@ from operation_command_service import (
     STOCK_IGNORED_DUPLICATE,
 )
 from order_approval_engine import evaluate_order_approval
-from order_candidate_engine import get_real_holding_qty, read_latest_price
+from order_candidate_engine import get_real_holding_qty
 from order_queue import append_order_candidates
 from operation_policy_gate import apply_operation_policy_gate_for_order
 from runtime_io import read_json_dict
@@ -86,7 +86,7 @@ def build_manual_ats_liquidation_preview(
     *,
     now_dt: datetime | None = None,
     command_id: str = "",
-    latest_price_reader: Callable[[str, str], Any] = read_latest_price,
+    current_price_reader: Callable[[str, str], Any] | None = None,
     holding_qty_override: int | None = None,
 ) -> dict[str, Any]:
     path = Path(stock_dir).resolve()
@@ -154,13 +154,23 @@ def build_manual_ats_liquidation_preview(
     if holding_qty is None or holding_qty <= 0:
         reasons.append("actual holding quantity is missing or zero")
 
-    latest_price = latest_price_reader(clean_code, clean_name)
-    try:
-        price_value = float(latest_price) if latest_price not in (None, "") else None
-    except (TypeError, ValueError):
-        price_value = None
-    if method == METHOD_CURRENT_PRICE and (price_value is None or price_value <= 0):
-        reasons.append("current-price liquidation requires a positive current price")
+    price_value = None
+    if method == METHOD_CURRENT_PRICE:
+        try:
+            current_price = (
+                current_price_reader(clean_code, clean_name)
+                if callable(current_price_reader)
+                else None
+            )
+            price_value = (
+                float(current_price) if current_price not in (None, "") else None
+            )
+        except Exception:
+            price_value = None
+        if price_value is None or price_value <= 0:
+            reasons.append(
+                "current-price liquidation requires an actionable current price"
+            )
     if reasons:
         return result
 
@@ -196,7 +206,7 @@ def build_manual_ats_liquidation_preview(
             if holding_qty_override is not None
             else "state"
         ),
-        "price_basis": "market" if method == METHOD_MARKET else "latest_price",
+        "price_basis": method,
         "execution_enabled": False,
         "reason": "MANUAL_ATS_LIQUIDATION",
         "order_intent": {

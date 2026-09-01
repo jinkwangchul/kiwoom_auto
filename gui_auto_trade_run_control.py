@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import re
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import date, datetime
+from enum import Enum
+from typing import Callable, Protocol
 
-from PyQt5.QtWidgets import (
-    QMessageBox,
-    QWidget,
-)
+from PyQt5.QtWidgets import QWidget
 
 from gui_toast import show_toast
 from gui_common_utils import safe_int_value
@@ -100,6 +100,45 @@ START_REQUEST_MULTIPLE = "multiple"
 ORDER_QUEUE_PATH = PROJECT_ROOT / "runtime" / "order_queue.json"
 ORDER_EXECUTIONS_PATH = PROJECT_ROOT / "runtime" / "order_executions.json"
 ORDER_LOCKS_PATH = PROJECT_ROOT / "runtime" / "order_locks.json"
+
+
+class OperationStartIntent(str, Enum):
+    FULL_START = "FULL_START"
+    SELECTIVE_START = "SELECTIVE_START"
+    ADDITIONAL_WAITING_START = "ADDITIONAL_WAITING_START"
+
+
+class OperationStartApplicationHost(Protocol):
+    """UI-neutral port consumed by the Operation Start application command."""
+
+    def registered_operation_start_targets(self) -> list[tuple[Path, str, str]]: ...
+
+    def running_registered_operation_targets(self) -> list[tuple[Path, str, str]]: ...
+
+    def update_global_operation_button_state(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class OperationStartCommandRequest:
+    intent: OperationStartIntent
+    selected_targets: tuple[tuple[Path, str, str], ...] = ()
+    source: str = ""
+
+
+@dataclass(frozen=True)
+class OperationStartCommandResult:
+    intent: OperationStartIntent
+    ok: bool
+    changed: bool
+    reason_code: str
+    requested_count: int
+    started_count: int
+    blocked_count: int
+    results: tuple[dict[str, object], ...]
+    payload: dict[str, object]
+
+    def as_legacy_dict(self) -> dict[str, object]:
+        return dict(self.payload)
 
 _P3_OPERATION_START_RUNTIME_REASONS = frozenset(
     {
@@ -1170,17 +1209,6 @@ def _global_start_prerequisite_result(
         "reason": reason,
         "user_message": message,
     }
-
-
-def _show_operation_warning(window, title: str, message: str) -> None:
-    setattr(window, "_last_operation_failure_dialog_shown", True)
-    setattr(window, "_last_operation_failure_dialog_title", title)
-    setattr(window, "_last_operation_failure_dialog_message", message)
-    parent_getter = getattr(window, "operation_message_parent", None)
-    parent = parent_getter() if callable(parent_getter) else window
-    if not isinstance(parent, QWidget):
-        return
-    QMessageBox.warning(parent, title, message)
 
 
 def _show_operation_start_failure_toast(window, message: str) -> None:
@@ -2951,8 +2979,17 @@ def auto_trade_start_selected_auto_trades(
     return result
 
 
-def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | None:
-    selected_targets = window.selected_stock_infos()
+def auto_trade_start_selected_rows_auto_trades(
+    window,
+    *,
+    selected_targets: list[tuple[Path, str, str]] | None = None,
+    source: str = "auto_trade_context_menu",
+) -> dict[str, object] | None:
+    selected_targets = (
+        list(selected_targets)
+        if selected_targets is not None
+        else window.selected_stock_infos()
+    )
     if not selected_targets:
         return None
 
@@ -2987,7 +3024,7 @@ def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | No
             window,
             request_scope="multiple",
             selected_targets=start_targets,
-            source="auto_trade_context_menu",
+            source=source,
         )
         if result.get("ok") is True:
             for stock_dir, code, _name in window.registered_operation_targets():
@@ -3054,11 +3091,232 @@ def auto_trade_start_selected_rows_auto_trades(window) -> dict[str, object] | No
         window,
         request_scope="multiple",
         selected_targets=start_targets,
-        source="auto_trade_context_menu",
+        source=source,
         already_running_targets=selected_running,
     )
     _refresh_start_button_state(window)
     return result
+
+
+def _operation_start_target_results(
+    payload: dict[str, object],
+) -> tuple[dict[str, object], ...]:
+    normalized: list[dict[str, object]] = []
+    for item in payload.get("results", ()) or ():
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    if normalized:
+        return tuple(normalized)
+
+    for label in payload.get("completed", ()) or ():
+        normalized.append({"target": str(label), "status": "STARTED"})
+    for target in payload.get("already_running_targets", ()) or ():
+        if isinstance(target, (tuple, list)) and len(target) >= 3:
+            normalized.append(
+                {
+                    "stock_code": str(target[1]),
+                    "stock_name": str(target[2]),
+                    "status": "ALREADY_RUNNING",
+                }
+            )
+    for item in payload.get("blocked_target_details", ()) or ():
+        if isinstance(item, dict):
+            blocked = dict(item)
+            blocked.setdefault("status", "BLOCKED")
+            normalized.append(blocked)
+    for label in payload.get("failed", ()) or ():
+        normalized.append({"target": str(label), "status": "FAILED"})
+    return tuple(normalized)
+
+
+def _operation_start_command_result(
+    payload: dict[str, object] | None,
+    *,
+    intent: OperationStartIntent,
+) -> OperationStartCommandResult:
+    result = dict(payload or {})
+    requested_count = safe_int_value(
+        result.get("requested_count"),
+        len(tuple(result.get("requested", ()) or ())),
+    )
+    started_count = safe_int_value(
+        result.get("started_count"),
+        len(tuple(result.get("completed", ()) or ())),
+    )
+    blocked_count = safe_int_value(result.get("blocked_count"), -1)
+    if blocked_count < 0:
+        blocked_count = (
+            safe_int_value(result.get("excluded_review_count"), 0)
+            + safe_int_value(result.get("excluded_validation_count"), 0)
+        )
+    reason_code = str(result.get("reason") or "").strip()
+    return OperationStartCommandResult(
+        intent=intent,
+        ok=result.get("ok") is True,
+        changed=started_count > 0,
+        reason_code=reason_code,
+        requested_count=requested_count,
+        started_count=started_count,
+        blocked_count=blocked_count,
+        results=_operation_start_target_results(result),
+        payload=result,
+    )
+
+
+def _execute_full_operation_start(
+    host: OperationStartApplicationHost,
+    request: OperationStartCommandRequest,
+    *,
+    start_backend: Callable[..., dict[str, object]],
+    operation_state_reader: Callable[[], dict[str, object]],
+    summary_presenter: Callable[[object, dict[str, object]], None],
+) -> OperationStartCommandResult:
+    if today_global_operation_status(operation_state_reader()) == "NORMAL_ENDED":
+        status_message = getattr(host, "statusBarMessage", None)
+        if callable(status_message):
+            status_message("오늘 운영이 종료되었습니다.")
+        host.update_global_operation_button_state()
+        return _operation_start_command_result(
+            {
+                "ok": False,
+                "reason": "NORMAL_ENDED",
+                "requested": (),
+                "requested_count": 0,
+                "started_count": 0,
+                "blocked_count": 0,
+            },
+            intent=OperationStartIntent.FULL_START,
+        )
+
+    running_targets = list(host.running_registered_operation_targets())
+    selected_targets = list(host.registered_operation_start_targets())
+    requested_targets = list(selected_targets)
+    running_keys = {
+        str(code or "").strip() or str(Path(stock_dir).resolve())
+        for stock_dir, code, _name in running_targets
+    }
+    selected_targets = [
+        target
+        for target in selected_targets
+        if (
+            str(target[1] or "").strip()
+            or str(Path(target[0]).resolve())
+        )
+        not in running_keys
+    ]
+    resolved_intent = (
+        OperationStartIntent.ADDITIONAL_WAITING_START
+        if running_targets and selected_targets
+        else OperationStartIntent.FULL_START
+    )
+
+    if not selected_targets:
+        if not running_targets:
+            status_message = getattr(host, "statusBarMessage", None)
+            if callable(status_message):
+                status_message(
+                    "운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요."
+                )
+            payload = {
+                "ok": False,
+                "reason": "NO_STARTABLE_TARGETS",
+                "requested": (),
+                "requested_count": 0,
+                "started_count": 0,
+                "blocked_count": 0,
+            }
+        else:
+            requested_targets = requested_targets or list(running_targets)
+            payload = {
+                "ok": False,
+                "reason": "ALREADY_RUNNING",
+                "user_message": "선택한 종목이 모두 이미 운영 중입니다.",
+                "requested": tuple(
+                    f"{code} {name}".strip()
+                    for _stock_dir, code, name in requested_targets
+                ),
+                "requested_count": len(requested_targets),
+                "completed": (),
+                "blocked_target_details": (),
+                "already_running_targets": tuple(running_targets),
+                "blocked_count": 0,
+                "already_running_count": len(running_targets),
+                "started_count": 0,
+                "failed_count": 0,
+                "excluded_review_count": 0,
+                "excluded_validation_count": 0,
+            }
+            summary_presenter(host, payload)
+        host.update_global_operation_button_state()
+        return _operation_start_command_result(payload, intent=resolved_intent)
+
+    start_kwargs: dict[str, object] = {
+        "request_scope": START_REQUEST_MULTIPLE,
+        "selected_targets": selected_targets,
+        "source": request.source or "auto_trade_global_start_button",
+    }
+    if running_targets:
+        start_kwargs["already_running_targets"] = running_targets
+    payload = start_backend(host, **start_kwargs)
+
+    parent_refreshed = False
+    parent_getter = getattr(host, "parent", None)
+    parent = parent_getter() if callable(parent_getter) else None
+    parent_refresh = getattr(parent, "refresh_all", None)
+    if callable(parent_refresh):
+        parent_refresh()
+        parent_refreshed = True
+    if not parent_refreshed:
+        host.update_global_operation_button_state()
+    return _operation_start_command_result(payload, intent=resolved_intent)
+
+
+def execute_operation_start_command(
+    host: OperationStartApplicationHost,
+    request: OperationStartCommandRequest,
+    *,
+    start_backend: Callable[..., dict[str, object]] | None = None,
+    selective_backend: Callable[..., dict[str, object] | None] | None = None,
+    operation_state_reader: Callable[[], dict[str, object]] | None = None,
+    summary_presenter: Callable[[object, dict[str, object]], None] | None = None,
+) -> OperationStartCommandResult:
+    """Execute one Operation Start intent through the canonical run-control path."""
+
+    start_backend = start_backend or auto_trade_start_selected_auto_trades
+    selective_backend = selective_backend or auto_trade_start_selected_rows_auto_trades
+    operation_state_reader = operation_state_reader or read_operation_state
+    summary_presenter = summary_presenter or _show_operation_start_summary_toast
+
+    if request.intent in {
+        OperationStartIntent.FULL_START,
+        OperationStartIntent.ADDITIONAL_WAITING_START,
+    }:
+        return _execute_full_operation_start(
+            host,
+            request,
+            start_backend=start_backend,
+            operation_state_reader=operation_state_reader,
+            summary_presenter=summary_presenter,
+        )
+
+    selective_kwargs: dict[str, object] = {}
+    if request.selected_targets:
+        selective_kwargs["selected_targets"] = list(request.selected_targets)
+    if request.source and request.source != "auto_trade_context_menu":
+        selective_kwargs["source"] = request.source
+    payload = selective_backend(host, **selective_kwargs)
+    return _operation_start_command_result(
+        payload
+        or {
+            "ok": False,
+            "reason": "NO_STARTABLE_TARGETS",
+            "requested": (),
+            "requested_count": 0,
+            "started_count": 0,
+            "blocked_count": 0,
+        },
+        intent=OperationStartIntent.SELECTIVE_START,
+    )
 
 
 def _refresh_start_button_state(window) -> None:

@@ -17,6 +17,8 @@ from assignment_episode_repository import (
     AssignmentEpisodeTarget,
     CanonicalAssignmentEpisodeRepository,
 )
+from gui_auto_trade_integrity import inspect_stock_review_state
+from gui_auto_trade_operation_host import AutoTradeOperationHost
 import gui_auto_trade_setting_window as setting_window
 from kiwoom_api import KiwoomApi
 import gui_windows
@@ -31,6 +33,8 @@ from routine_instance_deletion_service import (
 )
 from stock_assignment_registration_service import register_unassigned_stock_to_instance
 from stock_repository import StockRecord, StockRepository
+from tests.filesystem_test_support import TemporaryProjectRoot
+from tests.qt_test_support import flush_deferred_deletes
 
 
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
@@ -43,23 +47,41 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+def _holding_state(*, holding: int = 0, review: bool = False) -> dict[str, object]:
+    avg_price = 70_000 if holding > 0 else 0
+    state: dict[str, object] = {
+        "status": "REVIEW_REQUIRED" if review else "STOPPED",
+        "trade_enabled": False,
+        "trade_started": False,
+        "holding_qty": holding,
+        "holding_amount": holding * avg_price,
+        "avg_price": avg_price,
+        "pending_order": False,
+        "pending_qty": 0,
+    }
+    if review:
+        state["review_required"] = True
+    return state
+
+
 def _stock(root: Path, *, holding: int = 0, review: bool = False) -> tuple[StockRecord, Path]:
     stock_dir = root / "stocks" / "005930_삼성전자"
     _write_json(
         stock_dir / "config.json",
         {
+            "code": "005930",
+            "name": "삼성전자",
+            "operation_excluded": False,
+            "real_trade_enabled": False,
             "assigned_routine_instance_id": INSTANCE_A,
             "routine_instance_name": "루틴A",
-            "routine_definition_id": "definition-a",
+            "routine_definition_id": "definition_a",
             "routine_type": "전략A",
             "routines": ["전략A"],
         },
     )
-    state = {"status": "REVIEW_REQUIRED" if review else "STOPPED", "holding_qty": holding}
-    if review:
-        state["review_required"] = True
-    _write_json(stock_dir / "state.json", state)
-    _write_json(stock_dir / "orders.json", [])
+    _write_json(stock_dir / "state.json", _holding_state(holding=holding, review=review))
+    _write_json(stock_dir / "orders.json", {"orders": []})
     return (
         StockRecord(
             "005930",
@@ -69,7 +91,7 @@ def _stock(root: Path, *, holding: int = 0, review: bool = False) -> tuple[Stock
             str(stock_dir.relative_to(root)),
             INSTANCE_A,
             "루틴A",
-            "definition-a",
+            "definition_a",
             "전략A",
         ),
         stock_dir,
@@ -77,14 +99,50 @@ def _stock(root: Path, *, holding: int = 0, review: bool = False) -> tuple[Stock
 
 
 def _instance(root: Path) -> tuple[Path, SimpleNamespace]:
+    routine_dir = root / "routines" / "전략A"
+    _write_json(
+        routine_dir / "routine.json",
+        {
+            "schema_version": "1.0",
+            "definition_id": "definition_a",
+            "name": "전략A",
+            "entry_file": "routine.py",
+            "rules_file": "rules.json",
+            "enabled": True,
+        },
+    )
+    (routine_dir / "routine.py").write_text("", encoding="utf-8")
+    _write_json(
+        root / "groups" / GROUP_ID / "group.json",
+        {
+            "schema_version": "1.0",
+            "group_id": GROUP_ID,
+            "definition_id": "definition_a",
+            "base_name": "그룹A",
+            "display_name": "그룹A",
+            "slot": 0,
+            "created_at": "2026-08-23T09:00:00+09:00",
+        },
+    )
+    _write_json(
+        root / "groups" / "registry.json",
+        {
+            "schema_version": "1.0",
+            "mode": "logical",
+            "group_ids": [GROUP_ID],
+            "cutover_at": "2026-08-23T09:00:00+09:00",
+        },
+    )
     instance_dir = root / "routine_instances" / INSTANCE_A
     payload = {
         "schema_version": "1.0",
         "instance_id": INSTANCE_A,
-        "definition_id": "definition-a",
+        "definition_id": "definition_a",
         "display_name": "루틴A",
         "description": "",
         "enabled": False,
+        "buy_limit_enabled": False,
+        "buy_limit_amount": None,
         "rules_file": "rules.json",
         "created_at": "2026-08-23T09:00:00+09:00",
         "updated_at": "2026-08-23T09:00:00+09:00",
@@ -95,25 +153,43 @@ def _instance(root: Path) -> tuple[Path, SimpleNamespace]:
     return instance_dir, SimpleNamespace(**payload, persisted=True)
 
 
+class _OperationOwner(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self._main_monitoring_auto_trade_operation_host = AutoTradeOperationHost(self)
+
+    def main_monitoring_auto_trade_operation_host(self) -> AutoTradeOperationHost:
+        return self._main_monitoring_auto_trade_operation_host
+
+    def startup_recovery_session_ready(self, *, refresh: bool = False) -> bool:
+        return True
+
+
 class PreInitializationSafetyContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
     def test_delete_guard_running_and_long_term_holding(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
+        with TemporaryProjectRoot(prefix="preinit_delete_guard_") as layout:
+            root = layout.root
             stock, stock_dir = _stock(root)
             running = preview_delete_scope(root, [stock], running_stock_dirs=[stock_dir])
             self.assertEqual(DELETE_BLOCKED_OPERATION_RUNNING, running[0].reason_code)
 
-            _write_json(stock_dir / "state.json", {"status": "STOPPED", "holding_qty": 3})
+            _write_json(stock_dir / "state.json", _holding_state(holding=3))
+            inspection = inspect_stock_review_state(stock_dir)
+            self.assertFalse(inspection.review_required)
+            self.assertTrue(inspection.state_valid)
+            self.assertEqual("CLEAR", inspection.reason_code)
+            state_before = (stock_dir / "state.json").read_bytes()
             holding = preview_delete_scope(root, [stock])
             self.assertEqual(DELETE_BLOCKED_LONG_TERM_HOLDING, holding[0].reason_code)
+            self.assertEqual(state_before, (stock_dir / "state.json").read_bytes())
 
             _write_json(
                 stock_dir / "state.json",
-                {"status": "REVIEW_REQUIRED", "holding_qty": 3, "review_required": True},
+                _holding_state(holding=3, review=True),
             )
             self.assertEqual((), preview_delete_scope(root, [stock]))
 
@@ -123,7 +199,7 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             stock, stock_dir = _stock(root, holding=7, review=True)
             instance_dir, instance = _instance(root)
             scope = RoutineInstanceDeletionScope(
-                root, INSTANCE_A, "루틴A", GROUP_ID, "definition-a", instance_dir, (stock,)
+                root, INSTANCE_A, "루틴A", GROUP_ID, "definition_a", instance_dir, (stock,)
             )
             state_before = (stock_dir / "state.json").read_bytes()
             result = delete_routine_instance_completely(scope)
@@ -142,7 +218,7 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             stock, stock_dir = _stock(root)
             instance_dir, _instance_record = _instance(root)
             scope = RoutineInstanceDeletionScope(
-                root, INSTANCE_A, "루틴A", GROUP_ID, "definition-a", instance_dir, (stock,)
+                root, INSTANCE_A, "루틴A", GROUP_ID, "definition_a", instance_dir, (stock,)
             )
             config_before = (stock_dir / "config.json").read_bytes()
             episode_repository = CanonicalAssignmentEpisodeRepository(root)
@@ -151,7 +227,7 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
                 AssignmentEpisodeTarget.assigned(
                     instance_id=INSTANCE_A,
                     group_id=GROUP_ID,
-                    definition_id="definition-a",
+                    definition_id="definition_a",
                     instance_name_snapshot="루틴A",
                     group_name_snapshot="그룹A",
                 ),
@@ -185,8 +261,8 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             self.assertEqual("ASSIGNED", current.ownership_kind)
 
     def test_registration_is_idempotent_and_blocks_other_current_instance(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
+        with TemporaryProjectRoot(prefix="preinit_registration_") as layout:
+            root = layout.root
             _stock_record, stock_dir = _stock(root)
             config_path = stock_dir / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -196,11 +272,28 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
             instance = SimpleNamespace(
                 instance_id=INSTANCE_A,
                 group_id=GROUP_ID,
-                definition_id="definition-a",
+                definition_id="definition_a",
                 display_name="루틴A",
             )
             group = SimpleNamespace(group_id=GROUP_ID, display_name="그룹A")
+            owner = _OperationOwner()
+            operation_host = owner.main_monitoring_auto_trade_operation_host()
+            self.addCleanup(flush_deferred_deletes, self.app)
+            self.addCleanup(owner.deleteLater)
+            self.addCleanup(operation_host.shutdown)
+            self.assertEqual(
+                (),
+                operation_host.current_session_operation_participant_stock_codes(),
+            )
             with (
+                patch(
+                    "assignment_authorization_service.RoutineInstanceRepository.get_instance",
+                    return_value=instance,
+                ),
+                patch(
+                    "assignment_authorization_service.scan_group_records",
+                    return_value=[group],
+                ),
                 patch("assignment_episode_linkage.RoutineInstanceRepository.get_instance", return_value=instance),
                 patch("assignment_episode_linkage.scan_group_records", return_value=[group]),
                 patch("stock_repository._append_routine_changed"),
@@ -208,22 +301,34 @@ class PreInitializationSafetyContractTests(unittest.TestCase):
                 first = register_unassigned_stock_to_instance(
                     root, "005930", "삼성전자",
                     instance_id=INSTANCE_A, instance_name="루틴A",
-                    definition_id="definition-a", routine_type="전략A",
+                    definition_id="definition_a", routine_type="전략A",
+                    operation_owner=owner,
                 )
                 episode_bytes = CanonicalAssignmentEpisodeRepository(root).document_path("005930").read_bytes()
                 second = register_unassigned_stock_to_instance(
                     root, "005930", "삼성전자",
                     instance_id=INSTANCE_A, instance_name="루틴A",
-                    definition_id="definition-a", routine_type="전략A",
+                    definition_id="definition_a", routine_type="전략A",
+                    operation_owner=owner,
+                )
+                instance.display_name = "루틴A 변경"
+                renamed = register_unassigned_stock_to_instance(
+                    root, "005930", "삼성전자",
+                    instance_id=INSTANCE_A, instance_name="과거 표시명",
+                    definition_id="definition_a", routine_type="전략A",
+                    operation_owner=owner,
                 )
                 blocked = register_unassigned_stock_to_instance(
                     root, "005930", "삼성전자",
                     instance_id=INSTANCE_B, instance_name="루틴B",
-                    definition_id="definition-a", routine_type="전략A",
+                    definition_id="definition_a", routine_type="전략A",
+                    operation_owner=owner,
                 )
             self.assertTrue(first.success and first.changed)
             self.assertEqual("ALREADY_CURRENT", second.status)
             self.assertFalse(second.changed)
+            self.assertTrue(renamed.success and renamed.changed)
+            self.assertEqual("루틴A 변경", json.loads(config_path.read_text(encoding="utf-8"))["routine_instance_name"])
             self.assertEqual("CURRENT_ASSIGNED_ELSEWHERE", blocked.status)
             self.assertEqual(episode_bytes, CanonicalAssignmentEpisodeRepository(root).document_path("005930").read_bytes())
 

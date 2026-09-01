@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 
 import gui_auto_trade_table_loader as table_loader
 import gui_auto_trade_context_menu
+from assignment_episode_linkage import assign_stock_routine
 from gui_operation_ui_context import refresh_auto_trade_views
 from gui_auto_trade_setting_window import (
     OPERATION_EXCLUDED_CONFIG_KEY,
@@ -18,16 +19,29 @@ from gui_auto_trade_setting_window import (
 from gui_auto_trade_display import SortableTableWidgetItem
 from runtime_io import read_json_dict
 from stock_repository import StockRepository
+from tests.participant_owner_fixture import participant_owner
 
 
 class AutoTradeOperationExclusionTests(unittest.TestCase):
+    ASSIGNMENT_INSTANCE_ID = "0f86470a-6368-4b31-802e-d25d6ce72a5f"
+    ASSIGNMENT_GROUP_ID = "4b366f80-1bbf-4a5e-b010-f411c3620e2e"
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self._participant_owner = participant_owner()
+        self._participant_owner_patcher = patch(
+            "gui_auto_trade_policy._auto_trade_operation_participant_owner",
+            return_value=self._participant_owner,
+        )
+        self._participant_owner_patcher.start()
+        self.addCleanup(self._participant_owner_patcher.stop)
+
     def _stock_dir(self, root: str) -> Path:
-        stock_dir = Path(root) / "111111_Test"
-        stock_dir.mkdir()
+        stock_dir = Path(root) / "stocks" / "111111_Test"
+        stock_dir.mkdir(parents=True)
         return stock_dir
 
     def _window(self) -> SimpleNamespace:
@@ -35,6 +49,43 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             statusBarMessage=Mock(),
             refresh_all=Mock(),
         )
+
+    def _write_stopped_state(self, stock_dir: Path) -> None:
+        (stock_dir / "state.json").write_text(
+            json.dumps(
+                {
+                    "status": "STOPPED",
+                    "trade_enabled": False,
+                    "trade_started": False,
+                    "holding_qty": 0,
+                    "holding_amount": 0,
+                    "avg_price": 0,
+                    "pending_order": False,
+                    "pending_qty": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _canonical_target(
+        self,
+        root: str,
+        *,
+        excluded: bool = False,
+    ) -> tuple[Path, str, str]:
+        stock_dir = self._stock_dir(root)
+        (stock_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    OPERATION_EXCLUDED_CONFIG_KEY: excluded,
+                    "operation_mode": "CONTINUOUS",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._write_stopped_state(stock_dir)
+        (stock_dir / "orders.json").write_text("[]", encoding="utf-8")
+        return stock_dir, "111111", "Test"
 
     def test_refresh_after_exclusion_uses_persistent_main_owner(self) -> None:
         main = QWidget()
@@ -51,39 +102,49 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         window.refresh_all.assert_not_called()
 
     def test_name_double_click_toggles_operation_exclusion_not_start(self) -> None:
-        target = (Path("stocks/111111_Test"), "111111", "Test")
-        window = SimpleNamespace(
-            stock_info_from_row=Mock(return_value=target),
-            toggle_stock_operation_exclusion=Mock(return_value=True),
-            running_registered_operation_targets=Mock(return_value=[]),
-        )
-        item = SimpleNamespace(column=lambda: 1, row=lambda: 3)
-
-        with patch(
-            "gui_auto_trade_setting_window.auto_trade_start_status_indicator"
-        ) as start_indicator:
-            AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
-                window,
-                item,
+        with TemporaryDirectory() as temp:
+            target = self._canonical_target(temp)
+            window = SimpleNamespace(
+                stock_info_from_row=Mock(return_value=target),
+                running_registered_operation_targets=Mock(return_value=[]),
             )
+            item = SimpleNamespace(column=lambda: 1, row=lambda: 3)
 
-        window.toggle_stock_operation_exclusion.assert_called_once_with(
+            with (
+                patch(
+                    "gui_auto_trade_setting_window.auto_trade_toggle_stock_operation_exclusion",
+                    return_value=True,
+                ) as toggle_exclusion,
+                patch(
+                    "gui_auto_trade_setting_window.auto_trade_start_status_indicator"
+                ) as start_indicator,
+            ):
+                AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
+                    window,
+                    item,
+                )
+
+        toggle_exclusion.assert_called_once_with(
+            window,
             target,
             refresh=False,
         )
         start_indicator.assert_not_called()
 
-    def test_name_double_click_while_running_does_not_toggle_or_start(self) -> None:
+    def test_name_double_click_while_running_blocks_command_and_start(self) -> None:
         target = (Path("stocks/111111_Test"), "111111", "Test")
         window = SimpleNamespace(
             stock_info_from_row=Mock(return_value=target),
-            toggle_stock_operation_exclusion=Mock(return_value=True),
             running_registered_operation_targets=Mock(return_value=[target]),
             statusBarMessage=Mock(),
         )
         item = SimpleNamespace(column=lambda: 1, row=lambda: 3)
 
         with (
+            patch(
+                "gui_auto_trade_setting_window.auto_trade_toggle_stock_operation_exclusion",
+                return_value=False,
+            ) as toggle_exclusion,
             patch("gui_auto_trade_setting_window.auto_trade_start_status_indicator") as start_indicator,
             patch("gui_auto_trade_run_control.auto_trade_start_selected_auto_trades") as start_backend,
         ):
@@ -92,7 +153,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 item,
             )
 
-        window.toggle_stock_operation_exclusion.assert_not_called()
+        toggle_exclusion.assert_not_called()
         start_indicator.assert_not_called()
         start_backend.assert_not_called()
         window.statusBarMessage.assert_called_once()
@@ -102,18 +163,20 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             with self.subTest(column=column):
                 window = SimpleNamespace(
                     stock_info_from_row=Mock(),
-                    toggle_stock_operation_exclusion=Mock(),
                     running_registered_operation_targets=Mock(return_value=[]),
                 )
                 item = SimpleNamespace(column=lambda: column, row=lambda: 3)
 
-                AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
-                    window,
-                    item,
-                )
+                with patch(
+                    "gui_auto_trade_setting_window.auto_trade_toggle_stock_operation_exclusion"
+                ) as toggle_exclusion:
+                    AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
+                        window,
+                        item,
+                    )
 
                 window.stock_info_from_row.assert_not_called()
-                window.toggle_stock_operation_exclusion.assert_not_called()
+                toggle_exclusion.assert_not_called()
 
     def test_toggle_operation_exclusion_persists_without_touching_operation_mode(self) -> None:
         with TemporaryDirectory() as temp:
@@ -131,6 +194,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            self._write_stopped_state(stock_dir)
             window = self._window()
             target = (stock_dir, "111111", "Test")
 
@@ -255,7 +319,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
     def test_clear_selected_operation_exclusions_uses_existing_config_path(self) -> None:
         with TemporaryDirectory() as temp:
             first_dir = self._stock_dir(temp)
-            second_dir = Path(temp) / "222222_Other"
+            second_dir = first_dir.parent / "222222_Other"
             second_dir.mkdir()
             for stock_dir in (first_dir, second_dir):
                 (stock_dir / "config.json").write_text(
@@ -335,9 +399,9 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
     def test_set_selected_operation_exclusions_uses_existing_config_path(self) -> None:
         with TemporaryDirectory() as temp:
             first_dir = self._stock_dir(temp)
-            second_dir = Path(temp) / "222222_Other"
+            second_dir = first_dir.parent / "222222_Other"
             second_dir.mkdir()
-            third_dir = Path(temp) / "333333_Third"
+            third_dir = first_dir.parent / "333333_Third"
             third_dir.mkdir()
             for stock_dir in (first_dir, second_dir, third_dir):
                 (stock_dir / "config.json").write_text(
@@ -447,7 +511,6 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             target = (stock_dir, "111111", "Test")
             window = SimpleNamespace(
                 stock_info_from_row=Mock(return_value=target),
-                toggle_stock_operation_exclusion=Mock(),
                 running_registered_operation_targets=Mock(return_value=[target]),
                 statusBarMessage=Mock(),
             )
@@ -460,7 +523,6 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
             self.assertEqual(before_config, config_path.read_text(encoding="utf-8"))
             self.assertEqual(before_state, state_path.read_text(encoding="utf-8"))
-            window.toggle_stock_operation_exclusion.assert_not_called()
             window.statusBarMessage.assert_called_once()
 
     def test_non_running_double_click_is_not_blocked_by_another_running_stock(self) -> None:
@@ -484,12 +546,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 json.dumps({"status": "STOPPED", "trade_enabled": False}),
                 encoding="utf-8",
             )
-            before_config = config_path.read_text(encoding="utf-8")
             before_state = state_path.read_text(encoding="utf-8")
             target = (stock_dir, "111111", "Test")
             window = SimpleNamespace(
                 stock_info_from_row=Mock(return_value=target),
-                toggle_stock_operation_exclusion=Mock(),
                 running_registered_operation_targets=Mock(
                     return_value=[(Path("stocks/000001_Run"), "000001", "Run")]
                 ),
@@ -497,18 +557,19 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             )
             item = SimpleNamespace(column=lambda: 1, row=lambda: 0)
 
-            AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
-                window,
-                item,
-            )
+            with (
+                patch("gui_auto_trade_status_ops.append_changelog"),
+                patch("gui_auto_trade_status_ops.show_toast"),
+            ):
+                AutoTradeSettingWindow.on_stock_table_name_item_double_clicked(
+                    window,
+                    item,
+                )
 
-            self.assertEqual(before_config, config_path.read_text(encoding="utf-8"))
+            config_after = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertFalse(config_after[OPERATION_EXCLUDED_CONFIG_KEY])
             self.assertEqual(before_state, state_path.read_text(encoding="utf-8"))
-            window.toggle_stock_operation_exclusion.assert_called_once_with(
-                target,
-                refresh=False,
-            )
-            window.statusBarMessage.assert_not_called()
+            window.statusBarMessage.assert_called_once()
 
     def test_toggle_operation_exclusion_does_not_toast_on_write_failure(self) -> None:
         with TemporaryDirectory() as temp:
@@ -518,11 +579,16 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 json.dumps({"operation_mode": "CONTINUOUS"}) + "\n",
                 encoding="utf-8",
             )
+            self._write_stopped_state(stock_dir)
             window = self._window()
             target = (stock_dir, "111111", "Test")
 
             with (
-                patch("pathlib.Path.write_text", side_effect=OSError("boom")),
+                patch.object(
+                    StockRepository,
+                    "_atomic_write_stock_config",
+                    side_effect=OSError("boom"),
+                ),
                 patch("gui_auto_trade_status_ops.QMessageBox.critical") as critical,
                 patch("gui_auto_trade_status_ops.show_toast") as toast,
             ):
@@ -613,23 +679,25 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             def exec_(self, _pos):
                 return _Menu.chosen_action
 
-        window = SimpleNamespace(
-            stock_table=SimpleNamespace(
-                itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
-                viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
-            ),
-            ensure_context_row_selected=Mock(),
-            selected_stock_infos=Mock(return_value=[(Path("stocks/111111_Test"), "111111", "Test")]),
-            selected_operation_mode_set=Mock(return_value=set()),
-            emergency_stop_selected_auto_trade_stocks=Mock(),
-            release_selected_emergency_stopped_auto_trade_stocks=Mock(),
-        )
-
-        with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
-            gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
-                window,
-                object(),
+        with TemporaryDirectory() as temp:
+            target = self._canonical_target(temp)
+            window = SimpleNamespace(
+                stock_table=SimpleNamespace(
+                    itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
+                    viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
+                ),
+                ensure_context_row_selected=Mock(),
+                selected_stock_infos=Mock(return_value=[target]),
+                selected_operation_mode_set=Mock(return_value=set()),
+                emergency_stop_selected_auto_trade_stocks=Mock(),
+                release_selected_emergency_stopped_auto_trade_stocks=Mock(),
             )
+
+            with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
+                gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
+                    window,
+                    object(),
+                )
 
         window.ensure_context_row_selected.assert_called_once_with(0)
         window.emergency_stop_selected_auto_trade_stocks.assert_called_once_with()
@@ -637,8 +705,8 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
 
     def test_stock_context_menu_has_no_emergency_release_action(self) -> None:
         with TemporaryDirectory() as temp:
-            stock_dir = Path(temp) / "111111_Test"
-            stock_dir.mkdir()
+            stock_dir = Path(temp) / "stocks" / "111111_Test"
+            stock_dir.mkdir(parents=True)
             (stock_dir / "state.json").write_text(
                 json.dumps({"status": "EMERGENCY_STOPPED"}),
                 encoding="utf-8",
@@ -754,10 +822,10 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
                 return None
 
         with TemporaryDirectory() as temp:
-            normal_dir = Path(temp) / "111111_Normal"
-            emergency_dir = Path(temp) / "222222_Emergency"
-            normal_dir.mkdir()
-            emergency_dir.mkdir()
+            normal_dir = Path(temp) / "stocks" / "111111_Normal"
+            emergency_dir = Path(temp) / "stocks" / "222222_Emergency"
+            normal_dir.mkdir(parents=True)
+            emergency_dir.mkdir(parents=True)
             (normal_dir / "state.json").write_text(
                 json.dumps({"status": "RUNNING"}),
                 encoding="utf-8",
@@ -1128,8 +1196,11 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             patch.object(gui_auto_trade_context_menu, "QMenu", _Menu),
             patch.object(
                 gui_auto_trade_context_menu,
-                "auto_trade_operation_exclusion_mutation_decision",
-                return_value={"allowed": False, "current_running": True},
+                "inspect_auto_trade_operation_exclusion_availability",
+                return_value=SimpleNamespace(
+                    allowed=False,
+                    reason_code="CURRENTLY_RUNNING",
+                ),
             ),
         ):
             gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
@@ -1186,27 +1257,29 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             def exec_(self, _pos):
                 return _Menu.chosen_action
 
-        window = SimpleNamespace(
-            _stock_status_filter="running",
-            stock_table=SimpleNamespace(
-                itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
-                viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
-            ),
-            ensure_context_row_selected=Mock(),
-            selected_stock_infos=Mock(return_value=[(Path("stocks/111111_Test"), "111111", "Test")]),
-            selected_operation_mode_set=Mock(return_value=set()),
-            current_selected_routine_row_metadata=Mock(return_value=None),
-            emergency_stop_selected_auto_trade_stocks=Mock(),
-            release_selected_emergency_stopped_auto_trade_stocks=Mock(),
-            set_selected_stock_operation_exclusions=Mock(),
-            unregister_selected_auto_trade_stocks=Mock(),
-        )
-
-        with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
-            gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
-                window,
-                object(),
+        with TemporaryDirectory() as temp:
+            target = self._canonical_target(temp)
+            window = SimpleNamespace(
+                _stock_status_filter="running",
+                stock_table=SimpleNamespace(
+                    itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
+                    viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
+                ),
+                ensure_context_row_selected=Mock(),
+                selected_stock_infos=Mock(return_value=[target]),
+                selected_operation_mode_set=Mock(return_value=set()),
+                current_selected_routine_row_metadata=Mock(return_value=None),
+                emergency_stop_selected_auto_trade_stocks=Mock(),
+                release_selected_emergency_stopped_auto_trade_stocks=Mock(),
+                set_selected_stock_operation_exclusions=Mock(),
+                unregister_selected_auto_trade_stocks=Mock(),
             )
+
+            with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
+                gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
+                    window,
+                    object(),
+                )
 
         window.ensure_context_row_selected.assert_called_once_with(0)
         window.set_selected_stock_operation_exclusions.assert_called_once_with()
@@ -1476,27 +1549,29 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             def exec_(self, _pos):
                 return _Menu.chosen_action
 
-        window = SimpleNamespace(
-            _stock_status_filter="excluded",
-            stock_table=SimpleNamespace(
-                itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
-                viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
-            ),
-            ensure_context_row_selected=Mock(),
-            selected_stock_infos=Mock(return_value=[(Path("stocks/111111_Test"), "111111", "Test")]),
-            selected_operation_mode_set=Mock(return_value=set()),
-            current_selected_routine_row_metadata=Mock(return_value=None),
-            emergency_stop_selected_auto_trade_stocks=Mock(),
-            release_selected_emergency_stopped_auto_trade_stocks=Mock(),
-            clear_selected_stock_operation_exclusions=Mock(),
-            unregister_selected_auto_trade_stocks=Mock(),
-        )
-
-        with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
-            gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
-                window,
-                object(),
+        with TemporaryDirectory() as temp:
+            target = self._canonical_target(temp, excluded=True)
+            window = SimpleNamespace(
+                _stock_status_filter="excluded",
+                stock_table=SimpleNamespace(
+                    itemAt=Mock(return_value=SimpleNamespace(row=lambda: 0)),
+                    viewport=lambda: SimpleNamespace(mapToGlobal=lambda pos: pos),
+                ),
+                ensure_context_row_selected=Mock(),
+                selected_stock_infos=Mock(return_value=[target]),
+                selected_operation_mode_set=Mock(return_value=set()),
+                current_selected_routine_row_metadata=Mock(return_value=None),
+                emergency_stop_selected_auto_trade_stocks=Mock(),
+                release_selected_emergency_stopped_auto_trade_stocks=Mock(),
+                clear_selected_stock_operation_exclusions=Mock(),
+                unregister_selected_auto_trade_stocks=Mock(),
             )
+
+            with patch.object(gui_auto_trade_context_menu, "QMenu", _Menu):
+                gui_auto_trade_context_menu.show_auto_trade_stock_context_menu(
+                    window,
+                    object(),
+                )
 
         window.ensure_context_row_selected.assert_called_once_with(0)
         window.clear_selected_stock_operation_exclusions.assert_called_once_with()
@@ -1510,6 +1585,70 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
         code: str = "222222",
         name: str = "Fresh",
     ) -> Path:
+        routine_dir = root / "routines" / "def_running"
+        routine_dir.mkdir(parents=True, exist_ok=True)
+        (routine_dir / "routine.py").write_text("", encoding="utf-8")
+        (routine_dir / "routine.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "definition_id": "def_running",
+                    "name": "Routine",
+                    "entry_file": "routine.py",
+                    "rules_file": "rules.json",
+                    "enabled": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        group_dir = root / "groups" / self.ASSIGNMENT_GROUP_ID
+        group_dir.mkdir(parents=True, exist_ok=True)
+        (group_dir / "group.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "group_id": self.ASSIGNMENT_GROUP_ID,
+                    "definition_id": "def_running",
+                    "base_name": "Running",
+                    "display_name": "Running",
+                    "slot": 0,
+                    "created_at": "2026-08-30T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "groups" / "registry.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "mode": "logical",
+                    "group_ids": [self.ASSIGNMENT_GROUP_ID],
+                    "cutover_at": "2026-08-30T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        instance_dir = root / "routine_instances" / self.ASSIGNMENT_INSTANCE_ID
+        instance_dir.mkdir(parents=True, exist_ok=True)
+        (instance_dir / "instance.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "instance_id": self.ASSIGNMENT_INSTANCE_ID,
+                    "definition_id": "def_running",
+                    "display_name": "Running",
+                    "enabled": False,
+                    "buy_limit_enabled": False,
+                    "buy_limit_amount": None,
+                    "rules_file": "rules.json",
+                    "created_at": "2026-08-30T09:00:00+09:00",
+                    "updated_at": "2026-08-30T09:00:00+09:00",
+                    "group_id": self.ASSIGNMENT_GROUP_ID,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (instance_dir / "rules.json").write_text("{}", encoding="utf-8")
         repository = StockRepository(root)
         stock_dir = repository.ensure_stock_folder(code, name, routine="")
         auto_trade_setting = SimpleNamespace(
@@ -1524,13 +1663,15 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             parent=lambda: auto_trade_setting,
         )
 
-        repository.update_stock_routine_instance(
+        assign_stock_routine(
+            root,
             code,
             name,
-            instance_id="inst-running",
+            instance_id=self.ASSIGNMENT_INSTANCE_ID,
             instance_name="Running",
-            definition_id="def-running",
+            definition_id="def_running",
             routine_type="Routine",
+            stock_repository=repository,
         )
         return stock_dir
 
@@ -1539,20 +1680,16 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             stock_dir = self._apply_routine_assignment(Path(temp), running=True)
             config = read_json_dict(stock_dir / "config.json")
             window = SimpleNamespace()
-            window.registered_operation_targets = lambda: (
-                AutoTradeSettingWindow.registered_operation_targets(window)
-            )
+            window.registered_operation_targets = lambda: [
+                (stock_dir, "222222", "Fresh")
+            ]
             window.registered_operation_start_targets = lambda: (
                 AutoTradeSettingWindow.registered_operation_start_targets(window)
             )
-            with patch(
-                "gui_auto_trade_run_control.all_registered_stock_dirs",
-                return_value=[stock_dir],
-            ):
-                start_targets = window.registered_operation_start_targets()
+            start_targets = window.registered_operation_start_targets()
 
         self.assertNotIn(OPERATION_EXCLUDED_CONFIG_KEY, config)
-        self.assertEqual("inst-running", config["assigned_routine_instance_id"])
+        self.assertEqual(self.ASSIGNMENT_INSTANCE_ID, config["assigned_routine_instance_id"])
         self.assertEqual(1, len(start_targets))
 
     def test_before_global_operation_new_assignment_keeps_existing_default(self) -> None:
@@ -1561,7 +1698,7 @@ class AutoTradeOperationExclusionTests(unittest.TestCase):
             config = read_json_dict(stock_dir / "config.json")
 
         self.assertNotIn(OPERATION_EXCLUDED_CONFIG_KEY, config)
-        self.assertEqual("inst-running", config["assigned_routine_instance_id"])
+        self.assertEqual(self.ASSIGNMENT_INSTANCE_ID, config["assigned_routine_instance_id"])
 
     def test_running_assignment_does_not_overwrite_existing_operation_excluded_value(self) -> None:
         with TemporaryDirectory() as temp:

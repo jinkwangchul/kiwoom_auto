@@ -190,6 +190,34 @@ def auto_trade_status_display(raw_status: object) -> str:
     return canonical_auto_trade_status(raw_text).display_status
 
 
+def display_status_text_for_gui(raw_status: object) -> str:
+    """Normalize raw state to the canonical operator-facing status text."""
+    status = str(raw_status or "").strip()
+    if not status or status == "-":
+        return "-"
+    try:
+        return auto_trade_status_display(status)
+    except Exception:
+        return "검토종목"
+
+
+def auto_trade_setting_display_status(
+    display_status: str,
+    *,
+    emergency_scope: str | None = None,
+) -> str:
+    """Project canonical status text for the AutoTrade settings view."""
+    normalized = display_status_text_for_gui(display_status)
+    if normalized == "감시/매도":
+        return "자동마감"
+    if (
+        normalized == "긴급정지"
+        and str(emergency_scope or "").strip().upper() == "SELECTED"
+    ):
+        return "검토종목"
+    return normalized
+
+
 def auto_trade_status_color(display_status: str) -> str:
     normalized = str(display_status or "").strip()
     color_map = {

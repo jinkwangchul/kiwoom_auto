@@ -15,6 +15,7 @@ gui_auto_trade_integrity.py
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from gui_order_utils import (
@@ -32,6 +33,13 @@ REVIEW_REASON_PENDING_ORDER_DATA_ERROR = "미체결 데이터 오류"
 REVIEW_REASON_LIQUIDATION_REMAINS = "청산 후 보유잔량"
 REVIEW_REASON_LIQUIDATION_PROCESSING_ERROR = "청산 처리 오류"
 REVIEW_REASON_RECOVERY_STATE_ERROR = "복구 상태 오류"
+REVIEW_REASON_ASSIGNMENT_RECONCILIATION = "루틴 할당 정보 불일치"
+
+REVIEW_INSPECTION_CLEAR = "CLEAR"
+REVIEW_INSPECTION_PERSISTED = "PERSISTED_REVIEW_REQUIRED"
+REVIEW_INSPECTION_STATE_MISSING = "STATE_FILE_MISSING"
+REVIEW_INSPECTION_STATE_READ_ERROR = "STATE_FILE_READ_ERROR"
+REVIEW_INSPECTION_STATE_DATA_INCONSISTENT = "STATE_DATA_INCONSISTENT"
 
 _REVIEW_LOCATION_DISPLAY_BY_SOURCE = {
     "운영시작": "운영 시작",
@@ -103,6 +111,8 @@ def operator_review_reason(reason: object, *, default: str = "-") -> str:
         return "미체결 주문 존재"
     if raw == "PENDING_CANCEL":
         return "주문 취소 처리 중"
+    if raw == "ASSIGNMENT_RECONCILIATION_REQUIRED":
+        return REVIEW_REASON_ASSIGNMENT_RECONCILIATION
     if raw.startswith("RECOVERY_"):
         return REVIEW_REASON_RECOVERY_STATE_ERROR
     if raw == "ACTIVE_CLOSE_OR_LIQUIDATION":
@@ -190,11 +200,7 @@ def is_operation_excluded(config: dict[str, object] | None) -> bool:
 
 def is_review_required_stock_dir(stock_dir: Path) -> bool:
     """runtime 폴더 기준 검토관리 전용 종목 여부."""
-    try:
-        state = read_json_dict(stock_dir / "state.json")
-    except Exception:
-        return False
-    return is_review_required_state(state)
+    return inspect_stock_review_state(stock_dir).review_required
 
 
 def read_review_state_with_issue(state_path: Path) -> tuple[dict[str, object], str]:
@@ -213,10 +219,109 @@ def read_review_state_with_issue(state_path: Path) -> tuple[dict[str, object], s
     return data, ""
 
 
+@dataclass(frozen=True)
+class StockReviewInspection:
+    """Read-only Review projection for one canonical stock state."""
+
+    state: dict[str, object]
+    review_required: bool
+    state_valid: bool
+    reason_code: str
+    issue_reason: str
+    source: str
+    issues: tuple[str, ...] = ()
+
+
+def inspect_review_state_data(
+    state: dict[str, object] | None,
+    *,
+    state_issue_reason: object = "",
+    source: str = "PRELOADED_STATE",
+) -> StockReviewInspection:
+    """Project Review classification from one already-read state payload."""
+
+    issue_reason = str(state_issue_reason or "").strip()
+    clean_state = dict(state) if isinstance(state, dict) else {}
+    if not isinstance(state, dict) and not issue_reason:
+        issue_reason = REVIEW_REASON_OPERATION_DATA_READ_ERROR
+
+    if issue_reason:
+        reason_code = (
+            REVIEW_INSPECTION_STATE_MISSING
+            if issue_reason == REVIEW_REASON_OPERATION_DATA_MISSING
+            else REVIEW_INSPECTION_STATE_READ_ERROR
+        )
+        return StockReviewInspection(
+            state=clean_state,
+            review_required=True,
+            state_valid=False,
+            reason_code=reason_code,
+            issue_reason=issue_reason,
+            source=str(source or "PRELOADED_STATE"),
+        )
+
+    review_required = is_review_required_state(clean_state)
+    data_issues = tuple(auto_trade_setting_data_inconsistency_reasons(clean_state))
+    if data_issues:
+        return StockReviewInspection(
+            state=clean_state,
+            review_required=True,
+            state_valid=False,
+            reason_code=(
+                REVIEW_INSPECTION_PERSISTED
+                if review_required
+                else REVIEW_INSPECTION_STATE_DATA_INCONSISTENT
+            ),
+            issue_reason=(
+                "" if review_required else REVIEW_REASON_OPERATION_DATA_MISMATCH
+            ),
+            source=str(source or "PRELOADED_STATE"),
+            issues=data_issues,
+        )
+
+    return StockReviewInspection(
+        state=clean_state,
+        review_required=review_required,
+        state_valid=True,
+        reason_code=(
+            REVIEW_INSPECTION_PERSISTED
+            if review_required
+            else REVIEW_INSPECTION_CLEAR
+        ),
+        issue_reason="",
+        source=str(source or "PRELOADED_STATE"),
+    )
+
+
+def inspect_review_state_path(state_path: Path) -> StockReviewInspection:
+    """Read and classify a canonical state.json without mutating it."""
+
+    state, issue_reason = read_review_state_with_issue(Path(state_path))
+    return inspect_review_state_data(
+        state,
+        state_issue_reason=issue_reason,
+        source="STATE_FILE",
+    )
+
+
+def inspect_stock_review_state(
+    stock_dir: Path,
+    *,
+    loaded_state: dict[str, object] | None = None,
+) -> StockReviewInspection:
+    """Return the canonical read-only Review projection for one stock directory."""
+
+    if isinstance(loaded_state, dict) and loaded_state:
+        return inspect_review_state_data(
+            loaded_state,
+            source="LOADED_STATE",
+        )
+    return inspect_review_state_path(Path(stock_dir) / "state.json")
+
+
 def is_review_protected_stock_dir(stock_dir: Path) -> bool:
     """Return whether a stock dir is protected by review-required collection rules."""
-    state, state_issue_reason = read_review_state_with_issue(stock_dir / "state.json")
-    return bool(state_issue_reason) or is_review_required_state(state)
+    return inspect_stock_review_state(stock_dir).review_required
 
 
 def auto_trade_setting_data_inconsistency_reasons(state: dict[str, object] | None) -> list[str]:

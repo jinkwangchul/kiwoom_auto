@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -229,8 +231,7 @@ class LifecycleCommitDryRunTest(unittest.TestCase):
         result = dry_run_lifecycle_commit(self._commit_preview(), self._store_snapshot(), self._runtime_context())
 
         self.assertEqual("LIFECYCLE_DRY_RUN_READY", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

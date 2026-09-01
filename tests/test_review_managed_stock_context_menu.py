@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from PyQt5.QtWidgets import QApplication
 
 import gui_auto_trade_context_menu as context_menu
+from tests.participant_owner_fixture import participant_owner
 
 
 class _Action:
@@ -31,6 +32,7 @@ class _Action:
 class _Menu:
     latest_root = None
     chosen_label = ""
+    chosen_menu_label = ""
 
     def __init__(self, _parent=None, *, label: str = "", root=None) -> None:
         self.label = label
@@ -63,17 +65,23 @@ class _Menu:
         pass
 
     def exec_(self, _pos):
-        return self._find_action(self.root, _Menu.chosen_label)
+        return self._find_action(
+            self.root,
+            _Menu.chosen_label,
+            _Menu.chosen_menu_label,
+        )
 
     @classmethod
-    def _find_action(cls, menu, label: str):
+    def _find_action(cls, menu, label: str, menu_label: str = ""):
         if not label:
             return None
+        if not menu_label or menu.label == menu_label:
+            for entry in menu.entries:
+                if isinstance(entry, _Action) and entry.label == label:
+                    return entry
         for entry in menu.entries:
-            if isinstance(entry, _Action) and entry.label == label:
-                return entry
             if isinstance(entry, _Menu):
-                found = cls._find_action(entry, label)
+                found = cls._find_action(entry, label, menu_label)
                 if found is not None:
                     return found
         return None
@@ -93,6 +101,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         *,
         review: bool,
         chosen_label: str = "",
+        chosen_menu_label: str = "",
         operation_excluded: bool = False,
         scheduled_excluded_management: bool = False,
     ):
@@ -103,12 +112,24 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         (stock_dir / "state.json").write_text(
             json.dumps(
                 {
-                    "status": "REVIEW_REQUIRED" if review else "STOPPED",
-                    "trade_enabled": False,
+                    "status": "REVIEW_REQUIRED" if review else "RUNNING",
+                    "trade_enabled": not review,
+                    "trade_started": False,
+                    "holding_qty": 0,
+                    "holding_amount": 0,
+                    "avg_price": 0,
+                    "pending_order": False,
+                    "pending_qty": 0,
                 }
             ),
             encoding="utf-8",
         )
+        (stock_dir / "config.json").write_text(
+            json.dumps({"operation_excluded": operation_excluded}),
+            encoding="utf-8",
+        )
+        paths = (stock_dir / "config.json", stock_dir / "state.json")
+        before_files = {path.name: path.read_bytes() for path in paths}
         target = (stock_dir, "111111", "Test")
         callbacks = context_menu.StockContextMenuCallbacks(
             select_all=Mock(),
@@ -145,14 +166,19 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             ),
             toggle_trade_permission=Mock(),
         )
-        parent = SimpleNamespace()
+        runtime_state = {"marker": "unchanged"}
+        parent = SimpleNamespace(
+            runtime_state=runtime_state,
+            _main_monitoring_auto_trade_operation_host=participant_owner(),
+        )
         _Menu.chosen_label = chosen_label
+        _Menu.chosen_menu_label = chosen_menu_label
         with (
             patch.object(context_menu, "QMenu", _Menu),
             patch.object(
                 context_menu,
-                "auto_trade_operation_exclusion_mutation_decision",
-                return_value={"allowed": True, "current_running": False},
+                "inspect_auto_trade_operation_exclusion_availability",
+                return_value=SimpleNamespace(allowed=True, reason_code=""),
             ),
             patch.object(
                 context_menu,
@@ -180,6 +206,11 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                 selected_targets=[target],
                 scheduled_excluded_management=scheduled_excluded_management,
             )
+        _Menu.latest_root._test_before_files = before_files
+        _Menu.latest_root._test_after_files = {
+            path.name: path.read_bytes() for path in paths
+        }
+        _Menu.latest_root._test_runtime_state = dict(runtime_state)
         return _Menu.latest_root, callbacks
 
     def test_scheduled_review_keeps_only_case_a_management_actions_enabled(self) -> None:
@@ -189,7 +220,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         normal = normal_menu.top_entries()
 
         self.assertEqual(list(normal), list(review))
-        for label in ("전체선택", "선택해제", "시간변경", "변경리셋", "등록해제"):
+        for label in ("전체선택", "선택해제", "시간변경", "변경리셋"):
             self.assertTrue(review[label].enabled, label)
         for label in (
             "운영시작",
@@ -199,6 +230,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "조기마감",
             "개별청산",
             "종목등록",
+            "등록해제",
             "간이차트",
         ):
             self.assertFalse(review[label].enabled, label)
@@ -211,7 +243,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
         normal = normal_menu.top_entries()
 
         self.assertEqual(list(normal), list(review))
-        for label in ("전체선택", "선택해제", "ATS설정", "등록해제"):
+        for label in ("전체선택", "선택해제", "ATS설정"):
             self.assertTrue(review[label].enabled, label)
         for label in (
             "운영시작",
@@ -221,6 +253,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "조기마감",
             "개별청산",
             "종목등록",
+            "등록해제",
             "간이차트",
         ):
             self.assertFalse(review[label].enabled, label)
@@ -236,8 +269,6 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "검토정지",
             "운영제외",
             "감시전용 전환",
-            "조기마감",
-            "개별청산",
             "시간변경",
             "변경리셋",
             "종목등록",
@@ -245,6 +276,8 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
             "간이차트",
         ):
             self.assertTrue(entries[label].enabled, label)
+        for label in ("조기마감", "개별청산"):
+            self.assertFalse(entries[label].enabled, label)
 
     def test_scheduled_excluded_management_keeps_exact_requested_actions_enabled(self) -> None:
         menu, _callbacks = self._render(
@@ -327,7 +360,7 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                 callbacks.stock_register.assert_not_called()
 
     def test_review_dispatch_rejects_forced_disabled_actions(self) -> None:
-        for label in ("운영시작", "루틴마감"):
+        for label in ("운영시작", "루틴마감", "등록해제"):
             with self.subTest(label=label):
                 _menu, callbacks = self._render(
                     "SCHEDULED",
@@ -338,6 +371,44 @@ class ReviewManagedStockContextMenuTests(unittest.TestCase):
                 callbacks.start.assert_not_called()
                 callbacks.early_close.assert_not_called()
                 callbacks.individual_liquidation.assert_not_called()
+                callbacks.unregister.assert_not_called()
+
+    def test_review_disabled_submenus_cannot_be_forced_to_dispatch(self) -> None:
+        for menu_label, action_label in (
+            ("조기마감", "시장가"),
+            ("개별청산", "시장가"),
+        ):
+            with self.subTest(menu=menu_label):
+                _menu, callbacks = self._render(
+                    "SCHEDULED",
+                    review=True,
+                    chosen_label=action_label,
+                    chosen_menu_label=menu_label,
+                )
+
+                callbacks.early_close.assert_not_called()
+                callbacks.individual_liquidation.assert_not_called()
+
+    def test_review_projection_preserves_canonical_reason_codes(self) -> None:
+        menu, _callbacks = self._render("SCHEDULED", review=True)
+
+        availability = menu._stock_context_availability
+        self.assertTrue(availability.review_managed)
+        self.assertEqual(availability.reason_for("start"), "REVIEW_REQUIRED")
+        self.assertEqual(availability.reason_for("exclusion"), "REVIEW_REQUIRED")
+        self.assertEqual(
+            availability.reason_for("trade_permission"),
+            "REVIEW_REQUIRED",
+        )
+        self.assertEqual(availability.reason_for("unregister"), "REVIEW_REQUIRED")
+
+    def test_context_menu_open_close_is_read_only(self) -> None:
+        menu, callbacks = self._render("SCHEDULED", review=True)
+
+        self.assertEqual(menu._test_before_files, menu._test_after_files)
+        self.assertEqual(menu._test_runtime_state, {"marker": "unchanged"})
+        callbacks.start.assert_not_called()
+        callbacks.unregister.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ from gui_auto_trade_display import apply_auto_trade_setting_protection_row_style
 from gui_review_utils import safe_float_value
 from gui_order_utils import pending_order_side_quantities, format_number_value
 from runtime_io import read_json_dict
+from assignment_episode_linkage import unassign_stock_routine
 from stock_repository import repository as stock_repository_factory
 from gui_auto_trade_utils import PENDING_INTEGRITY_USER_REASON
 from runtime_stock_state_mutation import mutate_runtime_stock_state
@@ -670,7 +671,13 @@ class GlobalReviewRequiredWindow(QDialog):
 
                 try:
                     if repo is not None:
-                        repo.update_stock_routine(code, name, [])
+                        unassign_stock_routine(
+                            repo.project_root,
+                            code,
+                            name,
+                            [],
+                            stock_repository=repo,
+                        )
                 except Exception:
                     pass
 

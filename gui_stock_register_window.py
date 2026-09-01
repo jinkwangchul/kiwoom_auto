@@ -82,10 +82,13 @@ from gui_common_utils import safe_int_value, sanitize_path_part
 from gui_stock_data import (
     active_routine_for_stock,
     assigned_runtime_dirs_for_stock,
+    find_library_stock_by_code,
+    is_valid_stock_code,
+    normalize_stock_code,
+    read_base_stocks,
     stock_runtime_dir_for_routine,
 )
 from gui_order_utils import (
-    pending_order_integrity_issue_codes,
     pending_order_side_quantities,
     order_value,
     order_status_display,
@@ -124,7 +127,6 @@ from gui_search_stock_register_dialog import SearchStockRegisterDialog
 from gui_auto_trade_utils import (
     PENDING_INTEGRITY_USER_REASON,
     auto_trade_unregister_category,
-    mark_pending_order_integrity_review_required,
 )
 from gui_auto_trade_run_control import auto_trade_running_registered_operation_targets
 from gui_routine_assign_utils import (
@@ -139,7 +141,13 @@ from gui_routine_policy import (
     classify_routine_assign_targets,
     can_unassign_active_routine_from_stock,
 )
-from gui_base_stock_service import update_base_stock_routine_instance
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_ASSIGN,
+    ASSIGNMENT_INTENT_UNASSIGN,
+    execute_assignment_change,
+    execute_assignment_unassign,
+    inspect_assignment_authorization,
+)
 from routine_instance_registry import (
     load_persisted_routine_instances,
     routine_definition_by_id,
@@ -151,6 +159,10 @@ from gui_routine_service import (
     ensure_single_real_trade_routine_for_stock,
 )
 from gui_toast import show_toast
+from gui_operation_ui_context import (
+    refresh_auto_trade_views,
+    sync_auto_trade_monitoring_universe,
+)
 from gui_window_policy import (
     configure_persistent_feature_window,
     persistent_feature_owner,
@@ -192,8 +204,12 @@ from gui_ats_utils import (
     manual_ats_session_labels,
 )
 from gui_auto_trade_display import (
+    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
+    AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
+    AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
+    auto_trade_setting_badge_stylesheet,
     auto_trade_setting_display_status,
     auto_trade_setting_status_color,
     create_auto_trade_setting_status_item,
@@ -210,71 +226,11 @@ from gui_auto_trade_integrity import (
     is_review_protected_stock_dir,
     is_review_required_state,
 )
-from gui_auto_trade_setting_window import (
-    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
-    AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
-    AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
-    AutoTradeSettingWindow,
-    ProfitLossEarlyCloseDialog,
-    StockPolicyOverrideDialog,
-    append_changelog,
-    append_stock_log,
-    assigned_stock_dirs_in_routine,
-    auto_trade_setting_ats_after_regular_blocked,
-    auto_trade_setting_close_timestamp_later,
-    auto_trade_setting_data_inconsistency_reasons,
-    auto_trade_setting_badge_stylesheet,
-    auto_trade_setting_early_close_metadata_is_stale,
-    auto_trade_setting_early_close_requested,
-    auto_trade_setting_effective_liquidation_method,
-    auto_trade_setting_has_buy_pending_problem,
-    auto_trade_setting_has_close_progress_quantity,
-    auto_trade_setting_has_unresolved_quantity,
-    auto_trade_setting_is_after_regular_end,
-    auto_trade_setting_liquidation_active,
-    auto_trade_setting_liquidation_completed_today,
-    auto_trade_setting_liquidation_phase_active,
-    auto_trade_setting_liquidation_result_policy,
-    auto_trade_setting_liquidation_text,
-    auto_trade_setting_mark_liquidation_result_for_display,
-    auto_trade_setting_method_text,
-    auto_trade_setting_no_next_step_notice,
-    auto_trade_setting_regular_end_seconds,
-    auto_trade_setting_server_mismatch_detected,
-    auto_trade_setting_should_preserve_raw_status,
-    auto_trade_setting_today_date_text,
-    base_stock_routine_assignments,
-    clear_auto_close_runtime_metadata,
-    clear_early_close_runtime_metadata_only,
-    close_method_from_state_or_policy,
-    compact_operation_time_range,
-    create_auto_trade_situation_item,
-    default_operation_policy,
-    effective_liquidation_policy_for_config,
-    ensure_single_real_trade_routine_for_all_stocks,
-    find_library_stock_by_code,
-    get_group_dirs,
-    get_stock_dirs_in_routine,
-    individual_liquidation_policy_from_config,
-    is_review_required_state,
-    is_review_required_stock_dir,
-    is_stock_assigned_to_routine,
-    is_valid_stock_code,
-    load_stock_library,
-    normalize_base_stock_single_routine_file,
-    normalize_stock_code,
-    now_text,
-    operation_policy_section,
-    parse_stock_folder_name,
-    read_base_stocks,
-    read_operation_policy,
-    restart_initial_review_reason_for_stock,
-    routine_display_name,
-    short_close_method_text,
-    single_routine_list,
-    unique_review_reasons,
-    update_base_stock_routines,
-    validate_base_stock_record,
+from gui_auto_trade_runtime import parse_stock_folder_name
+from gui_auto_trade_status_ops import append_changelog
+from auto_trade_performance_ui import (
+    routine_tree_performance_texts,
+    routine_tree_stock_performance_source,
 )
 from gui_main_table_loader import ROUTINE_INSTANCE_GRID_COLUMNS
 from group_scope import load_group_scope
@@ -981,15 +937,6 @@ def stock_register_unavailable_reason(code: str, name: str) -> tuple[str, str, l
             continue
 
         if buy_pending_qty == "?" or sell_pending_qty == "?":
-            issue_codes = pending_order_integrity_issue_codes(stock_dir, state)
-            mark_pending_order_integrity_review_required(
-                routine_name,
-                stock_dir,
-                code,
-                name,
-                issue_codes,
-                source="종목등록 창 미체결 데이터 무결성 오류",
-            )
             blocked_reasons.append(f"{routine_prefix}{PENDING_INTEGRITY_USER_REASON}")
             continue
 
@@ -1090,12 +1037,18 @@ def stock_register_operation_status_rank(display_status: str) -> int:
     }.get(normalized, 99)
 
 class StockRegisterPerformanceAdapter:
-    _routine_tree_stock_performance_source = (
-        AutoTradeSettingWindow._routine_tree_stock_performance_source
-    )
-    _routine_tree_performance_texts = (
-        AutoTradeSettingWindow._routine_tree_performance_texts
-    )
+    def _routine_tree_stock_performance_source(
+        self,
+        stock: dict[str, object],
+    ) -> dict[str, object]:
+        return routine_tree_stock_performance_source(self, stock)
+
+    def _routine_tree_performance_texts(
+        self,
+        stocks: list[dict[str, object]],
+        source_cache: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return routine_tree_performance_texts(self, stocks, source_cache)
 
 
 _STOCK_REGISTER_PERFORMANCE_ADAPTER = StockRegisterPerformanceAdapter()
@@ -1374,9 +1327,10 @@ class StockRegisterWindow(QDialog):
     종목관리 창.
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, stock_search_register_opener=None) -> None:
         super().__init__(None)
         configure_persistent_feature_window(self, parent)
+        self._stock_search_register_opener = stock_search_register_opener
 
         self.setWindowTitle("종목관리")
 
@@ -1954,33 +1908,6 @@ class StockRegisterWindow(QDialog):
         writer = getattr(parent, "mark_review_required", None)
         return writer if callable(writer) else None
 
-    def _review_required_stock_summary(self, result: dict[str, object]) -> str:
-        issues = result.get("issues", [])
-        names: list[str] = []
-        seen: set[tuple[str, str]] = set()
-        if isinstance(issues, list):
-            for issue in issues:
-                if not isinstance(issue, dict):
-                    continue
-                if issue.get("requires_review") is not True:
-                    continue
-                if str(issue.get("execution_status", "") or "").strip().upper() != LOCAL_STATUS_REVIEW_REQUIRED:
-                    continue
-                code = str(issue.get("stock_code", "") or "").strip()
-                name = str(issue.get("stock_name", "") or "").strip()
-                key = (code, name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                title = f"{code} {name}".strip()
-                if title:
-                    names.append(title)
-        if not names:
-            return "검토관리 대상 종목 있음"
-        if len(names) == 1:
-            return f"검토관리 {names[0]}"
-        return f"검토관리 {names[0]} 외 {len(names) - 1}종목"
-
     def _integrity_writer_failed(self, result: dict[str, object]) -> bool:
         issues = result.get("issues", [])
         if not isinstance(issues, list):
@@ -2238,9 +2165,24 @@ class StockRegisterWindow(QDialog):
                 skipped_items.append(f"{code} {name}: 기존 루틴({', '.join(existing_routine_list)})")
                 continue
 
-            can_process, guard_info = routine_action_reasons_for_stock(code, name, allow_unassigned=True)
-            if not can_process:
-                blocked_items.append(guard_info)
+            owner = persistent_feature_owner(self)
+            authorization = inspect_assignment_authorization(
+                owner,
+                PROJECT_ROOT,
+                code,
+                name,
+                intent=ASSIGNMENT_INTENT_ASSIGN,
+                target_instance_id=selected_instance.instance_id,
+                expected_instance_id="",
+            )
+            if not authorization.allowed:
+                blocked_items.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "reasons": [authorization.reason_code],
+                    }
+                )
                 continue
 
             if not is_valid_stock_code(code):
@@ -2253,14 +2195,19 @@ class StockRegisterWindow(QDialog):
                 continue
 
             repo = stock_repository_factory()
-            if not update_base_stock_routine_instance(
+            assignment_result = execute_assignment_change(
+                owner,
+                PROJECT_ROOT,
                 code,
                 name,
                 instance_id=selected_instance.instance_id,
                 instance_name=selected_instance.display_name,
                 definition_id=selected_definition.definition_id,
                 routine_type=selected_definition.display_name,
-            ):
+                expected_instance_id="",
+                intent=ASSIGNMENT_INTENT_ASSIGN,
+            )
+            if not assignment_result.ok or not assignment_result.changed:
                 skipped_items.append(f"{code} {name}: 저장 실패")
                 continue
 
@@ -2295,11 +2242,9 @@ class StockRegisterWindow(QDialog):
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
 
-        parent = persistent_feature_owner(self)
-        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
-            parent.refresh_auto_trade_assignment_views()
-        elif parent is not None and hasattr(parent, "refresh_all"):
-            parent.refresh_all()
+        if applied_items:
+            sync_auto_trade_monitoring_universe(self)
+        refresh_auto_trade_views(self)
 
         unavailable_count = len(blocked_items) + len(skipped_items)
         show_toast(
@@ -2347,6 +2292,7 @@ class StockRegisterWindow(QDialog):
         skipped_unassigned: list[str] = []
         blocked_items: list[dict[str, object]] = []
 
+        owner = persistent_feature_owner(self)
         for code, name in selected_stocks:
             can_unassign, routine_name, reasons = can_unassign_active_routine_from_stock(code, name)
             title = f"{code} {name}"
@@ -2369,7 +2315,19 @@ class StockRegisterWindow(QDialog):
 
         removed_items: list[str] = []
         for code, name, routine_name in allowed:
-            if update_base_stock_routines(code, name, []):
+            current = stock_repository_factory().find_by_code(code)
+            expected_instance_id = str(
+                getattr(current, "assigned_routine_instance_id", "") or ""
+            ).strip()
+            result = execute_assignment_unassign(
+                owner,
+                PROJECT_ROOT,
+                code,
+                name,
+                expected_instance_id=expected_instance_id,
+                intent=ASSIGNMENT_INTENT_UNASSIGN,
+            )
+            if result.ok and result.changed:
                 ensure_single_real_trade_routine_for_stock(code, name)
                 removed_items.append(f"{code},{name}({routine_name})")
 
@@ -2384,11 +2342,9 @@ class StockRegisterWindow(QDialog):
         self.stock_table.clearSelection()
         self.btn_delete_stock.setEnabled(False)
 
-        parent = persistent_feature_owner(self)
-        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
-            parent.refresh_auto_trade_assignment_views()
-        elif parent is not None and hasattr(parent, "refresh_all"):
-            parent.refresh_all()
+        if removed_items:
+            sync_auto_trade_monitoring_universe(self)
+        refresh_auto_trade_views(self)
 
         show_toast(
             self,
@@ -2515,11 +2471,8 @@ class StockRegisterWindow(QDialog):
         self.btn_delete_stock.setEnabled(False)
         self.btn_stock_history.setEnabled(False)
 
-        parent = persistent_feature_owner(self)
-        if parent is not None and hasattr(parent, "refresh_auto_trade_assignment_views"):
-            parent.refresh_auto_trade_assignment_views()
-        elif parent is not None and hasattr(parent, "refresh_all"):
-            parent.refresh_all()
+        sync_auto_trade_monitoring_universe(self)
+        refresh_auto_trade_views(self)
 
         show_toast(self, "초기화 완료")
 
@@ -2712,9 +2665,10 @@ class StockRegisterWindow(QDialog):
         self._position_stock_performance_sort_badges()
     def open_search_register_dialog(self) -> None:
         """검증된 runtime Master Library를 사용하는 등록 경로를 연다."""
-        from gui_auto_trade_setting_window import open_instance_stock_search_register_dialog
-
-        dialog = open_instance_stock_search_register_dialog(
+        opener = getattr(self, "_stock_search_register_opener", None)
+        if not callable(opener):
+            return
+        opener(
             self,
             {
                 "row_kind": "unassigned",
@@ -2733,9 +2687,10 @@ class StockRegisterWindow(QDialog):
         """
         종목등록 버튼에서 공식 검색등록 UI를 연다.
         """
-        from gui_auto_trade_setting_window import open_instance_stock_search_register_dialog
-
-        dialog = open_instance_stock_search_register_dialog(
+        opener = getattr(self, "_stock_search_register_opener", None)
+        if not callable(opener):
+            return
+        opener(
             self,
             {
                 "row_kind": "unassigned",

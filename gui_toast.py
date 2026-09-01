@@ -29,7 +29,7 @@ class ToastMessage(QFrame):
         self._position = position
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setObjectName("commonToastMessage")
 
         self._label = QLabel(str(message), self)
@@ -108,6 +108,7 @@ class ToastMessage(QFrame):
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event: object) -> None:
+        self._timer.stop()
         parent = self.parentWidget()
         if parent is not None:
             parent.removeEventFilter(self)

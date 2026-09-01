@@ -191,12 +191,31 @@ class KiwoomStockLibrarySyncTests(unittest.TestCase):
         )
         return service, scheduler, events
 
+    @staticmethod
+    def _incident_api() -> _FakeApi:
+        return _FakeApi(
+            raw_market_returns={
+                "0": "005930; BAD01;ABC123;000000;;005930;",
+                "10": "035720;1234567;12-345;\x0012345;",
+            },
+            names={
+                "005930": "삼성전자",
+                "035720": "카카오",
+                "BAD01": "비대상Master",
+            },
+        )
+
     def test_normal_markets_merge_validate_and_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             service, scheduler, events = self._service(root)
-            self.assertTrue(service.start_for_current_session())
-            scheduler.drain()
+            with patch.object(
+                service,
+                "_write_diagnostic_file",
+                wraps=service._write_diagnostic_file,
+            ) as diagnostic_writer:
+                self.assertTrue(service.start_for_current_session())
+                scheduler.drain()
 
             self.assertEqual("SUCCEEDED", service.state.state)
             records = json.loads(service.runtime_library_path.read_text(encoding="utf-8"))
@@ -227,6 +246,14 @@ class KiwoomStockLibrarySyncTests(unittest.TestCase):
             self.assertEqual(service.state.content_sha256, metadata["content_sha256"])
             self.assertEqual("STOCK_LIBRARY_SYNC_SUCCEEDED", events[0][0])
             self.assertEqual(1, len(events))
+            diagnostics = root / "runtime" / "diagnostics"
+            self.assertEqual([], list(diagnostics.glob("*.json")))
+            self.assertFalse(service.state.diagnostic_file_written)
+            self.assertEqual("", service.state.diagnostic_file_name)
+            event_details = events[0][1]["details"]
+            self.assertFalse(event_details["issue_detected"])
+            self.assertEqual(0, event_details["invalid_count"])
+            diagnostic_writer.assert_not_called()
 
     def test_name_lookup_is_split_across_event_loop_batches(self) -> None:
         api = _FakeApi(
@@ -424,22 +451,17 @@ class KiwoomStockLibrarySyncTests(unittest.TestCase):
             self.assertEqual("VALID_CODE_RATIO_TOO_LOW", service.state.reason)
 
     def test_invalid_diagnostic_captures_raw_tokens_reasons_and_master_names(self) -> None:
-        api = _FakeApi(
-            raw_market_returns={
-                "0": "005930; BAD01;ABC123;000000;;005930;",
-                "10": "035720;1234567;12-345;\x0012345;",
-            },
-            names={
-                "005930": "삼성전자",
-                "035720": "카카오",
-                "BAD01": "비대상Master",
-            },
-        )
+        api = self._incident_api()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             service, scheduler, events = self._service(root, api, minimum_count=2)
-            service.start_for_current_session()
-            scheduler.drain()
+            with patch.object(
+                service,
+                "_write_diagnostic_file",
+                wraps=service._write_diagnostic_file,
+            ) as diagnostic_writer:
+                service.start_for_current_session()
+                scheduler.drain()
 
             self.assertEqual("FAILED", service.state.state)
             self.assertEqual("VALID_CODE_RATIO_TOO_LOW", service.state.reason)
@@ -466,26 +488,40 @@ class KiwoomStockLibrarySyncTests(unittest.TestCase):
             self.assertEqual(1, api.name_calls.count("1234567"))
             self.assertEqual(1, api.name_calls.count("12-345"))
             self.assertEqual(1, api.name_calls.count("\x0012345"))
-            kospi_tokens = payload["markets"]["KOSPI"]["tokens"]
-            whitespace = next(item for item in kospi_tokens if item["raw_token"] == " BAD01")
+            self.assertNotIn("markets", payload)
+            whitespace = next(
+                item for item in payload["invalid_items"] if item["raw_token"] == " BAD01"
+            )
             self.assertTrue(whitespace["leading_whitespace"])
             self.assertEqual("' BAD01'", whitespace["raw_repr"])
-            self.assertTrue(any(item["invalid_reason"] == "EMPTY" for item in kospi_tokens))
             control_item = next(
                 item for item in payload["invalid_items"] if item["invalid_reason"] == "CONTROL_CHARACTER"
             )
             self.assertTrue(control_item["has_control_character"])
             event_details = events[-1][1]["details"]
             self.assertEqual(summary["invalid_by_reason"], event_details["invalid_by_reason"])
+            self.assertTrue(event_details["issue_detected"])
+            self.assertEqual(5, event_details["invalid_count"])
             self.assertTrue(event_details["diagnostic_file_written"])
+            self.assertEqual(diagnostic_path.name, event_details["diagnostic_file_name"])
             self.assertNotIn("invalid_items", event_details)
             self.assertFalse(diagnostic_path.with_name(diagnostic_path.name + ".tmp").exists())
             self.assertFalse(service.runtime_library_path.exists())
+            diagnostic_writer.assert_called_once()
+
+            legacy_payload = dict(payload)
+            legacy_payload["markets"] = service._market_diagnostics
+            legacy_size = len(service._json_bytes(legacy_payload))
+            self.assertLess(diagnostic_path.stat().st_size, legacy_size)
 
     def test_diagnostic_write_failure_is_fail_open_for_existing_sync_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            service, scheduler, events = self._service(root)
+            service, scheduler, events = self._service(
+                root,
+                self._incident_api(),
+                minimum_count=2,
+            )
             with patch.object(
                 service,
                 "_write_diagnostic_file",
@@ -493,11 +529,125 @@ class KiwoomStockLibrarySyncTests(unittest.TestCase):
             ):
                 service.start_for_current_session()
                 scheduler.drain()
-            self.assertEqual("SUCCEEDED", service.state.state)
-            self.assertTrue(service.runtime_library_path.exists())
+            self.assertEqual("FAILED", service.state.state)
+            self.assertEqual("VALID_CODE_RATIO_TOO_LOW", service.state.reason)
             self.assertFalse(service.state.diagnostic_file_written)
             self.assertFalse(events[-1][1]["details"]["diagnostic_file_written"])
             self.assertEqual("", events[-1][1]["details"]["diagnostic_file_name"])
+
+    def test_incident_snapshot_replaces_same_session_without_file_growth(self) -> None:
+        api = self._incident_api()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, scheduler, events = self._service(root, api, minimum_count=2)
+
+            self.assertTrue(service.start_for_current_session())
+            scheduler.drain()
+            diagnostics = root / "runtime" / "diagnostics"
+            paths = list(diagnostics.glob("*.json"))
+            self.assertEqual(1, len(paths))
+            first_path = paths[0]
+            first_payload = json.loads(first_path.read_text(encoding="utf-8"))
+
+            api.raw_market_returns["10"] = "035720;1234567;12-345;ABC123;\x0012345;"
+            self.assertTrue(service.start_for_current_session(explicit_retry=True))
+            scheduler.drain()
+
+            paths = list(diagnostics.glob("*.json"))
+            self.assertEqual([first_path], paths)
+            second_payload = json.loads(first_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(first_payload["summary"], second_payload["summary"])
+            self.assertEqual(2, len(events))
+            self.assertTrue(all(event[1]["details"]["issue_detected"] for event in events))
+
+    def test_incidents_from_different_sessions_keep_distinct_snapshots(self) -> None:
+        api = self._incident_api()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, scheduler, _events = self._service(root, api, minimum_count=2)
+
+            self.assertTrue(service.start_for_current_session())
+            scheduler.drain()
+            api.session_id = "SESSION-2"
+            api.epoch = 2
+            self.assertTrue(service.start_for_current_session())
+            scheduler.drain()
+
+            paths = sorted((root / "runtime" / "diagnostics").glob("*.json"))
+            self.assertEqual(2, len(paths))
+            identities = {
+                (
+                    json.loads(path.read_text(encoding="utf-8"))["connection_epoch"],
+                    json.loads(path.read_text(encoding="utf-8"))["login_session_id"],
+                )
+                for path in paths
+            }
+            self.assertEqual({(1, "SESSION-1"), (2, "SESSION-2")}, identities)
+
+    def test_normal_retry_preserves_prior_same_session_incident_snapshot(self) -> None:
+        api = self._incident_api()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, scheduler, events = self._service(root, api, minimum_count=2)
+
+            self.assertTrue(service.start_for_current_session())
+            scheduler.drain()
+            diagnostic_path = next((root / "runtime" / "diagnostics").glob("*.json"))
+            incident_bytes = diagnostic_path.read_bytes()
+
+            api.raw_market_returns = {}
+            api.market_codes = {
+                "0": ["005930", "000660"],
+                "10": ["035720"],
+                "NXT": ["005930"],
+            }
+            api.names.update({"000660": "SK하이닉스"})
+            self.assertTrue(service.start_for_current_session(explicit_retry=True))
+            scheduler.drain()
+
+            self.assertEqual("SUCCEEDED", service.state.state)
+            self.assertEqual(incident_bytes, diagnostic_path.read_bytes())
+            self.assertEqual(1, len(list(diagnostic_path.parent.glob("*.json"))))
+            self.assertFalse(events[-1][1]["details"]["issue_detected"])
+            self.assertFalse(events[-1][1]["details"]["diagnostic_file_written"])
+
+    def test_repeated_normal_sync_never_creates_diagnostic_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, scheduler, events = self._service(root)
+            for attempt in range(100):
+                self.assertTrue(
+                    service.start_for_current_session(explicit_retry=attempt > 0)
+                )
+                scheduler.drain()
+
+            self.assertEqual("SUCCEEDED", service.state.state)
+            self.assertEqual([], list((root / "runtime" / "diagnostics").glob("*.json")))
+            self.assertEqual(100, len(events))
+            self.assertTrue(
+                all(not event[1]["details"]["issue_detected"] for event in events)
+            )
+
+    def test_three_invalid_codes_create_compact_incident_snapshot(self) -> None:
+        api = _FakeApi(
+            raw_market_returns={
+                "0": "005930;BAD01;000000;",
+                "10": "035720;12-345;",
+            },
+            names={"005930": "삼성전자", "035720": "카카오"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service, scheduler, events = self._service(root, api, minimum_count=2)
+            self.assertTrue(service.start_for_current_session())
+            scheduler.drain()
+
+            diagnostic_path = next((root / "runtime" / "diagnostics").glob("*.json"))
+            payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            self.assertEqual(3, payload["summary"]["invalid_count"])
+            self.assertEqual(3, len(payload["invalid_items"]))
+            self.assertNotIn("markets", payload)
+            self.assertTrue(events[-1][1]["details"]["issue_detected"])
 
     def test_atomic_promote_failure_preserves_existing_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

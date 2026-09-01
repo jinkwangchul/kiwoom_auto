@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -21,7 +20,7 @@ from routine_instance_registry import load_persisted_routine_instances
 from runtime_io import read_json_dict
 from stock_repository import StockRecord, StockRepository
 from assignment_episode_repository import CanonicalAssignmentEpisodeRepository
-from assignment_episode_repository import AssignmentEpisodeTarget
+from assignment_episode_linkage import unassign_stock_routine
 from routine_delete_policy import preview_delete_scope
 
 
@@ -232,24 +231,15 @@ def delete_group_completely(
             stock_backups.append(
                 (episode_path, episode_path.read_bytes() if episode_path.exists() else None)
             )
-            before_target = AssignmentEpisodeTarget.assigned(
-                instance_id=stock.assigned_routine_instance_id,
-                group_id=scope.group_id,
-                definition_id=group_record.definition_id,
-                instance_name_snapshot=(stock.routine_instance_name or stock.assigned_routine_instance_id),
-                group_name_snapshot=scope.group_name,
+            result = unassign_stock_routine(
+                repository.project_root,
+                stock.code,
+                stock.name,
+                [],
+                expected_instance_id=stock.assigned_routine_instance_id,
+                stock_repository=repository,
             )
-            update_parameters = inspect.signature(repository.update_stock_routine).parameters
-            if "_episode_before_target" in update_parameters:
-                updated = repository.update_stock_routine(
-                    stock.code,
-                    stock.name,
-                    [],
-                    _episode_before_target=before_target,
-                )
-            else:
-                updated = repository.update_stock_routine(stock.code, stock.name, [])
-            if not updated:
+            if not result.ok:
                 raise RuntimeError(f"종목 관계를 해제하지 못했습니다: {stock.code} {stock.name}")
             saved = read_json_dict(config_path)
             if (

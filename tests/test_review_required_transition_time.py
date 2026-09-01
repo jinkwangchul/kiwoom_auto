@@ -280,17 +280,15 @@ class ReviewRequiredTransitionTimeTest(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertEqual(["검토관리"], info["reasons"])
 
-            with (
-                patch.object(
-                    routine_policy,
-                    "base_stock_routines_for_stock",
-                    return_value=(True, ["지표추종매매"]),
-                ),
-                patch.object(
-                    routine_policy,
-                    "stock_runtime_dir_for_routine",
-                    return_value=stock_dir,
-                ),
+            unassign_decision = SimpleNamespace(
+                allowed=False,
+                evidence={"persisted_routine_fields": ("지표추종매매",)},
+                user_reasons=("검토관리",),
+            )
+            with patch.object(
+                routine_policy,
+                "routine_unassign_decision",
+                return_value=unassign_decision,
             ):
                 can_unassign, routine_name, reasons = (
                     routine_policy.can_unassign_active_routine_from_stock(

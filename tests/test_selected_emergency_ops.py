@@ -58,7 +58,6 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
         return SimpleNamespace(
             refresh_all=Mock(),
             statusBarMessage=Mock(),
-            production_recovery_stock_is_review_required=lambda _code: False,
             startup_recovery_session_ready=lambda refresh=False: True,
         )
 
@@ -72,7 +71,6 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             statusBar=lambda: status_bar,
             btn_emergency_stop=SimpleNamespace(setText=Mock()),
             startup_recovery_session_ready=lambda refresh=False: True,
-            production_recovery_stock_is_review_required=lambda _code: False,
             start_production_recovery=Mock(),
         )
 
@@ -566,10 +564,22 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                 json.dumps(state, ensure_ascii=False), encoding="utf-8"
             )
 
+            def unassign_result(*_args, **_kwargs):
+                (stock_dir / "config.json").write_text("{}\n", encoding="utf-8")
+                return SimpleNamespace(
+                    ok=True,
+                    reason_code="OK",
+                    reconciliation_required=False,
+                )
+
             with (
                 patch.object(emergency_ops, "emergency_release_common_guard", return_value=(True, "")),
                 patch.object(emergency_ops, "append_stock_log"),
-                patch.object(emergency_ops, "update_base_stock_routines", return_value=True) as unassign,
+                patch.object(
+                    emergency_ops,
+                    "execute_assignment_unassign",
+                    side_effect=unassign_result,
+                ) as unassign,
             ):
                 result = emergency_ops.normalize_review_emergency_target(
                     self._window(), stock_dir, code, name, destination="UNASSIGNED"
@@ -582,7 +592,114 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
             self.assertEqual("", saved["active_routine"])
             self.assertEqual("", saved["routine_name"])
             self.assertTrue(stock_dir.exists())
-            unassign.assert_called_once_with(code, name, [])
+            unassign.assert_called_once()
+            self.assertEqual((code, name), unassign.call_args.args[2:])
+            self.assertEqual("", unassign.call_args.kwargs["expected_instance_id"])
+
+    def test_common_unassigned_transaction_failure_never_writes_stopped(self) -> None:
+        for reason_code, reconciliation_required in (
+            ("FIELD_CONFLICT", False),
+            ("RECONCILIATION_REQUIRED", True),
+        ):
+            with self.subTest(reason_code=reason_code):
+                with tempfile.TemporaryDirectory() as root:
+                    stock_dir, code, name = self._target(
+                        root,
+                        "000001",
+                        status="REVIEW_REQUIRED",
+                    )
+                    config = {
+                        "assigned_routine_instance_id": "instance-a",
+                        "routine_instance_name": "Routine A",
+                    }
+                    (stock_dir / "config.json").write_text(
+                        json.dumps(config),
+                        encoding="utf-8",
+                    )
+                    before_state = read_json_dict(stock_dir / "state.json")
+                    failure = SimpleNamespace(
+                        ok=False,
+                        reason_code=reason_code,
+                        reconciliation_required=reconciliation_required,
+                    )
+                    with (
+                        patch.object(
+                            emergency_ops,
+                            "emergency_release_common_guard",
+                            return_value=(True, ""),
+                        ),
+                        patch.object(
+                            emergency_ops,
+                            "execute_assignment_unassign",
+                            return_value=failure,
+                        ),
+                        patch.object(
+                            emergency_ops,
+                            "update_runtime_stock_status",
+                        ) as runtime_write,
+                    ):
+                        result = emergency_ops.normalize_review_emergency_target(
+                            self._window(),
+                            stock_dir,
+                            code,
+                            name,
+                            destination="UNASSIGNED",
+                        )
+
+                    self.assertEqual("FAILED", result["status"])
+                    self.assertEqual(reason_code, result["reason_code"])
+                    self.assertEqual(
+                        reconciliation_required,
+                        result["reconciliation_required"],
+                    )
+                    runtime_write.assert_not_called()
+                    self.assertEqual(before_state, read_json_dict(stock_dir / "state.json"))
+                    self.assertEqual(config, read_json_dict(stock_dir / "config.json"))
+
+    def test_common_unassigned_readback_failure_never_writes_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            stock_dir, code, name = self._target(
+                root,
+                "000001",
+                status="REVIEW_REQUIRED",
+            )
+            config = {"assigned_routine_instance_id": "instance-a"}
+            (stock_dir / "config.json").write_text(
+                json.dumps(config),
+                encoding="utf-8",
+            )
+            success_without_readback = SimpleNamespace(
+                ok=True,
+                reason_code="OK",
+                reconciliation_required=False,
+            )
+            with (
+                patch.object(
+                    emergency_ops,
+                    "emergency_release_common_guard",
+                    return_value=(True, ""),
+                ),
+                patch.object(
+                    emergency_ops,
+                    "execute_assignment_unassign",
+                    return_value=success_without_readback,
+                ),
+                patch.object(
+                    emergency_ops,
+                    "update_runtime_stock_status",
+                ) as runtime_write,
+            ):
+                result = emergency_ops.normalize_review_emergency_target(
+                    self._window(),
+                    stock_dir,
+                    code,
+                    name,
+                    destination="UNASSIGNED",
+                )
+
+            self.assertEqual("FAILED", result["status"])
+            self.assertEqual("READ_BACK_FAILED", result["reason_code"])
+            runtime_write.assert_not_called()
 
     def test_common_restore_blocks_without_release_or_routine_change(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -606,7 +723,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                     "emergency_review_reason_for_stock",
                     return_value=(True, "보유잔량 존재"),
                 ),
-                patch.object(emergency_ops, "update_base_stock_routines") as unassign,
+                patch.object(emergency_ops, "execute_assignment_unassign") as unassign,
             ):
                 result = emergency_ops.normalize_review_emergency_target(
                     self._window(), stock_dir, code, name, destination="RESTORE"
@@ -638,7 +755,7 @@ class SelectedEmergencyOpsTest(unittest.TestCase):
                     "emergency_review_reason_for_stock",
                     return_value=(True, "보유잔량 존재"),
                 ),
-                patch.object(emergency_ops, "update_base_stock_routines") as unassign,
+                patch.object(emergency_ops, "execute_assignment_unassign") as unassign,
             ):
                 result = emergency_ops.normalize_review_emergency_target(
                     self._window(), stock_dir, code, name, destination="UNASSIGNED"

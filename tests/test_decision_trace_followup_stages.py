@@ -189,7 +189,7 @@ class DecisionTraceFollowupStagesTest(unittest.TestCase):
         queued = CaptureObserver()
         duplicate = CaptureObserver()
         with patch.object(routine_signal_probe, "_append_log"), patch.object(
-            routine_signal_probe, "read_latest_price", return_value=None
+            routine_signal_probe, "read_reference_price", return_value=None
         ), patch.object(
             routine_signal_probe,
             "enqueue_routine_signal",
@@ -199,7 +199,7 @@ class DecisionTraceFollowupStagesTest(unittest.TestCase):
                 BuyRoutine, "test", stock_dir, "tick", decision_trace_observer=queued
             )
         with patch.object(routine_signal_probe, "_append_log"), patch.object(
-            routine_signal_probe, "read_latest_price", return_value=None
+            routine_signal_probe, "read_reference_price", return_value=None
         ), patch.object(
             routine_signal_probe,
             "enqueue_routine_signal",

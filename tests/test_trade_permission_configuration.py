@@ -16,6 +16,7 @@ from gui_auto_trade_timer import (
     _process_pending_signal_pipeline,
 )
 from state_policy import real_trade_enabled, trade_permission_display
+from tests.participant_owner_fixture import attach_participant_owner, participant_owner
 
 
 def _write_stock(
@@ -25,7 +26,7 @@ def _write_stock(
     state: dict[str, object] | None = None,
     config: dict[str, object] | None = None,
 ) -> Path:
-    stock_dir = root / name
+    stock_dir = root / "stocks" / name
     stock_dir.mkdir(parents=True)
     base_config = {
         "routine": "지표추종매매",
@@ -60,7 +61,9 @@ class TradePermissionConfigurationTest(unittest.TestCase):
             stock_dir = _write_stock(Path(temp))
             before = json.loads((stock_dir / "config.json").read_text(encoding="utf-8"))
             result = set_stock_real_trade_enabled(
-                SimpleNamespace(),
+                SimpleNamespace(
+                    _main_monitoring_auto_trade_operation_host=participant_owner()
+                ),
                 stock_dir,
                 "012210",
                 "삼미금속",
@@ -85,7 +88,7 @@ class TradePermissionConfigurationTest(unittest.TestCase):
             )
             second = _write_stock(
                 root,
-                "012210_삼미금속B",
+                "005070_삼미금속B",
                 config={"real_trade_enabled": True, "routine_instance_name": "B"},
             )
             with patch(
@@ -93,7 +96,9 @@ class TradePermissionConfigurationTest(unittest.TestCase):
                 return_value=[("A", first), ("B", second)],
             ):
                 result = set_stock_real_trade_enabled(
-                    SimpleNamespace(),
+                    SimpleNamespace(
+                        _main_monitoring_auto_trade_operation_host=participant_owner()
+                    ),
                     first,
                     "012210",
                     "삼미금속",
@@ -114,7 +119,9 @@ class TradePermissionConfigurationTest(unittest.TestCase):
             )
             before = (stock_dir / "config.json").read_text(encoding="utf-8")
             result = set_stock_real_trade_enabled(
-                SimpleNamespace(),
+                SimpleNamespace(
+                    _main_monitoring_auto_trade_operation_host=participant_owner({"012210"})
+                ),
                 stock_dir,
                 "012210",
                 "삼미금속",
@@ -155,7 +162,7 @@ class TradePermissionConfigurationTest(unittest.TestCase):
                 config={"real_trade_enabled": False},
             )
             window = SimpleNamespace(
-                _current_session_operation_participant_stock_codes={"012210"},
+                _main_monitoring_auto_trade_operation_host=participant_owner({"012210"}),
                 startup_recovery_session_ready=lambda refresh=False: True,
                 registered_operation_targets=lambda: [(stock_dir, "012210", "삼미금속")],
             )

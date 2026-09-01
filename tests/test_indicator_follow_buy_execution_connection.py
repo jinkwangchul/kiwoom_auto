@@ -33,7 +33,13 @@ bridge = _load_module("routine_buy_execution.py", "indicator_follow_buy_executio
 
 
 class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
-    def _rules(self, *, repeat_mode: str = "ROUND", max_rounds: int | None = None) -> dict:
+    def _rules(
+        self,
+        *,
+        repeat_mode: str = "ROUND",
+        max_rounds: int | None = None,
+        price_basis: str = "CURRENT_PRICE",
+    ) -> dict:
         repeat = {
             "buy_phase": "REPEAT",
             "starts_from_round": 2,
@@ -52,7 +58,7 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
                         "buy_phase": "BASE",
                         "buy_round": 1,
                         "hoga_mode": "SINGLE",
-                        "order_price_basis": "CURRENT_PRICE",
+                        "order_price_basis": price_basis,
                         "hoga_up": 0,
                         "hoga_down": 0,
                     },
@@ -78,20 +84,60 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def _build(self, *, cycle=None, config=None, rules=None, price=100.0, account_budget=None) -> dict:
+    def _build(
+        self,
+        *,
+        cycle=None,
+        config=None,
+        rules=None,
+        price=100.0,
+        actionable_price=Ellipsis,
+        account_budget=None,
+    ) -> dict:
         context = {
             "cycle": cycle if cycle is not None else self._cycle(),
             "stock_config": config or {"trade_amount_type": "QUANTITY", "buy_qty": 1},
             "rules": rules if rules is not None else self._rules(),
-            "current_price": price,
+            "reference_price": price,
             "routine_instance_id": "INSTANCE_A",
         }
+        if actionable_price is Ellipsis:
+            context["actionable_current_price"] = price
+        elif actionable_price is not None:
+            context["actionable_current_price"] = actionable_price
         if account_budget is not None:
             context["account_budget"] = account_budget
         return bridge.build_indicator_follow_buy_intent(
             buy_signal_result={"signal": "BUY", "reason": "indicator"},
             context=context,
         )
+
+    def test_current_price_requires_actionable_price_not_reference_price(self) -> None:
+        blocked = self._build(price=80_000, actionable_price=None)
+        ready = self._build(price=70_000, actionable_price=80_000)
+
+        self.assertEqual("CURRENT_PRICE_VALUE_MISSING", blocked["reason"])
+        self.assertEqual("READY", ready["status"])
+        self.assertEqual(80_000, ready["execution_intent"]["price"])
+        self.assertEqual(80_000, ready["execution_intent"]["budget"])
+
+    def test_order_and_market_keep_reference_sizing_without_actionable_price(self) -> None:
+        order_price = self._build(
+            rules=self._rules(price_basis="ORDER_PRICE"),
+            price=70_000,
+            actionable_price=None,
+        )
+        market = self._build(
+            rules=self._rules(price_basis="MARKET"),
+            price=70_000,
+            actionable_price=None,
+        )
+
+        self.assertEqual("READY", order_price["status"])
+        self.assertEqual(70_000, order_price["execution_intent"]["price"])
+        self.assertEqual("READY", market["status"])
+        self.assertIsNone(market["execution_intent"]["price"])
+        self.assertEqual(70_000, market["execution_intent"]["budget"])
 
     def test_account_total_budget_blocks_4000_plus_100_before_queueing(self) -> None:
         result = self._build(
@@ -172,7 +218,8 @@ class IndicatorFollowBuyExecutionConnectionTest(unittest.TestCase):
             "rules": self._rules(),
             "cycle": self._cycle(),
             "stock_config": {"trade_amount_type": "QUANTITY", "buy_qty": 3},
-            "current_price": 50000,
+            "reference_price": 50000,
+            "actionable_current_price": 50000,
             "routine_instance_id": "INSTANCE_A",
         })
 

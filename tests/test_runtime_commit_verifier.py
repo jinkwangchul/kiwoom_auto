@@ -159,7 +159,7 @@ class TestRuntimeCommitVerifier(unittest.TestCase):
         self.assertEqual(before_mtime, after_mtime)
 
     # 8. commit_id 없으면 INVALID
-    def test_invalid_without_commit_id(self):
+    def test_plan_invalid_without_commit_id(self):
         f1 = self._real_existing_file("a.json")
         backup_plan = self._make_valid_backup_plan([f1])
         rollback_plan = self._make_valid_rollback_plan(backup_plan)

@@ -5,10 +5,10 @@ import unittest
 from unittest.mock import Mock
 
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from gui_windows import MainWindow, _MarketDataMonitoringWindow
+from tests.qt_test_support import flush_deferred_deletes
 
 
 class _MonitoringHost:
@@ -87,7 +87,7 @@ class MarketDataMonitoringWindowTests(unittest.TestCase):
             window.close()
             window.deleteLater()
         self.parent.close()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        flush_deferred_deletes(self.app)
 
     def test_open_ten_times_reuses_single_window_and_observes_only(self) -> None:
         windows = [
@@ -103,8 +103,7 @@ class MarketDataMonitoringWindowTests(unittest.TestCase):
     def test_close_then_reopen_creates_a_live_window(self) -> None:
         first = MainWindow.open_market_data_monitoring_window(self.parent)
         first.close()
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self.app.processEvents()
+        flush_deferred_deletes(self.app)
         second = MainWindow.open_market_data_monitoring_window(self.parent)
 
         self.assertIsNot(first, second)

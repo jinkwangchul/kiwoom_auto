@@ -16,10 +16,20 @@ from close_liquidation_transition_service import (
     TransitionEvidence,
     decide_close_liquidation_transition,
 )
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class IndividualLiquidationTimeContractTests(unittest.TestCase):
     NOW_DATE = (2026, 8, 16)
+
+    def setUp(self) -> None:
+        patcher = patch.object(
+            policy,
+            "auto_trade_setting_today_date_text",
+            return_value="2026-08-16",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _operation_policy() -> dict[str, object]:
@@ -63,8 +73,8 @@ class IndividualLiquidationTimeContractTests(unittest.TestCase):
     def _window(stock: Path) -> Mock:
         window = Mock()
         window.selected_stock_infos.return_value = [(stock, "005930", "Samsung")]
+        attach_participant_owner(window, {"005930"})
         window.capture_stock_table_view_state.return_value = ([str(stock)], 0)
-        window.current_runtime_file_signature.return_value = ()
         return window
 
     @staticmethod

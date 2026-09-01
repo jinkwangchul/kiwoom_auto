@@ -14,6 +14,7 @@ from gui_auto_trade_run_control import (
     auto_trade_start_selected_auto_trades,
     operation_start_result_summary_toast_text,
 )
+from tests.participant_owner_fixture import attach_participant_owner
 
 
 class _BlockedStartWindow:
@@ -27,6 +28,7 @@ class _BlockedStartWindow:
             repaint=lambda: None,
         )
         self.show_auto_trade_result_dialog = Mock()
+        attach_participant_owner(self)
 
     def selected_stock_infos(self):
         return list(self.targets)
@@ -207,21 +209,31 @@ class OperationStartBlockReasonMessageTest(unittest.TestCase):
                 "display_label": "002810 삼영무역",
             },
         )
-        target = (Path("tests/002810_삼영무역"), "002810", "삼영무역")
-        running = (Path("tests/012210_삼미금속"), "012210", "삼미금속")
-        window = _BlockedStartWindow([target], blocked)
-
-        with (
-            patch.object(run_control, "read_operation_state", return_value={}),
-            patch.object(run_control, "_global_start_prerequisite_result", return_value=None),
-            patch.object(run_control, "_show_start_failure_once"),
-        ):
-            result = auto_trade_start_selected_auto_trades(
-                window,
-                selected_targets=[target],
-                already_running_targets=[running],
-                source="test",
+        with tempfile.TemporaryDirectory() as temp:
+            stock = Path(temp) / "002810_삼영무역"
+            stock.mkdir()
+            (stock / "state.json").write_text(
+                '{"status":"AUTO_CLOSE","trade_enabled":false,"holding_qty":0}',
+                encoding="utf-8",
             )
+            (stock / "config.json").write_text(
+                '{"operation_mode":"SCHEDULED"}', encoding="utf-8"
+            )
+            target = (stock, "002810", "삼영무역")
+            running = (Path(temp) / "012210_삼미금속", "012210", "삼미금속")
+            window = _BlockedStartWindow([target], blocked)
+
+            with (
+                patch.object(run_control, "read_operation_state", return_value={}),
+                patch.object(run_control, "_global_start_prerequisite_result", return_value=None),
+                patch.object(run_control, "_show_start_failure_once"),
+            ):
+                result = auto_trade_start_selected_auto_trades(
+                    window,
+                    selected_targets=[target],
+                    already_running_targets=[running],
+                    source="test",
+                )
 
         self.assertEqual(2, result["requested_count"])
         self.assertEqual(1, result["already_running_count"])

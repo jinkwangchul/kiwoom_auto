@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from tests.filesystem_test_support import assert_project_mutable_guard_active
+
 from copy import deepcopy
 import hashlib
 from pathlib import Path
@@ -200,8 +202,7 @@ class LifecycleTransitionApprovalGateTest(unittest.TestCase):
         result = evaluate_lifecycle_transition_approval(self._transition(), self._policy(), self._operator())
 
         self.assertEqual("LIFECYCLE_APPROVED", result["status"])
-        self.assertFalse((ROOT / "runtime" / "order_executions.json").exists())
-        self.assertFalse((ROOT / "runtime" / "order_locks.json").exists())
+        assert_project_mutable_guard_active(self)
 
 
 if __name__ == "__main__":

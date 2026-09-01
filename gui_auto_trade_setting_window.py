@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 gui_auto_trade_setting_window.py
 
@@ -68,7 +68,7 @@ from routine_tree_title_display import (
     tree_title_text,
     tree_title_tooltip,
 )
-from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS, project_current_stock_pnl
+from pnl_ui_refresh import PNL_REFRESH_INTERVAL_MS, project_current_stock_pnl_snapshot
 from auto_trade_order_execution_boundary import (
     AutoTradeOrderExecutionBoundary,
     AutoTradeOrderExecutionContext,
@@ -187,6 +187,11 @@ from gui_routine_policy import (
     can_unassign_active_routine_from_stock,
     routine_unassign_decision,
 )
+from assignment_authorization_service import (
+    ASSIGNMENT_INTENT_UNASSIGN,
+    execute_assignment_unassign,
+    inspect_stock_unregister_availability,
+)
 from runtime_io import (
     read_json_dict,
     read_orders_data,
@@ -228,14 +233,20 @@ class _AutoTradeRoutineInstanceNameEdit(QLineEdit):
         super().focusOutEvent(event)
 
 
+def _snapshot_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
 class _NumericSnapshotTableWidgetItem(QTableWidgetItem):
     def __lt__(self, other: QTableWidgetItem) -> bool:
-        left = InstanceStockSearchRegisterDialog._snapshot_number(
-            self.data(Qt.UserRole)
-        )
-        right = InstanceStockSearchRegisterDialog._snapshot_number(
-            other.data(Qt.UserRole)
-        )
+        left = _snapshot_number(self.data(Qt.UserRole))
+        right = _snapshot_number(other.data(Qt.UserRole))
         if left is None:
             return right is None and self.text() < other.text()
         if right is None:
@@ -1282,13 +1293,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
 
     @staticmethod
     def _snapshot_number(value: object) -> int | float | None:
-        if isinstance(value, bool) or value is None:
-            return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return None
-        return int(number) if number.is_integer() else number
+        return _snapshot_number(value)
 
     @classmethod
     def _format_snapshot_integer(cls, value: object) -> str:
@@ -1474,7 +1479,10 @@ class InstanceStockSearchRegisterDialog(QDialog):
         try:
             stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
             state = read_json_dict(stock_dir / "state.json")
-            if is_review_required_state(state):
+            if inspect_stock_review_state(
+                stock_dir,
+                loaded_state=state,
+            ).review_required:
                 return "검토관리"
         except Exception:
             pass
@@ -1504,35 +1512,13 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 return routine_name or assigned_instance_id
         return assigned_instance_id
 
-    def _refresh_parent_views(self) -> None:
-        parent = persistent_feature_owner(self)
-        refresh_assignment_views = getattr(
-            parent,
-            "refresh_auto_trade_assignment_views",
-            None,
-        )
-        if callable(refresh_assignment_views):
-            try:
-                refresh_assignment_views()
-                return
-            except Exception:
-                LOGGER.exception("Failed to refresh assignment views")
-        if parent is not None and hasattr(parent, "refresh_all"):
-            try:
-                parent.refresh_all()
-                return
-            except Exception:
-                LOGGER.exception("Failed to refresh auto-trade setting window")
-        if parent is not None and hasattr(parent, "load_routine_table"):
-            try:
-                parent.load_routine_table()
-            except Exception:
-                LOGGER.exception("Failed to refresh routine table")
-        if parent is not None and hasattr(parent, "load_selected_routine_stocks"):
-            try:
-                parent.load_selected_routine_stocks()
-            except Exception:
-                LOGGER.exception("Failed to refresh stock table")
+    def _refresh_parent_views(self, *, sync_monitoring_universe: bool = False) -> None:
+        if sync_monitoring_universe:
+            sync_auto_trade_monitoring_universe(self)
+        try:
+            refresh_auto_trade_views(self)
+        except Exception:
+            LOGGER.exception("Failed to refresh assignment views")
 
     def on_result_item_double_clicked(self, item: QTableWidgetItem) -> None:
         if item is None:
@@ -1588,9 +1574,12 @@ class InstanceStockSearchRegisterDialog(QDialog):
         try:
             stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
             state = read_json_dict(stock_dir / "state.json")
+            return inspect_stock_review_state(
+                stock_dir,
+                loaded_state=state,
+            ).review_required
         except Exception:
-            return False
-        return is_review_required_state(state)
+            return True
 
     def _registered_routine_name_for_stock(self, code: str, name: str) -> str:
         stock = self._registered_stock(code)
@@ -1628,10 +1617,18 @@ class InstanceStockSearchRegisterDialog(QDialog):
         return assigned_instance_id
 
     def _has_selected_routine_registered_stock(self) -> bool:
+        owner = persistent_feature_owner(self)
         for code, name in self._selected_result_stocks():
-            if self._is_review_required_stock(code, name):
+            routine_name = self._registered_routine_name_for_stock(code, name)
+            if not routine_name:
                 continue
-            if self._registered_routine_name_for_stock(code, name):
+            availability = inspect_stock_unregister_availability(
+                owner,
+                PROJECT_ROOT,
+                code,
+                name,
+            )
+            if availability.allowed:
                 return True
         return False
 
@@ -1696,25 +1693,25 @@ class InstanceStockSearchRegisterDialog(QDialog):
         skipped = 0
         blocked: list[tuple[str, str, list[str]]] = []
         seen_codes: set[str] = set()
+        owner = persistent_feature_owner(self)
         for code, name in selected:
             if code in seen_codes:
                 continue
             seen_codes.add(code)
-            if self._is_review_required_stock(code, name):
-                skipped += 1
-                continue
-            can_unassign, routine_name, reasons = can_unassign_active_routine_from_stock(
+            availability = inspect_stock_unregister_availability(
+                owner,
+                PROJECT_ROOT,
                 code,
                 name,
             )
-            routine_name = str(routine_name or "").strip()
+            routine_name = self._registered_routine_name_for_stock(code, name)
             if not routine_name:
                 skipped += 1
                 continue
-            if can_unassign:
+            if availability.allowed:
                 allowed.append((code, name, routine_name))
             else:
-                blocked.append((code, name, list(reasons)))
+                blocked.append((code, name, [availability.reason_code]))
 
         if not allowed:
             if blocked:
@@ -1727,7 +1724,19 @@ class InstanceStockSearchRegisterDialog(QDialog):
         succeeded_names: list[str] = []
         failed: list[str] = []
         for code, name, _routine_name in allowed:
-            if update_base_stock_routines(code, name, []):
+            current = StockRepository(PROJECT_ROOT).find_by_code(code)
+            expected_instance_id = str(
+                getattr(current, "assigned_routine_instance_id", "") or ""
+            ).strip()
+            result = execute_assignment_unassign(
+                owner,
+                PROJECT_ROOT,
+                code,
+                name,
+                expected_instance_id=expected_instance_id,
+                intent=ASSIGNMENT_INTENT_UNASSIGN,
+            )
+            if result.ok and result.changed:
                 ensure_single_real_trade_routine_for_stock(code, name)
                 succeeded.append(code)
                 succeeded_names.append(name)
@@ -1735,7 +1744,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 failed.append(code)
 
         if succeeded:
-            self._refresh_parent_views()
+            self._refresh_parent_views(sync_monitoring_universe=True)
             for code in succeeded:
                 self._refresh_classification_for_stock(code)
 
@@ -1790,6 +1799,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
             PROJECT_ROOT,
             code,
             name,
+            operation_owner=persistent_feature_owner(self),
             instance_id=instance_id,
             instance_name=instance_name,
             definition_id=definition_id,
@@ -1953,7 +1963,9 @@ class InstanceStockSearchRegisterDialog(QDialog):
                     counts["failed"] += 1
 
         if changed:
-            self._refresh_parent_views()
+            self._refresh_parent_views(
+                sync_monitoring_universe=not unassigned_target,
+            )
             for code in changed_codes:
                 self._refresh_classification_for_stock(code)
         if counts.get("move_cancelled") and not counts.get("new") and not changed:
@@ -2027,7 +2039,7 @@ class InstanceStockSearchRegisterDialog(QDialog):
                 self._toast("종목 지정에 실패했습니다.")
             return False
 
-        self._refresh_parent_views()
+        self._refresh_parent_views(sync_monitoring_universe=True)
         self._refresh_classification_for_stock(code)
         if newly_registered:
             self._toast("종목 등록 및 지정이 완료됐습니다.")
@@ -2178,7 +2190,7 @@ def auto_trade_register_historical_stock_to_original_instance(
             emit_toast("종목 등록에 실패했습니다.")
             return False
 
-        dialog._refresh_parent_views()
+        dialog._refresh_parent_views(sync_monitoring_universe=True)
         dialog._refresh_classification_for_stock(code)
         emit_toast(f"등록 1건 | {name}")
         return True
@@ -2196,8 +2208,6 @@ from gui_base_stock_service import (
     normalize_stock_code,
     read_base_stocks,
     single_routine_list,
-    update_base_stock_routine_instance,
-    update_base_stock_routines,
     validate_base_stock_record,
 )
 from state_policy import (
@@ -2212,7 +2222,6 @@ from state_policy import (
     normalized_hhmmss_or_empty,
     operation_mode_check_text,
     operation_mode_display,
-    real_trade_enabled,
     trade_permission_display,
     operation_mode_recalculation_target_status,
     operation_text_and_color,
@@ -2232,9 +2241,12 @@ from gui_ats_utils import (
 )
 from gui_auto_trade_display import (
     AUTO_TRADE_SETTING_AMBER_TEXT_COLOR,
+    AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_BORDER_COLOR,
     AUTO_TRADE_SETTING_BADGE_HEIGHT,
+    AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR,
     AUTO_TRADE_SETTING_BADGE_TEXT_COLOR,
+    AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT,
     apply_auto_trade_setting_activity_style,
     apply_auto_trade_setting_liquidation_style,
     auto_trade_setting_badge_stylesheet,
@@ -2251,10 +2263,6 @@ from gui_auto_trade_display import (
     routine_status_display_text,
     SORT_ROLE,
     SortableTableWidgetItem,
-)
-from gui_auto_trade_policy import (
-    START_BUDGET_PROTECTED_FIELDS,
-    preserve_active_participant_start_budget_fields,
 )
 from gui_auto_trade_situation import create_auto_trade_situation_item
 from gui_auto_trade_policy import (
@@ -2294,6 +2302,7 @@ from gui_auto_trade_policy import (
 )
 from gui_auto_trade_integrity import (
     unique_review_reasons,
+    inspect_stock_review_state,
     is_emergency_stopped_state,
     is_operation_excluded,
     is_review_required_state,
@@ -2345,14 +2354,16 @@ from gui_auto_trade_ats_ops import (
     auto_trade_set_selected_manual_ats_flag,
 )
 from gui_auto_trade_timer import (
-    auto_trade_current_runtime_file_signature,
     auto_trade_current_time_policy_minute_key,
-    auto_trade_on_runtime_file_timer_tick,
     auto_trade_on_time_policy_gui_timer_tick,
 )
-from gui_operation_ui_context import refresh_auto_trade_views
+from gui_operation_ui_context import (
+    refresh_auto_trade_views,
+    sync_auto_trade_monitoring_universe,
+)
 from gui_auto_trade_status_ops import (
     OPERATION_EXCLUDED_CONFIG_KEY,
+    OPERATION_EXCLUSION_REVIEW_BLOCK_MESSAGE,
     OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE,
     append_changelog,
     append_stock_log,
@@ -2375,6 +2386,8 @@ from gui_auto_trade_status_ops import (
     handle_auto_trade_operation_mode_double_click,
 )
 from gui_auto_trade_run_control import (
+    OperationStartCommandRequest,
+    OperationStartIntent,
     _show_operation_start_summary_toast,
     auto_trade_registered_operation_start_targets,
     auto_trade_registered_operation_targets,
@@ -2383,6 +2396,7 @@ from gui_auto_trade_run_control import (
     auto_trade_start_selected_rows_auto_trades,
     auto_trade_start_status_indicator,
     auto_trade_update_global_operation_button_state,
+    execute_operation_start_command,
     startup_recovery_operation_block_message,
     today_global_operation_status as _today_global_operation_status,
 )
@@ -2401,10 +2415,14 @@ from gui_review_required_window import (
 from gui_auto_trade_table_loader import (
     _selected_instance_stock_dirs,
     auto_trade_load_selected_routine_stocks,
+    refresh_auto_trade_chart_open_code_styles,
 )
 from gui_routine_service import (
     ensure_single_real_trade_routine_for_stock,
-    set_stock_real_trade_enabled,
+    execute_selected_stock_real_trade_command,
+    selected_stock_real_trade_target_enabled,
+    selected_stock_trade_permission_available,
+    selected_stock_trade_permission_label,
 )
 from gui_operation_environment import (
     OperationEnvironmentSettingsDialog,
@@ -2412,6 +2430,10 @@ from gui_operation_environment import (
     default_operation_policy,
     read_operation_policy,
     write_operation_policy,
+)
+from program_factory_reset import (
+    execute_program_factory_reset,
+    validate_factory_reset_safety,
 )
 from gui_review_required_window import (
     GlobalReviewRequiredWindow,
@@ -2427,8 +2449,12 @@ from main_group_projection import build_main_group_projection
 from auto_trade_performance_ui import (
     CanonicalPerformanceUiSnapshot,
     build_canonical_performance_ui_snapshot,
+    normalize_profit_factor,
+    routine_tree_performance_texts,
+    routine_tree_stock_performance_source,
 )
 from performance_metrics import MetricStatus
+from production_recovery_state_registry import recovery_stock_is_review_required
 from routine_instance_registry import (
     load_persisted_routine_instances,
     load_routine_definitions,
@@ -2436,7 +2462,16 @@ from routine_instance_registry import (
     routine_instance_by_id,
 )
 from routine_instance_repository import RoutineInstanceRepository
-from stock_repository import StockRepository
+from stock_repository import (
+    STOCK_CONFIG_DELETE_FIELD,
+    STOCK_CONFIG_EXPECTED_MISSING,
+    STOCK_CONFIG_WRITE_INVALID_PATCH,
+    STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+    STOCK_CONFIG_WRITE_NO_CHANGE,
+    STOCK_CONFIG_WRITE_READBACK_FAILED,
+    StockConfigWriteResult,
+    StockRepository,
+)
 from group_scope import load_group_scope
 from execution_enable_service import commit_execution_enable, preview_execution_enable
 from execution_final_send_gate_input_adapter import adapt_final_send_gate_readiness_to_input
@@ -2490,10 +2525,7 @@ ROUTINE_INSTANCE_REQUIRED_MESSAGE = "이 작업을 수행할 대상 루틴을 �
 ROUTINE_STATUS_DEFAULT = "기본운영"
 ROUTINE_TREE_STOCK_TITLE_DISPLAY_CHARS = 7
 ROUTINE_TREE_STOCK_TITLE_PREFIX_CHARS = 7
-AUTO_TRADE_SETTING_BADGE_ACTIVE_COLOR = "#16A34A"
-AUTO_TRADE_SETTING_BADGE_INACTIVE_COLOR = "#111827"
 AUTO_TRADE_SETTING_BADGE_IDLE_TEXT_COLOR = "#4B5563"
-AUTO_TRADE_SETTING_TOP_CONTROL_ROW_HEIGHT = AUTO_TRADE_SETTING_BADGE_HEIGHT
 AUTO_TRADE_SETTING_TOP_CONTROL_MARGIN = 1
 AUTO_TRADE_SETTING_TOP_CONTROL_BODY_SPACING = 2
 AUTO_TRADE_SETTING_EARLY_CLOSE_BUTTON_STYLE = "color: #2563eb; font-weight: bold;"
@@ -2870,14 +2902,6 @@ def routine_tree_layout_metrics(font: QFont) -> dict[str, int]:
     }
 
 
-def normalize_profit_factor(value: object) -> float:
-    """PF display input is non-negative; unavailable values normalize to zero."""
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return 0.0
-
-
 class StockPositionMetricDelegate(QStyledItemDelegate):
     """보유/가격/손익/매매 셀의 숫자 슬롯을 우측 정렬해 그린다."""
 
@@ -3009,6 +3033,10 @@ class AutoTradeNotificationPopup(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 10, 16, 10)
         layout.addWidget(self._label)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+        parent.installEventFilter(self)
         self.setStyleSheet(
             """
             QFrame#autoTradeNotificationPopup {
@@ -3024,13 +3052,23 @@ class AutoTradeNotificationPopup(QFrame):
         )
 
     def show_message(self, message: str, timeout_ms: int = 2500) -> None:
+        self._hide_timer.stop()
         self._label.setText(str(message or ""))
         self.adjustSize()
         self._move_to_parent_center()
         self.show()
         self.raise_()
         if timeout_ms > 0:
-            QTimer.singleShot(timeout_ms, self.hide)
+            self._hide_timer.start(timeout_ms)
+
+    def hideEvent(self, event: object) -> None:
+        self._hide_timer.stop()
+        super().hideEvent(event)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched is self.parentWidget() and event.type() in (QEvent.Close, QEvent.Hide):
+            self.hide()
+        return super().eventFilter(watched, event)
 
     def text(self) -> str:
         return self._label.text()
@@ -3300,15 +3338,36 @@ def _mark_close_routine_final_sell_from_broker_acceptance(
             "stock_dir": str(stock_dir),
         }
 
-    marked = mark_routine_order_accepted_for_stock_dir(
+    before_marker = (
+        state.get("close_routine_final_sell_ordered"),
+        state.get("close_routine_final_sell_ordered_at"),
+    )
+    write_succeeded = mark_routine_order_accepted_for_stock_dir(
         stock_dir,
         decision,
         source="kiwoom_chejan",
     )
+    saved_state = read_json_dict(stock_dir / "state.json") if write_succeeded else {}
+    saved_marker = (
+        saved_state.get("close_routine_final_sell_ordered"),
+        saved_state.get("close_routine_final_sell_ordered_at"),
+    )
+    marked = bool(
+        write_succeeded
+        and saved_state.get("close_routine_final_sell_ordered") is True
+        and str(saved_state.get("close_routine_final_sell_source") or "").strip()
+        == "kiwoom_chejan"
+    )
     return {
         "attempted": True,
-        "marked": marked is True,
-        "reason": "broker accepted routine SELL" if marked else "state write failed",
+        "marked": marked,
+        "changed": marked and saved_marker != before_marker,
+        "read_back_verified": marked,
+        "reason": (
+            "broker accepted routine SELL"
+            if marked
+            else "state write or read-back verification failed"
+        ),
         "stock_dir": str(stock_dir),
     }
 
@@ -3542,9 +3601,6 @@ def get_group_dirs() -> list[Path]:
     return registry_get_group_dirs()
 
 
-def get_routine_dirs() -> list[Path]:
-    """Compatibility wrapper for historical Group-path callers."""
-    return get_group_dirs()
 
 
 def routine_display_name(routine_dir: Path) -> str:
@@ -3630,6 +3686,129 @@ def read_operation_policy() -> dict[str, object]:
     return merged
 
 
+POLICY_OVERRIDE_VALUE_FIELDS = (
+    "policy_override_enabled",
+    "operation_policy_override",
+    "manual_operation_override",
+    "scheduled_operation_override",
+    "auto_close_override",
+    "early_close_override",
+    "liquidation_override",
+)
+POLICY_OVERRIDE_EDITABLE_FIELDS = (
+    "policy_override_enabled",
+    "policy_override_memo",
+)
+POLICY_OVERRIDE_WRITABLE_FIELDS = frozenset(
+    POLICY_OVERRIDE_VALUE_FIELDS
+    + (
+        "policy_override_memo",
+        "policy_override_updated_at",
+        "policy_override_reset_at",
+        "updated_at",
+    )
+)
+
+
+def _stock_policy_override_expected_fields(
+    config: dict[str, object],
+    field_keys: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        key: config[key] if key in config else STOCK_CONFIG_EXPECTED_MISSING
+        for key in field_keys
+    }
+
+
+def _stock_policy_override_write_result(
+    *,
+    ok: bool,
+    changed: bool,
+    field_keys: tuple[str, ...],
+    reason_code: str,
+    read_back_verified: bool,
+) -> StockConfigWriteResult:
+    return StockConfigWriteResult(
+        ok=ok,
+        changed=changed,
+        field_keys=field_keys,
+        conflict_detected=False,
+        read_back_verified=read_back_verified,
+        reason_code=reason_code,
+    )
+
+
+def _patch_stock_policy_override_config(
+    stock_dir: Path,
+    code: str,
+    patch: dict[str, object],
+    *,
+    expected_fields: dict[str, object],
+) -> StockConfigWriteResult:
+    field_keys = tuple(patch.keys()) if isinstance(patch, dict) else ()
+    if (
+        not isinstance(patch, dict)
+        or not patch
+        or not isinstance(expected_fields, dict)
+        or any(key not in POLICY_OVERRIDE_WRITABLE_FIELDS for key in patch)
+        or any(key not in patch for key in expected_fields)
+    ):
+        return _stock_policy_override_write_result(
+            ok=False,
+            changed=False,
+            field_keys=field_keys,
+            reason_code=STOCK_CONFIG_WRITE_INVALID_PATCH,
+            read_back_verified=False,
+        )
+
+    target_dir = Path(stock_dir)
+    stocks_dir = target_dir.parent
+    clean_code = normalize_stock_code(target_dir.name.partition("_")[0])
+    requested_code = normalize_stock_code(str(code or ""))
+    if stocks_dir.name != "stocks" or not clean_code or clean_code != requested_code:
+        return _stock_policy_override_write_result(
+            ok=False,
+            changed=False,
+            field_keys=field_keys,
+            reason_code=STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+            read_back_verified=False,
+        )
+    repository = StockRepository(stocks_dir.parent)
+    if repository.resolve_stock_dir(clean_code).resolve() != target_dir.resolve():
+        return _stock_policy_override_write_result(
+            ok=False,
+            changed=False,
+            field_keys=field_keys,
+            reason_code=STOCK_CONFIG_WRITE_INVALID_STOCK_IDENTITY,
+            read_back_verified=False,
+        )
+    return repository.patch_stock_config(
+        clean_code,
+        patch,
+        expected_fields=expected_fields,
+    )
+
+
+def _policy_override_patch_matches_readback(
+    patch: dict[str, object],
+    read_back: dict[str, object],
+) -> bool:
+    return all(
+        (key not in read_back)
+        if value is STOCK_CONFIG_DELETE_FIELD
+        else (key in read_back and read_back[key] == value)
+        for key, value in patch.items()
+    )
+
+
+def _policy_override_display_value(config: dict[str, object], key: str) -> object:
+    if key == "policy_override_enabled":
+        return bool(config.get(key, False))
+    if key == "policy_override_memo":
+        return str(config.get(key, "") or "").strip()
+    return config.get(key)
+
+
 class StockPolicyOverrideDialog(QDialog):
     """개별종목 예외설정 1차 UI.
 
@@ -3637,15 +3816,7 @@ class StockPolicyOverrideDialog(QDialog):
     전체 리셋은 종목별 예외 설정값을 제거한다.
     """
 
-    OVERRIDE_KEYS = (
-        "policy_override_enabled",
-        "operation_policy_override",
-        "manual_operation_override",
-        "scheduled_operation_override",
-        "auto_close_override",
-        "early_close_override",
-        "liquidation_override",
-    )
+    OVERRIDE_KEYS = POLICY_OVERRIDE_VALUE_FIELDS
 
     def __init__(self, stock_dir: Path, code: str, name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3654,6 +3825,8 @@ class StockPolicyOverrideDialog(QDialog):
         self.name = name
         self.config_path = stock_dir / "config.json"
         self.config = read_json_dict(self.config_path) or default_config()
+        self._policy_override_opening_config = deepcopy(self.config)
+        self._last_config_write_result = None
         self.setWindowTitle(f"개별종목 설정 - {code} {name}")
         self.resize(520, 360)
 
@@ -3697,44 +3870,35 @@ class StockPolicyOverrideDialog(QDialog):
         self.use_override.setChecked(bool(self.config.get("policy_override_enabled", False)))
         self.memo.setPlainText(str(self.config.get("policy_override_memo", "")))
 
-    def write_config(self) -> None:
-        current_config = read_json_dict(self.config_path)
-        if not isinstance(current_config, dict):
-            current_config = {}
-        self.config, self._start_budget_preservation_result = (
-            preserve_active_participant_start_budget_fields(
-                self,
-                self.code,
-                current_config,
-                self.config,
-                current_state=read_json_dict(self.stock_dir / "state.json"),
+    def write_config(
+        self,
+        patch: dict[str, object],
+        *,
+        expected_fields: dict[str, object],
+    ) -> StockConfigWriteResult:
+        result = _patch_stock_policy_override_config(
+            self.stock_dir,
+            self.code,
+            patch,
+            expected_fields=expected_fields,
+        )
+        read_back = read_json_dict(self.config_path)
+        self._latest_config_readback = read_back
+        if result.ok and not _policy_override_patch_matches_readback(patch, read_back):
+            result = StockConfigWriteResult(
+                ok=False,
+                changed=result.changed,
+                field_keys=result.field_keys,
+                conflict_detected=False,
+                read_back_verified=False,
+                reason_code=STOCK_CONFIG_WRITE_READBACK_FAILED,
+                before_fingerprint=result.before_fingerprint,
+                after_fingerprint=result.after_fingerprint,
             )
-        )
-        preserved_fields = tuple(
-            field
-            for field in START_BUDGET_PROTECTED_FIELDS
-            if current_config.get(field) != self.config.get(field)
-        )
-        for field in START_BUDGET_PROTECTED_FIELDS:
-            if field in current_config:
-                self.config[field] = current_config[field]
-            else:
-                self.config.pop(field, None)
-        if preserved_fields:
-            self._start_budget_preservation_result = {
-                **self._start_budget_preservation_result,
-                "canonical_fields_preserved": True,
-                "preserved_fields": preserved_fields,
-                "reason": str(
-                    self._start_budget_preservation_result.get("reason")
-                    or "START_BUDGET_CANONICAL_FIELDS_PRESERVED"
-                ),
-            }
-        self.config["updated_at"] = now_text()
-        self.config_path.write_text(
-            json.dumps(self.config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        if result.ok:
+            self.config = read_back
+        self._last_config_write_result = result
+        return result
 
     def _append_override_changed(
         self,
@@ -3776,19 +3940,47 @@ class StockPolicyOverrideDialog(QDialog):
         )
 
     def save_override(self) -> None:
-        before = deepcopy(self.config)
-        self.config["policy_override_enabled"] = self.use_override.isChecked()
-        self.config["policy_override_memo"] = self.memo.toPlainText().strip()
-        self.config["policy_override_updated_at"] = now_text()
+        opening_config = deepcopy(
+            getattr(self, "_policy_override_opening_config", self.config)
+        )
+        desired = {
+            "policy_override_enabled": bool(self.use_override.isChecked()),
+            "policy_override_memo": self.memo.toPlainText().strip(),
+        }
+        semantic_patch = {
+            key: desired[key]
+            for key in POLICY_OVERRIDE_EDITABLE_FIELDS
+            if desired[key] != _policy_override_display_value(opening_config, key)
+        }
+        before = read_json_dict(self.config_path)
+        if not semantic_patch:
+            self.config = before
+            self._last_config_write_result = _stock_policy_override_write_result(
+                ok=True,
+                changed=False,
+                field_keys=(),
+                reason_code=STOCK_CONFIG_WRITE_NO_CHANGE,
+                read_back_verified=True,
+            )
+            QMessageBox.information(self, "저장 완료", "개별종목 설정을 저장했습니다.")
+            self.accept()
+            return
+
+        changed_at = now_text()
+        patch = {
+            **semantic_patch,
+            "policy_override_updated_at": changed_at,
+            "updated_at": changed_at,
+        }
+        expected_fields = _stock_policy_override_expected_fields(
+            opening_config,
+            tuple(semantic_patch),
+        )
         try:
-            self.write_config()
-            saved = read_json_dict(self.config_path)
-            if any(saved.get(key) != self.config.get(key) for key in self.OVERRIDE_KEYS):
-                raise RuntimeError("개별종목 설정 저장 후 검증이 일치하지 않습니다.")
-            if str(saved.get("policy_override_memo") or "") != str(
-                self.config.get("policy_override_memo") or ""
-            ):
-                raise RuntimeError("개별종목 메모 저장 후 검증이 일치하지 않습니다.")
+            result = self.write_config(patch, expected_fields=expected_fields)
+            if not result.ok:
+                raise RuntimeError(result.reason_code)
+            saved = deepcopy(self.config)
             append_stock_log(self.stock_dir, "GUI", "개별종목 설정 저장")
             append_changelog("UPDATE", "config.json", f"개별종목 설정 저장: {self.code} {self.name}")
         except Exception as exc:
@@ -3799,15 +3991,51 @@ class StockPolicyOverrideDialog(QDialog):
         self.accept()
 
     def reset_all_to_global(self) -> None:
-        before = deepcopy(self.config)
-        for key in self.OVERRIDE_KEYS:
-            self.config.pop(key, None)
-        self.config.pop("policy_override_memo", None)
-        self.config["policy_override_enabled"] = False
-        self.config["policy_override_reset_at"] = now_text()
+        opening_config = deepcopy(
+            getattr(self, "_policy_override_opening_config", self.config)
+        )
+        reset_field_keys = self.OVERRIDE_KEYS + ("policy_override_memo",)
+        reset_needed = bool(opening_config.get("policy_override_enabled", False)) or any(
+            key in opening_config
+            for key in self.OVERRIDE_KEYS[1:] + ("policy_override_memo",)
+        )
+        before = read_json_dict(self.config_path)
+        if not reset_needed:
+            self.config = before
+            self._last_config_write_result = _stock_policy_override_write_result(
+                ok=True,
+                changed=False,
+                field_keys=(),
+                reason_code=STOCK_CONFIG_WRITE_NO_CHANGE,
+                read_back_verified=True,
+            )
+            QMessageBox.information(
+                self,
+                "리셋 완료",
+                "해당 종목의 개별설정을 환경설정값으로 전체 리셋했습니다.",
+            )
+            self.accept()
+            return
+
+        changed_at = now_text()
+        patch = {
+            "policy_override_enabled": False,
+            **{
+                key: STOCK_CONFIG_DELETE_FIELD
+                for key in self.OVERRIDE_KEYS[1:] + ("policy_override_memo",)
+            },
+            "policy_override_reset_at": changed_at,
+            "updated_at": changed_at,
+        }
+        expected_fields = _stock_policy_override_expected_fields(
+            opening_config,
+            reset_field_keys,
+        )
         try:
-            self.write_config()
-            saved = read_json_dict(self.config_path)
+            result = self.write_config(patch, expected_fields=expected_fields)
+            if not result.ok:
+                raise RuntimeError(result.reason_code)
+            saved = deepcopy(self.config)
             if bool(saved.get("policy_override_enabled", False)):
                 raise RuntimeError("개별종목 설정 리셋 후 검증이 일치하지 않습니다.")
             if any(key in saved for key in self.OVERRIDE_KEYS[1:]):
@@ -3839,9 +4067,19 @@ def handle_stock_name_operation_exclusion_double_click(
     if decision.get("allowed") is not True:
         status_message = getattr(host, "statusBarMessage", None)
         if callable(status_message):
-            status_message(OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE)
+            status_message(
+                OPERATION_EXCLUSION_REVIEW_BLOCK_MESSAGE
+                if decision.get("reason_code") == "REVIEW_REQUIRED"
+                else OPERATION_EXCLUSION_RUNNING_BLOCK_MESSAGE
+            )
         return False
-    changed = bool(host.toggle_stock_operation_exclusion(target, refresh=False))
+    changed = bool(
+        auto_trade_toggle_stock_operation_exclusion(
+            host,
+            target,
+            refresh=False,
+        )
+    )
     if not changed:
         return False
 
@@ -3919,7 +4157,9 @@ def delete_routine_instance_with_existing_policy(
             "after_assignment": "UNASSIGNED",
         },
     )
-    window.refresh_all()
+    if result.cleared_stock_codes:
+        sync_auto_trade_monitoring_universe(window)
+    refresh_auto_trade_views(window)
 
 
 def clone_routine_instance_with_existing_policy(
@@ -4227,12 +4467,6 @@ class AutoTradeSettingWindow(QDialog):
         self._time_policy_timer.setInterval(10_000)
         self._time_policy_timer.timeout.connect(self.on_time_policy_timer_tick)
 
-        # 외부에서 state/config/orders 파일을 직접 수정한 경우 화면에 자동 반영한다.
-        # 예: VSCode에서 보유수량/평단을 임시 입력하면 별도 버튼 없이 종목표가 갱신된다.
-        self._runtime_file_snapshot: dict[str, int] = {}
-        self._runtime_file_timer = QTimer(self)
-        self._runtime_file_timer.setInterval(2_000)
-        self._runtime_file_timer.timeout.connect(self.on_runtime_file_timer_tick)
         self._pnl_refresh_timer = QTimer(self)
         self._pnl_refresh_timer.setInterval(PNL_REFRESH_INTERVAL_MS)
         self._pnl_refresh_timer.timeout.connect(self.refresh_stock_pnl_cells)
@@ -4839,6 +5073,13 @@ class AutoTradeSettingWindow(QDialog):
                     {},
                 ).items()
             }
+            count_kwargs["state_issue_by_stock_dir"] = {
+                stock_dir: str(data.get("state_issue_reason", "") or "")
+                for stock_dir, data in snapshot.get(
+                    "stock_data_by_dir",
+                    {},
+                ).items()
+            }
         counts_by_instance = _instance_stock_counts(**count_kwargs)
         target_instance_ids = {
             str(instance_id or "").strip()
@@ -5243,7 +5484,7 @@ class AutoTradeSettingWindow(QDialog):
         return auto_trade_initial_read_snapshot(self)
 
     def _build_initial_read_snapshot(self) -> dict[str, object]:
-        """Read one coherent data set for this window's first refresh only."""
+        """Read one coherent data set for a full Settings refresh."""
         definitions = tuple(load_routine_definitions())
         instances = tuple(load_persisted_routine_instances())
         groups = tuple(get_group_records())
@@ -5331,51 +5572,52 @@ class AutoTradeSettingWindow(QDialog):
         # 시간변경/운영시작 등 상태 갱신 후 종목표가 맨 위로 튀는 문제를 막는다.
         selected_stock_paths, stock_scroll_value = self.capture_stock_table_view_state()
 
-        initial_refresh = bool(getattr(self, "_initializing_open_refresh", False))
         normalize_base_stock_single_routine_file()
-        ensure_single_real_trade_routine_for_all_stocks()
         from gui_main_table_loader import _invalidate_main_pnl_refresh_cache
 
         # Config-backed exclusion is mutable; rebuild the aggregate input for
         # this refresh so badges and row filters share the latest projection.
         _invalidate_main_pnl_refresh_cache(self)
-        if initial_refresh:
-            self._auto_trade_initial_read_snapshot = (
-                self._build_initial_read_snapshot()
-            )
-        selected_routine_metadata = self.current_selected_routine_row_metadata()
-        all_stocks_scope_active = bool(
-            getattr(self, "_all_stocks_scope_active", False)
+        previous_snapshot = getattr(self, "_auto_trade_initial_read_snapshot", None)
+        snapshot_builder = getattr(self, "_build_initial_read_snapshot", None)
+        self._auto_trade_initial_read_snapshot = (
+            snapshot_builder() if callable(snapshot_builder) else previous_snapshot
         )
-        routine_selection_blocker = QSignalBlocker(self.routine_table)
-        self.routine_table.setUpdatesEnabled(False)
         try:
-            self.load_routine_table()
+            selected_routine_metadata = self.current_selected_routine_row_metadata()
+            all_stocks_scope_active = bool(
+                getattr(self, "_all_stocks_scope_active", False)
+            )
+            routine_selection_blocker = QSignalBlocker(self.routine_table)
+            self.routine_table.setUpdatesEnabled(False)
+            try:
+                self.load_routine_table()
 
-            if selected_routine_metadata:
-                self.restore_routine_selection_metadata(selected_routine_metadata)
+                if selected_routine_metadata:
+                    self.restore_routine_selection_metadata(selected_routine_metadata)
 
-            if (
-                not all_stocks_scope_active
-                and self.current_selected_routine_row_metadata() is None
-                and self.routine_table.rowCount() > 0
-            ):
-                self.routine_table.selectRow(0)
+                if (
+                    not all_stocks_scope_active
+                    and self.current_selected_routine_row_metadata() is None
+                    and self.routine_table.rowCount() > 0
+                ):
+                    self.routine_table.selectRow(0)
+            finally:
+                del routine_selection_blocker
+                self.routine_table.setUpdatesEnabled(True)
+                self.routine_table.viewport().update()
+
+            self.update_selected_routine_status_bar()
+            self._defer_stock_loader_action_update = True
+            try:
+                self.load_selected_routine_stocks()
+            finally:
+                self._defer_stock_loader_action_update = False
+            self.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
+            self.update_review_required_button_text()
+            self.update_action_buttons()
         finally:
-            del routine_selection_blocker
-            self.routine_table.setUpdatesEnabled(True)
-            self.routine_table.viewport().update()
-
-        self.update_selected_routine_status_bar()
-        self._defer_stock_loader_action_update = True
-        try:
-            self.load_selected_routine_stocks()
-        finally:
-            self._defer_stock_loader_action_update = False
-        self.restore_stock_table_view_state(selected_stock_paths, stock_scroll_value)
-        self._runtime_file_snapshot = self.current_runtime_file_signature()
-        self.update_review_required_button_text()
-        self.update_action_buttons()
+            self._auto_trade_initial_read_snapshot = previous_snapshot
 
     def review_required_stock_count(self) -> int:
         """검토관리창과 동일 Collector 기준으로 대상 종목 수를 계산한다."""
@@ -5399,21 +5641,6 @@ class AutoTradeSettingWindow(QDialog):
 
     def current_time_policy_minute_key(self) -> str:
         return auto_trade_current_time_policy_minute_key(self)
-
-    def current_runtime_file_signature(self) -> tuple[tuple[str, int, int], ...]:
-        return auto_trade_current_runtime_file_signature(self)
-
-    def on_runtime_file_timer_tick(self) -> None:
-        previous_snapshot = self._runtime_file_snapshot
-        try:
-            auto_trade_on_runtime_file_timer_tick(self)
-        except Exception:
-            LOGGER.exception("Runtime file timer refresh failed")
-            self._runtime_file_snapshot = previous_snapshot
-            self.statusBarMessage(
-                "Runtime 상태를 갱신하지 못했습니다. "
-                "로그를 확인한 뒤 Recovery를 다시 실행하십시오."
-            )
 
     def on_time_policy_timer_tick(self) -> None:
         previous_minute_key = self._last_time_policy_gui_minute_key
@@ -5476,13 +5703,7 @@ class AutoTradeSettingWindow(QDialog):
     ) -> bool:
         if is_review_required_stock_dir(stock_dir):
             return True
-        parent = persistent_feature_owner(self)
-        checker = getattr(
-            parent,
-            "production_recovery_stock_is_review_required",
-            None,
-        )
-        return bool(checker(stock_code)) if callable(checker) else False
+        return recovery_stock_is_review_required(stock_code)
 
     def filter_start_targets_by_recovery(
         self,
@@ -5541,7 +5762,7 @@ class AutoTradeSettingWindow(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
+        for timer in (self._time_policy_timer, self._pnl_refresh_timer):
             if not timer.isActive():
                 timer.start()
 
@@ -5550,7 +5771,7 @@ class AutoTradeSettingWindow(QDialog):
         del identity
         started_count = 0
         if self.isVisible():
-            for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
+            for timer in (self._time_policy_timer, self._pnl_refresh_timer):
                 if timer.isActive():
                     continue
                 timer.start()
@@ -5564,7 +5785,7 @@ class AutoTradeSettingWindow(QDialog):
     def stop_periodic_timers_for_recovery(self) -> dict[str, object]:
         """Stop settings-only GUI refresh timers."""
         stopped_count = 0
-        for timer in (self._time_policy_timer, self._runtime_file_timer, self._pnl_refresh_timer):
+        for timer in (self._time_policy_timer, self._pnl_refresh_timer):
             if not timer.isActive():
                 continue
             timer.stop()
@@ -5582,12 +5803,21 @@ class AutoTradeSettingWindow(QDialog):
 
     def refresh_stock_pnl_cells(self) -> None:
         """Update only PnL cells; never rebuild the settings table."""
+        rows: list[tuple[object, str]] = []
         for row in range(self.stock_table.rowCount()):
             code_item = self.stock_table.item(row, 0)
             pnl_item = self.stock_table.item(row, 9)
             if code_item is None or pnl_item is None:
                 continue
-            result = project_current_stock_pnl(code_item.text(), project_root=PROJECT_ROOT)
+            code = str(code_item.text() or "").strip().lstrip("A")
+            if code:
+                rows.append((pnl_item, code))
+        pnl_by_code = project_current_stock_pnl_snapshot(
+            (code for _item, code in rows),
+            project_root=PROJECT_ROOT,
+        )
+        for pnl_item, code in rows:
+            result = pnl_by_code.get(code, {})
             if result.get("available") is not True:
                 continue
             profit_metric, amount, _rate = confirmable_stock_profit_metric(result)
@@ -5662,6 +5892,9 @@ class AutoTradeSettingWindow(QDialog):
         self.btn_log_view.setEnabled(single_stock)
         self.btn_review_view.setEnabled(True)
         self.update_startup_recovery_controls()
+
+    def refresh_stock_instance_chart_open_code_styles(self) -> None:
+        refresh_auto_trade_chart_open_code_styles(self)
 
     def registered_operation_targets(self) -> list[tuple[Path, str, str]]:
         snapshot = auto_trade_initial_read_snapshot(self)
@@ -5936,11 +6169,14 @@ class AutoTradeSettingWindow(QDialog):
         selected: list[tuple[Path, str, str]] | None = None,
     ) -> str:
         selected = selected if selected is not None else self.selected_stock_infos()
-        values = []
-        for stock_dir, _code, _name in selected:
-            config = read_json_dict(stock_dir / "config.json")
-            values.append(real_trade_enabled(config if config else default_config()))
-        return "감시전용 전환" if values and all(values) else "실주문 전환"
+        return selected_stock_trade_permission_label(selected)
+
+    def selected_trade_permission_available(
+        self,
+        selected: list[tuple[Path, str, str]] | None = None,
+    ) -> bool:
+        selected = selected if selected is not None else self.selected_stock_infos()
+        return selected_stock_trade_permission_available(self, selected)
 
     def toggle_selected_trade_permission(
         self,
@@ -5950,41 +6186,26 @@ class AutoTradeSettingWindow(QDialog):
         if not selected:
             self.statusBarMessage("거래권한을 변경할 종목을 1개 이상 선택하세요.")
             return {"ok": False, "changed": 0, "blocked": 0, "reason": "NO_SELECTION"}
-        target_enabled = self.selected_trade_permission_context_label(selected).startswith("실주문")
-        changed: list[str] = []
-        blocked: list[str] = []
-        for stock_dir, code, name in selected:
-            result = set_stock_real_trade_enabled(
-                self,
-                stock_dir,
-                code,
-                name,
-                target_enabled,
-            )
-            label = f"{code} {name}".strip()
-            if result.get("ok") is True:
-                if result.get("changed") is True:
-                    changed.append(label)
-            else:
-                blocked.append(f"{label}({result.get('reason') or 'BLOCKED'})")
-        if changed:
+        target_enabled = selected_stock_real_trade_target_enabled(selected)
+        result = execute_selected_stock_real_trade_command(
+            self,
+            selected,
+            target_enabled,
+        )
+        changed_targets = tuple(result.get("changed_targets", ()) or ())
+        blocked_targets = tuple(result.get("blocked_targets", ()) or ())
+        if changed_targets:
             append_changelog(
                 "UPDATE",
                 "config.json",
-                f"거래권한 변경: {' / '.join(changed)} -> {'실주문' if target_enabled else '감시전용'}",
+                f"거래권한 변경: {' / '.join(changed_targets)} -> {'실주문' if target_enabled else '감시전용'}",
             )
-            self.refresh_all()
-        message = f"거래권한 변경: {len(changed)}개"
-        if blocked:
-            message += f" / 차단 {len(blocked)}개"
+            refresh_auto_trade_views(self)
+        message = f"거래권한 변경: {result.get('changed', 0)}개"
+        if blocked_targets:
+            message += f" / 차단 {len(blocked_targets)}개"
         self.statusBarMessage(message)
-        return {
-            "ok": bool(changed) and not blocked,
-            "changed": len(changed),
-            "blocked": len(blocked),
-            "target_real_trade_enabled": target_enabled,
-            "blocked_targets": tuple(blocked),
-        }
+        return result
 
     def toggle_selected_manual_override_flag(self, flag_key: str, label: str) -> None:
         """수동운영 종목의 개별 수동시간 사용 여부를 즉시 전환한다.
@@ -6011,21 +6232,33 @@ class AutoTradeSettingWindow(QDialog):
             manual_override = config.get("manual_operation_override", {})
             if not isinstance(manual_override, dict):
                 manual_override = {}
+            manual_override = deepcopy(manual_override)
 
             current_value = bool(manual_override.get(flag_key, False))
             manual_override[flag_key] = not current_value
-            config["manual_operation_override"] = manual_override
-            config["policy_override_enabled"] = True
-            config["policy_override_updated_at"] = now_text()
-            config["updated_at"] = now_text()
+            changed_at = now_text()
+            patch = {
+                "manual_operation_override": manual_override,
+                "policy_override_enabled": True,
+                "policy_override_updated_at": changed_at,
+                "updated_at": changed_at,
+            }
 
-            try:
-                config_path.write_text(
-                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+            result = _patch_stock_policy_override_config(
+                stock_dir,
+                code,
+                patch,
+                expected_fields=_stock_policy_override_expected_fields(
+                    config,
+                    ("manual_operation_override", "policy_override_enabled"),
+                ),
+            )
+            if not result.ok:
+                QMessageBox.critical(
+                    self,
+                    "저장 오류",
+                    f"{code} {name} 설정 저장 중 오류가 발생했습니다.\n\n{result.reason_code}",
                 )
-            except Exception as exc:
-                QMessageBox.critical(self, "저장 오류", f"{code} {name} 설정 저장 중 오류가 발생했습니다.\n\n{exc}")
                 continue
 
             changed.append(f"{code} {name}({label}: {'ON' if manual_override[flag_key] else 'OFF'})")
@@ -6034,7 +6267,7 @@ class AutoTradeSettingWindow(QDialog):
         if changed:
             append_changelog("UPDATE", "config.json", f"수동운영 개별설정 변경: {' / '.join(changed)}")
             self.statusBarMessage(f"{label} 전환 완료: {len(changed)}개")
-            self.refresh_all()
+            refresh_auto_trade_views(self)
         else:
             QMessageBox.information(self, "처리 없음", "수동운영 종목만 이 메뉴를 사용할 수 있습니다.")
 
@@ -6058,17 +6291,28 @@ class AutoTradeSettingWindow(QDialog):
             if "manual_operation_override" not in config:
                 continue
 
-            config.pop("manual_operation_override", None)
-            config["policy_override_updated_at"] = now_text()
-            config["updated_at"] = now_text()
+            changed_at = now_text()
+            patch = {
+                "manual_operation_override": STOCK_CONFIG_DELETE_FIELD,
+                "policy_override_updated_at": changed_at,
+                "updated_at": changed_at,
+            }
 
-            try:
-                config_path.write_text(
-                    json.dumps(config, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
+            result = _patch_stock_policy_override_config(
+                stock_dir,
+                code,
+                patch,
+                expected_fields=_stock_policy_override_expected_fields(
+                    config,
+                    ("manual_operation_override",),
+                ),
+            )
+            if not result.ok:
+                QMessageBox.critical(
+                    self,
+                    "리셋 오류",
+                    f"{code} {name} 설정 리셋 중 오류가 발생했습니다.\n\n{result.reason_code}",
                 )
-            except Exception as exc:
-                QMessageBox.critical(self, "리셋 오류", f"{code} {name} 설정 리셋 중 오류가 발생했습니다.\n\n{exc}")
                 continue
 
             changed.append(f"{code} {name}")
@@ -6077,7 +6321,7 @@ class AutoTradeSettingWindow(QDialog):
         if changed:
             append_changelog("UPDATE", "config.json", f"수동운영 개별설정 리셋: {' / '.join(changed)}")
             self.statusBarMessage(f"수동운영 기본 리셋 완료: {len(changed)}개")
-            self.refresh_all()
+            refresh_auto_trade_views(self)
         else:
             QMessageBox.information(self, "처리 없음", "리셋할 수동운영 개별설정이 없습니다.")
 
@@ -6503,190 +6747,14 @@ class AutoTradeSettingWindow(QDialog):
         self,
         stock: dict[str, object],
     ) -> dict[str, object]:
-        if bool(stock.get("is_development_fixture", False)):
-            fixture = stock.get("performance_fixture")
-            if isinstance(fixture, dict):
-                profit_factor = normalize_profit_factor(
-                    fixture.get(
-                        "profit_factor",
-                        fixture.get("efficiency"),
-                    )
-                )
-                return {
-                    **fixture,
-                    "gross_profit": fixture.get("gross_profit"),
-                    "gross_loss_abs": fixture.get("gross_loss_abs"),
-                    "profit_factor": profit_factor,
-                    "is_current": False,
-                }
-        stock_path = Path(str(stock.get("stock_path", "") or "").strip())
-        if not stock_path.is_absolute():
-            stock_path = Path(__file__).resolve().parent / stock_path
-        snapshot = auto_trade_initial_read_snapshot(self)
-        snapshot_data = (
-            snapshot.get("stock_data_by_dir", {}).get(str(stock_path), {})
-            if snapshot is not None
-            else {}
-        )
-        orders = (
-            list(snapshot_data.get("orders", ()))
-            if snapshot_data
-            else read_orders_data(stock_path / "orders.json")
-        )
-        is_historical = bool(stock.get("is_historical", False))
-        if is_historical:
-            registered_at = parse_order_datetime_value(
-                stock.get("registered_at")
-            )
-            unregistered_at = parse_order_datetime_value(
-                stock.get("unregistered_at")
-            )
-            orders = [
-                order
-                for order in orders
-                if (parsed := order_datetime(order)) is not None
-                and (registered_at is None or parsed >= registered_at)
-                and (unregistered_at is None or parsed <= unregistered_at)
-            ]
-        filled_orders = [
-            order
-            for order in orders
-            if numeric_order_value(order, ["filled_qty", "filled", "executed_qty"], 0.0) > 0
-        ]
-        trade_dates = {
-            parsed.date()
-            for order in filled_orders
-            if (parsed := order_datetime(order)) is not None
-        }
-        realized_profit: float | None = None
-        if filled_orders:
-            realized_profit = float(summarize_orders(orders).get("realized_pnl", 0.0) or 0.0)
-        return {
-            "trade_days": len(trade_dates) if trade_dates else None,
-            "realized_profit": realized_profit,
-            "profit_rate": None,
-            "average": None,
-            "average_rate": None,
-            "gross_profit": None,
-            "gross_loss_abs": None,
-            "profit_factor": 0.0,
-            "is_current": bool(stock.get("is_current", not is_historical)),
-        }
+        return routine_tree_stock_performance_source(self, stock)
 
     def _routine_tree_performance_texts(
         self,
         stocks: list[dict[str, object]],
         source_cache: dict[str, dict[str, object]] | None = None,
-    ) -> dict[str, str]:
-        cache = source_cache if source_cache is not None else {}
-        source_rows: list[dict[str, object]] = []
-        for stock in stocks:
-            stock_path_key = str(stock.get("stock_path", "") or "").strip()
-            is_historical = bool(stock.get("is_historical", False))
-            cache_key = stock_path_key
-            if is_historical or not cache_key:
-                cache_key = "|".join(
-                    (
-                        str(stock.get("instance_id", "") or "").strip(),
-                        str(stock.get("stock_code", "") or "").strip(),
-                        stock_path_key,
-                        "historical" if is_historical else "current",
-                    )
-                )
-            if cache_key not in cache:
-                cache[cache_key] = self._routine_tree_stock_performance_source(stock)
-            source_rows.append(cache[cache_key])
-        trade_days = [
-            int(source.get("trade_days", 0) or 0)
-            for source in source_rows
-            if int(source.get("trade_days", 0) or 0) > 0
-        ]
-        period_text = "0"
-        if len(stocks) == 1 and trade_days:
-            period_text = str(trade_days[0])
-        elif len(stocks) > 1 and trade_days:
-            period_text = str(safe_int_value(sum(trade_days) / len(trade_days), 0))
-
-        realized_values = [
-            float(source["realized_profit"])
-            for source in source_rows
-            if source.get("realized_profit") is not None
-        ]
-        profit_value = sum(realized_values) if realized_values else 0.0
-        profit_amount_text = format_signed_money(profit_value)
-
-        profit_rate_value = (
-            source_rows[0].get("profit_rate")
-            if len(source_rows) == 1
-            else None
-        )
-        profit_rate_text = format_signed_percent(
-            profit_rate_value if profit_rate_value is not None else 0.0,
-            digits=2,
-        )
-        average_values = [
-            float(source["average"])
-            for source in source_rows
-            if source.get("average") is not None
-        ]
-        average_value = (
-            sum(average_values) / len(average_values)
-            if average_values
-            else 0.0
-        )
-        average_rate_values = [
-            float(source["average_rate"])
-            for source in source_rows
-            if source.get("average_rate") is not None
-        ]
-        average_rate_value = (
-            sum(average_rate_values) / len(average_rate_values)
-            if average_rate_values
-            else 0.0
-        )
-        average_amount_text = format_signed_money(average_value)
-        average_rate_text = format_signed_percent(
-            average_rate_value,
-            digits=2,
-        )
-        profit_factor_value = (
-            source_rows[0].get(
-                "profit_factor",
-                source_rows[0].get("efficiency"),
-            )
-            if len(source_rows) == 1
-            else 0.0
-        )
-        profit_factor_value = normalize_profit_factor(profit_factor_value)
-        efficiency_text = f"{profit_factor_value:.1f}"
-
-        return {
-            "performance_period_text": f"기간({period_text})",
-            "performance_profit_text": (
-                f"수익({profit_amount_text} / {profit_rate_text})"
-            ),
-            "performance_average_text": (
-                f"평균({average_amount_text} / {average_rate_text})"
-            ),
-            "performance_efficiency_text": f"효율({efficiency_text})",
-            "performance_period_value": period_text,
-            "performance_profit_amount": profit_amount_text,
-            "performance_profit_rate": profit_rate_text,
-            "performance_profit_color": profit_loss_value_color(profit_value),
-            "performance_average_amount": average_amount_text,
-            "performance_average_rate": average_rate_text,
-            "performance_average_color": profit_loss_value_color(
-                average_value if average_values else None
-            ),
-            "performance_efficiency_value": efficiency_text,
-            "performance_efficiency_color": directional_value_color(
-                profit_factor_value
-            ),
-            "performance_period_sort_value": float(sum(trade_days)),
-            "performance_profit_sort_value": float(profit_value),
-            "performance_average_sort_value": float(average_value),
-            "performance_efficiency_sort_value": float(profit_factor_value),
-        }
+    ) -> dict[str, object]:
+        return routine_tree_performance_texts(self, stocks, source_cache)
 
     def _routine_tree_stock_group_performance_source(
         self,
@@ -6779,120 +6847,6 @@ class AutoTradeSettingWindow(QDialog):
                 bool(source.get("is_current", False)) for source in source_rows
             ),
         }
-
-    def _routine_tree_group_stock_rows_by_code(
-        self,
-        stock_rows: list[dict[str, object]],
-        source_cache: dict[str, dict[str, object]],
-    ) -> list[dict[str, object]]:
-        grouped: dict[str, list[dict[str, object]]] = {}
-        first_index: dict[str, int] = {}
-        for index, row in enumerate(stock_rows):
-            stock_code = str(row.get("stock_code", "") or "").strip()
-            if not stock_code:
-                continue
-            grouped.setdefault(stock_code, []).append(row)
-            first_index.setdefault(stock_code, index)
-
-        result: list[dict[str, object]] = []
-        for stock_code, rows_for_code in sorted(
-            grouped.items(),
-            key=lambda item: first_index.get(item[0], 0),
-        ):
-            representative = next(
-                (
-                    row
-                    for row in rows_for_code
-                    if not bool(row.get("is_historical", False))
-                ),
-                rows_for_code[0],
-            )
-            source_stocks = [
-                dict(row.get("_source_stock", row))
-                for row in rows_for_code
-            ]
-            aggregate_source = self._routine_tree_stock_group_performance_source(
-                source_stocks,
-                source_cache,
-            )
-            stock_path = f"aggregate://{stock_code}"
-            cache_key = stock_path
-            source_cache[cache_key] = aggregate_source
-            row = dict(representative)
-            row.pop("_source_stock", None)
-            row.update(
-                {
-                    "instance_id": str(representative.get("instance_id", "") or ""),
-                    "instance_name": str(representative.get("instance_name", "") or ""),
-                    "stock_path": stock_path,
-                    "historical_instance_ids": tuple(
-                        sorted(
-                            {
-                                str(item.get("instance_id", "") or "").strip()
-                                for item in rows_for_code
-                                if bool(item.get("is_historical", False))
-                                and str(item.get("instance_id", "") or "").strip()
-                            }
-                        )
-                    ),
-                    "tree_icon": (
-                        "\u2713"
-                        if any(not bool(item.get("is_historical", False)) for item in rows_for_code)
-                        else "\u25aa"
-                    ),
-                    "stock_relation_kind": (
-                        CURRENT_STOCK_RELATION
-                        if any(not bool(item.get("is_historical", False)) for item in rows_for_code)
-                        else HISTORICAL_STOCK_RELATION
-                    ),
-                    "is_historical": not any(
-                        not bool(item.get("is_historical", False))
-                        for item in rows_for_code
-                    ),
-                    "is_development_fixture": True,
-                    "performance_fixture": aggregate_source,
-                    **self._routine_tree_performance_texts(
-                        [
-                            {
-                                "stock_path": stock_path,
-                                "stock_code": stock_code,
-                                "is_development_fixture": True,
-                                "performance_fixture": aggregate_source,
-                            }
-                        ],
-                        source_cache,
-                    ),
-                }
-            )
-            result.append(row)
-        if bool(getattr(self, "_routine_tree_stock_performance_sort_active", False)):
-            display_criterion = str(
-                getattr(self, "_routine_tree_display_criterion", "profit") or "profit"
-            )
-            source_key_by_criterion = {
-                "period": "trade_days",
-                "profit": "realized_profit",
-                "average": "average",
-                "efficiency": "profit_factor",
-            }
-            source_key = source_key_by_criterion.get(
-                display_criterion,
-                "realized_profit",
-            )
-
-            def _aggregate_sort_value(row: dict[str, object]) -> float:
-                fixture = row.get("performance_fixture")
-                source = fixture if isinstance(fixture, dict) else {}
-                raw_value = source.get(source_key)
-                if source_key == "profit_factor":
-                    return normalize_profit_factor(raw_value)
-                try:
-                    return float(raw_value)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            result = sorted(result, key=_aggregate_sort_value, reverse=True)
-        return result
 
     def _routine_tree_row_sort_value(
         self,
@@ -7034,6 +6988,13 @@ class AutoTradeSettingWindow(QDialog):
             static_data=snapshot.get("count_static_data", {}),
             state_by_stock_dir={
                 stock_dir: data.get("state", {})
+                for stock_dir, data in snapshot.get(
+                    "stock_data_by_dir",
+                    {},
+                ).items()
+            },
+            state_issue_by_stock_dir={
+                stock_dir: str(data.get("state_issue_reason", "") or "")
                 for stock_dir, data in snapshot.get(
                     "stock_data_by_dir",
                     {},
@@ -9750,9 +9711,12 @@ class AutoTradeSettingWindow(QDialog):
         try:
             stock_dir = StockRepository(PROJECT_ROOT).resolve_stock_dir(code, name)
             state = read_json_dict(stock_dir / "state.json")
+            return inspect_stock_review_state(
+                stock_dir,
+                loaded_state=state,
+            ).review_required
         except Exception:
-            return False
-        return is_review_required_state(state)
+            return True
 
     def _routine_tree_registered_stock_for_code(self, code: str) -> dict[str, object] | None:
         clean_code = normalize_stock_code(code)
@@ -9927,42 +9891,6 @@ class AutoTradeSettingWindow(QDialog):
             },
         }
 
-    def _routine_tree_register_convert_enabled_for_stock_row(
-        self,
-        metadata: dict[str, object],
-    ) -> bool:
-        if str(metadata.get("row_kind", "") or "") != "stock":
-            return False
-        context = self._routine_tree_stock_row_action_context(metadata)
-        return bool(context["actions"]["convert"]["enabled"])
-
-    def _routine_tree_hide_historical_display_enabled_for_stock_row(
-        self,
-        metadata: dict[str, object],
-    ) -> bool:
-        if str(metadata.get("row_kind", "") or "") != "stock":
-            return False
-        context = self._routine_tree_stock_row_action_context(metadata)
-        return bool(context["actions"]["hide"]["enabled"])
-
-    def _routine_tree_unregister_target_for_stock_row(
-        self,
-        metadata: dict[str, object],
-    ) -> dict[str, str] | None:
-        if str(metadata.get("row_kind", "") or "") != "stock":
-            return None
-        context = self._routine_tree_stock_row_action_context(metadata)
-        if not bool(context["actions"]["unassign"]["enabled"]):
-            return None
-        return {
-            "stock_code": str(context["stock_code"]),
-            "stock_name": str(context["stock_name"]),
-            "instance_id": str(context["row_instance_id"]),
-            "instance_name": str(metadata.get("instance_name", "") or "").strip(),
-            "definition_id": str(metadata.get("definition_id", "") or "").strip(),
-            "definition_name": str(metadata.get("definition_name", "") or "").strip(),
-        }
-
     def _routine_unassign_event_details(
         self,
         decision: RoutineUnassignDecision,
@@ -10122,15 +10050,21 @@ class AutoTradeSettingWindow(QDialog):
             )
             return False
 
-        if not update_base_stock_routines(code, name, []):
+        assignment_result = execute_assignment_unassign(
+            persistent_feature_owner(self),
+            PROJECT_ROOT,
+            code,
+            name,
+            expected_instance_id=instance_id,
+            intent=ASSIGNMENT_INTENT_UNASSIGN,
+        )
+        if not assignment_result.ok or not assignment_result.changed:
             show_toast(self, "등록해제할 수 없는 종목입니다.\n검토관리에서 확인하세요.")
             return False
 
         ensure_single_real_trade_routine_for_stock(code, name)
-        scroll_bar = self.routine_table.verticalScrollBar()
-        scroll_value = scroll_bar.value()
-        self.refresh_all()
-        scroll_bar.setValue(scroll_value)
+        sync_auto_trade_monitoring_universe(self)
+        refresh_auto_trade_views(self)
         observe_owner_failure_transition(
             self,
             f"routine-unassign-integrity:{code}",
@@ -10292,7 +10226,7 @@ class AutoTradeSettingWindow(QDialog):
                 result.error or "루틴 이름을 변경하지 못했습니다.",
             )
             return
-        self.refresh_all()
+        refresh_auto_trade_views(self)
 
     def delete_routine_instance(self, metadata: dict[str, object]) -> None:
         delete_routine_instance_with_existing_policy(self, metadata)
@@ -10353,7 +10287,7 @@ class AutoTradeSettingWindow(QDialog):
                 "과거 종목 표시 정보를 갱신하지 못했습니다.",
             )
             return
-        self.load_routine_table()
+        refresh_auto_trade_views(self)
 
     def _left_display_intent_owns_all_stock_scope(self) -> bool:
         return self._left_flat_filter_scope_active()
@@ -12721,7 +12655,11 @@ class AutoTradeSettingWindow(QDialog):
             existing.raise_()
             existing.activateWindow()
             return
-        dialog = OperationEnvironmentSettingsDialog(self)
+        dialog = OperationEnvironmentSettingsDialog(
+            self,
+            factory_reset_validator=validate_factory_reset_safety,
+            factory_reset_executor=execute_program_factory_reset,
+        )
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         self.operation_environment_settings_window = dialog
 
@@ -12741,19 +12679,8 @@ class AutoTradeSettingWindow(QDialog):
         dialog.activateWindow()
 
     def _handle_operation_environment_settings_saved(self, dialog) -> None:
-        owner = persistent_feature_owner(self)
-        recalculate_limits = getattr(
-            owner,
-            "_recalculate_recommended_stock_buy_limits_for_starting_budget_change",
-            None,
-        )
-        if (
-            bool(getattr(dialog, "_starting_budget_defaults_changed", False))
-            and callable(recalculate_limits)
-        ):
-            recalculate_limits()
         self.statusBarMessage("환경설정 저장 완료")
-        self.refresh_all()
+        refresh_auto_trade_views(self)
 
     def open_stock_register_window(self) -> None:
         """관제창과 동일한 중앙 종목 등록 창을 연다."""
@@ -12765,10 +12692,17 @@ class AutoTradeSettingWindow(QDialog):
             return
         from gui_stock_register_window import StockRegisterWindow
 
-        self.stock_register_window = StockRegisterWindow(self)
+        self.stock_register_window = StockRegisterWindow(
+            self,
+            stock_search_register_opener=open_instance_stock_search_register_dialog,
+        )
         self.stock_register_window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.stock_register_window.finished.connect(
-            lambda _result: self.refresh_all()
+            lambda result: (
+                refresh_auto_trade_views(self)
+                if result == QDialog.Accepted
+                else None
+            )
         )
         self.stock_register_window.show()
 
@@ -12781,16 +12715,12 @@ class AutoTradeSettingWindow(QDialog):
         stock_dir, code, name = selected
         dialog = StockPolicyOverrideDialog(stock_dir, code, name, self)
         if dialog.exec_() == QDialog.Accepted:
-            self.refresh_all()
+            refresh_auto_trade_views(self)
 
-    def set_global_schedule_time(self) -> None:
-        """하위 호환용: 스케줄매매관리 창을 연다."""
-        self.open_schedule_trade_management_window()
 
     def open_schedule_trade_management_window(self) -> None:
         dialog = ScheduleTradeManagementDialog(self)
         dialog.exec_()
-        self.refresh_all()
 
     def set_selected_individual_schedule_time(self) -> None:
         selected = self.selected_stock_infos()
@@ -12936,73 +12866,16 @@ class AutoTradeSettingWindow(QDialog):
         dialog.exec_()
 
     def start_selected_auto_trades(self) -> None:
-        if _today_global_operation_status(read_operation_state()) == "NORMAL_ENDED":
-            status_message = getattr(self, "statusBarMessage", None)
-            if callable(status_message):
-                status_message("오늘 운영이 종료되었습니다.")
-            self.update_global_operation_button_state()
-            return
-        running_targets = self.running_registered_operation_targets()
-        selected_targets = self.registered_operation_start_targets()
-        requested_targets = list(selected_targets)
-        running_keys = {
-            str(code or "").strip() or str(Path(stock_dir).resolve())
-            for stock_dir, code, _name in running_targets
-        }
-        selected_targets = [
-            target
-            for target in selected_targets
-            if (
-                str(target[1] or "").strip()
-                or str(Path(target[0]).resolve())
-            ) not in running_keys
-        ]
-        if not selected_targets:
-            if not running_targets:
-                status_message = getattr(self, "statusBarMessage", None)
-                if callable(status_message):
-                    status_message("운영시작 대상이 없습니다. 운영 제외를 해제한 뒤 다시 시도하세요.")
-            else:
-                requested_targets = requested_targets or list(running_targets)
-                result = {
-                    "ok": False,
-                    "reason": "ALREADY_RUNNING",
-                    "user_message": "선택한 종목이 모두 이미 운영 중입니다.",
-                    "requested": tuple(
-                        f"{code} {name}".strip()
-                        for _stock_dir, code, name in requested_targets
-                    ),
-                    "requested_count": len(requested_targets),
-                    "completed": (),
-                    "blocked_target_details": (),
-                    "already_running_targets": tuple(running_targets),
-                    "blocked_count": 0,
-                    "already_running_count": len(running_targets),
-                    "started_count": 0,
-                    "failed_count": 0,
-                    "excluded_review_count": 0,
-                    "excluded_validation_count": 0,
-                }
-                _show_operation_start_summary_toast(self, result)
-            self.update_global_operation_button_state()
-            return
-        start_kwargs = {
-            "request_scope": "multiple",
-            "selected_targets": selected_targets,
-            "source": "auto_trade_global_start_button",
-        }
-        if running_targets:
-            start_kwargs["already_running_targets"] = running_targets
-        auto_trade_start_selected_auto_trades(self, **start_kwargs)
-        parent_refreshed = False
-        parent_getter = getattr(self, "parent", None)
-        parent = parent_getter() if callable(parent_getter) else None
-        parent_refresh = getattr(parent, "refresh_all", None)
-        if callable(parent_refresh):
-            parent_refresh()
-            parent_refreshed = True
-        if not parent_refreshed:
-            self.update_global_operation_button_state()
+        execute_operation_start_command(
+            self,
+            OperationStartCommandRequest(
+                intent=OperationStartIntent.FULL_START,
+                source="auto_trade_global_start_button",
+            ),
+            start_backend=auto_trade_start_selected_auto_trades,
+            operation_state_reader=read_operation_state,
+            summary_presenter=_show_operation_start_summary_toast,
+        )
 
     def recalculate_routine_limits_for_new_operation_session(self) -> dict[str, object]:
         from routine_limit_recalculation import (
@@ -13012,7 +12885,15 @@ class AutoTradeSettingWindow(QDialog):
         return recalculate_enabled_routine_limits_for_new_session(self)
 
     def start_selected_rows_auto_trades(self) -> dict[str, object] | None:
-        return auto_trade_start_selected_rows_auto_trades(self)
+        return execute_operation_start_command(
+            self,
+            OperationStartCommandRequest(
+                intent=OperationStartIntent.SELECTIVE_START,
+                source="auto_trade_context_menu",
+            ),
+            start_backend=auto_trade_start_selected_auto_trades,
+            selective_backend=auto_trade_start_selected_rows_auto_trades,
+        ).as_legacy_dict()
 
     def emergency_stop_selected_auto_trade_stocks(self) -> dict[str, object]:
         selected_targets = self.selected_stock_infos()
@@ -13112,18 +12993,3 @@ def is_stock_assigned_to_routine(code: str, name: str, routine_name: str) -> boo
     """
     assignments = base_stock_routine_assignments()
     return routine_name in assignments.get((code, name), set())
-
-
-def assigned_stock_dirs_in_routine(routine_dir: Path) -> list[Path]:
-    """
-    자동매매설정 표시용 루틴 종목 폴더 목록을 반환한다.
-
-    루틴 폴더 안에 물리 폴더가 남아 있어도 기초종목.txt 에 연결 정보가 없으면
-    자동매매설정 창에는 표시하지 않는다.
-    """
-    result: list[Path] = []
-    for stock_dir in get_stock_dirs_in_routine(routine_dir):
-        if is_review_required_stock_dir(stock_dir):
-            continue
-        result.append(stock_dir)
-    return result

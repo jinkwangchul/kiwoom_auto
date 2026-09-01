@@ -113,31 +113,58 @@ class MainPnlRefreshOptimizationTests(unittest.TestCase):
                 }
             ]
         )
-        running_loader = MagicMock(return_value=[])
+        group_loader = MagicMock(return_value=[])
+        category_projector = MagicMock(return_value="waiting")
+        batch_projector = MagicMock(return_value={})
+
+        def inspect_state(stock_dir: Path):
+            return SimpleNamespace(
+                state=read_json(Path(stock_dir) / "state.json"),
+                review_required=False,
+                issue_reason="",
+            )
+
         with (
             patch.object(table_loader, "load_routine_definitions", definitions_loader),
             patch.object(table_loader, "load_persisted_routine_instances", instances_loader),
+            patch.object(table_loader, "get_group_records", group_loader),
             patch.object(table_loader, "read_base_stocks", base_loader),
             patch.object(table_loader, "read_json_dict", side_effect=read_json),
             patch.object(
                 table_loader,
-                "auto_trade_running_registered_operation_targets",
-                running_loader,
+                "inspect_stock_review_state",
+                side_effect=inspect_state,
             ),
-            patch.object(table_loader, "project_current_stock_pnl_snapshot", return_value={}),
+            patch.object(
+                table_loader,
+                "auto_trade_stock_operation_category",
+                category_projector,
+            ),
+            patch.object(
+                table_loader,
+                "project_current_stock_pnl_snapshot",
+                batch_projector,
+            ),
         ):
             table_loader.main_refresh_pnl_only(window)
             table_loader.main_refresh_pnl_only(window)
 
         self.assertEqual(1, definitions_loader.call_count)
         self.assertEqual(1, instances_loader.call_count)
+        self.assertEqual(1, group_loader.call_count)
         self.assertEqual(1, base_loader.call_count)
         self.assertEqual(1, read_counts["config"])
         self.assertEqual(2, read_counts["state"])
-        self.assertEqual(2, running_loader.call_count)
-        for call in running_loader.call_args_list:
-            self.assertEqual(1, len(call.kwargs["registered_targets"]))
-            self.assertEqual(1, len(call.kwargs["state_by_stock_dir"]))
+        self.assertEqual(2, batch_projector.call_count)
+        for call in batch_projector.call_args_list:
+            self.assertEqual(
+                {"000001": {"status": "STOPPED", "trade_enabled": False}},
+                call.kwargs["state_by_code"],
+            )
+        self.assertEqual(2, category_projector.call_count)
+        for call in category_projector.call_args_list:
+            self.assertEqual("000001", call.kwargs["stock_code"])
+            self.assertFalse(call.kwargs["persisted_trade_started"])
 
     def test_invalidation_reloads_changed_instance_and_assignment_metadata(self) -> None:
         window = SimpleNamespace()
@@ -153,6 +180,12 @@ class MainPnlRefreshOptimizationTests(unittest.TestCase):
                 [{"code": "000002", "name": "B", "stock_path": "stocks/B"}],
             ]
         )
+        group_loader = MagicMock(
+            side_effect=[
+                [SimpleNamespace(group_id="group-before")],
+                [SimpleNamespace(group_id="group-after")],
+            ]
+        )
         config_by_parent = {
             "A": {"assigned_routine_instance_id": "instance-a"},
             "B": {"assigned_routine_instance_id": "instance-b"},
@@ -160,6 +193,7 @@ class MainPnlRefreshOptimizationTests(unittest.TestCase):
         with (
             patch.object(table_loader, "load_routine_definitions", return_value=[]),
             patch.object(table_loader, "load_persisted_routine_instances", instances_loader),
+            patch.object(table_loader, "get_group_records", group_loader),
             patch.object(table_loader, "read_base_stocks", base_loader),
             patch.object(
                 table_loader,
@@ -173,11 +207,14 @@ class MainPnlRefreshOptimizationTests(unittest.TestCase):
             refreshed = table_loader._main_pnl_refresh_static_cache(window)
 
         self.assertIs(first, reused)
+        self.assertEqual("group-before", first["groups"][0].group_id)
         self.assertEqual("instance-a", first["instances"][0].instance_id)
         self.assertEqual("000001", first["stocks"][0]["code"])
+        self.assertEqual("group-after", refreshed["groups"][0].group_id)
         self.assertEqual("instance-b", refreshed["instances"][0].instance_id)
         self.assertEqual("000002", refreshed["stocks"][0]["code"])
         self.assertEqual(2, instances_loader.call_count)
+        self.assertEqual(2, group_loader.call_count)
         self.assertEqual(2, base_loader.call_count)
 
     def test_unchanged_summary_skips_all_label_and_style_setters(self) -> None:
